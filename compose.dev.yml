@@ -15,14 +15,28 @@
 #   the volume `dev-mokosh-infisical-postgres-data` sorts adjacent to its
 #   parent in alphabetical listings.
 #
-# This stack only contains the secrets-management infrastructure
-# (Infisical + its Postgres + Valkey). The Mokosh apps themselves still run
-# on the host via `dx serve --package <app>` for fast iteration. Each app
-# reads INFISICAL_* env vars from .env and connects out to the Infisical
-# container on its published localhost port.
+# This stack contains the Mokosh API server plus its secrets-management
+# infrastructure (Infisical + its Postgres + Valkey). The Mokosh client
+# apps (e.g. `dx serve --package <app>`) still run on the host and connect
+# to the Mokosh API on its published port (MOKOSH_HOST_BIND_IP:MOKOSH_PORT)
+# and to Infisical on its published loopback port (127.0.0.1:28002).
+#
+# The Mokosh API server runs as the `mokosh-server` service, reachable
+# inside the compose network as `mokosh-server:${MOKOSH_PORT}` and on the
+# host at `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PORT}`. The host bind targets a
+# private LAN interface (e.g. br0/eth0) instead of 127.0.0.1 so other
+# Docker containers on the host can reach it; the private IP is not
+# routable from the public internet on a VPS.
+#
+# Discover the host IP with:
+#   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
+#
+# The Mokosh application database (DATABASE_URL) is NOT part of this
+# stack. The container reaches the host's PostgreSQL via the
+# `host.docker.internal` DNS name (mapped to `host-gateway` for Linux).
 #
 # This file contains no hardcoded values. Every environment variable is
-# sourced from .env (which is created from .env.dev by `just dev-up`).
+# sourced from .env (which is created from .env.dev by `just dev`).
 # Required-but-empty values use the `${VAR:?...}` form so compose fails
 # loudly with a helpful message instead of starting a misconfigured stack.
 
@@ -35,9 +49,9 @@ services:
     # https://hub.docker.com/_/postgres
     image: postgres:18.2-alpine3.23
     environment:
-      POSTGRES_DB: ${INFISICAL_PG_DB:?INFISICAL_PG_DB missing - run `just dev-up` (which copies .env.dev to .env)}
-      POSTGRES_USER: ${INFISICAL_PG_USER:?INFISICAL_PG_USER missing - run `just dev-up` (which copies .env.dev to .env)}
-      POSTGRES_PASSWORD: ${INFISICAL_PG_PASSWORD:?INFISICAL_PG_PASSWORD missing - run `just dev-up` (which copies .env.dev to .env)}
+      POSTGRES_DB: ${INFISICAL_PG_DB:?INFISICAL_PG_DB missing - run `just dev` (which copies .env.dev to .env)}
+      POSTGRES_USER: ${INFISICAL_PG_USER:?INFISICAL_PG_USER missing - run `just dev` (which copies .env.dev to .env)}
+      POSTGRES_PASSWORD: ${INFISICAL_PG_PASSWORD:?INFISICAL_PG_PASSWORD missing - run `just dev` (which copies .env.dev to .env)}
     networks:
       - private
     expose:
@@ -68,12 +82,12 @@ services:
   infisical:
     image: infisical/infisical:latest
     environment:
-      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev-up` (which copies .env.dev to .env)}
-      AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev-up` (which copies .env.dev to .env)}
-      DB_CONNECTION_URI: ${INFISICAL_DB_CONNECTION_URI:?INFISICAL_DB_CONNECTION_URI missing - run `just dev-up` (which copies .env.dev to .env)}
-      REDIS_URL: ${INFISICAL_REDIS_URL:?INFISICAL_REDIS_URL missing - run `just dev-up` (which copies .env.dev to .env)}
-      SITE_URL: ${INFISICAL_SITE_URL:?INFISICAL_SITE_URL missing - run `just dev-up` (which copies .env.dev to .env)}
-      TELEMETRY_ENABLED: ${INFISICAL_TELEMETRY_ENABLED:?INFISICAL_TELEMETRY_ENABLED missing - run `just dev-up` (which copies .env.dev to .env)}
+      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
+      AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev` (which copies .env.dev to .env)}
+      DB_CONNECTION_URI: ${INFISICAL_DB_CONNECTION_URI:?INFISICAL_DB_CONNECTION_URI missing - run `just dev` (which copies .env.dev to .env)}
+      REDIS_URL: ${INFISICAL_REDIS_URL:?INFISICAL_REDIS_URL missing - run `just dev` (which copies .env.dev to .env)}
+      SITE_URL: ${INFISICAL_SITE_URL:?INFISICAL_SITE_URL missing - run `just dev` (which copies .env.dev to .env)}
+      TELEMETRY_ENABLED: ${INFISICAL_TELEMETRY_ENABLED:?INFISICAL_TELEMETRY_ENABLED missing - run `just dev` (which copies .env.dev to .env)}
     networks:
       - private
     ports:
@@ -90,9 +104,58 @@ services:
       retries: 10
       start_period: 30s
 
+  # Mokosh API server. Built from the dev Dockerfile; source mounted for
+  # live reload via `cargo run`. Port published on loopback only.
+  mokosh-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${MOKOSH_PORT:?MOKOSH_PORT missing - run `just dev` (which copies .env.dev to .env)}
+      ENVIRONMENT: development
+      BASE_URL: http://${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}
+
+      # Reach the host's PostgreSQL via host.docker.internal (see extra_hosts).
+      DATABASE_URL: ${DATABASE_URL_IN_CONTAINER:?DATABASE_URL_IN_CONTAINER missing - run `just dev` (which copies .env.dev to .env)}
+
+      # Inside the compose network, reach Infisical by service-DNS, not the
+      # published localhost port.
+      INFISICAL_BASE_URL: http://infisical:8080
+      INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
+      INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}
+
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - run `just dev` (which copies .env.dev to .env)}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
+
+      # First-run admin bootstrap (DEV ONLY). Ignored once any user exists.
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+
+      RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
+    networks:
+      - private
+    ports:
+      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}:${MOKOSH_PORT}"
+    extra_hosts:
+      host.docker.internal: host-gateway
+    volumes:
+      - ./src:/app/src
+      - ./Cargo.toml:/app/Cargo.toml
+      - ./Cargo.lock:/app/Cargo.lock
+      - ./migrations:/app/migrations
+      - mokosh-server-target:/app/target
+    depends_on:
+      infisical:
+        condition: service_healthy
+
 volumes:
   infisical-postgres-data:
     name: dev-mokosh-infisical-postgres-data
+  mokosh-server-target:
+    name: dev-mokosh-server-target
 
 networks:
   private:

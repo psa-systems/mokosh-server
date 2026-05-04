@@ -89,6 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Database connected");
 
+    if let Err(e) = mokosh_server::modules::auth::bootstrap::maybe_bootstrap_admin(&db).await {
+        tracing::warn!("Admin bootstrap failed: {}", e);
+    }
+
     let router = create_api_router(db, config.jwt_secret);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;

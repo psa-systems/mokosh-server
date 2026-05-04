@@ -11,9 +11,29 @@ default:
 ensure-env:
     @test -f .env || cp .env.dev .env
 
-# Bring up the dev secrets-management stack (Infisical + Postgres + Valkey).
-[doc("Start Infisical and its sidecars in Docker")]
-dev-up *args: ensure-env
+# Bring up the dev stack (mokosh-server + Infisical + Postgres + Valkey). Trailing args go to `docker compose up` (e.g. --detach).
+[doc("Start the dev stack in Docker. Trailing args go to `docker compose up` (e.g. --detach).")]
+dev *args: ensure-env
+    #!/usr/bin/env nu
+    let bind_ip = (
+        sys net
+        | where name =~ 'eth0|br0'
+        | get ip
+        | flatten
+        | where protocol == 'ipv4' and $it.loop == false
+        | get address.0
+    )
+    print $"Binding mokosh-server host port to ($bind_ip)"
+    let updated = (
+        open .env --raw
+        | lines
+        | where not ($it | str starts-with 'MOKOSH_HOST_BIND_IP=')
+        | append $"MOKOSH_HOST_BIND_IP=($bind_ip)"
+        | str join "\n"
+    )
+    if ('.env.new' | path exists) { rm .env.new }
+    $"($updated)\n" | save .env.new
+    mv .env.new .env
     docker compose --file {{ compose_file }} up {{ args }}
 
 # Stop the dev secrets-management stack. Volumes are preserved.
@@ -28,8 +48,8 @@ dev-clean: ensure-env
     docker compose --file {{ compose_file }} down --volumes
     if ('.env' | path exists) { rm .env }
 
-# Bootstrap Infisical for the dev stack (run once after `just dev-up`).
-[doc("Bootstrap Infisical for the dev stack (run once after `just dev-up`)")]
+# Bootstrap Infisical for the dev stack (run once after `just dev`).
+[doc("Bootstrap Infisical for the dev stack (run once after `just dev`)")]
 infisical-bootstrap: ensure-env
     #!/usr/bin/env nu
     let env_file = ".env.infisical"
