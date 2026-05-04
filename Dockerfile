@@ -23,6 +23,6 @@ RUN mkdir --parents src src/bin \
 
 # Source code is mounted via volumes in compose
 
-EXPOSE 8080
+EXPOSE 4301
 
 CMD ["cargo", "run", "--bin", "mokosh-server"]
