@@ -1,0 +1,163 @@
+//! Database connection pool and management
+
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::utils::error::{AppError, AppResult};
+
+/// Database connection pool wrapper
+#[derive(Clone)]
+pub struct Database {
+    pool: PgPool,
+}
+
+impl Database {
+    /// Create a new database connection pool
+    pub async fn new(database_url: &str) -> AppResult<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(20)
+            .min_connections(2)
+            .acquire_timeout(Duration::from_secs(30))
+            .idle_timeout(Duration::from_secs(600))
+            .max_lifetime(Duration::from_secs(1800))
+            .connect(database_url)
+            .await
+            .map_err(|e| AppError::Database(format!("Failed to connect to database: {}", e)))?;
+
+        tracing::info!("Connected to database");
+
+        Ok(Self { pool })
+    }
+
+    /// Get a reference to the connection pool
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Run database migrations
+    pub async fn run_migrations(&self) -> AppResult<()> {
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(format!("Migration failed: {}", e)))?;
+
+        tracing::info!("Database migrations completed");
+        Ok(())
+    }
+
+    /// Health check for the database
+    pub async fn health_check(&self) -> AppResult<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(format!("Health check failed: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Get a connection from the pool with tenant context set
+    #[cfg(feature = "multi-tenant")]
+    pub async fn with_tenant(&self, tenant_id: uuid::Uuid) -> AppResult<TenantConnection> {
+        use sqlx::Executor;
+
+        let mut conn = self.pool.acquire().await?;
+
+        // Set the tenant context for Row Level Security
+        sqlx::query(&format!("SET LOCAL app.current_tenant = '{}'", tenant_id))
+            .execute(&mut *conn)
+            .await?;
+
+        Ok(TenantConnection { conn, tenant_id })
+    }
+
+    /// Begin a transaction with tenant context
+    #[cfg(feature = "multi-tenant")]
+    pub async fn begin_with_tenant(
+        &self,
+        tenant_id: uuid::Uuid,
+    ) -> AppResult<TenantTransaction<'_>> {
+        use sqlx::Executor;
+
+        let mut tx = self.pool.begin().await?;
+
+        // Set the tenant context for Row Level Security
+        sqlx::query(&format!("SET LOCAL app.current_tenant = '{}'", tenant_id))
+            .execute(&mut *tx)
+            .await?;
+
+        Ok(TenantTransaction { tx, tenant_id })
+    }
+}
+
+/// A database connection with tenant context set
+#[cfg(feature = "multi-tenant")]
+pub struct TenantConnection {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    tenant_id: uuid::Uuid,
+}
+
+#[cfg(feature = "multi-tenant")]
+impl TenantConnection {
+    pub fn tenant_id(&self) -> uuid::Uuid {
+        self.tenant_id
+    }
+}
+
+#[cfg(feature = "multi-tenant")]
+impl std::ops::Deref for TenantConnection {
+    type Target = sqlx::pool::PoolConnection<sqlx::Postgres>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+#[cfg(feature = "multi-tenant")]
+impl std::ops::DerefMut for TenantConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
+}
+
+/// A database transaction with tenant context set
+#[cfg(feature = "multi-tenant")]
+pub struct TenantTransaction<'a> {
+    tx: sqlx::Transaction<'a, sqlx::Postgres>,
+    tenant_id: uuid::Uuid,
+}
+
+#[cfg(feature = "multi-tenant")]
+impl<'a> TenantTransaction<'a> {
+    pub fn tenant_id(&self) -> uuid::Uuid {
+        self.tenant_id
+    }
+
+    pub async fn commit(self) -> AppResult<()> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn rollback(self) -> AppResult<()> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "multi-tenant")]
+impl<'a> std::ops::Deref for TenantTransaction<'a> {
+    type Target = sqlx::Transaction<'a, sqlx::Postgres>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
+    }
+}
+
+#[cfg(feature = "multi-tenant")]
+impl<'a> std::ops::DerefMut for TenantTransaction<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tx
+    }
+}
+
+use super::TenantContext;

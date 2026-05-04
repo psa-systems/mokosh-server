@@ -1,0 +1,70 @@
+---
+
+# Create a Forgejo release when a release/* branch is merged to main.
+# Extracts the version from the branch name, generates a changelog from
+# git log between the previous tag and HEAD, and creates the release
+# (with tag) via the Forgejo API.
+name: Create release
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+jobs:
+  create-release:
+    name: Create release from merged PR
+    if: >-
+      github.event.pull_request.merged == true
+      && startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Create release
+        shell: nu {0}
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_PAT }}
+        run: |
+          let branch = "${{ github.event.pull_request.head.ref }}"
+          let tag = ($branch | str replace "release/" "")
+
+          # Build changelog from commits since the previous tag
+          let prev_tag = (do { ^git describe --tags --abbrev=0 $"($tag)^" } | complete)
+          let changelog = if $prev_tag.exit_code == 0 {
+            let prev = ($prev_tag.stdout | str trim)
+            ^git log --oneline $"($prev)..HEAD" | str trim
+          } else {
+            # No previous tag — include all commits
+            ^git log --oneline | str trim
+          }
+
+          let body = $"## Changelog\n\n($changelog)"
+
+          let api_url = $"($env.GITHUB_SERVER_URL)/api/v1/repos/($env.GITHUB_REPOSITORY)/releases"
+          let payload = {
+            tag_name: $tag,
+            target_commitish: "main",
+            name: $tag,
+            body: $body,
+            draft: false,
+            prerelease: false,
+          }
+
+          let response = (
+            http post
+              --content-type application/json
+              --headers [Authorization $"token ($env.FORGEJO_TOKEN)"]
+              $api_url
+              $payload
+          )
+
+          print $"Release ($tag) created: ($response.html_url)"

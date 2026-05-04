@@ -1,0 +1,845 @@
+//! Contact service implementation
+
+use uuid::Uuid;
+
+use crate::db::Database;
+use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
+
+use super::models::*;
+
+/// Contact management service
+#[derive(Clone)]
+pub struct ContactService {
+    db: Database,
+}
+
+impl ContactService {
+    pub fn new(db: Database) -> Self {
+        Self { db }
+    }
+
+    // ========================================================================
+    // COMPANIES
+    // ========================================================================
+
+    /// Create a new company
+    pub async fn create_company(
+        &self,
+        tenant_id: Uuid,
+        request: &CreateCompanyRequest,
+    ) -> AppResult<Company> {
+        let company_id = Uuid::new_v4();
+        let address = request.address.clone().unwrap_or_default();
+        let billing_address = request.billing_address.clone().unwrap_or_default();
+
+        sqlx::query(
+            r#"
+            INSERT INTO companies (
+                id, tenant_id, name, parent_company_id, company_type, status,
+                industry, website, phone, fax,
+                address_line1, address_line2, city, state, postal_code, country,
+                billing_address_line1, billing_address_line2, billing_city,
+                billing_state, billing_postal_code, billing_country,
+                tax_id, account_number, account_manager_id, sla_id,
+                payment_terms, tax_exempt, custom_fields, tags, notes, portal_enabled
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
+            )
+            "#,
+        )
+        .bind(company_id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(request.parent_company_id)
+        .bind(request.company_type.as_str())
+        .bind(request.status.as_str())
+        .bind(&request.industry)
+        .bind(&request.website)
+        .bind(&request.phone)
+        .bind(&request.fax)
+        .bind(&address.line1)
+        .bind(&address.line2)
+        .bind(&address.city)
+        .bind(&address.state)
+        .bind(&address.postal_code)
+        .bind(&address.country)
+        .bind(&billing_address.line1)
+        .bind(&billing_address.line2)
+        .bind(&billing_address.city)
+        .bind(&billing_address.state)
+        .bind(&billing_address.postal_code)
+        .bind(&billing_address.country)
+        .bind(&request.tax_id)
+        .bind(&request.account_number)
+        .bind(request.account_manager_id)
+        .bind(request.sla_id)
+        .bind(&request.payment_terms)
+        .bind(request.tax_exempt)
+        .bind(&request.custom_fields)
+        .bind(&request.tags)
+        .bind(&request.notes)
+        .bind(request.portal_enabled)
+        .execute(self.db.pool())
+        .await?;
+
+        self.get_company(tenant_id, company_id).await
+    }
+
+    /// Get company by ID
+    pub async fn get_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<Company> {
+        let row = sqlx::query_as::<_, CompanyRow>(
+            r#"
+            SELECT id, tenant_id, name, parent_company_id, company_type, status,
+                   industry, website, phone, fax,
+                   address_line1, address_line2, city, state, postal_code, country,
+                   billing_address_line1, billing_address_line2, billing_city,
+                   billing_state, billing_postal_code, billing_country,
+                   tax_id, account_number, default_billing_contact_id,
+                   default_technical_contact_id, account_manager_id, sla_id,
+                   default_contract_id, payment_terms, tax_exempt,
+                   custom_fields, tags, notes, logo_url, portal_enabled,
+                   created_at, updated_at
+            FROM companies
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("Company".to_string()))?;
+
+        Ok(row.into())
+    }
+
+    /// List companies with filters
+    pub async fn list_companies(
+        &self,
+        tenant_id: Uuid,
+        filter: &CompanyFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<Company>, u64)> {
+        let offset = pagination.offset() as i32;
+        let limit = pagination.limit() as i32;
+
+        // Build dynamic query
+        let mut conditions = vec!["tenant_id = $1".to_string()];
+        let mut param_idx = 4;
+
+        if filter.q.is_some() {
+            conditions.push(format!("name ILIKE ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.company_type.is_some() {
+            conditions.push(format!("company_type = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.status.is_some() {
+            conditions.push(format!("status = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.account_manager_id.is_some() {
+            conditions.push(format!("account_manager_id = ${}", param_idx));
+            // param_idx += 1;
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let order_by = pagination.order_by("name", &["name", "created_at", "updated_at"]);
+
+        let query = format!(
+            r#"
+            SELECT id, tenant_id, name, parent_company_id, company_type, status,
+                   industry, website, phone, fax,
+                   address_line1, address_line2, city, state, postal_code, country,
+                   billing_address_line1, billing_address_line2, billing_city,
+                   billing_state, billing_postal_code, billing_country,
+                   tax_id, account_number, default_billing_contact_id,
+                   default_technical_contact_id, account_manager_id, sla_id,
+                   default_contract_id, payment_terms, tax_exempt,
+                   custom_fields, tags, notes, logo_url, portal_enabled,
+                   created_at, updated_at
+            FROM companies
+            WHERE {}
+            ORDER BY {}
+            LIMIT $2 OFFSET $3
+            "#,
+            where_clause, order_by
+        );
+
+        let count_query = format!("SELECT COUNT(*) FROM companies WHERE {}", where_clause);
+
+        // Execute queries
+        let mut query_builder = sqlx::query_as::<_, CompanyRow>(&query)
+            .bind(tenant_id)
+            .bind(limit)
+            .bind(offset);
+
+        let mut count_builder = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+
+        if let Some(ref q) = filter.q {
+            let search = format!("%{}%", q);
+            query_builder = query_builder.bind(search.clone());
+            count_builder = count_builder.bind(search);
+        }
+        if let Some(ref ct) = filter.company_type {
+            query_builder = query_builder.bind(ct.as_str());
+            count_builder = count_builder.bind(ct.as_str());
+        }
+        if let Some(ref status) = filter.status {
+            query_builder = query_builder.bind(status.as_str());
+            count_builder = count_builder.bind(status.as_str());
+        }
+        if let Some(ref am_id) = filter.account_manager_id {
+            query_builder = query_builder.bind(am_id);
+            count_builder = count_builder.bind(am_id);
+        }
+
+        let rows = query_builder.fetch_all(self.db.pool()).await?;
+        let total = count_builder.fetch_one(self.db.pool()).await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// Update company
+    pub async fn update_company(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        request: &UpdateCompanyRequest,
+    ) -> AppResult<Company> {
+        // Verify company exists
+        self.get_company(tenant_id, company_id).await?;
+
+        // Build update query dynamically
+        let mut updates = vec!["updated_at = NOW()".to_string()];
+        let mut param_idx = 3;
+
+        if request.name.is_some() {
+            updates.push(format!("name = ${}", param_idx));
+            param_idx += 1;
+        }
+        if request.company_type.is_some() {
+            updates.push(format!("company_type = ${}", param_idx));
+            param_idx += 1;
+        }
+        if request.status.is_some() {
+            updates.push(format!("status = ${}", param_idx));
+            param_idx += 1;
+        }
+        // Add more fields as needed...
+
+        let query = format!(
+            "UPDATE companies SET {} WHERE tenant_id = $1 AND id = $2",
+            updates.join(", ")
+        );
+
+        let mut query_builder = sqlx::query(&query).bind(tenant_id).bind(company_id);
+
+        if let Some(ref name) = request.name {
+            query_builder = query_builder.bind(name);
+        }
+        if let Some(ref ct) = request.company_type {
+            query_builder = query_builder.bind(ct.as_str());
+        }
+        if let Some(ref status) = request.status {
+            query_builder = query_builder.bind(status.as_str());
+        }
+
+        query_builder.execute(self.db.pool()).await?;
+
+        self.get_company(tenant_id, company_id).await
+    }
+
+    /// Delete company
+    pub async fn delete_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<()> {
+        // Check for related records
+        let ticket_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND company_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        if ticket_count > 0 {
+            return Err(AppError::BadRequest(
+                "Cannot delete company with existing tickets".to_string(),
+            ));
+        }
+
+        sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(company_id)
+            .execute(self.db.pool())
+            .await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // CONTACTS
+    // ========================================================================
+
+    /// Create a new contact
+    pub async fn create_contact(
+        &self,
+        tenant_id: Uuid,
+        request: &CreateContactRequest,
+    ) -> AppResult<Contact> {
+        // Verify company exists
+        self.get_company(tenant_id, request.company_id).await?;
+
+        let contact_id = Uuid::new_v4();
+        let timezone = request
+            .timezone
+            .clone()
+            .unwrap_or_else(|| "UTC".to_string());
+
+        sqlx::query(
+            r#"
+            INSERT INTO contacts (
+                id, tenant_id, company_id, first_name, last_name, email,
+                phone, mobile, fax, title, department, contact_type,
+                preferred_contact_method, timezone, custom_fields, tags, notes
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+            )
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(request.company_id)
+        .bind(&request.first_name)
+        .bind(&request.last_name)
+        .bind(&request.email)
+        .bind(&request.phone)
+        .bind(&request.mobile)
+        .bind(&request.fax)
+        .bind(&request.title)
+        .bind(&request.department)
+        .bind(request.contact_type.as_str())
+        .bind("email") // preferred_contact_method
+        .bind(&timezone)
+        .bind(&request.custom_fields)
+        .bind(&request.tags)
+        .bind(&request.notes)
+        .execute(self.db.pool())
+        .await?;
+
+        // TODO: If create_portal_access is true, set up portal access
+
+        self.get_contact(tenant_id, contact_id).await
+    }
+
+    /// Get contact by ID
+    pub async fn get_contact(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<Contact> {
+        let row = sqlx::query_as::<_, ContactRow>(
+            r#"
+            SELECT id, tenant_id, company_id, first_name, last_name, email,
+                   phone, mobile, fax, title, department, contact_type,
+                   is_portal_user, portal_user_id, preferred_contact_method,
+                   timezone, locale, custom_fields, tags, notes, avatar_url,
+                   status, created_at, updated_at
+            FROM contacts
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("Contact".to_string()))?;
+
+        Ok(row.into())
+    }
+
+    /// List contacts with filters
+    pub async fn list_contacts(
+        &self,
+        tenant_id: Uuid,
+        filter: &ContactFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<Contact>, u64)> {
+        let offset = pagination.offset() as i32;
+        let limit = pagination.limit() as i32;
+
+        let mut conditions = vec!["tenant_id = $1".to_string()];
+        let mut param_idx = 4;
+
+        if filter.q.is_some() {
+            conditions.push(format!(
+                "(first_name ILIKE ${} OR last_name ILIKE ${} OR email ILIKE ${})",
+                param_idx, param_idx, param_idx
+            ));
+            param_idx += 1;
+        }
+        if filter.company_id.is_some() {
+            conditions.push(format!("company_id = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.contact_type.is_some() {
+            conditions.push(format!("contact_type = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.status.is_some() {
+            conditions.push(format!("status = ${}", param_idx));
+            // param_idx += 1;
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let order_by = pagination.order_by(
+            "last_name",
+            &["first_name", "last_name", "email", "created_at"],
+        );
+
+        let query = format!(
+            r#"
+            SELECT id, tenant_id, company_id, first_name, last_name, email,
+                   phone, mobile, fax, title, department, contact_type,
+                   is_portal_user, portal_user_id, preferred_contact_method,
+                   timezone, locale, custom_fields, tags, notes, avatar_url,
+                   status, created_at, updated_at
+            FROM contacts
+            WHERE {}
+            ORDER BY {}
+            LIMIT $2 OFFSET $3
+            "#,
+            where_clause, order_by
+        );
+
+        let count_query = format!("SELECT COUNT(*) FROM contacts WHERE {}", where_clause);
+
+        let mut query_builder = sqlx::query_as::<_, ContactRow>(&query)
+            .bind(tenant_id)
+            .bind(limit)
+            .bind(offset);
+
+        let mut count_builder = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+
+        if let Some(ref q) = filter.q {
+            let search = format!("%{}%", q);
+            query_builder = query_builder.bind(search.clone());
+            count_builder = count_builder.bind(search);
+        }
+        if let Some(ref company_id) = filter.company_id {
+            query_builder = query_builder.bind(company_id);
+            count_builder = count_builder.bind(company_id);
+        }
+        if let Some(ref ct) = filter.contact_type {
+            query_builder = query_builder.bind(ct.as_str());
+            count_builder = count_builder.bind(ct.as_str());
+        }
+        if let Some(ref status) = filter.status {
+            query_builder = query_builder.bind(status.as_str());
+            count_builder = count_builder.bind(status.as_str());
+        }
+
+        let rows = query_builder.fetch_all(self.db.pool()).await?;
+        let total = count_builder.fetch_one(self.db.pool()).await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// Get contacts for a company
+    pub async fn get_company_contacts(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+    ) -> AppResult<Vec<Contact>> {
+        let rows = sqlx::query_as::<_, ContactRow>(
+            r#"
+            SELECT id, tenant_id, company_id, first_name, last_name, email,
+                   phone, mobile, fax, title, department, contact_type,
+                   is_portal_user, portal_user_id, preferred_contact_method,
+                   timezone, locale, custom_fields, tags, notes, avatar_url,
+                   status, created_at, updated_at
+            FROM contacts
+            WHERE tenant_id = $1 AND company_id = $2
+            ORDER BY contact_type, last_name
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Update contact
+    pub async fn update_contact(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        request: &UpdateContactRequest,
+    ) -> AppResult<Contact> {
+        self.get_contact(tenant_id, contact_id).await?;
+
+        // Simplified update - in production, use dynamic query building
+        if let Some(ref first_name) = request.first_name {
+            sqlx::query("UPDATE contacts SET first_name = $1, updated_at = NOW() WHERE tenant_id = $2 AND id = $3")
+                .bind(first_name)
+                .bind(tenant_id)
+                .bind(contact_id)
+                .execute(self.db.pool())
+                .await?;
+        }
+
+        if let Some(ref last_name) = request.last_name {
+            sqlx::query("UPDATE contacts SET last_name = $1, updated_at = NOW() WHERE tenant_id = $2 AND id = $3")
+                .bind(last_name)
+                .bind(tenant_id)
+                .bind(contact_id)
+                .execute(self.db.pool())
+                .await?;
+        }
+
+        if let Some(ref email) = request.email {
+            sqlx::query("UPDATE contacts SET email = $1, updated_at = NOW() WHERE tenant_id = $2 AND id = $3")
+                .bind(email)
+                .bind(tenant_id)
+                .bind(contact_id)
+                .execute(self.db.pool())
+                .await?;
+        }
+
+        self.get_contact(tenant_id, contact_id).await
+    }
+
+    /// Delete contact
+    pub async fn delete_contact(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<()> {
+        sqlx::query("DELETE FROM contacts WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(contact_id)
+            .execute(self.db.pool())
+            .await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // SITES
+    // ========================================================================
+
+    /// Create a new site
+    pub async fn create_site(
+        &self,
+        tenant_id: Uuid,
+        request: &CreateSiteRequest,
+    ) -> AppResult<Site> {
+        self.get_company(tenant_id, request.company_id).await?;
+
+        let site_id = Uuid::new_v4();
+        let address = request.address.clone().unwrap_or_default();
+        let timezone = request
+            .timezone
+            .clone()
+            .unwrap_or_else(|| "UTC".to_string());
+
+        // If this is marked as primary, unmark other sites
+        if request.is_primary {
+            sqlx::query(
+                "UPDATE sites SET is_primary = FALSE WHERE tenant_id = $1 AND company_id = $2",
+            )
+            .bind(tenant_id)
+            .bind(request.company_id)
+            .execute(self.db.pool())
+            .await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO sites (
+                id, tenant_id, company_id, name,
+                address_line1, address_line2, city, state, postal_code, country,
+                phone, is_primary, timezone, notes, latitude, longitude
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+            )
+            "#,
+        )
+        .bind(site_id)
+        .bind(tenant_id)
+        .bind(request.company_id)
+        .bind(&request.name)
+        .bind(&address.line1)
+        .bind(&address.line2)
+        .bind(&address.city)
+        .bind(&address.state)
+        .bind(&address.postal_code)
+        .bind(&address.country)
+        .bind(&request.phone)
+        .bind(request.is_primary)
+        .bind(&timezone)
+        .bind(&request.notes)
+        .bind(request.latitude)
+        .bind(request.longitude)
+        .execute(self.db.pool())
+        .await?;
+
+        self.get_site(tenant_id, site_id).await
+    }
+
+    /// Get site by ID
+    pub async fn get_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<Site> {
+        let row = sqlx::query_as::<_, SiteRow>(
+            r#"
+            SELECT id, tenant_id, company_id, name,
+                   address_line1, address_line2, city, state, postal_code, country,
+                   phone, is_primary, timezone, notes, latitude, longitude,
+                   created_at, updated_at
+            FROM sites
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(site_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("Site".to_string()))?;
+
+        Ok(row.into())
+    }
+
+    /// Get sites for a company
+    pub async fn get_company_sites(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+    ) -> AppResult<Vec<Site>> {
+        let rows = sqlx::query_as::<_, SiteRow>(
+            r#"
+            SELECT id, tenant_id, company_id, name,
+                   address_line1, address_line2, city, state, postal_code, country,
+                   phone, is_primary, timezone, notes, latitude, longitude,
+                   created_at, updated_at
+            FROM sites
+            WHERE tenant_id = $1 AND company_id = $2
+            ORDER BY is_primary DESC, name
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Delete site
+    pub async fn delete_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<()> {
+        sqlx::query("DELETE FROM sites WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(site_id)
+            .execute(self.db.pool())
+            .await?;
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// DATABASE ROW TYPES
+// ============================================================================
+
+#[derive(sqlx::FromRow)]
+struct CompanyRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    name: String,
+    parent_company_id: Option<Uuid>,
+    company_type: String,
+    status: String,
+    industry: Option<String>,
+    website: Option<String>,
+    phone: Option<String>,
+    fax: Option<String>,
+    address_line1: Option<String>,
+    address_line2: Option<String>,
+    city: Option<String>,
+    state: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+    billing_address_line1: Option<String>,
+    billing_address_line2: Option<String>,
+    billing_city: Option<String>,
+    billing_state: Option<String>,
+    billing_postal_code: Option<String>,
+    billing_country: Option<String>,
+    tax_id: Option<String>,
+    account_number: Option<String>,
+    default_billing_contact_id: Option<Uuid>,
+    default_technical_contact_id: Option<Uuid>,
+    account_manager_id: Option<Uuid>,
+    sla_id: Option<Uuid>,
+    default_contract_id: Option<Uuid>,
+    payment_terms: Option<String>,
+    tax_exempt: bool,
+    custom_fields: serde_json::Value,
+    tags: Vec<String>,
+    notes: Option<String>,
+    logo_url: Option<String>,
+    portal_enabled: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<CompanyRow> for Company {
+    fn from(row: CompanyRow) -> Self {
+        Self {
+            id: row.id,
+            tenant_id: row.tenant_id,
+            name: row.name,
+            parent_company_id: row.parent_company_id,
+            company_type: CompanyType::from_str(&row.company_type).unwrap_or_default(),
+            status: CompanyStatus::from_str(&row.status).unwrap_or_default(),
+            industry: row.industry,
+            website: row.website,
+            phone: row.phone,
+            fax: row.fax,
+            address: Address {
+                line1: row.address_line1,
+                line2: row.address_line2,
+                city: row.city,
+                state: row.state,
+                postal_code: row.postal_code,
+                country: row.country,
+            },
+            billing_address: Address {
+                line1: row.billing_address_line1,
+                line2: row.billing_address_line2,
+                city: row.billing_city,
+                state: row.billing_state,
+                postal_code: row.billing_postal_code,
+                country: row.billing_country,
+            },
+            tax_id: row.tax_id,
+            account_number: row.account_number,
+            default_billing_contact_id: row.default_billing_contact_id,
+            default_technical_contact_id: row.default_technical_contact_id,
+            account_manager_id: row.account_manager_id,
+            sla_id: row.sla_id,
+            default_contract_id: row.default_contract_id,
+            payment_terms: row.payment_terms,
+            tax_exempt: row.tax_exempt,
+            custom_fields: row.custom_fields,
+            tags: row.tags,
+            notes: row.notes,
+            logo_url: row.logo_url,
+            portal_enabled: row.portal_enabled,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ContactRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    first_name: String,
+    last_name: String,
+    email: Option<String>,
+    phone: Option<String>,
+    mobile: Option<String>,
+    fax: Option<String>,
+    title: Option<String>,
+    department: Option<String>,
+    contact_type: String,
+    is_portal_user: bool,
+    portal_user_id: Option<Uuid>,
+    preferred_contact_method: String,
+    timezone: String,
+    locale: String,
+    custom_fields: serde_json::Value,
+    tags: Vec<String>,
+    notes: Option<String>,
+    avatar_url: Option<String>,
+    status: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<ContactRow> for Contact {
+    fn from(row: ContactRow) -> Self {
+        Self {
+            id: row.id,
+            tenant_id: row.tenant_id,
+            company_id: row.company_id,
+            first_name: row.first_name,
+            last_name: row.last_name,
+            email: row.email,
+            phone: row.phone,
+            mobile: row.mobile,
+            fax: row.fax,
+            title: row.title,
+            department: row.department,
+            contact_type: ContactType::from_str(&row.contact_type).unwrap_or_default(),
+            is_portal_user: row.is_portal_user,
+            portal_user_id: row.portal_user_id,
+            preferred_contact_method: PreferredContactMethod::Email,
+            timezone: row.timezone,
+            locale: row.locale,
+            custom_fields: row.custom_fields,
+            tags: row.tags,
+            notes: row.notes,
+            avatar_url: row.avatar_url,
+            status: row.status.parse::<ContactStatus>().unwrap_or_default(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SiteRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    name: String,
+    address_line1: Option<String>,
+    address_line2: Option<String>,
+    city: Option<String>,
+    state: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+    phone: Option<String>,
+    is_primary: bool,
+    timezone: String,
+    notes: Option<String>,
+    latitude: Option<rust_decimal::Decimal>,
+    longitude: Option<rust_decimal::Decimal>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<SiteRow> for Site {
+    fn from(row: SiteRow) -> Self {
+        Self {
+            id: row.id,
+            tenant_id: row.tenant_id,
+            company_id: row.company_id,
+            name: row.name,
+            address: Address {
+                line1: row.address_line1,
+                line2: row.address_line2,
+                city: row.city,
+                state: row.state,
+                postal_code: row.postal_code,
+                country: row.country,
+            },
+            phone: row.phone,
+            is_primary: row.is_primary,
+            timezone: row.timezone,
+            notes: row.notes,
+            latitude: row.latitude.map(|d| d.to_string().parse().unwrap_or(0.0)),
+            longitude: row.longitude.map(|d| d.to_string().parse().unwrap_or(0.0)),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}

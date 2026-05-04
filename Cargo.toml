@@ -1,0 +1,122 @@
+[workspace]
+
+[package]
+name = "mokosh-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mokosh Server Team"]
+description = "Professional Services Automation platform for MSPs - API server"
+license = "Proprietary"
+repository = "https://github.com/your-org/mokosh-server"
+
+[[bin]]
+name = "mokosh-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "mokosh-bootstrap"
+path = "src/bin/mokosh-bootstrap.rs"
+
+[features]
+default = ["multi-tenant", "server"]
+multi-tenant = []
+single-tenant = []
+server = []
+
+[lib]
+name = "mokosh_server"
+path = "src/lib.rs"
+
+[dependencies]
+# Axum HTTP server
+axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "limit", "request-id"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# UUID
+uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Password hashing
+argon2 = "0.5"
+
+# JWT tokens
+jsonwebtoken = "9"
+
+# Validation
+validator = { version = "0.19", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Email
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+
+# HTTP client (for integrations)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+urlencoding = "2"
+
+# Encryption
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.9"
+
+# Rate limiting
+governor = "0.8"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }
+
+# Decimal
+rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
+
+# Markdown
+pulldown-cmark = "0.12"
+
+# Templates
+minijinja = "2"
+
+# Regex
+regex = "1"
+
+# Cron
+cron = "0.15"
+
+# URL
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,99 @@
+---
+
+# Development environment for Mokosh Server.
+# Usage: docker compose up   (COMPOSE_FILE=compose.dev.yml is set in .env)
+#
+# Naming convention (see ~/.claude/CLAUDE.md):
+# - The Compose project name (`dev-mokosh`) namespaces every resource. Service
+#   keys inside this file are short (e.g. `infisical-postgres`, `valkey`);
+#   Compose composes them with the project name to form container names
+#   (`dev-mokosh-infisical-1`). Within the network, services reach each other
+#   by the short service-key DNS name. Volume `name:` and the network
+#   `name:` are set explicitly to the prefixed form so they show up grouped
+#   under `dev-mokosh-` in `docker volume ls` and `docker network ls`.
+# - Sub-services keep their parent's segment before the resource type, so
+#   the volume `dev-mokosh-infisical-postgres-data` sorts adjacent to its
+#   parent in alphabetical listings.
+#
+# This stack only contains the secrets-management infrastructure
+# (Infisical + its Postgres + Valkey). The Mokosh apps themselves still run
+# on the host via `dx serve --package <app>` for fast iteration. Each app
+# reads INFISICAL_* env vars from .env and connects out to the Infisical
+# container on its published localhost port.
+#
+# This file contains no hardcoded values. Every environment variable is
+# sourced from .env (which is created from .env.dev by `just dev-up`).
+# Required-but-empty values use the `${VAR:?...}` form so compose fails
+# loudly with a helpful message instead of starting a misconfigured stack.
+
+name: dev-mokosh
+
+services:
+
+  # PostgreSQL database for Infisical (internal only).
+  infisical-postgres:
+    # https://hub.docker.com/_/postgres
+    image: postgres:18.2-alpine3.23
+    environment:
+      POSTGRES_DB: ${INFISICAL_PG_DB:?INFISICAL_PG_DB missing - run `just dev-up` (which copies .env.dev to .env)}
+      POSTGRES_USER: ${INFISICAL_PG_USER:?INFISICAL_PG_USER missing - run `just dev-up` (which copies .env.dev to .env)}
+      POSTGRES_PASSWORD: ${INFISICAL_PG_PASSWORD:?INFISICAL_PG_PASSWORD missing - run `just dev-up` (which copies .env.dev to .env)}
+    networks:
+      - private
+    expose:
+      - "5432"
+    volumes:
+      - infisical-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Prefer Valkey over Redis (required by Infisical). Internal only.
+  valkey:
+    # https://hub.docker.com/r/valkey/valkey
+    image: docker.io/valkey/valkey:8-alpine
+    networks:
+      - private
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Infisical secrets manager (admin UI reachable from the host).
+  infisical:
+    image: infisical/infisical:latest
+    environment:
+      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev-up` (which copies .env.dev to .env)}
+      AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev-up` (which copies .env.dev to .env)}
+      DB_CONNECTION_URI: ${INFISICAL_DB_CONNECTION_URI:?INFISICAL_DB_CONNECTION_URI missing - run `just dev-up` (which copies .env.dev to .env)}
+      REDIS_URL: ${INFISICAL_REDIS_URL:?INFISICAL_REDIS_URL missing - run `just dev-up` (which copies .env.dev to .env)}
+      SITE_URL: ${INFISICAL_SITE_URL:?INFISICAL_SITE_URL missing - run `just dev-up` (which copies .env.dev to .env)}
+      TELEMETRY_ENABLED: ${INFISICAL_TELEMETRY_ENABLED:?INFISICAL_TELEMETRY_ENABLED missing - run `just dev-up` (which copies .env.dev to .env)}
+    networks:
+      - private
+    ports:
+      - "127.0.0.1:28002:8080"
+    depends_on:
+      infisical-postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  infisical-postgres-data:
+    name: dev-mokosh-infisical-postgres-data
+
+networks:
+  private:
+    name: dev-mokosh-private

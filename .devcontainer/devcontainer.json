@@ -1,0 +1,107 @@
+// For format details, see https://containers.dev/implementors/json_reference/.
+// For config options, see the README at: https://github.com/devcontainers/templates/tree/main/src/universal
+{
+  // A name for the dev container displayed in the UI.
+  "name": "openSUSE Leap 16.0",
+  // Use a Dockerfile or Docker Compose file: https://containers.dev/guide/dockerfile
+  // Use an image: https://github.com/devcontainers/images/blob/main/src/base-debian/history/1.0.9.md
+  // Custom image based on openSUSE Leap 15.6: https://github.com/niceguyit/oci-images/pkgs/container/opensuse-base
+  "image": "ghcr.io/niceguyit/opensuse-dev:v0.7.0-leap-16.0",
+  // "image": "opensuse-dev:v0.6.0-leap-16.0",
+  // For application development
+  "forwardPorts": ["localhost:3000", "8080"],
+  // Use 'postCreateCommand' to run commands after the container is created.
+  "postCreateCommand": {
+    // FIXME: It seems JetBrains does not run postCreateCommand as the user.
+    "config-devcontainer": [
+      "/usr/bin/sudo",
+      "/usr/bin/su",
+      "--login",
+      "--command",
+      "${containerWorkspaceFolder}/.devcontainer/config-devcontainer.sh",
+      "dev"
+    ]
+  },
+  "updateContentCommand": {
+    // FIXME: It seems JetBrains does not run postCreateCommand as the user.
+    "config-devcontainer": [
+      "/usr/bin/sudo",
+      "/usr/bin/su",
+      "--login",
+      "--command",
+      "${containerWorkspaceFolder}/.devcontainer/config-devcontainer.sh",
+      "dev"
+    ]
+  },
+  "postStartCommand": {
+    // FIXME: It seems JetBrains does not run postCreateCommand as the user.
+    "config-devcontainer": [
+      "/usr/bin/sudo",
+      "/usr/bin/su",
+      "--login",
+      "--command",
+      "${containerWorkspaceFolder}/.devcontainer/config-devcontainer.sh",
+      "dev"
+    ]
+  },
+  // Configure tool-specific properties.
+  "customizations": {
+    "jetbrains": {
+      "settings": {
+        "com.intellij:app:EditorSettings.soft_wrap_file_masks": "*.md; *.txt; *.rst; *.adoc",
+        "org.jetbrains.plugins.terminal:app:TerminalOptionsProvider.myHighlightHyperlinks": false
+      },
+      "plugins": [
+        "com.jetbrains.sh",
+        "co.anbora.labs.nushell.community",
+        // The reviews indicate the plugin just calls the CLI.
+        // https://plugins.jetbrains.com/plugin/27310-claude-code-beta-/reviews
+        "com.anthropic.code.plugin"
+      ],
+      "backend": "IntelliJ"
+    },
+    "vscode": {
+      "extensions": [
+        // Common extensions
+        "esbenp.prettier-vscode",
+        "github.vscode-github-actions",
+        "mikestead.dotenv",
+        "skellock.just",
+        "streetsidesoftware.code-spell-checker",
+        "TheNuProjectContributors.vscode-nushell-lang",
+        "timonwong.shellcheck",
+        "VisualStudioExptTeam.vscodeintellicode"
+      ]
+    }
+  },
+  // Docker-from-docker uses the host's docker socket to gain access to Docker.
+  // https://github.com/microsoft/vscode-dev-containers/tree/main/containers/docker-from-docker
+  "runArgs": [
+    "--init",
+    // Allow the devcontainer access to host resources for Postgres.
+    "--add-host=host.docker.internal:host-gateway",
+  ],
+  "mounts": [
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+    // While the bind mount works, the logic doesn't. The bind mount masks the Nushell config in the openSUSE image
+    // and prevents the symlink from /.jbdevcontainer/config from working.
+    //"source=${localWorkspaceFolder}/.devcontainer/config,target=/home/dev/.config,type=bind"
+    // .claude.json has the account information
+    "source=/home/dev/.claude.json,target=/home/dev/.claude.json,type=bind",
+    "source=/home/dev/.claude,target=/home/dev/.claude,type=bind"
+  ]
+  // Docker-in-Docker runs Docker inside the container without connecting to the host.
+  // https://github.com/microsoft/vscode-dev-containers/tree/main/containers/docker-in-docker
+  // Running "Docker in Docker" requires the parent container to be run as --privileged. This definition
+  // also adds a /usr/local/share/docker-init.sh ENTRYPOINT script that, spawns the dockerd process,
+  // so overrideCommand: false also needs to be set in devcontainer.json
+  // "remoteUser": "root",
+  //"runArgs": [
+  //"--init",
+  //"--privileged"
+  //],
+  //"mounts": [
+  //]
+  // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+  //"overrideCommand": false,
+}
