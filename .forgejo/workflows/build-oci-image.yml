@@ -5,21 +5,30 @@ name: Build OCI container
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "oci-build/**"
+      - ".forgejo/workflows/build-oci-image.yml"
 
 jobs:
   build-and-push:
-    name: Build and push image
+    name: Build and push mokosh-api image
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
     permissions:
       contents: read
       packages: write
     env:
+      IMAGE_REGISTRY: ""
       REGISTRY_PROVIDER: dev.a8n.run
-      REGISTRY_ORG: psa-systems
-      IMAGE_REGISTRY: dev.a8n.run/psa-systems
-      REGISTRY_USER: psa-systems
+      REGISTRY_USER: ""
       REGISTRY_PASSWORD: ${{ secrets.FORGEJO_PAT }}
 
     steps:
@@ -33,9 +42,12 @@ jobs:
           docker version
           docker buildx version
 
-      - name: Set up buildx builder
+      - name: Set environment variables
+        shell: nu {0}
         run: |
-          docker buildx create --name container-builder --driver docker-container --use
+          let owner = ($env.GITHUB_REPOSITORY_OWNER | str downcase)
+          $"REGISTRY_USER=($owner)\n" | save --append $env.GITHUB_ENV
+          $"IMAGE_REGISTRY=($env.REGISTRY_PROVIDER)/($owner)\n" | save --append $env.GITHUB_ENV
 
       - name: Get image tags
         id: get-tags
@@ -49,7 +61,7 @@ jobs:
         run: |
           ^docker login --username $env.REGISTRY_USER --password $env.REGISTRY_PASSWORD $env.REGISTRY_PROVIDER
 
-      - name: Build and push image
+      - name: Build and push mokosh-api image
         shell: nu {0}
         run: |
           let tags_str = "${{ steps.get-tags.outputs.tags }}"
@@ -57,11 +69,9 @@ jobs:
           let image = "mokosh-api"
           let registry = $env.IMAGE_REGISTRY
           let tag_args = ($tags | each {|tag| [-t $"($registry)/($image):($tag)"]} | flatten)
-          let cache_ref = $"($registry)/($image):buildcache"
-          let cache_from = $"type=registry,ref=($cache_ref)"
-          let cache_to = $"type=registry,ref=($cache_ref),mode=max"
+          let cache_from = $"type=registry,ref=($registry)/($image):latest"
           print $"Building and pushing ($image) with tags: ($tags_str)"
-          ^docker buildx build --push --cache-from $cache_from --cache-to $cache_to --build-arg $"GIT_SHA=($env.GITHUB_SHA)" ...$tag_args --file oci-build/Dockerfile .
+          ^docker buildx build --push --cache-from $cache_from --cache-to type=inline --build-arg $"GIT_SHA=($env.GITHUB_SHA)" ...$tag_args -f oci-build/Dockerfile .
 
       - name: Print image URLs
         shell: nu {0}
