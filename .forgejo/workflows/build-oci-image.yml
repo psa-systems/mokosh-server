@@ -21,7 +21,7 @@ on:
 jobs:
   build-and-push:
     name: Build and push mokosh-api image
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    runs-on: opensuse-base-16.0-latest
     permissions:
       contents: read
       packages: write
