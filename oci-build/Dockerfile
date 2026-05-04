@@ -32,8 +32,10 @@ RUN chown --recursive appuser:appuser /app
 
 USER appuser
 
-LABEL org.opencontainers.image.source=https://dev.a8n.run/a8n-tools/mokosh-server
+ARG GIT_SHA=""
+LABEL org.opencontainers.image.source=https://dev.a8n.run/psa-systems/mokosh-server
 LABEL org.opencontainers.image.description="Mokosh Server"
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
 EXPOSE 8080
 
