@@ -21,15 +21,16 @@ on:
 jobs:
   build-and-push:
     name: Build and push mokosh-api image
-    runs-on: opensuse-base-16.0-latest
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
     permissions:
       contents: read
       packages: write
     env:
       IMAGE_REGISTRY: ""
       REGISTRY_PROVIDER: dev.a8n.run
+      REGISTRY_OWNER: ${{ vars.PSA_SYSTEMS_PRIVATE_PACKAGE_OWNER }}
       REGISTRY_USER: ""
-      REGISTRY_PASSWORD: ${{ secrets.FORGEJO_PAT }}
+      REGISTRY_PASSWORD: ${{ secrets.PSA_SYSTEMS_PRIVATE_PACKAGE_PAT }}
 
     steps:
       - name: Clone the repository
@@ -45,7 +46,7 @@ jobs:
       - name: Set environment variables
         shell: nu {0}
         run: |
-          let owner = ($env.GITHUB_REPOSITORY_OWNER | str downcase)
+          let owner = $env.REGISTRY_OWNER
           $"REGISTRY_USER=($owner)\n" | save --append $env.GITHUB_ENV
           $"IMAGE_REGISTRY=($env.REGISTRY_PROVIDER)/($owner)\n" | save --append $env.GITHUB_ENV
 
