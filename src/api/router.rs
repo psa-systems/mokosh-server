@@ -22,9 +22,16 @@ pub struct AppState {
 }
 
 /// Create the main API router with all routes
-pub fn create_api_router(db: Database, jwt_secret: String) -> Router {
+pub fn create_api_router(
+    db: Database,
+    jwt_secret: String,
+    google_oauth: Arc<google_oauth_flow::Client>,
+    client_origin: String,
+    super_admin_domains: Vec<String>,
+    cookie_secure: bool,
+) -> Router {
     // Create services
-    let auth_service = AuthService::new(db.clone(), jwt_secret.clone());
+    let auth_service = AuthService::new(db.clone(), jwt_secret.clone(), super_admin_domains);
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
@@ -37,7 +44,16 @@ pub fn create_api_router(db: Database, jwt_secret: String) -> Router {
         // Health check
         .route("/health", get(health_check))
         // Auth routes
-        .nest("/auth", auth_routes(auth_service))
+        .nest(
+            "/auth",
+            auth_routes(
+                auth_service,
+                google_oauth,
+                client_origin,
+                jwt_secret.clone(),
+                cookie_secure,
+            ),
+        )
         // Tenant management (multi-tenant mode)
         .nest("/tenants", tenant_routes(tenant_service))
         // Contact management

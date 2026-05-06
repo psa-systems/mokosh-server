@@ -137,6 +137,22 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - run `just dev` (which copies .env.dev to .env)}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
 
+      # Google OAuth login. Consumed by the google-oauth-flow workspace
+      # crate (Config::from_env()). The two secrets are required; the
+      # redirect URI defaults to the dev localhost callback.
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:?GOOGLE_OAUTH_CLIENT_ID missing - paste the dev OAuth client id into .env}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:?GOOGLE_OAUTH_CLIENT_SECRET missing - paste the dev OAuth client secret into .env}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:4301/api/v1/auth/google/callback}
+
+      # The exact origin the callback HTML postMessages tokens to.
+      # Must equal the browser-visible client origin byte-for-byte.
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:4301}
+
+      # Comma-separated, lowercased email-domain allowlist. First-time
+      # Google sign-ins from these domains are auto-promoted to
+      # role 'super_admin'. Existing users are never re-roled.
+      OAUTH_SUPER_ADMIN_DOMAINS: ${OAUTH_SUPER_ADMIN_DOMAINS:-niceguyit.biz}
+
       # First-run admin bootstrap (DEV ONLY). Ignored once any user exists.
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -145,7 +161,11 @@ services:
     networks:
       - private
     ports:
-      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}:${MOKOSH_PORT}"
+      # Host port 4302 by default so the client dev stack can keep host
+      # 4301 for the SPA + Dioxus dev-server proxy. Container port is
+      # MOKOSH_PORT (4301) - the API itself still listens on 4301 inside
+      # the network.
+      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_API_HOST_PORT:-4302}:${MOKOSH_PORT}"
     extra_hosts:
       host.docker.internal: host-gateway
     volumes:
