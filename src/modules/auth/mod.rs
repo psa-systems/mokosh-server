@@ -3,6 +3,8 @@
 //! Handles user authentication, session management, and authorization.
 
 #[cfg(feature = "server")]
+pub mod at_jwt;
+#[cfg(feature = "server")]
 pub mod bootstrap;
 #[cfg(feature = "server")]
 pub mod middleware;

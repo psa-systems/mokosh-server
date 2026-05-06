@@ -1,6 +1,5 @@
 //! Mokosh Server - API server entrypoint
 
-use axum::Router;
 use mokosh_server::{api::create_api_router, Database};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -94,18 +93,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Admin bootstrap failed: {}", e);
     }
 
-    let psa_router = create_api_router(db.clone(), config.jwt_secret);
-
-    // Mount mokosh-auth (SSO / OIDC) at the root of the app. The OIDC
-    // discovery URL must live at `/.well-known/openid-configuration`, so
-    // it cannot be nested under `/api/v1`. This is additive: PSA routes
-    // continue to use the legacy auth middleware for now. Per-module
-    // migration to bearer-token validation against mokosh-auth's JWKS is
-    // tracked separately.
-    let router = match try_build_sso_router(db.pool().clone()).await {
-        Ok(sso_router) => {
+    // Try to bootstrap mokosh-auth first so the resulting key set can
+    // be passed into the PSA router as the at+jwt verifier. The PSA
+    // middleware then accepts SSO-issued access tokens alongside its
+    // own legacy HS256 cookies.
+    let (sso_router, at_jwt) = match try_bootstrap_sso(db.pool().clone()).await {
+        Ok(auth) => {
             tracing::info!("SSO subsystem mounted (mokosh-auth)");
-            psa_router.merge(sso_router)
+            let issuer = auth.provider.cfg.issuer.as_str().to_string();
+            let verifier =
+                mokosh_server::modules::auth::at_jwt::AtJwtVerifier::new(auth.provider.keys.clone(), issuer);
+            (Some(auth.router()), Some(verifier))
         }
         Err(e) => {
             tracing::warn!(
@@ -114,8 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  MOKOSH_AUTH_JWT_ACTIVE_KID, MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, \
                  and MOKOSH_AUTH_DATA_ENCRYPTION_KEY to enable SSO."
             );
-            psa_router
+            (None, None)
         }
+    };
+
+    let psa_router = create_api_router(db.clone(), config.jwt_secret, at_jwt);
+    let router = match sso_router {
+        Some(sso) => psa_router.merge(sso),
+        None => psa_router,
     };
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
@@ -131,12 +135,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Try to bootstrap the SSO subsystem. Returns its router on success;
-/// the caller merges it into the top-level app. On failure (typically
-/// required env vars not set in dev), the error is surfaced so the
-/// caller can fall back to legacy auth only.
-async fn try_build_sso_router(pool: sqlx::PgPool) -> Result<Router, Box<dyn std::error::Error>> {
+/// Try to bootstrap the SSO subsystem. Returns the full `MokoshAuth`
+/// handle so the caller can pull both the router and the key set out of
+/// it. On failure (typically required env vars not set in dev), the
+/// error is surfaced so the caller can fall back to legacy auth only.
+async fn try_bootstrap_sso(
+    pool: sqlx::PgPool,
+) -> Result<mokosh_auth::MokoshAuth, Box<dyn std::error::Error>> {
     let auth_cfg = mokosh_auth::AuthConfig::from_env()?;
     let auth = mokosh_auth::bootstrap(auth_cfg, pool).await?;
-    Ok(auth.router())
+    Ok(auth)
 }

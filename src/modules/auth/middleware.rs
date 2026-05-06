@@ -8,6 +8,7 @@ use axum::{
 };
 use std::sync::Arc;
 
+use super::at_jwt::{current_user_from_at_jwt, AtJwtVerifier};
 use super::{AuthService, AuthState, CurrentUser, JwtClaims, UserRole};
 use crate::utils::error::AppError;
 
@@ -15,13 +16,27 @@ use crate::utils::error::AppError;
 #[derive(Clone)]
 pub struct AuthMiddleware {
     pub auth_service: Arc<AuthService>,
+    /// Optional `at+jwt` verifier. When set, the middleware tries
+    /// EdDSA verification against `mokosh-auth`'s key set first and
+    /// only falls back to the legacy HS256 path when the token is not
+    /// recognisable as an `at+jwt`. This is how PSA endpoints accept
+    /// access tokens minted by SSO during the transition window.
+    pub at_jwt: Option<AtJwtVerifier>,
 }
 
 impl AuthMiddleware {
     pub fn new(auth_service: AuthService) -> Self {
         Self {
             auth_service: Arc::new(auth_service),
+            at_jwt: None,
         }
+    }
+
+    /// Attach an `at+jwt` verifier. Call this once at startup with the
+    /// `OidcKeySet` returned from `mokosh_auth::bootstrap`.
+    pub fn with_at_jwt(mut self, verifier: AtJwtVerifier) -> Self {
+        self.at_jwt = Some(verifier);
+        self
     }
 }
 
@@ -31,40 +46,51 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Try to extract token from Authorization header
-    let auth_state = if let Some(auth_header) = request.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+    // Extract Bearer token from Authorization header. When SSO is
+    // enabled we try at+jwt first (EdDSA, signed by mokosh-auth);
+    // failing that we fall back to the legacy HS256 path. The fallback
+    // is what keeps existing sessions working during transition.
+    let auth_state = match bearer(&request) {
+        Some(token) => {
+            // 1. SSO at+jwt path.
+            let from_sso = auth_middleware
+                .at_jwt
+                .as_ref()
+                .and_then(|v| v.try_verify(token));
+            if let Some(verified) = from_sso {
+                let tenant_id = verified.tenant_id;
+                let user = current_user_from_at_jwt(&verified);
+                AuthState::authenticated(user, tenant_id)
+            } else {
+                // 2. Legacy HS256 path.
                 match auth_middleware.auth_service.decode_token(token) {
-                    Ok(claims) => {
-                        // Fetch user to get current info
-                        match auth_middleware
-                            .auth_service
-                            .get_user_by_id(claims.sub)
-                            .await
-                        {
-                            Ok(user) => {
-                                AuthState::authenticated(user.to_current_user(), claims.tid)
-                            }
-                            Err(_) => AuthState::default(),
-                        }
-                    }
+                    Ok(claims) => match auth_middleware
+                        .auth_service
+                        .get_user_by_id(claims.sub)
+                        .await
+                    {
+                        Ok(user) => AuthState::authenticated(user.to_current_user(), claims.tid),
+                        Err(_) => AuthState::default(),
+                    },
                     Err(_) => AuthState::default(),
                 }
-            } else {
-                AuthState::default()
             }
-        } else {
-            AuthState::default()
         }
-    } else {
-        AuthState::default()
+        None => AuthState::default(),
     };
 
     // Insert auth state into request extensions
     request.extensions_mut().insert(auth_state);
 
     next.run(request).await
+}
+
+fn bearer(req: &Request) -> Option<&str> {
+    req.headers()
+        .get("Authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 /// Middleware that requires authentication

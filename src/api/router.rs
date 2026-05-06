@@ -9,6 +9,7 @@ use tower_http::{
 };
 
 use crate::db::Database;
+use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
@@ -21,16 +22,30 @@ pub struct AppState {
     pub jwt_secret: String,
 }
 
-/// Create the main API router with all routes
-pub fn create_api_router(db: Database, jwt_secret: String) -> Router {
+/// Create the main API router with all routes.
+///
+/// When `at_jwt` is `Some`, PSA endpoints accept access tokens minted by
+/// `mokosh-auth` (EdDSA `at+jwt`) in addition to the legacy HS256
+/// cookie. Pass `None` to run with legacy auth only (e.g. dev environments
+/// where SSO env vars are not configured).
+pub fn create_api_router(
+    db: Database,
+    jwt_secret: String,
+    at_jwt: Option<AtJwtVerifier>,
+) -> Router {
     // Create services
     let auth_service = AuthService::new(db.clone(), jwt_secret.clone());
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
 
-    // Create auth middleware
-    let auth_middleware = AuthMiddleware::new(auth_service.clone());
+    // Create auth middleware. The at+jwt verifier (when present) is
+    // attached so the same middleware can authenticate either kind of
+    // bearer token.
+    let mut auth_middleware = AuthMiddleware::new(auth_service.clone());
+    if let Some(v) = at_jwt {
+        auth_middleware = auth_middleware.with_at_jwt(v);
+    }
 
     // Build API v1 routes
     let api_v1 = Router::new()
