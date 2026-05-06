@@ -33,17 +33,28 @@ pub struct LoginPageQuery {
     /// re-render the form with feedback. Plain string; we HTML-escape
     /// before rendering.
     pub error: Option<String>,
+    /// Pin the tenant for this sign-in (admin / support flows). The
+    /// default flow resolves the tenant from the email globally.
+    pub tenant_id: Option<String>,
 }
 
 pub async fn login_form(Query(q): Query<LoginPageQuery>) -> Html<String> {
-    Html(render(q.return_to.as_deref().unwrap_or(""), q.error.as_deref()))
+    Html(render(
+        q.return_to.as_deref().unwrap_or(""),
+        q.error.as_deref(),
+        q.tenant_id.as_deref().unwrap_or(""),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LoginFormBody {
     pub email: String,
     pub password: String,
-    pub tenant_id: String,
+    /// Optional. The form does not show this field by default; an
+    /// administrator-style URL (e.g. for support flows) can pass it as
+    /// a hidden input to pin the tenant explicitly.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub return_to: Option<String>,
 }
 
@@ -54,10 +65,14 @@ pub async fn login_submit(
     jar: CookieJar,
     axum::Form(body): axum::Form<LoginFormBody>,
 ) -> Result<Response, HttpError> {
-    let tenant_id = body
-        .tenant_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| HttpError(mokosh_auth_core::AuthError::InvalidRequest("tenant_id must be a UUID".into())))?;
+    let tenant_id = match body.tenant_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => Some(s.parse::<uuid::Uuid>().map_err(|_| {
+            HttpError(mokosh_auth_core::AuthError::InvalidRequest(
+                "tenant_id must be a UUID".into(),
+            ))
+        })?),
+        None => None,
+    };
     let req = LocalLoginRequest {
         tenant_id,
         email: body.email.clone(),
@@ -117,11 +132,19 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-fn render(return_to: &str, error: Option<&str>) -> String {
+fn render(return_to: &str, error: Option<&str>, tenant_id: &str) -> String {
     let return_to_e = html_escape(return_to);
+    let tenant_id_e = html_escape(tenant_id);
     let error_html = match error {
         Some(_) => r#"<div class="err">Sign-in failed. Check your email and password.</div>"#.to_string(),
         None => String::new(),
+    };
+    let tenant_pin_note = if !tenant_id.is_empty() {
+        format!(
+            r#"<div class="err" style="background:#dbeafe;color:#1e3a8a">Signing in to tenant <code>{tenant_id_e}</code></div>"#
+        )
+    } else {
+        String::new()
     };
     format!(
         r#"<!doctype html>
@@ -151,6 +174,7 @@ fn render(return_to: &str, error: Option<&str>) -> String {
   <main class="card">
     <h1>Sign in to Mokosh</h1>
     {error_html}
+    {tenant_pin_note}
     <form method="post" action="/login" autocomplete="on">
       <div class="field">
         <label for="email">Email</label>
@@ -160,15 +184,11 @@ fn render(return_to: &str, error: Option<&str>) -> String {
         <label for="password">Password</label>
         <input id="password" name="password" type="password" required autocomplete="current-password"/>
       </div>
-      <div class="field">
-        <label for="tenant_id">Tenant ID</label>
-        <input id="tenant_id" name="tenant_id" type="text" required pattern="[0-9a-fA-F-]{{8,}}"
-               placeholder="00000000-0000-0000-0000-000000000000"/>
-      </div>
       <input type="hidden" name="return_to" value="{return_to_e}"/>
+      <input type="hidden" name="tenant_id" value="{tenant_id_e}"/>
       <button type="submit">Sign in</button>
     </form>
-    <small>Single-tenant deploys can pre-fill the tenant via deploy config in a later iteration.</small>
+    <small>Need to sign in to a specific tenant? Append <code>?tenant_id=&lt;uuid&gt;</code> to the URL.</small>
   </main>
 </body></html>"#,
         error_html = error_html,

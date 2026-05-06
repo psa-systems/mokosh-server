@@ -22,3 +22,18 @@ sqlx = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# End-to-end tests boot the auth router on a real TCP socket and walk
+# the OIDC flow with reqwest. They require DATABASE_URL pointing at a
+# Postgres reachable to sqlx::test (which provisions per-test databases).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
+tempfile = "3"
+ed25519-dalek = { workspace = true }
+getrandom = "0.2"
+uuid = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }
+mokosh-auth-crypto = { path = "../mokosh-auth-crypto" }

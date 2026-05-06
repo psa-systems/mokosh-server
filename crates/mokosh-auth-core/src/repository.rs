@@ -20,6 +20,15 @@ pub trait UserRepository: Send + Sync {
         tenant_id: TenantId,
         email: &str,
     ) -> Result<Option<User>, AuthError>;
+    /// Look up an active user by email across every tenant.
+    ///
+    /// Used by the OP login UI so a user only has to type their email
+    /// (the tenant is resolved from their row). Returns up to two
+    /// matches: the caller treats `len() >= 2` as ambiguous, since
+    /// `(tenant_id, email)` is unique but `email` alone is not. The
+    /// caller MUST treat ambiguity as a soft failure (do not reveal
+    /// which tenants own the email).
+    async fn find_by_email_globally(&self, email: &str) -> Result<Vec<User>, AuthError>;
     async fn create(&self, new: NewUser) -> Result<User, AuthError>;
     async fn update_last_login(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn set_password_hash(&self, id: UserId, hash: &str) -> Result<(), AuthError>;

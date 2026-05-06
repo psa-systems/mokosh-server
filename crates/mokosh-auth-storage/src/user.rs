@@ -55,6 +55,25 @@ impl UserRepository for PgUserRepository {
         row.map(User::try_from).transpose()
     }
 
+    async fn find_by_email_globally(&self, email: &str) -> Result<Vec<User>, AuthError> {
+        // LIMIT 2: we only need to distinguish "exactly one match" from
+        // "ambiguous" (>= 2). No reason to read more rows than that.
+        // Restrict to active accounts so deactivated users in tenant A
+        // do not block sign-in for the same email in tenant B.
+        let rows: Vec<UserRow> = sqlx::query_as(&format!(
+            "{SELECT_USER}
+             WHERE email = $1
+               AND deleted_at IS NULL
+               AND status = 'active'
+             LIMIT 2"
+        ))
+        .bind(email)
+        .fetch_all(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(User::try_from).collect()
+    }
+
     async fn create(&self, new: NewUser) -> Result<User, AuthError> {
         let row: UserRow = sqlx::query_as(&format!(
             "INSERT INTO mokosh_auth.users

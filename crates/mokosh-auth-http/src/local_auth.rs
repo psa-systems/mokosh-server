@@ -16,7 +16,12 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LocalLoginRequest {
-    pub tenant_id: uuid::Uuid,
+    /// Optional. When omitted, the tenant is resolved by looking up the
+    /// email globally (`UserRepository::find_by_email_globally`). The
+    /// override is kept for service-account or admin flows that need to
+    /// pin a specific tenant unambiguously.
+    #[serde(default)]
+    pub tenant_id: Option<uuid::Uuid>,
     pub email: String,
     pub password: String,
 }
@@ -35,24 +40,55 @@ impl LocalAuth {
         ip: Option<std::net::IpAddr>,
         user_agent: Option<&str>,
     ) -> Result<OpSession, AuthError> {
-        let tenant_id = TenantId(req.tenant_id);
-
         // Always do a password verification, even when the user does not
-        // exist, to avoid a username-enumeration timing oracle. We use a
-        // fixed dummy hash known to never match.
+        // exist or the tenant is ambiguous, to avoid a username-
+        // enumeration timing oracle. We use a fixed dummy hash known to
+        // never match.
         const DUMMY_HASH: &str =
             "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXkxMjM0NTY3OA$\
              SGEgaGEgdGhpcyBpcyBub3QgcmVhbCBoYXNoIGxlbmd0aA";
 
-        let maybe_user = self.users.find_by_email(tenant_id, &req.email).await?;
-        let user = match maybe_user {
+        let user = match req.tenant_id {
+            Some(tid) => self
+                .users
+                .find_by_email(TenantId(tid), &req.email)
+                .await?,
+            None => {
+                // Email-only flow: resolve tenant from the user record.
+                // 0 matches: invalid (do not reveal whether the email exists).
+                // 1 match:   use that tenant.
+                // 2+ matches: ambiguous; refuse without naming the tenants
+                //             (telling the user which tenants own the email
+                //             is itself an enumeration oracle).
+                let mut matches = self.users.find_by_email_globally(&req.email).await?;
+                if matches.len() >= 2 {
+                    let _ = verify_password(&req.password, DUMMY_HASH);
+                    let _ = self
+                        .audit
+                        .record(
+                            None,
+                            None,
+                            ip,
+                            AuditEvent::LoginFailed {
+                                email: req.email.clone(),
+                                ip: ip.map(|i| i.to_string()),
+                                reason: "ambiguous email across tenants".into(),
+                            },
+                        )
+                        .await;
+                    return Err(AuthError::AccessDenied("invalid credentials".into()));
+                }
+                matches.pop()
+            }
+        };
+        let user = match user {
             Some(u) => u,
             None => {
                 let _ = verify_password(&req.password, DUMMY_HASH);
                 let _ = self
                     .audit
                     .record(
-                        Some(tenant_id),
+                        req.tenant_id.map(TenantId),
                         None,
                         ip,
                         AuditEvent::LoginFailed {
