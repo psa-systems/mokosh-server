@@ -7,9 +7,12 @@ RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static lld
 
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
-# Copy manifests, source, and migrations (sqlx::migrate! reads at compile time)
+# Copy manifests, source, workspace members, and migrations
+# (sqlx::migrate! reads migrations at compile time; workspace members
+# must be present so cargo can resolve the workspace).
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY crates ./crates
 COPY migrations ./migrations
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
