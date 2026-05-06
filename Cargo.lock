@@ -1837,6 +1837,7 @@ dependencies = [
 name = "mokosh-auth"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "mokosh-auth-core",
  "mokosh-auth-crypto",
@@ -1846,7 +1847,10 @@ dependencies = [
  "mokosh-auth-storage",
  "secrecy",
  "serde",
+ "sqlx",
  "thiserror",
+ "tokio",
+ "tracing",
  "url",
 ]
 
@@ -1911,6 +1915,7 @@ dependencies = [
  "axum-extra",
  "base64",
  "chrono",
+ "http",
  "mokosh-auth-core",
  "mokosh-auth-crypto",
  "mokosh-auth-federation",
@@ -1918,10 +1923,12 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "tower",
  "tower-http",
  "tracing",
  "url",
+ "urlencoding",
  "uuid",
 ]
 

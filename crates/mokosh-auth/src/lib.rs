@@ -10,6 +10,8 @@ pub use mokosh_auth_http as http;
 pub use mokosh_auth_oidc as oidc;
 pub use mokosh_auth_storage as storage;
 
+pub mod bootstrap;
 pub mod config;
 
-pub use config::AuthConfig;
+pub use bootstrap::{bootstrap, BootstrapError, MokoshAuth};
+pub use config::{AuthConfig, ConfigError};

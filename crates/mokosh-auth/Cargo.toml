@@ -18,3 +18,7 @@ thiserror = { workspace = true }
 secrecy = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+sqlx = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
