@@ -12,8 +12,13 @@
 #     container's $MOKOSH_PORT.
 #   - SSO env vars are pinned to the public URL so issued JWTs carry the
 #     right `iss` and the cookie domain spans `.a8n.run`.
-
-name: dev-mokosh-${USER}
+#
+# The project name is intentionally NOT redefined here. The base
+# compose.dev.yml already sets `name: dev-mokosh` and binds an explicit
+# non-prefixed network name (`dev-mokosh-private`); overriding the
+# project name would make compose see that network as foreign and
+# refuse to start. Per-developer isolation lives in container_name +
+# Traefik label keys, not in the project name.
 
 services:
 
@@ -47,6 +52,16 @@ services:
       MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: /app/secrets
 
 networks:
+  # The base compose.dev.yml normally owns and creates this network.
+  # We mark it external here so the overlay only ATTACHES rather than
+  # re-claiming ownership. Without this, compose refuses if the network
+  # exists with labels it doesn't recognise (e.g. from a prior
+  # project-name churn, or because another developer's worktree owns
+  # the same shared `name: dev-mokosh-private`). The just recipe runs
+  # `docker network create` defensively so a fresh host also works.
+  private:
+    external: true
+    name: dev-mokosh-private
   traefik-public:
     name: network-traefik-public
     external: true

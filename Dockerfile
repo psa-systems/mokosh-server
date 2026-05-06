@@ -1,4 +1,14 @@
-# Development Dockerfile - debug builds, source mounted via volumes
+# Development Dockerfile - debug builds. Source code (src/, crates/,
+# migrations/, Cargo.toml, Cargo.lock) is mounted in via compose
+# volumes; the build target lives on a named volume so cargo's
+# incremental cache survives container restarts.
+#
+# The previous version of this image did a pre-build deps trick (stub
+# main.rs + cargo build) to populate /app/target. That was dead weight
+# in this setup because compose.dev.yml mounts mokosh-server-target
+# over /app/target, masking anything baked into the image. Each
+# developer's first `just dev` does the full compile into the named
+# volume; subsequent runs are incremental.
 FROM rust:1-slim-trixie
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
@@ -8,20 +18,6 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
 RUN mkdir --parents /app /data /config
 
 WORKDIR /app
-
-# Copy manifests + migrations (sqlx::migrate! reads at compile time)
-COPY Cargo.toml Cargo.lock ./
-COPY migrations/ ./migrations/
-
-# Pre-build dependencies (stub source)
-RUN mkdir --parents src src/bin \
-    && echo "fn main() {}" > src/main.rs \
-    && echo "" > src/lib.rs \
-    && echo "fn main() {}" > src/bin/mokosh-bootstrap.rs \
-    && cargo build --bins \
-    && rm -rf src
-
-# Source code is mounted via volumes in compose
 
 EXPOSE 4301
 

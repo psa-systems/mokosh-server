@@ -44,6 +44,28 @@ name: dev-mokosh
 
 services:
 
+  # PostgreSQL for the mokosh-server application DB. Self-contained so
+  # the dev stack does not depend on a host Postgres install. Data
+  # survives container restarts via the named volume.
+  postgres:
+    # https://hub.docker.com/_/postgres
+    image: postgres:18.2-alpine3.23
+    environment:
+      POSTGRES_DB: mokosh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
+    networks:
+      - private
+    expose:
+      - "5432"
+    volumes:
+      - mokosh-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=postgres --dbname=mokosh"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # PostgreSQL database for Infisical (internal only).
   infisical-postgres:
     # https://hub.docker.com/_/postgres
@@ -157,8 +179,6 @@ services:
       - private
     ports:
       - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}:${MOKOSH_PORT}"
-    extra_hosts:
-      host.docker.internal: host-gateway
     volumes:
       - ./src:/app/src
       - ./crates:/app/crates
@@ -171,10 +191,14 @@ services:
       - ./secrets:/app/secrets:ro
       - mokosh-server-target:/app/target
     depends_on:
+      postgres:
+        condition: service_healthy
       infisical:
         condition: service_healthy
 
 volumes:
+  mokosh-postgres-data:
+    name: dev-mokosh-postgres-data
   infisical-postgres-data:
     name: dev-mokosh-infisical-postgres-data
   mokosh-server-target:

@@ -52,8 +52,17 @@ ensure-oidc-keys:
 # Per-developer Traefik-routed instance for SSO testing.
 #   API:  https://{USER}-mokosh-api.a8n.run
 # Run `just dev-sso` here AND in mokosh-clients to get both ends up.
+# The dev-mokosh-private network is shared with whoever else may have
+# a stack running on this host. The dev-sso overlay marks it external,
+# so we create it defensively here (idempotent: skipped if it already
+# exists). Without this step a clean host would have nothing to attach
+# to and `docker compose up` would error.
+[private]
+ensure-private-network:
+    @docker network inspect dev-mokosh-private >/dev/null 2>&1 || docker network create dev-mokosh-private >/dev/null
+
 [doc("Start the SSO dev stack (Traefik-routed at *.a8n.run)")]
-dev-sso: ensure-env ensure-oidc-keys
+dev-sso: ensure-env ensure-oidc-keys ensure-private-network
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml up --build --detach
     @echo ""
     @echo "Mokosh API (OIDC IdP):"
@@ -79,8 +88,22 @@ register-client: ensure-env
     let user = $env.USER
     let api_origin = $"https://($user)-mokosh-api.a8n.run"
     let app_origin = $"https://($user)-mokosh.a8n.run"
-    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@host.docker.internal:5432/mokosh")
+    # In-network DNS: the postgres compose service is reachable at the
+    # short name `postgres` from inside any container on the private
+    # network. The DATABASE_URL_IN_CONTAINER value in .env is not
+    # exported to the host shell (compose reads it for interpolation),
+    # so we hardcode the in-network URL here as the canonical fallback.
+    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=mokosh-clients-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" mokosh-server cargo run --quiet --bin mokosh-bootstrap -- clients register
+
+# Stop everything this repo runs (both LAN-IP and SSO modes), regardless
+# of which `just dev*` you started with. Volumes preserved.
+# `--remove-orphans` cleans up containers from one compose file that the
+# other file does not declare (e.g. the SSO postgres if you only ran
+# `just dev` historically).
+[doc("Stop the entire dev stack (LAN-IP and SSO modes). Volumes preserved.")]
+down: ensure-env
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
 
 # Stop the dev secrets-management stack. Volumes are preserved.
 [doc("Stop Infisical and its sidecars (volumes preserved)")]

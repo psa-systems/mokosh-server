@@ -32,11 +32,11 @@ pub fn ticket_routes(ticket_service: TicketService) -> Router {
         // Tickets
         .route("/", get(list_tickets))
         .route("/", post(create_ticket))
-        .route("/:ticket_id", get(get_ticket))
-        .route("/:ticket_id", put(update_ticket))
-        .route("/:ticket_id/assign", post(assign_ticket))
-        .route("/:ticket_id/notes", get(get_ticket_notes))
-        .route("/:ticket_id/notes", post(add_note))
+        .route("/{ticket_id}", get(get_ticket))
+        .route("/{ticket_id}", put(update_ticket))
+        .route("/{ticket_id}/assign", post(assign_ticket))
+        .route("/{ticket_id}/notes", get(get_ticket_notes))
+        .route("/{ticket_id}/notes", post(add_note))
         // Configuration
         .route("/statuses", get(get_statuses))
         .route("/priorities", get(get_priorities))

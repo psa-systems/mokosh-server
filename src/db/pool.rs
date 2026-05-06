@@ -35,9 +35,18 @@ impl Database {
         &self.pool
     }
 
-    /// Run database migrations
+    /// Run database migrations.
+    ///
+    /// `set_ignore_missing(true)` is required because mokosh-auth's
+    /// migrations share the same `_sqlx_migrations` table. Without it,
+    /// the PSA migrator sees timestamp-versioned auth migrations like
+    /// `20260506000001` as "applied but missing in the resolved
+    /// source" and refuses to run. Auth migrations live under their
+    /// own range so version collisions are impossible.
     pub async fn run_migrations(&self) -> AppResult<()> {
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&self.pool)
             .await
             .map_err(|e| AppError::Database(format!("Migration failed: {}", e)))?;
