@@ -36,6 +36,52 @@ dev *args: ensure-env
     mv .env.new .env
     docker compose --file {{ compose_file }} up {{ args }}
 
+# Generate the dev OIDC Ed25519 keypair (kid=dev-key) if missing.
+# Each per-developer instance must generate its own; the repo does not
+# ship private keys (see secrets/ in .gitignore). Without these the
+# server crash-loops with "Failed to read OIDC private key".
+[private]
+ensure-oidc-keys:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f secrets/dev-key.pem ] && [ -f secrets/dev-key.pub.pem ]; then
+        exit 0
+    fi
+    bash ./scripts/gen-oidc-key.sh dev-key
+
+# Per-developer Traefik-routed instance for SSO testing.
+#   API:  https://{USER}-mokosh-api.a8n.run
+# Run `just dev-sso` here AND in mokosh-clients to get both ends up.
+[doc("Start the SSO dev stack (Traefik-routed at *.a8n.run)")]
+dev-sso: ensure-env ensure-oidc-keys
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml up --build --detach
+    @echo ""
+    @echo "Mokosh API (OIDC IdP):"
+    @echo "  https://{{env('USER')}}-mokosh-api.a8n.run"
+    @echo "  https://{{env('USER')}}-mokosh-api.a8n.run/.well-known/openid-configuration"
+    @echo ""
+    @echo "Next:"
+    @echo "  1. (cd ../mokosh-clients && just dev-sso)"
+    @echo "  2. just register-client     # registers mokosh-clients-web in oauth_clients"
+    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-clients/.env to the printed UUID"
+
+# Stop the SSO dev stack.
+[doc("Stop the SSO dev stack")]
+dev-sso-down: ensure-env
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down
+
+# Register mokosh-clients as a public OIDC client. Run once after
+# `just dev-sso` is up. Prints the client_id UUID; copy it into
+# mokosh-clients/.env as MOKOSH_OIDC_CLIENT_ID.
+[doc("Register mokosh-clients as a public OIDC client (one-shot, idempotent on (name))")]
+register-client: ensure-env
+    #!/usr/bin/env nu
+    let user = $env.USER
+    let api_origin = $"https://($user)-mokosh-api.a8n.run"
+    let app_origin = $"https://($user)-mokosh.a8n.run"
+    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@host.docker.internal:5432/mokosh")
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=mokosh-clients-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" mokosh-server cargo run --quiet --bin mokosh-bootstrap -- clients register
+
 # Stop the dev secrets-management stack. Volumes are preserved.
 [doc("Stop Infisical and its sidecars (volumes preserved)")]
 dev-down: ensure-env

@@ -103,6 +103,29 @@ impl RefreshTokenRepository for PgRefreshTokenRepository {
         unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
     }
 
+    async fn revoke_by_token_hash(
+        &self,
+        token_hash: [u8; 32],
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        // Look up the family that owns this token. If the token is
+        // unknown we still return Ok: the caller (the /oauth2/revoke
+        // endpoint) must not distinguish hits from misses.
+        let family_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT family_id FROM mokosh_auth.refresh_tokens WHERE token_hash = $1",
+        )
+        .bind(&token_hash[..])
+        .fetch_optional(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+
+        if let Some(fid) = family_id {
+            self.revoke_family(RefreshFamilyId(fid), reason, at).await?;
+        }
+        Ok(())
+    }
+
     async fn revoke_family(
         &self,
         family: RefreshFamilyId,

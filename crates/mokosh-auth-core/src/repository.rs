@@ -106,6 +106,19 @@ pub trait RefreshTokenRepository: Send + Sync {
         reason: &str,
         at: DateTime<Utc>,
     ) -> Result<(), AuthError>;
+
+    /// Revoke the family that owns the refresh token whose hash matches.
+    ///
+    /// Returns `Ok(())` whether or not a row matched: per RFC 7009 the
+    /// revocation endpoint MUST NOT differentiate, to prevent token
+    /// enumeration. The caller (the `/oauth2/revoke` handler) collapses
+    /// errors and unknown tokens into a single 200 response.
+    async fn revoke_by_token_hash(
+        &self,
+        token_hash: [u8; 32],
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(), AuthError>;
 }
 
 #[async_trait]

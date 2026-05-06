@@ -1,0 +1,52 @@
+# Per-developer Traefik-routed dev instance for SSO testing.
+#
+# Layered ON TOP of compose.dev.yml:
+#   docker compose -f compose.dev.yml -f compose.dev-sso.yml up --build --detach
+#
+# `just dev-sso` is the supported entry point.
+#
+# What this overlay changes:
+#   - mokosh-server stops binding to the host LAN IP (Traefik does the
+#     terminating instead) and joins the shared `traefik-public` network.
+#   - Traefik labels route https://${USER}-mokosh-api.a8n.run to the
+#     container's $MOKOSH_PORT.
+#   - SSO env vars are pinned to the public URL so issued JWTs carry the
+#     right `iss` and the cookie domain spans `.a8n.run`.
+
+name: dev-mokosh-${USER}
+
+services:
+
+  mokosh-server:
+    container_name: dev-mokosh-server-${USER}
+    networks:
+      - private
+      - traefik-public
+    # Remove the LAN-IP host port binding from compose.dev.yml; Traefik
+    # is the only ingress for this profile.
+    ports: !reset []
+    labels:
+      traefik.enable: true
+      traefik.docker.network: network-traefik-public
+      traefik.http.routers.mokosh-api-${USER}.rule: Host(`${USER}-mokosh-api.a8n.run`)
+      traefik.http.routers.mokosh-api-${USER}.entrypoints: web-secure
+      traefik.http.routers.mokosh-api-${USER}.tls.certresolver: cert-cloudflare
+      traefik.http.services.mokosh-api-${USER}.loadbalancer.server.port: ${MOKOSH_PORT}
+    environment:
+      # Public URL the OP advertises to relying parties. The issuer goes
+      # into every signed JWT, the discovery doc, and JWKS URLs.
+      MOKOSH_AUTH_ISSUER: https://${USER}-mokosh-api.a8n.run
+      # Cross-subdomain SSO: cookies span every *.a8n.run app this user
+      # might add later. Mirrors saas / dmarc-reporter behaviour.
+      MOKOSH_AUTH_COOKIE_DOMAIN: .a8n.run
+      # Keys live in ./secrets, mounted at /app/secrets:ro by
+      # compose.dev.yml. `just ensure-oidc-keys` generates them if
+      # missing (kid=dev-key by convention).
+      MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: /app/secrets/dev-key.pem
+      MOKOSH_AUTH_JWT_ACTIVE_KID: dev-key
+      MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: /app/secrets
+
+networks:
+  traefik-public:
+    name: network-traefik-public
+    external: true

@@ -27,3 +27,4 @@ base64 = { workspace = true }
 time = "0.3"
 http = "1"
 urlencoding = "2"
+governor = "0.8"

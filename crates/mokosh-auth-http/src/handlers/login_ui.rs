@@ -65,6 +65,23 @@ pub async fn login_submit(
     jar: CookieJar,
     axum::Form(body): axum::Form<LoginFormBody>,
 ) -> Result<Response, HttpError> {
+    // Rate-limit BEFORE any DB / Argon2 work so a brute-force run
+    // hits the cheap path. We check both IP and email keys.
+    if let Err(rl) = st.rate_limiter.check_login(
+        crate::rate_limit::LoginScope::Form,
+        Some(addr.ip()),
+        &body.email,
+    ) {
+        tracing::warn!(
+            target: "mokosh_auth.rate_limit",
+            ip = %addr.ip(),
+            email = %body.email,
+            scope = "login_form",
+            "rate limit exceeded"
+        );
+        return Ok(rl.into_response());
+    }
+
     let tenant_id = match body.tenant_id.as_deref().filter(|s| !s.is_empty()) {
         Some(s) => Some(s.parse::<uuid::Uuid>().map_err(|_| {
             HttpError(mokosh_auth_core::AuthError::InvalidRequest(

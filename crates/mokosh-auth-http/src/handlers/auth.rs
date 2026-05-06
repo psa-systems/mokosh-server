@@ -29,6 +29,20 @@ pub async fn login(
     Json(req): Json<LocalLoginRequest>,
 ) -> Result<Response, HttpError> {
     let ip = Some(addr.ip());
+    if let Err(rl) = st.rate_limiter.check_login(
+        crate::rate_limit::LoginScope::Json,
+        ip,
+        &req.email,
+    ) {
+        tracing::warn!(
+            target: "mokosh_auth.rate_limit",
+            ip = %addr.ip(),
+            email = %req.email,
+            scope = "login_json",
+            "rate limit exceeded"
+        );
+        return Ok(rl.into_response());
+    }
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok());

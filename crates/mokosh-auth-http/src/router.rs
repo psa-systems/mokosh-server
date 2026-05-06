@@ -12,6 +12,7 @@ use crate::handlers::{
     auth as auth_h, discovery as disc_h, login_ui as login_h, oidc as oidc_h,
 };
 use crate::local_auth::LocalAuth;
+use crate::rate_limit::RateLimiter;
 
 #[derive(Clone)]
 pub struct AuthHttpState {
@@ -21,6 +22,9 @@ pub struct AuthHttpState {
     /// URL of the OP login UI that `authorize` redirects to when the
     /// user is not authenticated. Hosted by the front-end (mokosh-clients).
     pub login_url: Url,
+    /// In-memory rate limiter for login + token endpoints. Shared
+    /// across the request handlers via `Arc`. Phase-1: per-replica.
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 pub fn build_router(state: Arc<AuthHttpState>) -> Router {

@@ -1,10 +1,11 @@
 //! `/oauth2/*` handlers.
 
-use axum::extract::{Form, Query, State};
+use axum::extract::{ConnectInfo, Form, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
+use std::net::SocketAddr;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mokosh_auth_oidc::{
     handle_authorize, handle_logout, handle_token, handle_userinfo, AuthorizeOutcome,
@@ -119,8 +120,18 @@ pub struct TokenJson {
 pub async fn token(
     State(st): State<Arc<AuthHttpState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Form(f): Form<TokenForm>,
 ) -> Result<Response, HttpError> {
+    if let Err(rl) = st.rate_limiter.check_token(Some(addr.ip())) {
+        tracing::warn!(
+            target: "mokosh_auth.rate_limit",
+            ip = %addr.ip(),
+            scope = "token_endpoint",
+            "rate limit exceeded"
+        );
+        return Ok(rl.into_response());
+    }
     let mut creds = mokosh_auth_oidc::client_auth::PresentedClientCredentials {
         client_id: f.client_id.clone(),
         client_secret: f.client_secret.clone(),
@@ -201,13 +212,36 @@ pub struct RevokeForm {
     pub token_type_hint: Option<String>,
 }
 
-/// RFC 7009: revocation endpoint MUST return 200 even if the token is
-/// invalid. We still try a best-effort revocation when the token looks
-/// like a refresh token (32-byte base64url) by hashing and revoking the
-/// matching family.
-pub async fn revoke(State(_st): State<Arc<AuthHttpState>>, Form(_f): Form<RevokeForm>) -> StatusCode {
-    // Phase-1: stub. Always 200 per RFC 7009. A future iteration can
-    // hash the token and call refresh.revoke_family by lookup.
+/// RFC 7009 revocation endpoint.
+///
+/// Per spec we MUST always return 200, regardless of whether the token
+/// was known, to prevent token enumeration via timing or status. The
+/// best-effort revocation underneath:
+///  - SHA-256 the presented token (refresh tokens are stored hashed)
+///  - Hand it to `revoke_by_token_hash`, which looks up the family
+///    and revokes every token in it
+///  - Swallow any storage error
+///
+/// `token_type_hint` is advisory per RFC 7009 5.1.1.1; we ignore it for
+/// now (refresh tokens are the only kind we can revoke server-side).
+/// Access tokens are stateless `at+jwt` and expire on their own.
+pub async fn revoke(
+    State(st): State<Arc<AuthHttpState>>,
+    Form(f): Form<RevokeForm>,
+) -> StatusCode {
+    if let Some(token) = f.token.as_deref().filter(|s| !s.is_empty()) {
+        let hash = mokosh_auth_crypto::hash_opaque_token(token);
+        let now = st.provider.clock.now();
+        if let Err(e) = st
+            .provider
+            .refresh
+            .revoke_by_token_hash(hash, "client_revocation", now)
+            .await
+        {
+            // Log but never surface: RFC 7009 demands a 200.
+            tracing::warn!("revoke: storage error swallowed: {e}");
+        }
+    }
     StatusCode::OK
 }
 

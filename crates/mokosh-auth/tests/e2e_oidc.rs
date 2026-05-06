@@ -407,6 +407,110 @@ async fn full_oidc_flow_including_refresh_reuse(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn revoke_kills_refresh_family(pool: PgPool) {
+    // Drive the flow up to a valid refresh token, POST /oauth2/revoke
+    // for that token, then verify the next refresh attempt is dead.
+    // RFC 7009 demands /revoke always return 200, including for unknown
+    // tokens; we also assert that.
+    let env = make_env(pool).await;
+    let client = http_client();
+    let (verifier, challenge) = pkce();
+
+    let mut authorize = env.base.join("oauth2/authorize").unwrap();
+    authorize
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &env.client_id.to_string())
+        .append_pair("redirect_uri", &env.redirect_uri)
+        .append_pair("scope", "openid email offline_access")
+        .append_pair("state", "s")
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
+
+    let r = client.get(authorize).send().await.unwrap();
+    let return_to = Url::parse(env.base.join(r.headers()["location"].to_str().unwrap()).unwrap().as_str())
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "return_to")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+    let r = client
+        .post(env.base.join("login").unwrap())
+        .form(&[
+            ("email", &env.user_email),
+            ("password", &env.user_password),
+            ("return_to", &return_to),
+            ("tenant_id", &String::new()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let resume = r.headers()["location"].to_str().unwrap().to_string();
+    let r = client.get(env.base.join(&resume).unwrap()).send().await.unwrap();
+    let cb = Url::parse(r.headers()["location"].to_str().unwrap()).unwrap();
+    let code = cb
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+
+    let token_resp = client
+        .post(env.base.join("oauth2/token").unwrap())
+        .basic_auth(env.client_id.to_string(), Some(&env.client_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", &env.redirect_uri),
+            ("code_verifier", &verifier),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = token_resp.json().await.unwrap();
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    // POST /oauth2/revoke. Should be 200 unconditionally.
+    let revoke = client
+        .post(env.base.join("oauth2/revoke").unwrap())
+        .basic_auth(env.client_id.to_string(), Some(&env.client_secret))
+        .form(&[
+            ("token", &refresh_token),
+            ("token_type_hint", &"refresh_token".to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), 200, "revoke must return 200");
+
+    // The revoked token must now fail to refresh.
+    let refresh_after = client
+        .post(env.base.join("oauth2/token").unwrap())
+        .basic_auth(env.client_id.to_string(), Some(&env.client_secret))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_token),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refresh_after.status(), 400, "revoked token must fail");
+    let err: serde_json::Value = refresh_after.json().await.unwrap();
+    assert_eq!(err["error"].as_str().unwrap(), "invalid_grant");
+
+    // RFC 7009 5: unknown tokens still get 200.
+    let revoke_unknown = client
+        .post(env.base.join("oauth2/revoke").unwrap())
+        .basic_auth(env.client_id.to_string(), Some(&env.client_secret))
+        .form(&[
+            ("token", &"definitely-not-a-real-refresh-token".to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke_unknown.status(), 200, "unknown token still 200");
+}
+
+#[sqlx::test]
 async fn token_endpoint_rejects_wrong_client_secret(pool: PgPool) {
     let env = make_env(pool).await;
     let client = http_client();

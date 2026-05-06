@@ -19,7 +19,7 @@ use chrono::Duration;
 use mokosh_auth_core::{Clock, time::SystemClock};
 use mokosh_auth_crypto::OidcKeySet;
 use mokosh_auth_http::cookies::CookieConfig;
-use mokosh_auth_http::{build_router, AuthHttpState, LocalAuth};
+use mokosh_auth_http::{build_router, AuthHttpState, LocalAuth, RateLimiter};
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
     run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
@@ -132,6 +132,7 @@ pub async fn bootstrap(
         local_auth,
         cookie_cfg,
         login_url,
+        rate_limiter: Arc::new(RateLimiter::new()),
     });
 
     Ok(MokoshAuth { provider, state })
