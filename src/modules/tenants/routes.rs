@@ -28,11 +28,11 @@ pub fn tenant_routes(tenant_service: TenantService) -> Router {
     Router::new()
         .route("/", get(list_tenants))
         .route("/", post(create_tenant))
-        .route("/:tenant_id", get(get_tenant))
-        .route("/:tenant_id", put(update_tenant))
-        .route("/:tenant_id/suspend", post(suspend_tenant))
-        .route("/:tenant_id/activate", post(activate_tenant))
-        .route("/:tenant_id/usage", get(get_tenant_usage))
+        .route("/{tenant_id}", get(get_tenant))
+        .route("/{tenant_id}", put(update_tenant))
+        .route("/{tenant_id}/suspend", post(suspend_tenant))
+        .route("/{tenant_id}/activate", post(activate_tenant))
+        .route("/{tenant_id}/usage", get(get_tenant_usage))
         .with_state(state)
 }
 

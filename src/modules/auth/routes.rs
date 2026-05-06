@@ -69,12 +69,12 @@ pub fn auth_routes(
         .route("/me", put(update_current_user))
         .route("/me/password", put(change_password))
         .route("/me/sessions", get(get_sessions))
-        .route("/me/sessions/:session_id", delete(delete_session))
+        .route("/me/sessions/{session_id}", delete(delete_session))
         // User management (admin only)
         .route("/users", get(list_users))
         .route("/users", post(create_user))
-        .route("/users/:user_id", get(get_user))
-        .route("/users/:user_id", put(update_user))
+        .route("/users/{user_id}", get(get_user))
+        .route("/users/{user_id}", put(update_user))
         .with_state(state)
 }
 

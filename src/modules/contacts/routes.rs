@@ -33,22 +33,22 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         // Companies
         .route("/companies", get(list_companies))
         .route("/companies", post(create_company))
-        .route("/companies/:company_id", get(get_company))
-        .route("/companies/:company_id", put(update_company))
-        .route("/companies/:company_id", delete(delete_company))
-        .route("/companies/:company_id/contacts", get(get_company_contacts))
-        .route("/companies/:company_id/sites", get(get_company_sites))
+        .route("/companies/{company_id}", get(get_company))
+        .route("/companies/{company_id}", put(update_company))
+        .route("/companies/{company_id}", delete(delete_company))
+        .route("/companies/{company_id}/contacts", get(get_company_contacts))
+        .route("/companies/{company_id}/sites", get(get_company_sites))
         // Contacts
         .route("/contacts", get(list_contacts))
         .route("/contacts", post(create_contact))
-        .route("/contacts/:contact_id", get(get_contact))
-        .route("/contacts/:contact_id", put(update_contact))
-        .route("/contacts/:contact_id", delete(delete_contact))
+        .route("/contacts/{contact_id}", get(get_contact))
+        .route("/contacts/{contact_id}", put(update_contact))
+        .route("/contacts/{contact_id}", delete(delete_contact))
         // Sites
         .route("/sites", post(create_site))
-        .route("/sites/:site_id", get(get_site))
-        .route("/sites/:site_id", put(update_site))
-        .route("/sites/:site_id", delete(delete_site))
+        .route("/sites/{site_id}", get(get_site))
+        .route("/sites/{site_id}", put(update_site))
+        .route("/sites/{site_id}", delete(delete_site))
         .with_state(state)
 }
 

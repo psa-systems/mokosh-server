@@ -141,7 +141,7 @@ where
 {
     Router::new()
         .route("/", get(not_implemented))
-        .route("/:id", get(not_implemented))
+        .route("/{id}", get(not_implemented))
 }
 
 async fn not_implemented() -> (axum::http::StatusCode, &'static str) {
