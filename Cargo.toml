@@ -76,6 +76,9 @@ name = "mokosh_server"
 path = "src/lib.rs"
 
 [dependencies]
+# SSO / OIDC subsystem (workspace-internal, replaces legacy HS256 auth)
+mokosh-auth = { path = "crates/mokosh-auth" }
+
 # Axum HTTP server
 axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
 tower = { version = "0.5", features = ["full"] }

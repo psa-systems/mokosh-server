@@ -1,5 +1,6 @@
 //! Mokosh Server - API server entrypoint
 
+use axum::Router;
 use mokosh_server::{api::create_api_router, Database};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -93,13 +94,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Admin bootstrap failed: {}", e);
     }
 
-    let router = create_api_router(db, config.jwt_secret);
+    let psa_router = create_api_router(db.clone(), config.jwt_secret);
+
+    // Mount mokosh-auth (SSO / OIDC) at the root of the app. The OIDC
+    // discovery URL must live at `/.well-known/openid-configuration`, so
+    // it cannot be nested under `/api/v1`. This is additive: PSA routes
+    // continue to use the legacy auth middleware for now. Per-module
+    // migration to bearer-token validation against mokosh-auth's JWKS is
+    // tracked separately.
+    let router = match try_build_sso_router(db.pool().clone()).await {
+        Ok(sso_router) => {
+            tracing::info!("SSO subsystem mounted (mokosh-auth)");
+            psa_router.merge(sso_router)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "SSO subsystem not mounted: {e}. The server will run with legacy auth only. \
+                 Set MOKOSH_AUTH_ISSUER, MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH, \
+                 MOKOSH_AUTH_JWT_ACTIVE_KID, MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, \
+                 and MOKOSH_AUTH_DATA_ENCRYPTION_KEY to enable SSO."
+            );
+            psa_router
+        }
+    };
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("Server listening on http://{}", addr);
 
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
+}
+
+/// Try to bootstrap the SSO subsystem. Returns its router on success;
+/// the caller merges it into the top-level app. On failure (typically
+/// required env vars not set in dev), the error is surfaced so the
+/// caller can fall back to legacy auth only.
+async fn try_build_sso_router(pool: sqlx::PgPool) -> Result<Router, Box<dyn std::error::Error>> {
+    let auth_cfg = mokosh_auth::AuthConfig::from_env()?;
+    let auth = mokosh_auth::bootstrap(auth_cfg, pool).await?;
+    Ok(auth.router())
 }

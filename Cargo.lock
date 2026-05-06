@@ -1986,6 +1986,7 @@ dependencies = [
  "lettre",
  "minijinja",
  "moka",
+ "mokosh-auth",
  "pulldown-cmark",
  "rand 0.9.4",
  "regex",
