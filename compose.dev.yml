@@ -34,9 +34,13 @@
 # Discover the host IP with:
 #   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
 #
-# The Mokosh application database (DATABASE_URL) is NOT part of this
-# stack. The container reaches the host's PostgreSQL via the
-# `host.docker.internal` DNS name (mapped to `host-gateway` for Linux).
+# The Mokosh application database runs inside this stack as the
+# `postgres` service (separate from `infisical-postgres`, which is for
+# Infisical only). Server reaches it via in-network DNS at
+# `postgres:5432`. The container is also published to the host so
+# host-side tools (sqlx-cli via `just migrate-run`) can connect via
+# `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT}` (default 5433 to
+# avoid clashing with any host-side postgres on 5432).
 #
 # This file contains no hardcoded values. Every environment variable is
 # sourced from .env (which is created from .env.dev by `just dev`).
@@ -110,6 +114,30 @@ services:
       retries: 10
       start_period: 30s
 
+  # PostgreSQL database for the Mokosh API server (the app's primary
+  # store, separate from Infisical's). Reachable in-network as
+  # `postgres:5432` and on the host as
+  # `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT}` for sqlx-cli.
+  postgres:
+    container_name: dev-mokosh-postgres-${USER:?USER missing - run via just dev}
+    # https://hub.docker.com/_/postgres
+    image: postgres:18.2-alpine3.23
+    environment:
+      POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
+      POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
+    networks:
+      - private
+    ports:
+      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PG_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
   # live reload via `cargo run`.
   server:
@@ -123,8 +151,8 @@ services:
       ENVIRONMENT: development
       BASE_URL: http://${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}
 
-      # Reach the host's PostgreSQL via host.docker.internal (see extra_hosts).
-      DATABASE_URL: ${DATABASE_URL_IN_CONTAINER:?DATABASE_URL_IN_CONTAINER missing - run `just dev` (which copies .env.dev to .env)}
+      # Reach the in-stack postgres by service-DNS name.
+      DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:-postgres}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
 
       # Inside the compose network, reach Infisical by service-DNS, not the
       # published localhost port.
@@ -166,21 +194,24 @@ services:
       # MOKOSH_PORT (4301) - the API itself still listens on 4301 inside
       # the network.
       - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_API_HOST_PORT:-4302}:${MOKOSH_PORT}"
-    extra_hosts:
-      host.docker.internal: host-gateway
     volumes:
       - ./src:/app/src
+      - ./crates:/app/crates
       - ./Cargo.toml:/app/Cargo.toml
       - ./Cargo.lock:/app/Cargo.lock
       - ./migrations:/app/migrations
       - server-target:/app/target
     depends_on:
+      postgres:
+        condition: service_healthy
       infisical:
         condition: service_healthy
 
 volumes:
   infisical-postgres-data:
     name: dev-mokosh-infisical-postgres-data-${USER:?USER missing - run via just dev}
+  postgres-data:
+    name: dev-mokosh-postgres-data-${USER:?USER missing - run via just dev}
   server-target:
     name: dev-mokosh-server-target-${USER:?USER missing - run via just dev}
 

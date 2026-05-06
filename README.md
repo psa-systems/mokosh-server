@@ -26,7 +26,7 @@ Modules under `src/modules/` cover the typical PSA surface area: `tickets`, `con
 - Docker + Docker Compose v2.
 - [`just`](https://github.com/casey/just) for the task runner.
 - [Nushell `0.112.2`](https://www.nushell.sh/) (used by several `just` recipes).
-- A PostgreSQL 18 instance reachable from the host (the dev compose stack does not bundle one).
+- (No host-side PostgreSQL needed - the dev compose stack now bundles a `postgres` service for the app DB, published to the host on `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT:-5433}` for `sqlx-cli`.)
 
 ## Quick start
 
@@ -59,8 +59,9 @@ The dev host is a VPS on the public internet. Binding to `127.0.0.1` would hide 
 | Variable | Where set | Purpose |
 | --- | --- | --- |
 | `COMPOSE_FILE` | `.env` | Pins `docker compose` to `compose.dev.yml`. |
-| `DATABASE_URL` | `.env` | Host-side connection string (used by `sqlx migrate`, `cargo run` on the host). |
-| `DATABASE_URL_IN_CONTAINER` | `.env` | Container-side connection string. Reaches the host PostgreSQL via `host.docker.internal`. |
+| `DATABASE_URL` | `.env` | Host-side connection string against the bundled `postgres` service (used by `sqlx migrate`, `cargo run` on the host). |
+| `MOKOSH_PG_DB`, `MOKOSH_PG_USER`, `MOKOSH_PG_PASSWORD` | `.env` | App-database credentials. Dev defaults only. |
+| `MOKOSH_PG_HOST_PORT` | `.env` | Host-published port for the `postgres` service. Default `5433`. |
 | `MOKOSH_PORT` | `.env` | TCP port for the API server (container and host bind). |
 | `MOKOSH_HOST_BIND_IP` | written to `.env` by `just dev` | Host interface IP that the container's port is published on. Falls back to `127.0.0.1` when unset. |
 | `JWT_SECRET`, `ENCRYPTION_KEY` | `.env` | API server secrets. Dev defaults only; rotate for any non-local environment. |
