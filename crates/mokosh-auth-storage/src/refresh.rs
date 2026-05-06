@@ -160,13 +160,14 @@ impl PgRefreshTokenRepository {
             client_id: uuid::Uuid,
             user_id: uuid::Uuid,
             tenant_id: uuid::Uuid,
+            scope: Vec<String>,
             used_at: Option<DateTime<Utc>>,
             revoked_at: Option<DateTime<Utc>>,
             idle_expires_at: DateTime<Utc>,
             absolute_expires_at: DateTime<Utc>,
         }
         let row: Option<Row> = sqlx::query_as(
-            "SELECT id, family_id, client_id, user_id, tenant_id,
+            "SELECT id, family_id, client_id, user_id, tenant_id, scope,
                     used_at, revoked_at, idle_expires_at, absolute_expires_at
              FROM mokosh_auth.refresh_tokens
              WHERE token_hash = $1
@@ -220,7 +221,23 @@ impl PgRefreshTokenRepository {
             return Err(AuthError::InvalidGrant("expired refresh token".into()));
         }
 
-        // 4. Mark old token used; insert new sibling within the family.
+        // 4. Resolve effective scope. An empty `scope_vec` means
+        // "preserve the prior scope" (RFC 6749 6: scope is optional and
+        // MUST default to the value originally granted). A non-empty
+        // request must be a subset of the prior scope.
+        use std::collections::BTreeSet;
+        let prior: BTreeSet<String> = row.scope.iter().cloned().collect();
+        let requested: BTreeSet<String> = scope_vec.iter().cloned().collect();
+        let effective: Vec<String> = if requested.is_empty() {
+            row.scope.clone()
+        } else {
+            if !requested.is_subset(&prior) {
+                return Err(AuthError::InvalidScope);
+            }
+            requested.into_iter().collect()
+        };
+
+        // 5. Mark old token used; insert new sibling within the family.
         sqlx::query("UPDATE mokosh_auth.refresh_tokens SET used_at = NOW() WHERE id = $1")
             .bind(row.id)
             .execute(&mut *tx)
@@ -241,7 +258,7 @@ impl PgRefreshTokenRepository {
         .bind(row.client_id)
         .bind(row.user_id)
         .bind(row.tenant_id)
-        .bind(scope_vec)
+        .bind(&effective)
         .bind(new_token.idle_expires_at)
         // Absolute expiry is inherited from the family, never extended.
         .bind(row.absolute_expires_at)
@@ -259,7 +276,7 @@ impl PgRefreshTokenRepository {
             client_id: mokosh_auth_core::ClientId(row.client_id),
             user_id: mokosh_auth_core::UserId(row.user_id),
             tenant_id: mokosh_auth_core::TenantId(row.tenant_id),
-            scope: scope_vec.to_vec(),
+            scope: effective,
         })
     }
 }
