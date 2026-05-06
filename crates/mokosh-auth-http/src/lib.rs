@@ -14,6 +14,7 @@ pub mod router;
 pub mod handlers {
     pub mod auth;
     pub mod discovery;
+    pub mod login_ui;
     pub mod oidc;
 }
 

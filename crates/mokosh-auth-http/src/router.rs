@@ -8,7 +8,9 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::cookies::CookieConfig;
-use crate::handlers::{auth as auth_h, discovery as disc_h, oidc as oidc_h};
+use crate::handlers::{
+    auth as auth_h, discovery as disc_h, login_ui as login_h, oidc as oidc_h,
+};
 use crate::local_auth::LocalAuth;
 
 #[derive(Clone)]
@@ -35,7 +37,9 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route("/oauth2/userinfo", get(oidc_h::userinfo))
         .route("/oauth2/revoke", post(oidc_h::revoke))
         .route("/oauth2/logout", get(oidc_h::logout))
-        // OP own login UI endpoints
+        // OP own login UI: HTML form (browser flow).
+        .route("/login", get(login_h::login_form).post(login_h::login_submit))
+        // JSON API equivalents (used by client SDKs / native apps).
         .route("/v1/auth/login", post(auth_h::login))
         .route("/v1/auth/logout", post(auth_h::logout))
         .with_state(state)
