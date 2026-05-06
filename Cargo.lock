@@ -1952,6 +1952,7 @@ dependencies = [
  "chrono",
  "ipnetwork",
  "mokosh-auth-core",
+ "mokosh-auth-crypto",
  "serde",
  "serde_json",
  "sqlx",

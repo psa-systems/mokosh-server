@@ -8,6 +8,7 @@ description = "Mokosh auth: PostgreSQL implementations of mokosh-auth-core repos
 
 [dependencies]
 mokosh-auth-core = { path = "../mokosh-auth-core" }
+mokosh-auth-crypto = { path = "../mokosh-auth-crypto" }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
