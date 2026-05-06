@@ -4,26 +4,29 @@
 # Usage: docker compose up   (COMPOSE_FILE=compose.dev.yml is set in .env)
 #
 # Naming convention (see ~/.claude/CLAUDE.md):
-# - The Compose project name (`dev-mokosh`) namespaces every resource. Service
-#   keys inside this file are short (e.g. `infisical-postgres`, `valkey`);
-#   Compose composes them with the project name to form container names
-#   (`dev-mokosh-infisical-1`). Within the network, services reach each other
-#   by the short service-key DNS name. Volume `name:` and the network
-#   `name:` are set explicitly to the prefixed form so they show up grouped
-#   under `dev-mokosh-` in `docker volume ls` and `docker network ls`.
+# - Project name `dev-mokosh` namespaces every resource under the
+#   `dev-mokosh-` prefix in `docker ps`, `docker volume ls`, and
+#   `docker network ls`. Service keys are short and descriptive
+#   (`server`, `infisical`, `infisical-postgres`, `valkey`) - they do not
+#   repeat the `mokosh` segment, since the project name already carries it.
+# - `container_name:` is set explicitly on every service with the
+#   `dev-mokosh-{descriptive}-${USER}` shape so multiple developers can
+#   run their own dev stacks on a shared host without colliding on
+#   container/volume/network names. `USER` is injected into .env by
+#   `just dev` (captured via `whoami`).
 # - Sub-services keep their parent's segment before the resource type, so
-#   the volume `dev-mokosh-infisical-postgres-data` sorts adjacent to its
-#   parent in alphabetical listings.
+#   the volume `dev-mokosh-infisical-postgres-data-${USER}` sorts
+#   adjacent to its parent in alphabetical listings.
 #
 # This stack contains the Mokosh API server plus its secrets-management
 # infrastructure (Infisical + its Postgres + Valkey). The Mokosh client
-# apps (e.g. `dx serve --package <app>`) still run on the host and connect
-# to the Mokosh API on its published port (MOKOSH_HOST_BIND_IP:MOKOSH_PORT)
-# and to Infisical on its published loopback port (127.0.0.1:28002).
+# apps run separately (see ../mokosh-clients) and reach the API on its
+# published port (MOKOSH_HOST_BIND_IP:MOKOSH_PORT) and Infisical on its
+# published loopback port (127.0.0.1:28002).
 #
-# The Mokosh API server runs as the `mokosh-server` service, reachable
-# inside the compose network as `mokosh-server:${MOKOSH_PORT}` and on the
-# host at `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PORT}`. The host bind targets a
+# The Mokosh API server runs as the `server` service, reachable inside
+# the compose network as `server:${MOKOSH_PORT}` and on the host at
+# `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PORT}`. The host bind targets a
 # private LAN interface (e.g. br0/eth0) instead of 127.0.0.1 so other
 # Docker containers on the host can reach it; the private IP is not
 # routable from the public internet on a VPS.
@@ -46,6 +49,7 @@ services:
 
   # PostgreSQL database for Infisical (internal only).
   infisical-postgres:
+    container_name: dev-mokosh-infisical-postgres-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/_/postgres
     image: postgres:18.2-alpine3.23
     environment:
@@ -66,6 +70,7 @@ services:
 
   # Prefer Valkey over Redis (required by Infisical). Internal only.
   valkey:
+    container_name: dev-mokosh-valkey-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/r/valkey/valkey
     image: docker.io/valkey/valkey:8-alpine
     networks:
@@ -80,6 +85,7 @@ services:
 
   # Infisical secrets manager (admin UI reachable from the host).
   infisical:
+    container_name: dev-mokosh-infisical-${USER:?USER missing - run via just dev}
     image: infisical/infisical:latest
     environment:
       ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
@@ -105,8 +111,9 @@ services:
       start_period: 30s
 
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
-  # live reload via `cargo run`. Port published on loopback only.
-  mokosh-server:
+  # live reload via `cargo run`.
+  server:
+    container_name: dev-mokosh-server-${USER:?USER missing - run via just dev}
     build:
       context: .
       dockerfile: Dockerfile
@@ -146,17 +153,17 @@ services:
       - ./Cargo.toml:/app/Cargo.toml
       - ./Cargo.lock:/app/Cargo.lock
       - ./migrations:/app/migrations
-      - mokosh-server-target:/app/target
+      - server-target:/app/target
     depends_on:
       infisical:
         condition: service_healthy
 
 volumes:
   infisical-postgres-data:
-    name: dev-mokosh-infisical-postgres-data
-  mokosh-server-target:
-    name: dev-mokosh-server-target
+    name: dev-mokosh-infisical-postgres-data-${USER:?USER missing - run via just dev}
+  server-target:
+    name: dev-mokosh-server-target-${USER:?USER missing - run via just dev}
 
 networks:
   private:
-    name: dev-mokosh-private
+    name: dev-mokosh-private-${USER:?USER missing - run via just dev}
