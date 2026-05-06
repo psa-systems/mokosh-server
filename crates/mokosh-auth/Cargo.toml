@@ -1,0 +1,20 @@
+[package]
+name = "mokosh-auth"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Mokosh auth: umbrella crate. Re-exports the public surface and provides bootstrap helpers."
+
+[dependencies]
+mokosh-auth-core = { path = "../mokosh-auth-core" }
+mokosh-auth-crypto = { path = "../mokosh-auth-crypto" }
+mokosh-auth-storage = { path = "../mokosh-auth-storage" }
+mokosh-auth-oidc = { path = "../mokosh-auth-oidc" }
+mokosh-auth-federation = { path = "../mokosh-auth-federation" }
+mokosh-auth-http = { path = "../mokosh-auth-http" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+secrecy = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
