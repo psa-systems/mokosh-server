@@ -5,6 +5,8 @@
 #[cfg(feature = "server")]
 pub mod bootstrap;
 #[cfg(feature = "server")]
+pub mod google_login;
+#[cfg(feature = "server")]
 pub mod middleware;
 mod models;
 #[cfg(feature = "server")]

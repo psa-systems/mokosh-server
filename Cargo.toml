@@ -1,4 +1,5 @@
 [workspace]
+members = ["crates/google-oauth-flow"]
 
 [package]
 name = "mokosh-server"
@@ -104,6 +105,12 @@ cron = "0.15"
 
 # URL
 url = "2"
+
+# Cookies (for the Google OAuth state cookie)
+cookie = "0.18"
+
+# Reusable Google OAuth helper (workspace member)
+google-oauth-flow = { path = "crates/google-oauth-flow" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
