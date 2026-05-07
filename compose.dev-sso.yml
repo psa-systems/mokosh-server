@@ -22,7 +22,12 @@
 
 services:
 
-  mokosh-server:
+  # Service key MUST match the base file's `server`. main's
+  # ba236ae refactor renamed the base service from `mokosh-server` to
+  # `server`; if we use the old key here, compose treats this as a new
+  # service definition with neither image nor build context and
+  # refuses to start.
+  server:
     container_name: dev-mokosh-server-${USER}
     networks:
       - private
