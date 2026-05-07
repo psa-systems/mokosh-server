@@ -8,7 +8,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use super::{AuthService, AuthState, CurrentUser, JwtClaims, UserRole};
+use super::{AuthService, AuthState, CurrentUser};
 use crate::utils::error::AppError;
 
 /// Extension to hold the current auth state

@@ -1,25 +1,19 @@
 //! API router configuration
 
-use axum::{middleware, routing::get, Router};
-use std::sync::Arc;
-use tower_http::{
-    compression::CompressionLayer,
-    cors::{Any, CorsLayer},
-    trace::TraceLayer,
+use axum::{
+    http::{header, HeaderValue, Method},
+    middleware,
+    routing::get,
+    Router,
 };
+use std::sync::Arc;
+use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 
 use crate::db::Database;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
-
-/// Application state shared across all routes
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Database,
-    pub jwt_secret: String,
-}
 
 /// Create the main API router with all routes
 pub fn create_api_router(
@@ -30,6 +24,7 @@ pub fn create_api_router(
     super_admin_domains: Vec<String>,
     cookie_secure: bool,
 ) -> Router {
+    let cors_allowed_origin = client_origin.clone();
     // Create services
     let auth_service = AuthService::new(db.clone(), jwt_secret.clone(), super_admin_domains);
     let tenant_service = TenantService::new(db.clone());
@@ -114,6 +109,33 @@ pub fn create_api_router(
         // Portal KB
         .nest("/kb", stub_routes());
 
+    // Audit F13: previously CORS was Any/Any/Any (dev-friendly but unsafe
+    // for any deployment that's reachable from the public internet).
+    // Tighten to: only the configured CLIENT_ORIGIN, only the methods
+    // we actually serve, only the headers the client sends. SPA and API
+    // typically share an origin (via Dioxus proxy / outer reverse proxy)
+    // so CORS rarely fires in normal use - this is defense in depth.
+    let cors = CorsLayer::new()
+        .allow_origin(
+            cors_allowed_origin
+                .parse::<HeaderValue>()
+                .expect("CLIENT_ORIGIN must be a valid HTTP header value"),
+        )
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+        ])
+        .allow_credentials(true);
+
     // Combine everything
     Router::new()
         .nest("/api/v1", api_v1)
@@ -121,12 +143,7 @@ pub fn create_api_router(
         // Apply global middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors)
 }
 
 /// Health check endpoint
@@ -134,7 +151,11 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-/// Stub routes for modules not yet implemented
+/// Stub routes for modules not yet implemented. Audit F12: previously
+/// returned a generic "Not implemented yet"; now responds with a JSON
+/// envelope that names the requested path and points at the audit
+/// findings, so an early integration attempt sees something useful in
+/// the response body instead of a hand-wave.
 fn stub_routes<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -144,9 +165,20 @@ where
         .route("/{id}", get(not_implemented))
 }
 
-async fn not_implemented() -> (axum::http::StatusCode, &'static str) {
+async fn not_implemented(
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> (
+    axum::http::StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    String,
+) {
+    let body = format!(
+        r#"{{"error":"not_implemented","path":"{}","note":"This module is on the post-OAuth backlog. See dev-docs/codebase-state.md for the audit-tracked module list."}}"#,
+        uri.path()
+    );
     (
         axum::http::StatusCode::NOT_IMPLEMENTED,
-        "Not implemented yet",
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
     )
 }

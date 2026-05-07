@@ -442,8 +442,10 @@ pub struct TicketAttachmentResponse {
 // TICKET FILTERS
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct TicketFilter {
+    /// Free-text search; capped to 200 chars to keep ILIKE patterns sane.
+    #[validate(length(max = 200))]
     pub q: Option<String>,
     pub status_id: Option<Uuid>,
     pub priority_id: Option<Uuid>,
@@ -459,6 +461,8 @@ pub struct TicketFilter {
     pub billing_status: Option<BillingStatus>,
     pub created_from: Option<DateTime<Utc>>,
     pub created_to: Option<DateTime<Utc>>,
+    /// Comma-separated tags; capped to keep query strings reasonable.
+    #[validate(length(max = 500))]
     pub tags: Option<String>,
 }
 

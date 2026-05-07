@@ -10,8 +10,8 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    CompanyDetailResponse, CompanyFilter, CompanyResponse, ContactFilter, ContactResponse,
-    ContactService, CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
+    CompanyFilter, CompanyResponse, ContactFilter, ContactResponse, ContactService,
+    CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
     UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
 };
 use crate::modules::auth::RequireAuth;
@@ -62,6 +62,8 @@ async fn list_companies(
     Query(filter): Query<CompanyFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CompanyResponse>>> {
+    // F9: validate filter inputs (length caps on free-text fields).
+    filter.validate()?;
     let (companies, total) = state
         .contact_service
         .list_companies(user.tenant_id, &filter, &pagination)
@@ -169,6 +171,8 @@ async fn list_contacts(
     Query(filter): Query<ContactFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContactResponse>>> {
+    // F9: validate filter inputs.
+    filter.validate()?;
     let (contacts, total) = state
         .contact_service
         .list_contacts(user.tenant_id, &filter, &pagination)
@@ -278,10 +282,9 @@ async fn update_site(
 ) -> AppResult<Json<SiteResponse>> {
     request.validate()?;
 
-    // TODO: Implement update_site in service
     let site = state
         .contact_service
-        .get_site(user.tenant_id, site_id)
+        .update_site(user.tenant_id, site_id, &request)
         .await?;
 
     Ok(Json(site.into()))
