@@ -51,6 +51,8 @@ async fn list_tickets(
     Query(filter): Query<TicketFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
+    // F9: validate filter inputs.
+    filter.validate()?;
     let (tickets, total) = state
         .ticket_service
         .list_tickets(user.tenant_id, &filter, &pagination)

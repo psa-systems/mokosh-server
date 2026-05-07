@@ -62,6 +62,8 @@ async fn list_companies(
     Query(filter): Query<CompanyFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CompanyResponse>>> {
+    // F9: validate filter inputs (length caps on free-text fields).
+    filter.validate()?;
     let (companies, total) = state
         .contact_service
         .list_companies(user.tenant_id, &filter, &pagination)
@@ -169,6 +171,8 @@ async fn list_contacts(
     Query(filter): Query<ContactFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContactResponse>>> {
+    // F9: validate filter inputs.
+    filter.validate()?;
     let (contacts, total) = state
         .contact_service
         .list_contacts(user.tenant_id, &filter, &pagination)
