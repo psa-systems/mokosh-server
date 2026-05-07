@@ -4,7 +4,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{header::SET_COOKIE, HeaderMap, HeaderValue},
     middleware,
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -116,7 +116,7 @@ async fn login(
 /// Logout endpoint
 async fn logout(
     State(state): State<AuthRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireAuth(_user): RequireAuth,
     headers: HeaderMap,
 ) -> AppResult<()> {
     // Extract session ID from token

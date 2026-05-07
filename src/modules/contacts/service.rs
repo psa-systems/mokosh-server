@@ -204,6 +204,11 @@ impl ContactService {
     }
 
     /// Update company
+    // The dynamic-update pattern increments `param_idx` after each
+    // conditional bind so additional fields can be appended without
+    // reflowing the chain. The final `+= 1` looks dead today but keeps
+    // the next added field one diff away.
+    #[allow(unused_assignments)]
     pub async fn update_company(
         &self,
         tenant_id: Uuid,
@@ -855,6 +860,7 @@ impl From<CompanyRow> for Company {
 }
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)] // FromRow mirrors the contacts column set; not every column is exposed on Contact yet.
 struct ContactRow {
     id: Uuid,
     tenant_id: Uuid,

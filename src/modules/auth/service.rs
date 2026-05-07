@@ -5,8 +5,6 @@ use chrono::{Duration, Utc};
 #[cfg(feature = "server")]
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 #[cfg(feature = "server")]
-use sqlx::PgPool;
-#[cfg(feature = "server")]
 use uuid::Uuid;
 
 #[cfg(feature = "server")]

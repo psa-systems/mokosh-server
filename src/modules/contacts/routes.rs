@@ -10,8 +10,8 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    CompanyDetailResponse, CompanyFilter, CompanyResponse, ContactFilter, ContactResponse,
-    ContactService, CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
+    CompanyFilter, CompanyResponse, ContactFilter, ContactResponse, ContactService,
+    CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
     UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
 };
 use crate::modules::auth::RequireAuth;

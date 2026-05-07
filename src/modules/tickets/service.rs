@@ -203,6 +203,10 @@ impl TicketService {
     }
 
     /// List tickets with filters
+    // See update_company in contacts/service.rs for the dynamic-filter
+    // pattern: the trailing `param_idx += 1` keeps the next added
+    // condition one line of diff away.
+    #[allow(unused_assignments)]
     pub async fn list_tickets(
         &self,
         tenant_id: Uuid,
@@ -331,7 +335,9 @@ impl TicketService {
         request: &UpdateTicketRequest,
     ) -> AppResult<Ticket> {
         let ticket = self.get_ticket(tenant_id, ticket_id).await?;
-        let old_status_id = ticket.status_id;
+        // Captured for a future "status changed" automation trigger;
+        // the F11 wiring only fires the generic OnUpdate today.
+        let _old_status_id = ticket.status_id;
 
         // Build update
         if let Some(ref title) = request.title {

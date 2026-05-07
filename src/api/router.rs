@@ -15,13 +15,6 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 
-/// Application state shared across all routes
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Database,
-    pub jwt_secret: String,
-}
-
 /// Create the main API router with all routes
 pub fn create_api_router(
     db: Database,

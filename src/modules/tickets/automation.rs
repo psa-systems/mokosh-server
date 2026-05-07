@@ -304,6 +304,7 @@ impl From<AutomationRuleRow> for AutomationRule {
 }
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)] // `id` mirrors the ticket PK we already passed in; kept for FromRow symmetry with the SELECT.
 struct TicketDataRow {
     id: Uuid,
     company_id: Uuid,
