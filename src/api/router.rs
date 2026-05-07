@@ -158,7 +158,11 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-/// Stub routes for modules not yet implemented
+/// Stub routes for modules not yet implemented. Audit F12: previously
+/// returned a generic "Not implemented yet"; now responds with a JSON
+/// envelope that names the requested path and points at the audit
+/// findings, so an early integration attempt sees something useful in
+/// the response body instead of a hand-wave.
 fn stub_routes<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -168,9 +172,20 @@ where
         .route("/{id}", get(not_implemented))
 }
 
-async fn not_implemented() -> (axum::http::StatusCode, &'static str) {
+async fn not_implemented(
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> (
+    axum::http::StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    String,
+) {
+    let body = format!(
+        r#"{{"error":"not_implemented","path":"{}","note":"This module is on the post-OAuth backlog. See dev-docs/codebase-state.md for the audit-tracked module list."}}"#,
+        uri.path()
+    );
     (
         axum::http::StatusCode::NOT_IMPLEMENTED,
-        "Not implemented yet",
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
     )
 }
