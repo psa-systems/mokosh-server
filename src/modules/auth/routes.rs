@@ -272,13 +272,16 @@ async fn list_users(
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
 
-    // TODO: Implement proper pagination query
-    // For now, return empty response
+    let (users, total) = state
+        .auth_service
+        .list_users(user.tenant_id, &pagination)
+        .await?;
+
     Ok(Json(PaginatedResponse::new(
-        vec![],
+        users.into_iter().map(UserResponse::from).collect(),
         pagination.page,
         pagination.per_page(),
-        0,
+        total,
     )))
 }
 

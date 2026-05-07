@@ -598,6 +598,50 @@ impl AuthService {
         self.get_user_by_id(user_id).await
     }
 
+    /// List users in a tenant, paginated. Audit F1.
+    pub async fn list_users(
+        &self,
+        tenant_id: Uuid,
+        pagination: &crate::utils::pagination::PaginationParams,
+    ) -> AppResult<(Vec<User>, u64)> {
+        let offset = pagination.offset() as i64;
+        let limit = pagination.limit() as i64;
+
+        let order_by = pagination.order_by(
+            "created_at",
+            &["email", "first_name", "last_name", "role", "status", "created_at"],
+        );
+
+        let query = format!(
+            r#"
+            SELECT id, tenant_id, email, password_hash, first_name, last_name,
+                   phone, mobile, title, avatar_url, timezone, locale, role,
+                   status, email_verified_at, last_login_at, mfa_enabled,
+                   mfa_secret, notification_preferences, settings,
+                   created_at, updated_at
+            FROM users
+            WHERE tenant_id = $1
+            ORDER BY {order_by}
+            LIMIT $2 OFFSET $3
+            "#
+        );
+
+        let rows = sqlx::query_as::<_, UserRow>(&query)
+            .bind(tenant_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(self.db.pool())
+            .await?;
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
     /// Get user by ID
     pub async fn get_user_by_id(&self, user_id: Uuid) -> AppResult<User> {
         let row = sqlx::query_as::<_, UserRow>(
