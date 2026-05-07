@@ -278,10 +278,9 @@ async fn update_site(
 ) -> AppResult<Json<SiteResponse>> {
     request.validate()?;
 
-    // TODO: Implement update_site in service
     let site = state
         .contact_service
-        .get_site(user.tenant_id, site_id)
+        .update_site(user.tenant_id, site_id, &request)
         .await?;
 
     Ok(Json(site.into()))
