@@ -1,10 +1,12 @@
 //! Build the auth router. Mount under whatever prefix the host
 //! application chooses (typically `/`).
 
+use axum::http::{header, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use mokosh_auth_oidc::OidcProvider;
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 use url::Url;
 
 use crate::cookies::CookieConfig;
@@ -28,6 +30,23 @@ pub struct AuthHttpState {
 }
 
 pub fn build_router(state: Arc<AuthHttpState>) -> Router {
+    // Permissive CORS on the OIDC surface. These endpoints are
+    // designed to be called cross-origin by browser SPAs:
+    //   - /.well-known/openid-configuration and jwks.json are public
+    //     metadata
+    //   - /oauth2/token, /userinfo, /revoke take Authorization headers
+    //     and PKCE proofs, never cookies (cross-origin cookie use
+    //     would defeat the SPA model anyway)
+    // We deliberately do NOT enable allow_credentials, since the OIDC
+    // flow uses Bearer tokens. /oauth2/authorize and /oauth2/logout
+    // are reached via top-level browser navigation (set_href), not
+    // fetch, so they do not need CORS at all but allowing them is
+    // harmless. /login is same-origin only.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]);
+
     Router::new()
         // Discovery
         .route(
@@ -46,5 +65,6 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // JSON API equivalents (used by client SDKs / native apps).
         .route("/v1/auth/login", post(auth_h::login))
         .route("/v1/auth/logout", post(auth_h::logout))
+        .layer(cors)
         .with_state(state)
 }
