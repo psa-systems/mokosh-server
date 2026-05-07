@@ -3,6 +3,7 @@
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{header::SET_COOKIE, HeaderMap, HeaderValue},
+    middleware,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -14,9 +15,9 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    google_login, AuthService, ChangePasswordRequest, CreateUserRequest, ForgotPasswordRequest,
-    LoginRequest, LoginResponse, RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest,
-    SessionInfo, UpdateUserRequest, UserResponse,
+    google_login, rate_limit, AuthService, ChangePasswordRequest, CreateUserRequest,
+    ForgotPasswordRequest, LoginRequest, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
+    ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
@@ -54,9 +55,20 @@ pub fn auth_routes(
         cookie_secure,
     };
 
+    // Per-IP rate limiter shared across `/login` requests for the
+    // lifetime of the server (audit F2).
+    let login_limiter = rate_limit::login_limiter();
+
     Router::new()
-        // Public routes
-        .route("/login", post(login))
+        // Public routes — `/login` is wrapped in a per-IP rate limiter
+        // (5/min) to harden against credential stuffing.
+        .route(
+            "/login",
+            post(login).layer(middleware::from_fn_with_state(
+                login_limiter,
+                rate_limit::login_rate_limit,
+            )),
+        )
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))

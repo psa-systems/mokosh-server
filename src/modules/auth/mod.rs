@@ -10,6 +10,8 @@ pub mod google_login;
 pub mod middleware;
 mod models;
 #[cfg(feature = "server")]
+pub mod rate_limit;
+#[cfg(feature = "server")]
 mod routes;
 mod service;
 
