@@ -147,3 +147,11 @@ pub struct ModuleConfig {
     pub is_enabled: bool,
     pub config: serde_json::Value,
 }
+
+/// Audit F5: payload for updating a tenant's per-module config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateModuleConfigRequest {
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}

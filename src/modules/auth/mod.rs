@@ -7,8 +7,12 @@ pub mod at_jwt;
 #[cfg(feature = "server")]
 pub mod bootstrap;
 #[cfg(feature = "server")]
+pub mod google_login;
+#[cfg(feature = "server")]
 pub mod middleware;
 mod models;
+#[cfg(feature = "server")]
+pub mod rate_limit;
 #[cfg(feature = "server")]
 mod routes;
 mod service;

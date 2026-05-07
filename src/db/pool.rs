@@ -1,7 +1,6 @@
 //! Database connection pool and management
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::utils::error::{AppError, AppResult};
@@ -68,8 +67,6 @@ impl Database {
     /// Get a connection from the pool with tenant context set
     #[cfg(feature = "multi-tenant")]
     pub async fn with_tenant(&self, tenant_id: uuid::Uuid) -> AppResult<TenantConnection> {
-        use sqlx::Executor;
-
         let mut conn = self.pool.acquire().await?;
 
         // Set the tenant context for Row Level Security
@@ -86,8 +83,6 @@ impl Database {
         &self,
         tenant_id: uuid::Uuid,
     ) -> AppResult<TenantTransaction<'_>> {
-        use sqlx::Executor;
-
         let mut tx = self.pool.begin().await?;
 
         // Set the tenant context for Row Level Security
@@ -168,5 +163,3 @@ impl<'a> std::ops::DerefMut for TenantTransaction<'a> {
         &mut self.tx
     }
 }
-
-use super::TenantContext;

@@ -1,20 +1,23 @@
 //! Authentication API routes
 
 use axum::{
-    extract::{ConnectInfo, Path, State},
-    http::HeaderMap,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{header::SET_COOKIE, HeaderMap, HeaderValue},
+    middleware,
+    response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    AuthService, ChangePasswordRequest, CreateUserRequest, ForgotPasswordRequest, LoginRequest,
-    LoginResponse, RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest, SessionInfo,
-    UpdateUserRequest, UserResponse,
+    google_login, rate_limit, AuthService, ChangePasswordRequest, CreateUserRequest,
+    ForgotPasswordRequest, LoginRequest, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
+    ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
@@ -24,21 +27,55 @@ use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 #[derive(Clone)]
 pub struct AuthRouterState {
     pub auth_service: Arc<AuthService>,
+    pub google_oauth: Arc<google_oauth_flow::Client>,
+    /// Origin where the SPA is served. Used as the `postMessage` target
+    /// origin in the popup-closing HTML.
+    pub client_origin: String,
+    /// JWT secret used to HMAC-sign the OAuth state cookie. Same key as
+    /// the access/refresh token signer.
+    pub jwt_secret: String,
+    /// Whether to set the `Secure` flag on the OAuth state cookie.
+    /// `false` over plain HTTP localhost in dev; `true` in prod.
+    pub cookie_secure: bool,
 }
 
 /// Create the auth router
-pub fn auth_routes(auth_service: AuthService) -> Router {
+pub fn auth_routes(
+    auth_service: AuthService,
+    google_oauth: Arc<google_oauth_flow::Client>,
+    client_origin: String,
+    jwt_secret: String,
+    cookie_secure: bool,
+) -> Router {
     let state = AuthRouterState {
         auth_service: Arc::new(auth_service),
+        google_oauth,
+        client_origin,
+        jwt_secret,
+        cookie_secure,
     };
 
+    // Per-IP rate limiter shared across `/login` requests for the
+    // lifetime of the server (audit F2).
+    let login_limiter = rate_limit::login_limiter();
+
     Router::new()
-        // Public routes
-        .route("/login", post(login))
+        // Public routes — `/login` is wrapped in a per-IP rate limiter
+        // (5/min) to harden against credential stuffing.
+        .route(
+            "/login",
+            post(login).layer(middleware::from_fn_with_state(
+                login_limiter,
+                rate_limit::login_rate_limit,
+            )),
+        )
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
         .route("/reset-password", post(reset_password))
+        // Google OAuth
+        .route("/google", get(google_authorize))
+        .route("/google/callback", get(google_callback))
         // Protected routes
         .route("/me", get(get_current_user))
         .route("/me", put(update_current_user))
@@ -79,7 +116,7 @@ async fn login(
 /// Logout endpoint
 async fn logout(
     State(state): State<AuthRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireAuth(_user): RequireAuth,
     headers: HeaderMap,
 ) -> AppResult<()> {
     // Extract session ID from token
@@ -235,13 +272,16 @@ async fn list_users(
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
 
-    // TODO: Implement proper pagination query
-    // For now, return empty response
+    let (users, total) = state
+        .auth_service
+        .list_users(user.tenant_id, &pagination)
+        .await?;
+
     Ok(Json(PaginatedResponse::new(
-        vec![],
+        users.into_iter().map(UserResponse::from).collect(),
         pagination.page,
         pagination.per_page(),
-        0,
+        total,
     )))
 }
 
@@ -299,4 +339,128 @@ async fn update_user(
     let updated = state.auth_service.update_user(user_id, &request).await?;
 
     Ok(Json(updated.into()))
+}
+
+// ---------------------------------------------------------------------------
+// Google OAuth handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct GoogleCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// Step 1 of the OAuth flow: redirect the browser to Google's consent
+/// page. Sets a short-lived signed cookie carrying the CSRF state and
+/// PKCE verifier so the callback can verify them.
+async fn google_authorize(State(state): State<AuthRouterState>) -> Result<Response, AppError> {
+    let (url, auth_state) = state
+        .google_oauth
+        .build_authorize_url()
+        .map_err(|e| AppError::internal(format!("OAuth setup failed: {e}")))?;
+
+    let cookie = google_login::encode_state_cookie(
+        &auth_state,
+        state.jwt_secret.as_bytes(),
+        state.cookie_secure,
+    )
+    .map_err(|e| AppError::internal(format!("OAuth state cookie failed: {e}")))?;
+
+    let cookie_value = HeaderValue::from_str(&cookie)
+        .map_err(|e| AppError::internal(format!("invalid cookie header: {e}")))?;
+
+    let mut response = Redirect::to(url.as_str()).into_response();
+    response.headers_mut().append(SET_COOKIE, cookie_value);
+    Ok(response)
+}
+
+/// Step 2: Google redirects the browser back here with `?code&state`.
+/// Verify the state cookie, exchange the code for userinfo, find or
+/// auto-provision the user, then return an HTML page that posts the
+/// JWT response to `window.opener` and closes itself.
+async fn google_callback(
+    State(state): State<AuthRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<GoogleCallbackQuery>,
+) -> Response {
+    let outcome = run_google_callback(&state, &addr, &headers, &query).await;
+    let (payload, set_cookies): (serde_json::Value, Vec<String>) = match outcome {
+        Ok(login_response) => (
+            serde_json::json!({ "ok": true, "data": login_response }),
+            vec![google_login::clear_state_cookie()],
+        ),
+        Err(message) => (
+            serde_json::json!({ "ok": false, "error": message }),
+            vec![google_login::clear_state_cookie()],
+        ),
+    };
+
+    let mut response = google_login::callback_html(&payload, &state.client_origin).into_response();
+    for cookie in set_cookies {
+        if let Ok(v) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().append(SET_COOKIE, v);
+        }
+    }
+    response
+}
+
+/// Inner helper for `google_callback` that returns a flat `Result` so
+/// errors can be turned into the popup-closing HTML payload uniformly.
+async fn run_google_callback(
+    state: &AuthRouterState,
+    addr: &SocketAddr,
+    headers: &HeaderMap,
+    query: &GoogleCallbackQuery,
+) -> Result<LoginResponse, String> {
+    if let Some(err) = &query.error {
+        let detail = query
+            .error_description
+            .clone()
+            .unwrap_or_else(|| err.clone());
+        return Err(format!("Google rejected the sign-in: {detail}"));
+    }
+
+    let code = query
+        .code
+        .as_deref()
+        .ok_or_else(|| "missing `code` in callback".to_string())?;
+    let received_state = query
+        .state
+        .as_deref()
+        .ok_or_else(|| "missing `state` in callback".to_string())?;
+
+    let cookie_header = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "missing state cookie".to_string())?;
+    let cookie_value = google_login::read_state_cookie(cookie_header)
+        .ok_or_else(|| "missing state cookie".to_string())?;
+    let auth_state = google_login::decode_state_cookie(&cookie_value, state.jwt_secret.as_bytes())
+        .map_err(|e| format!("invalid state cookie: {e}"))?;
+
+    if auth_state.csrf_token != received_state {
+        return Err("state mismatch (possible CSRF)".to_string());
+    }
+
+    let userinfo = state
+        .google_oauth
+        .exchange_code(code, &auth_state.pkce_verifier)
+        .await
+        .map_err(|e| format!("Google token exchange failed: {e}"))?;
+
+    let ip = Some(addr.ip().to_string());
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    state
+        .auth_service
+        .login_with_google(userinfo, ip, user_agent)
+        .await
+        .map_err(|e| e.to_string())
 }

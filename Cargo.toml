@@ -9,6 +9,8 @@ members = [
     "crates/mokosh-auth-federation",
     "crates/mokosh-auth-http",
     "crates/mokosh-auth",
+    # main added this crate for the Google OAuth popup flow.
+    "crates/google-oauth-flow",
 ]
 
 [workspace.package]
@@ -155,6 +157,12 @@ cron = "0.15"
 
 # URL
 url = "2"
+
+# Cookies (for the Google OAuth state cookie)
+cookie = "0.18"
+
+# Reusable Google OAuth helper (workspace member)
+google-oauth-flow = { path = "crates/google-oauth-flow" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

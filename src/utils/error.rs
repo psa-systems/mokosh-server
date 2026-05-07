@@ -3,7 +3,6 @@
 //! Provides a unified error type that works across server and client.
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use thiserror::Error;
 
 /// Result type alias for application errors

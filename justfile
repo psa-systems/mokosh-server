@@ -23,12 +23,15 @@ dev *args: ensure-env
         | where protocol == 'ipv4' and $it.loop == false
         | get address.0
     )
-    print $"Binding mokosh-server host port to ($bind_ip)"
+    let user_name = (^whoami | str trim)
+    print $"Binding mokosh-server host port to ($bind_ip) as user ($user_name)"
     let updated = (
         open .env --raw
         | lines
         | where not ($it | str starts-with 'MOKOSH_HOST_BIND_IP=')
+        | where not ($it | str starts-with 'USER=')
         | append $"MOKOSH_HOST_BIND_IP=($bind_ip)"
+        | append $"USER=($user_name)"
         | str join "\n"
     )
     if ('.env.new' | path exists) { rm .env.new }

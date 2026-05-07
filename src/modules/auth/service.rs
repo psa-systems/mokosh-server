@@ -5,8 +5,6 @@ use chrono::{Duration, Utc};
 #[cfg(feature = "server")]
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 #[cfg(feature = "server")]
-use sqlx::PgPool;
-#[cfg(feature = "server")]
 use uuid::Uuid;
 
 #[cfg(feature = "server")]
@@ -27,17 +25,22 @@ pub struct AuthService {
     jwt_secret: String,
     access_token_ttl: Duration,
     refresh_token_ttl: Duration,
+    /// Lowercased email domains whose first-time Google sign-ins are
+    /// auto-promoted to role 'super_admin'. Existing users are never
+    /// re-roled.
+    super_admin_domains: Vec<String>,
 }
 
 #[cfg(feature = "server")]
 impl AuthService {
-    /// Create a new auth service
-    pub fn new(db: Database, jwt_secret: String) -> Self {
+    /// Create a new auth service.
+    pub fn new(db: Database, jwt_secret: String, super_admin_domains: Vec<String>) -> Self {
         Self {
             db,
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
+            super_admin_domains,
         }
     }
 
@@ -107,6 +110,164 @@ impl AuthService {
             user: user.to_current_user(),
             mfa_required: false,
         })
+    }
+
+    /// Authenticate (or auto-provision) a user from a Google OAuth
+    /// userinfo response. The caller is responsible for verifying the
+    /// CSRF state and exchanging the authorization code via the
+    /// `google-oauth-flow` crate before calling this.
+    pub async fn login_with_google(
+        &self,
+        google: google_oauth_flow::GoogleUserInfo,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        // Reject if Google did not confirm the email is verified.
+        if google.email_verified != Some(true) {
+            return Err(AppError::Forbidden(
+                "Google did not report this email as verified".to_string(),
+            ));
+        }
+
+        // 1. Look up an existing identity by (provider, subject).
+        let linked_user_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM user_oauth_identities \
+             WHERE provider = 'google' AND subject = $1",
+        )
+        .bind(&google.sub)
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        let user = if let Some(user_id) = linked_user_id {
+            sqlx::query(
+                "UPDATE user_oauth_identities SET last_used_at = NOW() \
+                 WHERE provider = 'google' AND subject = $1",
+            )
+            .bind(&google.sub)
+            .execute(self.db.pool())
+            .await?;
+            self.get_user_by_id(user_id).await?
+        } else {
+            // 2. No identity row yet - find or create the user by email.
+            match self.find_user_by_email_optional(&google.email).await? {
+                Some(existing) => {
+                    // Link new identity to existing user; do NOT change role.
+                    sqlx::query(
+                        "INSERT INTO user_oauth_identities \
+                         (user_id, provider, subject, email) \
+                         VALUES ($1, 'google', $2, $3)",
+                    )
+                    .bind(existing.id)
+                    .bind(&google.sub)
+                    .bind(&google.email)
+                    .execute(self.db.pool())
+                    .await?;
+                    existing
+                }
+                None => self.provision_user_from_google(&google).await?,
+            }
+        };
+
+        // 3. Reject inactive users.
+        if user.status != UserStatus::Active {
+            return Err(AppError::Forbidden("Account is not active".to_string()));
+        }
+
+        // 4. Issue session + tokens identically to the password flow.
+        let session_id = self
+            .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
+            .await?;
+        let (access_token, refresh_token, expires_at) =
+            self.generate_tokens(&user, session_id)?;
+        self.update_last_login(user.id).await?;
+
+        Ok(LoginResponse {
+            access_token,
+            refresh_token,
+            expires_at,
+            user: user.to_current_user(),
+            mfa_required: false,
+        })
+    }
+
+    /// Auto-provision a brand-new user from a verified Google identity.
+    /// Role is `super_admin` if the hosted domain (or email domain) is
+    /// in `self.super_admin_domains`, else `technician`.
+    async fn provision_user_from_google(
+        &self,
+        google: &google_oauth_flow::GoogleUserInfo,
+    ) -> AppResult<User> {
+        let domain = google
+            .hd
+            .clone()
+            .or_else(|| google.email.split('@').nth(1).map(str::to_string))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let role = if self
+            .super_admin_domains
+            .iter()
+            .any(|d| d == &domain)
+        {
+            "super_admin"
+        } else {
+            "technician"
+        };
+
+        let user_id = Uuid::new_v4();
+        // Default tenant seeded by migrations/002_seed_data.sql.
+        let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+            .expect("default tenant UUID is valid");
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+                id, tenant_id, email, password_hash, first_name, last_name,
+                role, status, email_verified_at
+            )
+            VALUES ($1, $2, $3, NULL, $4, $5, $6, 'active', NOW())
+            "#,
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(&google.email)
+        .bind(google.given_name.clone().unwrap_or_default())
+        .bind(google.family_name.clone().unwrap_or_default())
+        .bind(role)
+        .execute(self.db.pool())
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO user_oauth_identities \
+             (user_id, provider, subject, email) \
+             VALUES ($1, 'google', $2, $3)",
+        )
+        .bind(user_id)
+        .bind(&google.sub)
+        .bind(&google.email)
+        .execute(self.db.pool())
+        .await?;
+
+        self.get_user_by_id(user_id).await
+    }
+
+    /// Look up a user by email; returns `Ok(None)` instead of
+    /// `Err(Unauthorized)` when no user exists.
+    async fn find_user_by_email_optional(&self, email: &str) -> AppResult<Option<User>> {
+        let row = sqlx::query_as::<_, UserRow>(
+            r#"
+            SELECT id, tenant_id, email, password_hash, first_name, last_name,
+                   phone, mobile, title, avatar_url, timezone, locale, role,
+                   status, email_verified_at, last_login_at, mfa_enabled,
+                   mfa_secret, notification_preferences, settings,
+                   created_at, updated_at
+            FROM users
+            WHERE email = $1
+            "#,
+        )
+        .bind(email)
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(row.map(Into::into))
     }
 
     /// Refresh access token
@@ -433,6 +594,50 @@ impl AuthService {
         query_builder.execute(self.db.pool()).await?;
 
         self.get_user_by_id(user_id).await
+    }
+
+    /// List users in a tenant, paginated. Audit F1.
+    pub async fn list_users(
+        &self,
+        tenant_id: Uuid,
+        pagination: &crate::utils::pagination::PaginationParams,
+    ) -> AppResult<(Vec<User>, u64)> {
+        let offset = pagination.offset() as i64;
+        let limit = pagination.limit() as i64;
+
+        let order_by = pagination.order_by(
+            "created_at",
+            &["email", "first_name", "last_name", "role", "status", "created_at"],
+        );
+
+        let query = format!(
+            r#"
+            SELECT id, tenant_id, email, password_hash, first_name, last_name,
+                   phone, mobile, title, avatar_url, timezone, locale, role,
+                   status, email_verified_at, last_login_at, mfa_enabled,
+                   mfa_secret, notification_preferences, settings,
+                   created_at, updated_at
+            FROM users
+            WHERE tenant_id = $1
+            ORDER BY {order_by}
+            LIMIT $2 OFFSET $3
+            "#
+        );
+
+        let rows = sqlx::query_as::<_, UserRow>(&query)
+            .bind(tenant_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(self.db.pool())
+            .await?;
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Get user by ID

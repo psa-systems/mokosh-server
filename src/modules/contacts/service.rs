@@ -204,6 +204,11 @@ impl ContactService {
     }
 
     /// Update company
+    // The dynamic-update pattern increments `param_idx` after each
+    // conditional bind so additional fields can be appended without
+    // reflowing the chain. The final `+= 1` looks dead today but keeps
+    // the next added field one diff away.
+    #[allow(unused_assignments)]
     pub async fn update_company(
         &self,
         tenant_id: Uuid,
@@ -583,6 +588,124 @@ impl ContactService {
         self.get_site(tenant_id, site_id).await
     }
 
+    /// Update a site. Audit F4: previously the route handler called
+    /// `get_site` and silently returned the unchanged record.
+    pub async fn update_site(
+        &self,
+        tenant_id: Uuid,
+        site_id: Uuid,
+        request: &UpdateSiteRequest,
+    ) -> AppResult<Site> {
+        // Verify site exists; also gives us the current company_id for
+        // the is_primary unmark below.
+        let current = self.get_site(tenant_id, site_id).await?;
+
+        // If this is being marked primary, demote the other sites under
+        // the same company first (mirrors create_site).
+        if matches!(request.is_primary, Some(true)) {
+            sqlx::query(
+                "UPDATE sites SET is_primary = FALSE \
+                 WHERE tenant_id = $1 AND company_id = $2 AND id <> $3",
+            )
+            .bind(tenant_id)
+            .bind(current.company_id)
+            .bind(site_id)
+            .execute(self.db.pool())
+            .await?;
+        }
+
+        // Build the dynamic UPDATE.
+        let mut updates = vec!["updated_at = NOW()".to_string()];
+        let mut param_idx = 3;
+
+        if request.name.is_some() {
+            updates.push(format!("name = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.address.is_some() {
+            updates.push(format!("address_line1 = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("address_line2 = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("city = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("state = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("postal_code = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("country = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.phone.is_some() {
+            updates.push(format!("phone = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.is_primary.is_some() {
+            updates.push(format!("is_primary = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.timezone.is_some() {
+            updates.push(format!("timezone = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.notes.is_some() {
+            updates.push(format!("notes = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.latitude.is_some() {
+            updates.push(format!("latitude = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.longitude.is_some() {
+            updates.push(format!("longitude = ${param_idx}"));
+            // param_idx += 1;
+        }
+
+        // No-op update (only `updated_at = NOW()`); just bump the row's
+        // updated_at without rewriting columns.
+        let query = format!(
+            "UPDATE sites SET {} WHERE tenant_id = $1 AND id = $2",
+            updates.join(", ")
+        );
+
+        let mut q = sqlx::query(&query).bind(tenant_id).bind(site_id);
+
+        if let Some(ref name) = request.name {
+            q = q.bind(name);
+        }
+        if let Some(ref addr) = request.address {
+            q = q
+                .bind(&addr.line1)
+                .bind(&addr.line2)
+                .bind(&addr.city)
+                .bind(&addr.state)
+                .bind(&addr.postal_code)
+                .bind(&addr.country);
+        }
+        if let Some(ref phone) = request.phone {
+            q = q.bind(phone);
+        }
+        if let Some(is_primary) = request.is_primary {
+            q = q.bind(is_primary);
+        }
+        if let Some(ref timezone) = request.timezone {
+            q = q.bind(timezone);
+        }
+        if let Some(ref notes) = request.notes {
+            q = q.bind(notes);
+        }
+        if let Some(latitude) = request.latitude {
+            q = q.bind(latitude);
+        }
+        if let Some(longitude) = request.longitude {
+            q = q.bind(longitude);
+        }
+
+        q.execute(self.db.pool()).await?;
+
+        self.get_site(tenant_id, site_id).await
+    }
+
     /// Get site by ID
     pub async fn get_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<Site> {
         let row = sqlx::query_as::<_, SiteRow>(
@@ -737,6 +860,7 @@ impl From<CompanyRow> for Company {
 }
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)] // FromRow mirrors the contacts column set; not every column is exposed on Contact yet.
 struct ContactRow {
     id: Uuid,
     tenant_id: Uuid,
