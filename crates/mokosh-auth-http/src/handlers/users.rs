@@ -100,13 +100,44 @@ async fn set_status(
         .map_err(HttpError)?
         .filter(|u| u.tenant_id == admin.tenant_id)
         .ok_or(HttpError(AuthError::NotFound))?;
-    // Refuse self-deactivation: the only admin in a tenant locking
-    // themselves out is a recoverable mess but a small UX trap worth
-    // catching at the API layer.
-    if target.id == admin.id && matches!(new_status, UserStatus::Suspended) {
-        return Err(HttpError(AuthError::InvalidRequest(
-            "cannot suspend your own account".into(),
-        )));
+    // Two limbo guards on suspension:
+    //
+    //   1. An admin cannot suspend themselves. Even with other
+    //      admins around the UX trap of clicking your own Suspend
+    //      and immediately losing access is worth catching at the
+    //      API layer.
+    //   2. The LAST active admin in a tenant cannot be suspended,
+    //      regardless of who is doing the suspending. Without this,
+    //      a tenant could end up with zero administrators and no
+    //      recovery path short of a server-side intervention.
+    //
+    // The check counts active admins INCLUDING the target, then
+    // refuses if the target is an admin and removing them would
+    // drop the count to zero.
+    if matches!(new_status, UserStatus::Suspended) {
+        if target.id == admin.id {
+            return Err(HttpError(AuthError::InvalidRequest(
+                "cannot suspend your own account".into(),
+            )));
+        }
+        if matches!(target.role, UserRole::Admin) {
+            let active_admins = st
+                .provider
+                .users
+                .list_by_tenant(admin.tenant_id)
+                .await
+                .map_err(HttpError)?
+                .into_iter()
+                .filter(|u| {
+                    matches!(u.role, UserRole::Admin) && matches!(u.status, UserStatus::Active)
+                })
+                .count();
+            if active_admins <= 1 {
+                return Err(HttpError(AuthError::InvalidRequest(
+                    "cannot suspend the last active admin in the tenant".into(),
+                )));
+            }
+        }
     }
 
     st.provider
