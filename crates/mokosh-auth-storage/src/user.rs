@@ -55,6 +55,19 @@ impl UserRepository for PgUserRepository {
         row.map(User::try_from).transpose()
     }
 
+    async fn list_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<User>, AuthError> {
+        let rows: Vec<UserRow> = sqlx::query_as(&format!(
+            "{SELECT_USER}
+             WHERE tenant_id = $1 AND deleted_at IS NULL
+             ORDER BY created_at DESC"
+        ))
+        .bind(tenant_id.0)
+        .fetch_all(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(User::try_from).collect()
+    }
+
     async fn find_by_email_globally(&self, email: &str) -> Result<Vec<User>, AuthError> {
         // LIMIT 2: we only need to distinguish "exactly one match" from
         // "ambiguous" (>= 2). No reason to read more rows than that.

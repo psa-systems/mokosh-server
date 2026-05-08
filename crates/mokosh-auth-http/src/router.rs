@@ -15,7 +15,7 @@ use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
     auth as auth_h, discovery as disc_h, invites as invites_h, oidc as oidc_h,
-    sessions as sessions_h,
+    sessions as sessions_h, users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -116,6 +116,16 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route(
             "/v1/auth/sessions/{session_id}/revoke",
             post(sessions_h::revoke_my_session),
+        )
+        // Admin user management.
+        .route("/v1/auth/users", get(users_h::list_users))
+        .route(
+            "/v1/auth/users/{user_id}/suspend",
+            post(users_h::suspend_user),
+        )
+        .route(
+            "/v1/auth/users/{user_id}/reactivate",
+            post(users_h::reactivate_user),
         )
         .layer(cors)
         .with_state(state)

@@ -29,6 +29,10 @@ pub trait UserRepository: Send + Sync {
     /// caller MUST treat ambiguity as a soft failure (do not reveal
     /// which tenants own the email).
     async fn find_by_email_globally(&self, email: &str) -> Result<Vec<User>, AuthError>;
+    /// All non-deleted users in a tenant, newest first. Powers the
+    /// admin "User management" page; not used in any auth-critical
+    /// path.
+    async fn list_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<User>, AuthError>;
     async fn create(&self, new: NewUser) -> Result<User, AuthError>;
     async fn update_last_login(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn set_password_hash(&self, id: UserId, hash: &str) -> Result<(), AuthError>;
