@@ -55,6 +55,15 @@ pub trait OpSessionRepository: Send + Sync {
         amr: &[String],
     ) -> Result<OpSession, AuthError>;
     async fn find_by_sid(&self, sid: &str) -> Result<Option<OpSession>, AuthError>;
+    async fn find_by_id(&self, id: OpSessionId) -> Result<Option<OpSession>, AuthError>;
+    /// All active (unrevoked, unexpired) sessions for a user. Used to
+    /// power the "active sessions" UI and the "revoke other devices"
+    /// administrative action.
+    async fn list_active_for_user(
+        &self,
+        user_id: UserId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<OpSession>, AuthError>;
     async fn touch(&self, id: OpSessionId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn revoke(&self, id: OpSessionId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn revoke_all_for_user(&self, user_id: UserId) -> Result<Vec<OpSessionId>, AuthError>;
@@ -109,13 +118,28 @@ pub trait RefreshTokenRepository: Send + Sync {
 
     /// Revoke the family that owns the refresh token whose hash matches.
     ///
-    /// Returns `Ok(())` whether or not a row matched: per RFC 7009 the
-    /// revocation endpoint MUST NOT differentiate, to prevent token
-    /// enumeration. The caller (the `/oauth2/revoke` handler) collapses
-    /// errors and unknown tokens into a single 200 response.
+    /// Returns the bound `op_session_id` (if any) so the caller can
+    /// also revoke the OP-side SSO session - logging out of the
+    /// refresh family without killing the session would leave the
+    /// HttpOnly OP cookie alive and silently re-authorize a future
+    /// `/oauth2/authorize` request. `Ok(None)` covers both "unknown
+    /// token" (per RFC 7009 callers MUST NOT differentiate hits from
+    /// misses) and "family had no bound session"; the `/oauth2/revoke`
+    /// handler collapses every outcome into a single 200 response.
     async fn revoke_by_token_hash(
         &self,
         token_hash: [u8; 32],
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<OpSessionId>, AuthError>;
+
+    /// Revoke every refresh family that was issued from a given OP
+    /// session. Mirror of the above: revoking an OP session kills
+    /// the refresh families bound to it, otherwise a stolen refresh
+    /// token would survive a "log out everywhere" action.
+    async fn revoke_families_for_session(
+        &self,
+        op_session_id: OpSessionId,
         reason: &str,
         at: DateTime<Utc>,
     ) -> Result<(), AuthError>;

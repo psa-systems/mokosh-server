@@ -243,10 +243,17 @@ pub async fn logout(
     session: Result<CurrentOpSession, HttpError>,
 ) -> Response {
     if let Ok(CurrentOpSession(s)) = session {
+        let now = st.provider.clock.now();
+        let _ = st.provider.sessions.revoke(s.id, now).await;
+        // Mirror of the /oauth2/revoke path: revoking the session
+        // must also kill every refresh-token family that was issued
+        // from it, otherwise stale refresh tokens would survive a
+        // logout and could mint fresh access tokens until their
+        // own absolute TTL.
         let _ = st
             .provider
-            .sessions
-            .revoke(s.id, st.provider.clock.now())
+            .refresh
+            .revoke_families_for_session(s.id, "logout", now)
             .await;
     }
     let cleared = jar.remove(clear_op_session_cookie(&st.cookie_cfg));

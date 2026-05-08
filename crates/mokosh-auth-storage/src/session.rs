@@ -74,6 +74,37 @@ impl OpSessionRepository for PgOpSessionRepository {
         Ok(row.map(Into::into))
     }
 
+    async fn find_by_id(&self, id: OpSessionId) -> Result<Option<OpSession>, AuthError> {
+        let row: Option<OpSessionRow> = sqlx::query_as(&format!(
+            "{SELECT_OP_SESSION} WHERE id = $1"
+        ))
+        .bind(id.0)
+        .fetch_optional(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn list_active_for_user(
+        &self,
+        user_id: UserId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<OpSession>, AuthError> {
+        let rows: Vec<OpSessionRow> = sqlx::query_as(&format!(
+            "{SELECT_OP_SESSION}
+             WHERE user_id = $1
+               AND revoked_at IS NULL
+               AND expires_at > $2
+             ORDER BY last_active_at DESC"
+        ))
+        .bind(user_id.0)
+        .bind(now)
+        .fetch_all(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     async fn touch(&self, id: OpSessionId, at: DateTime<Utc>) -> Result<(), AuthError> {
         sqlx::query(
             "UPDATE mokosh_auth.op_sessions

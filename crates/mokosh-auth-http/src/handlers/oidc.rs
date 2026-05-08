@@ -232,14 +232,26 @@ pub async fn revoke(
     if let Some(token) = f.token.as_deref().filter(|s| !s.is_empty()) {
         let hash = mokosh_auth_crypto::hash_opaque_token(token);
         let now = st.provider.clock.now();
-        if let Err(e) = st
+        match st
             .provider
             .refresh
             .revoke_by_token_hash(hash, "client_revocation", now)
             .await
         {
-            // Log but never surface: RFC 7009 demands a 200.
-            tracing::warn!("revoke: storage error swallowed: {e}");
+            Ok(Some(op_sid)) => {
+                // The family was bound to an OP session. Kill the
+                // session too so the user is genuinely logged out;
+                // otherwise the HttpOnly OP cookie would silently
+                // re-authorize a future /oauth2/authorize request.
+                if let Err(e) = st.provider.sessions.revoke(op_sid, now).await {
+                    tracing::warn!("revoke: op_session storage error swallowed: {e}");
+                }
+            }
+            Ok(None) => {} // unknown token (RFC 7009: indistinguishable response)
+            Err(e) => {
+                // Log but never surface: RFC 7009 demands a 200.
+                tracing::warn!("revoke: storage error swallowed: {e}");
+            }
         }
     }
     StatusCode::OK

@@ -1970,6 +1970,7 @@ dependencies = [
  "futures-util",
  "governor",
  "http",
+ "jsonwebtoken",
  "mokosh-auth-core",
  "mokosh-auth-crypto",
  "mokosh-auth-federation",

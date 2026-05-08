@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{
-    AuthError, NewRefreshToken, NewRefreshTokenFamily, RefreshFamilyId, RefreshTokenRepository,
-    RotatedTokens,
+    AuthError, NewRefreshToken, NewRefreshTokenFamily, OpSessionId, RefreshFamilyId,
+    RefreshTokenRepository, RotatedTokens,
 };
 use std::collections::BTreeSet;
 
@@ -108,21 +108,63 @@ impl RefreshTokenRepository for PgRefreshTokenRepository {
         token_hash: [u8; 32],
         reason: &str,
         at: DateTime<Utc>,
-    ) -> Result<(), AuthError> {
-        // Look up the family that owns this token. If the token is
-        // unknown we still return Ok: the caller (the /oauth2/revoke
-        // endpoint) must not distinguish hits from misses.
-        let family_id: Option<uuid::Uuid> = sqlx::query_scalar(
-            "SELECT family_id FROM mokosh_auth.refresh_tokens WHERE token_hash = $1",
+    ) -> Result<Option<OpSessionId>, AuthError> {
+        // Look up the family + bound op_session_id in one query. If
+        // the token is unknown we still return Ok(None): the caller
+        // (the /oauth2/revoke endpoint) must not distinguish hits
+        // from misses (RFC 7009).
+        let row: Option<(uuid::Uuid, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT f.id, f.op_session_id
+             FROM mokosh_auth.refresh_tokens rt
+             JOIN mokosh_auth.refresh_token_families f ON f.id = rt.family_id
+             WHERE rt.token_hash = $1",
         )
         .bind(&token_hash[..])
         .fetch_optional(self.pool.pg())
         .await
         .map_err(db_err)?;
 
-        if let Some(fid) = family_id {
-            self.revoke_family(RefreshFamilyId(fid), reason, at).await?;
+        match row {
+            Some((fid, op_sid)) => {
+                self.revoke_family(RefreshFamilyId(fid), reason, at).await?;
+                Ok(op_sid.map(OpSessionId))
+            }
+            None => Ok(None),
         }
+    }
+
+    async fn revoke_families_for_session(
+        &self,
+        op_session_id: OpSessionId,
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        let mut tx = self.pool.pg().begin().await.map_err(db_err)?;
+        sqlx::query(
+            "UPDATE mokosh_auth.refresh_token_families
+             SET revoked_at = $1, revoke_reason = $2
+             WHERE op_session_id = $3 AND revoked_at IS NULL",
+        )
+        .bind(at)
+        .bind(reason)
+        .bind(op_session_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE mokosh_auth.refresh_tokens rt
+             SET revoked_at = $1
+             FROM mokosh_auth.refresh_token_families f
+             WHERE rt.family_id = f.id
+               AND f.op_session_id = $2
+               AND rt.revoked_at IS NULL",
+        )
+        .bind(at)
+        .bind(op_session_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 

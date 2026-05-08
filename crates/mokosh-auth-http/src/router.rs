@@ -15,6 +15,7 @@ use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
     auth as auth_h, discovery as disc_h, invites as invites_h, oidc as oidc_h,
+    sessions as sessions_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -102,6 +103,13 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route(
             "/v1/auth/invites/by-token/{token}/accept",
             post(invites_h::accept_by_token),
+        )
+        // Self-service session management. Bearer-authed, cross-origin
+        // friendly (no cookie required).
+        .route("/v1/auth/sessions", get(sessions_h::list_my_sessions))
+        .route(
+            "/v1/auth/sessions/{session_id}/revoke",
+            post(sessions_h::revoke_my_session),
         )
         .layer(cors)
         .with_state(state)

@@ -18,6 +18,7 @@ pub mod handlers {
     pub mod discovery;
     pub mod invites;
     pub mod oidc;
+    pub mod sessions;
 }
 
 pub use cookies::{clear_op_session_cookie, set_op_session_cookie, OP_SESSION_COOKIE};
