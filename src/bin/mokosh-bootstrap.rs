@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use mokosh_server::infisical::{run_dev_bootstrap, BootstrapInput, DevBootstrapConfig};
+use mokosh_server::version::VersionInfo;
 
 const DEFAULT_URL: &str = "http://localhost:28002";
 const DEFAULT_PROJECT_NAME: &str = "mokosh";
@@ -41,13 +42,20 @@ async fn main() -> ExitCode {
     let subcommand = args.get(1).map(String::as_str);
 
     match subcommand {
-        Some("bootstrap-infisical") => match run_bootstrap_infisical().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {:#}", e);
-                ExitCode::FAILURE
+        Some("--version") | Some("-V") => {
+            println!("{}", VersionInfo::current().banner());
+            ExitCode::SUCCESS
+        }
+        Some("bootstrap-infisical") => {
+            tracing::info!("Starting {}", VersionInfo::current().banner());
+            match run_bootstrap_infisical().await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Some("--help") | Some("-h") | None => {
             print_help();
             ExitCode::SUCCESS
@@ -62,13 +70,15 @@ async fn main() -> ExitCode {
 
 fn print_help() {
     eprintln!(
-        "mokosh-bootstrap - Mokosh Server bootstrap utility
+        "mokosh-bootstrap {version} ({hash}) - Mokosh Server bootstrap utility
+Built {date}.
 
 USAGE:
     mokosh-bootstrap <SUBCOMMAND>
 
 SUBCOMMANDS:
     bootstrap-infisical    First-run setup of a fresh Infisical instance.
+    --version, -V          Print version information and exit.
 
 ENVIRONMENT (bootstrap-infisical):
     INFISICAL_ADMIN_EMAIL          (required) Admin user email.
@@ -88,6 +98,9 @@ ENVIRONMENT (bootstrap-infisical):
         identity = DEFAULT_IDENTITY_NAME,
         env = DEFAULT_ENVIRONMENT,
         file = DEFAULT_ENV_FILE,
+        version = mokosh_server::version::GIT_DESCRIBE,
+        hash = mokosh_server::version::GIT_HASH,
+        date = mokosh_server::version::BUILD_DATE,
     );
 }
 

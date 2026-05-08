@@ -8,7 +8,9 @@ pub mod error;
 pub mod infisical;
 pub mod modules;
 pub mod utils;
+pub mod version;
 
 pub use db::Database;
 pub use modules::auth::{AuthState, CurrentUser};
 pub use utils::error::{AppError, AppResult};
+pub use version::VersionInfo;
