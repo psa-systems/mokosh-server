@@ -8,7 +8,8 @@
 
 use chrono::Duration;
 use mokosh_auth_core::{
-    AuditEvent, AuthError, OpSession, OpSessionRepository, TenantId, UserRepository, UserStatus,
+    AuditEvent, AuthError, OpSession, OpSessionRepository, TenantId, User, UserRepository,
+    UserStatus,
 };
 use mokosh_auth_crypto::password::verify_password;
 use serde::Deserialize;
@@ -26,6 +27,15 @@ pub struct LocalLoginRequest {
     pub password: String,
 }
 
+/// Result of a successful local-password login. Bundles the OP session
+/// (whose `sid` becomes the cookie value) with the authenticated User
+/// so HTTP-layer callers can mint OIDC tokens for first-party SPA
+/// clients without an extra `users.find_by_id` round-trip.
+pub struct LocalLoginOk {
+    pub session: OpSession,
+    pub user: User,
+}
+
 pub struct LocalAuth {
     pub users: Arc<dyn UserRepository>,
     pub sessions: Arc<dyn OpSessionRepository>,
@@ -39,7 +49,7 @@ impl LocalAuth {
         req: LocalLoginRequest,
         ip: Option<std::net::IpAddr>,
         user_agent: Option<&str>,
-    ) -> Result<OpSession, AuthError> {
+    ) -> Result<LocalLoginOk, AuthError> {
         // Always do a password verification, even when the user does not
         // exist or the tenant is ambiguous, to avoid a username-
         // enumeration timing oracle. We use a fixed dummy hash known to
@@ -176,7 +186,7 @@ impl LocalAuth {
             )
             .await;
 
-        Ok(session)
+        Ok(LocalLoginOk { session, user })
     }
 }
 

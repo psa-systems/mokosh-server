@@ -14,7 +14,7 @@ use url::Url;
 use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
-    auth as auth_h, discovery as disc_h, invites as invites_h, login_ui as login_h, oidc as oidc_h,
+    auth as auth_h, discovery as disc_h, invites as invites_h, oidc as oidc_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -78,9 +78,13 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route("/oauth2/userinfo", get(oidc_h::userinfo))
         .route("/oauth2/revoke", post(oidc_h::revoke))
         .route("/oauth2/logout", get(oidc_h::logout))
-        // OP own login UI: HTML form (browser flow).
-        .route("/login", get(login_h::login_form).post(login_h::login_submit))
-        // JSON API equivalents (used by client SDKs / native apps).
+        // Local password authentication. The SPA posts here directly and
+        // (when supplying `client_id`) gets back a token bundle, so users
+        // never see a separate OP-hosted login form. The OIDC authorize
+        // endpoint above is kept available for future relying parties; if
+        // they hit it without an OP session we currently 404 the
+        // login-redirect path - that gets wired to a real RP login screen
+        // when the first external RP is onboarded.
         .route("/v1/auth/login", post(auth_h::login))
         .route("/v1/auth/logout", post(auth_h::logout))
         // Admin invites (admin-gated)

@@ -3,7 +3,7 @@
 //! The only crate that knows about Axum, cookies, request parsing, and
 //! HTTP error mapping. Composing the router happens through
 //! [`build_router`], which takes a populated `OidcProvider` plus the
-//! `LocalAuth` service for the OP's own login UI.
+//! `LocalAuth` service for password-based logins.
 
 pub mod cookies;
 pub mod email;
@@ -17,7 +17,6 @@ pub mod handlers {
     pub mod auth;
     pub mod discovery;
     pub mod invites;
-    pub mod login_ui;
     pub mod oidc;
 }
 
