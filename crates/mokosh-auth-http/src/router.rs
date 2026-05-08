@@ -43,6 +43,12 @@ pub struct AuthHttpState {
     /// Outbound email for invites (and future password reset / magic
     /// link). Stub `LogMailer` in dev; `LettreMailer` in prod.
     pub mailer: Arc<dyn Mailer>,
+    /// Public URL the SPA serves the invite-accept page on (e.g.
+    /// `https://${USER}-mokosh.a8n.run`). Combined with the raw token
+    /// to build the shareable invite link returned in the issue +
+    /// resend responses, so admins can copy the link directly out of
+    /// the UI without depending on email delivery.
+    pub accept_base_url: String,
     /// Tenant-name resolver. The auth crates do not own the tenants
     /// table, so the host app injects this closure.
     pub tenant_name: TenantNameLookup,

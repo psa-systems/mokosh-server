@@ -138,7 +138,9 @@ pub async fn bootstrap(
     let accept_base_url = std::env::var("MOKOSH_ACCEPT_BASE_URL")
         .or_else(|_| std::env::var("CLIENT_ORIGIN"))
         .unwrap_or_else(|_| cfg.issuer.as_str().trim_end_matches('/').to_string());
-    let mailer: Arc<dyn Mailer> = Arc::new(LogMailer { accept_base_url });
+    let mailer: Arc<dyn Mailer> = Arc::new(LogMailer {
+        accept_base_url: accept_base_url.clone(),
+    });
 
     // Tenant-name lookup: the auth crates do not own public.tenants, so
     // we inject a closure that runs a single query against the same
@@ -164,6 +166,7 @@ pub async fn bootstrap(
         rate_limiter: Arc::new(RateLimiter::new()),
         invites,
         mailer,
+        accept_base_url,
         tenant_name,
     });
 

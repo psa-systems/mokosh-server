@@ -21,8 +21,14 @@ use uuid::Uuid;
 
 use crate::email::display_name;
 use crate::errors::HttpError;
-use crate::extractors::CurrentUser;
+use crate::extractors::BearerUser;
 use crate::router::AuthHttpState;
+
+/// Build the user-facing accept URL admins copy out of the UI when
+/// SMTP is not configured: `<accept_base_url>/invite/<raw_token>`.
+fn build_accept_url(base: &str, raw_token: &str) -> String {
+    format!("{}/invite/{}", base.trim_end_matches('/'), raw_token)
+}
 
 const INVITE_TTL_DAYS: i64 = 7;
 
@@ -149,7 +155,7 @@ fn invite_not_found() -> Response {
 /// `POST /v1/auth/invites`
 pub async fn issue(
     State(st): State<Arc<AuthHttpState>>,
-    CurrentUser(admin): CurrentUser,
+    BearerUser(admin): BearerUser,
     Json(body): Json<IssueInviteBody>,
 ) -> Result<Response, HttpError> {
     require_admin(&admin)?;
@@ -227,7 +233,14 @@ pub async fn issue(
         )
         .await;
 
-    let mut body = json!({ "invite": invite_view(invite, admin.email.clone()) });
+    let accept_url = build_accept_url(&st.accept_base_url, &raw_token);
+    let mut body = json!({
+        "invite": invite_view(invite, admin.email.clone()),
+        // Returned so the issuing admin can copy a shareable link
+        // directly out of the UI. SMTP delivery (when configured) is
+        // additive; this stays the canonical recipe-of-record.
+        "accept_url": accept_url,
+    });
     if let Some(w) = mail_warning {
         body["warning"] = json!(w);
     }
@@ -237,7 +250,7 @@ pub async fn issue(
 /// `GET /v1/auth/invites` - list open invites for caller's tenant.
 pub async fn list_open(
     State(st): State<Arc<AuthHttpState>>,
-    CurrentUser(admin): CurrentUser,
+    BearerUser(admin): BearerUser,
 ) -> Result<Response, HttpError> {
     require_admin(&admin)?;
 
@@ -266,7 +279,7 @@ pub async fn list_open(
 /// `POST /v1/auth/invites/:invite_id/revoke`
 pub async fn revoke(
     State(st): State<Arc<AuthHttpState>>,
-    CurrentUser(admin): CurrentUser,
+    BearerUser(admin): BearerUser,
     Path(invite_id): Path<Uuid>,
     Json(body): Json<RevokeBody>,
 ) -> Result<Response, HttpError> {
@@ -313,7 +326,7 @@ pub async fn revoke(
 /// `POST /v1/auth/invites/:invite_id/resend` - new token, push expiry.
 pub async fn resend(
     State(st): State<Arc<AuthHttpState>>,
-    CurrentUser(admin): CurrentUser,
+    BearerUser(admin): BearerUser,
     Path(invite_id): Path<Uuid>,
 ) -> Result<Response, HttpError> {
     require_admin(&admin)?;
@@ -328,14 +341,13 @@ pub async fn resend(
         Err(e) => return Err(HttpError(e)),
     };
 
-    if let Err(e) = st.mailer.send_invite(&invite, &raw_token, &admin).await {
-        tracing::error!(invite_id = %invite.id, "resend email send failed: {e}");
-        return Ok((
-            StatusCode::OK,
-            Json(json!({ "warning": "email_send_failed" })),
-        )
-            .into_response());
-    }
+    let mail_warning = match st.mailer.send_invite(&invite, &raw_token, &admin).await {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::error!(invite_id = %invite.id, "resend email send failed: {e}");
+            Some("email_send_failed")
+        }
+    };
 
     let _ = st
         .provider
@@ -347,14 +359,19 @@ pub async fn resend(
             AuditEvent::InviteIssued {
                 invite_id: invite.id,
                 tenant_id: admin.tenant_id,
-                email: invite.email,
+                email: invite.email.clone(),
                 role: invite.role,
                 invited_by: admin.id,
             },
         )
         .await;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let accept_url = build_accept_url(&st.accept_base_url, &raw_token);
+    let mut body = json!({ "accept_url": accept_url });
+    if let Some(w) = mail_warning {
+        body["warning"] = json!(w);
+    }
+    Ok((StatusCode::OK, Json(body)).into_response())
 }
 
 // ---------------------------------------------------------------------------
