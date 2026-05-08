@@ -49,6 +49,18 @@ const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 
+/// Crate version from `Cargo.toml`.
+pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `git describe --tags --always --dirty` at build time. See `build.rs`.
+pub const GIT_DESCRIBE: &str = env!("MOKOSH_GIT_DESCRIBE");
+
+/// Short git commit hash captured at build time.
+pub const GIT_HASH: &str = env!("MOKOSH_GIT_HASH");
+
+/// ISO-8601 UTC build timestamp.
+pub const BUILD_DATE: &str = env!("MOKOSH_BUILD_DATE");
+
 /// OAuth credentials + redirect URI.
 #[derive(Debug, Clone)]
 pub struct Config {
