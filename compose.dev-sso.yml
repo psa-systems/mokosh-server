@@ -55,6 +55,10 @@ services:
       MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: /app/secrets/dev-key.pem
       MOKOSH_AUTH_JWT_ACTIVE_KID: dev-key
       MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: /app/secrets
+      # Where invite emails point: the SPA's public URL. Without this
+      # the LogMailer falls back to CLIENT_ORIGIN (localhost:4301),
+      # which sends recipients to the wrong host on Traefik-routed dev.
+      MOKOSH_ACCEPT_BASE_URL: https://${USER}-mokosh.a8n.run
 
 networks:
   # The base compose.dev.yml normally owns and creates this network.

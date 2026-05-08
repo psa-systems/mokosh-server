@@ -37,6 +37,10 @@ fn event_kind(e: &AuditEvent) -> &'static str {
         KeyRotated { .. } => "key_rotated",
         SuspiciousActivity { .. } => "suspicious_activity",
         AdminAction { .. } => "admin_action",
+        InviteIssued { .. } => "invite_issued",
+        InviteRevoked { .. } => "invite_revoked",
+        InviteAccepted { .. } => "invite_accepted",
+        InviteAttemptFailed { .. } => "invite_attempt_failed",
     }
 }
 

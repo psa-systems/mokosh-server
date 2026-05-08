@@ -42,6 +42,24 @@ pub struct RateLimiter {
     /// the honest steady state but well below any meaningful brute
     /// force.
     token_by_ip: std::sync::Arc<Keyed<IpAddr>>,
+    /// Invite-issuance attempts by issuing admin (per-user). 30/hour
+    /// covers a busy onboarding burst without making spam practical.
+    invite_issue_by_admin: std::sync::Arc<Keyed<mokosh_auth_core::UserId>>,
+    /// Invite-issuance attempts to a given email (per-tenant scope is
+    /// captured via the email being unique within tenant). 3/hour
+    /// stops a malicious or careless admin from blasting one inbox.
+    invite_issue_by_email: std::sync::Arc<Keyed<String>>,
+    /// Invite-token lookups by IP. 30/min - generous for legitimate
+    /// retries (the accept page may load twice, the user may copy-
+    /// paste the link), tight enough to make token-bruteforcing
+    /// pointless against a 32-byte token.
+    invite_lookup_by_ip: std::sync::Arc<Keyed<IpAddr>>,
+    /// Lookups for a specific token-hash. 10/hour. Stops a single
+    /// linked invite being polled.
+    invite_lookup_by_token: std::sync::Arc<Keyed<[u8; 32]>>,
+    /// Accept attempts by IP. 10/hour - a legitimate accept happens
+    /// once.
+    invite_accept_by_ip: std::sync::Arc<Keyed<IpAddr>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,11 +88,59 @@ impl RateLimiter {
         // every ~10 minutes per session.
         let token_quota = Quota::per_minute(nz(60));
 
+        let hour = Duration::from_secs(3600);
+        let invite_admin_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(30));
+        let invite_email_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(3));
+        let invite_lookup_ip_quota = Quota::per_minute(nz(30));
+        let invite_lookup_token_quota =
+            Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
+        let invite_accept_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
+
         Self {
             login_by_ip: std::sync::Arc::new(Governor::keyed(login_ip_quota)),
             login_by_email: std::sync::Arc::new(Governor::keyed(login_email_quota)),
             token_by_ip: std::sync::Arc::new(Governor::keyed(token_quota)),
+            invite_issue_by_admin: std::sync::Arc::new(Governor::keyed(invite_admin_quota)),
+            invite_issue_by_email: std::sync::Arc::new(Governor::keyed(invite_email_quota)),
+            invite_lookup_by_ip: std::sync::Arc::new(Governor::keyed(invite_lookup_ip_quota)),
+            invite_lookup_by_token: std::sync::Arc::new(Governor::keyed(invite_lookup_token_quota)),
+            invite_accept_by_ip: std::sync::Arc::new(Governor::keyed(invite_accept_quota)),
         }
+    }
+
+    pub fn check_invite_issue(
+        &self,
+        admin: mokosh_auth_core::UserId,
+        email: &str,
+    ) -> Result<(), RateLimited> {
+        self.invite_issue_by_admin
+            .check_key(&admin)
+            .map_err(|n| RateLimited::from_negative(&n))?;
+        let key = email.trim().to_ascii_lowercase();
+        if !key.is_empty() {
+            self.invite_issue_by_email
+                .check_key(&key)
+                .map_err(|n| RateLimited::from_negative(&n))?;
+        }
+        Ok(())
+    }
+
+    pub fn check_invite_lookup(&self, ip: IpAddr, token: &str) -> Result<(), RateLimited> {
+        self.invite_lookup_by_ip
+            .check_key(&ip)
+            .map_err(|n| RateLimited::from_negative(&n))?;
+        let h = mokosh_auth_crypto::hash_opaque_token(token);
+        self.invite_lookup_by_token
+            .check_key(&h)
+            .map_err(|n| RateLimited::from_negative(&n))?;
+        Ok(())
+    }
+
+    pub fn check_invite_accept(&self, ip: IpAddr) -> Result<(), RateLimited> {
+        self.invite_accept_by_ip
+            .check_key(&ip)
+            .map_err(|n| RateLimited::from_negative(&n))?;
+        Ok(())
     }
 
     /// Check before processing a login request.

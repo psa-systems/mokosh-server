@@ -376,6 +376,33 @@ pub enum AuditEvent {
     KeyRotated { kid_old: String, kid_new: String },
     SuspiciousActivity { description: String, ip: Option<String> },
     AdminAction { admin_id: UserId, action: String, target: String },
+    InviteIssued {
+        invite_id: uuid::Uuid,
+        tenant_id: TenantId,
+        email: String,
+        role: UserRole,
+        invited_by: UserId,
+    },
+    InviteRevoked {
+        invite_id: uuid::Uuid,
+        revoked_by: UserId,
+        reason: String,
+    },
+    InviteAccepted {
+        invite_id: uuid::Uuid,
+        new_user_id: UserId,
+        tenant_id: TenantId,
+        email: String,
+        role: UserRole,
+    },
+    /// Used for failed lookups + failed accepts. We log only the first
+    /// 8 hex chars of the SHA-256 hash so the raw token never touches
+    /// the audit table even on replay attempts.
+    InviteAttemptFailed {
+        token_hash_prefix: String,
+        ip: Option<String>,
+        reason: String,
+    },
 }
 
 impl AuditEvent {
@@ -384,7 +411,9 @@ impl AuditEvent {
         match self {
             LoginFailed { .. } | PasswordResetRequested { .. } => AuditSeverity::Info,
             RefreshReuseDetected { .. } | SuspiciousActivity { .. } => AuditSeverity::Critical,
-            ClientDisabled { .. } | SessionRevoked { .. } => AuditSeverity::Warning,
+            ClientDisabled { .. } | SessionRevoked { .. } | InviteRevoked { .. } => {
+                AuditSeverity::Warning
+            }
             _ => AuditSeverity::Info,
         }
     }

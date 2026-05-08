@@ -6,6 +6,7 @@
 //! `LocalAuth` service for the OP's own login UI.
 
 pub mod cookies;
+pub mod email;
 pub mod errors;
 pub mod extractors;
 pub mod local_auth;
@@ -15,12 +16,14 @@ pub mod router;
 pub mod handlers {
     pub mod auth;
     pub mod discovery;
+    pub mod invites;
     pub mod login_ui;
     pub mod oidc;
 }
 
 pub use cookies::{clear_op_session_cookie, set_op_session_cookie, OP_SESSION_COOKIE};
+pub use email::{LogMailer, Mailer};
 pub use errors::HttpError;
 pub use local_auth::{LocalAuth, LocalLoginRequest};
 pub use rate_limit::{RateLimited, RateLimiter};
-pub use router::{build_router, AuthHttpState};
+pub use router::{build_router, AuthHttpState, TenantNameLookup};

@@ -149,3 +149,108 @@ pub trait AuditLogger: Send + Sync {
 pub trait RandomSource: Send + Sync {
     fn fill(&self, buf: &mut [u8]);
 }
+
+// ---------------------------------------------------------------------------
+// Admin invites
+// ---------------------------------------------------------------------------
+
+/// Domain payload for the admin-issued invite system. Storage layer
+/// owns the `id`, `issued_at`, and the `token_hash` (it hashes the raw
+/// token internally on insert).
+#[derive(Clone, Debug)]
+pub struct NewInvite {
+    pub tenant_id: TenantId,
+    pub email: String,
+    pub role: UserRole,
+    pub token: String,
+    pub invited_by: UserId,
+    pub expires_at: DateTime<Utc>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Invite {
+    pub id: uuid::Uuid,
+    pub tenant_id: TenantId,
+    pub email: String,
+    pub role: UserRole,
+    pub invited_by: UserId,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub used_at: Option<DateTime<Utc>>,
+    pub used_by: Option<UserId>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: Option<UserId>,
+    pub revoke_reason: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Repository for the admin-invite flow. See
+/// `docs/mokosh-auth/01-schema.md` for the contract.
+#[async_trait]
+pub trait InviteRepository: Send + Sync {
+    /// Insert a new invite. The implementation hashes `new.token`
+    /// (SHA-256) before storage; the raw value never persists.
+    /// Errors with `Conflict("...")` if an open invite already exists
+    /// for `(tenant_id, email)` (the partial-unique-index will reject
+    /// the insert; the impl translates that into a clean Conflict).
+    async fn issue(&self, new: NewInvite) -> Result<Invite, AuthError>;
+
+    /// Find an invite by raw token. Returns `None` for any
+    /// non-acceptable state (unknown, used, revoked, expired) so the
+    /// caller treats them uniformly.
+    async fn find_open_by_token(&self, token: &str) -> Result<Option<Invite>, AuthError>;
+
+    /// Find an invite by id, tenant-scoped. Returns `None` if no row
+    /// matches the (id, tenant) pair, which is also the right answer
+    /// for cross-tenant lookups (defence-in-depth on top of the
+    /// handler's tenant check).
+    async fn find_by_id(
+        &self,
+        invite_id: uuid::Uuid,
+        tenant_id: TenantId,
+    ) -> Result<Option<Invite>, AuthError>;
+
+    /// Find the open invite (if any) for `(tenant_id, email)`. Used by
+    /// the issuance handler to populate `existing_invite_id` in the
+    /// 409 response.
+    async fn find_open_by_email(
+        &self,
+        tenant_id: TenantId,
+        email: &str,
+    ) -> Result<Option<Invite>, AuthError>;
+
+    /// List all OPEN invites for a tenant, newest first.
+    async fn list_open(&self, tenant_id: TenantId) -> Result<Vec<Invite>, AuthError>;
+
+    /// Revoke an open invite. Idempotent: revoking a revoked or used
+    /// invite returns Ok(()) so the admin UI can retry safely.
+    async fn revoke(
+        &self,
+        invite_id: uuid::Uuid,
+        tenant_id: TenantId,
+        revoked_by: UserId,
+        reason: &str,
+    ) -> Result<(), AuthError>;
+
+    /// Replace the token on an open invite (resend flow). Pushes
+    /// `expires_at` forward by `ttl_days`. Returns the new raw token
+    /// so the caller can email it.
+    async fn replace_token(
+        &self,
+        invite_id: uuid::Uuid,
+        tenant_id: TenantId,
+        ttl_days: i64,
+    ) -> Result<(Invite, String), AuthError>;
+
+    /// Atomic accept under SERIALIZABLE isolation. Marks the invite
+    /// used AND inserts the new user in one transaction. Returns the
+    /// created user.
+    async fn accept(
+        &self,
+        token: &str,
+        password_hash: &str,
+        first_name: Option<&str>,
+        last_name: Option<&str>,
+    ) -> Result<User, AuthError>;
+}

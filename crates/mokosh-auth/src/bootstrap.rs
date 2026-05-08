@@ -18,12 +18,16 @@ use axum::Router;
 use chrono::Duration;
 use mokosh_auth_core::{Clock, time::SystemClock};
 use mokosh_auth_crypto::OidcKeySet;
+use mokosh_auth_core::TenantId;
 use mokosh_auth_http::cookies::CookieConfig;
-use mokosh_auth_http::{build_router, AuthHttpState, LocalAuth, RateLimiter};
+use mokosh_auth_http::{
+    build_router, AuthHttpState, LocalAuth, LogMailer, Mailer, RateLimiter, TenantNameLookup,
+};
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
     run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
-    PgOAuthClientRepository, PgOpSessionRepository, PgRefreshTokenRepository, PgUserRepository,
+    PgInviteRepository, PgOAuthClientRepository, PgOpSessionRepository, PgRefreshTokenRepository,
+    PgUserRepository,
 };
 use std::sync::Arc;
 use url::Url;
@@ -127,12 +131,40 @@ pub async fn bootstrap(
         secure: !is_local_issuer(&cfg.issuer),
     };
 
+    let invites = Arc::new(PgInviteRepository::new(auth_pool.clone()));
+
+    // Phase-1 mailer: log link to tracing. Production deploys swap this
+    // for `LettreMailer` once SMTP is wired (see docs/mokosh-auth/04-email.md).
+    let accept_base_url = std::env::var("MOKOSH_ACCEPT_BASE_URL")
+        .or_else(|_| std::env::var("CLIENT_ORIGIN"))
+        .unwrap_or_else(|_| cfg.issuer.as_str().trim_end_matches('/').to_string());
+    let mailer: Arc<dyn Mailer> = Arc::new(LogMailer { accept_base_url });
+
+    // Tenant-name lookup: the auth crates do not own public.tenants, so
+    // we inject a closure that runs a single query against the same
+    // pool. Bounds the cross-schema coupling to one line.
+    let tenant_pool = auth_pool.clone();
+    let tenant_name: TenantNameLookup = Arc::new(move |tid: TenantId| {
+        let pool = tenant_pool.clone();
+        Box::pin(async move {
+            sqlx::query_scalar::<_, String>("SELECT name FROM public.tenants WHERE id = $1")
+                .bind(tid.0)
+                .fetch_optional(pool.pg())
+                .await
+                .ok()
+                .flatten()
+        })
+    });
+
     let state = Arc::new(AuthHttpState {
         provider: provider.clone(),
         local_auth,
         cookie_cfg,
         login_url,
         rate_limiter: Arc::new(RateLimiter::new()),
+        invites,
+        mailer,
+        tenant_name,
     });
 
     Ok(MokoshAuth { provider, state })

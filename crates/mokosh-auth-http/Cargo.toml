@@ -28,3 +28,6 @@ time = "0.3"
 http = "1"
 urlencoding = "2"
 governor = "0.8"
+futures-util = "0.3"
+sha2 = { workspace = true }
+tokio = { workspace = true }
