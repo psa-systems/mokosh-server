@@ -120,6 +120,32 @@ pub async fn login(
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
+
+    // If the browser already has a valid OP session cookie, revoke
+    // the corresponding session before creating a new one. Without
+    // this, every fresh sign-in (re-login from the same browser,
+    // every CI smoke test, every dev-tools "Sign in" click) leaks
+    // a new `op_sessions` row and the user's "active sessions" page
+    // accumulates indefinitely. The 30-day cookie TTL is per-device
+    // by design; we just want one row per device-cookie at a time.
+    if let Some(prior_sid) = jar
+        .get(crate::cookies::OP_SESSION_COOKIE)
+        .map(|c| c.value().to_string())
+    {
+        let now = st.provider.clock.now();
+        match st.provider.sessions.find_by_sid(&prior_sid).await {
+            Ok(Some(prior)) => {
+                let _ = st.provider.sessions.revoke(prior.id, now).await;
+                let _ = st
+                    .provider
+                    .refresh
+                    .revoke_families_for_session(prior.id, "superseded_by_login", now)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
     let local_req = crate::local_auth::LocalLoginRequest {
         // Email is globally unique post phase-1; lookup is by email
         // alone. The legacy tenant pin is no longer load-bearing for
