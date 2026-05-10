@@ -30,6 +30,7 @@ pub(crate) struct UserRow {
     pub locale: String,
     pub mfa_enrolled: bool,
     pub last_login_at: Option<DateTime<Utc>>,
+    pub last_active_tenant: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -53,6 +54,7 @@ impl TryFrom<UserRow> for User {
             locale: r.locale,
             mfa_enrolled: r.mfa_enrolled,
             last_login_at: r.last_login_at,
+            last_active_tenant: r.last_active_tenant.map(TenantId),
             created_at: r.created_at,
             updated_at: r.updated_at,
         })

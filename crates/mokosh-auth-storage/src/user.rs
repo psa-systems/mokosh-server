@@ -13,7 +13,8 @@ pub(crate) const SELECT_USER_PUB: &str = SELECT_USER;
 const SELECT_USER: &str = r#"
     SELECT id, tenant_id, email, email_verified_at, password_hash,
            role, status, first_name, last_name, timezone, locale,
-           mfa_enrolled, last_login_at, created_at, updated_at
+           mfa_enrolled, last_login_at, last_active_tenant,
+           created_at, updated_at
     FROM mokosh_auth.users
 "#;
 
@@ -95,7 +96,8 @@ impl UserRepository for PgUserRepository {
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, tenant_id, email, email_verified_at, password_hash,
                        role, status, first_name, last_name, timezone, locale,
-                       mfa_enrolled, last_login_at, created_at, updated_at"
+                       mfa_enrolled, last_login_at, last_active_tenant,
+                       created_at, updated_at"
         ))
         .bind(new.tenant_id.0)
         .bind(&new.email)
@@ -142,6 +144,24 @@ impl UserRepository for PgUserRepository {
             .execute(self.pool.pg())
             .await
             .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn set_last_active_tenant(
+        &self,
+        id: UserId,
+        tenant_id: Option<mokosh_auth_core::TenantId>,
+    ) -> Result<(), AuthError> {
+        sqlx::query(
+            "UPDATE mokosh_auth.users
+             SET last_active_tenant = $1, updated_at = NOW()
+             WHERE id = $2",
+        )
+        .bind(tenant_id.map(|t| t.0))
+        .bind(id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 

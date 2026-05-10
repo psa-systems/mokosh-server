@@ -25,8 +25,16 @@ pub struct AccessTokenClaims {
     pub aud: String,           // client.audience
     pub client_id: String,
     /// Mokosh-specific. Namespaced (`mokosh_tenant_id`) so it cannot be
-    /// confused with anyone else's `tenant_id` claim.
+    /// confused with anyone else's `tenant_id` claim. Historically the
+    /// "home tenant"; with memberships it equals `mokosh_active_tenant`
+    /// for now and is kept for backcompat with relying parties that
+    /// have not learned the active-tenant claim yet.
     pub mokosh_tenant_id: String,
+    /// The tenant the user is *currently acting under*. With the
+    /// memberships model a user can have many; this claim pins the
+    /// one this token is good for. RPs MUST gate authorization on
+    /// this claim, not on `mokosh_tenant_id`.
+    pub mokosh_active_tenant: String,
     pub scope: String,         // space-separated
     pub jti: String,
     pub iat: i64,
@@ -53,6 +61,7 @@ pub struct IdTokenClaims {
     pub acr: String,
     pub amr: Vec<String>,
     pub mokosh_tenant_id: String,
+    pub mokosh_active_tenant: String,
     pub mokosh_role: String,
     // OIDC Core "email" scope claims, populated only when the scope is granted.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +93,14 @@ pub struct MintedAccessToken {
 }
 
 /// Mint an RFC 9068 access token.
+///
+/// `active_tenant` is the tenant context this token authorizes. For
+/// pre-memberships call sites pass `user.tenant_id` (the home tenant)
+/// and the result matches the historical behaviour. With memberships,
+/// the caller resolves the active tenant from the request (explicit
+/// `tenant_id` body field at login, `users.last_active_tenant`, or
+/// home tenant) and passes it here; the claim flows to RPs as
+/// `mokosh_active_tenant`.
 pub fn mint_access_token(
     keys: &OidcKeySet,
     cfg: &EngineConfig,
@@ -93,6 +110,7 @@ pub fn mint_access_token(
     auth_time: DateTime<Utc>,
     acr: &str,
     amr: &[String],
+    active_tenant: mokosh_auth_core::TenantId,
     now: DateTime<Utc>,
 ) -> Result<MintedAccessToken, AuthError> {
     let exp = now + client.access_token_ttl;
@@ -103,6 +121,7 @@ pub fn mint_access_token(
         aud: client.audience.clone(),
         client_id: client.client_id.0.to_string(),
         mokosh_tenant_id: user.tenant_id.0.to_string(),
+        mokosh_active_tenant: active_tenant.0.to_string(),
         scope: scope.join(" "),
         jti: jti.clone(),
         iat: now.timestamp(),
@@ -139,6 +158,7 @@ pub fn mint_id_token(
     amr: &[String],
     nonce: Option<&str>,
     access_token: &str,
+    active_tenant: mokosh_auth_core::TenantId,
     now: DateTime<Utc>,
 ) -> Result<String, AuthError> {
     let exp = now + client.access_token_ttl;
@@ -158,6 +178,7 @@ pub fn mint_id_token(
         acr: acr.to_string(),
         amr: amr.to_vec(),
         mokosh_tenant_id: user.tenant_id.0.to_string(),
+        mokosh_active_tenant: active_tenant.0.to_string(),
         mokosh_role: user.role.as_str().to_string(),
         email: include_email.then(|| user.email.clone()),
         email_verified: include_email.then(|| user.email_verified_at.is_some()),

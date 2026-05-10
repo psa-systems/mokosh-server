@@ -89,6 +89,11 @@ pub struct User {
     pub locale: String,
     pub mfa_enrolled: bool,
     pub last_login_at: Option<DateTime<Utc>>,
+    /// Tenant the user was most recently acting under. `None` means
+    /// "use the home tenant" (`tenant_id` field above). Read at login
+    /// time to resolve the active-tenant token claim; updated by the
+    /// /v1/auth/active-tenant switcher endpoint.
+    pub last_active_tenant: Option<TenantId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

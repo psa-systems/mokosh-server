@@ -17,7 +17,7 @@ use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
     auth as auth_h, discovery as disc_h, invites as invites_h, oidc as oidc_h,
-    sessions as sessions_h, signup as signup_h, users as users_h,
+    sessions as sessions_h, signup as signup_h, tenants as tenants_h, users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -28,6 +28,12 @@ use crate::rate_limit::RateLimiter;
 /// tenant ids; callers fall back to a generic "Mokosh" label.
 pub type TenantNameLookup =
     Arc<dyn Fn(TenantId) -> BoxFuture<'static, Option<String>> + Send + Sync>;
+
+/// Resolve a tenant's display name AND kind ("personal" | "org").
+/// Used by /v1/auth/memberships to render the switcher with
+/// appropriate badges. Same isolation reason as TenantNameLookup.
+pub type TenantInfoLookup =
+    Arc<dyn Fn(TenantId) -> BoxFuture<'static, Option<(String, String)>> + Send + Sync>;
 
 /// Create a brand-new personal tenant for a self-signing-up user.
 /// Inserts a row in `public.tenants` (kind='personal', name derived
@@ -83,6 +89,10 @@ pub struct AuthHttpState {
     /// Tenant-name resolver. The auth crates do not own the tenants
     /// table, so the host app injects this closure.
     pub tenant_name: TenantNameLookup,
+    /// Tenant info resolver: name + kind. Used by the memberships
+    /// endpoint and the SPA tenant switcher; injected for the same
+    /// schema-isolation reason as `tenant_name`.
+    pub tenant_info: TenantInfoLookup,
 }
 
 pub fn build_router(state: Arc<AuthHttpState>) -> Router {
@@ -169,6 +179,12 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route(
             "/v1/auth/signup/by-token/{token}/complete",
             post(signup_h::complete),
+        )
+        // Membership-aware tenant switcher. Bearer-authed.
+        .route("/v1/auth/memberships", get(tenants_h::list_my_memberships))
+        .route(
+            "/v1/auth/active-tenant",
+            post(tenants_h::switch_active_tenant),
         )
         .layer(cors)
         .with_state(state)

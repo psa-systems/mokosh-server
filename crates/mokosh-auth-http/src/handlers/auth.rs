@@ -41,12 +41,18 @@ use crate::router::AuthHttpState;
 const DEFAULT_FIRST_PARTY_SCOPE: &[&str] = &["openid", "email", "offline_access"];
 
 /// Request body for `/v1/auth/login`. The local-auth fields
-/// (email, password, optional tenant pin) come from
-/// [`crate::local_auth::LocalLoginRequest`]; the OIDC fields are
-/// optional and only consulted when the caller wants tokens minted
-/// in the same call.
+/// (email, password) come from [`crate::local_auth::LocalLoginRequest`];
+/// the OIDC fields are optional and only consulted when the caller
+/// wants tokens minted in the same call.
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
+    /// Desired active tenant on success. Must be a tenant the user
+    /// has an active membership in; otherwise the login fails with
+    /// 403. When omitted, the server falls back to
+    /// `users.last_active_tenant` and finally to the home tenant.
+    /// (Historically this field was a "tenant pin" for the local-
+    /// password lookup; with global email uniqueness that meaning
+    /// is moot, so we repurpose it for active-tenant selection.)
     #[serde(default)]
     pub tenant_id: Option<uuid::Uuid>,
     pub email: String,
@@ -67,7 +73,13 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub user_id: String,
+    /// Home tenant (legacy, kept for backcompat with clients that
+    /// have not learned the active-tenant model yet).
     pub tenant_id: String,
+    /// The tenant the SPA should act under from this point. Equals
+    /// the request's tenant_id (when supplied and authorized), the
+    /// user's last_active_tenant, or the home tenant.
+    pub active_tenant_id: String,
     /// Present when the request supplied `client_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenBundle>,
@@ -109,14 +121,45 @@ pub async fn login(
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
     let local_req = crate::local_auth::LocalLoginRequest {
-        tenant_id: req.tenant_id,
+        // Email is globally unique post phase-1; lookup is by email
+        // alone. The legacy tenant pin is no longer load-bearing for
+        // login (it is repurposed below for active-tenant selection).
+        tenant_id: None,
         email: req.email.clone(),
         password: req.password.clone(),
     };
     let ok = st.local_auth.login(local_req, ip, ua).await?;
 
+    // Resolve active tenant: explicit request -> last_active_tenant ->
+    // home tenant. The explicit value MUST correspond to a real,
+    // active membership for this user; otherwise we 403.
+    let requested = req.tenant_id.map(mokosh_auth_core::TenantId);
+    let active_tenant = match requested {
+        Some(tid) => {
+            let m = st.memberships.find(ok.user.id, tid).await?;
+            match m {
+                Some(m) if matches!(m.status, mokosh_auth_core::MembershipStatus::Active) => tid,
+                _ => {
+                    return Err(HttpError(mokosh_auth_core::AuthError::Forbidden(
+                        "no active membership in requested tenant".into(),
+                    )));
+                }
+            }
+        }
+        None => ok
+            .user
+            .last_active_tenant
+            .unwrap_or(ok.user.tenant_id),
+    };
+    // Persist for next login. Best-effort; do not fail the call.
+    let _ = st
+        .provider
+        .users
+        .set_last_active_tenant(ok.user.id, Some(active_tenant))
+        .await;
+
     let tokens = if let Some(cid) = req.client_id {
-        Some(mint_first_party_tokens(&st, &ok, cid, req.scope.as_deref()).await?)
+        Some(mint_first_party_tokens(&st, &ok, cid, req.scope.as_deref(), active_tenant).await?)
     } else {
         None
     };
@@ -129,6 +172,7 @@ pub async fn login(
     let body = LoginResponse {
         user_id: ok.session.user_id.0.to_string(),
         tenant_id: ok.session.tenant_id.0.to_string(),
+        active_tenant_id: active_tenant.0.to_string(),
         tokens,
     };
     Ok((jar.add(cookie), Json(body)).into_response())
@@ -139,6 +183,7 @@ async fn mint_first_party_tokens(
     ok: &crate::local_auth::LocalLoginOk,
     client_id: uuid::Uuid,
     scope_param: Option<&str>,
+    active_tenant: mokosh_auth_core::TenantId,
 ) -> Result<TokenBundle, AuthError> {
     let provider = &st.provider;
     let client = provider
@@ -177,6 +222,7 @@ async fn mint_first_party_tokens(
         ok.session.created_at,
         acr,
         &amr,
+        active_tenant,
         now,
     )?;
     let id_token = mint_id_token(
@@ -190,6 +236,7 @@ async fn mint_first_party_tokens(
         &amr,
         None,
         &access.token,
+        active_tenant,
         now,
     )?;
 

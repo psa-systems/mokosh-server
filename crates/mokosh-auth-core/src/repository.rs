@@ -38,6 +38,15 @@ pub trait UserRepository: Send + Sync {
     async fn set_password_hash(&self, id: UserId, hash: &str) -> Result<(), AuthError>;
     async fn set_status(&self, id: UserId, status: UserStatus) -> Result<(), AuthError>;
     async fn mark_email_verified(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
+    /// Update the user's `last_active_tenant` pointer. Called by
+    /// `/v1/auth/active-tenant` when the user switches tenants and
+    /// implicitly by login when an explicit tenant_id is supplied.
+    /// Pass `None` to clear (falls back to the home tenant).
+    async fn set_last_active_tenant(
+        &self,
+        id: UserId,
+        tenant_id: Option<TenantId>,
+    ) -> Result<(), AuthError>;
 }
 
 #[async_trait]

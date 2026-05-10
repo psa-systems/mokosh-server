@@ -22,7 +22,7 @@ use mokosh_auth_core::TenantId;
 use mokosh_auth_http::cookies::CookieConfig;
 use mokosh_auth_http::{
     build_router, AuthHttpState, LocalAuth, LogMailer, Mailer, PersonalTenantCreator, RateLimiter,
-    TenantNameLookup,
+    TenantInfoLookup, TenantNameLookup,
 };
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
@@ -231,6 +231,21 @@ pub async fn bootstrap(
         })
     });
 
+    let tenant_info_pool = auth_pool.clone();
+    let tenant_info: TenantInfoLookup = Arc::new(move |tid: TenantId| {
+        let pool = tenant_info_pool.clone();
+        Box::pin(async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT name, kind FROM public.tenants WHERE id = $1",
+            )
+            .bind(tid.0)
+            .fetch_optional(pool.pg())
+            .await
+            .ok()
+            .flatten()
+        })
+    });
+
     let state = Arc::new(AuthHttpState {
         provider: provider.clone(),
         local_auth,
@@ -245,6 +260,7 @@ pub async fn bootstrap(
         mailer,
         accept_base_url,
         tenant_name,
+        tenant_info,
     });
 
     Ok(MokoshAuth { provider, state })

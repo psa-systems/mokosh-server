@@ -148,6 +148,11 @@ async fn exchange_code(
     // Mint access + id tokens.
     let acr = consumed.acr.clone();
     let amr = consumed.amr.clone();
+    // Active tenant: home tenant for the OIDC code path. The
+    // membership-aware tenant switch lives on the SPA-only
+    // /v1/auth/login flow; external RPs see one tenant per token
+    // and would re-issue if the user wanted to switch.
+    let active_tenant = user.tenant_id;
     let access = mint_access_token(
         &p.keys,
         &p.cfg,
@@ -157,6 +162,7 @@ async fn exchange_code(
         consumed.auth_time,
         &acr,
         &amr,
+        active_tenant,
         now,
     )?;
     let id_token = mint_id_token(
@@ -170,6 +176,7 @@ async fn exchange_code(
         &amr,
         consumed.nonce.as_deref(),
         &access.token,
+        active_tenant,
         now,
     )?;
 
@@ -284,6 +291,11 @@ async fn exchange_refresh(
     // narrowed when the request specified one).
     let scope_vec = rotated.scope.clone();
 
+    // Refresh: preserve the active tenant from the user's
+    // last_active_tenant pointer, falling back to the home tenant.
+    // Switching tenants triggers a fresh /v1/auth/active-tenant call
+    // (which mints a new bundle and resets the family).
+    let active_tenant = user.last_active_tenant.unwrap_or(user.tenant_id);
     let access = mint_access_token(
         &p.keys,
         &p.cfg,
@@ -293,6 +305,7 @@ async fn exchange_refresh(
         now, // refresh-issued tokens get a current auth_time
         "urn:mokosh:loa:pwd",
         &["pwd".to_string()],
+        active_tenant,
         now,
     )?;
 
