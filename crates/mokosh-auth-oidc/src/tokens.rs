@@ -35,6 +35,12 @@ pub struct AccessTokenClaims {
     /// one this token is good for. RPs MUST gate authorization on
     /// this claim, not on `mokosh_tenant_id`.
     pub mokosh_active_tenant: String,
+    /// OP session id this token was minted under, when known.
+    /// Lets handlers identify the "current session" without
+    /// relying on the cookie. Refresh-grant tokens may omit it
+    /// (the refresh path doesn't carry session_id end-to-end yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mokosh_op_session_id: Option<String>,
     pub scope: String,         // space-separated
     pub jti: String,
     pub iat: i64,
@@ -111,6 +117,7 @@ pub fn mint_access_token(
     acr: &str,
     amr: &[String],
     active_tenant: mokosh_auth_core::TenantId,
+    op_session_id: Option<mokosh_auth_core::OpSessionId>,
     now: DateTime<Utc>,
 ) -> Result<MintedAccessToken, AuthError> {
     let exp = now + client.access_token_ttl;
@@ -122,6 +129,7 @@ pub fn mint_access_token(
         client_id: client.client_id.0.to_string(),
         mokosh_tenant_id: user.tenant_id.0.to_string(),
         mokosh_active_tenant: active_tenant.0.to_string(),
+        mokosh_op_session_id: op_session_id.map(|s| s.0.to_string()),
         scope: scope.join(" "),
         jti: jti.clone(),
         iat: now.timestamp(),

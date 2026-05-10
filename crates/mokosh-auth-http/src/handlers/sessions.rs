@@ -15,12 +15,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use mokosh_auth_core::{AuthError, OpSession, OpSessionId};
+use mokosh_auth_core::{AuthError, OpSessionId};
 use serde::Serialize;
 use std::sync::Arc;
 
 use crate::errors::HttpError;
-use crate::extractors::BearerUser;
+use crate::extractors::{BearerSessionId, BearerUser};
 use crate::router::AuthHttpState;
 
 #[derive(Debug, Serialize)]
@@ -33,19 +33,11 @@ pub struct SessionView {
     pub user_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
-}
-
-impl From<OpSession> for SessionView {
-    fn from(s: OpSession) -> Self {
-        Self {
-            id: s.id.0.to_string(),
-            created_at: s.created_at,
-            last_active_at: s.last_active_at,
-            expires_at: s.expires_at,
-            user_agent: s.user_agent,
-            ip: s.ip.map(|i| i.to_string()),
-        }
-    }
+    /// `true` when this row is the OP session the caller is signed
+    /// in under right now. Sourced from the `mokosh_op_session_id`
+    /// claim on the access token used to make this request. The SPA
+    /// renders a "Current session" badge on this row.
+    pub is_current: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +48,7 @@ pub struct SessionListResponse {
 pub async fn list_my_sessions(
     State(st): State<Arc<AuthHttpState>>,
     BearerUser(user): BearerUser,
+    BearerSessionId(current_sid): BearerSessionId,
 ) -> Result<Json<SessionListResponse>, HttpError> {
     let now = st.provider.clock.now();
     let sessions = st
@@ -64,9 +57,19 @@ pub async fn list_my_sessions(
         .list_active_for_user(user.id, now)
         .await
         .map_err(HttpError)?;
-    Ok(Json(SessionListResponse {
-        sessions: sessions.into_iter().map(SessionView::from).collect(),
-    }))
+    let views: Vec<SessionView> = sessions
+        .into_iter()
+        .map(|s| SessionView {
+            is_current: current_sid.map(|c| c == s.id).unwrap_or(false),
+            id: s.id.0.to_string(),
+            created_at: s.created_at,
+            last_active_at: s.last_active_at,
+            expires_at: s.expires_at,
+            user_agent: s.user_agent,
+            ip: s.ip.map(|i| i.to_string()),
+        })
+        .collect();
+    Ok(Json(SessionListResponse { sessions: views }))
 }
 
 pub async fn revoke_my_session(

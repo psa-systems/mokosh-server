@@ -5,7 +5,7 @@ use axum::http::header;
 use axum::http::request::Parts;
 use axum_extra::extract::cookie::CookieJar;
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
-use mokosh_auth_core::{AuthError, OpSession, User, UserId, UserStatus};
+use mokosh_auth_core::{AuthError, OpSession, OpSessionId, User, UserId, UserStatus};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -84,6 +84,71 @@ where
 /// `OidcKeySet` the issuer endpoint uses, so there is no JWKS fetch.
 #[derive(Debug, Clone)]
 pub struct BearerUser(pub User);
+
+/// Optional OP-session id parsed from the same Bearer access token
+/// the `BearerUser` extractor used. Returned alongside `BearerUser`
+/// when a route needs to identify the "current session" for the UI
+/// (e.g. the active-sessions list marks one row as "current"). The
+/// claim is omitted on refresh-grant tokens, so this is `Option`.
+#[derive(Debug, Clone)]
+pub struct BearerSessionId(pub Option<OpSessionId>);
+
+impl<S> FromRequestParts<S> for BearerSessionId
+where
+    S: Send + Sync,
+    Arc<AuthHttpState>: axum::extract::FromRef<S>,
+{
+    type Rejection = HttpError;
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let st: Arc<AuthHttpState> = axum::extract::FromRef::from_ref(state);
+
+        let token = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .or_else(|| {
+                parts
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.strip_prefix("bearer "))
+            })
+            .ok_or_else(|| HttpError(AuthError::LoginRequired))?
+            .trim();
+
+        let header_data = decode_header(token)
+            .map_err(|_| HttpError(AuthError::AccessDenied("malformed token".into())))?;
+        let kid = header_data
+            .kid
+            .ok_or_else(|| HttpError(AuthError::AccessDenied("missing kid".into())))?;
+        let dk = st
+            .provider
+            .keys
+            .decoding_key(&kid)
+            .ok_or_else(|| HttpError(AuthError::AccessDenied("unknown kid".into())))?;
+
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&[st.provider.cfg.issuer_str().trim_end_matches('/')]);
+        validation.leeway = 30;
+        validation.validate_aud = false;
+
+        #[derive(Deserialize)]
+        struct C {
+            #[serde(default)]
+            mokosh_op_session_id: Option<String>,
+        }
+        let data = decode::<C>(token, dk, &validation)
+            .map_err(|_| HttpError(AuthError::AccessDenied("invalid token".into())))?;
+        let session_id = data
+            .claims
+            .mokosh_op_session_id
+            .as_deref()
+            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+            .map(OpSessionId);
+        Ok(BearerSessionId(session_id))
+    }
+}
 
 impl<S> FromRequestParts<S> for BearerUser
 where

@@ -163,6 +163,7 @@ async fn exchange_code(
         &acr,
         &amr,
         active_tenant,
+        Some(consumed.op_session_id),
         now,
     )?;
     let id_token = mint_id_token(
@@ -306,6 +307,13 @@ async fn exchange_refresh(
         "urn:mokosh:loa:pwd",
         &["pwd".to_string()],
         active_tenant,
+        // Refresh-grant: RotatedTokens does not currently carry the
+        // bound op_session_id, so refreshed tokens omit the claim.
+        // Sessions list still works on the primary login + switch
+        // paths; refresh-only tokens just don't get the
+        // "current session" badge until the rotate path threads
+        // op_session_id through.
+        None,
         now,
     )?;
 

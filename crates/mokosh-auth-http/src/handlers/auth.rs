@@ -249,6 +249,7 @@ async fn mint_first_party_tokens(
         acr,
         &amr,
         active_tenant,
+        Some(ok.session.id),
         now,
     )?;
     let id_token = mint_id_token(

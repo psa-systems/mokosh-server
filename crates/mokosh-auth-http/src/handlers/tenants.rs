@@ -187,6 +187,10 @@ pub async fn switch_active_tenant(
         acr,
         &amr,
         tenant_id,
+        // Switching tenant doesn't currently re-bind to an OP session;
+        // the new family is session-less and the access token omits
+        // the claim. The previous session (if any) stays alive.
+        None,
         now,
     )
     .map_err(HttpError)?;
