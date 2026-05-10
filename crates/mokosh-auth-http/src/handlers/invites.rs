@@ -70,7 +70,11 @@ pub struct RevokeBody {
 
 #[derive(Deserialize)]
 pub struct AcceptInviteBody {
-    pub password: String,
+    /// Required for the `new_account` accept path (creates a fresh
+    /// User). Ignored on the `join_tenant` path because the user
+    /// already has a password.
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default)]
     pub first_name: Option<String>,
     #[serde(default)]
@@ -380,6 +384,14 @@ pub async fn resend(
 
 #[derive(Serialize)]
 pub struct InvitePreview {
+    /// Discriminator the SPA branches on:
+    ///   * `new_account` - no Mokosh user owns this email yet; the
+    ///     accept page collects a password and creates the account.
+    ///   * `join_tenant` - the email already belongs to an existing
+    ///     user; accepting just adds a membership in the inviter's
+    ///     tenant. The accept page shows a confirmation card and no
+    ///     password field.
+    pub kind: &'static str,
     pub email: String,
     pub role: String,
     pub tenant_name: String,
@@ -388,6 +400,23 @@ pub struct InvitePreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub expires_at: chrono::DateTime<Utc>,
+}
+
+/// Look up `email` across every tenant. Used by the invite-accept
+/// flow to decide between the "create user" and "add membership"
+/// branches. Returns the first match - email is now globally unique
+/// (see migration 20260510000001) so there can be at most one.
+async fn find_existing_user_by_email(
+    st: &AuthHttpState,
+    email: &str,
+) -> Result<Option<mokosh_auth_core::User>, HttpError> {
+    let mut matches = st
+        .provider
+        .users
+        .find_by_email_globally(email)
+        .await
+        .map_err(HttpError)?;
+    Ok(matches.pop())
 }
 
 /// `GET /v1/auth/invites/by-token/:token`
@@ -431,7 +460,17 @@ pub async fn read_by_token(
         .await
         .unwrap_or_else(|| "Mokosh".to_string());
 
+    let kind = if find_existing_user_by_email(&st, &invite.email)
+        .await?
+        .is_some()
+    {
+        "join_tenant"
+    } else {
+        "new_account"
+    };
+
     let preview = InvitePreview {
+        kind,
         email: invite.email,
         role: invite.role.as_str().to_string(),
         tenant_name,
@@ -477,61 +516,120 @@ pub async fn accept_by_token(
         }
     };
 
-    if let Err(e) =
-        mokosh_auth_core::policy::validate_password_strength(&body.password, &invite.email)
-    {
-        let _ = st
-            .provider
-            .audit
-            .record(
-                Some(invite.tenant_id),
-                None,
-                Some(addr.ip()),
-                AuditEvent::InviteAttemptFailed {
-                    token_hash_prefix: token_hash_prefix(&token),
-                    ip: Some(addr.ip().to_string()),
-                    reason: "weak_password".into(),
-                },
-            )
-            .await;
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "invalid_request",
-                "details": { "password": e.to_string() },
-            })),
-        )
-            .into_response());
-    }
+    // Branch on whether a user already owns this email globally. The
+    // `find_existing_user_by_email` lookup is best-effort here; the
+    // SERIALIZABLE accept_* tx re-checks all invariants under lock.
+    let existing = find_existing_user_by_email(&st, &invite.email).await?;
 
-    // Hash off the I/O thread; argon2 is CPU-bound.
-    let pw = body.password.clone();
-    let hash = tokio::task::spawn_blocking(move || mokosh_auth_crypto::hash_password(&pw))
-        .await
-        .map_err(|e| HttpError(AuthError::Internal(format!("argon2 join: {e}"))))?
-        .map_err(|e| HttpError(AuthError::Crypto(format!("argon2: {e}"))))?;
-
-    let first_name = body.first_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let last_name = body.last_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
-
-    let user = match st
-        .invites
-        .accept(&token, &hash, first_name, last_name)
-        .await
-    {
-        Ok(u) => u,
-        Err(AuthError::NotFound) | Err(AuthError::InvalidGrant(_)) => {
-            return Ok(invite_not_found());
+    let user = if let Some(target) = existing {
+        // join_tenant path: no password, just create a membership.
+        match st.invites.accept_existing(&token, target.id).await {
+            Ok(u) => u,
+            Err(AuthError::NotFound) | Err(AuthError::InvalidGrant(_)) => {
+                return Ok(invite_not_found());
+            }
+            Err(AuthError::Conflict(msg)) => {
+                // (user_id, tenant_id) PK collision OR
+                // "invite already used" - either way the right thing
+                // for the SPA is "you're already in this tenant /
+                // the link's already been used; sign in".
+                let _ = st
+                    .provider
+                    .audit
+                    .record(
+                        Some(invite.tenant_id),
+                        Some(target.id),
+                        Some(addr.ip()),
+                        AuditEvent::InviteAttemptFailed {
+                            token_hash_prefix: token_hash_prefix(&token),
+                            ip: Some(addr.ip().to_string()),
+                            reason: format!("conflict: {msg}"),
+                        },
+                    )
+                    .await;
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "invite_already_used"})),
+                )
+                    .into_response());
+            }
+            Err(e) => return Err(HttpError(e)),
         }
-        Err(AuthError::Conflict(_)) => {
+    } else {
+        // new_account path: validate + hash password, create user
+        // (existing flow).
+        let password = body.password.as_deref().unwrap_or("");
+        if let Err(e) =
+            mokosh_auth_core::policy::validate_password_strength(password, &invite.email)
+        {
+            let _ = st
+                .provider
+                .audit
+                .record(
+                    Some(invite.tenant_id),
+                    None,
+                    Some(addr.ip()),
+                    AuditEvent::InviteAttemptFailed {
+                        token_hash_prefix: token_hash_prefix(&token),
+                        ip: Some(addr.ip().to_string()),
+                        reason: "weak_password".into(),
+                    },
+                )
+                .await;
             return Ok((
-                StatusCode::CONFLICT,
-                Json(json!({"error": "invite_already_used"})),
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_request",
+                    "details": { "password": e.to_string() },
+                })),
             )
                 .into_response());
         }
-        Err(e) => return Err(HttpError(e)),
+
+        let pw = password.to_string();
+        let hash = tokio::task::spawn_blocking(move || mokosh_auth_crypto::hash_password(&pw))
+            .await
+            .map_err(|e| HttpError(AuthError::Internal(format!("argon2 join: {e}"))))?
+            .map_err(|e| HttpError(AuthError::Crypto(format!("argon2: {e}"))))?;
+
+        let first_name = body.first_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let last_name = body.last_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+        match st
+            .invites
+            .accept(&token, &hash, first_name, last_name)
+            .await
+        {
+            Ok(u) => u,
+            Err(AuthError::NotFound) | Err(AuthError::InvalidGrant(_)) => {
+                return Ok(invite_not_found());
+            }
+            Err(AuthError::Conflict(_)) => {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "invite_already_used"})),
+                )
+                    .into_response());
+            }
+            Err(e) => return Err(HttpError(e)),
+        }
     };
+
+    // Phase 3: also create a membership in the inviter's tenant for
+    // the new user. The classic `accept` path does NOT create one
+    // today (memberships landed in phase 1, after invite-accept was
+    // written), so we do it here. Idempotent under the (user_id,
+    // tenant_id) PK; we swallow the Conflict to keep this best-
+    // effort.
+    let _ = st
+        .memberships
+        .create(mokosh_auth_core::NewMembership {
+            user_id: user.id,
+            tenant_id: invite.tenant_id,
+            role: invite.role,
+            status: mokosh_auth_core::MembershipStatus::Active,
+        })
+        .await;
 
     let _ = st
         .provider

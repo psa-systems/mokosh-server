@@ -9,6 +9,7 @@ use mokosh_auth_core::{
 use crate::conv::{db_err, UserRow};
 use crate::pool::AuthPool;
 
+pub(crate) const SELECT_USER_PUB: &str = SELECT_USER;
 const SELECT_USER: &str = r#"
     SELECT id, tenant_id, email, email_verified_at, password_hash,
            role, status, first_name, last_name, timezone, locale,

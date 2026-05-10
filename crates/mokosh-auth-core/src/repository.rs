@@ -372,4 +372,19 @@ pub trait InviteRepository: Send + Sync {
         first_name: Option<&str>,
         last_name: Option<&str>,
     ) -> Result<User, AuthError>;
+
+    /// Membership-aware accept for an invitee whose email already
+    /// belongs to a `mokosh_auth.users` row. Marks the invite used
+    /// AND inserts a membership in `(user_id, invite.tenant_id)` in
+    /// one transaction. The User row is NOT touched. Returns the
+    /// existing user so the handler can echo it back to the SPA.
+    ///
+    /// `AuthError::Conflict` if the user is already a member of the
+    /// inviter's tenant; the handler can surface that as a soft "you
+    /// are already a member" notice or as a redirect to /login.
+    async fn accept_existing(
+        &self,
+        token: &str,
+        user_id: UserId,
+    ) -> Result<User, AuthError>;
 }

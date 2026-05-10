@@ -241,6 +241,29 @@ impl InviteRepository for PgInviteRepository {
         }
         unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
     }
+
+    async fn accept_existing(
+        &self,
+        token: &str,
+        user_id: UserId,
+    ) -> Result<User, AuthError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.accept_existing_once(token, user_id).await {
+                Err(AuthError::Storage(msg))
+                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
+                {
+                    tracing::debug!(
+                        attempt,
+                        "invite membership-accept serialization conflict; retrying"
+                    );
+                    continue;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+    }
 }
 
 impl PgInviteRepository {
@@ -336,6 +359,114 @@ impl PgInviteRepository {
         tx.commit().await.map_err(db_err)?;
         let user = User::try_from(user_row)?;
         debug_assert!(matches!(user.status, UserStatus::Active));
+        Ok(user)
+    }
+
+    async fn accept_existing_once(
+        &self,
+        token: &str,
+        existing_user_id: UserId,
+    ) -> Result<User, AuthError> {
+        let token_hash = mokosh_auth_crypto::hash_opaque_token(token);
+        let mut tx = self.pool.pg().begin().await.map_err(db_err)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+        // 1. Lock the invite row (same shape as accept_once).
+        #[derive(sqlx::FromRow)]
+        struct Locked {
+            id: Uuid,
+            tenant_id: Uuid,
+            email: String,
+            role: String,
+            expires_at: DateTime<Utc>,
+            used_at: Option<DateTime<Utc>>,
+            revoked_at: Option<DateTime<Utc>>,
+        }
+        let row: Option<Locked> = sqlx::query_as(
+            "SELECT id, tenant_id, email, role, expires_at, used_at, revoked_at
+             FROM mokosh_auth.admin_invites
+             WHERE token_hash = $1
+             FOR UPDATE",
+        )
+        .bind(&token_hash[..])
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        let row = row.ok_or(AuthError::NotFound)?;
+
+        if row.used_at.is_some() {
+            return Err(AuthError::Conflict("invite already used".into()));
+        }
+        if row.revoked_at.is_some() {
+            return Err(AuthError::InvalidGrant("invite revoked".into()));
+        }
+        if row.expires_at < Utc::now() {
+            return Err(AuthError::InvalidGrant("invite expired".into()));
+        }
+
+        // 2. Sanity check: the existing user's email must match the
+        //    invite's email. The handler already looked the user up
+        //    by email globally, but a SERIALIZABLE re-check inside
+        //    the tx closes any race where the user's email gets
+        //    changed between preview and accept.
+        let user_row: UserRow = sqlx::query_as(&format!(
+            "{} WHERE id = $1 AND deleted_at IS NULL",
+            crate::user::SELECT_USER_PUB
+        ))
+        .bind(existing_user_id.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::RowNotFound => AuthError::NotFound,
+            _ => db_err(e),
+        })?;
+
+        let user = User::try_from(user_row)?;
+        if user.email.to_lowercase() != row.email.to_lowercase() {
+            return Err(AuthError::Forbidden(
+                "user email does not match invite".into(),
+            ));
+        }
+
+        // 3. Insert the membership. Unique-violation on the (user_id,
+        //    tenant_id) PK means the user is already a member; we
+        //    surface that as Conflict so the handler can render a
+        //    "you're already in this tenant" message rather than an
+        //    error.
+        sqlx::query(
+            "INSERT INTO mokosh_auth.memberships
+                (user_id, tenant_id, role, status)
+             VALUES ($1, $2, $3, 'active')",
+        )
+        .bind(existing_user_id.0)
+        .bind(row.tenant_id)
+        .bind(&row.role)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                AuthError::Conflict("user is already a member of this tenant".into())
+            }
+            _ => db_err(e),
+        })?;
+
+        // 4. Mark the invite used.
+        sqlx::query(
+            "UPDATE mokosh_auth.admin_invites
+             SET used_at = NOW(), used_by = $1
+             WHERE id = $2",
+        )
+        .bind(existing_user_id.0)
+        .bind(row.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
         Ok(user)
     }
 }
