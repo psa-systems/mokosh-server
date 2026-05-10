@@ -236,6 +236,72 @@ impl OpSession {
     }
 }
 
+// --- Memberships --------------------------------------------------------
+//
+// One row per (user, tenant) pair. A user can be a member of N tenants;
+// `mokosh_auth.users.tenant_id` is the user's "home" tenant pointer but
+// the source of truth for access is the memberships table. Status and
+// role are tenant-scoped: a user may be `admin` in their personal
+// tenant and `member` in an org tenant they were invited to.
+//
+// See docs/mokosh-auth/10-memberships-and-self-signup.md.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MembershipStatus {
+    Active,
+    Suspended,
+}
+
+impl MembershipStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "active" => Self::Active,
+            "suspended" => Self::Suspended,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Membership {
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub role: UserRole,
+    pub status: MembershipStatus,
+    pub joined_at: DateTime<Utc>,
+}
+
+impl Membership {
+    pub fn is_active(&self) -> bool {
+        matches!(self.status, MembershipStatus::Active)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NewMembership {
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub role: UserRole,
+    pub status: MembershipStatus,
+}
+
+/// A membership joined with the resolved tenant display name. The auth
+/// crates do not own `public.tenants`, so the storage layer takes the
+/// name as a closure-resolved value. Used by the (forthcoming)
+/// `/v1/auth/memberships` endpoint and the SPA tenant switcher.
+#[derive(Clone, Debug)]
+pub struct MembershipWithTenant {
+    pub membership: Membership,
+    pub tenant_name: String,
+}
+
 // --- Authorization code -------------------------------------------------
 
 #[derive(Clone, Debug)]

@@ -26,7 +26,8 @@ use mokosh_auth_http::{
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
     run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
-    PgInviteRepository, PgOAuthClientRepository, PgOpSessionRepository, PgRefreshTokenRepository,
+    PgInviteRepository, PgMembershipRepository, PgOAuthClientRepository, PgOpSessionRepository,
+    PgRefreshTokenRepository,
     PgUserRepository,
 };
 use std::sync::Arc;
@@ -119,6 +120,7 @@ pub async fn bootstrap(
     };
 
     let invites = Arc::new(PgInviteRepository::new(auth_pool.clone()));
+    let memberships = Arc::new(PgMembershipRepository::new(auth_pool.clone()));
 
     // Phase-1 mailer: log link to tracing. Production deploys swap this
     // for `LettreMailer` once SMTP is wired (see docs/mokosh-auth/04-email.md).
@@ -194,6 +196,7 @@ pub async fn bootstrap(
         login_url,
         rate_limiter: Arc::new(RateLimiter::new()),
         invites,
+        memberships,
         mailer,
         accept_base_url,
         tenant_name,

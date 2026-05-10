@@ -215,6 +215,53 @@ pub struct Invite {
 
 /// Repository for the admin-invite flow. See
 /// `docs/mokosh-auth/01-schema.md` for the contract.
+/// (user, tenant, role, status) joins. A user can have many.
+///
+/// Powers the "active sessions" tenant-switcher UI, the membership-
+/// aware invite-accept (existing user gets a fresh membership instead
+/// of a duplicate `User` row), and self-signup (new personal-tenant
+/// owner membership). See docs/mokosh-auth/10-memberships-and-self-signup.md.
+///
+/// All methods are tenant-scoped at the SQL level: callers MUST also
+/// re-check authorization at the HTTP handler.
+#[async_trait]
+pub trait MembershipRepository: Send + Sync {
+    /// All memberships for a user (active and suspended). Caller filters.
+    async fn list_for_user(&self, user_id: UserId) -> Result<Vec<Membership>, AuthError>;
+
+    /// All memberships in a tenant. Used to count active admins for the
+    /// "cannot suspend the last admin" guard, and (later) to render the
+    /// admin user-management page now that `users.tenant_id` is no longer
+    /// authoritative.
+    async fn list_for_tenant(&self, tenant_id: TenantId) -> Result<Vec<Membership>, AuthError>;
+
+    /// Resolve a single membership for active-tenant authorization.
+    /// Returns `None` if the user is not a member of that tenant.
+    async fn find(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+    ) -> Result<Option<Membership>, AuthError>;
+
+    /// Insert a new membership. Called from self-signup (new personal
+    /// tenant) and invite-accept (existing user joins an org tenant).
+    /// Returns `AuthError::Conflict` if the (user_id, tenant_id) pair
+    /// already exists; the caller decides whether that is a soft
+    /// "already a member" 409 or a hard error.
+    async fn create(&self, m: NewMembership) -> Result<Membership, AuthError>;
+
+    /// Mutate the status of an existing membership (active <-> suspended).
+    /// Mirrors `set_status` on User but tenant-scoped: suspending the
+    /// admin's membership in tenant A does not affect their access to
+    /// tenant B.
+    async fn set_status(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        status: MembershipStatus,
+    ) -> Result<(), AuthError>;
+}
+
 #[async_trait]
 pub trait InviteRepository: Send + Sync {
     /// Insert a new invite. The implementation hashes `new.token`

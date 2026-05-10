@@ -5,7 +5,7 @@ use axum::http::{header, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::future::BoxFuture;
-use mokosh_auth_core::{InviteRepository, TenantId};
+use mokosh_auth_core::{InviteRepository, MembershipRepository, TenantId};
 use mokosh_auth_oidc::OidcProvider;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -40,6 +40,12 @@ pub struct AuthHttpState {
     pub rate_limiter: Arc<RateLimiter>,
     /// Admin-invite repository (Phase 1 of registration system).
     pub invites: Arc<dyn InviteRepository>,
+    /// (user, tenant) memberships. Sourced of truth for tenant access;
+    /// the existing `mokosh_auth.users.tenant_id` is becoming a "home
+    /// tenant" pointer as the membership model takes over. Phase 1
+    /// just wires the repo; subsequent phases (self-signup,
+    /// membership-aware invite-accept, tenant switcher) consume it.
+    pub memberships: Arc<dyn MembershipRepository>,
     /// Outbound email for invites (and future password reset / magic
     /// link). Stub `LogMailer` in dev; `LettreMailer` in prod.
     pub mailer: Arc<dyn Mailer>,
