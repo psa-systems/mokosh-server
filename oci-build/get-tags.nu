@@ -28,7 +28,7 @@ export def main [
         log info $"[get-tags] Exact tag. Resolved tags: [($describe), latest]"
         [$describe, "latest"]
     } else {
-        # No tag — just latest
+        # No tag - just latest
         log info $"[get-tags] No tag. Resolved tags: [latest]"
         ["latest"]
     }

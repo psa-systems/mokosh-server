@@ -7,17 +7,20 @@ use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
+use super::automation::AutomationEngine;
 use super::models::*;
 
 /// Ticket management service
 #[derive(Clone)]
 pub struct TicketService {
     db: Database,
+    automation: AutomationEngine,
 }
 
 impl TicketService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        let automation = AutomationEngine::new(db.clone());
+        Self { db, automation }
     }
 
     /// Generate next ticket number for tenant
@@ -129,7 +132,16 @@ impl TicketService {
         // Calculate and set SLA due dates
         self.calculate_sla_dates(tenant_id, ticket_id).await?;
 
-        // TODO: Run automation rules for on_create trigger
+        // Audit F11: run on_create automation rules. Failures are logged
+        // but do not abort the ticket creation - a misconfigured rule
+        // shouldn't block legitimate work.
+        if let Err(e) = self
+            .automation
+            .process_rules(tenant_id, ticket_id, AutomationTrigger::OnCreate)
+            .await
+        {
+            tracing::warn!(?e, %tenant_id, %ticket_id, "on_create automation failed");
+        }
 
         self.get_ticket(tenant_id, ticket_id).await
     }
@@ -191,6 +203,10 @@ impl TicketService {
     }
 
     /// List tickets with filters
+    // See update_company in contacts/service.rs for the dynamic-filter
+    // pattern: the trailing `param_idx += 1` keeps the next added
+    // condition one line of diff away.
+    #[allow(unused_assignments)]
     pub async fn list_tickets(
         &self,
         tenant_id: Uuid,
@@ -319,7 +335,9 @@ impl TicketService {
         request: &UpdateTicketRequest,
     ) -> AppResult<Ticket> {
         let ticket = self.get_ticket(tenant_id, ticket_id).await?;
-        let old_status_id = ticket.status_id;
+        // Captured for a future "status changed" automation trigger;
+        // the F11 wiring only fires the generic OnUpdate today.
+        let _old_status_id = ticket.status_id;
 
         // Build update
         if let Some(ref title) = request.title {
@@ -406,7 +424,15 @@ impl TicketService {
                 .await?;
         }
 
-        // TODO: Run automation rules for on_update trigger
+        // Audit F11: run on_update automation rules. Same fail-soft
+        // policy as on_create - log but do not surface a 500.
+        if let Err(e) = self
+            .automation
+            .process_rules(tenant_id, ticket_id, AutomationTrigger::OnUpdate)
+            .await
+        {
+            tracing::warn!(?e, %tenant_id, %ticket_id, "on_update automation failed");
+        }
 
         self.get_ticket(tenant_id, ticket_id).await
     }

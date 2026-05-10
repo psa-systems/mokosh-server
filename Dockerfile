@@ -9,19 +9,13 @@ RUN mkdir --parents /app /data /config
 
 WORKDIR /app
 
-# Copy manifests + migrations (sqlx::migrate! reads at compile time)
-COPY Cargo.toml Cargo.lock ./
-COPY migrations/ ./migrations/
-
-# Pre-build dependencies (stub source)
-RUN mkdir --parents src src/bin \
-    && echo "fn main() {}" > src/main.rs \
-    && echo "" > src/lib.rs \
-    && echo "fn main() {}" > src/bin/mokosh-bootstrap.rs \
-    && cargo build --bins \
-    && rm -rf src
-
-# Source code is mounted via volumes in compose
+# Source code, manifests, migrations are all mounted from the host via
+# compose volumes. We deliberately do NOT pre-build with stub sources in
+# the image - that approach was leaving stale `target/` fingerprints
+# that confused cargo into a no-op rebuild when real sources arrived,
+# silently running an empty binary. First container start does a full
+# cargo build (~45s); subsequent starts hit the persisted target volume
+# cache.
 
 EXPOSE 4301
 

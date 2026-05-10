@@ -7,9 +7,28 @@ RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static lld
 
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
-# Copy manifests, source, and migrations (sqlx::migrate! reads at compile time)
-COPY Cargo.toml Cargo.lock ./
+# Build-time version metadata. The `.git` directory is intentionally not
+# copied into the build context, so `build.rs` cannot derive these from
+# `git` itself - they must be passed in by the caller (CI, `just
+# build-docker`, etc). When unset, `build.rs` falls back to "unknown"
+# and the package version, which is fine for ad-hoc local builds but
+# will not reflect the actual commit.
+ARG MOKOSH_GIT_HASH=""
+ARG MOKOSH_GIT_DESCRIBE=""
+ARG MOKOSH_BUILD_DATE=""
+ARG SOURCE_DATE_EPOCH=""
+ENV MOKOSH_GIT_HASH=${MOKOSH_GIT_HASH}
+ENV MOKOSH_GIT_DESCRIBE=${MOKOSH_GIT_DESCRIBE}
+ENV MOKOSH_BUILD_DATE=${MOKOSH_BUILD_DATE}
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+
+# Copy manifests, source, workspace members, build script, and migrations
+# (sqlx::migrate! reads migrations at compile time; workspace members
+# must be present so cargo can resolve the workspace; build.rs is needed
+# so the version metadata env vars get baked into the binaries).
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+COPY crates ./crates
 COPY migrations ./migrations
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -32,8 +51,12 @@ RUN chown --recursive appuser:appuser /app
 
 USER appuser
 
-LABEL org.opencontainers.image.source=https://dev.a8n.run/a8n-tools/mokosh-server
+ARG MOKOSH_GIT_HASH=""
+ARG MOKOSH_GIT_DESCRIBE=""
+LABEL org.opencontainers.image.source=https://dev.a8n.run/psa-systems/mokosh-server
 LABEL org.opencontainers.image.description="Mokosh Server"
+LABEL org.opencontainers.image.revision="${MOKOSH_GIT_HASH}"
+LABEL org.opencontainers.image.version="${MOKOSH_GIT_DESCRIBE}"
 
 EXPOSE 8080
 

@@ -23,12 +23,15 @@ dev *args: ensure-env
         | where protocol == 'ipv4' and $it.loop == false
         | get address.0
     )
-    print $"Binding mokosh-server host port to ($bind_ip)"
+    let user_name = (^whoami | str trim)
+    print $"Binding mokosh-server host port to ($bind_ip) as user ($user_name)"
     let updated = (
         open .env --raw
         | lines
         | where not ($it | str starts-with 'MOKOSH_HOST_BIND_IP=')
+        | where not ($it | str starts-with 'USER=')
         | append $"MOKOSH_HOST_BIND_IP=($bind_ip)"
+        | append $"USER=($user_name)"
         | str join "\n"
     )
     if ('.env.new' | path exists) { rm .env.new }
@@ -96,11 +99,19 @@ build:
 
 # Build OCI image for validation (builder stage)
 check-docker:
-    docker buildx build --target builder --tag mokosh-server:check --file oci-build/Dockerfile .
+    #!/usr/bin/env nu
+    let git_hash = (^git rev-parse --short=12 HEAD | str trim)
+    let git_describe = (^git describe --tags --always --dirty | str trim)
+    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
+    docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
 # Build OCI image
 build-docker:
-    docker buildx build --tag mokosh-server:local --file oci-build/Dockerfile .
+    #!/usr/bin/env nu
+    let git_hash = (^git rev-parse --short=12 HEAD | str trim)
+    let git_describe = (^git describe --tags --always --dirty | str trim)
+    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
+    docker buildx build --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:local --file oci-build/Dockerfile .
 
 # Run database migrations against the running database
 migrate-run:

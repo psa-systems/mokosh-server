@@ -609,22 +609,26 @@ impl From<Site> for SiteResponse {
 // ============================================================================
 
 /// Company filter parameters
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct CompanyFilter {
+    #[validate(length(max = 200))]
     pub q: Option<String>,
     pub company_type: Option<CompanyType>,
     pub status: Option<CompanyStatus>,
     pub account_manager_id: Option<Uuid>,
+    #[validate(length(max = 500))]
     pub tags: Option<String>,
 }
 
 /// Contact filter parameters
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct ContactFilter {
+    #[validate(length(max = 200))]
     pub q: Option<String>,
     pub company_id: Option<Uuid>,
     pub contact_type: Option<ContactType>,
     pub status: Option<ContactStatus>,
     pub is_portal_user: Option<bool>,
+    #[validate(length(max = 500))]
     pub tags: Option<String>,
 }

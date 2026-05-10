@@ -19,7 +19,7 @@ jobs:
     if: >-
       github.event.pull_request.merged == true
       && startsWith(github.event.pull_request.head.ref, 'release/v')
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    runs-on: opensuse-base-16.0-latest
     permissions:
       contents: write
 
