@@ -1,5 +1,5 @@
 # Development Dockerfile - debug builds, source mounted via volumes
-FROM rust:1-slim-trixie
+FROM ghcr.io/niceguyit/rust-builder-glibc:v1.0.0-rust1.94-trixie
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
     pkg-config libssl-dev curl \
