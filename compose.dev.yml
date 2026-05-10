@@ -144,6 +144,37 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    # The postgres image only honours POSTGRES_PASSWORD on first
+    # volume init; subsequent runs against an existing volume keep
+    # whatever password was baked in originally. With dev volumes
+    # shared across session-rebuilds, that password regularly drifts
+    # from the current env value and the server fails to connect
+    # ("password authentication failed for user 'postgres'"). The
+    # entrypoint wrapper below runs the normal docker-entrypoint
+    # in the background, waits for the unix socket to come up
+    # (peer-trusted for the postgres user inside the container),
+    # idempotently `ALTER USER`s the password back to
+    # `$POSTGRES_PASSWORD`, then waits on the postgres process for
+    # the foreground. First-init paths still go through the standard
+    # docker-entrypoint flow; this only fixes the "existing volume,
+    # drifted password" case.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        docker-entrypoint.sh postgres &
+        pg_pid=$$!
+        # Wait for the unix socket (not TCP) so the ALTER below
+        # uses peer-trust, sidestepping the very password we want
+        # to reset.
+        until pg_isready -U "$$POSTGRES_USER" -h /var/run/postgresql -q 2>/dev/null; do
+            sleep 1
+        done
+        psql -U "$$POSTGRES_USER" -h /var/run/postgresql -d "$$POSTGRES_DB" \
+            -c "ALTER USER \"$$POSTGRES_USER\" WITH PASSWORD '$$POSTGRES_PASSWORD'" \
+            || echo "[entrypoint] ALTER USER failed (socket not trust-mode?); continuing"
+        wait "$$pg_pid"
 
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
   # live reload via `cargo run`.
