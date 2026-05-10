@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderValue, Method},
     middleware,
     routing::get,
-    Router,
+    Json, Router,
 };
 use std::sync::Arc;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
@@ -15,6 +15,7 @@ use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
+use crate::version::VersionInfo;
 
 /// Application state shared across all routes
 #[derive(Clone)]
@@ -57,6 +58,8 @@ pub fn create_api_router(
     let api_v1 = Router::new()
         // Health check
         .route("/health", get(health_check))
+        // Build / version info (public, used for diagnostics)
+        .route("/version", get(version_info))
         // Auth routes
         .nest(
             "/auth",
@@ -168,6 +171,14 @@ pub fn create_api_router(
 /// Health check endpoint
 async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Build / version info endpoint. Returns the package version, the
+/// `git describe` string (matches the release tag for tagged builds), the
+/// short commit hash, and the build timestamp. Useful when troubleshooting
+/// to confirm exactly which revision a running server was built from.
+async fn version_info() -> Json<VersionInfo> {
+    Json(VersionInfo::current())
 }
 
 /// Stub routes for modules not yet implemented. Audit F12: previously

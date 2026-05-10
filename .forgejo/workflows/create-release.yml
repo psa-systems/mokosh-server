@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Clone the repository
-        uses: https://code.forgejo.org/actions/checkout@v3
+        uses: https://code.forgejo.org/actions/checkout@v5
         with:
           fetch-depth: 0
 

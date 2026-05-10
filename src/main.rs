@@ -1,6 +1,6 @@
 //! Mokosh Server - API server entrypoint
 
-use mokosh_server::{api::create_api_router, Database};
+use mokosh_server::{api::create_api_router, version::VersionInfo, Database};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    tracing::info!("Starting Mokosh Server");
+    tracing::info!("Starting {}", VersionInfo::current().banner());
 
     #[cfg(feature = "multi-tenant")]
     tracing::info!("Running in multi-tenant mode");

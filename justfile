@@ -168,11 +168,19 @@ build:
 
 # Build OCI image for validation (builder stage)
 check-docker:
-    docker buildx build --target builder --tag mokosh-server:check --file oci-build/Dockerfile .
+    #!/usr/bin/env nu
+    let git_hash = (^git rev-parse --short=12 HEAD | str trim)
+    let git_describe = (^git describe --tags --always --dirty | str trim)
+    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
+    docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
 # Build OCI image
 build-docker:
-    docker buildx build --tag mokosh-server:local --file oci-build/Dockerfile .
+    #!/usr/bin/env nu
+    let git_hash = (^git rev-parse --short=12 HEAD | str trim)
+    let git_describe = (^git describe --tags --always --dirty | str trim)
+    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
+    docker buildx build --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:local --file oci-build/Dockerfile .
 
 # Run database migrations against the running database
 migrate-run:
