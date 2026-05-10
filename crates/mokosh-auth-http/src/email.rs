@@ -19,6 +19,15 @@ pub trait Mailer: Send + Sync {
         raw_token: &str,
         inviter: &User,
     ) -> Result<(), AuthError>;
+
+    /// Send a self-signup confirmation email. The recipient clicks
+    /// the link and lands on /signup/<raw_token>, where they pick a
+    /// password and finish creating the account. We deliberately
+    /// send no payload other than the link itself: the body is
+    /// identical for "new email" and "email already in use" cases
+    /// so the recipient cannot infer enumeration outcomes from the
+    /// message.
+    async fn send_signup(&self, email: &str, raw_token: &str) -> Result<(), AuthError>;
 }
 
 /// Dev-only mailer. Logs the would-be email body to `tracing` and
@@ -47,6 +56,21 @@ impl Mailer for LogMailer {
             role = %invite.role.as_str(),
             link = %link,
             "[DEV] would send invite email"
+        );
+        Ok(())
+    }
+
+    async fn send_signup(&self, email: &str, raw_token: &str) -> Result<(), AuthError> {
+        let link = format!(
+            "{}/signup/{}",
+            self.accept_base_url.trim_end_matches('/'),
+            raw_token,
+        );
+        tracing::info!(
+            target: "mokosh_auth.mailer",
+            to = %email,
+            link = %link,
+            "[DEV] would send signup email"
         );
         Ok(())
     }

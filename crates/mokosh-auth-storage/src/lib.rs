@@ -16,6 +16,7 @@ pub mod migrations;
 pub mod pool;
 pub mod refresh;
 pub mod session;
+pub mod signup;
 pub mod user;
 
 pub use audit::PgAuditLogger;
@@ -28,4 +29,5 @@ pub use migrations::run_migrations;
 pub use pool::AuthPool;
 pub use refresh::PgRefreshTokenRepository;
 pub use session::PgOpSessionRepository;
+pub use signup::PgSignupTokenRepository;
 pub use user::PgUserRepository;

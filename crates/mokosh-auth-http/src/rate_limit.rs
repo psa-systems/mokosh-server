@@ -60,6 +60,11 @@ pub struct RateLimiter {
     /// Accept attempts by IP. 10/hour - a legitimate accept happens
     /// once.
     invite_accept_by_ip: std::sync::Arc<Keyed<IpAddr>>,
+    /// Self-signup start by IP. 5/hour. The endpoint sends an email
+    /// every time, so abuse maps to inbox-spam.
+    signup_start_by_ip: std::sync::Arc<Keyed<IpAddr>>,
+    /// Self-signup start per email. 2/hour. Same idea, but per-victim.
+    signup_start_by_email: std::sync::Arc<Keyed<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +100,8 @@ impl RateLimiter {
         let invite_lookup_token_quota =
             Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
         let invite_accept_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
+        let signup_start_ip_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(5));
+        let signup_start_email_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(2));
 
         Self {
             login_by_ip: std::sync::Arc::new(Governor::keyed(login_ip_quota)),
@@ -105,7 +112,23 @@ impl RateLimiter {
             invite_lookup_by_ip: std::sync::Arc::new(Governor::keyed(invite_lookup_ip_quota)),
             invite_lookup_by_token: std::sync::Arc::new(Governor::keyed(invite_lookup_token_quota)),
             invite_accept_by_ip: std::sync::Arc::new(Governor::keyed(invite_accept_quota)),
+            signup_start_by_ip: std::sync::Arc::new(Governor::keyed(signup_start_ip_quota)),
+            signup_start_by_email: std::sync::Arc::new(Governor::keyed(signup_start_email_quota)),
         }
+    }
+
+    /// /v1/auth/signup rate-limit: per-IP and per-email. Both must
+    /// allow the request, otherwise the response is 429 (the email
+    /// path is what slows email-spam-as-a-service against a single
+    /// inbox).
+    pub fn check_signup_start(&self, ip: IpAddr, email: &str) -> Result<(), RateLimited> {
+        self.signup_start_by_ip
+            .check_key(&ip)
+            .map_err(|n| RateLimited::from_negative(&n))?;
+        let key = email.trim().to_ascii_lowercase();
+        self.signup_start_by_email
+            .check_key(&key)
+            .map_err(|n| RateLimited::from_negative(&n))
     }
 
     pub fn check_invite_issue(

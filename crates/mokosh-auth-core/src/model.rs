@@ -302,6 +302,44 @@ pub struct MembershipWithTenant {
     pub tenant_name: String,
 }
 
+// --- Self-signup --------------------------------------------------------
+//
+// One-shot tokens issued by POST /v1/auth/signup. The bearer of the
+// raw token (delivered via email) is allowed to complete an account
+// creation by POSTing to /v1/auth/signup/by-token/{token}/complete.
+// The accept transaction creates a personal tenant, a user, and an
+// owner membership atomically under SERIALIZABLE isolation.
+//
+// See docs/mokosh-auth/10-memberships-and-self-signup.md.
+
+#[derive(Clone, Debug)]
+pub struct NewSignupToken {
+    pub email: String,
+    /// SHA-256 of the URL-safe random token. The raw token is delivered
+    /// via email and never persisted.
+    pub token_hash: [u8; 32],
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SignupToken {
+    pub id: uuid::Uuid,
+    pub email: String,
+    pub token_hash: [u8; 32],
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub used_at: Option<DateTime<Utc>>,
+    pub user_id: Option<UserId>,
+}
+
+impl SignupToken {
+    /// `true` if the row is still consumable: not yet used and within
+    /// the expiry window.
+    pub fn is_open(&self, now: DateTime<Utc>) -> bool {
+        self.used_at.is_none() && self.expires_at > now
+    }
+}
+
 // --- Authorization code -------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -465,6 +503,30 @@ pub enum AuditEvent {
     /// 8 hex chars of the SHA-256 hash so the raw token never touches
     /// the audit table even on replay attempts.
     InviteAttemptFailed {
+        token_hash_prefix: String,
+        ip: Option<String>,
+        reason: String,
+    },
+    /// Self-signup requested. Always recorded - even when the email is
+    /// already in use and the request is a no-op - so brute-force
+    /// attempts are visible in the audit trail. The email is recorded;
+    /// the token is not.
+    SignupRequested {
+        email: String,
+        ip: Option<String>,
+    },
+    /// Self-signup token successfully redeemed. The new user, personal
+    /// tenant, and owner membership all exist by the time this is
+    /// written.
+    SignupCompleted {
+        user_id: UserId,
+        tenant_id: TenantId,
+        email: String,
+    },
+    /// Failed signup-token redemption (unknown / used / expired token,
+    /// password policy rejection, etc). Same enumeration-resistance
+    /// shape as InviteAttemptFailed.
+    SignupAttemptFailed {
         token_hash_prefix: String,
         ip: Option<String>,
         reason: String,

@@ -19,6 +19,7 @@ pub mod handlers {
     pub mod invites;
     pub mod oidc;
     pub mod sessions;
+    pub mod signup;
     pub mod users;
 }
 
@@ -27,4 +28,6 @@ pub use email::{LogMailer, Mailer};
 pub use errors::HttpError;
 pub use local_auth::{LocalAuth, LocalLoginRequest};
 pub use rate_limit::{RateLimited, RateLimiter};
-pub use router::{build_router, AuthHttpState, TenantNameLookup};
+pub use router::{
+    build_router, AuthHttpState, PersonalTenantCreator, TenantNameLookup,
+};

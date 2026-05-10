@@ -262,6 +262,50 @@ pub trait MembershipRepository: Send + Sync {
     ) -> Result<(), AuthError>;
 }
 
+/// Persistent storage for one-shot self-signup tokens.
+///
+/// Used by POST /v1/auth/signup (issue) and the
+/// /v1/auth/signup/by-token/{token}/{,complete} endpoints (consume).
+/// Lifetime mirrors admin invites: SHA-256 hash for storage, raw
+/// token never persisted; rows are immutable except for `used_at` /
+/// `user_id` which are set once on completion.
+#[async_trait]
+pub trait SignupTokenRepository: Send + Sync {
+    /// Insert a new open signup token. Implementations MUST persist
+    /// the hash byte-for-byte; the caller has already SHA-256-hashed
+    /// the raw token.
+    async fn issue(&self, new: NewSignupToken) -> Result<SignupToken, AuthError>;
+
+    /// Look up by token hash. Returns `None` for unknown hashes; the
+    /// caller cannot tell unknown / used / expired apart in its
+    /// 404 response.
+    async fn find_by_token_hash(
+        &self,
+        token_hash: [u8; 32],
+    ) -> Result<Option<SignupToken>, AuthError>;
+
+    /// Find an open (unused, unexpired) token for an email, if any.
+    /// Used to coalesce repeat /v1/auth/signup requests so the
+    /// recipient does not get spammed.
+    async fn find_open_by_email(
+        &self,
+        email: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<SignupToken>, AuthError>;
+
+    /// Mark a token as used and bind it to the new user. Called from
+    /// inside the SERIALIZABLE accept transaction; if the row is
+    /// already used the implementation MUST return
+    /// `AuthError::NotFound` so the handler collapses to the same
+    /// generic 404 as unknown-token.
+    async fn mark_used(
+        &self,
+        token_hash: [u8; 32],
+        user_id: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<(), AuthError>;
+}
+
 #[async_trait]
 pub trait InviteRepository: Send + Sync {
     /// Insert a new invite. The implementation hashes `new.token`

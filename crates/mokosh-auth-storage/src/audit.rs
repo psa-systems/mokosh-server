@@ -41,6 +41,9 @@ fn event_kind(e: &AuditEvent) -> &'static str {
         InviteRevoked { .. } => "invite_revoked",
         InviteAccepted { .. } => "invite_accepted",
         InviteAttemptFailed { .. } => "invite_attempt_failed",
+        SignupRequested { .. } => "signup_requested",
+        SignupCompleted { .. } => "signup_completed",
+        SignupAttemptFailed { .. } => "signup_attempt_failed",
     }
 }
 

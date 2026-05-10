@@ -21,13 +21,14 @@ use mokosh_auth_crypto::OidcKeySet;
 use mokosh_auth_core::TenantId;
 use mokosh_auth_http::cookies::CookieConfig;
 use mokosh_auth_http::{
-    build_router, AuthHttpState, LocalAuth, LogMailer, Mailer, RateLimiter, TenantNameLookup,
+    build_router, AuthHttpState, LocalAuth, LogMailer, Mailer, PersonalTenantCreator, RateLimiter,
+    TenantNameLookup,
 };
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
     run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
     PgInviteRepository, PgMembershipRepository, PgOAuthClientRepository, PgOpSessionRepository,
-    PgRefreshTokenRepository,
+    PgRefreshTokenRepository, PgSignupTokenRepository,
     PgUserRepository,
 };
 use std::sync::Arc;
@@ -121,6 +122,47 @@ pub async fn bootstrap(
 
     let invites = Arc::new(PgInviteRepository::new(auth_pool.clone()));
     let memberships = Arc::new(PgMembershipRepository::new(auth_pool.clone()));
+    let signup_tokens = Arc::new(PgSignupTokenRepository::new(auth_pool.clone()));
+
+    let public_signup_enabled = std::env::var("MOKOSH_PUBLIC_SIGNUP_ENABLED")
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    // Personal-tenant insertion for self-signup. The auth crate does
+    // not own public.tenants, so we wrap the SQL in a closure injected
+    // into AuthHttpState. Tenant name = "<email>'s account"; slug must
+    // be unique so we hash the email for the slug.
+    let tenant_pool_create = auth_pool.clone();
+    let create_personal_tenant: PersonalTenantCreator = Arc::new(move |email: String| {
+        let pool = tenant_pool_create.clone();
+        Box::pin(async move {
+            // Slug: take a 12-char b64-of-sha256 of the email so it is
+            // stable per email but does not leak the email in the URL
+            // (matches the 12-char convention used elsewhere). The
+            // tenant name is human-readable.
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(email.as_bytes());
+            let slug = format!(
+                "personal-{}",
+                URL_SAFE_NO_PAD.encode(&digest[..9])
+            );
+            let display = format!("{}'s account", email);
+            let id: uuid::Uuid = sqlx::query_scalar(
+                "INSERT INTO public.tenants (name, slug, kind, status)
+                 VALUES ($1, $2, 'personal', 'active')
+                 RETURNING id",
+            )
+            .bind(&display)
+            .bind(&slug)
+            .fetch_one(pool.pg())
+            .await
+            .map_err(|e| {
+                mokosh_auth_core::AuthError::Storage(format!("create personal tenant: {e}"))
+            })?;
+            Ok(TenantId(id))
+        })
+    });
 
     // Phase-1 mailer: log link to tracing. Production deploys swap this
     // for `LettreMailer` once SMTP is wired (see docs/mokosh-auth/04-email.md).
@@ -197,6 +239,9 @@ pub async fn bootstrap(
         rate_limiter: Arc::new(RateLimiter::new()),
         invites,
         memberships,
+        signup_tokens,
+        public_signup_enabled,
+        create_personal_tenant,
         mailer,
         accept_base_url,
         tenant_name,

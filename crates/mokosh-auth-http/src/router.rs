@@ -5,7 +5,9 @@ use axum::http::{header, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::future::BoxFuture;
-use mokosh_auth_core::{InviteRepository, MembershipRepository, TenantId};
+use mokosh_auth_core::{
+    AuthError, InviteRepository, MembershipRepository, SignupTokenRepository, TenantId,
+};
 use mokosh_auth_oidc::OidcProvider;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -15,7 +17,7 @@ use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
     auth as auth_h, discovery as disc_h, invites as invites_h, oidc as oidc_h,
-    sessions as sessions_h, users as users_h,
+    sessions as sessions_h, signup as signup_h, users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -26,6 +28,17 @@ use crate::rate_limit::RateLimiter;
 /// tenant ids; callers fall back to a generic "Mokosh" label.
 pub type TenantNameLookup =
     Arc<dyn Fn(TenantId) -> BoxFuture<'static, Option<String>> + Send + Sync>;
+
+/// Create a brand-new personal tenant for a self-signing-up user.
+/// Inserts a row in `public.tenants` (kind='personal', name derived
+/// from the email) and returns its id. Owned by the host app for the
+/// same schema-isolation reason as TenantNameLookup. Failures bubble
+/// up as `AuthError::Storage`.
+pub type PersonalTenantCreator = Arc<
+    dyn Fn(String /* email */) -> BoxFuture<'static, Result<TenantId, AuthError>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct AuthHttpState {
@@ -46,6 +59,18 @@ pub struct AuthHttpState {
     /// just wires the repo; subsequent phases (self-signup,
     /// membership-aware invite-accept, tenant switcher) consume it.
     pub memberships: Arc<dyn MembershipRepository>,
+    /// Self-signup tokens. Issued by /v1/auth/signup, consumed by
+    /// /v1/auth/signup/by-token/{token}/complete. Phase 2 of doc 10.
+    pub signup_tokens: Arc<dyn SignupTokenRepository>,
+    /// Whether public self-signup is enabled. PSA hub deployments
+    /// keep this false (registration is admin-invite-gated); the
+    /// a8n / individual SKU sets it true. Set via the
+    /// `MOKOSH_PUBLIC_SIGNUP_ENABLED` env var at bootstrap.
+    pub public_signup_enabled: bool,
+    /// Host-app closure that creates a new personal tenant in
+    /// `public.tenants`. The auth crate does not own that table,
+    /// so the call goes through this closure.
+    pub create_personal_tenant: PersonalTenantCreator,
     /// Outbound email for invites (and future password reset / magic
     /// link). Stub `LogMailer` in dev; `LettreMailer` in prod.
     pub mailer: Arc<dyn Mailer>,
@@ -132,6 +157,18 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route(
             "/v1/auth/users/{user_id}/reactivate",
             post(users_h::reactivate_user),
+        )
+        // Self-signup. Public, rate-limited. Only enabled when
+        // MOKOSH_PUBLIC_SIGNUP_ENABLED=true at bootstrap; otherwise
+        // every endpoint here returns 404 signup_disabled.
+        .route("/v1/auth/signup", post(signup_h::start))
+        .route(
+            "/v1/auth/signup/by-token/{token}",
+            get(signup_h::preview),
+        )
+        .route(
+            "/v1/auth/signup/by-token/{token}/complete",
+            post(signup_h::complete),
         )
         .layer(cors)
         .with_state(state)

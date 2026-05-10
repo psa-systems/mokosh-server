@@ -64,6 +64,11 @@ services:
       # is the only sign-in screen any RP ever uses. See
       # docs/mokosh-auth/09-single-login-bridge.md.
       MOKOSH_AUTH_LOGIN_URL: https://${USER}-mokosh.a8n.run/login
+      # Enable public self-signup. PSA hub deploys keep this off
+      # (registration is admin-invite-gated); the a8n / individual SKU
+      # turns it on. Dev defaults on so we can smoke-test the flow.
+      # See docs/mokosh-auth/10-memberships-and-self-signup.md.
+      MOKOSH_PUBLIC_SIGNUP_ENABLED: "true"
 
 networks:
   # The base compose.dev.yml normally owns and creates this network.
