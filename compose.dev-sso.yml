@@ -59,6 +59,11 @@ services:
       # the LogMailer falls back to CLIENT_ORIGIN (localhost:4301),
       # which sends recipients to the wrong host on Traefik-routed dev.
       MOKOSH_ACCEPT_BASE_URL: https://${USER}-mokosh.a8n.run
+      # Universal sign-in URL. /oauth2/authorize 302s unauthenticated
+      # users here with ?return_to=<authorize_query> so the SPA login
+      # is the only sign-in screen any RP ever uses. See
+      # docs/mokosh-auth/09-single-login-bridge.md.
+      MOKOSH_AUTH_LOGIN_URL: https://${USER}-mokosh.a8n.run/login
 
 networks:
   # The base compose.dev.yml normally owns and creates this network.

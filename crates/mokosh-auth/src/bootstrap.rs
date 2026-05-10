@@ -113,19 +113,6 @@ pub async fn bootstrap(
         op_session_ttl: cfg.op_session_ttl,
     });
 
-    // The login URL is hosted by the front-end (mokosh-clients). It is
-    // computed by appending `/login` to the configured issuer host's
-    // *origin*, but in practice this is a separate host. The host
-    // application can override this by mutating `state.login_url` after
-    // bootstrap, or by configuring `MOKOSH_AUTH_LOGIN_URL` in a future
-    // iteration. For now, default to <issuer>/login.
-    let mut login_url = cfg.issuer.clone();
-    login_url
-        .path_segments_mut()
-        .map_err(|_| BootstrapError::Config("issuer URL cannot be a base".into()))?
-        .pop_if_empty()
-        .push("login");
-
     let cookie_cfg = CookieConfig {
         domain: cfg.cookie_domain.clone(),
         secure: !is_local_issuer(&cfg.issuer),
@@ -138,6 +125,48 @@ pub async fn bootstrap(
     let accept_base_url = std::env::var("MOKOSH_ACCEPT_BASE_URL")
         .or_else(|_| std::env::var("CLIENT_ORIGIN"))
         .unwrap_or_else(|_| cfg.issuer.as_str().trim_end_matches('/').to_string());
+
+    // The login URL is the SPA's `/login` page, hosted on the SPA host
+    // (mokosh-clients). When `/oauth2/authorize` needs to ask the user
+    // to sign in, it 302s here with `?return_to=<authorize_query>` and
+    // the SPA bounces back after a successful login. See
+    // docs/mokosh-auth/09-single-login-bridge.md.
+    //
+    // Resolution order:
+    //   1. MOKOSH_AUTH_LOGIN_URL (explicit override)
+    //   2. <accept_base_url>/login (production default; same host the
+    //      SPA is hosted on, so the cookie path covers everything)
+    //   3. <issuer>/login (last-resort dev fallback; the OP login UI is
+    //      no longer rendered server-side, so a deployment that hits
+    //      this branch is misconfigured)
+    let login_url = std::env::var("MOKOSH_AUTH_LOGIN_URL")
+        .ok()
+        .and_then(|s| Url::parse(&s).ok())
+        .or_else(|| {
+            Url::parse(&format!(
+                "{}/login",
+                accept_base_url.trim_end_matches('/')
+            ))
+            .ok()
+        })
+        .unwrap_or_else(|| {
+            let mut u = cfg.issuer.clone();
+            u.path_segments_mut()
+                .expect("issuer URL is a base")
+                .pop_if_empty()
+                .push("login");
+            u
+        });
+    if login_url.scheme() != "https" {
+        let host = login_url.host_str().unwrap_or("");
+        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+        if !is_loopback {
+            tracing::warn!(
+                login_url = %login_url,
+                "MOKOSH_AUTH_LOGIN_URL is not HTTPS; downstream OIDC redirects will break secure-context guards"
+            );
+        }
+    }
     let mailer: Arc<dyn Mailer> = Arc::new(LogMailer {
         accept_base_url: accept_base_url.clone(),
     });
