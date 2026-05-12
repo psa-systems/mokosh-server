@@ -68,6 +68,13 @@ pub struct LoginRequest {
     /// `openid email offline_access`.
     #[serde(default)]
     pub scope: Option<String>,
+    /// 7-day trust token issued by /v1/auth/mfa/verify when the user
+    /// previously checked "Remember this browser". If present and
+    /// still valid (non-revoked, non-expired, bound to the same user),
+    /// the MFA challenge step is skipped and the login flow continues
+    /// straight to session + token issuance.
+    #[serde(default)]
+    pub trust_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,7 +196,28 @@ pub async fn login(
     // MFA-required branch. Issue a single-use opaque challenge, store
     // the SHA-256 hash, return the raw token to the SPA. No cookie,
     // no op_session, no tokens until /v1/auth/mfa/verify completes.
+    //
+    // Unless: the user previously opted in to "Remember this browser
+    // for 7 days" and the trust token they got back is still valid
+    // AND bound to this user. In that case we treat MFA as satisfied
+    // for this login (acr=mfa, amr=['pwd', 'trusted_device']) and
+    // skip the challenge entirely.
+    let mut trust_bypass = false;
     if user.mfa_enrolled {
+        if let Some(raw_trust) = req.trust_token.as_deref().filter(|s| !s.is_empty()) {
+            let hash = mokosh_auth_crypto::hash_opaque_token(raw_trust);
+            match st.trusted_devices.find_active_and_touch(hash).await? {
+                Some(td) if td.user_id == user.id => {
+                    trust_bypass = true;
+                }
+                _ => {
+                    // Stale / forged / belongs-to-different-user: fall
+                    // through to the regular MFA challenge.
+                }
+            }
+        }
+    }
+    if user.mfa_enrolled && !trust_bypass {
         let raw = mokosh_auth_crypto::generate_opaque_token();
         let token_hash = mokosh_auth_crypto::hash_opaque_token(&raw);
         let now = st.provider.clock.now();
@@ -236,10 +264,21 @@ pub async fn login(
             .into_response());
     }
 
-    // Non-MFA path: create the session + mint tokens as before.
+    // Non-MFA path: create the session + mint tokens as before. When
+    // the trust-bypass fired, the session is acr=mfa amr=['pwd',
+    // 'trusted_device'] so downstream RPs see the same LOA they would
+    // have after a real MFA verify.
+    let (acr, amr) = if trust_bypass {
+        (
+            "urn:mokosh:loa:mfa",
+            vec!["pwd".to_string(), "trusted_device".to_string()],
+        )
+    } else {
+        ("urn:mokosh:loa:pwd", vec!["pwd".to_string()])
+    };
     let session = st
         .local_auth
-        .create_session(&user, ip, ua, "urn:mokosh:loa:pwd", &["pwd".to_string()])
+        .create_session(&user, ip, ua, acr, &amr)
         .await?;
     let ok = crate::local_auth::LocalLoginOk { session, user };
     let tokens = if let Some(cid) = req.client_id {

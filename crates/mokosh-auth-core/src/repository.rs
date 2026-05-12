@@ -561,6 +561,23 @@ pub trait RecoveryCodeRepository: Send + Sync {
 }
 
 #[async_trait]
+pub trait TrustedDeviceRepository: Send + Sync {
+    async fn issue(&self, new: NewTrustedDevice) -> Result<TrustedDevice, AuthError>;
+    /// Look up a non-revoked, non-expired device whose hash matches.
+    /// Side effects: bumps `last_used_at` to `NOW()` on a successful
+    /// lookup so the SPA's "trusted devices" list shows the freshness.
+    async fn find_active_and_touch(
+        &self,
+        token_hash: [u8; 32],
+    ) -> Result<Option<TrustedDevice>, AuthError>;
+    async fn list_active_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<TrustedDevice>, AuthError>;
+    async fn revoke(&self, id: uuid::Uuid, user_id: UserId) -> Result<(), AuthError>;
+}
+
+#[async_trait]
 pub trait MfaChallengeRepository: Send + Sync {
     async fn issue(&self, new: NewMfaChallenge) -> Result<MfaChallenge, AuthError>;
 

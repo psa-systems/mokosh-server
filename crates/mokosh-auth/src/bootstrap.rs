@@ -31,7 +31,7 @@ use mokosh_auth_storage::{
     PgInviteRepository, PgMembershipRepository, PgMfaChallengeRepository,
     PgOAuthClientRepository, PgOpSessionRepository, PgPasswordResetTokenRepository,
     PgRecoveryCodeRepository, PgRefreshTokenRepository, PgSignupTokenRepository, PgTotpRepository,
-    PgUserRepository,
+    PgTrustedDeviceRepository, PgUserRepository,
 };
 use std::sync::Arc;
 use url::Url;
@@ -141,6 +141,7 @@ pub async fn bootstrap(
     let totp = Arc::new(PgTotpRepository::new(auth_pool.clone()));
     let recovery_codes = Arc::new(PgRecoveryCodeRepository::new(auth_pool.clone()));
     let mfa_challenges = Arc::new(PgMfaChallengeRepository::new(auth_pool.clone()));
+    let trusted_devices = Arc::new(PgTrustedDeviceRepository::new(auth_pool.clone()));
 
     // Build the at-rest encryption key set. The hex-encoded data
     // encryption keys come in via AuthConfig; we decode here and
@@ -340,6 +341,7 @@ pub async fn bootstrap(
         totp,
         recovery_codes,
         mfa_challenges,
+        trusted_devices,
         dek,
         dek_version: cfg.data_key_version,
         mfa_issuer,

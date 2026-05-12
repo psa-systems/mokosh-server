@@ -8,7 +8,7 @@ use futures_util::future::BoxFuture;
 use mokosh_auth_core::{
     AuthError, InviteRepository, MembershipRepository, MfaChallengeRepository,
     PasswordResetTokenRepository, RecoveryCodeRepository, SignupTokenRepository, TenantId,
-    TotpRepository,
+    TotpRepository, TrustedDeviceRepository,
 };
 use mokosh_auth_crypto::EncryptionKeySet;
 use mokosh_auth_oidc::OidcProvider;
@@ -103,6 +103,7 @@ pub struct AuthHttpState {
     pub totp: Arc<dyn TotpRepository>,
     pub recovery_codes: Arc<dyn RecoveryCodeRepository>,
     pub mfa_challenges: Arc<dyn MfaChallengeRepository>,
+    pub trusted_devices: Arc<dyn TrustedDeviceRepository>,
     /// AES-256-GCM key set for at-rest encryption of TOTP shared secrets.
     /// Built at bootstrap from `AuthConfig::data_encryption_key` (plus the
     /// optional previous key for rotation).

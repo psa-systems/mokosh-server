@@ -251,7 +251,17 @@ pub async fn confirm(
 pub struct VerifyBody {
     pub challenge: String,
     pub code: String,
+    /// When true, the server issues a 7-day opaque trust token. The SPA
+    /// stores it and sends it on the next /v1/auth/login as
+    /// `trust_token`; the server skips the MFA challenge if it still
+    /// matches a non-revoked row.
+    #[serde(default)]
+    pub remember_device: bool,
 }
+
+/// 7 days. The cookie/localStorage on the SPA side expires at the same
+/// instant.
+const TRUST_TOKEN_TTL_DAYS: i64 = 7;
 
 /// `POST /v1/auth/mfa/verify`
 ///
@@ -441,12 +451,37 @@ pub async fn verify(
         None
     };
 
+    // If the user opted in, issue a 7-day trust token. The raw value is
+    // returned exactly once in the response body; the SPA stores it
+    // (localStorage) and sends it on the next /login to skip the MFA
+    // prompt. The hash is what we keep around to validate.
+    let trust_token = if body.remember_device {
+        let raw = mokosh_auth_crypto::generate_opaque_token();
+        let token_hash = mokosh_auth_crypto::hash_opaque_token(&raw);
+        let now = chrono::Utc::now();
+        st.trusted_devices
+            .issue(mokosh_auth_core::NewTrustedDevice {
+                user_id: user.id,
+                tenant_id: user.tenant_id,
+                token_hash,
+                expires_at: now + chrono::Duration::days(TRUST_TOKEN_TTL_DAYS),
+                ip,
+                user_agent: ua.map(str::to_string),
+            })
+            .await?;
+        Some(raw)
+    } else {
+        None
+    };
+
     let cookie = set_op_session_cookie(&st.cookie_cfg, session.sid.clone(), st.provider.cfg.op_session_ttl);
     let body = json!({
         "user_id":          user.id.0.to_string(),
         "tenant_id":        user.tenant_id.0.to_string(),
         "active_tenant_id": challenge.active_tenant_id.0.to_string(),
         "tokens":           tokens,
+        "trust_token":      trust_token,
+        "trust_expires_in": trust_token.as_ref().map(|_| TRUST_TOKEN_TTL_DAYS * 24 * 60 * 60),
     });
     Ok((jar.add(cookie), Json(body)).into_response())
 }

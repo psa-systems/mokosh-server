@@ -602,6 +602,42 @@ impl MfaChallengePurpose {
     }
 }
 
+// --- Trusted devices ----------------------------------------------------
+//
+// "Remember this browser for 7 days." Issued by /v1/auth/mfa/verify
+// when the user opts in; the raw token rides with /v1/auth/login to
+// skip the MFA prompt.
+
+#[derive(Clone, Debug)]
+pub struct NewTrustedDevice {
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub token_hash: [u8; 32],
+    pub expires_at: DateTime<Utc>,
+    pub ip: Option<std::net::IpAddr>,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrustedDevice {
+    pub id: uuid::Uuid,
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub token_hash: [u8; 32],
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub user_agent: Option<String>,
+    pub ip: Option<std::net::IpAddr>,
+}
+
+impl TrustedDevice {
+    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+        self.revoked_at.is_none() && self.expires_at > now
+    }
+}
+
 // --- Audit events -------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

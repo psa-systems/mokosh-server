@@ -21,6 +21,7 @@ pub mod refresh;
 pub mod session;
 pub mod signup;
 pub mod totp;
+pub mod trusted_device;
 pub mod user;
 
 pub use audit::PgAuditLogger;
@@ -38,4 +39,5 @@ pub use refresh::PgRefreshTokenRepository;
 pub use session::PgOpSessionRepository;
 pub use signup::PgSignupTokenRepository;
 pub use totp::PgTotpRepository;
+pub use trusted_device::PgTrustedDeviceRepository;
 pub use user::PgUserRepository;
