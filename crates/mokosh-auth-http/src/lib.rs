@@ -18,6 +18,7 @@ pub mod handlers {
     pub mod discovery;
     pub mod invites;
     pub mod oidc;
+    pub mod password_reset;
     pub mod sessions;
     pub mod signup;
     pub mod tenants;

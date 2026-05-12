@@ -345,6 +345,40 @@ impl SignupToken {
     }
 }
 
+// --- Password reset -----------------------------------------------------
+//
+// One-shot tokens issued by POST /v1/auth/password-reset. Bearer of
+// the raw token (delivered via email) sets a new password by POSTing
+// to /v1/auth/password-reset/by-token/{token}/complete. The complete
+// transaction runs under SERIALIZABLE and revokes every active OP
+// session for the user (boot-everywhere is the point of a reset).
+//
+// See docs/mokosh-smtp/05-password-reset.md.
+
+#[derive(Clone, Debug)]
+pub struct NewPasswordResetToken {
+    pub email: String,
+    pub token_hash: [u8; 32],
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PasswordResetToken {
+    pub id: uuid::Uuid,
+    pub email: String,
+    pub token_hash: [u8; 32],
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub used_at: Option<DateTime<Utc>>,
+    pub user_id: Option<UserId>,
+}
+
+impl PasswordResetToken {
+    pub fn is_open(&self, now: DateTime<Utc>) -> bool {
+        self.used_at.is_none() && self.expires_at > now
+    }
+}
+
 // --- Authorization code -------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -531,6 +565,16 @@ pub enum AuditEvent {
     /// Failed signup-token redemption (unknown / used / expired token,
     /// password policy rejection, etc). Same enumeration-resistance
     /// shape as InviteAttemptFailed.
+    /// Failed password-reset attempt: unknown / used / expired token
+    /// at preview or complete time, or a complete request that
+    /// failed policy / confirmation. We log only the first 8 hex
+    /// chars of the SHA-256 hash so the raw token never reaches the
+    /// audit table.
+    PasswordResetAttemptFailed {
+        token_hash_prefix: String,
+        ip: Option<String>,
+        reason: String,
+    },
     SignupAttemptFailed {
         token_hash_prefix: String,
         ip: Option<String>,

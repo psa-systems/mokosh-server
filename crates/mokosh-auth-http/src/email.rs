@@ -28,6 +28,14 @@ pub trait Mailer: Send + Sync {
     /// so the recipient cannot infer enumeration outcomes from the
     /// message.
     async fn send_signup(&self, email: &str, raw_token: &str) -> Result<(), AuthError>;
+
+    /// Send a password-reset link. Same enumeration-resistance
+    /// constraint as `send_signup`: the body shape MUST be identical
+    /// whether the recipient address has an account or not. The
+    /// handler decides whether to actually call this; the mailer is
+    /// just the transport.
+    async fn send_password_reset(&self, email: &str, raw_token: &str)
+        -> Result<(), AuthError>;
 }
 
 /// Dev-only mailer. Logs the would-be email body to `tracing` and
@@ -71,6 +79,25 @@ impl Mailer for LogMailer {
             to = %email,
             link = %link,
             "[DEV] would send signup email"
+        );
+        Ok(())
+    }
+
+    async fn send_password_reset(
+        &self,
+        email: &str,
+        raw_token: &str,
+    ) -> Result<(), AuthError> {
+        let link = format!(
+            "{}/reset-password/{}",
+            self.accept_base_url.trim_end_matches('/'),
+            raw_token,
+        );
+        tracing::info!(
+            target: "mokosh_auth.mailer",
+            to = %email,
+            link = %link,
+            "[DEV] would send password-reset email"
         );
         Ok(())
     }
@@ -267,6 +294,17 @@ impl Mailer for LettreMailer {
         let (subject, text, html) = templates::signup_email(email, &link);
         self.send_multipart(to, &subject, text, html).await
     }
+
+    async fn send_password_reset(
+        &self,
+        email: &str,
+        raw_token: &str,
+    ) -> Result<(), AuthError> {
+        let link = self.build_link("reset-password", raw_token);
+        let to = parse_recipient(email)?;
+        let (subject, text, html) = templates::password_reset_email(email, &link);
+        self.send_multipart(to, &subject, text, html).await
+    }
 }
 
 // --- Templates ----------------------------------------------------------
@@ -344,6 +382,53 @@ If you did not expect this invite, you can safely ignore this email.\n\
             inviter_name = html_escape(&inviter_name),
             inviter_email = html_escape(&inviter.email),
             role = html_escape(role),
+            link = html_escape(link),
+        );
+
+        (subject, text, html)
+    }
+
+    /// Password-reset email. Enumeration-resistant: identical body
+    /// shape whether the recipient actually has an account. The "if
+    /// you did not request this" line is doing the load-bearing
+    /// work. 1-hour TTL is shorter than invites / signup because a
+    /// leaked reset token overrides an existing account's credentials.
+    pub fn password_reset_email(email: &str, link: &str) -> (String, String, String) {
+        let subject = "Reset your Mokosh password".to_string();
+
+        let text = format!(
+            "Hi,\n\
+\n\
+A password reset was requested for {email}. Click the link below to\n\
+set a new password. The link is valid for 1 hour and can only be\n\
+used once.\n\
+\n\
+  {link}\n\
+\n\
+If you did not request this, you can safely ignore this email; your\n\
+password will not change.\n\
+\n\
+(This is an automated message; do not reply.)\n",
+            email = email,
+            link = link,
+        );
+
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px;color:#1f2937;max-width:560px;margin:24px auto;padding:0 16px;">
+  <p>Hi,</p>
+  <p>A password reset was requested for <strong>{email}</strong>.</p>
+  <p><a href="{link}" style="display:inline-block;background:#2563eb;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;font-weight:600;">Reset password</a></p>
+  <p style="font-size:12px;color:#6b7280;">The link is valid for 1 hour and can only be used once.</p>
+  <p style="font-size:12px;color:#6b7280;">If the button does not work, paste this URL into your browser:<br><span style="font-family:ui-monospace,Menlo,monospace;word-break:break-all;">{link}</span></p>
+  <p style="font-size:12px;color:#6b7280;">If you did not request this, you can safely ignore this email; your password has not changed.</p>
+  <p style="font-size:11px;color:#9ca3af;">This is an automated message; do not reply.</p>
+</body>
+</html>
+"#,
+            email = html_escape(email),
             link = html_escape(link),
         );
 
@@ -472,5 +557,21 @@ mod tests {
         let (_, _, html) = templates::signup_email("<script>@b.test", "https://x");
         assert!(html.contains("&lt;script&gt;@b.test"));
         assert!(!html.contains("<script>@b.test"));
+    }
+
+    #[test]
+    fn password_reset_html_escapes_and_text_round_trips() {
+        let (subject, text, html) =
+            templates::password_reset_email("alice&bob@x.test", "https://x/y/abc");
+        assert_eq!(subject, "Reset your Mokosh password");
+        // Text body preserves & verbatim.
+        assert!(text.contains("alice&bob@x.test"));
+        assert!(!text.contains("alice&amp;bob"));
+        // HTML body escapes &.
+        assert!(html.contains("alice&amp;bob@x.test"));
+        assert!(!html.contains("alice&bob@x.test"));
+        // Link round-trips in both parts.
+        assert!(text.contains("https://x/y/abc"));
+        assert!(html.contains("https://x/y/abc"));
     }
 }

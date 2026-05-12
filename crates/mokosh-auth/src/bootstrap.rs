@@ -28,7 +28,7 @@ use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
     run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
     PgInviteRepository, PgMembershipRepository, PgOAuthClientRepository, PgOpSessionRepository,
-    PgRefreshTokenRepository, PgSignupTokenRepository,
+    PgPasswordResetTokenRepository, PgRefreshTokenRepository, PgSignupTokenRepository,
     PgUserRepository,
 };
 use std::sync::Arc;
@@ -123,6 +123,7 @@ pub async fn bootstrap(
     let invites = Arc::new(PgInviteRepository::new(auth_pool.clone()));
     let memberships = Arc::new(PgMembershipRepository::new(auth_pool.clone()));
     let signup_tokens = Arc::new(PgSignupTokenRepository::new(auth_pool.clone()));
+    let password_reset_tokens = Arc::new(PgPasswordResetTokenRepository::new(auth_pool.clone()));
 
     let public_signup_enabled = std::env::var("MOKOSH_PUBLIC_SIGNUP_ENABLED")
         .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -286,6 +287,7 @@ pub async fn bootstrap(
         invites,
         memberships,
         signup_tokens,
+        password_reset_tokens,
         public_signup_enabled,
         create_personal_tenant,
         mailer,

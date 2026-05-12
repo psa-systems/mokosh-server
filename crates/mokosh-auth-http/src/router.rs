@@ -6,7 +6,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use mokosh_auth_core::{
-    AuthError, InviteRepository, MembershipRepository, SignupTokenRepository, TenantId,
+    AuthError, InviteRepository, MembershipRepository, PasswordResetTokenRepository,
+    SignupTokenRepository, TenantId,
 };
 use mokosh_auth_oidc::OidcProvider;
 use std::sync::Arc;
@@ -17,7 +18,8 @@ use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
     auth as auth_h, discovery as disc_h, invites as invites_h, oidc as oidc_h,
-    sessions as sessions_h, signup as signup_h, tenants as tenants_h, users as users_h,
+    password_reset as pwd_reset_h, sessions as sessions_h, signup as signup_h,
+    tenants as tenants_h, users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -68,6 +70,8 @@ pub struct AuthHttpState {
     /// Self-signup tokens. Issued by /v1/auth/signup, consumed by
     /// /v1/auth/signup/by-token/{token}/complete. Phase 2 of doc 10.
     pub signup_tokens: Arc<dyn SignupTokenRepository>,
+    /// Password-reset tokens. See docs/mokosh-smtp/05-password-reset.md.
+    pub password_reset_tokens: Arc<dyn PasswordResetTokenRepository>,
     /// Whether public self-signup is enabled. PSA hub deployments
     /// keep this false (registration is admin-invite-gated); the
     /// a8n / individual SKU sets it true. Set via the
@@ -179,6 +183,16 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route(
             "/v1/auth/signup/by-token/{token}/complete",
             post(signup_h::complete),
+        )
+        // Password reset. Public, rate-limited per docs/mokosh-smtp/05.
+        .route("/v1/auth/password-reset", post(pwd_reset_h::start))
+        .route(
+            "/v1/auth/password-reset/by-token/{token}",
+            get(pwd_reset_h::preview),
+        )
+        .route(
+            "/v1/auth/password-reset/by-token/{token}/complete",
+            post(pwd_reset_h::complete),
         )
         // Membership-aware tenant switcher. Bearer-authed.
         .route("/v1/auth/memberships", get(tenants_h::list_my_memberships))

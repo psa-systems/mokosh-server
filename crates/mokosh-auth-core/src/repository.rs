@@ -315,6 +315,47 @@ pub trait SignupTokenRepository: Send + Sync {
     ) -> Result<(), AuthError>;
 }
 
+/// Persistent storage for password-reset tokens.
+///
+/// Same shape as `SignupTokenRepository` but for the
+/// `/v1/auth/password-reset` flow. The `complete` handler runs its
+/// own SERIALIZABLE transaction at the storage layer (see
+/// `PgPasswordResetTokenRepository::complete`); this trait only
+/// covers the simple lifecycle methods.
+#[async_trait]
+pub trait PasswordResetTokenRepository: Send + Sync {
+    async fn issue(
+        &self,
+        new: NewPasswordResetToken,
+    ) -> Result<PasswordResetToken, AuthError>;
+
+    async fn find_by_token_hash(
+        &self,
+        token_hash: [u8; 32],
+    ) -> Result<Option<PasswordResetToken>, AuthError>;
+
+    async fn find_open_by_email(
+        &self,
+        email: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<PasswordResetToken>, AuthError>;
+
+    /// Atomic complete under SERIALIZABLE isolation. Locks the
+    /// password-reset row by token_hash, looks up the user by the
+    /// row's email, updates `users.password_hash`, marks the token
+    /// used, and revokes every active op_session + refresh-token
+    /// family for the user. Returns the affected `UserId`.
+    ///
+    /// Returns `AuthError::NotFound` for unknown / used / expired
+    /// tokens, and for the rare case where the email no longer
+    /// resolves to a user (deleted between request and complete).
+    async fn complete(
+        &self,
+        token_hash: [u8; 32],
+        new_password_hash: &str,
+    ) -> Result<UserId, AuthError>;
+}
+
 #[async_trait]
 pub trait InviteRepository: Send + Sync {
     /// Insert a new invite. The implementation hashes `new.token`

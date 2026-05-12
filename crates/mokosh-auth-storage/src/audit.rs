@@ -44,6 +44,7 @@ fn event_kind(e: &AuditEvent) -> &'static str {
         SignupRequested { .. } => "signup_requested",
         SignupCompleted { .. } => "signup_completed",
         SignupAttemptFailed { .. } => "signup_attempt_failed",
+        PasswordResetAttemptFailed { .. } => "password_reset_attempt_failed",
     }
 }
 
