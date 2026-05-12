@@ -1,6 +1,6 @@
 # Development Dockerfile - debug builds. Source code (src/, crates/,
-# migrations/, Cargo.toml, Cargo.lock) is mounted in via compose
-# volumes; the build target lives on a named volume so cargo's
+# migrations/, Cargo.toml, Cargo.lock, build.rs) is mounted in via
+# compose volumes; the build target lives on a named volume so cargo's
 # incremental cache survives container restarts.
 #
 # The previous version of this image did a pre-build deps trick (stub
@@ -9,7 +9,7 @@
 # over /app/target, masking anything baked into the image. Each
 # developer's first `just dev` does the full compile into the named
 # volume; subsequent runs are incremental.
-FROM rust:1-slim-trixie
+FROM ghcr.io/niceguyit/rust-builder-glibc:v1.0.0-rust1.94-trixie
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
     pkg-config libssl-dev curl \
