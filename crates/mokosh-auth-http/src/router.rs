@@ -186,6 +186,10 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
             "/v1/auth/sessions/{session_id}/revoke",
             post(sessions_h::revoke_my_session),
         )
+        .route(
+            "/v1/auth/sessions/{session_id}/rename",
+            post(sessions_h::rename_my_session),
+        )
         // Admin user management.
         .route("/v1/auth/users", get(users_h::list_users))
         .route(

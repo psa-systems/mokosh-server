@@ -234,6 +234,9 @@ pub struct OpSession {
     pub ip: Option<std::net::IpAddr>,
     pub acr: String,
     pub amr: Vec<String>,
+    /// User-supplied label, e.g. "Work laptop", "Phone". NULL until the
+    /// user renames the session from the Sessions page.
+    pub display_name: Option<String>,
 }
 
 impl OpSession {

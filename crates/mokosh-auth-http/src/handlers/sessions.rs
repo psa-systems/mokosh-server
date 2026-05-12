@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{AuthError, OpSessionId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::errors::HttpError;
@@ -33,6 +33,8 @@ pub struct SessionView {
     pub user_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// `true` when this row is the OP session the caller is signed
     /// in under right now. Sourced from the `mokosh_op_session_id`
     /// claim on the access token used to make this request. The SPA
@@ -67,6 +69,7 @@ pub async fn list_my_sessions(
             expires_at: s.expires_at,
             user_agent: s.user_agent,
             ip: s.ip.map(|i| i.to_string()),
+            display_name: s.display_name,
         })
         .collect();
     Ok(Json(SessionListResponse { sessions: views }))
@@ -108,5 +111,49 @@ pub async fn revoke_my_session(
         .revoke_families_for_session(id, "user_revoked_session", now)
         .await;
 
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameBody {
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// `POST /v1/auth/sessions/{session_id}/rename`
+///
+/// Set or clear the user-supplied label on a session. Empty / null /
+/// whitespace-only collapses to NULL. Ownership-checked; foreign
+/// session ids return 404 so this can't be used as an enumeration
+/// oracle.
+pub async fn rename_my_session(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(user): BearerUser,
+    Path(session_id): Path<uuid::Uuid>,
+    Json(body): Json<RenameBody>,
+) -> Result<Response, HttpError> {
+    let id = OpSessionId(session_id);
+    let session = st
+        .provider
+        .sessions
+        .find_by_id(id)
+        .await
+        .map_err(HttpError)?;
+    let owns = matches!(&session, Some(s) if s.user_id == user.id);
+    if !owns {
+        return Err(HttpError(AuthError::NotFound));
+    }
+    if let Some(name) = body.display_name.as_deref() {
+        if name.len() > 100 {
+            return Err(HttpError(AuthError::InvalidRequest(
+                "display_name <=100 chars".into(),
+            )));
+        }
+    }
+    st.provider
+        .sessions
+        .rename(id, user.id, body.display_name.as_deref())
+        .await
+        .map_err(HttpError)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

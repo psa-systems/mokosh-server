@@ -11,7 +11,7 @@ use crate::pool::AuthPool;
 
 const SELECT_OP_SESSION: &str = r#"
     SELECT id, sid, user_id, tenant_id, created_at, last_active_at,
-           expires_at, revoked_at, user_agent, ip, acr, amr
+           expires_at, revoked_at, user_agent, ip, acr, amr, display_name
     FROM mokosh_auth.op_sessions
 "#;
 
@@ -47,7 +47,7 @@ impl OpSessionRepository for PgOpSessionRepository {
                 (sid, user_id, tenant_id, expires_at, user_agent, ip, acr, amr)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING id, sid, user_id, tenant_id, created_at, last_active_at,
-                       expires_at, revoked_at, user_agent, ip, acr, amr",
+                       expires_at, revoked_at, user_agent, ip, acr, amr, display_name",
         )
         .bind(&sid)
         .bind(user_id.0)
@@ -127,6 +127,80 @@ impl OpSessionRepository for PgOpSessionRepository {
         )
         .bind(at)
         .bind(id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn revoke_others_same_user_agent(
+        &self,
+        user_id: UserId,
+        user_agent: Option<&str>,
+        keep_id: OpSessionId,
+        at: DateTime<Utc>,
+    ) -> Result<u64, AuthError> {
+        // Two SQL shapes because COMPARING `user_agent = $2` with NULL
+        // is always false; NULL UAs need IS NULL semantics.
+        let n = match user_agent {
+            Some(ua) => {
+                sqlx::query(
+                    "UPDATE mokosh_auth.op_sessions
+                     SET revoked_at = $1
+                     WHERE user_id = $2
+                       AND user_agent = $3
+                       AND id <> $4
+                       AND revoked_at IS NULL",
+                )
+                .bind(at)
+                .bind(user_id.0)
+                .bind(ua)
+                .bind(keep_id.0)
+                .execute(self.pool.pg())
+                .await
+                .map_err(db_err)?
+                .rows_affected()
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE mokosh_auth.op_sessions
+                     SET revoked_at = $1
+                     WHERE user_id = $2
+                       AND user_agent IS NULL
+                       AND id <> $3
+                       AND revoked_at IS NULL",
+                )
+                .bind(at)
+                .bind(user_id.0)
+                .bind(keep_id.0)
+                .execute(self.pool.pg())
+                .await
+                .map_err(db_err)?
+                .rows_affected()
+            }
+        };
+        Ok(n)
+    }
+
+    async fn rename(
+        &self,
+        id: OpSessionId,
+        user_id: UserId,
+        display_name: Option<&str>,
+    ) -> Result<(), AuthError> {
+        // Empty / whitespace-only strings normalize to NULL so the UI
+        // can "clear" the label by submitting "".
+        let normalized = display_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        sqlx::query(
+            "UPDATE mokosh_auth.op_sessions
+             SET display_name = $1
+             WHERE id = $2 AND user_id = $3 AND revoked_at IS NULL",
+        )
+        .bind(normalized.as_deref())
+        .bind(id.0)
+        .bind(user_id.0)
         .execute(self.pool.pg())
         .await
         .map_err(db_err)?;

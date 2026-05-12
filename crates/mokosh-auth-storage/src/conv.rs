@@ -157,6 +157,7 @@ pub(crate) struct OpSessionRow {
     pub ip: Option<ipnetwork::IpNetwork>,
     pub acr: String,
     pub amr: Vec<String>,
+    pub display_name: Option<String>,
 }
 
 impl From<OpSessionRow> for OpSession {
@@ -174,6 +175,7 @@ impl From<OpSessionRow> for OpSession {
             ip: r.ip.map(|n| n.ip()),
             acr: r.acr,
             amr: r.amr,
+            display_name: r.display_name,
         }
     }
 }

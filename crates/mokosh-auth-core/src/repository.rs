@@ -104,6 +104,28 @@ pub trait OpSessionRepository: Send + Sync {
     async fn touch(&self, id: OpSessionId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn revoke(&self, id: OpSessionId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn revoke_all_for_user(&self, user_id: UserId) -> Result<Vec<OpSessionId>, AuthError>;
+    /// Revoke every active session for the user whose user_agent matches
+    /// the supplied string EXCEPT `keep_id`. Used by the login handler
+    /// to dedupe the "same browser = same logical session" case: the
+    /// SPA's fetch does not carry the OP-session cookie back, so the
+    /// cookie-based revoke does not fire and stale rows pile up. Match
+    /// is exact on the UA string; NULL UAs match other NULL UAs.
+    async fn revoke_others_same_user_agent(
+        &self,
+        user_id: UserId,
+        user_agent: Option<&str>,
+        keep_id: OpSessionId,
+        at: DateTime<Utc>,
+    ) -> Result<u64, AuthError>;
+    /// Update the user-friendly display name on a session row. NULL or
+    /// empty clears the name. Tenant-scoped: the caller must own the
+    /// session.
+    async fn rename(
+        &self,
+        id: OpSessionId,
+        user_id: UserId,
+        display_name: Option<&str>,
+    ) -> Result<(), AuthError>;
 }
 
 #[async_trait]
