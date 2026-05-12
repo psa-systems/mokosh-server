@@ -21,8 +21,8 @@ use mokosh_auth_crypto::OidcKeySet;
 use mokosh_auth_core::TenantId;
 use mokosh_auth_http::cookies::CookieConfig;
 use mokosh_auth_http::{
-    build_router, AuthHttpState, LocalAuth, LogMailer, Mailer, PersonalTenantCreator, RateLimiter,
-    TenantInfoLookup, TenantNameLookup,
+    build_router, AuthHttpState, LettreConfig, LettreMailer, LocalAuth, LogMailer, Mailer,
+    PersonalTenantCreator, RateLimiter, TenantInfoLookup, TenantNameLookup, TlsMode,
 };
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
@@ -211,9 +211,40 @@ pub async fn bootstrap(
             );
         }
     }
-    let mailer: Arc<dyn Mailer> = Arc::new(LogMailer {
-        accept_base_url: accept_base_url.clone(),
-    });
+    // Mailer selection. SMTP_HOST set + parseable SMTP_FROM -> real
+    // LettreMailer. Otherwise -> LogMailer (links go to tracing, the
+    // dev fallback). Misconfiguration (host set but other required
+    // fields missing or invalid) is a hard error so we don't silently
+    // start a prod deploy with email going nowhere. See
+    // docs/mokosh-smtp/03-config-and-bootstrap.md.
+    let mailer: Arc<dyn Mailer> = match resolve_mailer_config(&accept_base_url)? {
+        Some(lettre_cfg) => {
+            // Log the resolved config (minus password) at INFO so an
+            // operator can confirm the mailer is wired post-deploy.
+            tracing::info!(
+                target: "mokosh_auth.mailer",
+                smtp_host = %lettre_cfg.host,
+                smtp_port = %lettre_cfg.port,
+                smtp_tls  = %lettre_cfg.tls.as_str(),
+                smtp_user = %lettre_cfg.username.as_deref().unwrap_or("(none)"),
+                from      = %lettre_cfg.from,
+                "outbound email enabled (LettreMailer)"
+            );
+            Arc::new(
+                LettreMailer::new(lettre_cfg)
+                    .map_err(|e| BootstrapError::Config(e.to_string()))?,
+            )
+        }
+        None => {
+            tracing::warn!(
+                target: "mokosh_auth.mailer",
+                "outbound email NOT configured; using LogMailer (links go to docker logs)",
+            );
+            Arc::new(LogMailer {
+                accept_base_url: accept_base_url.clone(),
+            })
+        }
+    };
 
     // Tenant-name lookup: the auth crates do not own public.tenants, so
     // we inject a closure that runs a single query against the same
@@ -271,4 +302,73 @@ pub async fn bootstrap(
 /// browsers over plain HTTP anyway).
 fn is_local_issuer(u: &Url) -> bool {
     matches!(u.host_str(), Some("localhost") | Some("127.0.0.1"))
+}
+
+/// Read SMTP_* env vars and return either a populated `LettreConfig`
+/// or `None` (caller falls back to LogMailer). Misconfiguration (host
+/// set but other required fields missing) is a hard error: we refuse
+/// to boot rather than silently start a prod deploy with emails going
+/// nowhere.
+///
+/// Contract:
+///   - `SMTP_HOST` empty / unset      -> Ok(None) (LogMailer path).
+///   - `SMTP_HOST` set:               -> require SMTP_PORT (u16) and
+///                                       SMTP_FROM.
+///   - `SMTP_USERNAME` set with empty -> treated as unset.
+///   - `SMTP_USERNAME` set, _PASSWORD -> hard error (almost always a typo).
+///     missing
+///   - `SMTP_TLS` defaults to starttls; values: none|starttls|implicit.
+fn resolve_mailer_config(accept_base_url: &str) -> Result<Option<LettreConfig>, BootstrapError> {
+    let host = match std::env::var("SMTP_HOST") {
+        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Ok(None),
+    };
+
+    let port: u16 = std::env::var("SMTP_PORT")
+        .map_err(|_| BootstrapError::Config("SMTP_PORT required when SMTP_HOST is set".into()))?
+        .trim()
+        .parse()
+        .map_err(|e| BootstrapError::Config(format!("SMTP_PORT is not a u16: {e}")))?;
+
+    let from = std::env::var("SMTP_FROM")
+        .map_err(|_| BootstrapError::Config("SMTP_FROM required when SMTP_HOST is set".into()))?;
+    if from.trim().is_empty() {
+        return Err(BootstrapError::Config("SMTP_FROM is empty".into()));
+    }
+
+    let username = std::env::var("SMTP_USERNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let password = std::env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty());
+    if username.is_some() && password.is_none() {
+        return Err(BootstrapError::Config(
+            "SMTP_USERNAME set but SMTP_PASSWORD missing".into(),
+        ));
+    }
+
+    let tls = match std::env::var("SMTP_TLS")
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("starttls")
+    {
+        "none" => TlsMode::None,
+        "starttls" => TlsMode::StartTls,
+        "implicit" => TlsMode::ImplicitTls,
+        other => {
+            return Err(BootstrapError::Config(format!(
+                "SMTP_TLS must be one of none|starttls|implicit, got '{other}'"
+            )));
+        }
+    };
+
+    Ok(Some(LettreConfig {
+        host,
+        port,
+        username,
+        password,
+        from,
+        tls,
+        accept_base_url: accept_base_url.to_string(),
+    }))
 }

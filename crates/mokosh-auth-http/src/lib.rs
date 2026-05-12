@@ -25,7 +25,7 @@ pub mod handlers {
 }
 
 pub use cookies::{clear_op_session_cookie, set_op_session_cookie, OP_SESSION_COOKIE};
-pub use email::{LogMailer, Mailer};
+pub use email::{LettreConfig, LettreMailer, LogMailer, Mailer, TlsMode};
 pub use errors::HttpError;
 pub use local_auth::{LocalAuth, LocalLoginRequest};
 pub use rate_limit::{RateLimited, RateLimiter};

@@ -215,6 +215,21 @@ services:
       # Reach the in-stack postgres by service-DNS name.
       DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:-postgres}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
 
+      # Outbound email. Dev defaults point at the mailpit service
+      # alongside this one; messages land in http://localhost:8025.
+      # Production deploys override these via secrets; setting
+      # SMTP_HOST empty drops back to LogMailer (links go to docker
+      # logs). See docs/mokosh-smtp/03-config-and-bootstrap.md.
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # Display name MUST NOT contain unquoted parens; they're RFC 5322
+      # comment syntax. If you want "Mokosh (dev)" wrap it in quotes
+      # at the env-var level.
+      SMTP_FROM: ${SMTP_FROM:-Mokosh Dev <noreply@mokosh.localdev>}
+      SMTP_TLS: ${SMTP_TLS:-none}
+
       # Inside the compose network, reach Infisical by service-DNS, not the
       # published localhost port.
       INFISICAL_BASE_URL: http://infisical:8080
