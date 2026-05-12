@@ -214,15 +214,24 @@ impl LettreMailer {
         )
     }
 
-    /// Compose + submit a single message. Phase 2 stays with
-    /// text/plain only; phase 4 (templates) swaps in
-    /// multipart/alternative with HTML.
-    async fn send_text(&self, to: Mailbox, subject: &str, text: String) -> Result<(), AuthError> {
+    /// Compose + submit one `multipart/alternative` message
+    /// (text/plain first, text/html second). Every client we care
+    /// about prefers the HTML part; text/plain helps deliverability
+    /// scoring and is what plain-text clients (or terminal-based
+    /// readers) see.
+    async fn send_multipart(
+        &self,
+        to: Mailbox,
+        subject: &str,
+        text: String,
+        html: String,
+    ) -> Result<(), AuthError> {
+        use lettre::message::MultiPart;
         let msg = Message::builder()
             .from(self.from.clone())
             .to(to)
             .subject(subject)
-            .body(text)
+            .multipart(MultiPart::alternative_plain_html(text, html))
             .map_err(|e| AuthError::Internal(format!("compose: {e}")))?;
         self.transport
             .send(msg)
@@ -248,35 +257,220 @@ impl Mailer for LettreMailer {
     ) -> Result<(), AuthError> {
         let link = self.build_link("invite", raw_token);
         let to = parse_recipient(&invite.email)?;
-        let subject = "You're invited to Mokosh".to_string();
-        let body = format!(
-            "Hi,\n\n\
-             {} ({}) invited you to join Mokosh as {}.\n\n\
-             Accept the invite by clicking this link within 7 days:\n\n  {}\n\n\
-             If you did not expect this invite, you can safely ignore this email.\n\n\
-             (This is an automated message; do not reply.)\n",
-            display_name(inviter),
-            inviter.email,
-            invite.role.as_str(),
-            link,
-        );
-        self.send_text(to, &subject, body).await
+        let (subject, text, html) = templates::invite_email(invite, inviter, &link);
+        self.send_multipart(to, &subject, text, html).await
     }
 
     async fn send_signup(&self, email: &str, raw_token: &str) -> Result<(), AuthError> {
         let link = self.build_link("signup", raw_token);
         let to = parse_recipient(email)?;
-        let subject = "Confirm your Mokosh account".to_string();
-        let body = format!(
-            "Hi,\n\n\
-             A Mokosh account creation was requested for {}. Click the link\n\
-             below to set a password and finish creating the account. The link\n\
-             is valid for 24 hours and can only be used once.\n\n  {}\n\n\
-             If you did not request this, you can safely ignore this email;\n\
-             nothing will happen and no account will be created.\n\n\
-             (This is an automated message; do not reply.)\n",
-            email, link,
+        let (subject, text, html) = templates::signup_email(email, &link);
+        self.send_multipart(to, &subject, text, html).await
+    }
+}
+
+// --- Templates ----------------------------------------------------------
+//
+// Hand-written text and HTML bodies. No template engine: the variable
+// set is tiny (recipient, inviter, tenant name, link, role) and
+// every byte is grep-able. Every HTML interpolation goes through
+// `html_escape`; plain-text bodies do not escape. Inline CSS only,
+// no <link rel="stylesheet">, no web fonts, no external images.
+// See docs/mokosh-smtp/04-templates.md.
+
+pub mod templates {
+    use mokosh_auth_core::{Invite, User, UserRole};
+
+    use super::{display_name, html_escape};
+
+    /// User-facing version of the role enum. The auth-core enum's
+    /// `as_str()` is for storage; this is for humans.
+    fn role_label(role: UserRole) -> &'static str {
+        match role {
+            UserRole::Admin => "Admin",
+            UserRole::Manager => "Manager",
+            UserRole::Finance => "Finance",
+            UserRole::Member => "Member",
+            UserRole::ReadOnly => "Read only",
+        }
+    }
+
+    /// Invite email. Returns `(subject, text, html)`.
+    pub fn invite_email(invite: &Invite, inviter: &User, link: &str)
+        -> (String, String, String)
+    {
+        let inviter_name = display_name(inviter);
+        let role = role_label(invite.role);
+        // We don't have the tenant name in scope here (the auth crate
+        // doesn't own public.tenants). The handler logs the link
+        // + tenant name separately; the email body uses a generic
+        // "Mokosh" until phase 4-bis threads the tenant-name closure
+        // through the mailer. Acceptable for now.
+        let subject = "You're invited to Mokosh".to_string();
+
+        let text = format!(
+            "Hi,\n\
+\n\
+{inviter_name} ({inviter_email}) invited you to join Mokosh as {role}.\n\
+\n\
+Accept the invite by clicking this link in the next 7 days:\n\
+\n\
+  {link}\n\
+\n\
+If you did not expect this invite, you can safely ignore this email.\n\
+\n\
+(This is an automated message; do not reply.)\n",
+            inviter_name = inviter_name,
+            inviter_email = inviter.email,
+            role = role,
+            link = link,
         );
-        self.send_text(to, &subject, body).await
+
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px;color:#1f2937;max-width:560px;margin:24px auto;padding:0 16px;">
+  <p>Hi,</p>
+  <p><strong>{inviter_name}</strong> (<a href="mailto:{inviter_email}" style="color:#2563eb;">{inviter_email}</a>) invited you to join Mokosh as <em>{role}</em>.</p>
+  <p>Accept the invite within 7 days:</p>
+  <p><a href="{link}" style="display:inline-block;background:#2563eb;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;font-weight:600;">Accept invite</a></p>
+  <p style="font-size:12px;color:#6b7280;">If the button does not work, paste this URL into your browser:<br><span style="font-family:ui-monospace,Menlo,monospace;word-break:break-all;">{link}</span></p>
+  <p style="font-size:12px;color:#6b7280;">If you did not expect this invite, you can safely ignore this email.</p>
+  <p style="font-size:11px;color:#9ca3af;">This is an automated message; do not reply.</p>
+</body>
+</html>
+"#,
+            inviter_name = html_escape(&inviter_name),
+            inviter_email = html_escape(&inviter.email),
+            role = html_escape(role),
+            link = html_escape(link),
+        );
+
+        (subject, text, html)
+    }
+
+    /// Signup confirmation email. Same body shape whether the email
+    /// is in use or not (enumeration-resistance is enforced at the
+    /// handler level; the body must not give it away).
+    pub fn signup_email(email: &str, link: &str) -> (String, String, String) {
+        let subject = "Confirm your Mokosh account".to_string();
+
+        let text = format!(
+            "Hi,\n\
+\n\
+A Mokosh account creation was requested for {email}. Click the link\n\
+below to set a password and finish creating the account. The link is\n\
+valid for 24 hours and can only be used once.\n\
+\n\
+  {link}\n\
+\n\
+If you did not request this, you can safely ignore this email; nothing\n\
+will happen and no account will be created.\n\
+\n\
+(This is an automated message; do not reply.)\n",
+            email = email,
+            link = link,
+        );
+
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px;color:#1f2937;max-width:560px;margin:24px auto;padding:0 16px;">
+  <p>Hi,</p>
+  <p>A Mokosh account creation was requested for <strong>{email}</strong>. Click below to set a password and finish.</p>
+  <p><a href="{link}" style="display:inline-block;background:#2563eb;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;font-weight:600;">Finish creating account</a></p>
+  <p style="font-size:12px;color:#6b7280;">The link is valid for 24 hours and can only be used once.</p>
+  <p style="font-size:12px;color:#6b7280;">If the button does not work, paste this URL into your browser:<br><span style="font-family:ui-monospace,Menlo,monospace;word-break:break-all;">{link}</span></p>
+  <p style="font-size:12px;color:#6b7280;">If you did not request this, you can safely ignore this email.</p>
+  <p style="font-size:11px;color:#9ca3af;">This is an automated message; do not reply.</p>
+</body>
+</html>
+"#,
+            email = html_escape(email),
+            link = html_escape(link),
+        );
+
+        (subject, text, html)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use mokosh_auth_core::{TenantId, UserId, UserRole, UserStatus};
+
+    fn stub_user(email: &str, first: Option<&str>, last: Option<&str>) -> User {
+        User {
+            id: UserId(uuid::Uuid::nil()),
+            tenant_id: TenantId(uuid::Uuid::nil()),
+            email: email.to_string(),
+            email_verified_at: Some(Utc::now()),
+            password_hash: None,
+            role: UserRole::Admin,
+            status: UserStatus::Active,
+            first_name: first.map(String::from),
+            last_name: last.map(String::from),
+            timezone: "UTC".into(),
+            locale: "en-US".into(),
+            mfa_enrolled: false,
+            last_login_at: None,
+            last_active_tenant: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn stub_invite(email: &str) -> Invite {
+        Invite {
+            id: uuid::Uuid::nil(),
+            tenant_id: TenantId(uuid::Uuid::nil()),
+            email: email.to_string(),
+            role: UserRole::Member,
+            invited_by: UserId(uuid::Uuid::nil()),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::days(7),
+            used_at: None,
+            used_by: None,
+            revoked_at: None,
+            revoked_by: None,
+            revoke_reason: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn invite_html_escapes_inviter_name() {
+        let inviter = stub_user("inv@x.test", Some("<b>Bob</b>"), None);
+        let invite = stub_invite("you@x.test");
+        let (_, _, html) = templates::invite_email(&invite, &inviter, "https://x/y");
+        assert!(html.contains("&lt;b&gt;Bob&lt;/b&gt;"));
+        assert!(!html.contains("<b>Bob</b>"));
+    }
+
+    #[test]
+    fn invite_text_does_not_escape() {
+        let inviter = stub_user("inv@x.test", Some("Bob & Bob"), None);
+        let invite = stub_invite("you@x.test");
+        let (_, text, _) = templates::invite_email(&invite, &inviter, "https://x/y");
+        assert!(text.contains("Bob & Bob"));
+        assert!(!text.contains("&amp;"));
+    }
+
+    #[test]
+    fn signup_link_round_trips() {
+        let link = "https://x/y/abc-DEF_-123";
+        let (_, text, html) = templates::signup_email("a@b.test", link);
+        assert!(text.contains(link));
+        assert!(html.contains(link)); // URL-safe chars are also HTML-safe.
+    }
+
+    #[test]
+    fn signup_html_escapes_email_local_part() {
+        let (_, _, html) = templates::signup_email("<script>@b.test", "https://x");
+        assert!(html.contains("&lt;script&gt;@b.test"));
+        assert!(!html.contains("<script>@b.test"));
     }
 }
