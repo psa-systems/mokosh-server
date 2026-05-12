@@ -146,18 +146,10 @@ impl TotpRepository for PgTotpRepository {
         row.map(TotpEnrollment::try_from).transpose()
     }
 
-    async fn confirm(
-        &self,
-        user_id: UserId,
-        tenant_id: TenantId,
-        recovery_code_hashes: &[[u8; 32]],
-    ) -> Result<(), AuthError> {
+    async fn confirm(&self, user_id: UserId) -> Result<(), AuthError> {
         const MAX_ATTEMPTS: u32 = 3;
         for attempt in 0..MAX_ATTEMPTS {
-            match self
-                .confirm_once(user_id, tenant_id, recovery_code_hashes)
-                .await
-            {
+            match self.confirm_once(user_id).await {
                 Err(AuthError::Storage(msg))
                     if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
                 {
@@ -206,27 +198,21 @@ impl TotpRepository for PgTotpRepository {
 }
 
 impl PgTotpRepository {
-    async fn confirm_once(
-        &self,
-        user_id: UserId,
-        _tenant_id: TenantId,
-        recovery_code_hashes: &[[u8; 32]],
-    ) -> Result<(), AuthError> {
+    async fn confirm_once(&self, user_id: UserId) -> Result<(), AuthError> {
         let mut tx = self.pool.pg().begin().await.map_err(db_err)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
 
-        // 1. Lock the user_totp row + verify it is still unconfirmed.
+        // Lock + check the row.
         #[derive(sqlx::FromRow)]
         struct Locked {
             id: Uuid,
-            tenant_id: Uuid,
             confirmed_at: Option<DateTime<Utc>>,
         }
         let row: Option<Locked> = sqlx::query_as(
-            "SELECT id, tenant_id, confirmed_at
+            "SELECT id, confirmed_at
              FROM mokosh_auth.user_totp
              WHERE user_id = $1 FOR UPDATE",
         )
@@ -239,7 +225,6 @@ impl PgTotpRepository {
             return Err(AuthError::Conflict("already_enrolled".into()));
         }
 
-        // 2. Mark the totp row confirmed.
         sqlx::query(
             "UPDATE mokosh_auth.user_totp
              SET confirmed_at = NOW(), updated_at = NOW()
@@ -250,7 +235,6 @@ impl PgTotpRepository {
         .await
         .map_err(db_err)?;
 
-        // 3. Flip the user flag + clear the "admin disenrolled you" banner.
         sqlx::query(
             "UPDATE mokosh_auth.users
              SET mfa_enrolled = TRUE,
@@ -262,29 +246,6 @@ impl PgTotpRepository {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-
-        // 4. Wipe any pre-existing recovery codes (from a prior
-        //    enrollment attempt that did not complete) and insert the
-        //    fresh set.
-        sqlx::query("DELETE FROM mokosh_auth.recovery_codes WHERE user_totp_id = $1")
-            .bind(row.id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        for hash in recovery_code_hashes {
-            sqlx::query(
-                "INSERT INTO mokosh_auth.recovery_codes
-                    (user_totp_id, user_id, tenant_id, code_hash)
-                 VALUES ($1, $2, $3, $4)",
-            )
-            .bind(row.id)
-            .bind(user_id.0)
-            .bind(row.tenant_id)
-            .bind(&hash[..])
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        }
 
         tx.commit().await.map_err(db_err)?;
         Ok(())

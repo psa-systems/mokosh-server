@@ -33,3 +33,5 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 jsonwebtoken = { workspace = true }
 lettre = { workspace = true }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+secrecy = { workspace = true }

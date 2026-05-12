@@ -6,9 +6,11 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use mokosh_auth_core::{
-    AuthError, InviteRepository, MembershipRepository, PasswordResetTokenRepository,
-    SignupTokenRepository, TenantId,
+    AuthError, InviteRepository, MembershipRepository, MfaChallengeRepository,
+    PasswordResetTokenRepository, RecoveryCodeRepository, SignupTokenRepository, TenantId,
+    TotpRepository,
 };
+use mokosh_auth_crypto::EncryptionKeySet;
 use mokosh_auth_oidc::OidcProvider;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -17,7 +19,7 @@ use url::Url;
 use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
-    auth as auth_h, discovery as disc_h, invites as invites_h, oidc as oidc_h,
+    auth as auth_h, discovery as disc_h, invites as invites_h, mfa as mfa_h, oidc as oidc_h,
     password_reset as pwd_reset_h, sessions as sessions_h, signup as signup_h,
     tenants as tenants_h, users as users_h,
 };
@@ -97,6 +99,21 @@ pub struct AuthHttpState {
     /// endpoint and the SPA tenant switcher; injected for the same
     /// schema-isolation reason as `tenant_name`.
     pub tenant_info: TenantInfoLookup,
+    // --- MFA ---
+    pub totp: Arc<dyn TotpRepository>,
+    pub recovery_codes: Arc<dyn RecoveryCodeRepository>,
+    pub mfa_challenges: Arc<dyn MfaChallengeRepository>,
+    /// AES-256-GCM key set for at-rest encryption of TOTP shared secrets.
+    /// Built at bootstrap from `AuthConfig::data_encryption_key` (plus the
+    /// optional previous key for rotation).
+    pub dek: Arc<EncryptionKeySet>,
+    /// Active DEK version. New TOTP enrollments use this; rotation is
+    /// "bump this number, leave the old key as `prev`, re-encrypt at
+    /// leisure."
+    pub dek_version: u16,
+    /// Issuer label shown in authenticator apps. Today the host app
+    /// passes "Mokosh" or the deployment-specific brand.
+    pub mfa_issuer: String,
 }
 
 pub fn build_router(state: Arc<AuthHttpState>) -> Router {
@@ -194,6 +211,9 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
             "/v1/auth/password-reset/by-token/{token}/complete",
             post(pwd_reset_h::complete),
         )
+        // MFA enrollment (Bearer-authed; user enrolls themselves).
+        .route("/v1/auth/mfa/setup", post(mfa_h::setup))
+        .route("/v1/auth/mfa/confirm", post(mfa_h::confirm))
         // Membership-aware tenant switcher. Bearer-authed.
         .route("/v1/auth/memberships", get(tenants_h::list_my_memberships))
         .route(

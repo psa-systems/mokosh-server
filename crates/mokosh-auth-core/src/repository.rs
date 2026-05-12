@@ -465,15 +465,12 @@ pub trait TotpRepository: Send + Sync {
     ) -> Result<Option<TotpEnrollment>, AuthError>;
 
     /// SERIALIZABLE: locks the user_totp row, marks `confirmed_at`,
-    /// flips `users.mfa_enrolled = TRUE`, clears
-    /// `users.mfa_disenrolled_at`, and inserts the recovery-code rows.
-    /// All-or-nothing.
-    async fn confirm(
-        &self,
-        user_id: UserId,
-        tenant_id: TenantId,
-        recovery_code_hashes: &[[u8; 32]],
-    ) -> Result<(), AuthError>;
+    /// flips `users.mfa_enrolled = TRUE`, and clears
+    /// `users.mfa_disenrolled_at`. Recovery codes are NOT touched here;
+    /// `RecoveryCodeRepository::replace_all` is called by the handler
+    /// at `setup` time so the user sees the cleartext codes alongside
+    /// the QR. Confirm-only path is just the flag flip.
+    async fn confirm(&self, user_id: UserId) -> Result<(), AuthError>;
 
     /// Anti-replay: succeeds only if `step` is strictly greater than the
     /// stored `last_used_step` (or it is NULL). Single-statement UPDATE;

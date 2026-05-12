@@ -140,7 +140,7 @@ async fn start_enrollment_conflict_when_confirmed(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id, fx.tenant_id, &[[0x11; 32]])
+    repo.confirm(fx.user_id)
         .await
         .unwrap();
     let err = repo
@@ -151,15 +151,20 @@ async fn start_enrollment_conflict_when_confirmed(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn confirm_flips_mfa_enrolled_and_inserts_codes(pool: PgPool) {
+async fn confirm_flips_mfa_enrolled_after_recovery_codes_seeded(pool: PgPool) {
     let fx = setup(pool).await;
-    let repo = PgTotpRepository::new(fx.auth_pool.clone());
+    let totp = PgTotpRepository::new(fx.auth_pool.clone());
+    let recov = PgRecoveryCodeRepository::new(fx.auth_pool.clone());
 
-    repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
+    let enrollment = totp
+        .start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
     let hashes: Vec<[u8; 32]> = (0..10).map(|i| [i as u8; 32]).collect();
-    repo.confirm(fx.user_id, fx.tenant_id, &hashes).await.unwrap();
+    recov.replace_all(fx.user_id, fx.tenant_id, enrollment.id, &hashes)
+        .await
+        .unwrap();
+    totp.confirm(fx.user_id).await.unwrap();
 
     let mfa: bool = sqlx::query_scalar("SELECT mfa_enrolled FROM mokosh_auth.users WHERE id = $1")
         .bind(fx.user_id.0)
@@ -167,14 +172,7 @@ async fn confirm_flips_mfa_enrolled_and_inserts_codes(pool: PgPool) {
         .await
         .unwrap();
     assert!(mfa);
-
-    let n: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mokosh_auth.recovery_codes WHERE user_id = $1")
-            .bind(fx.user_id.0)
-            .fetch_one(&fx.pool)
-            .await
-            .unwrap();
-    assert_eq!(n, 10);
+    assert_eq!(recov.count_unused(fx.user_id).await.unwrap(), 10);
 }
 
 #[sqlx::test]
@@ -185,11 +183,11 @@ async fn confirm_twice_is_conflict(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id, fx.tenant_id, &[[0x22; 32]])
+    repo.confirm(fx.user_id)
         .await
         .unwrap();
     let err = repo
-        .confirm(fx.user_id, fx.tenant_id, &[[0x33; 32]])
+        .confirm(fx.user_id)
         .await
         .expect_err("second confirm must fail");
     assert!(matches!(err, AuthError::Conflict(_)), "got {err:?}");
@@ -225,7 +223,7 @@ async fn disenroll_is_idempotent_and_sets_banner(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id, fx.tenant_id, &[[0x55; 32]])
+    repo.confirm(fx.user_id)
         .await
         .unwrap();
 
@@ -258,7 +256,7 @@ async fn confirm_clears_mfa_disenrolled_banner(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id, fx.tenant_id, &[[0x77; 32]])
+    repo.confirm(fx.user_id)
         .await
         .unwrap();
 
@@ -278,12 +276,14 @@ async fn recovery_code_consume_then_replay_is_not_found(pool: PgPool) {
     let recov = PgRecoveryCodeRepository::new(fx.auth_pool.clone());
 
     let code_hash = [0x42u8; 32];
-    totp.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
+    let enrollment = totp
+        .start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    totp.confirm(fx.user_id, fx.tenant_id, &[code_hash])
+    recov.replace_all(fx.user_id, fx.tenant_id, enrollment.id, &[code_hash])
         .await
         .unwrap();
+    totp.confirm(fx.user_id).await.unwrap();
 
     recov.consume_unused(fx.user_id, code_hash).await.unwrap();
     let err = recov
@@ -304,7 +304,10 @@ async fn recovery_replace_all_wipes_old(pool: PgPool) {
         .start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    totp.confirm(fx.user_id, fx.tenant_id, &old).await.unwrap();
+    recov.replace_all(fx.user_id, fx.tenant_id, enrollment.id, &old)
+        .await
+        .unwrap();
+    totp.confirm(fx.user_id).await.unwrap();
     assert_eq!(recov.count_unused(fx.user_id).await.unwrap(), 10);
 
     let new: Vec<[u8; 32]> = (50..60).map(|i| [i; 32]).collect();

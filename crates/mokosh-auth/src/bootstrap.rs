@@ -17,8 +17,9 @@
 use axum::Router;
 use chrono::Duration;
 use mokosh_auth_core::{Clock, time::SystemClock};
-use mokosh_auth_crypto::OidcKeySet;
+use mokosh_auth_crypto::{EncryptionKeySet, OidcKeySet};
 use mokosh_auth_core::TenantId;
+use secrecy::ExposeSecret;
 use mokosh_auth_http::cookies::CookieConfig;
 use mokosh_auth_http::{
     build_router, AuthHttpState, LettreConfig, LettreMailer, LocalAuth, LogMailer, Mailer,
@@ -27,8 +28,9 @@ use mokosh_auth_http::{
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
     run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
-    PgInviteRepository, PgMembershipRepository, PgOAuthClientRepository, PgOpSessionRepository,
-    PgPasswordResetTokenRepository, PgRefreshTokenRepository, PgSignupTokenRepository,
+    PgInviteRepository, PgMembershipRepository, PgMfaChallengeRepository,
+    PgOAuthClientRepository, PgOpSessionRepository, PgPasswordResetTokenRepository,
+    PgRecoveryCodeRepository, PgRefreshTokenRepository, PgSignupTokenRepository, PgTotpRepository,
     PgUserRepository,
 };
 use std::sync::Arc;
@@ -124,6 +126,33 @@ pub async fn bootstrap(
     let memberships = Arc::new(PgMembershipRepository::new(auth_pool.clone()));
     let signup_tokens = Arc::new(PgSignupTokenRepository::new(auth_pool.clone()));
     let password_reset_tokens = Arc::new(PgPasswordResetTokenRepository::new(auth_pool.clone()));
+    let totp = Arc::new(PgTotpRepository::new(auth_pool.clone()));
+    let recovery_codes = Arc::new(PgRecoveryCodeRepository::new(auth_pool.clone()));
+    let mfa_challenges = Arc::new(PgMfaChallengeRepository::new(auth_pool.clone()));
+
+    // Build the at-rest encryption key set. The hex-encoded data
+    // encryption keys come in via AuthConfig; we decode here and
+    // build the lettre-style "current + optional prev" ring used for
+    // both TOTP secrets and any future at-rest blobs.
+    let dek_current_bytes = decode_hex_key(cfg.data_encryption_key.expose_secret())
+        .map_err(|e| BootstrapError::Config(format!("MOKOSH_AUTH_DATA_ENCRYPTION_KEY: {e}")))?;
+    let dek_prev_bytes = match cfg.data_encryption_key_prev.as_ref() {
+        Some(s) => Some(
+            decode_hex_key(s.expose_secret())
+                .map_err(|e| BootstrapError::Config(format!("MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV: {e}")))?,
+        ),
+        None => None,
+    };
+    let dek = Arc::new(EncryptionKeySet::new(
+        cfg.data_key_version,
+        &dek_current_bytes,
+        // Phase-1 keeps prev under version-1 if version is unspecified; in
+        // practice operators set MOKOSH_AUTH_DATA_KEY_VERSION when they
+        // rotate, and the prev version is `version - 1`.
+        dek_prev_bytes
+            .as_ref()
+            .map(|b| (cfg.data_key_version.saturating_sub(1), b)),
+    ));
 
     let public_signup_enabled = std::env::var("MOKOSH_PUBLIC_SIGNUP_ENABLED")
         .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -278,6 +307,8 @@ pub async fn bootstrap(
         })
     });
 
+    let mfa_issuer = std::env::var("MOKOSH_MFA_ISSUER").unwrap_or_else(|_| "Mokosh".to_string());
+
     let state = Arc::new(AuthHttpState {
         provider: provider.clone(),
         local_auth,
@@ -294,6 +325,12 @@ pub async fn bootstrap(
         accept_base_url,
         tenant_name,
         tenant_info,
+        totp,
+        recovery_codes,
+        mfa_challenges,
+        dek,
+        dek_version: cfg.data_key_version,
+        mfa_issuer,
     });
 
     Ok(MokoshAuth { provider, state })
@@ -304,6 +341,25 @@ pub async fn bootstrap(
 /// browsers over plain HTTP anyway).
 fn is_local_issuer(u: &Url) -> bool {
     matches!(u.host_str(), Some("localhost") | Some("127.0.0.1"))
+}
+
+/// Decode a hex-encoded 32-byte AES-256 key. The encryption-key env vars
+/// arrive as 64 hex chars (uppercase or lowercase, no `0x` prefix).
+fn decode_hex_key(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return Err(format!(
+            "expected 64 hex chars (32 bytes), got {}",
+            s.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let chunk = &s[i * 2..i * 2 + 2];
+        *byte = u8::from_str_radix(chunk, 16)
+            .map_err(|e| format!("invalid hex at byte {i}: {e}"))?;
+    }
+    Ok(out)
 }
 
 /// Read SMTP_* env vars and return either a populated `LettreConfig`

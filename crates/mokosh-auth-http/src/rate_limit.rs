@@ -72,6 +72,16 @@ pub struct RateLimiter {
     /// Password-reset complete by IP. 10/hour. Catches token brute-
     /// force against a single victim's reset link.
     password_reset_complete_by_ip: std::sync::Arc<Keyed<IpAddr>>,
+    /// MFA setup by user-id. 3/hour: each call rotates the unconfirmed
+    /// secret + recovery codes, so this throttles a malicious bearer
+    /// from chewing DB rows.
+    mfa_setup_by_user: std::sync::Arc<Keyed<mokosh_auth_core::UserId>>,
+    /// MFA confirm by user-id. 5 per 15 min. Each call is a brute-force
+    /// chance against the 160-bit secret; the floor is well below
+    /// meaningful attack rates.
+    mfa_confirm_by_user: std::sync::Arc<Keyed<mokosh_auth_core::UserId>>,
+    /// MFA verify (login challenge consumption) by IP. 5 per 15 min.
+    mfa_verify_by_ip: std::sync::Arc<Keyed<IpAddr>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,6 +122,10 @@ impl RateLimiter {
         let reset_start_ip_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(5));
         let reset_start_email_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(2));
         let reset_complete_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
+        let mfa_setup_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(3));
+        let fifteen_min = Duration::from_secs(900);
+        let mfa_confirm_quota = Quota::with_period(fifteen_min).expect("non-zero").allow_burst(nz(5));
+        let mfa_verify_quota = Quota::with_period(fifteen_min).expect("non-zero").allow_burst(nz(5));
 
         Self {
             login_by_ip: std::sync::Arc::new(Governor::keyed(login_ip_quota)),
@@ -127,7 +141,28 @@ impl RateLimiter {
             password_reset_start_by_ip: std::sync::Arc::new(Governor::keyed(reset_start_ip_quota)),
             password_reset_start_by_email: std::sync::Arc::new(Governor::keyed(reset_start_email_quota)),
             password_reset_complete_by_ip: std::sync::Arc::new(Governor::keyed(reset_complete_quota)),
+            mfa_setup_by_user: std::sync::Arc::new(Governor::keyed(mfa_setup_quota)),
+            mfa_confirm_by_user: std::sync::Arc::new(Governor::keyed(mfa_confirm_quota)),
+            mfa_verify_by_ip: std::sync::Arc::new(Governor::keyed(mfa_verify_quota)),
         }
+    }
+
+    pub fn check_mfa_setup(&self, user_id: mokosh_auth_core::UserId) -> Result<(), RateLimited> {
+        self.mfa_setup_by_user
+            .check_key(&user_id)
+            .map_err(|n| RateLimited::from_negative(&n))
+    }
+
+    pub fn check_mfa_confirm(&self, user_id: mokosh_auth_core::UserId) -> Result<(), RateLimited> {
+        self.mfa_confirm_by_user
+            .check_key(&user_id)
+            .map_err(|n| RateLimited::from_negative(&n))
+    }
+
+    pub fn check_mfa_verify(&self, ip: IpAddr) -> Result<(), RateLimited> {
+        self.mfa_verify_by_ip
+            .check_key(&ip)
+            .map_err(|n| RateLimited::from_negative(&n))
     }
 
     /// /v1/auth/password-reset rate-limit. Per-IP and per-email, both
