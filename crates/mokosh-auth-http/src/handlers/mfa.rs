@@ -744,6 +744,157 @@ pub async fn status(
         .into_response())
 }
 
+/// `POST /v1/auth/mfa/disable` (user-initiated)
+///
+/// Consumes a step-up token and turns MFA off. Best-effort email alert
+/// to the user.
+pub async fn disable(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(user): BearerUser,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<StepUpGatedBody>,
+) -> Result<Response, HttpError> {
+    if !user.mfa_enrolled {
+        return Ok((StatusCode::CONFLICT, Json(json!({"error": "not_enrolled"}))).into_response());
+    }
+    let ip = Some(addr.ip());
+    let token_hash = mokosh_auth_crypto::hash_opaque_token(&body.step_up_token);
+    let _consumed = match st
+        .mfa_challenges
+        .consume(token_hash, MfaChallengePurpose::StepUp)
+        .await
+    {
+        Ok(c) if c.user_id == user.id => c,
+        _ => return Ok(step_up_not_valid()),
+    };
+
+    st.totp.disenroll(user.id).await?;
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(user.tenant_id),
+            Some(user.id),
+            ip,
+            AuditEvent::TotpDisenrolled {
+                user_id: user.id,
+                by: "self".into(),
+                admin_user_id: None,
+                reason: None,
+                ip: ip.map(|i| i.to_string()),
+            },
+        )
+        .await;
+    if let Err(e) = st
+        .mailer
+        .send_security_alert(
+            &user.email,
+            "Two-factor authentication disabled",
+            "Two-factor authentication has been disabled on your Mokosh account.",
+        )
+        .await
+    {
+        tracing::error!(email = %user.email, "mfa disable alert email failed: {e}");
+    }
+    Ok((StatusCode::OK, Json(json!({"mfa_enrolled": false}))).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminDisenrollBody {
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDisenrollResponse {
+    pub user_id: String,
+    pub mfa_enrolled: bool,
+}
+
+/// `POST /v1/auth/users/{user_id}/mfa/disenroll`
+///
+/// Admin-only. Audit-loud. Same disenroll path as the self-initiated
+/// disable, plus an alert email that includes the admin-provided reason.
+pub async fn admin_force_disenroll(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(admin): BearerUser,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path(target_user_id): axum::extract::Path<uuid::Uuid>,
+    Json(body): Json<AdminDisenrollBody>,
+) -> Result<Response, HttpError> {
+    if !matches!(admin.role, mokosh_auth_core::UserRole::Admin) {
+        return Err(HttpError(AuthError::Forbidden(
+            "admin role required".into(),
+        )));
+    }
+    let reason = body.reason.trim().to_string();
+    if reason.is_empty() || reason.len() > 500 {
+        return Err(HttpError(AuthError::InvalidRequest(
+            "reason: 1-500 chars".into(),
+        )));
+    }
+
+    let target = st
+        .provider
+        .users
+        .find_by_id(mokosh_auth_core::UserId(target_user_id))
+        .await?
+        .ok_or(AuthError::NotFound)?;
+
+    // Cross-tenant force-disenroll is out of scope for now. An admin in
+    // tenant A cannot disenroll a user in tenant B.
+    if target.tenant_id != admin.tenant_id {
+        return Err(HttpError(AuthError::Forbidden(
+            "admin and target are in different tenants".into(),
+        )));
+    }
+
+    if !target.mfa_enrolled {
+        return Ok((StatusCode::CONFLICT, Json(json!({"error": "not_enrolled"}))).into_response());
+    }
+
+    st.totp.disenroll(target.id).await?;
+    let ip = Some(addr.ip());
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(target.tenant_id),
+            Some(target.id),
+            ip,
+            AuditEvent::TotpDisenrolled {
+                user_id: target.id,
+                by: "admin".into(),
+                admin_user_id: Some(admin.id),
+                reason: Some(reason.clone()),
+                ip: ip.map(|i| i.to_string()),
+            },
+        )
+        .await;
+    let alert_body = format!(
+        "An administrator disabled two-factor authentication on your Mokosh account.\n\
+         Reason: {reason}"
+    );
+    if let Err(e) = st
+        .mailer
+        .send_security_alert(
+            &target.email,
+            "Administrator disabled two-factor authentication",
+            &alert_body,
+        )
+        .await
+    {
+        tracing::error!(email = %target.email, "mfa force-disenroll alert email failed: {e}");
+    }
+    Ok((
+        StatusCode::OK,
+        Json(AdminDisenrollResponse {
+            user_id: target.id.0.to_string(),
+            mfa_enrolled: false,
+        }),
+    )
+        .into_response())
+}
+
 fn step_up_not_valid() -> Response {
     (
         StatusCode::NOT_FOUND,

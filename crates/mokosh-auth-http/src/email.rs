@@ -36,6 +36,18 @@ pub trait Mailer: Send + Sync {
     /// just the transport.
     async fn send_password_reset(&self, email: &str, raw_token: &str)
         -> Result<(), AuthError>;
+
+    /// Generic free-form security alert. Used today by the MFA disable
+    /// paths (self and admin-force); intended to grow as additional
+    /// "something changed on your account" notifications land. Free-form
+    /// because there is exactly one template today, and routing every
+    /// new alert through its own Mailer method would be process churn.
+    async fn send_security_alert(
+        &self,
+        email: &str,
+        subject: &str,
+        paragraph: &str,
+    ) -> Result<(), AuthError>;
 }
 
 /// Dev-only mailer. Logs the would-be email body to `tracing` and
@@ -98,6 +110,22 @@ impl Mailer for LogMailer {
             to = %email,
             link = %link,
             "[DEV] would send password-reset email"
+        );
+        Ok(())
+    }
+
+    async fn send_security_alert(
+        &self,
+        email: &str,
+        subject: &str,
+        paragraph: &str,
+    ) -> Result<(), AuthError> {
+        tracing::info!(
+            target: "mokosh_auth.mailer",
+            to = %email,
+            subject = %subject,
+            body = %paragraph,
+            "[DEV] would send security alert email"
         );
         Ok(())
     }
@@ -305,6 +333,18 @@ impl Mailer for LettreMailer {
         let (subject, text, html) = templates::password_reset_email(email, &link);
         self.send_multipart(to, &subject, text, html).await
     }
+
+    async fn send_security_alert(
+        &self,
+        email: &str,
+        subject: &str,
+        paragraph: &str,
+    ) -> Result<(), AuthError> {
+        let to = parse_recipient(email)?;
+        let (rendered_subject, text, html) =
+            templates::security_alert_email(email, subject, paragraph, &self.accept_base_url);
+        self.send_multipart(to, &rendered_subject, text, html).await
+    }
 }
 
 // --- Templates ----------------------------------------------------------
@@ -393,6 +433,53 @@ If you did not expect this invite, you can safely ignore this email.\n\
     /// you did not request this" line is doing the load-bearing
     /// work. 1-hour TTL is shorter than invites / signup because a
     /// leaked reset token overrides an existing account's credentials.
+    /// Free-form security-event alert email. The handler picks the
+    /// subject + body; this template just wraps them in the standard
+    /// Mokosh chrome and adds a "if this was not you" footer pointing
+    /// at the login page.
+    pub fn security_alert_email(
+        email: &str,
+        subject: &str,
+        paragraph: &str,
+        accept_base_url: &str,
+    ) -> (String, String, String) {
+        let base = accept_base_url.trim_end_matches('/');
+        let text = format!(
+            "Hi,\n\
+\n\
+{paragraph}\n\
+\n\
+Account: {email}\n\
+\n\
+If this was not you, change your password immediately at\n\
+  {base}/login\n\
+\n\
+(This is an automated message; do not reply.)\n",
+            paragraph = paragraph,
+            email = email,
+            base = base,
+        );
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px;color:#1f2937;max-width:560px;margin:24px auto;padding:0 16px;">
+  <p>Hi,</p>
+  <p>{paragraph}</p>
+  <p>Account: <strong>{email}</strong></p>
+  <p>If this was not you, change your password immediately at
+     <a href="{base}/login">{base}/login</a>.</p>
+  <p style="font-size:11px;color:#9ca3af;">This is an automated message; do not reply.</p>
+</body>
+</html>
+"#,
+            paragraph = html_escape(paragraph),
+            email = html_escape(email),
+            base = html_escape(base),
+        );
+        (subject.to_string(), text, html)
+    }
+
     pub fn password_reset_email(email: &str, link: &str) -> (String, String, String) {
         let subject = "Reset your Mokosh password".to_string();
 

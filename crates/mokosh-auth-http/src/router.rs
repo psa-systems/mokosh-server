@@ -223,6 +223,13 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // Recovery codes: list/regenerate (regenerate is step-up-gated).
         .route("/v1/auth/mfa/recovery-codes/regenerate", post(mfa_h::regenerate_recovery_codes))
         .route("/v1/auth/mfa/status", axum::routing::get(mfa_h::status))
+        // Disenroll (self) - step-up-gated; admin force-disenroll is
+        // mounted under /v1/auth/users to keep the URL space tidy.
+        .route("/v1/auth/mfa/disable", post(mfa_h::disable))
+        .route(
+            "/v1/auth/users/{user_id}/mfa/disenroll",
+            post(mfa_h::admin_force_disenroll),
+        )
         // Membership-aware tenant switcher. Bearer-authed.
         .route("/v1/auth/memberships", get(tenants_h::list_my_memberships))
         .route(
