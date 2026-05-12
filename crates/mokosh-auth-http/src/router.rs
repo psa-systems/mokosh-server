@@ -19,9 +19,9 @@ use url::Url;
 use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
-    auth as auth_h, discovery as disc_h, invites as invites_h, mfa as mfa_h, oidc as oidc_h,
-    password_reset as pwd_reset_h, sessions as sessions_h, signup as signup_h,
-    tenants as tenants_h, users as users_h,
+    audit as audit_h, auth as auth_h, discovery as disc_h, invites as invites_h, mfa as mfa_h,
+    oidc as oidc_h, password_reset as pwd_reset_h, profile as profile_h, sessions as sessions_h,
+    signup as signup_h, tenants as tenants_h, users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -212,6 +212,12 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
             post(pwd_reset_h::complete),
         )
         // MFA enrollment (Bearer-authed; user enrolls themselves).
+        // Admin audit log reader.
+        .route("/v1/auth/audit-logs", axum::routing::get(audit_h::list))
+        // Self-service profile.
+        .route("/v1/auth/me", axum::routing::get(profile_h::get_me))
+        .route("/v1/auth/me/profile", axum::routing::put(profile_h::update_profile))
+        .route("/v1/auth/me/password", post(profile_h::change_password))
         .route("/v1/auth/mfa/setup", post(mfa_h::setup))
         .route("/v1/auth/mfa/confirm", post(mfa_h::confirm))
         // MFA verify: consumes the login challenge issued by /v1/auth/login

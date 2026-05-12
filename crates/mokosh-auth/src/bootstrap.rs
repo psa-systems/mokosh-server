@@ -110,11 +110,23 @@ pub async fn bootstrap(
         clock,
     );
 
+    let lockout_threshold = std::env::var("MOKOSH_AUTH_LOCKOUT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(5)
+        .max(1);
+    let lockout_seconds = std::env::var("MOKOSH_AUTH_LOCKOUT_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(15 * 60)
+        .max(1);
     let local_auth = Arc::new(LocalAuth {
         users,
         sessions,
         audit,
         op_session_ttl: cfg.op_session_ttl,
+        lockout_threshold,
+        lockout_seconds,
     });
 
     let cookie_cfg = CookieConfig {

@@ -87,6 +87,7 @@ pub struct User {
     pub last_name: Option<String>,
     pub timezone: String,
     pub locale: String,
+    pub avatar_url: Option<String>,
     pub mfa_enrolled: bool,
     pub last_login_at: Option<DateTime<Utc>>,
     /// Tenant the user was most recently acting under. `None` means
@@ -479,6 +480,14 @@ pub struct RotatedTokens {
     pub scope: Vec<String>,
 }
 
+/// Returned by `UserRepository::record_failed_login`. Tells the caller
+/// the post-increment counter and whether the threshold tripped a lock.
+#[derive(Clone, Debug)]
+pub struct FailedLoginOutcome {
+    pub failed_login_count: i32,
+    pub locked_until: Option<DateTime<Utc>>,
+}
+
 // --- TOTP / MFA ---------------------------------------------------------
 //
 // One `user_totp` row per user. `secret_encrypted` is the AES-GCM blob
@@ -757,6 +766,20 @@ pub enum AuditEvent {
         user_id: UserId,
         ip: Option<String>,
     },
+    /// Login rejected because `users.locked_until > now()`. Carries the
+    /// remaining lock window so an alerting pipeline can correlate.
+    AccountLockoutHit {
+        user_id: UserId,
+        locked_until: DateTime<Utc>,
+        ip: Option<String>,
+    },
+    /// Threshold tripped on the just-recorded failed login; the user is
+    /// now locked.
+    AccountLocked {
+        user_id: UserId,
+        locked_until: DateTime<Utc>,
+        ip: Option<String>,
+    },
 }
 
 impl AuditEvent {
@@ -769,6 +792,7 @@ impl AuditEvent {
                 AuditSeverity::Warning
             }
             TotpDisenrolled { by, .. } if by == "admin" => AuditSeverity::Warning,
+            AccountLocked { .. } => AuditSeverity::Warning,
             _ => AuditSeverity::Info,
         }
     }

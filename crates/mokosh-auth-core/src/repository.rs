@@ -5,7 +5,7 @@
 //! that cross-tenant data leakage is structurally impossible at this layer.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeSet;
 
 use crate::error::AuthError;
@@ -35,7 +35,31 @@ pub trait UserRepository: Send + Sync {
     async fn list_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<User>, AuthError>;
     async fn create(&self, new: NewUser) -> Result<User, AuthError>;
     async fn update_last_login(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
+    /// Atomically increment `failed_login_count`, set `last_failed_login_at = NOW()`,
+    /// and (if the new count crosses the threshold) set `locked_until = NOW() + lock_for`.
+    /// Returns the post-increment counter so the caller can audit the lock.
+    async fn record_failed_login(
+        &self,
+        id: UserId,
+        threshold: i32,
+        lock_for: Duration,
+    ) -> Result<FailedLoginOutcome, AuthError>;
+    /// Reset the counter + clear `locked_until` after a successful login.
+    async fn clear_failed_logins(&self, id: UserId) -> Result<(), AuthError>;
+    /// Read `locked_until` for the user; if `> now()` the account is locked.
+    async fn lockout_status(&self, id: UserId) -> Result<Option<DateTime<Utc>>, AuthError>;
     async fn set_password_hash(&self, id: UserId, hash: &str) -> Result<(), AuthError>;
+    /// Update the self-editable profile fields. Empty strings on
+    /// `first_name` / `last_name` / `avatar_url` collapse to NULL; the
+    /// `timezone` is set as-is (validation lives in the handler).
+    async fn update_profile(
+        &self,
+        id: UserId,
+        first_name: Option<&str>,
+        last_name: Option<&str>,
+        timezone: &str,
+        avatar_url: Option<&str>,
+    ) -> Result<(), AuthError>;
     async fn set_status(&self, id: UserId, status: UserStatus) -> Result<(), AuthError>;
     async fn mark_email_verified(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
     /// Update the user's `last_active_tenant` pointer. Called by
@@ -179,6 +203,33 @@ pub trait AuditLogger: Send + Sync {
         ip: Option<std::net::IpAddr>,
         event: AuditEvent,
     ) -> Result<(), AuthError>;
+
+    /// List the most recent rows for a tenant. Pagination is offset-based
+    /// because the admin UI is the only consumer today and the volumes
+    /// are modest; if this grows we switch to a `(created_at, id)` cursor.
+    /// `kind` is an optional `event_kind` filter; `actor_id` filters to
+    /// rows where the actor matches (used for "show me everything user X
+    /// did").
+    async fn list_recent(
+        &self,
+        tenant_id: TenantId,
+        kind: Option<&str>,
+        actor_id: Option<UserId>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditEntry>, AuthError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    pub id: uuid::Uuid,
+    pub tenant_id: Option<TenantId>,
+    pub actor_id: Option<UserId>,
+    pub event_kind: String,
+    pub severity: String,
+    pub ip: Option<std::net::IpAddr>,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Cryptographic primitives the OIDC engine needs at runtime, abstracted so

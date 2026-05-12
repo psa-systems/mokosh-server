@@ -326,7 +326,7 @@ impl PgInviteRepository {
              VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, NOW())
              RETURNING id, tenant_id, email, email_verified_at, password_hash,
                        role, status, first_name, last_name, timezone, locale,
-                       mfa_enrolled, last_login_at, last_active_tenant,
+                       avatar_url, mfa_enrolled, last_login_at, last_active_tenant,
                        created_at, updated_at",
         )
         .bind(new_user_id)

@@ -13,7 +13,7 @@ pub(crate) const SELECT_USER_PUB: &str = SELECT_USER;
 const SELECT_USER: &str = r#"
     SELECT id, tenant_id, email, email_verified_at, password_hash,
            role, status, first_name, last_name, timezone, locale,
-           mfa_enrolled, last_login_at, last_active_tenant,
+           avatar_url, mfa_enrolled, last_login_at, last_active_tenant,
            created_at, updated_at
     FROM mokosh_auth.users
 "#;
@@ -96,7 +96,7 @@ impl UserRepository for PgUserRepository {
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, tenant_id, email, email_verified_at, password_hash,
                        role, status, first_name, last_name, timezone, locale,
-                       mfa_enrolled, last_login_at, last_active_tenant,
+                       avatar_url, mfa_enrolled, last_login_at, last_active_tenant,
                        created_at, updated_at"
         ))
         .bind(new.tenant_id.0)
@@ -134,6 +134,96 @@ impl UserRepository for PgUserRepository {
             .execute(self.pool.pg())
             .await
             .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn record_failed_login(
+        &self,
+        id: UserId,
+        threshold: i32,
+        lock_for: chrono::Duration,
+    ) -> Result<mokosh_auth_core::FailedLoginOutcome, AuthError> {
+        let lock_for_secs = lock_for.num_seconds().max(0);
+        // Increment + conditionally set locked_until in one statement so
+        // parallel failed-logins do not race the threshold check.
+        let row: (i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "UPDATE mokosh_auth.users
+             SET failed_login_count = failed_login_count + 1,
+                 last_failed_login_at = NOW(),
+                 locked_until = CASE
+                     WHEN failed_login_count + 1 >= $2 THEN NOW() + ($3 || ' seconds')::INTERVAL
+                     ELSE locked_until
+                 END,
+                 updated_at = NOW()
+             WHERE id = $1
+             RETURNING failed_login_count, locked_until",
+        )
+        .bind(id.0)
+        .bind(threshold)
+        .bind(lock_for_secs.to_string())
+        .fetch_one(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(mokosh_auth_core::FailedLoginOutcome {
+            failed_login_count: row.0,
+            locked_until: row.1,
+        })
+    }
+
+    async fn clear_failed_logins(&self, id: UserId) -> Result<(), AuthError> {
+        sqlx::query(
+            "UPDATE mokosh_auth.users
+             SET failed_login_count = 0,
+                 last_failed_login_at = NULL,
+                 locked_until = NULL,
+                 updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn lockout_status(
+        &self,
+        id: UserId,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, AuthError> {
+        let row: Option<Option<chrono::DateTime<chrono::Utc>>> =
+            sqlx::query_scalar("SELECT locked_until FROM mokosh_auth.users WHERE id = $1")
+                .bind(id.0)
+                .fetch_optional(self.pool.pg())
+                .await
+                .map_err(db_err)?;
+        Ok(row.flatten())
+    }
+
+    async fn update_profile(
+        &self,
+        id: UserId,
+        first_name: Option<&str>,
+        last_name: Option<&str>,
+        timezone: &str,
+        avatar_url: Option<&str>,
+    ) -> Result<(), AuthError> {
+        sqlx::query(
+            "UPDATE mokosh_auth.users
+             SET first_name = $1,
+                 last_name = $2,
+                 timezone = $3,
+                 avatar_url = $4,
+                 updated_at = NOW()
+             WHERE id = $5",
+        )
+        .bind(first_name)
+        .bind(last_name)
+        .bind(timezone)
+        .bind(avatar_url)
+        .bind(id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 

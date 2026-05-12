@@ -1,7 +1,10 @@
 //! Postgres-backed `AuditLogger`. Append-only.
 
 use async_trait::async_trait;
-use mokosh_auth_core::{AuditEvent, AuditLogger, AuthError, TenantId, UserId};
+use chrono::{DateTime, Utc};
+use ipnetwork::IpNetwork;
+use mokosh_auth_core::{AuditEntry, AuditEvent, AuditLogger, AuthError, TenantId, UserId};
+use uuid::Uuid;
 
 use crate::conv::{db_err, ip_to_inet};
 use crate::pool::AuthPool;
@@ -56,6 +59,8 @@ fn event_kind(e: &AuditEvent) -> &'static str {
         RecoveryCodesIssued { .. } => "recovery_codes_issued",
         RecoveryCodesRegenerated { .. } => "recovery_codes_regenerated",
         RecoveryCodeUsed { .. } => "recovery_code_used",
+        AccountLockoutHit { .. } => "account_lockout_hit",
+        AccountLocked { .. } => "account_locked",
     }
 }
 
@@ -93,5 +98,58 @@ impl AuditLogger for PgAuditLogger {
             tracing::warn!(target: "mokosh_auth.audit", kind, ?event, "critical audit event");
         }
         Ok(())
+    }
+
+    async fn list_recent(
+        &self,
+        tenant_id: TenantId,
+        kind: Option<&str>,
+        actor_id: Option<UserId>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditEntry>, AuthError> {
+        let limit = limit.clamp(1, 200);
+        let offset = offset.max(0);
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            tenant_id: Option<Uuid>,
+            actor_id: Option<Uuid>,
+            event_kind: String,
+            severity: String,
+            ip: Option<IpNetwork>,
+            metadata: serde_json::Value,
+            created_at: DateTime<Utc>,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, tenant_id, actor_id, event_kind, severity, ip, metadata, created_at
+             FROM mokosh_auth.audit_logs
+             WHERE tenant_id = $1
+               AND ($2::TEXT IS NULL OR event_kind = $2)
+               AND ($3::UUID IS NULL OR actor_id = $3)
+             ORDER BY created_at DESC
+             LIMIT $4 OFFSET $5",
+        )
+        .bind(tenant_id.0)
+        .bind(kind)
+        .bind(actor_id.map(|a| a.0))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AuditEntry {
+                id: r.id,
+                tenant_id: r.tenant_id.map(TenantId),
+                actor_id: r.actor_id.map(UserId),
+                event_kind: r.event_kind,
+                severity: r.severity,
+                ip: r.ip.map(|n| n.ip()),
+                metadata: r.metadata,
+                created_at: r.created_at,
+            })
+            .collect())
     }
 }

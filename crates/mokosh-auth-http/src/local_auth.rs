@@ -41,6 +41,12 @@ pub struct LocalAuth {
     pub sessions: Arc<dyn OpSessionRepository>,
     pub audit: Arc<dyn mokosh_auth_core::AuditLogger>,
     pub op_session_ttl: Duration,
+    /// Consecutive-failure count that triggers a lock. Defaults to 5
+    /// when constructed via `bootstrap.rs` (overridable via
+    /// `MOKOSH_AUTH_LOCKOUT_THRESHOLD`).
+    pub lockout_threshold: i32,
+    /// How long the lock lasts, in seconds. Defaults to 15 minutes.
+    pub lockout_seconds: i64,
 }
 
 /// Result of password-only verification. Carries the verified `User` but
@@ -145,6 +151,25 @@ impl LocalAuth {
                 return Err(AuthError::AccessDenied("invalid credentials".into()));
             }
         };
+        if let Some(locked_until) = self.users.lockout_status(user.id).await? {
+            if locked_until > chrono::Utc::now() {
+                let _ = verify_password(&req.password, DUMMY_HASH);
+                let _ = self
+                    .audit
+                    .record(
+                        Some(user.tenant_id),
+                        Some(user.id),
+                        ip,
+                        AuditEvent::AccountLockoutHit {
+                            user_id: user.id,
+                            locked_until,
+                            ip: ip.map(|i| i.to_string()),
+                        },
+                    )
+                    .await;
+                return Err(AuthError::AccessDenied("invalid credentials".into()));
+            }
+        }
         if !verify_password(&req.password, stored_hash) {
             let _ = self
                 .audit
@@ -159,8 +184,34 @@ impl LocalAuth {
                     },
                 )
                 .await;
+            let outcome = self
+                .users
+                .record_failed_login(
+                    user.id,
+                    self.lockout_threshold,
+                    chrono::Duration::seconds(self.lockout_seconds),
+                )
+                .await?;
+            if let Some(locked_until) = outcome.locked_until {
+                if locked_until > chrono::Utc::now() {
+                    let _ = self
+                        .audit
+                        .record(
+                            Some(user.tenant_id),
+                            Some(user.id),
+                            ip,
+                            AuditEvent::AccountLocked {
+                                user_id: user.id,
+                                locked_until,
+                                ip: ip.map(|i| i.to_string()),
+                            },
+                        )
+                        .await;
+                }
+            }
             return Err(AuthError::AccessDenied("invalid credentials".into()));
         }
+        let _ = self.users.clear_failed_logins(user.id).await;
 
         let session = self
             .sessions
@@ -241,6 +292,29 @@ impl LocalAuth {
                 return Err(AuthError::AccessDenied("invalid credentials".into()));
             }
         };
+        // Lockout pre-check: refuse the login if the user is still
+        // inside the lockout window. We do this AFTER establishing the
+        // user identity but BEFORE the password verify; the dummy-hash
+        // pass on the early-exit paths keeps the timing oracle closed.
+        if let Some(locked_until) = self.users.lockout_status(user.id).await? {
+            if locked_until > chrono::Utc::now() {
+                let _ = verify_password(&req.password, DUMMY_HASH);
+                let _ = self
+                    .audit
+                    .record(
+                        Some(user.tenant_id),
+                        Some(user.id),
+                        ip,
+                        AuditEvent::AccountLockoutHit {
+                            user_id: user.id,
+                            locked_until,
+                            ip: ip.map(|i| i.to_string()),
+                        },
+                    )
+                    .await;
+                return Err(AuthError::AccessDenied("invalid credentials".into()));
+            }
+        }
         if !verify_password(&req.password, stored_hash) {
             let _ = self
                 .audit
@@ -255,8 +329,35 @@ impl LocalAuth {
                     },
                 )
                 .await;
+            let outcome = self
+                .users
+                .record_failed_login(
+                    user.id,
+                    self.lockout_threshold,
+                    chrono::Duration::seconds(self.lockout_seconds),
+                )
+                .await?;
+            if let Some(locked_until) = outcome.locked_until {
+                if locked_until > chrono::Utc::now() {
+                    let _ = self
+                        .audit
+                        .record(
+                            Some(user.tenant_id),
+                            Some(user.id),
+                            ip,
+                            AuditEvent::AccountLocked {
+                                user_id: user.id,
+                                locked_until,
+                                ip: ip.map(|i| i.to_string()),
+                            },
+                        )
+                        .await;
+                }
+            }
             return Err(AuthError::AccessDenied("invalid credentials".into()));
         }
+        // Successful password: clear the counter.
+        let _ = self.users.clear_failed_logins(user.id).await;
         Ok(LocalVerifyOk { user })
     }
 

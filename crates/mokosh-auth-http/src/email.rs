@@ -587,6 +587,7 @@ mod tests {
             last_name: last.map(String::from),
             timezone: "UTC".into(),
             locale: "en-US".into(),
+            avatar_url: None,
             mfa_enrolled: false,
             last_login_at: None,
             last_active_tenant: None,
