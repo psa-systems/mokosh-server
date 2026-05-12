@@ -438,3 +438,95 @@ pub trait InviteRepository: Send + Sync {
         user_id: UserId,
     ) -> Result<User, AuthError>;
 }
+
+#[async_trait]
+pub trait TotpRepository: Send + Sync {
+    /// Idempotent "start enrollment". If a row exists with
+    /// `confirmed_at IS NULL`, leaves the existing `user_totp` row in
+    /// place and returns it (so a page-reload during enrollment does
+    /// not generate a new secret). If a row exists with
+    /// `confirmed_at IS NOT NULL`, returns
+    /// `Conflict("already_enrolled")`. Otherwise inserts a fresh
+    /// unconfirmed row.
+    ///
+    /// The caller passes the encrypted blob + the key version it was
+    /// produced under. The handler is responsible for the encryption.
+    async fn start_enrollment(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        encrypted_secret: serde_json::Value,
+        key_version: u16,
+    ) -> Result<TotpEnrollment, AuthError>;
+
+    async fn find_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Option<TotpEnrollment>, AuthError>;
+
+    /// SERIALIZABLE: locks the user_totp row, marks `confirmed_at`,
+    /// flips `users.mfa_enrolled = TRUE`, clears
+    /// `users.mfa_disenrolled_at`, and inserts the recovery-code rows.
+    /// All-or-nothing.
+    async fn confirm(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        recovery_code_hashes: &[[u8; 32]],
+    ) -> Result<(), AuthError>;
+
+    /// Anti-replay: succeeds only if `step` is strictly greater than the
+    /// stored `last_used_step` (or it is NULL). Single-statement UPDATE;
+    /// no transaction required.
+    async fn consume_step(&self, user_id: UserId, step: i64) -> Result<(), AuthError>;
+
+    /// SERIALIZABLE: removes the user_totp row + every recovery_codes
+    /// row + flips `users.mfa_enrolled = FALSE` + writes
+    /// `users.mfa_disenrolled_at = NOW()`. Idempotent.
+    async fn disenroll(&self, user_id: UserId) -> Result<(), AuthError>;
+}
+
+#[async_trait]
+pub trait RecoveryCodeRepository: Send + Sync {
+    /// SERIALIZABLE: looks up an unused row whose hash matches and marks
+    /// it used. Returns `NotFound` for unknown/used. Same shape as the
+    /// "wrong TOTP code" response in the verify handler so callers can
+    /// keep them indistinguishable.
+    async fn consume_unused(
+        &self,
+        user_id: UserId,
+        code_hash: [u8; 32],
+    ) -> Result<(), AuthError>;
+
+    async fn count_unused(&self, user_id: UserId) -> Result<usize, AuthError>;
+
+    /// SERIALIZABLE: wipes every existing row for the user and inserts
+    /// the fresh set in one tx. Used by enrollment (initial issue) and
+    /// by `/v1/auth/mfa/recovery-codes/regenerate`.
+    async fn replace_all(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        user_totp_id: uuid::Uuid,
+        new_hashes: &[[u8; 32]],
+    ) -> Result<(), AuthError>;
+}
+
+#[async_trait]
+pub trait MfaChallengeRepository: Send + Sync {
+    async fn issue(&self, new: NewMfaChallenge) -> Result<MfaChallenge, AuthError>;
+
+    async fn find_by_token_hash(
+        &self,
+        token_hash: [u8; 32],
+    ) -> Result<Option<MfaChallenge>, AuthError>;
+
+    /// SERIALIZABLE: locks the row, returns `NotFound` if it is
+    /// missing/used/expired/wrong-purpose, otherwise marks it consumed
+    /// and returns the row.
+    async fn consume(
+        &self,
+        token_hash: [u8; 32],
+        expected_purpose: MfaChallengePurpose,
+    ) -> Result<MfaChallenge, AuthError>;
+}

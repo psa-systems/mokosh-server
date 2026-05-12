@@ -479,6 +479,120 @@ pub struct RotatedTokens {
     pub scope: Vec<String>,
 }
 
+// --- TOTP / MFA ---------------------------------------------------------
+//
+// One `user_totp` row per user. `secret_encrypted` is the AES-GCM blob
+// the encryption-key set produced; `key_version` selects which key to
+// use for decryption. `confirmed_at` flips when the user completes
+// /v1/auth/mfa/confirm. `last_used_step` is the most recent verified
+// step, used to defeat in-window replay.
+
+#[derive(Clone, Debug)]
+pub struct TotpEnrollment {
+    pub id: uuid::Uuid,
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    /// Raw JSONB form of `mokosh_auth_crypto::EncryptedBlob`. Kept as a
+    /// `serde_json::Value` here so the core crate stays free of the
+    /// crypto dep; the handler layer (which has crypto) deserializes
+    /// into the typed blob and calls `EncryptionKeySet::decrypt`.
+    pub secret_encrypted: serde_json::Value,
+    pub key_version: u16,
+    pub confirmed_at: Option<DateTime<Utc>>,
+    pub last_used_step: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TotpEnrollment {
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed_at.is_some()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryCode {
+    pub id: uuid::Uuid,
+    pub user_totp_id: uuid::Uuid,
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub code_hash: [u8; 32],
+    pub used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+// --- MFA challenge ------------------------------------------------------
+//
+// Issued by `/v1/auth/login` when the user has MFA on, or by the step-up
+// flow for destructive operations. Single-use, short-lived, raw token is
+// returned to the caller exactly once.
+
+#[derive(Clone, Debug)]
+pub struct NewMfaChallenge {
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub token_hash: [u8; 32],
+    pub client_id: Option<ClientId>,
+    pub scope: Vec<String>,
+    pub active_tenant_id: TenantId,
+    pub purpose: MfaChallengePurpose,
+    pub expires_at: DateTime<Utc>,
+    pub ip: Option<std::net::IpAddr>,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MfaChallenge {
+    pub id: uuid::Uuid,
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub token_hash: [u8; 32],
+    pub client_id: Option<ClientId>,
+    pub scope: Vec<String>,
+    pub active_tenant_id: TenantId,
+    pub purpose: MfaChallengePurpose,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl MfaChallenge {
+    pub fn is_open(&self, now: DateTime<Utc>) -> bool {
+        self.consumed_at.is_none() && self.expires_at > now
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfaChallengePurpose {
+    /// Issued by `/v1/auth/login` when the user has MFA on; consumed by
+    /// `/v1/auth/mfa/verify` which returns the OIDC token bundle.
+    Login,
+    /// Issued by `/v1/auth/mfa/step-up/start`; consumed by
+    /// `/v1/auth/mfa/step-up/verify` which returns a `step_up_token`
+    /// (itself another challenge row of `purpose = StepUp`). The
+    /// step-up token gates destructive operations (regenerate recovery
+    /// codes, disable MFA).
+    StepUp,
+}
+
+impl MfaChallengePurpose {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MfaChallengePurpose::Login => "login",
+            MfaChallengePurpose::StepUp => "step_up",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "login" => Some(Self::Login),
+            "step_up" => Some(Self::StepUp),
+            _ => None,
+        }
+    }
+}
+
 // --- Audit events -------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +694,69 @@ pub enum AuditEvent {
         ip: Option<String>,
         reason: String,
     },
+    // --- TOTP / MFA ---
+    /// User started MFA enrollment: `/v1/auth/mfa/setup` returned a fresh
+    /// (or in-progress) secret. Not yet confirmed; `mfa_enrolled` is still
+    /// false.
+    TotpEnrollmentStarted {
+        user_id: UserId,
+    },
+    /// Confirmation succeeded; `users.mfa_enrolled` is now true.
+    TotpEnrolled {
+        user_id: UserId,
+    },
+    /// MFA was turned off. `by = "self"` for the user-initiated path,
+    /// `by = "admin"` for force-disenroll (with `admin_user_id` set).
+    TotpDisenrolled {
+        user_id: UserId,
+        by: String,
+        admin_user_id: Option<UserId>,
+        reason: Option<String>,
+        ip: Option<String>,
+    },
+    /// `/v1/auth/login` returned a challenge (the user has MFA on); the
+    /// SPA must now POST to `/v1/auth/mfa/verify`.
+    MfaChallengeIssued {
+        user_id: UserId,
+        ip: Option<String>,
+    },
+    /// Challenge was successfully consumed. `method` is `"totp"` or
+    /// `"recovery"`.
+    MfaChallengeConsumed {
+        user_id: UserId,
+        method: String,
+    },
+    /// Verify-time failure: wrong code, expired/used challenge, replayed
+    /// step, used recovery code. `reason` is one of "wrong_totp",
+    /// "wrong_recovery", "unknown_or_used_or_expired", "code_replayed".
+    MfaVerifyFailed {
+        user_id: Option<UserId>,
+        reason: String,
+        ip: Option<String>,
+    },
+    /// Step-up challenge was issued for a destructive operation
+    /// (regenerate recovery codes, disable MFA).
+    StepUpIssued {
+        user_id: UserId,
+        purpose: String,
+    },
+    StepUpConsumed {
+        user_id: UserId,
+        purpose: String,
+    },
+    RecoveryCodesIssued {
+        user_id: UserId,
+        count: usize,
+    },
+    RecoveryCodesRegenerated {
+        user_id: UserId,
+        count: usize,
+        ip: Option<String>,
+    },
+    RecoveryCodeUsed {
+        user_id: UserId,
+        ip: Option<String>,
+    },
 }
 
 impl AuditEvent {
@@ -591,6 +768,7 @@ impl AuditEvent {
             ClientDisabled { .. } | SessionRevoked { .. } | InviteRevoked { .. } => {
                 AuditSeverity::Warning
             }
+            TotpDisenrolled { by, .. } if by == "admin" => AuditSeverity::Warning,
             _ => AuditSeverity::Info,
         }
     }

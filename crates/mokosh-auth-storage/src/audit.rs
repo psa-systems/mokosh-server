@@ -45,6 +45,17 @@ fn event_kind(e: &AuditEvent) -> &'static str {
         SignupCompleted { .. } => "signup_completed",
         SignupAttemptFailed { .. } => "signup_attempt_failed",
         PasswordResetAttemptFailed { .. } => "password_reset_attempt_failed",
+        TotpEnrollmentStarted { .. } => "totp_enrollment_started",
+        TotpEnrolled { .. } => "totp_enrolled",
+        TotpDisenrolled { .. } => "totp_disenrolled",
+        MfaChallengeIssued { .. } => "mfa_challenge_issued",
+        MfaChallengeConsumed { .. } => "mfa_challenge_consumed",
+        MfaVerifyFailed { .. } => "mfa_verify_failed",
+        StepUpIssued { .. } => "step_up_issued",
+        StepUpConsumed { .. } => "step_up_consumed",
+        RecoveryCodesIssued { .. } => "recovery_codes_issued",
+        RecoveryCodesRegenerated { .. } => "recovery_codes_regenerated",
+        RecoveryCodeUsed { .. } => "recovery_code_used",
     }
 }
 

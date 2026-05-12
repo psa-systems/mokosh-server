@@ -7,7 +7,9 @@
 pub mod aead;
 pub mod keys;
 pub mod password;
+pub mod recovery;
 pub mod token;
+pub mod totp;
 
 pub use aead::{EncryptedBlob, EncryptionKeySet};
 pub use keys::{KeyError, OidcKeySet};
