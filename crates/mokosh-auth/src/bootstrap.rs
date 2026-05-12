@@ -374,3 +374,194 @@ fn resolve_mailer_config(accept_base_url: &str) -> Result<Option<LettreConfig>, 
         accept_base_url: accept_base_url.to_string(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Env var mutation is process-global; serialize so tests do not
+    // see each other's SMTP_* values.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    /// Lock the env mutex, scrub every SMTP_* var, set the supplied
+    /// pairs, run the resolver, then restore. Returns the resolver
+    /// result. Safe to use in parallel test runs because every call
+    /// goes through the mutex.
+    fn with_smtp_env<F, R>(pairs: &[(&str, &str)], f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let keys = [
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USERNAME",
+            "SMTP_PASSWORD",
+            "SMTP_FROM",
+            "SMTP_TLS",
+        ];
+        // Snapshot + clear.
+        let snapshot: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(*k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        for (k, v) in pairs {
+            std::env::set_var(k, v);
+        }
+        let out = f();
+        // Restore.
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        for (k, v) in snapshot {
+            if let Some(v) = v {
+                std::env::set_var(k, v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_smtp_host_returns_none() {
+        let cfg = with_smtp_env(&[], || resolve_mailer_config("https://x")).unwrap();
+        assert!(cfg.is_none(), "missing SMTP_HOST must select LogMailer");
+    }
+
+    #[test]
+    fn empty_smtp_host_returns_none() {
+        // Whitespace-only counts as unset; the resolver trims.
+        let cfg =
+            with_smtp_env(&[("SMTP_HOST", "  ")], || resolve_mailer_config("https://x")).unwrap();
+        assert!(cfg.is_none());
+    }
+
+    #[test]
+    fn smtp_host_without_from_is_hard_error() {
+        let res = with_smtp_env(
+            &[("SMTP_HOST", "mailpit"), ("SMTP_PORT", "1025")],
+            || resolve_mailer_config("https://x"),
+        );
+        assert!(matches!(res, Err(BootstrapError::Config(_))));
+    }
+
+    #[test]
+    fn smtp_host_without_port_is_hard_error() {
+        let res = with_smtp_env(
+            &[
+                ("SMTP_HOST", "mailpit"),
+                ("SMTP_FROM", "Mokosh <noreply@x.test>"),
+            ],
+            || resolve_mailer_config("https://x"),
+        );
+        assert!(matches!(res, Err(BootstrapError::Config(_))));
+    }
+
+    #[test]
+    fn smtp_port_must_parse_as_u16() {
+        let res = with_smtp_env(
+            &[
+                ("SMTP_HOST", "mailpit"),
+                ("SMTP_PORT", "not-a-number"),
+                ("SMTP_FROM", "Mokosh <noreply@x.test>"),
+            ],
+            || resolve_mailer_config("https://x"),
+        );
+        assert!(matches!(res, Err(BootstrapError::Config(_))));
+    }
+
+    #[test]
+    fn username_without_password_is_hard_error() {
+        let res = with_smtp_env(
+            &[
+                ("SMTP_HOST", "mailpit"),
+                ("SMTP_PORT", "1025"),
+                ("SMTP_FROM", "Mokosh <noreply@x.test>"),
+                ("SMTP_USERNAME", "alice"),
+            ],
+            || resolve_mailer_config("https://x"),
+        );
+        match res {
+            Err(BootstrapError::Config(msg)) => {
+                assert!(msg.contains("SMTP_PASSWORD"), "unexpected msg: {msg}")
+            }
+            Err(e) => panic!("expected Config error, got different error: {e}"),
+            Ok(_) => panic!("expected Config error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn unknown_smtp_tls_is_hard_error() {
+        let res = with_smtp_env(
+            &[
+                ("SMTP_HOST", "mailpit"),
+                ("SMTP_PORT", "1025"),
+                ("SMTP_FROM", "Mokosh <noreply@x.test>"),
+                ("SMTP_TLS", "unicorns"),
+            ],
+            || resolve_mailer_config("https://x"),
+        );
+        assert!(matches!(res, Err(BootstrapError::Config(_))));
+    }
+
+    #[test]
+    fn full_smtp_env_returns_some_with_expected_values() {
+        let cfg = with_smtp_env(
+            &[
+                ("SMTP_HOST", "mailpit"),
+                ("SMTP_PORT", "1025"),
+                ("SMTP_FROM", "Mokosh <noreply@x.test>"),
+                ("SMTP_USERNAME", "alice"),
+                ("SMTP_PASSWORD", "hunter2"),
+                ("SMTP_TLS", "implicit"),
+            ],
+            || resolve_mailer_config("https://accept.x"),
+        )
+        .unwrap()
+        .expect("Some(cfg)");
+        assert_eq!(cfg.host, "mailpit");
+        assert_eq!(cfg.port, 1025);
+        assert_eq!(cfg.from, "Mokosh <noreply@x.test>");
+        assert_eq!(cfg.username.as_deref(), Some("alice"));
+        assert_eq!(cfg.password.as_deref(), Some("hunter2"));
+        assert_eq!(cfg.tls, TlsMode::ImplicitTls);
+        assert_eq!(cfg.accept_base_url, "https://accept.x");
+    }
+
+    #[test]
+    fn smtp_tls_defaults_to_starttls() {
+        let cfg = with_smtp_env(
+            &[
+                ("SMTP_HOST", "mailpit"),
+                ("SMTP_PORT", "587"),
+                ("SMTP_FROM", "Mokosh <noreply@x.test>"),
+            ],
+            || resolve_mailer_config("https://accept.x"),
+        )
+        .unwrap()
+        .expect("Some(cfg)");
+        assert_eq!(cfg.tls, TlsMode::StartTls);
+    }
+
+    #[test]
+    fn empty_username_is_treated_as_unset() {
+        // SMTP_USERNAME="" must NOT trip the "username without
+        // password" guard. mailpit and other anonymous relays rely
+        // on this.
+        let cfg = with_smtp_env(
+            &[
+                ("SMTP_HOST", "mailpit"),
+                ("SMTP_PORT", "1025"),
+                ("SMTP_FROM", "Mokosh <noreply@x.test>"),
+                ("SMTP_USERNAME", ""),
+                ("SMTP_TLS", "none"),
+            ],
+            || resolve_mailer_config("https://accept.x"),
+        )
+        .unwrap()
+        .expect("Some(cfg)");
+        assert!(cfg.username.is_none());
+        assert!(cfg.password.is_none());
+    }
+}
