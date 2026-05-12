@@ -49,6 +49,10 @@ constant_time_eq = "0.3"
 anyhow = "1"
 ipnetwork = "0.20"
 bytes = "1"
+# `pool` is NOT a lettre default; opt in so LettreMailer reuses TCP
+# connections across sends. `native-tls` over rustls because some SMTP
+# relays' cert chains historically failed verification under rustls.
+lettre = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "builder", "smtp-transport", "pool"] }
 
 [package]
 name = "mokosh-server"
@@ -122,8 +126,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Environment
 dotenvy = "0.15"
 
-# Email
-lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+# Email. The host crate uses lettre only for error-type conversions
+# in src/utils/error.rs. LettreMailer itself lives in
+# crates/mokosh-auth-http and pulls the same workspace dep there.
+lettre = { workspace = true }
 
 # HTTP client (for integrations)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

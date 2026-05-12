@@ -32,3 +32,4 @@ futures-util = "0.3"
 sha2 = { workspace = true }
 tokio = { workspace = true }
 jsonwebtoken = { workspace = true }
+lettre = { workspace = true }
