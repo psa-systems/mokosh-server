@@ -463,3 +463,149 @@ async fn password_reset_round_trip_via_mailpit() {
         .expect("POST new-pw login");
     assert_eq!(new_login.status(), StatusCode::OK, "new password should log in");
 }
+
+// --- MFA -----------------------------------------------------------------
+
+async fn seed_user(c: &reqwest::Client) -> (String, String) {
+    reset_mailpit(c).await;
+    let bearer = login_bearer(c, &admin_email(), &admin_password()).await;
+    let email = format!("mfa-user-{}@test.local", rand_local_part());
+    let issue = c
+        .post(format!("{}/v1/auth/invites", api_base()))
+        .bearer_auth(&bearer)
+        .json(&json!({ "email": email, "role": "member" }))
+        .send()
+        .await
+        .expect("seed invite");
+    assert!(issue.status().is_success(), "seed invite: {}", issue.status());
+    let msg = wait_for_email(c, &email).await;
+    let link = extract_link(msg["Text"].as_str().expect("Text"));
+    let token = token_from_link(&link);
+    let password = "Aa!seed-pass-12".to_string();
+    let accept = c
+        .post(format!("{}/v1/auth/invites/by-token/{}/accept", api_base(), token))
+        .json(&json!({ "password": password }))
+        .send()
+        .await
+        .expect("seed accept");
+    assert!(accept.status().is_success(), "seed accept: {}", accept.status());
+    reset_mailpit(c).await;
+    (email, password)
+}
+
+async fn user_bearer(c: &reqwest::Client, email: &str, password: &str) -> String {
+    let res = c
+        .post(format!("{}/v1/auth/login", api_base()))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "client_id": client_id(),
+        }))
+        .send()
+        .await
+        .expect("user login");
+    assert_eq!(res.status(), StatusCode::OK, "user login");
+    let body: Value = res.json().await.expect("login json");
+    body["tokens"]["access_token"]
+        .as_str()
+        .expect("tokens.access_token")
+        .to_string()
+}
+
+#[tokio::test]
+#[ignore = "requires `just dev-sso` and MOKOSH_E2E_CLIENT_ID"]
+async fn mfa_enroll_then_login_requires_challenge() {
+    let c = http();
+    let (email, password) = seed_user(&c).await;
+    let bearer = user_bearer(&c, &email, &password).await;
+
+    // /mfa/setup
+    let setup_res = c
+        .post(format!("{}/v1/auth/mfa/setup", api_base()))
+        .bearer_auth(&bearer)
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("POST setup");
+    assert_eq!(setup_res.status(), StatusCode::OK, "setup");
+    let setup_body: Value = setup_res.json().await.expect("setup json");
+    let secret_b32 = setup_body["secret"].as_str().expect("secret").to_string();
+    let recovery_codes: Vec<String> = setup_body["recovery_codes"]
+        .as_array()
+        .expect("recovery_codes array")
+        .iter()
+        .map(|v| v.as_str().expect("code").to_string())
+        .collect();
+    assert_eq!(recovery_codes.len(), 10);
+
+    // Compute the current TOTP code locally and confirm.
+    let secret = mokosh_auth_crypto::totp::base32_decode(&secret_b32).expect("b32 decode");
+    let code = mokosh_auth_crypto::totp::code_at(&secret, chrono::Utc::now());
+    let confirm = c
+        .post(format!("{}/v1/auth/mfa/confirm", api_base()))
+        .bearer_auth(&bearer)
+        .json(&json!({"code": code}))
+        .send()
+        .await
+        .expect("POST confirm");
+    assert_eq!(confirm.status(), StatusCode::OK, "confirm: {}", confirm.text().await.unwrap_or_default());
+
+    // Next login must return a challenge, not tokens.
+    let login = c
+        .post(format!("{}/v1/auth/login", api_base()))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "client_id": client_id(),
+        }))
+        .send()
+        .await
+        .expect("POST login");
+    assert_eq!(login.status(), StatusCode::OK);
+    let login_body: Value = login.json().await.expect("login json");
+    assert_eq!(login_body["mfa_required"], json!(true), "got {login_body}");
+    let challenge = login_body["challenge"].as_str().expect("challenge").to_string();
+
+    // Compute a fresh TOTP code (the prior one is consumed for replay
+    // defense, so we wait a step if we're on the same step boundary).
+    let mut code2 = mokosh_auth_crypto::totp::code_at(&secret, chrono::Utc::now());
+    if code2 == code {
+        // Avoid hitting `code_replayed`: nudge into the next 30-sec step.
+        let future = chrono::Utc::now() + chrono::Duration::seconds(30);
+        code2 = mokosh_auth_crypto::totp::code_at(&secret, future);
+        // Actually wait so the server's clock catches up.
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+    }
+    let verify = c
+        .post(format!("{}/v1/auth/mfa/verify", api_base()))
+        .json(&json!({"challenge": challenge, "code": code2}))
+        .send()
+        .await
+        .expect("POST verify");
+    assert_eq!(verify.status(), StatusCode::OK, "verify: {}", verify.text().await.unwrap_or_default());
+    let verify_body: Value = verify.json().await.expect("verify json");
+    assert!(verify_body["tokens"].is_object(), "verify must return tokens, got {verify_body}");
+
+    // Recovery-code path.
+    let login2 = c
+        .post(format!("{}/v1/auth/login", api_base()))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "client_id": client_id(),
+        }))
+        .send()
+        .await
+        .expect("POST login (recovery)");
+    let challenge2 = login2.json::<Value>().await.expect("json")["challenge"]
+        .as_str()
+        .expect("challenge")
+        .to_string();
+    let verify_recovery = c
+        .post(format!("{}/v1/auth/mfa/verify", api_base()))
+        .json(&json!({"challenge": challenge2, "code": &recovery_codes[0]}))
+        .send()
+        .await
+        .expect("POST verify recovery");
+    assert_eq!(verify_recovery.status(), StatusCode::OK, "verify recovery");
+}

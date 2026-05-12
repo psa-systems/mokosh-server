@@ -12,16 +12,19 @@
 //! same pattern as password-reset: idempotent under repeated POSTs; a
 //! refresh of the setup page yields a fresh secret + fresh codes.
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum_extra::extract::CookieJar;
 use chrono::Utc;
-use mokosh_auth_core::{AuditEvent, AuthError};
+use mokosh_auth_core::{AuditEvent, AuthError, MfaChallengePurpose, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::cookies::set_op_session_cookie;
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
 use crate::router::AuthHttpState;
@@ -242,6 +245,226 @@ pub async fn confirm(
         Json(ConfirmResponse { mfa_enrolled: true }),
     )
         .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyBody {
+    pub challenge: String,
+    pub code: String,
+}
+
+/// `POST /v1/auth/mfa/verify`
+///
+/// Consumes the login challenge issued by `/v1/auth/login`, validates a
+/// TOTP code or a recovery code, creates the op_session (with the
+/// stronger `acr = urn:mokosh:loa:mfa`), and returns the same shape the
+/// regular login response uses for a non-MFA account.
+pub async fn verify(
+    State(st): State<Arc<AuthHttpState>>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    jar: CookieJar,
+    Json(body): Json<VerifyBody>,
+) -> Result<Response, HttpError> {
+    if let Err(rl) = st.rate_limiter.check_mfa_verify(addr.ip()) {
+        return Ok(rl.into_response());
+    }
+    let ip = Some(addr.ip());
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+
+    let token_hash = mokosh_auth_crypto::hash_opaque_token(&body.challenge);
+    // Validate purpose + freshness + consumed under the SERIALIZABLE
+    // tx; the repo also marks the row consumed in the same tx.
+    let challenge = match st
+        .mfa_challenges
+        .consume(token_hash, MfaChallengePurpose::Login)
+        .await
+    {
+        Ok(c) => c,
+        Err(AuthError::NotFound) => {
+            let _ = st
+                .provider
+                .audit
+                .record(
+                    None,
+                    None,
+                    ip,
+                    AuditEvent::MfaVerifyFailed {
+                        user_id: None,
+                        reason: "unknown_or_used_or_expired".into(),
+                        ip: ip.map(|i| i.to_string()),
+                    },
+                )
+                .await;
+            return Ok(challenge_not_found());
+        }
+        Err(e) => return Err(HttpError(e)),
+    };
+
+    let user = st
+        .provider
+        .users
+        .find_by_id(challenge.user_id)
+        .await?
+        .ok_or(AuthError::AccessDenied("user not found".into()))?;
+
+    // Verify the supplied code. Pick TOTP vs recovery by the input shape:
+    // a 6-digit all-numeric string is TOTP; anything else is treated as
+    // a recovery code.
+    let code = body.code.trim();
+    let is_totp = code.len() == 6 && code.chars().all(|c| c.is_ascii_digit());
+    let amr_method: &'static str;
+    if is_totp {
+        let enrollment = st
+            .totp
+            .find_for_user(user.id)
+            .await?
+            .ok_or(AuthError::AccessDenied("user not enrolled".into()))?;
+        let blob: mokosh_auth_crypto::EncryptedBlob =
+            serde_json::from_value(enrollment.secret_encrypted.clone())
+                .map_err(|e| HttpError(AuthError::Storage(format!("blob deserialize: {e}"))))?;
+        let secret = st
+            .dek
+            .decrypt(&blob)
+            .map_err(|e| HttpError(AuthError::Crypto(format!("dek decrypt: {e}"))))?;
+        let step = match mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1) {
+            Some(s) => s,
+            None => {
+                let _ = st
+                    .provider
+                    .audit
+                    .record(
+                        Some(user.tenant_id),
+                        Some(user.id),
+                        ip,
+                        AuditEvent::MfaVerifyFailed {
+                            user_id: Some(user.id),
+                            reason: "wrong_totp".into(),
+                            ip: ip.map(|i| i.to_string()),
+                        },
+                    )
+                    .await;
+                return Ok(invalid_code(user.id));
+            }
+        };
+        if let Err(AuthError::InvalidGrant(_)) = st.totp.consume_step(user.id, step).await {
+            let _ = st
+                .provider
+                .audit
+                .record(
+                    Some(user.tenant_id),
+                    Some(user.id),
+                    ip,
+                    AuditEvent::MfaVerifyFailed {
+                        user_id: Some(user.id),
+                        reason: "code_replayed".into(),
+                        ip: ip.map(|i| i.to_string()),
+                    },
+                )
+                .await;
+            return Ok(invalid_code(user.id));
+        }
+        amr_method = "totp";
+    } else {
+        let hash = mokosh_auth_crypto::recovery::hash_code(code);
+        match st.recovery_codes.consume_unused(user.id, hash).await {
+            Ok(()) => {
+                let _ = st
+                    .provider
+                    .audit
+                    .record(
+                        Some(user.tenant_id),
+                        Some(user.id),
+                        ip,
+                        AuditEvent::RecoveryCodeUsed {
+                            user_id: user.id,
+                            ip: ip.map(|i| i.to_string()),
+                        },
+                    )
+                    .await;
+                amr_method = "recovery";
+            }
+            Err(AuthError::NotFound) => {
+                let _ = st
+                    .provider
+                    .audit
+                    .record(
+                        Some(user.tenant_id),
+                        Some(user.id),
+                        ip,
+                        AuditEvent::MfaVerifyFailed {
+                            user_id: Some(user.id),
+                            reason: "wrong_recovery".into(),
+                            ip: ip.map(|i| i.to_string()),
+                        },
+                    )
+                    .await;
+                return Ok(invalid_code(user.id));
+            }
+            Err(e) => return Err(HttpError(e)),
+        }
+    }
+
+    let amr = vec!["pwd".to_string(), amr_method.to_string()];
+    let session = st
+        .local_auth
+        .create_session(&user, ip, ua, "urn:mokosh:loa:mfa", &amr)
+        .await?;
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(user.tenant_id),
+            Some(user.id),
+            ip,
+            AuditEvent::MfaChallengeConsumed {
+                user_id: user.id,
+                method: amr_method.to_string(),
+            },
+        )
+        .await;
+
+    // Mint OIDC tokens if the original login carried a client_id.
+    let tokens = if let Some(client_id) = challenge.client_id {
+        Some(
+            crate::handlers::auth::mint_first_party_tokens_for(
+                &st,
+                &user,
+                &session,
+                client_id.0,
+                &challenge.scope,
+                challenge.active_tenant_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let cookie = set_op_session_cookie(&st.cookie_cfg, session.sid.clone(), st.provider.cfg.op_session_ttl);
+    let body = json!({
+        "user_id":          user.id.0.to_string(),
+        "tenant_id":        user.tenant_id.0.to_string(),
+        "active_tenant_id": challenge.active_tenant_id.0.to_string(),
+        "tokens":           tokens,
+    });
+    Ok((jar.add(cookie), Json(body)).into_response())
+}
+
+fn challenge_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "challenge_not_found"})),
+    )
+        .into_response()
+}
+
+fn invalid_code(_user_id: UserId) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "invalid_code"})),
+    )
+        .into_response()
 }
 
 /// Render a black-on-white SVG QR encoding `data`. The SPA inlines this

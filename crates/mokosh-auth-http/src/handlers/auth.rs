@@ -154,7 +154,13 @@ pub async fn login(
         email: req.email.clone(),
         password: req.password.clone(),
     };
-    let ok = st.local_auth.login(local_req, ip, ua).await?;
+
+    // Two-phase: verify the password without yet creating an op_session.
+    // If the account has MFA on, the session is created downstream by
+    // /v1/auth/mfa/verify (with the stronger `acr = urn:mokosh:loa:mfa`).
+    // Otherwise we proceed directly to session creation here.
+    let verify = st.local_auth.verify_only(local_req, ip, ua).await?;
+    let user = verify.user;
 
     // Resolve active tenant: explicit request -> last_active_tenant ->
     // home tenant. The explicit value MUST correspond to a real,
@@ -162,7 +168,7 @@ pub async fn login(
     let requested = req.tenant_id.map(mokosh_auth_core::TenantId);
     let active_tenant = match requested {
         Some(tid) => {
-            let m = st.memberships.find(ok.user.id, tid).await?;
+            let m = st.memberships.find(user.id, tid).await?;
             match m {
                 Some(m) if matches!(m.status, mokosh_auth_core::MembershipStatus::Active) => tid,
                 _ => {
@@ -172,24 +178,75 @@ pub async fn login(
                 }
             }
         }
-        None => ok
-            .user
-            .last_active_tenant
-            .unwrap_or(ok.user.tenant_id),
+        None => user.last_active_tenant.unwrap_or(user.tenant_id),
     };
-    // Persist for next login. Best-effort; do not fail the call.
     let _ = st
         .provider
         .users
-        .set_last_active_tenant(ok.user.id, Some(active_tenant))
+        .set_last_active_tenant(user.id, Some(active_tenant))
         .await;
 
+    // MFA-required branch. Issue a single-use opaque challenge, store
+    // the SHA-256 hash, return the raw token to the SPA. No cookie,
+    // no op_session, no tokens until /v1/auth/mfa/verify completes.
+    if user.mfa_enrolled {
+        let raw = mokosh_auth_crypto::generate_opaque_token();
+        let token_hash = mokosh_auth_crypto::hash_opaque_token(&raw);
+        let now = st.provider.clock.now();
+        let scope: Vec<String> = req
+            .scope
+            .as_deref()
+            .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>())
+            .unwrap_or_default();
+        st.mfa_challenges
+            .issue(mokosh_auth_core::NewMfaChallenge {
+                user_id: user.id,
+                tenant_id: user.tenant_id,
+                token_hash,
+                client_id: req.client_id.map(mokosh_auth_core::ClientId),
+                scope,
+                active_tenant_id: active_tenant,
+                purpose: mokosh_auth_core::MfaChallengePurpose::Login,
+                expires_at: now + chrono::Duration::minutes(MFA_CHALLENGE_TTL_MINUTES),
+                ip,
+                user_agent: ua.map(str::to_string),
+            })
+            .await?;
+        let _ = st
+            .provider
+            .audit
+            .record(
+                Some(user.tenant_id),
+                Some(user.id),
+                ip,
+                mokosh_auth_core::AuditEvent::MfaChallengeIssued {
+                    user_id: user.id,
+                    ip: ip.map(|i| i.to_string()),
+                },
+            )
+            .await;
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "mfa_required": true,
+                "challenge":    raw,
+                "expires_in":   MFA_CHALLENGE_TTL_MINUTES * 60,
+            })),
+        )
+            .into_response());
+    }
+
+    // Non-MFA path: create the session + mint tokens as before.
+    let session = st
+        .local_auth
+        .create_session(&user, ip, ua, "urn:mokosh:loa:pwd", &["pwd".to_string()])
+        .await?;
+    let ok = crate::local_auth::LocalLoginOk { session, user };
     let tokens = if let Some(cid) = req.client_id {
         Some(mint_first_party_tokens(&st, &ok, cid, req.scope.as_deref(), active_tenant).await?)
     } else {
         None
     };
-
     let cookie = set_op_session_cookie(
         &st.cookie_cfg,
         ok.session.sid.clone(),
@@ -202,6 +259,31 @@ pub async fn login(
         tokens,
     };
     Ok((jar.add(cookie), Json(body)).into_response())
+}
+
+const MFA_CHALLENGE_TTL_MINUTES: i64 = 5;
+
+/// Same as `mint_first_party_tokens` but takes user + session
+/// explicitly. Used by `/v1/auth/mfa/verify` which creates its own
+/// session after consuming the challenge.
+pub async fn mint_first_party_tokens_for(
+    st: &AuthHttpState,
+    user: &mokosh_auth_core::User,
+    session: &mokosh_auth_core::OpSession,
+    client_id: uuid::Uuid,
+    scope: &[String],
+    active_tenant: mokosh_auth_core::TenantId,
+) -> Result<TokenBundle, AuthError> {
+    let ok = crate::local_auth::LocalLoginOk {
+        session: session.clone(),
+        user: user.clone(),
+    };
+    let scope_str = if scope.is_empty() {
+        None
+    } else {
+        Some(scope.join(" "))
+    };
+    mint_first_party_tokens(st, &ok, client_id, scope_str.as_deref(), active_tenant).await
 }
 
 async fn mint_first_party_tokens(

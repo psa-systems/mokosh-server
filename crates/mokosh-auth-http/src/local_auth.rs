@@ -43,6 +43,13 @@ pub struct LocalAuth {
     pub op_session_ttl: Duration,
 }
 
+/// Result of password-only verification. Carries the verified `User` but
+/// does NOT create an op_session; used by the MFA-required branch of
+/// `/v1/auth/login` to issue a challenge before the session exists.
+pub struct LocalVerifyOk {
+    pub user: User,
+}
+
 impl LocalAuth {
     pub async fn login(
         &self,
@@ -187,6 +194,113 @@ impl LocalAuth {
             .await;
 
         Ok(LocalLoginOk { session, user })
+    }
+
+    /// Verify-only path: same enumeration-resistant flow as `login`, but
+    /// does not create an op_session. The handler is responsible for
+    /// session creation downstream (the MFA-verified branch creates the
+    /// session inside the same SERIALIZABLE tx that consumes the
+    /// challenge). On a wrong password it still emits the same audit
+    /// event so the failure trail is identical to `login`.
+    pub async fn verify_only(
+        &self,
+        req: LocalLoginRequest,
+        ip: Option<std::net::IpAddr>,
+        _user_agent: Option<&str>,
+    ) -> Result<LocalVerifyOk, AuthError> {
+        const DUMMY_HASH: &str =
+            "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXkxMjM0NTY3OA$\
+             SGEgaGEgdGhpcyBpcyBub3QgcmVhbCBoYXNoIGxlbmd0aA";
+
+        let user = match req.tenant_id {
+            Some(tid) => self.users.find_by_email(TenantId(tid), &req.email).await?,
+            None => {
+                let mut matches = self.users.find_by_email_globally(&req.email).await?;
+                if matches.len() >= 2 {
+                    let _ = verify_password(&req.password, DUMMY_HASH);
+                    return Err(AuthError::AccessDenied("invalid credentials".into()));
+                }
+                matches.pop()
+            }
+        };
+        let user = match user {
+            Some(u) => u,
+            None => {
+                let _ = verify_password(&req.password, DUMMY_HASH);
+                return Err(AuthError::AccessDenied("invalid credentials".into()));
+            }
+        };
+        if !matches!(user.status, mokosh_auth_core::UserStatus::Active) {
+            let _ = verify_password(&req.password, DUMMY_HASH);
+            return Err(AuthError::AccessDenied("invalid credentials".into()));
+        }
+        let stored_hash = match user.password_hash.as_deref() {
+            Some(h) => h,
+            None => {
+                let _ = verify_password(&req.password, DUMMY_HASH);
+                return Err(AuthError::AccessDenied("invalid credentials".into()));
+            }
+        };
+        if !verify_password(&req.password, stored_hash) {
+            let _ = self
+                .audit
+                .record(
+                    Some(user.tenant_id),
+                    Some(user.id),
+                    ip,
+                    AuditEvent::LoginFailed {
+                        email: req.email.clone(),
+                        ip: ip.map(|i| i.to_string()),
+                        reason: "wrong password".into(),
+                    },
+                )
+                .await;
+            return Err(AuthError::AccessDenied("invalid credentials".into()));
+        }
+        Ok(LocalVerifyOk { user })
+    }
+
+    /// Create an op_session for an already-verified user. Mirrors the
+    /// session-creation tail of `login`. `acr` and `amr` are set by the
+    /// caller so the MFA branch can pass the stronger context class.
+    pub async fn create_session(
+        &self,
+        user: &User,
+        ip: Option<std::net::IpAddr>,
+        user_agent: Option<&str>,
+        acr: &str,
+        amr: &[String],
+    ) -> Result<OpSession, AuthError> {
+        let session = self
+            .sessions
+            .create(
+                user.id,
+                user.tenant_id,
+                self.op_session_ttl,
+                user_agent,
+                ip,
+                acr,
+                amr,
+            )
+            .await?;
+        let _ = self
+            .users
+            .update_last_login(user.id, mokosh_auth_core::time::SystemClock.now_or_default())
+            .await;
+        let _ = self
+            .audit
+            .record(
+                Some(user.tenant_id),
+                Some(user.id),
+                ip,
+                AuditEvent::LoginSuccess {
+                    user_id: user.id,
+                    ip: ip.map(|i| i.to_string()),
+                    user_agent: user_agent.map(str::to_string),
+                },
+            )
+            .await;
+        Ok(session)
     }
 }
 

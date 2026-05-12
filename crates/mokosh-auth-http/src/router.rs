@@ -214,6 +214,9 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // MFA enrollment (Bearer-authed; user enrolls themselves).
         .route("/v1/auth/mfa/setup", post(mfa_h::setup))
         .route("/v1/auth/mfa/confirm", post(mfa_h::confirm))
+        // MFA verify: consumes the login challenge issued by /v1/auth/login
+        // when the account has MFA on; no Bearer (the challenge is the auth).
+        .route("/v1/auth/mfa/verify", post(mfa_h::verify))
         // Membership-aware tenant switcher. Bearer-authed.
         .route("/v1/auth/memberships", get(tenants_h::list_my_memberships))
         .route(
