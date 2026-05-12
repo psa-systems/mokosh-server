@@ -217,6 +217,12 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // MFA verify: consumes the login challenge issued by /v1/auth/login
         // when the account has MFA on; no Bearer (the challenge is the auth).
         .route("/v1/auth/mfa/verify", post(mfa_h::verify))
+        // Step-up gate for destructive MFA operations.
+        .route("/v1/auth/mfa/step-up/start", post(mfa_h::step_up_start))
+        .route("/v1/auth/mfa/step-up/verify", post(mfa_h::step_up_verify))
+        // Recovery codes: list/regenerate (regenerate is step-up-gated).
+        .route("/v1/auth/mfa/recovery-codes/regenerate", post(mfa_h::regenerate_recovery_codes))
+        .route("/v1/auth/mfa/status", axum::routing::get(mfa_h::status))
         // Membership-aware tenant switcher. Bearer-authed.
         .route("/v1/auth/memberships", get(tenants_h::list_my_memberships))
         .route(

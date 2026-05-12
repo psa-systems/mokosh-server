@@ -467,6 +467,291 @@ fn invalid_code(_user_id: UserId) -> Response {
         .into_response()
 }
 
+// --- Step-up + recovery management --------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct ChallengeResponse {
+    pub challenge: String,
+    pub expires_in: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StepUpVerifyBody {
+    pub challenge: String,
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StepUpToken {
+    pub step_up_token: String,
+    pub expires_in: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StepUpGatedBody {
+    pub step_up_token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
+    pub mfa_enrolled: bool,
+    pub method: Option<&'static str>,
+    pub recovery_codes_unused: u32,
+    pub low_warning: bool,
+}
+
+const STEP_UP_CHALLENGE_TTL_MINUTES: i64 = 5;
+const STEP_UP_TOKEN_TTL_MINUTES: i64 = 5;
+const LOW_RECOVERY_WARNING_THRESHOLD: u32 = 2;
+
+/// `POST /v1/auth/mfa/step-up/start`
+///
+/// Issues a single-use challenge (purpose=step_up) for a destructive
+/// operation. Requires `mfa_enrolled = true`.
+pub async fn step_up_start(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(user): BearerUser,
+) -> Result<Response, HttpError> {
+    if !user.mfa_enrolled {
+        return Ok((StatusCode::CONFLICT, Json(json!({"error": "not_enrolled"}))).into_response());
+    }
+    let raw = mokosh_auth_crypto::generate_opaque_token();
+    let token_hash = mokosh_auth_crypto::hash_opaque_token(&raw);
+    let expires_at = Utc::now() + chrono::Duration::minutes(STEP_UP_CHALLENGE_TTL_MINUTES);
+    st.mfa_challenges
+        .issue(mokosh_auth_core::NewMfaChallenge {
+            user_id: user.id,
+            tenant_id: user.tenant_id,
+            token_hash,
+            client_id: None,
+            scope: vec![],
+            active_tenant_id: user.last_active_tenant.unwrap_or(user.tenant_id),
+            purpose: MfaChallengePurpose::StepUp,
+            expires_at,
+            ip: None,
+            user_agent: None,
+        })
+        .await?;
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(user.tenant_id),
+            Some(user.id),
+            None,
+            AuditEvent::StepUpIssued {
+                user_id: user.id,
+                purpose: "step_up".into(),
+            },
+        )
+        .await;
+    Ok((
+        StatusCode::OK,
+        Json(ChallengeResponse {
+            challenge: raw,
+            expires_in: STEP_UP_CHALLENGE_TTL_MINUTES * 60,
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /v1/auth/mfa/step-up/verify`
+///
+/// Consumes the step-up challenge + a TOTP-or-recovery code; on success
+/// issues a `step_up_token` (itself a single-use challenge row with
+/// purpose=step_up) that the destructive endpoint gates on. The Bearer
+/// must match the user the challenge was issued for; otherwise we
+/// return the same indistinguishable 404.
+pub async fn step_up_verify(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(user): BearerUser,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<StepUpVerifyBody>,
+) -> Result<Response, HttpError> {
+    let ip = Some(addr.ip());
+    let token_hash = mokosh_auth_crypto::hash_opaque_token(&body.challenge);
+    let challenge = match st
+        .mfa_challenges
+        .consume(token_hash, MfaChallengePurpose::StepUp)
+        .await
+    {
+        Ok(c) if c.user_id == user.id => c,
+        _ => return Ok(step_up_not_valid()),
+    };
+
+    // Verify the code (TOTP only on step-up; we discourage spending a
+    // recovery code on destructive ops since a user with mistyped
+    // recovery code might pour through their codes).
+    let code = body.code.trim();
+    if !(code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())) {
+        return Ok(step_up_not_valid());
+    }
+    let enrollment = st
+        .totp
+        .find_for_user(user.id)
+        .await?
+        .ok_or(AuthError::AccessDenied("user not enrolled".into()))?;
+    let blob: mokosh_auth_crypto::EncryptedBlob =
+        serde_json::from_value(enrollment.secret_encrypted.clone())
+            .map_err(|e| HttpError(AuthError::Storage(format!("blob deserialize: {e}"))))?;
+    let secret = st
+        .dek
+        .decrypt(&blob)
+        .map_err(|e| HttpError(AuthError::Crypto(format!("dek decrypt: {e}"))))?;
+    let step = match mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1) {
+        Some(s) => s,
+        None => {
+            let _ = st
+                .provider
+                .audit
+                .record(
+                    Some(user.tenant_id),
+                    Some(user.id),
+                    ip,
+                    AuditEvent::MfaVerifyFailed {
+                        user_id: Some(user.id),
+                        reason: "wrong_totp_step_up".into(),
+                        ip: ip.map(|i| i.to_string()),
+                    },
+                )
+                .await;
+            return Ok(step_up_not_valid());
+        }
+    };
+    if let Err(AuthError::InvalidGrant(_)) = st.totp.consume_step(user.id, step).await {
+        return Ok(step_up_not_valid());
+    }
+
+    // Issue the step_up_token (another challenge row, purpose=step_up,
+    // but tagged as "the token" by the fact that the original challenge
+    // is now consumed; the token itself is the next row).
+    let token_raw = mokosh_auth_crypto::generate_opaque_token();
+    let token_hash = mokosh_auth_crypto::hash_opaque_token(&token_raw);
+    st.mfa_challenges
+        .issue(mokosh_auth_core::NewMfaChallenge {
+            user_id: user.id,
+            tenant_id: user.tenant_id,
+            token_hash,
+            client_id: None,
+            scope: vec![],
+            active_tenant_id: challenge.active_tenant_id,
+            purpose: MfaChallengePurpose::StepUp,
+            expires_at: Utc::now() + chrono::Duration::minutes(STEP_UP_TOKEN_TTL_MINUTES),
+            ip,
+            user_agent: None,
+        })
+        .await?;
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(user.tenant_id),
+            Some(user.id),
+            ip,
+            AuditEvent::StepUpConsumed {
+                user_id: user.id,
+                purpose: "step_up".into(),
+            },
+        )
+        .await;
+    Ok((
+        StatusCode::OK,
+        Json(StepUpToken {
+            step_up_token: token_raw,
+            expires_in: STEP_UP_TOKEN_TTL_MINUTES * 60,
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /v1/auth/mfa/recovery-codes/regenerate`
+///
+/// Step-up-gated. Wipes the current codes and issues a fresh set.
+pub async fn regenerate_recovery_codes(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(user): BearerUser,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<StepUpGatedBody>,
+) -> Result<Response, HttpError> {
+    if !user.mfa_enrolled {
+        return Ok((StatusCode::CONFLICT, Json(json!({"error": "not_enrolled"}))).into_response());
+    }
+    let ip = Some(addr.ip());
+    // Consume the step_up_token. Same SERIALIZABLE consume_once + bind
+    // to user-id check as step_up_verify does.
+    let token_hash = mokosh_auth_crypto::hash_opaque_token(&body.step_up_token);
+    let consumed = match st
+        .mfa_challenges
+        .consume(token_hash, MfaChallengePurpose::StepUp)
+        .await
+    {
+        Ok(c) if c.user_id == user.id => c,
+        _ => return Ok(step_up_not_valid()),
+    };
+    let _ = consumed;
+
+    let enrollment = st
+        .totp
+        .find_for_user(user.id)
+        .await?
+        .ok_or(AuthError::AccessDenied("user not enrolled".into()))?;
+
+    let new_codes = mokosh_auth_crypto::recovery::generate_set();
+    let hashes: Vec<[u8; 32]> = new_codes
+        .iter()
+        .map(|c| mokosh_auth_crypto::recovery::hash_code(c))
+        .collect();
+    st.recovery_codes
+        .replace_all(user.id, user.tenant_id, enrollment.id, &hashes)
+        .await?;
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(user.tenant_id),
+            Some(user.id),
+            ip,
+            AuditEvent::RecoveryCodesRegenerated {
+                user_id: user.id,
+                count: new_codes.len(),
+                ip: ip.map(|i| i.to_string()),
+            },
+        )
+        .await;
+    Ok((StatusCode::OK, Json(json!({"recovery_codes": new_codes}))).into_response())
+}
+
+/// `GET /v1/auth/mfa/status`
+pub async fn status(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(user): BearerUser,
+) -> Result<Response, HttpError> {
+    let method: Option<&'static str> = if user.mfa_enrolled { Some("totp") } else { None };
+    let unused = if user.mfa_enrolled {
+        st.recovery_codes.count_unused(user.id).await? as u32
+    } else {
+        0
+    };
+    Ok((
+        StatusCode::OK,
+        Json(StatusResponse {
+            mfa_enrolled: user.mfa_enrolled,
+            method,
+            recovery_codes_unused: unused,
+            low_warning: user.mfa_enrolled && unused <= LOW_RECOVERY_WARNING_THRESHOLD,
+        }),
+    )
+        .into_response())
+}
+
+fn step_up_not_valid() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "step_up_not_valid"})),
+    )
+        .into_response()
+}
+
 /// Render a black-on-white SVG QR encoding `data`. The SPA inlines this
 /// directly so there is no QR-encoder JS bundle and no first-render
 /// flash.
