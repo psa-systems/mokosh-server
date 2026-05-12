@@ -176,6 +176,29 @@ services:
             || echo "[entrypoint] ALTER USER failed (socket not trust-mode?); continuing"
         wait "$$pg_pid"
 
+  # Mailpit captures every outgoing email locally. mokosh-server points
+  # SMTP_HOST=mailpit in the dev env (see the server service below); the
+  # web UI is at http://localhost:8025. State is intentionally
+  # ephemeral - no volume mount, restart clears the inbox. See
+  # docs/mokosh-smtp/01-dev-mailcatcher.md.
+  mailpit:
+    container_name: dev-mokosh-mailpit-${USER:?USER missing - run via just dev}
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_DELIVER: "false"
+    networks:
+      - private
+    ports:
+      # Loopback-only on both ports. Multiple developers on the same
+      # box can collide on the host's 1025/8025; if you hit that,
+      # publish on a different host port (mailpit's internal ports
+      # stay 1025/8025 either way).
+      - "127.0.0.1:1025:1025"  # SMTP submission (mokosh-server -> mailpit)
+      - "127.0.0.1:8025:8025"  # web UI (developer browser)
+
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
   # live reload via `cargo run`.
   server:
@@ -271,6 +294,10 @@ services:
         condition: service_healthy
       infisical:
         condition: service_healthy
+      mailpit:
+        # No healthcheck on mailpit; it accepts SMTP from cold start.
+        # Wait for the container to be running, not healthy.
+        condition: service_started
 
 volumes:
   infisical-postgres-data:
