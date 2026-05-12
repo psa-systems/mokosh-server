@@ -384,21 +384,10 @@ impl LocalAuth {
                 amr,
             )
             .await?;
-        // Dedupe: revoke every other active session for this user with
-        // the SAME user_agent. The intent is "one browser = one logical
-        // session". This is necessary because the SPA's fetch from a
-        // different origin does not carry the OP-session cookie back,
-        // so the cookie-based revoke in `login` never fires and rows
-        // pile up. Best-effort; an error here doesn't fail the login.
-        let _ = self
-            .sessions
-            .revoke_others_same_user_agent(
-                user.id,
-                user_agent,
-                session.id,
-                mokosh_auth_core::time::SystemClock.now_or_default(),
-            )
-            .await;
+        // `OpSessionRepository::create` is upsert-on-(user_id, user_agent):
+        // an existing row (active OR revoked-by-logout) gets its sid
+        // rotated and revoked_at cleared in place, preserving display_name
+        // and created_at. Cleanup-other-rows is no longer needed here.
         let _ = self
             .users
             .update_last_login(user.id, mokosh_auth_core::time::SystemClock.now_or_default())
