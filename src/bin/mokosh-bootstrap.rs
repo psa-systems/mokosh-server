@@ -120,6 +120,7 @@ ENVIRONMENT (clients register):
     MOKOSH_CLIENT_TENANT_ID          Optional UUID; omit for platform-wide client.
     MOKOSH_CLIENT_DESCRIPTION        Optional short blurb shown by the Bunyip app launcher.
     MOKOSH_CLIENT_ICON_URL           Optional icon URL shown by the Bunyip app launcher.
+    MOKOSH_CLIENT_ACCESS_TOKEN_TTL   Access-token lifetime in seconds (60-3600, default 600).
 
 ENVIRONMENT (bootstrap-infisical):
     INFISICAL_ADMIN_EMAIL          (required) Admin user email.
@@ -274,6 +275,13 @@ async fn run_clients_register() -> anyhow::Result<()> {
     let icon_url = std::env::var("MOKOSH_CLIENT_ICON_URL")
         .ok()
         .filter(|s| !s.is_empty());
+    let access_token_ttl: Option<i32> = match std::env::var("MOKOSH_CLIENT_ACCESS_TOKEN_TTL") {
+        Ok(s) if !s.is_empty() => Some(
+            s.parse()
+                .map_err(|e| anyhow::anyhow!("MOKOSH_CLIENT_ACCESS_TOKEN_TTL: {}", e))?,
+        ),
+        _ => None,
+    };
     let tenant_id = std::env::var("MOKOSH_CLIENT_TENANT_ID")
         .ok()
         .filter(|s| !s.is_empty())
@@ -300,13 +308,18 @@ async fn run_clients_register() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
 
+    // `COALESCE($16, access_token_ttl_seconds)` keeps the DB
+    // default (600) intact when the env var is unset, so the new
+    // column does not silently widen the lifetime on omitted calls.
     sqlx::query(
         "INSERT INTO mokosh_auth.oauth_clients
             (client_id, tenant_id, client_secret_hash, client_type, name,
              redirect_uris, post_logout_redirect_uris, backchannel_logout_uri,
              lifecycle_event_uri, allowed_scopes, allowed_grant_types,
-             token_endpoint_auth_method, audience, description, icon_url)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+             token_endpoint_auth_method, audience, description, icon_url,
+             access_token_ttl_seconds)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                 COALESCE($16, 600))",
     )
     .bind(client_id)
     .bind(tenant_id)
@@ -323,6 +336,7 @@ async fn run_clients_register() -> anyhow::Result<()> {
     .bind(&audience)
     .bind(&description)
     .bind(&icon_url)
+    .bind(access_token_ttl)
     .execute(&pool)
     .await?;
 
