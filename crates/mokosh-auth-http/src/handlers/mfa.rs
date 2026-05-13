@@ -172,11 +172,7 @@ pub async fn confirm(
                 .into_response());
         }
         None => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "not_setup"})),
-            )
-                .into_response());
+            return Ok((StatusCode::NOT_FOUND, Json(json!({"error": "not_setup"}))).into_response());
         }
     };
 
@@ -240,11 +236,7 @@ pub async fn confirm(
         )
         .await;
 
-    Ok((
-        StatusCode::OK,
-        Json(ConfirmResponse { mfa_enrolled: true }),
-    )
-        .into_response())
+    Ok((StatusCode::OK, Json(ConfirmResponse { mfa_enrolled: true })).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,18 +272,27 @@ pub async fn verify(
         return Ok(rl.into_response());
     }
     let ip = Some(addr.ip());
-    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
 
     let token_hash = mokosh_auth_crypto::hash_opaque_token(&body.challenge);
-    // Validate purpose + freshness + consumed under the SERIALIZABLE
-    // tx; the repo also marks the row consumed in the same tx.
-    let challenge = match st
-        .mfa_challenges
-        .consume(token_hash, MfaChallengePurpose::Login)
-        .await
-    {
-        Ok(c) => c,
-        Err(AuthError::NotFound) => {
+    // Peek the challenge without consuming it. A wrong TOTP code or a
+    // wrong recovery code MUST leave the challenge open so the user can
+    // retry within the prompt's lifetime (~5 min) without restarting
+    // the whole sign-in dance. The challenge is only marked consumed
+    // after the code itself verifies, via the atomic `consume` call at
+    // the bottom of this handler. Rate limiting + the expiry window
+    // bound the retry budget.
+    let now = Utc::now();
+    let challenge = match st.mfa_challenges.find_by_token_hash(token_hash).await? {
+        Some(c)
+            if c.is_open(now)
+                && matches!(c.purpose, MfaChallengePurpose::Login) =>
+        {
+            c
+        }
+        _ => {
             let _ = st
                 .provider
                 .audit
@@ -308,7 +309,6 @@ pub async fn verify(
                 .await;
             return Ok(challenge_not_found());
         }
-        Err(e) => return Err(HttpError(e)),
     };
 
     let user = st
@@ -415,6 +415,20 @@ pub async fn verify(
         }
     }
 
+    // Code verified. Now atomically mark the challenge consumed so a
+    // simultaneous second request with the same (still-valid) TOTP step
+    // cannot also succeed. NotFound here means another request beat us
+    // to it - rare, but treat it as the challenge having been used.
+    match st
+        .mfa_challenges
+        .consume(token_hash, MfaChallengePurpose::Login)
+        .await
+    {
+        Ok(_) => {}
+        Err(AuthError::NotFound) => return Ok(challenge_not_found()),
+        Err(e) => return Err(HttpError(e)),
+    }
+
     let amr = vec!["pwd".to_string(), amr_method.to_string()];
     let session = st
         .local_auth
@@ -474,7 +488,11 @@ pub async fn verify(
         None
     };
 
-    let cookie = set_op_session_cookie(&st.cookie_cfg, session.sid.clone(), st.provider.cfg.op_session_ttl);
+    let cookie = set_op_session_cookie(
+        &st.cookie_cfg,
+        session.sid.clone(),
+        st.provider.cfg.op_session_ttl,
+    );
     let body = json!({
         "user_id":          user.id.0.to_string(),
         "tenant_id":        user.tenant_id.0.to_string(),
@@ -761,7 +779,11 @@ pub async fn status(
     State(st): State<Arc<AuthHttpState>>,
     BearerUser(user): BearerUser,
 ) -> Result<Response, HttpError> {
-    let method: Option<&'static str> = if user.mfa_enrolled { Some("totp") } else { None };
+    let method: Option<&'static str> = if user.mfa_enrolled {
+        Some("totp")
+    } else {
+        None
+    };
     let unused = if user.mfa_enrolled {
         st.recovery_codes.count_unused(user.id).await? as u32
     } else {
