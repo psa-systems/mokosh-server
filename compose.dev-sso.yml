@@ -55,15 +55,18 @@ services:
       MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: /app/secrets/dev-key.pem
       MOKOSH_AUTH_JWT_ACTIVE_KID: dev-key
       MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: /app/secrets
-      # Where invite emails point: the SPA's public URL. Without this
-      # the LogMailer falls back to CLIENT_ORIGIN (localhost:4301),
-      # which sends recipients to the wrong host on Traefik-routed dev.
-      MOKOSH_ACCEPT_BASE_URL: https://${USER}-mokosh.a8n.run
+      # Account-management email links (invites, password reset, signup
+      # complete) land on bunyip - it owns the user-account surface.
+      # mokosh-clients no longer hosts those pages once the bunyip hub
+      # is live; see docs/bunyip/07-sso-redirect-bridge.md.
+      MOKOSH_ACCEPT_BASE_URL: https://${USER}-bunyip.a8n.run
       # Universal sign-in URL. /oauth2/authorize 302s unauthenticated
-      # users here with ?return_to=<authorize_query> so the SPA login
-      # is the only sign-in screen any RP ever uses. See
-      # docs/mokosh-auth/09-single-login-bridge.md.
-      MOKOSH_AUTH_LOGIN_URL: https://${USER}-mokosh.a8n.run/login
+      # users here with ?return_to=<authorize_query> so bunyip's login
+      # is the only sign-in screen any RP ever uses. Bunyip's LoginPage
+      # validates return_to, runs the password+MFA dance, then bounces
+      # to ${issuer}/oauth2/authorize?<return_to> so the freshly-set OP
+      # cookie closes the loop. See docs/bunyip/07-sso-redirect-bridge.md.
+      MOKOSH_AUTH_LOGIN_URL: https://${USER}-bunyip.a8n.run/login
       # Enable public self-signup. PSA hub deploys keep this off
       # (registration is admin-invite-gated); the a8n / individual SKU
       # turns it on. Dev defaults on so we can smoke-test the flow.
