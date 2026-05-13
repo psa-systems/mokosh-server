@@ -13,7 +13,7 @@ use mokosh_auth_core::{
 use mokosh_auth_crypto::EncryptionKeySet;
 use mokosh_auth_oidc::OidcProvider;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use url::Url;
 
 use crate::cookies::CookieConfig;
@@ -116,20 +116,25 @@ pub struct AuthHttpState {
 }
 
 pub fn build_router(state: Arc<AuthHttpState>) -> Router {
-    // Permissive CORS on the OIDC surface. These endpoints are
-    // designed to be called cross-origin by browser SPAs:
-    //   - /.well-known/openid-configuration and jwks.json are public
-    //     metadata
-    //   - /oauth2/token, /userinfo, /revoke take Authorization headers
-    //     and PKCE proofs, never cookies (cross-origin cookie use
-    //     would defeat the SPA model anyway)
-    // We deliberately do NOT enable allow_credentials, since the OIDC
-    // flow uses Bearer tokens. /oauth2/authorize and /oauth2/logout
-    // are reached via top-level browser navigation (set_href), not
-    // fetch, so they do not need CORS at all but allowing them is
-    // harmless. /login is same-origin only.
+    // CORS for the SPA-facing surface.
+    //
+    // /v1/auth/login + /v1/auth/logout + /v1/auth/mfa/verify SET or
+    // CLEAR the OP session cookie. Browsers will only honour those
+    // Set-Cookie headers when the cross-origin fetch carries
+    // `credentials: 'include'` AND the response advertises both
+    // `Access-Control-Allow-Credentials: true` and a specific (non
+    // wildcard) `Access-Control-Allow-Origin` value. So we MUST run
+    // with credentialed CORS - allow_origin(Any) plus credentials is
+    // a browser-rejected combination.
+    //
+    // `AllowOrigin::mirror_request()` echoes the request's Origin
+    // header back so any origin can talk to us (suitable for dev and
+    // for our hub-of-RPs production model). Production deployments
+    // that want to lock the surface down should swap this for a
+    // hard-coded list via env.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(true)
         .allow_methods([
             Method::GET,
             Method::POST,
