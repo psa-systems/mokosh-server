@@ -106,7 +106,7 @@ register-client: ensure-env
     # exported to the host shell (compose reads it for interpolation),
     # so we hardcode the in-network URL here as the canonical fallback.
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=mokosh-clients-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" server cargo run --quiet --bin mokosh-bootstrap -- clients register
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=mokosh-clients-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=PSA tools for the day-to-day" --env $"MOKOSH_CLIENT_ICON_URL=($app_origin)/assets/icon.svg" server cargo run --quiet --bin mokosh-bootstrap -- clients register
 
 # Stop everything this repo runs (both LAN-IP and SSO modes), regardless
 # of which `just dev*` you started with. Volumes preserved.

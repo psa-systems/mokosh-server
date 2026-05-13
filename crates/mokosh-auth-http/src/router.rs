@@ -19,9 +19,9 @@ use url::Url;
 use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
-    audit as audit_h, auth as auth_h, discovery as disc_h, invites as invites_h, mfa as mfa_h,
-    oidc as oidc_h, password_reset as pwd_reset_h, profile as profile_h, sessions as sessions_h,
-    signup as signup_h, tenants as tenants_h, users as users_h,
+    apps as apps_h, audit as audit_h, auth as auth_h, discovery as disc_h, invites as invites_h,
+    mfa as mfa_h, oidc as oidc_h, password_reset as pwd_reset_h, profile as profile_h,
+    sessions as sessions_h, signup as signup_h, tenants as tenants_h, users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -45,9 +45,7 @@ pub type TenantInfoLookup =
 /// same schema-isolation reason as TenantNameLookup. Failures bubble
 /// up as `AuthError::Storage`.
 pub type PersonalTenantCreator = Arc<
-    dyn Fn(String /* email */) -> BoxFuture<'static, Result<TenantId, AuthError>>
-        + Send
-        + Sync,
+    dyn Fn(String /* email */) -> BoxFuture<'static, Result<TenantId, AuthError>> + Send + Sync,
 >;
 
 #[derive(Clone)]
@@ -168,8 +166,14 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
             "/v1/auth/invites",
             post(invites_h::issue).get(invites_h::list_open),
         )
-        .route("/v1/auth/invites/{invite_id}/revoke", post(invites_h::revoke))
-        .route("/v1/auth/invites/{invite_id}/resend", post(invites_h::resend))
+        .route(
+            "/v1/auth/invites/{invite_id}/revoke",
+            post(invites_h::revoke),
+        )
+        .route(
+            "/v1/auth/invites/{invite_id}/resend",
+            post(invites_h::resend),
+        )
         // Public token-gated invite endpoints
         .route(
             "/v1/auth/invites/by-token/{token}",
@@ -204,10 +208,7 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // MOKOSH_PUBLIC_SIGNUP_ENABLED=true at bootstrap; otherwise
         // every endpoint here returns 404 signup_disabled.
         .route("/v1/auth/signup", post(signup_h::start))
-        .route(
-            "/v1/auth/signup/by-token/{token}",
-            get(signup_h::preview),
-        )
+        .route("/v1/auth/signup/by-token/{token}", get(signup_h::preview))
         .route(
             "/v1/auth/signup/by-token/{token}/complete",
             post(signup_h::complete),
@@ -225,9 +226,14 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // MFA enrollment (Bearer-authed; user enrolls themselves).
         // Admin audit log reader.
         .route("/v1/auth/audit-logs", axum::routing::get(audit_h::list))
+        // App launcher: list OAuth clients the signed-in user can launch.
+        .route("/v1/auth/apps", get(apps_h::list_apps))
         // Self-service profile.
         .route("/v1/auth/me", axum::routing::get(profile_h::get_me))
-        .route("/v1/auth/me/profile", axum::routing::put(profile_h::update_profile))
+        .route(
+            "/v1/auth/me/profile",
+            axum::routing::put(profile_h::update_profile),
+        )
         .route("/v1/auth/me/password", post(profile_h::change_password))
         .route("/v1/auth/mfa/setup", post(mfa_h::setup))
         .route("/v1/auth/mfa/confirm", post(mfa_h::confirm))
@@ -238,7 +244,10 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route("/v1/auth/mfa/step-up/start", post(mfa_h::step_up_start))
         .route("/v1/auth/mfa/step-up/verify", post(mfa_h::step_up_verify))
         // Recovery codes: list/regenerate (regenerate is step-up-gated).
-        .route("/v1/auth/mfa/recovery-codes/regenerate", post(mfa_h::regenerate_recovery_codes))
+        .route(
+            "/v1/auth/mfa/recovery-codes/regenerate",
+            post(mfa_h::regenerate_recovery_codes),
+        )
         .route("/v1/auth/mfa/status", axum::routing::get(mfa_h::status))
         // Disenroll (self) - step-up-gated; admin force-disenroll is
         // mounted under /v1/auth/users to keep the URL space tidy.

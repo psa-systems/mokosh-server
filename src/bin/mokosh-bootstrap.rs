@@ -118,6 +118,8 @@ ENVIRONMENT (clients register):
                                      (default: client_secret_basic for confidential, none for public).
     MOKOSH_CLIENT_AUDIENCE           (required) Audience for issued access tokens.
     MOKOSH_CLIENT_TENANT_ID          Optional UUID; omit for platform-wide client.
+    MOKOSH_CLIENT_DESCRIPTION        Optional short blurb shown by the Bunyip app launcher.
+    MOKOSH_CLIENT_ICON_URL           Optional icon URL shown by the Bunyip app launcher.
 
 ENVIRONMENT (bootstrap-infisical):
     INFISICAL_ADMIN_EMAIL          (required) Admin user email.
@@ -211,8 +213,8 @@ async fn run_clients_register() -> anyhow::Result<()> {
 
     let database_url = require_env("DATABASE_URL")?;
     let name = require_env("MOKOSH_CLIENT_NAME")?;
-    let client_type = std::env::var("MOKOSH_CLIENT_TYPE")
-        .unwrap_or_else(|_| "confidential".to_string());
+    let client_type =
+        std::env::var("MOKOSH_CLIENT_TYPE").unwrap_or_else(|_| "confidential".to_string());
     if !matches!(client_type.as_str(), "public" | "confidential") {
         anyhow::bail!("MOKOSH_CLIENT_TYPE must be 'public' or 'confidential'");
     }
@@ -222,15 +224,18 @@ async fn run_clients_register() -> anyhow::Result<()> {
         anyhow::bail!("MOKOSH_CLIENT_REDIRECT_URIS must list at least one URI");
     }
     for u in &redirect_uris {
-        url::Url::parse(u)
-            .map_err(|e| anyhow::anyhow!("invalid redirect URI `{}`: {}", u, e))?;
+        url::Url::parse(u).map_err(|e| anyhow::anyhow!("invalid redirect URI `{}`: {}", u, e))?;
     }
 
     let post_logout_uris = std::env::var("MOKOSH_CLIENT_POST_LOGOUT_URIS")
         .map(|s| parse_csv(&s))
         .unwrap_or_default();
-    let backchannel = std::env::var("MOKOSH_CLIENT_BACKCHANNEL_URI").ok().filter(|s| !s.is_empty());
-    let lifecycle = std::env::var("MOKOSH_CLIENT_LIFECYCLE_URI").ok().filter(|s| !s.is_empty());
+    let backchannel = std::env::var("MOKOSH_CLIENT_BACKCHANNEL_URI")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let lifecycle = std::env::var("MOKOSH_CLIENT_LIFECYCLE_URI")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let scopes = std::env::var("MOKOSH_CLIENT_SCOPES")
         .unwrap_or_else(|_| "openid email offline_access".to_string());
@@ -239,12 +244,11 @@ async fn run_clients_register() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "authorization_code refresh_token".to_string());
     let grant_vec: Vec<String> = grants.split_whitespace().map(String::from).collect();
 
-    let auth_method = std::env::var("MOKOSH_CLIENT_AUTH_METHOD").unwrap_or_else(|_| {
-        match client_type.as_str() {
+    let auth_method =
+        std::env::var("MOKOSH_CLIENT_AUTH_METHOD").unwrap_or_else(|_| match client_type.as_str() {
             "public" => "none".to_string(),
             _ => "client_secret_basic".to_string(),
-        }
-    });
+        });
     if !matches!(
         auth_method.as_str(),
         "none" | "client_secret_basic" | "client_secret_post"
@@ -264,6 +268,12 @@ async fn run_clients_register() -> anyhow::Result<()> {
     }
 
     let audience = require_env("MOKOSH_CLIENT_AUDIENCE")?;
+    let description = std::env::var("MOKOSH_CLIENT_DESCRIPTION")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let icon_url = std::env::var("MOKOSH_CLIENT_ICON_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
     let tenant_id = std::env::var("MOKOSH_CLIENT_TENANT_ID")
         .ok()
         .filter(|s| !s.is_empty())
@@ -295,8 +305,8 @@ async fn run_clients_register() -> anyhow::Result<()> {
             (client_id, tenant_id, client_secret_hash, client_type, name,
              redirect_uris, post_logout_redirect_uris, backchannel_logout_uri,
              lifecycle_event_uri, allowed_scopes, allowed_grant_types,
-             token_endpoint_auth_method, audience)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             token_endpoint_auth_method, audience, description, icon_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(client_id)
     .bind(tenant_id)
@@ -311,6 +321,8 @@ async fn run_clients_register() -> anyhow::Result<()> {
     .bind(&grant_vec)
     .bind(&auth_method)
     .bind(&audience)
+    .bind(&description)
+    .bind(&icon_url)
     .execute(&pool)
     .await?;
 

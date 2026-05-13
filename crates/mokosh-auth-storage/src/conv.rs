@@ -6,8 +6,8 @@
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{
     AuthError, ClientAuthMethod, ClientId, ClientType, GrantType, OAuthClient, OpSession,
-    OpSessionId, RefreshFamilyId, RefreshToken, RefreshTokenFamily, RefreshTokenId, TenantId,
-    User, UserId, UserRole, UserStatus,
+    OpSessionId, RefreshFamilyId, RefreshToken, RefreshTokenFamily, RefreshTokenId, TenantId, User,
+    UserId, UserRole, UserStatus,
 };
 use std::collections::BTreeSet;
 use url::Url;
@@ -72,6 +72,8 @@ pub(crate) struct OAuthClientRow {
     pub client_secret_hash: Option<String>,
     pub client_type: String,
     pub name: String,
+    pub description: Option<String>,
+    pub icon_url: Option<String>,
     pub redirect_uris: Vec<String>,
     pub post_logout_redirect_uris: Vec<String>,
     pub backchannel_logout_uri: Option<String>,
@@ -89,7 +91,10 @@ pub(crate) struct OAuthClientRow {
 
 fn parse_urls(raw: Vec<String>, label: &str) -> Result<Vec<Url>, AuthError> {
     raw.into_iter()
-        .map(|s| Url::parse(&s).map_err(|e| AuthError::Storage(format!("invalid {label} URL `{s}`: {e}"))))
+        .map(|s| {
+            Url::parse(&s)
+                .map_err(|e| AuthError::Storage(format!("invalid {label} URL `{s}`: {e}")))
+        })
         .collect()
 }
 
@@ -109,18 +114,30 @@ impl TryFrom<OAuthClientRow> for OAuthClient {
             client_id: ClientId(r.client_id),
             tenant_id: r.tenant_id.map(TenantId),
             name: r.name,
-            client_type: ClientType::parse(&r.client_type)
-                .ok_or_else(|| AuthError::Storage(format!("invalid client_type: {}", r.client_type)))?,
+            description: r.description,
+            icon_url: r.icon_url,
+            client_type: ClientType::parse(&r.client_type).ok_or_else(|| {
+                AuthError::Storage(format!("invalid client_type: {}", r.client_type))
+            })?,
             client_secret_hash: r.client_secret_hash,
             redirect_uris: parse_urls(r.redirect_uris, "redirect_uri")?,
-            post_logout_redirect_uris: parse_urls(r.post_logout_redirect_uris, "post_logout_redirect_uri")?,
+            post_logout_redirect_uris: parse_urls(
+                r.post_logout_redirect_uris,
+                "post_logout_redirect_uri",
+            )?,
             backchannel_logout_uri: r
                 .backchannel_logout_uri
-                .map(|s| Url::parse(&s).map_err(|e| AuthError::Storage(format!("backchannel_logout_uri: {e}"))))
+                .map(|s| {
+                    Url::parse(&s)
+                        .map_err(|e| AuthError::Storage(format!("backchannel_logout_uri: {e}")))
+                })
                 .transpose()?,
             lifecycle_event_uri: r
                 .lifecycle_event_uri
-                .map(|s| Url::parse(&s).map_err(|e| AuthError::Storage(format!("lifecycle_event_uri: {e}"))))
+                .map(|s| {
+                    Url::parse(&s)
+                        .map_err(|e| AuthError::Storage(format!("lifecycle_event_uri: {e}")))
+                })
                 .transpose()?,
             allowed_scopes: r.allowed_scopes.into_iter().collect(),
             allowed_grant_types: allowed_grant_types?,

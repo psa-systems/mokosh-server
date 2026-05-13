@@ -193,6 +193,12 @@ pub struct OAuthClient {
     /// `None` means platform-wide; `Some(t)` scopes the client to tenant `t`.
     pub tenant_id: Option<TenantId>,
     pub name: String,
+    /// Human-readable blurb surfaced by the app launcher. NULL allowed;
+    /// the launcher falls back to the client name when missing.
+    pub description: Option<String>,
+    /// Square icon URL surfaced by the app launcher (typically points
+    /// at a static asset on the relying-party's SPA). NULL allowed.
+    pub icon_url: Option<String>,
     pub client_type: ClientType,
     /// Argon2id PHC string. `None` for public clients.
     pub client_secret_hash: Option<String>,
@@ -664,23 +670,80 @@ impl AuditSeverity {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditEvent {
-    LoginSuccess { user_id: UserId, ip: Option<String>, user_agent: Option<String> },
-    LoginFailed { email: String, ip: Option<String>, reason: String },
-    LogoutSuccess { user_id: UserId },
-    PasswordChanged { user_id: UserId },
-    PasswordResetRequested { email: String, ip: Option<String> },
-    PasswordResetCompleted { user_id: UserId, ip: Option<String> },
-    MagicLinkRequested { email: String, ip: Option<String> },
-    MagicLinkUsed { user_id: UserId, ip: Option<String> },
-    TokenIssued { user_id: UserId, client_id: ClientId, scope: Vec<String>, jti: String },
-    TokenRefreshed { user_id: UserId, client_id: ClientId, family_id: RefreshFamilyId },
-    RefreshReuseDetected { family_id: RefreshFamilyId, client_id: ClientId, user_id: UserId },
-    SessionRevoked { user_id: UserId, sid: String, reason: String },
-    ClientCreated { client_id: ClientId, by: Option<UserId> },
-    ClientDisabled { client_id: ClientId, by: Option<UserId> },
-    KeyRotated { kid_old: String, kid_new: String },
-    SuspiciousActivity { description: String, ip: Option<String> },
-    AdminAction { admin_id: UserId, action: String, target: String },
+    LoginSuccess {
+        user_id: UserId,
+        ip: Option<String>,
+        user_agent: Option<String>,
+    },
+    LoginFailed {
+        email: String,
+        ip: Option<String>,
+        reason: String,
+    },
+    LogoutSuccess {
+        user_id: UserId,
+    },
+    PasswordChanged {
+        user_id: UserId,
+    },
+    PasswordResetRequested {
+        email: String,
+        ip: Option<String>,
+    },
+    PasswordResetCompleted {
+        user_id: UserId,
+        ip: Option<String>,
+    },
+    MagicLinkRequested {
+        email: String,
+        ip: Option<String>,
+    },
+    MagicLinkUsed {
+        user_id: UserId,
+        ip: Option<String>,
+    },
+    TokenIssued {
+        user_id: UserId,
+        client_id: ClientId,
+        scope: Vec<String>,
+        jti: String,
+    },
+    TokenRefreshed {
+        user_id: UserId,
+        client_id: ClientId,
+        family_id: RefreshFamilyId,
+    },
+    RefreshReuseDetected {
+        family_id: RefreshFamilyId,
+        client_id: ClientId,
+        user_id: UserId,
+    },
+    SessionRevoked {
+        user_id: UserId,
+        sid: String,
+        reason: String,
+    },
+    ClientCreated {
+        client_id: ClientId,
+        by: Option<UserId>,
+    },
+    ClientDisabled {
+        client_id: ClientId,
+        by: Option<UserId>,
+    },
+    KeyRotated {
+        kid_old: String,
+        kid_new: String,
+    },
+    SuspiciousActivity {
+        description: String,
+        ip: Option<String>,
+    },
+    AdminAction {
+        admin_id: UserId,
+        action: String,
+        target: String,
+    },
     InviteIssued {
         invite_id: uuid::Uuid,
         tenant_id: TenantId,

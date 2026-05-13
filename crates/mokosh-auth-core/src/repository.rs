@@ -75,8 +75,21 @@ pub trait UserRepository: Send + Sync {
 
 #[async_trait]
 pub trait OAuthClientRepository: Send + Sync {
-    async fn find_by_client_id(&self, client_id: ClientId)
-        -> Result<Option<OAuthClient>, AuthError>;
+    async fn find_by_client_id(
+        &self,
+        client_id: ClientId,
+    ) -> Result<Option<OAuthClient>, AuthError>;
+    /// All enabled OAuth clients launchable by the given (user, tenant)
+    /// pair. Visibility today is simple: every non-disabled row whose
+    /// `tenant_id` is NULL (platform-wide) OR matches the supplied
+    /// tenant, AND that has at least one redirect_uri. Powers the
+    /// Bunyip app launcher; the `user_id` is accepted today for future
+    /// per-user ACLs but is currently unused by every implementation.
+    async fn list_for_user(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+    ) -> Result<Vec<OAuthClient>, AuthError>;
 }
 
 #[async_trait]
@@ -397,10 +410,7 @@ pub trait SignupTokenRepository: Send + Sync {
 /// covers the simple lifecycle methods.
 #[async_trait]
 pub trait PasswordResetTokenRepository: Send + Sync {
-    async fn issue(
-        &self,
-        new: NewPasswordResetToken,
-    ) -> Result<PasswordResetToken, AuthError>;
+    async fn issue(&self, new: NewPasswordResetToken) -> Result<PasswordResetToken, AuthError>;
 
     async fn find_by_token_hash(
         &self,
@@ -505,11 +515,7 @@ pub trait InviteRepository: Send + Sync {
     /// `AuthError::Conflict` if the user is already a member of the
     /// inviter's tenant; the handler can surface that as a soft "you
     /// are already a member" notice or as a redirect to /login.
-    async fn accept_existing(
-        &self,
-        token: &str,
-        user_id: UserId,
-    ) -> Result<User, AuthError>;
+    async fn accept_existing(&self, token: &str, user_id: UserId) -> Result<User, AuthError>;
 }
 
 #[async_trait]
@@ -532,10 +538,7 @@ pub trait TotpRepository: Send + Sync {
         key_version: u16,
     ) -> Result<TotpEnrollment, AuthError>;
 
-    async fn find_for_user(
-        &self,
-        user_id: UserId,
-    ) -> Result<Option<TotpEnrollment>, AuthError>;
+    async fn find_for_user(&self, user_id: UserId) -> Result<Option<TotpEnrollment>, AuthError>;
 
     /// SERIALIZABLE: locks the user_totp row, marks `confirmed_at`,
     /// flips `users.mfa_enrolled = TRUE`, and clears
@@ -562,11 +565,7 @@ pub trait RecoveryCodeRepository: Send + Sync {
     /// it used. Returns `NotFound` for unknown/used. Same shape as the
     /// "wrong TOTP code" response in the verify handler so callers can
     /// keep them indistinguishable.
-    async fn consume_unused(
-        &self,
-        user_id: UserId,
-        code_hash: [u8; 32],
-    ) -> Result<(), AuthError>;
+    async fn consume_unused(&self, user_id: UserId, code_hash: [u8; 32]) -> Result<(), AuthError>;
 
     async fn count_unused(&self, user_id: UserId) -> Result<usize, AuthError>;
 
@@ -592,10 +591,7 @@ pub trait TrustedDeviceRepository: Send + Sync {
         &self,
         token_hash: [u8; 32],
     ) -> Result<Option<TrustedDevice>, AuthError>;
-    async fn list_active_for_user(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<TrustedDevice>, AuthError>;
+    async fn list_active_for_user(&self, user_id: UserId) -> Result<Vec<TrustedDevice>, AuthError>;
     async fn revoke(&self, id: uuid::Uuid, user_id: UserId) -> Result<(), AuthError>;
 }
 
