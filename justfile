@@ -85,6 +85,15 @@ dev-sso-down: ensure-env
 # Register mokosh-clients as a public OIDC client. Run once after
 # `just dev-sso` is up. Prints the client_id UUID; copy it into
 # mokosh-clients/.env as MOKOSH_OIDC_CLIENT_ID.
+[doc("Register bunyip-web as a public OIDC client (one-shot, idempotent on (name))")]
+register-bunyip-client: ensure-env
+    #!/usr/bin/env nu
+    let user = $env.USER
+    let api_origin = $"https://($user)-mokosh-api.a8n.run"
+    let hub_origin = $"https://($user)-bunyip.a8n.run"
+    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=bunyip-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($hub_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($hub_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" server cargo run --quiet --bin mokosh-bootstrap -- clients register
+
 [doc("Register mokosh-clients as a public OIDC client (one-shot, idempotent on (name))")]
 register-client: ensure-env
     #!/usr/bin/env nu
