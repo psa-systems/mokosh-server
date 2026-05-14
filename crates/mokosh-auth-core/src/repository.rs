@@ -61,6 +61,31 @@ pub trait UserRepository: Send + Sync {
         avatar_url: Option<&str>,
     ) -> Result<(), AuthError>;
     async fn set_status(&self, id: UserId, status: UserStatus) -> Result<(), AuthError>;
+    /// Mutate the global role on a single user row. The handler is
+    /// responsible for the last-admin guard + the step-up gate when
+    /// promoting to Admin; this is the bare write.
+    async fn set_role(&self, id: UserId, role: UserRole) -> Result<(), AuthError>;
+    /// Count active Admins in the tenant, EXCLUDING `excluded`. Used
+    /// by the last-admin guard on suspend / demote / delete. Callers
+    /// run this in the same transaction as the mutation they are
+    /// guarding so the count is race-safe at SERIALIZABLE.
+    async fn count_active_admins_excluding(
+        &self,
+        tenant_id: TenantId,
+        excluded: UserId,
+    ) -> Result<u64, AuthError>;
+    /// Update the email column. Used by `user.delete` so the original
+    /// address can be reused by a fresh signup. Returns `Conflict` if
+    /// the new email already exists for the tenant.
+    async fn update_email(&self, id: UserId, new_email: &str) -> Result<(), AuthError>;
+    /// Filtered + paginated listing. Powers the enhanced admin
+    /// user-management page. Returns `(rows, total_matching)` so the
+    /// SPA can render "Showing N of M".
+    async fn list_filtered(
+        &self,
+        tenant_id: TenantId,
+        filter: UserListFilter,
+    ) -> Result<(Vec<User>, u64), AuthError>;
     async fn mark_email_verified(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
     /// Update the user's `last_active_tenant` pointer. Called by
     /// `/v1/auth/active-tenant` when the user switches tenants and

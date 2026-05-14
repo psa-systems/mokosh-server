@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{
-    AuthError, NewUser, TenantId, User, UserId, UserRepository, UserStatus,
+    AuthError, NewUser, TenantId, User, UserId, UserListFilter, UserRepository, UserRole,
+    UserStatus,
 };
 
 use crate::conv::{db_err, UserRow};
@@ -118,22 +119,26 @@ impl UserRepository for PgUserRepository {
     }
 
     async fn update_last_login(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError> {
-        sqlx::query("UPDATE mokosh_auth.users SET last_login_at = $1, updated_at = NOW() WHERE id = $2")
-            .bind(at)
-            .bind(id.0)
-            .execute(self.pool.pg())
-            .await
-            .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE mokosh_auth.users SET last_login_at = $1, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(at)
+        .bind(id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
     async fn set_password_hash(&self, id: UserId, hash: &str) -> Result<(), AuthError> {
-        sqlx::query("UPDATE mokosh_auth.users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
-            .bind(hash)
-            .bind(id.0)
-            .execute(self.pool.pg())
-            .await
-            .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE mokosh_auth.users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(hash)
+        .bind(id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -267,5 +272,115 @@ impl UserRepository for PgUserRepository {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn set_role(&self, id: UserId, role: UserRole) -> Result<(), AuthError> {
+        sqlx::query("UPDATE mokosh_auth.users SET role = $1, updated_at = NOW() WHERE id = $2")
+            .bind(role.as_str())
+            .bind(id.0)
+            .execute(self.pool.pg())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn count_active_admins_excluding(
+        &self,
+        tenant_id: TenantId,
+        excluded: UserId,
+    ) -> Result<u64, AuthError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mokosh_auth.users
+             WHERE tenant_id = $1
+               AND role = 'admin'
+               AND status = 'active'
+               AND deleted_at IS NULL
+               AND id <> $2",
+        )
+        .bind(tenant_id.0)
+        .bind(excluded.0)
+        .fetch_one(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    async fn update_email(&self, id: UserId, new_email: &str) -> Result<(), AuthError> {
+        sqlx::query("UPDATE mokosh_auth.users SET email = $1, updated_at = NOW() WHERE id = $2")
+            .bind(new_email)
+            .bind(id.0)
+            .execute(self.pool.pg())
+            .await
+            .map_err(|e| match &e {
+                sqlx::Error::Database(db) if db.is_unique_violation() => {
+                    AuthError::Conflict("email already registered for this tenant".into())
+                }
+                _ => db_err(e),
+            })?;
+        Ok(())
+    }
+
+    async fn list_filtered(
+        &self,
+        tenant_id: TenantId,
+        filter: UserListFilter,
+    ) -> Result<(Vec<User>, u64), AuthError> {
+        // Clamp limit/offset defensively even though the handler is
+        // supposed to. Storage MUST NOT trust caller-supplied bounds.
+        let limit = filter.limit.clamp(1, 200) as i64;
+        let offset = filter.offset.min(i32::MAX as u32) as i64;
+        let search = filter
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let search_pattern = search.map(|s| format!("%{s}%"));
+
+        // Same WHERE clause for the count + the page; build once.
+        // Postgres lets a NULL pass-through param disable the predicate,
+        // so a single template covers every filter combination.
+        let where_sql = r#"
+            tenant_id = $1
+            AND deleted_at IS NULL
+            AND ($2::text IS NULL OR
+                 (email || ' ' || COALESCE(first_name,'') || ' ' || COALESCE(last_name,''))
+                 ILIKE $2)
+            AND ($3::text IS NULL OR role = $3)
+            AND ($4::text IS NULL OR status = $4)
+            AND ($5::bool IS NULL OR mfa_enrolled = $5)
+        "#;
+
+        let role = filter.role.map(|r| r.as_str().to_string());
+        let status = filter.status.map(|s| s.as_str().to_string());
+
+        let count_sql = format!("SELECT COUNT(*) FROM mokosh_auth.users WHERE {where_sql}");
+        let total: (i64,) = sqlx::query_as(&count_sql)
+            .bind(tenant_id.0)
+            .bind(&search_pattern)
+            .bind(&role)
+            .bind(&status)
+            .bind(filter.mfa_enrolled)
+            .fetch_one(self.pool.pg())
+            .await
+            .map_err(db_err)?;
+
+        let page_sql = format!(
+            "{SELECT_USER} WHERE {where_sql}
+             ORDER BY created_at DESC
+             LIMIT $6 OFFSET $7"
+        );
+        let rows: Vec<UserRow> = sqlx::query_as(&page_sql)
+            .bind(tenant_id.0)
+            .bind(&search_pattern)
+            .bind(&role)
+            .bind(&status)
+            .bind(filter.mfa_enrolled)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(self.pool.pg())
+            .await
+            .map_err(db_err)?;
+        let users: Result<Vec<User>, _> = rows.into_iter().map(User::try_from).collect();
+        Ok((users?, total.0.max(0) as u64))
     }
 }

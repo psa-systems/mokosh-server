@@ -110,6 +110,26 @@ pub struct NewUser {
     pub last_name: Option<String>,
 }
 
+/// Query input for the admin user-management list endpoint. Every
+/// field is optional; an all-`None` filter is equivalent to the
+/// existing `list_by_tenant` semantics.
+///
+/// `limit` and `offset` are clamped by the handler (`limit` to [1, 200],
+/// default 50; `offset` to >= 0, default 0) so storage never sees
+/// hostile values.
+#[derive(Clone, Debug, Default)]
+pub struct UserListFilter {
+    /// Case-insensitive substring match against
+    /// `email || ' ' || coalesce(first_name,'') || ' ' || coalesce(last_name,'')`.
+    /// Empty / whitespace-only treated as `None`.
+    pub search: Option<String>,
+    pub role: Option<UserRole>,
+    pub status: Option<UserStatus>,
+    pub mfa_enrolled: Option<bool>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 // --- OAuth client -------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

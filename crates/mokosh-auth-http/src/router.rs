@@ -199,8 +199,14 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
             "/v1/auth/sessions/{session_id}/rename",
             post(sessions_h::rename_my_session),
         )
-        // Admin user management.
+        // Admin user management. The list endpoint supports filter
+        // and pagination query params:
+        //   ?search=&role=&status=&mfa=yes|no&limit=&offset=
+        // The body shape is { users, total, limit, offset }; backwards-
+        // compatible with the v1 envelope (just adds the pagination
+        // fields). See docs/bunyip-settings/03-server-additions.md.
         .route("/v1/auth/users", get(users_h::list_users))
+        .route("/v1/auth/users/{user_id}", get(users_h::get_one))
         .route(
             "/v1/auth/users/{user_id}/suspend",
             post(users_h::suspend_user),
@@ -208,6 +214,19 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         .route(
             "/v1/auth/users/{user_id}/reactivate",
             post(users_h::reactivate_user),
+        )
+        .route("/v1/auth/users/{user_id}/role", post(users_h::change_role))
+        .route(
+            "/v1/auth/users/{user_id}/delete",
+            post(users_h::delete_user),
+        )
+        .route(
+            "/v1/auth/users/{user_id}/resend-verify",
+            post(users_h::resend_verify),
+        )
+        .route(
+            "/v1/auth/users/{user_id}/password-reset",
+            post(users_h::admin_trigger_password_reset),
         )
         // Self-signup. Public, rate-limited. Only enabled when
         // MOKOSH_PUBLIC_SIGNUP_ENABLED=true at bootstrap; otherwise
