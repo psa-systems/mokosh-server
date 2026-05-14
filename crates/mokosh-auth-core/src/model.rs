@@ -1026,3 +1026,64 @@ impl AuditEvent {
         }
     }
 }
+
+// --- Feedback (audit doc 04) -------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeedbackStatus {
+    New,
+    Triaged,
+    Closed,
+}
+
+impl FeedbackStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Triaged => "triaged",
+            Self::Closed => "closed",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "new" => Self::New,
+            "triaged" => Self::Triaged,
+            "closed" => Self::Closed,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NewFeedback {
+    pub tenant_id: Option<TenantId>,
+    pub submitter_id: Option<UserId>,
+    pub submitter_name: Option<String>,
+    pub submitter_email: Option<String>,
+    pub subject: Option<String>,
+    pub message: String,
+    pub tags: Vec<String>,
+    pub page_path: Option<String>,
+    pub user_agent: Option<String>,
+    pub ip: Option<std::net::IpAddr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Feedback {
+    pub id: uuid::Uuid,
+    pub tenant_id: Option<TenantId>,
+    pub submitter_id: Option<UserId>,
+    pub submitter_name: Option<String>,
+    pub submitter_email: Option<String>,
+    pub subject: Option<String>,
+    pub message: String,
+    pub tags: Vec<String>,
+    pub page_path: Option<String>,
+    pub user_agent: Option<String>,
+    pub ip: Option<std::net::IpAddr>,
+    pub status: FeedbackStatus,
+    pub forgejo_issue_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+}

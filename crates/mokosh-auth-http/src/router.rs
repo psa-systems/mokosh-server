@@ -2,11 +2,11 @@
 //! application chooses (typically `/`).
 
 use axum::http::{header, Method};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use mokosh_auth_core::{
-    AuthError, InviteRepository, MembershipRepository, MfaChallengeRepository,
+    AuthError, FeedbackRepository, InviteRepository, MembershipRepository, MfaChallengeRepository,
     OrgInvitationRepository, PasswordResetTokenRepository, RecoveryCodeRepository,
     SignupTokenRepository, TenantId, TenantRepository, TotpRepository, TrustedDeviceRepository,
 };
@@ -19,10 +19,10 @@ use url::Url;
 use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
-    apps as apps_h, audit as audit_h, auth as auth_h, discovery as disc_h, invites as invites_h,
-    mfa as mfa_h, oidc as oidc_h, orgs as orgs_h, password_reset as pwd_reset_h,
-    profile as profile_h, sessions as sessions_h, signup as signup_h, tenants as tenants_h,
-    users as users_h,
+    apps as apps_h, audit as audit_h, auth as auth_h, discovery as disc_h, feedback as feedback_h,
+    invites as invites_h, mfa as mfa_h, oidc as oidc_h, orgs as orgs_h,
+    password_reset as pwd_reset_h, profile as profile_h, sessions as sessions_h,
+    signup as signup_h, tenants as tenants_h, users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -75,6 +75,9 @@ pub struct AuthHttpState {
     /// mint new users); these add an existing user as a member of an
     /// org tenant.
     pub org_invitations: Arc<dyn OrgInvitationRepository>,
+    /// In-app feedback inbox. Submit anonymous via /v1/feedback, triage
+    /// via /v1/admin/feedback. See docs/mokosh-fixes/04-feedback-inbox.md.
+    pub feedback: Arc<dyn FeedbackRepository>,
     /// Self-signup tokens. Issued by /v1/auth/signup, consumed by
     /// /v1/auth/signup/by-token/{token}/complete. Phase 2 of doc 10.
     pub signup_tokens: Arc<dyn SignupTokenRepository>,
@@ -320,6 +323,10 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         )
         .route("/v1/invitations/lookup", get(orgs_h::lookup_invitation))
         .route("/v1/invitations/accept", post(orgs_h::accept_invitation))
+        // Feedback inbox (doc 04).
+        .route("/v1/feedback", post(feedback_h::submit))
+        .route("/v1/admin/feedback", get(feedback_h::list_admin))
+        .route("/v1/admin/feedback/{id}", patch(feedback_h::update_status))
         .layer(cors)
         .with_state(state)
 }

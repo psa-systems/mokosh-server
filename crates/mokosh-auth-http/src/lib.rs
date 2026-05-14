@@ -18,6 +18,7 @@ pub mod handlers {
     pub mod audit;
     pub mod auth;
     pub mod discovery;
+    pub mod feedback;
     pub mod invites;
     pub mod mfa;
     pub mod oidc;

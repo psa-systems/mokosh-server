@@ -708,3 +708,36 @@ pub trait MfaChallengeRepository: Send + Sync {
         expected_purpose: MfaChallengePurpose,
     ) -> Result<MfaChallenge, AuthError>;
 }
+
+// ---------------------------------------------------------------------------
+// Feedback inbox (audit doc 04)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait FeedbackRepository: Send + Sync {
+    async fn submit(&self, new: NewFeedback) -> Result<Feedback, AuthError>;
+
+    /// Filtered listing. Today: optional `status` + `tenant_id`. The
+    /// `tenant_id` filter is `None` (anonymous-only / cross-tenant
+    /// global view for platform admins) or `Some(t)` (rows for that
+    /// tenant PLUS anonymous-with-null-tenant rows, so the admin can
+    /// see un-tagged feedback alongside their own).
+    async fn list_filtered(
+        &self,
+        tenant_id: Option<TenantId>,
+        status: Option<FeedbackStatus>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Feedback>, u64), AuthError>;
+
+    async fn find_by_id(&self, id: uuid::Uuid) -> Result<Option<Feedback>, AuthError>;
+
+    /// Update lifecycle status. Sets `closed_at` + `closed_by` when
+    /// transitioning to `Closed`; clears them on reopen.
+    async fn set_status(
+        &self,
+        id: uuid::Uuid,
+        status: FeedbackStatus,
+        actor: UserId,
+    ) -> Result<(), AuthError>;
+}
