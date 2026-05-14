@@ -269,6 +269,7 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // MFA enrollment (Bearer-authed; user enrolls themselves).
         // Admin audit log reader.
         .route("/v1/auth/audit-logs", axum::routing::get(audit_h::list))
+        .route("/v1/auth/audit/launched-app", post(audit_h::launched_app))
         // App launcher: list OAuth clients the signed-in user can launch.
         .route("/v1/auth/apps", get(apps_h::list_apps))
         // Self-service profile.

@@ -83,3 +83,56 @@ pub async fn list(
         offset,
     }))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct LaunchedAppBody {
+    pub client_id: String,
+}
+
+/// `POST /v1/auth/audit/launched-app`
+///
+/// Records the user's click on a launcher tile so the audit log
+/// reflects the cross-app hand-off. Doc 07 nice-to-have #9. Best-effort
+/// from the SPA's side: the call fires just before the browser
+/// navigates to the target app's origin; the row may not land if the
+/// network drops mid-flight, but the loss is bounded to one click.
+pub async fn launched_app(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(caller): BearerUser,
+    Json(body): Json<LaunchedAppBody>,
+) -> Result<axum::http::StatusCode, HttpError> {
+    use mokosh_auth_core::{AuditEvent, ClientId};
+
+    let client_id = body.client_id.trim().to_string();
+    if client_id.is_empty() {
+        return Err(HttpError(AuthError::InvalidRequest(
+            "client_id required".into(),
+        )));
+    }
+    let client_uuid = Uuid::parse_str(&client_id)
+        .map_err(|_| HttpError(AuthError::InvalidRequest("client_id must be a uuid".into())))?;
+    let client_label = st
+        .provider
+        .clients
+        .find_by_client_id(ClientId(client_uuid))
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.name)
+        .unwrap_or_else(|| client_id.clone());
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(caller.tenant_id),
+            Some(caller.id),
+            None,
+            AuditEvent::AdminAction {
+                admin_id: caller.id,
+                action: format!("app.launched:{client_label}"),
+                target: client_id,
+            },
+        )
+        .await;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
