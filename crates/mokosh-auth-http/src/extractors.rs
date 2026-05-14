@@ -206,7 +206,7 @@ where
             .sub
             .parse::<uuid::Uuid>()
             .map_err(|_| HttpError(AuthError::AccessDenied("malformed sub".into())))?;
-        let user = st
+        let mut user = st
             .provider
             .users
             .find_by_id(UserId(user_id))
@@ -216,6 +216,44 @@ where
         if !matches!(user.status, UserStatus::Active) {
             return Err(HttpError(AuthError::Forbidden("user not active".into())));
         }
+
+        // Resolve role through the active tenant's membership rather
+        // than the user's home-tenant default. The JWT carries
+        // `mokosh_active_tenant`; we look up `memberships.role` for
+        // that (user, tenant) pair and use it as the effective role
+        // for this request. Without this, a user whose home-tenant
+        // role is Admin keeps Admin everywhere they switch into,
+        // bypassing the per-tenant role taxonomy.
+        //
+        // `users.role` is left in place on the User struct as the
+        // home-tenant default for cases where no active_tenant claim
+        // is present (legacy tokens) or no membership exists (e.g.
+        // tenant was just deleted under us; the user gets a 403).
+        if let Some(active) = data
+            .claims
+            .mokosh_active_tenant
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .map(mokosh_auth_core::TenantId)
+        {
+            let m = st
+                .memberships
+                .find(user.id, active)
+                .await
+                .map_err(HttpError)?
+                .ok_or_else(|| {
+                    HttpError(AuthError::Forbidden(
+                        "no membership in active tenant".into(),
+                    ))
+                })?;
+            if !matches!(m.status, mokosh_auth_core::MembershipStatus::Active) {
+                return Err(HttpError(AuthError::Forbidden(
+                    "membership in active tenant is suspended".into(),
+                )));
+            }
+            user.role = m.role;
+            user.tenant_id = m.tenant_id;
+        }
         Ok(BearerUser(user))
     }
 }
@@ -223,4 +261,6 @@ where
 #[derive(Debug, Deserialize)]
 struct BearerClaims {
     sub: String,
+    #[serde(default)]
+    mokosh_active_tenant: Option<String>,
 }
