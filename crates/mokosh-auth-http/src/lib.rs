@@ -21,6 +21,7 @@ pub mod handlers {
     pub mod invites;
     pub mod mfa;
     pub mod oidc;
+    pub mod orgs;
     pub mod password_reset;
     pub mod profile;
     pub mod sessions;

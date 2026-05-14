@@ -2,7 +2,7 @@
 //! application chooses (typically `/`).
 
 use axum::http::{header, Method};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use mokosh_auth_core::{
@@ -20,8 +20,9 @@ use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
     apps as apps_h, audit as audit_h, auth as auth_h, discovery as disc_h, invites as invites_h,
-    mfa as mfa_h, oidc as oidc_h, password_reset as pwd_reset_h, profile as profile_h,
-    sessions as sessions_h, signup as signup_h, tenants as tenants_h, users as users_h,
+    mfa as mfa_h, oidc as oidc_h, orgs as orgs_h, password_reset as pwd_reset_h,
+    profile as profile_h, sessions as sessions_h, signup as signup_h, tenants as tenants_h,
+    users as users_h,
 };
 use crate::local_auth::LocalAuth;
 use crate::rate_limit::RateLimiter;
@@ -293,6 +294,32 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
             "/v1/auth/active-tenant",
             post(tenants_h::switch_active_tenant),
         )
+        // Org-management surface (doc 03).
+        .route(
+            "/v1/orgs",
+            get(orgs_h::list_my_orgs).post(orgs_h::create_org),
+        )
+        .route("/v1/orgs/{slug}", get(orgs_h::get_org))
+        .route("/v1/orgs/{slug}/leave", post(orgs_h::leave_org))
+        .route("/v1/orgs/{slug}/members", get(orgs_h::list_members))
+        .route(
+            "/v1/orgs/{slug}/members/{user_id}",
+            delete(orgs_h::remove_member),
+        )
+        .route(
+            "/v1/orgs/{slug}/members/{user_id}/role",
+            post(orgs_h::change_member_role),
+        )
+        .route(
+            "/v1/orgs/{slug}/invitations",
+            get(orgs_h::list_invitations).post(orgs_h::create_invitation),
+        )
+        .route(
+            "/v1/orgs/{slug}/invitations/{invite_id}",
+            delete(orgs_h::revoke_invitation),
+        )
+        .route("/v1/invitations/lookup", get(orgs_h::lookup_invitation))
+        .route("/v1/invitations/accept", post(orgs_h::accept_invitation))
         .layer(cors)
         .with_state(state)
 }
