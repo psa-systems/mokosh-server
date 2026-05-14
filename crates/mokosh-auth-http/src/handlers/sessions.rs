@@ -75,6 +75,38 @@ pub async fn list_my_sessions(
     Ok(Json(SessionListResponse { sessions: views }))
 }
 
+/// `POST /v1/auth/sessions/revoke-others`
+///
+/// Revoke every active op_session for the caller EXCEPT the current
+/// one (identified by the `sid` claim on the calling Bearer token).
+/// Used by the "Sign out of all other sessions" affordance on
+/// `/settings/sessions`. Doc 06 polish item #2.
+pub async fn revoke_others(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(user): BearerUser,
+    BearerSessionId(current_sid): BearerSessionId,
+) -> Result<Response, HttpError> {
+    let now = st.provider.clock.now();
+    let actives = st
+        .provider
+        .sessions
+        .list_active_for_user(user.id, now)
+        .await
+        .map_err(HttpError)?;
+    for s in actives {
+        if Some(s.id) == current_sid {
+            continue;
+        }
+        let _ = st.provider.sessions.revoke(s.id, now).await;
+        let _ = st
+            .provider
+            .refresh
+            .revoke_families_for_session(s.id, "user_revoked_others", now)
+            .await;
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 pub async fn revoke_my_session(
     State(st): State<Arc<AuthHttpState>>,
     BearerUser(user): BearerUser,

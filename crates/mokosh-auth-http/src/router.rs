@@ -207,6 +207,10 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // friendly (no cookie required).
         .route("/v1/auth/sessions", get(sessions_h::list_my_sessions))
         .route(
+            "/v1/auth/sessions/revoke-others",
+            post(sessions_h::revoke_others),
+        )
+        .route(
             "/v1/auth/sessions/{session_id}/revoke",
             post(sessions_h::revoke_my_session),
         )
