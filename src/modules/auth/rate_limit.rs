@@ -27,9 +27,7 @@ pub type LoginLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, Defa
 /// Build the limiter; share the resulting `Arc` with the middleware via
 /// `axum::middleware::from_fn_with_state`.
 pub fn login_limiter() -> Arc<LoginLimiter> {
-    let quota = Quota::per_minute(
-        NonZeroU32::new(5).expect("5 is non-zero"),
-    );
+    let quota = Quota::per_minute(NonZeroU32::new(5).expect("5 is non-zero"));
     Arc::new(RateLimiter::keyed(quota))
 }
 

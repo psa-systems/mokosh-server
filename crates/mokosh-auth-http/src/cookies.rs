@@ -17,11 +17,7 @@ pub struct CookieConfig {
     pub secure: bool,
 }
 
-pub fn set_op_session_cookie<'a>(
-    cfg: &CookieConfig,
-    sid: String,
-    ttl: Duration,
-) -> Cookie<'a> {
+pub fn set_op_session_cookie<'a>(cfg: &CookieConfig, sid: String, ttl: Duration) -> Cookie<'a> {
     let mut c = Cookie::new(OP_SESSION_COOKIE, sid);
     c.set_http_only(true);
     c.set_secure(cfg.secure);

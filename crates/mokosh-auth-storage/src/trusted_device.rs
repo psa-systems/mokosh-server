@@ -110,10 +110,7 @@ impl TrustedDeviceRepository for PgTrustedDeviceRepository {
         row.map(TrustedDevice::try_from).transpose()
     }
 
-    async fn list_active_for_user(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<TrustedDevice>, AuthError> {
+    async fn list_active_for_user(&self, user_id: UserId) -> Result<Vec<TrustedDevice>, AuthError> {
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT id, user_id, tenant_id, token_hash, issued_at, expires_at,
                     last_used_at, revoked_at, user_agent, ip

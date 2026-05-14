@@ -120,14 +120,13 @@ impl InviteRepository for PgInviteRepository {
         invite_id: Uuid,
         tenant_id: TenantId,
     ) -> Result<Option<Invite>, AuthError> {
-        let row: Option<InviteRow> = sqlx::query_as(&format!(
-            "{SELECT_INVITE} WHERE id = $1 AND tenant_id = $2"
-        ))
-        .bind(invite_id)
-        .bind(tenant_id.0)
-        .fetch_optional(self.pool.pg())
-        .await
-        .map_err(db_err)?;
+        let row: Option<InviteRow> =
+            sqlx::query_as(&format!("{SELECT_INVITE} WHERE id = $1 AND tenant_id = $2"))
+                .bind(invite_id)
+                .bind(tenant_id.0)
+                .fetch_optional(self.pool.pg())
+                .await
+                .map_err(db_err)?;
         row.map(Invite::try_from).transpose()
     }
 
@@ -242,11 +241,7 @@ impl InviteRepository for PgInviteRepository {
         unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
     }
 
-    async fn accept_existing(
-        &self,
-        token: &str,
-        user_id: UserId,
-    ) -> Result<User, AuthError> {
+    async fn accept_existing(&self, token: &str, user_id: UserId) -> Result<User, AuthError> {
         const MAX_ATTEMPTS: u32 = 3;
         for attempt in 0..MAX_ATTEMPTS {
             match self.accept_existing_once(token, user_id).await {

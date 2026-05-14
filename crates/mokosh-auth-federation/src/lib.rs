@@ -48,7 +48,10 @@ pub trait UpstreamIdentityProvider: Send + Sync {
     fn id(&self) -> &str;
     fn kind(&self) -> ProviderKind;
     async fn begin_login(&self, ctx: BeginLoginCtx) -> Result<RedirectTarget, FederationError>;
-    async fn complete_login(&self, ctx: CompleteLoginCtx) -> Result<UpstreamAssertion, FederationError>;
+    async fn complete_login(
+        &self,
+        ctx: CompleteLoginCtx,
+    ) -> Result<UpstreamAssertion, FederationError>;
 }
 
 /// Phase-1: empty registry. Phase-2 will populate this from

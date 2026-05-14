@@ -48,7 +48,9 @@ pub async fn list(
     Query(params): Query<ListParams>,
 ) -> Result<Json<ListResponse>, HttpError> {
     if !matches!(admin.role, mokosh_auth_core::UserRole::Admin) {
-        return Err(HttpError(AuthError::Forbidden("admin role required".into())));
+        return Err(HttpError(AuthError::Forbidden(
+            "admin role required".into(),
+        )));
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let offset = params.offset.unwrap_or(0).max(0);

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use mokosh_auth_core::{
-    AuthCodeRepository, AuditLogger, Clock, EntitlementRepository, OAuthClientRepository,
+    AuditLogger, AuthCodeRepository, Clock, EntitlementRepository, OAuthClientRepository,
     OpSessionRepository, RefreshTokenRepository, UserRepository,
 };
 use mokosh_auth_crypto::OidcKeySet;

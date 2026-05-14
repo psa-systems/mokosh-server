@@ -36,7 +36,10 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         .route("/companies/{company_id}", get(get_company))
         .route("/companies/{company_id}", put(update_company))
         .route("/companies/{company_id}", delete(delete_company))
-        .route("/companies/{company_id}/contacts", get(get_company_contacts))
+        .route(
+            "/companies/{company_id}/contacts",
+            get(get_company_contacts),
+        )
         .route("/companies/{company_id}/sites", get(get_company_sites))
         // Contacts
         .route("/contacts", get(list_contacts))

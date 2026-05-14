@@ -80,8 +80,8 @@ impl OidcKeySet {
 
         // Sanity check the private key parses with ed25519-dalek too;
         // this catches malformed PEMs early with a clearer error.
-        let priv_pem_str =
-            std::str::from_utf8(&priv_pem).map_err(|_| KeyError::InvalidPrivatePem("not utf-8".into()))?;
+        let priv_pem_str = std::str::from_utf8(&priv_pem)
+            .map_err(|_| KeyError::InvalidPrivatePem("not utf-8".into()))?;
         SigningKey::from_pkcs8_pem(priv_pem_str)
             .map_err(|e| KeyError::InvalidPrivatePem(e.to_string()))?;
 
@@ -103,16 +103,18 @@ impl OidcKeySet {
                 None => continue,
             };
             let pem_bytes = std::fs::read(&path)?;
-            let pem_str = std::str::from_utf8(&pem_bytes).map_err(|_| KeyError::InvalidPublicPem {
-                path: path.clone(),
-                msg: "not utf-8".into(),
-            })?;
+            let pem_str =
+                std::str::from_utf8(&pem_bytes).map_err(|_| KeyError::InvalidPublicPem {
+                    path: path.clone(),
+                    msg: "not utf-8".into(),
+                })?;
 
             // jsonwebtoken DecodingKey for verification.
-            let dk = DecodingKey::from_ed_pem(&pem_bytes).map_err(|e| KeyError::InvalidPublicPem {
-                path: path.clone(),
-                msg: e.to_string(),
-            })?;
+            let dk =
+                DecodingKey::from_ed_pem(&pem_bytes).map_err(|e| KeyError::InvalidPublicPem {
+                    path: path.clone(),
+                    msg: e.to_string(),
+                })?;
 
             // ed25519-dalek VerifyingKey to extract raw 32-byte `x` for JWKS.
             let vk = VerifyingKey::from_public_key_pem(pem_str).map_err(|e| {
@@ -145,9 +147,7 @@ impl OidcKeySet {
         // Sort for stable JWKS output (helps caching at relying parties).
         jwks_entries.sort_by(|a, b| a.kid.cmp(&b.kid));
 
-        let jwks = Jwks {
-            keys: jwks_entries,
-        };
+        let jwks = Jwks { keys: jwks_entries };
         let jwks_cache = serde_json::to_value(&jwks).expect("jwks serializable");
 
         Ok(Self {

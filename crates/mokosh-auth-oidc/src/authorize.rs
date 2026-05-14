@@ -15,9 +15,7 @@
 //! attacker who controls a malicious redirect_uri can harvest authorize
 //! errors. See OAuth 2.0 Security BCP section 4.1.
 
-use mokosh_auth_core::{
-    policy, AuthError, ClientId, NewAuthCode, OAuthClient, OpSession,
-};
+use mokosh_auth_core::{policy, AuthError, ClientId, NewAuthCode, OAuthClient, OpSession};
 use mokosh_auth_crypto::{generate_opaque_token, hash_opaque_token};
 use std::collections::BTreeSet;
 use url::Url;
@@ -65,21 +63,35 @@ pub async fn handle_authorize(
     //    redirect (where would we send it?).
     let client_id = match req.client_id.parse::<uuid::Uuid>() {
         Ok(u) => ClientId(u),
-        Err(_) => return AuthorizeOutcome::ErrorPage { error: AuthError::InvalidClient },
+        Err(_) => {
+            return AuthorizeOutcome::ErrorPage {
+                error: AuthError::InvalidClient,
+            }
+        }
     };
     let client = match p.clients.find_by_client_id(client_id).await {
         Ok(Some(c)) if c.is_enabled() => c,
-        Ok(_) => return AuthorizeOutcome::ErrorPage { error: AuthError::InvalidClient },
+        Ok(_) => {
+            return AuthorizeOutcome::ErrorPage {
+                error: AuthError::InvalidClient,
+            }
+        }
         Err(e) => return AuthorizeOutcome::ErrorPage { error: e },
     };
 
     // 2. Validate redirect_uri BEFORE any other reflected error.
     let redirect_uri = match Url::parse(&req.redirect_uri) {
         Ok(u) => u,
-        Err(_) => return AuthorizeOutcome::ErrorPage { error: AuthError::InvalidRedirect },
+        Err(_) => {
+            return AuthorizeOutcome::ErrorPage {
+                error: AuthError::InvalidRedirect,
+            }
+        }
     };
     if !policy::validate_redirect_uri(&redirect_uri, &client.redirect_uris) {
-        return AuthorizeOutcome::ErrorPage { error: AuthError::InvalidRedirect };
+        return AuthorizeOutcome::ErrorPage {
+            error: AuthError::InvalidRedirect,
+        };
     }
 
     // 3. From here on, errors can be redirected back as RFC 6749 / OIDC
@@ -100,7 +112,10 @@ pub async fn handle_authorize(
         if !requested.contains("openid") {
             return Err(AuthError::InvalidScope);
         }
-        let granted: BTreeSet<String> = requested.intersection(&client.allowed_scopes).cloned().collect();
+        let granted: BTreeSet<String> = requested
+            .intersection(&client.allowed_scopes)
+            .cloned()
+            .collect();
         if granted.len() != requested.len() {
             return Err(AuthError::InvalidScope);
         }

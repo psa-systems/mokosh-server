@@ -111,13 +111,12 @@ impl MfaChallengeRepository for PgMfaChallengeRepository {
         &self,
         token_hash: [u8; 32],
     ) -> Result<Option<MfaChallenge>, AuthError> {
-        let row: Option<ChallengeRow> = sqlx::query_as(&format!(
-            "{SELECT_CHALLENGE} WHERE token_hash = $1"
-        ))
-        .bind(&token_hash[..])
-        .fetch_optional(self.pool.pg())
-        .await
-        .map_err(db_err)?;
+        let row: Option<ChallengeRow> =
+            sqlx::query_as(&format!("{SELECT_CHALLENGE} WHERE token_hash = $1"))
+                .bind(&token_hash[..])
+                .fetch_optional(self.pool.pg())
+                .await
+                .map_err(db_err)?;
         row.map(MfaChallenge::try_from).transpose()
     }
 

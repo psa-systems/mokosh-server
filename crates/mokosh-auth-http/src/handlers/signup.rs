@@ -156,11 +156,7 @@ pub async fn start(
                 },
             )
             .await;
-        return Ok((
-            StatusCode::OK,
-            Json(StartResponse { status: "ok" }),
-        )
-            .into_response());
+        return Ok((StatusCode::OK, Json(StartResponse { status: "ok" })).into_response());
     }
 
     // Coalesce repeat requests for the same email if we already have
@@ -172,11 +168,7 @@ pub async fn start(
         .await?
         .is_some()
     {
-        return Ok((
-            StatusCode::OK,
-            Json(StartResponse { status: "ok" }),
-        )
-            .into_response());
+        return Ok((StatusCode::OK, Json(StartResponse { status: "ok" })).into_response());
     }
 
     let raw_token = mokosh_auth_crypto::generate_opaque_token();
@@ -208,11 +200,7 @@ pub async fn start(
         )
         .await;
 
-    Ok((
-        StatusCode::OK,
-        Json(StartResponse { status: "ok" }),
-    )
-        .into_response())
+    Ok((StatusCode::OK, Json(StartResponse { status: "ok" })).into_response())
 }
 
 /// `GET /v1/auth/signup/by-token/{token}`
@@ -228,11 +216,9 @@ pub async fn preview(
     let token_hash = mokosh_auth_crypto::hash_opaque_token(&token);
     let now = Utc::now();
     match st.signup_tokens.find_by_token_hash(token_hash).await? {
-        Some(t) if t.is_open(now) => Ok((
-            StatusCode::OK,
-            Json(SignupPreview { email: t.email }),
-        )
-            .into_response()),
+        Some(t) if t.is_open(now) => {
+            Ok((StatusCode::OK, Json(SignupPreview { email: t.email })).into_response())
+        }
         _ => {
             let _ = st
                 .provider

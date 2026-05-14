@@ -2,9 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use mokosh_auth_core::{
-    AuthError, OpSession, OpSessionId, OpSessionRepository, TenantId, UserId,
-};
+use mokosh_auth_core::{AuthError, OpSession, OpSessionId, OpSessionRepository, TenantId, UserId};
 
 use crate::conv::{db_err, ip_to_inet, OpSessionRow};
 use crate::pool::AuthPool;
@@ -129,13 +127,12 @@ impl OpSessionRepository for PgOpSessionRepository {
     }
 
     async fn find_by_id(&self, id: OpSessionId) -> Result<Option<OpSession>, AuthError> {
-        let row: Option<OpSessionRow> = sqlx::query_as(&format!(
-            "{SELECT_OP_SESSION} WHERE id = $1"
-        ))
-        .bind(id.0)
-        .fetch_optional(self.pool.pg())
-        .await
-        .map_err(db_err)?;
+        let row: Option<OpSessionRow> =
+            sqlx::query_as(&format!("{SELECT_OP_SESSION} WHERE id = $1"))
+                .bind(id.0)
+                .fetch_optional(self.pool.pg())
+                .await
+                .map_err(db_err)?;
         Ok(row.map(Into::into))
     }
 
@@ -197,41 +194,37 @@ impl OpSessionRepository for PgOpSessionRepository {
         // Two SQL shapes because COMPARING `user_agent = $2` with NULL
         // is always false; NULL UAs need IS NULL semantics.
         let n = match user_agent {
-            Some(ua) => {
-                sqlx::query(
-                    "UPDATE mokosh_auth.op_sessions
+            Some(ua) => sqlx::query(
+                "UPDATE mokosh_auth.op_sessions
                      SET revoked_at = $1
                      WHERE user_id = $2
                        AND user_agent = $3
                        AND id <> $4
                        AND revoked_at IS NULL",
-                )
-                .bind(at)
-                .bind(user_id.0)
-                .bind(ua)
-                .bind(keep_id.0)
-                .execute(self.pool.pg())
-                .await
-                .map_err(db_err)?
-                .rows_affected()
-            }
-            None => {
-                sqlx::query(
-                    "UPDATE mokosh_auth.op_sessions
+            )
+            .bind(at)
+            .bind(user_id.0)
+            .bind(ua)
+            .bind(keep_id.0)
+            .execute(self.pool.pg())
+            .await
+            .map_err(db_err)?
+            .rows_affected(),
+            None => sqlx::query(
+                "UPDATE mokosh_auth.op_sessions
                      SET revoked_at = $1
                      WHERE user_id = $2
                        AND user_agent IS NULL
                        AND id <> $3
                        AND revoked_at IS NULL",
-                )
-                .bind(at)
-                .bind(user_id.0)
-                .bind(keep_id.0)
-                .execute(self.pool.pg())
-                .await
-                .map_err(db_err)?
-                .rows_affected()
-            }
+            )
+            .bind(at)
+            .bind(user_id.0)
+            .bind(keep_id.0)
+            .execute(self.pool.pg())
+            .await
+            .map_err(db_err)?
+            .rows_affected(),
         };
         Ok(n)
     }
@@ -275,4 +268,3 @@ impl OpSessionRepository for PgOpSessionRepository {
         Ok(rows.into_iter().map(|(id,)| OpSessionId(id)).collect())
     }
 }
-

@@ -43,8 +43,7 @@ impl EncryptionKeySet {
         previous: Option<(u16, &[u8; 32])>,
     ) -> Self {
         let current = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(current_key));
-        let previous = previous
-            .map(|(v, k)| (v, Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(k))));
+        let previous = previous.map(|(v, k)| (v, Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(k))));
         Self {
             current_version,
             current,
@@ -119,6 +118,9 @@ mod tests {
         let set = EncryptionKeySet::new(1, &key, None);
         let mut blob = set.encrypt(b"x").unwrap();
         blob.version = 99;
-        assert!(matches!(set.decrypt(&blob), Err(AeadError::UnknownKeyVersion(99))));
+        assert!(matches!(
+            set.decrypt(&blob),
+            Err(AeadError::UnknownKeyVersion(99))
+        ));
     }
 }

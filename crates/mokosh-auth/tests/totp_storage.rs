@@ -11,8 +11,7 @@ use mokosh_auth_core::{
     RecoveryCodeRepository, TenantId, TotpRepository, UserId,
 };
 use mokosh_auth_storage::{
-    run_migrations, AuthPool, PgMfaChallengeRepository, PgRecoveryCodeRepository,
-    PgTotpRepository,
+    run_migrations, AuthPool, PgMfaChallengeRepository, PgRecoveryCodeRepository, PgTotpRepository,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -140,9 +139,7 @@ async fn start_enrollment_conflict_when_confirmed(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id)
-        .await
-        .unwrap();
+    repo.confirm(fx.user_id).await.unwrap();
     let err = repo
         .start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
@@ -161,7 +158,8 @@ async fn confirm_flips_mfa_enrolled_after_recovery_codes_seeded(pool: PgPool) {
         .await
         .unwrap();
     let hashes: Vec<[u8; 32]> = (0..10).map(|i| [i as u8; 32]).collect();
-    recov.replace_all(fx.user_id, fx.tenant_id, enrollment.id, &hashes)
+    recov
+        .replace_all(fx.user_id, fx.tenant_id, enrollment.id, &hashes)
         .await
         .unwrap();
     totp.confirm(fx.user_id).await.unwrap();
@@ -183,9 +181,7 @@ async fn confirm_twice_is_conflict(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id)
-        .await
-        .unwrap();
+    repo.confirm(fx.user_id).await.unwrap();
     let err = repo
         .confirm(fx.user_id)
         .await
@@ -223,9 +219,7 @@ async fn disenroll_is_idempotent_and_sets_banner(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id)
-        .await
-        .unwrap();
+    repo.confirm(fx.user_id).await.unwrap();
 
     repo.disenroll(fx.user_id).await.unwrap();
     repo.disenroll(fx.user_id).await.unwrap(); // idempotent
@@ -256,9 +250,7 @@ async fn confirm_clears_mfa_disenrolled_banner(pool: PgPool) {
     repo.start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    repo.confirm(fx.user_id)
-        .await
-        .unwrap();
+    repo.confirm(fx.user_id).await.unwrap();
 
     let banner: Option<chrono::DateTime<Utc>> =
         sqlx::query_scalar("SELECT mfa_disenrolled_at FROM mokosh_auth.users WHERE id = $1")
@@ -280,7 +272,8 @@ async fn recovery_code_consume_then_replay_is_not_found(pool: PgPool) {
         .start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    recov.replace_all(fx.user_id, fx.tenant_id, enrollment.id, &[code_hash])
+    recov
+        .replace_all(fx.user_id, fx.tenant_id, enrollment.id, &[code_hash])
         .await
         .unwrap();
     totp.confirm(fx.user_id).await.unwrap();
@@ -304,7 +297,8 @@ async fn recovery_replace_all_wipes_old(pool: PgPool) {
         .start_enrollment(fx.user_id, fx.tenant_id, fake_encrypted_blob(), 1)
         .await
         .unwrap();
-    recov.replace_all(fx.user_id, fx.tenant_id, enrollment.id, &old)
+    recov
+        .replace_all(fx.user_id, fx.tenant_id, enrollment.id, &old)
         .await
         .unwrap();
     totp.confirm(fx.user_id).await.unwrap();
@@ -317,7 +311,10 @@ async fn recovery_replace_all_wipes_old(pool: PgPool) {
         .unwrap();
     assert_eq!(recov.count_unused(fx.user_id).await.unwrap(), 10);
 
-    let err = recov.consume_unused(fx.user_id, old[0]).await.expect_err("old must be gone");
+    let err = recov
+        .consume_unused(fx.user_id, old[0])
+        .await
+        .expect_err("old must be gone");
     assert!(matches!(err, AuthError::NotFound));
     recov.consume_unused(fx.user_id, new[0]).await.unwrap();
 }

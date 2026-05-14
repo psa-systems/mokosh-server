@@ -67,15 +67,11 @@ impl LocalAuth {
         // exist or the tenant is ambiguous, to avoid a username-
         // enumeration timing oracle. We use a fixed dummy hash known to
         // never match.
-        const DUMMY_HASH: &str =
-            "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXkxMjM0NTY3OA$\
+        const DUMMY_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXkxMjM0NTY3OA$\
              SGEgaGEgdGhpcyBpcyBub3QgcmVhbCBoYXNoIGxlbmd0aA";
 
         let user = match req.tenant_id {
-            Some(tid) => self
-                .users
-                .find_by_email(TenantId(tid), &req.email)
-                .await?,
+            Some(tid) => self.users.find_by_email(TenantId(tid), &req.email).await?,
             None => {
                 // Email-only flow: resolve tenant from the user record.
                 // 0 matches: invalid (do not reveal whether the email exists).
@@ -228,7 +224,10 @@ impl LocalAuth {
 
         let _ = self
             .users
-            .update_last_login(user.id, mokosh_auth_core::time::SystemClock.now_or_default())
+            .update_last_login(
+                user.id,
+                mokosh_auth_core::time::SystemClock.now_or_default(),
+            )
             .await;
         let _ = self
             .audit
@@ -259,8 +258,7 @@ impl LocalAuth {
         ip: Option<std::net::IpAddr>,
         _user_agent: Option<&str>,
     ) -> Result<LocalVerifyOk, AuthError> {
-        const DUMMY_HASH: &str =
-            "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXkxMjM0NTY3OA$\
+        const DUMMY_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXkxMjM0NTY3OA$\
              SGEgaGEgdGhpcyBpcyBub3QgcmVhbCBoYXNoIGxlbmd0aA";
 
         let user = match req.tenant_id {
@@ -390,7 +388,10 @@ impl LocalAuth {
         // and created_at. Cleanup-other-rows is no longer needed here.
         let _ = self
             .users
-            .update_last_login(user.id, mokosh_auth_core::time::SystemClock.now_or_default())
+            .update_last_login(
+                user.id,
+                mokosh_auth_core::time::SystemClock.now_or_default(),
+            )
             .await;
         let _ = self
             .audit

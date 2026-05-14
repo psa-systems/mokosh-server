@@ -36,8 +36,9 @@ impl AppConfig {
             .collect();
 
         Ok(Self {
-            database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/mokosh".to_string()),
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
+            }),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -118,8 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(auth) => {
             tracing::info!("SSO subsystem mounted (mokosh-auth)");
             let issuer = auth.provider.cfg.issuer.as_str().to_string();
-            let verifier =
-                mokosh_server::modules::auth::at_jwt::AtJwtVerifier::new(auth.provider.keys.clone(), issuer);
+            let verifier = mokosh_server::modules::auth::at_jwt::AtJwtVerifier::new(
+                auth.provider.keys.clone(),
+                issuer,
+            );
             (Some(auth.router()), Some(verifier))
         }
         Err(e) => {

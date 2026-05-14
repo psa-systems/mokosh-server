@@ -2,9 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mokosh_auth_core::{
-    AuthError, TenantId, TotpEnrollment, TotpRepository, UserId,
-};
+use mokosh_auth_core::{AuthError, TenantId, TotpEnrollment, TotpRepository, UserId};
 use uuid::Uuid;
 
 use crate::conv::db_err;
@@ -77,13 +75,12 @@ impl TotpRepository for PgTotpRepository {
         // a small tx: SELECT FOR UPDATE, branch on confirmed_at.
         let mut tx = self.pool.pg().begin().await.map_err(db_err)?;
 
-        let row: Option<TotpRow> = sqlx::query_as(&format!(
-            "{SELECT_TOTP} WHERE user_id = $1 FOR UPDATE"
-        ))
-        .bind(user_id.0)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        let row: Option<TotpRow> =
+            sqlx::query_as(&format!("{SELECT_TOTP} WHERE user_id = $1 FOR UPDATE"))
+                .bind(user_id.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
 
         if let Some(existing) = row {
             if existing.confirmed_at.is_some() {
@@ -132,17 +129,12 @@ impl TotpRepository for PgTotpRepository {
         TotpEnrollment::try_from(inserted)
     }
 
-    async fn find_for_user(
-        &self,
-        user_id: UserId,
-    ) -> Result<Option<TotpEnrollment>, AuthError> {
-        let row: Option<TotpRow> = sqlx::query_as(&format!(
-            "{SELECT_TOTP} WHERE user_id = $1"
-        ))
-        .bind(user_id.0)
-        .fetch_optional(self.pool.pg())
-        .await
-        .map_err(db_err)?;
+    async fn find_for_user(&self, user_id: UserId) -> Result<Option<TotpEnrollment>, AuthError> {
+        let row: Option<TotpRow> = sqlx::query_as(&format!("{SELECT_TOTP} WHERE user_id = $1"))
+            .bind(user_id.0)
+            .fetch_optional(self.pool.pg())
+            .await
+            .map_err(db_err)?;
         row.map(TotpEnrollment::try_from).transpose()
     }
 

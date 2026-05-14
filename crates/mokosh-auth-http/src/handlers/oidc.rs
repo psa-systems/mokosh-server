@@ -5,13 +5,13 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
-use std::net::SocketAddr;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mokosh_auth_oidc::{
     handle_authorize, handle_logout, handle_token, handle_userinfo, AuthorizeOutcome,
     AuthorizeRequest, LogoutOutcome, LogoutRequest, TokenRequest,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::cookies::OP_SESSION_COOKIE;
@@ -145,10 +145,14 @@ pub async fn token(
                     if let Ok(text) = std::str::from_utf8(&decoded) {
                         if let Some((id, secret)) = text.split_once(':') {
                             creds.client_id = Some(
-                                urlencoding::decode(id).map(|c| c.into_owned()).unwrap_or(id.to_string()),
+                                urlencoding::decode(id)
+                                    .map(|c| c.into_owned())
+                                    .unwrap_or(id.to_string()),
                             );
                             creds.client_secret = Some(
-                                urlencoding::decode(secret).map(|c| c.into_owned()).unwrap_or(secret.to_string()),
+                                urlencoding::decode(secret)
+                                    .map(|c| c.into_owned())
+                                    .unwrap_or(secret.to_string()),
                             );
                             creds.from_basic_header = true;
                         }
@@ -199,7 +203,11 @@ pub async fn userinfo(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or_else(|| HttpError(mokosh_auth_core::AuthError::AccessDenied("missing bearer".into())))?;
+        .ok_or_else(|| {
+            HttpError(mokosh_auth_core::AuthError::AccessDenied(
+                "missing bearer".into(),
+            ))
+        })?;
     let resp = handle_userinfo(&st.provider, bearer).await?;
     Ok(Json(resp).into_response())
 }
@@ -225,10 +233,7 @@ pub struct RevokeForm {
 /// `token_type_hint` is advisory per RFC 7009 5.1.1.1; we ignore it for
 /// now (refresh tokens are the only kind we can revoke server-side).
 /// Access tokens are stateless `at+jwt` and expire on their own.
-pub async fn revoke(
-    State(st): State<Arc<AuthHttpState>>,
-    Form(f): Form<RevokeForm>,
-) -> StatusCode {
+pub async fn revoke(State(st): State<Arc<AuthHttpState>>, Form(f): Form<RevokeForm>) -> StatusCode {
     if let Some(token) = f.token.as_deref().filter(|s| !s.is_empty()) {
         let hash = mokosh_auth_crypto::hash_opaque_token(token);
         let now = st.provider.clock.now();
@@ -286,15 +291,13 @@ pub async fn logout(
     let cleared = jar.remove(crate::cookies::clear_op_session_cookie(&st.cookie_cfg));
 
     match outcome {
-        LogoutOutcome::LoggedOut { redirect_to: Some(to) } => {
-            (cleared, Redirect::to(to.as_str())).into_response()
-        }
+        LogoutOutcome::LoggedOut {
+            redirect_to: Some(to),
+        } => (cleared, Redirect::to(to.as_str())).into_response(),
         LogoutOutcome::LoggedOut { redirect_to: None } => {
             (cleared, StatusCode::NO_CONTENT).into_response()
         }
-        LogoutOutcome::NeedsConfirmation => {
-            (cleared, StatusCode::NO_CONTENT).into_response()
-        }
+        LogoutOutcome::NeedsConfirmation => (cleared, StatusCode::NO_CONTENT).into_response(),
         LogoutOutcome::Error(err) => HttpError(err).into_response(),
     }
 }

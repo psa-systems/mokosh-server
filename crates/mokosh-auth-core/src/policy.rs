@@ -44,20 +44,16 @@ fn is_loopback_root(u: &Url) -> bool {
 }
 
 fn same_loopback(presented: &Url, registered: &Url) -> bool {
-    presented.scheme() == "http"
-        && presented.host_str() == registered.host_str()
-        // Loopback exception ignores port and path (per RFC 8252 native-app
-        // redirect URIs typically vary by port and may carry a callback path).
+    presented.scheme() == "http" && presented.host_str() == registered.host_str()
+    // Loopback exception ignores port and path (per RFC 8252 native-app
+    // redirect URIs typically vary by port and may carry a callback path).
 }
 
 /// Narrow a requested scope set to those granted by the client.
 ///
 /// Returns the intersection. The caller is responsible for emitting
 /// `invalid_scope` if narrowing dropped any requested scope.
-pub fn narrow_scopes(
-    requested: &BTreeSet<String>,
-    allowed: &BTreeSet<String>,
-) -> BTreeSet<String> {
+pub fn narrow_scopes(requested: &BTreeSet<String>, allowed: &BTreeSet<String>) -> BTreeSet<String> {
     requested.intersection(allowed).cloned().collect()
 }
 

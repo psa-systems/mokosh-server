@@ -2,9 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mokosh_auth_core::{
-    AuthError, NewSignupToken, SignupToken, SignupTokenRepository, UserId,
-};
+use mokosh_auth_core::{AuthError, NewSignupToken, SignupToken, SignupTokenRepository, UserId};
 use uuid::Uuid;
 
 use crate::conv::db_err;
@@ -89,13 +87,12 @@ impl SignupTokenRepository for PgSignupTokenRepository {
         &self,
         token_hash: [u8; 32],
     ) -> Result<Option<SignupToken>, AuthError> {
-        let row: Option<SignupRow> = sqlx::query_as(&format!(
-            "{SELECT_SIGNUP} WHERE token_hash = $1"
-        ))
-        .bind(&token_hash[..])
-        .fetch_optional(self.pool.pg())
-        .await
-        .map_err(db_err)?;
+        let row: Option<SignupRow> =
+            sqlx::query_as(&format!("{SELECT_SIGNUP} WHERE token_hash = $1"))
+                .bind(&token_hash[..])
+                .fetch_optional(self.pool.pg())
+                .await
+                .map_err(db_err)?;
         row.map(SignupToken::try_from).transpose()
     }
 

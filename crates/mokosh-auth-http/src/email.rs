@@ -34,8 +34,7 @@ pub trait Mailer: Send + Sync {
     /// whether the recipient address has an account or not. The
     /// handler decides whether to actually call this; the mailer is
     /// just the transport.
-    async fn send_password_reset(&self, email: &str, raw_token: &str)
-        -> Result<(), AuthError>;
+    async fn send_password_reset(&self, email: &str, raw_token: &str) -> Result<(), AuthError>;
 
     /// Generic free-form security alert. Used today by the MFA disable
     /// paths (self and admin-force); intended to grow as additional
@@ -95,11 +94,7 @@ impl Mailer for LogMailer {
         Ok(())
     }
 
-    async fn send_password_reset(
-        &self,
-        email: &str,
-        raw_token: &str,
-    ) -> Result<(), AuthError> {
+    async fn send_password_reset(&self, email: &str, raw_token: &str) -> Result<(), AuthError> {
         let link = format!(
             "{}/reset-password/{}",
             self.accept_base_url.trim_end_matches('/'),
@@ -323,11 +318,7 @@ impl Mailer for LettreMailer {
         self.send_multipart(to, &subject, text, html).await
     }
 
-    async fn send_password_reset(
-        &self,
-        email: &str,
-        raw_token: &str,
-    ) -> Result<(), AuthError> {
+    async fn send_password_reset(&self, email: &str, raw_token: &str) -> Result<(), AuthError> {
         let link = self.build_link("reset-password", raw_token);
         let to = parse_recipient(email)?;
         let (subject, text, html) = templates::password_reset_email(email, &link);
@@ -374,9 +365,7 @@ pub mod templates {
     }
 
     /// Invite email. Returns `(subject, text, html)`.
-    pub fn invite_email(invite: &Invite, inviter: &User, link: &str)
-        -> (String, String, String)
-    {
+    pub fn invite_email(invite: &Invite, inviter: &User, link: &str) -> (String, String, String) {
         let inviter_name = display_name(inviter);
         let role = role_label(invite.role);
         // We don't have the tenant name in scope here (the auth crate

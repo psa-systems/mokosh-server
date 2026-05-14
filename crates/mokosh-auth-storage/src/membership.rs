@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{
-    AuthError, Membership, MembershipRepository, MembershipStatus, NewMembership, TenantId,
-    UserId, UserRole,
+    AuthError, Membership, MembershipRepository, MembershipStatus, NewMembership, TenantId, UserId,
+    UserRole,
 };
 
 use crate::conv::db_err;

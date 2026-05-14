@@ -9,9 +9,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{Duration, Utc};
-use mokosh_auth_core::{
-    AuditEvent, AuditLogger, AuthError, Invite, NewInvite, UserRole,
-};
+use mokosh_auth_core::{AuditEvent, AuditLogger, AuthError, Invite, NewInvite, UserRole};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -592,8 +590,16 @@ pub async fn accept_by_token(
             .map_err(|e| HttpError(AuthError::Internal(format!("argon2 join: {e}"))))?
             .map_err(|e| HttpError(AuthError::Crypto(format!("argon2: {e}"))))?;
 
-        let first_name = body.first_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let last_name = body.last_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let first_name = body
+            .first_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let last_name = body
+            .last_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         match st
             .invites

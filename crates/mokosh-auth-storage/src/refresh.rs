@@ -93,7 +93,9 @@ impl RefreshTokenRepository for PgRefreshTokenRepository {
                 .rotate_once(&presented_hash, &new_token, &scope_vec)
                 .await
             {
-                Err(AuthError::Storage(msg)) if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS => {
+                Err(AuthError::Storage(msg))
+                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
+                {
                     tracing::debug!(attempt, "refresh rotation serialization conflict, retrying");
                     continue;
                 }
@@ -279,10 +281,7 @@ impl PgRefreshTokenRepository {
 
         // 3. Expiry / revocation checks.
         let now = Utc::now();
-        if row.revoked_at.is_some()
-            || row.idle_expires_at < now
-            || row.absolute_expires_at < now
-        {
+        if row.revoked_at.is_some() || row.idle_expires_at < now || row.absolute_expires_at < now {
             return Err(AuthError::InvalidGrant("expired refresh token".into()));
         }
 

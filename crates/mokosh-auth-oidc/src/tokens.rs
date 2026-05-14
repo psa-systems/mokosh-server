@@ -21,8 +21,8 @@ use crate::config::EngineConfig;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AccessTokenClaims {
     pub iss: String,
-    pub sub: String,           // user UUID as string
-    pub aud: String,           // client.audience
+    pub sub: String, // user UUID as string
+    pub aud: String, // client.audience
     pub client_id: String,
     /// Mokosh-specific. Namespaced (`mokosh_tenant_id`) so it cannot be
     /// confused with anyone else's `tenant_id` claim. Historically the
@@ -41,7 +41,7 @@ pub struct AccessTokenClaims {
     /// (the refresh path doesn't carry session_id end-to-end yet).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mokosh_op_session_id: Option<String>,
-    pub scope: String,         // space-separated
+    pub scope: String, // space-separated
     pub jti: String,
     pub iat: i64,
     pub nbf: i64,
@@ -57,13 +57,13 @@ pub struct IdTokenClaims {
     pub iss: String,
     pub sub: String,
     pub aud: String,
-    pub azp: String,           // authorized party = client_id
+    pub azp: String, // authorized party = client_id
     pub exp: i64,
     pub iat: i64,
     pub auth_time: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
-    pub at_hash: String,       // base64url(left-half(SHA-256(access_token)))
+    pub at_hash: String, // base64url(left-half(SHA-256(access_token)))
     pub acr: String,
     pub amr: Vec<String>,
     pub mokosh_tenant_id: String,
@@ -233,4 +233,3 @@ fn compute_at_hash(access_token: &str) -> String {
     let digest = Sha256::digest(access_token.as_bytes());
     URL_SAFE_NO_PAD.encode(&digest[..16])
 }
-

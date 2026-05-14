@@ -140,13 +140,8 @@ pub enum ExchangeError {
 /// Type alias for the configured [`oauth2::basic::BasicClient`] after we
 /// set the auth, token, and redirect endpoints. Keeps the verbose
 /// typestate generics in one place.
-type ConfiguredOAuthClient = BasicClient<
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointSet,
->;
+type ConfiguredOAuthClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 /// The OAuth client. Holds the credentials and a reusable
 /// [`reqwest::Client`]. Cheap to clone via `Arc` if you need to share

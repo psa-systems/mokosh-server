@@ -19,11 +19,7 @@ impl PgRecoveryCodeRepository {
 
 #[async_trait]
 impl RecoveryCodeRepository for PgRecoveryCodeRepository {
-    async fn consume_unused(
-        &self,
-        user_id: UserId,
-        code_hash: [u8; 32],
-    ) -> Result<(), AuthError> {
+    async fn consume_unused(&self, user_id: UserId, code_hash: [u8; 32]) -> Result<(), AuthError> {
         const MAX_ATTEMPTS: u32 = 3;
         for attempt in 0..MAX_ATTEMPTS {
             match self.consume_unused_once(user_id, code_hash).await {

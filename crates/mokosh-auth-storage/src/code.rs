@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{
-    AuthCodeRepository, AuthError, AuthorizationCode, ClientId, NewAuthCode, OpSessionId,
-    TenantId, UserId,
+    AuthCodeRepository, AuthError, AuthorizationCode, ClientId, NewAuthCode, OpSessionId, TenantId,
+    UserId,
 };
 use uuid::Uuid;
 

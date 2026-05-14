@@ -286,12 +286,7 @@ pub async fn verify(
     // bound the retry budget.
     let now = Utc::now();
     let challenge = match st.mfa_challenges.find_by_token_hash(token_hash).await? {
-        Some(c)
-            if c.is_open(now)
-                && matches!(c.purpose, MfaChallengePurpose::Login) =>
-        {
-            c
-        }
+        Some(c) if c.is_open(now) && matches!(c.purpose, MfaChallengePurpose::Login) => c,
         _ => {
             let _ = st
                 .provider

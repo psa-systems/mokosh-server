@@ -110,11 +110,10 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, HttpError> {
     let ip = Some(addr.ip());
-    if let Err(rl) = st.rate_limiter.check_login(
-        crate::rate_limit::LoginScope::Json,
-        ip,
-        &req.email,
-    ) {
+    if let Err(rl) =
+        st.rate_limiter
+            .check_login(crate::rate_limit::LoginScope::Json, ip, &req.email)
+    {
         tracing::warn!(
             target: "mokosh_auth.rate_limit",
             ip = %addr.ip(),

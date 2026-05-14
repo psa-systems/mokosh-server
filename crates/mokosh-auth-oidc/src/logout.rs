@@ -52,7 +52,11 @@ pub async fn handle_logout(p: &OidcProvider, req: LogoutRequest) -> LogoutOutcom
 
     let header = match jsonwebtoken::decode_header(&hint) {
         Ok(h) => h,
-        Err(_) => return LogoutOutcome::Error(AuthError::InvalidRequest("malformed id_token_hint".into())),
+        Err(_) => {
+            return LogoutOutcome::Error(AuthError::InvalidRequest(
+                "malformed id_token_hint".into(),
+            ))
+        }
     };
     let kid = match header.kid {
         Some(k) => k,
@@ -73,7 +77,9 @@ pub async fn handle_logout(p: &OidcProvider, req: LogoutRequest) -> LogoutOutcom
 
     let claims = match jsonwebtoken::decode::<IdTokenSubsetClaims>(&hint, dk, &validation) {
         Ok(d) => d.claims,
-        Err(_) => return LogoutOutcome::Error(AuthError::InvalidRequest("invalid id_token_hint".into())),
+        Err(_) => {
+            return LogoutOutcome::Error(AuthError::InvalidRequest("invalid id_token_hint".into()))
+        }
     };
 
     // 2. Resolve client (from claims.aud or from `client_id` form field).
@@ -82,11 +88,7 @@ pub async fn handle_logout(p: &OidcProvider, req: LogoutRequest) -> LogoutOutcom
         serde_json::Value::Array(ref a) => a.first().and_then(|v| v.as_str()).map(str::to_string),
         _ => None,
     };
-    let client_id_str = req
-        .client_id
-        .clone()
-        .or(aud_str)
-        .unwrap_or_default();
+    let client_id_str = req.client_id.clone().or(aud_str).unwrap_or_default();
     let client_uuid = match client_id_str.parse::<uuid::Uuid>() {
         Ok(u) => u,
         Err(_) => return LogoutOutcome::Error(AuthError::InvalidClient),
@@ -99,7 +101,14 @@ pub async fn handle_logout(p: &OidcProvider, req: LogoutRequest) -> LogoutOutcom
     // 3. Validate post_logout_redirect_uri against the client's allow list.
     let redirect_to = match req.post_logout_redirect_uri.as_deref() {
         Some(s) => match Url::parse(s) {
-            Ok(u) if client.post_logout_redirect_uris.iter().any(|allowed| allowed == &u) => Some(u),
+            Ok(u)
+                if client
+                    .post_logout_redirect_uris
+                    .iter()
+                    .any(|allowed| allowed == &u) =>
+            {
+                Some(u)
+            }
             _ => return LogoutOutcome::Error(AuthError::InvalidRedirect),
         },
         None => None,

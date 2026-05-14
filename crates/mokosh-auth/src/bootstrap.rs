@@ -16,10 +16,9 @@
 
 use axum::Router;
 use chrono::Duration;
-use mokosh_auth_core::{Clock, time::SystemClock};
-use mokosh_auth_crypto::{EncryptionKeySet, OidcKeySet};
 use mokosh_auth_core::TenantId;
-use secrecy::ExposeSecret;
+use mokosh_auth_core::{time::SystemClock, Clock};
+use mokosh_auth_crypto::{EncryptionKeySet, OidcKeySet};
 use mokosh_auth_http::cookies::CookieConfig;
 use mokosh_auth_http::{
     build_router, AuthHttpState, LettreConfig, LettreMailer, LocalAuth, LogMailer, Mailer,
@@ -28,11 +27,12 @@ use mokosh_auth_http::{
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
     run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
-    PgInviteRepository, PgMembershipRepository, PgMfaChallengeRepository,
-    PgOAuthClientRepository, PgOpSessionRepository, PgPasswordResetTokenRepository,
-    PgRecoveryCodeRepository, PgRefreshTokenRepository, PgSignupTokenRepository, PgTotpRepository,
-    PgTrustedDeviceRepository, PgUserRepository,
+    PgInviteRepository, PgMembershipRepository, PgMfaChallengeRepository, PgOAuthClientRepository,
+    PgOpSessionRepository, PgPasswordResetTokenRepository, PgRecoveryCodeRepository,
+    PgRefreshTokenRepository, PgSignupTokenRepository, PgTotpRepository, PgTrustedDeviceRepository,
+    PgUserRepository,
 };
+use secrecy::ExposeSecret;
 use std::sync::Arc;
 use url::Url;
 
@@ -63,10 +63,7 @@ impl MokoshAuth {
 }
 
 /// Wire everything. Runs migrations as a side effect.
-pub async fn bootstrap(
-    cfg: AuthConfig,
-    pool: sqlx::PgPool,
-) -> Result<MokoshAuth, BootstrapError> {
+pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth, BootstrapError> {
     let auth_pool = AuthPool::from_pool(pool);
     run_migrations(&auth_pool)
         .await
@@ -150,10 +147,9 @@ pub async fn bootstrap(
     let dek_current_bytes = decode_hex_key(cfg.data_encryption_key.expose_secret())
         .map_err(|e| BootstrapError::Config(format!("MOKOSH_AUTH_DATA_ENCRYPTION_KEY: {e}")))?;
     let dek_prev_bytes = match cfg.data_encryption_key_prev.as_ref() {
-        Some(s) => Some(
-            decode_hex_key(s.expose_secret())
-                .map_err(|e| BootstrapError::Config(format!("MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV: {e}")))?,
-        ),
+        Some(s) => Some(decode_hex_key(s.expose_secret()).map_err(|e| {
+            BootstrapError::Config(format!("MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV: {e}"))
+        })?),
         None => None,
     };
     let dek = Arc::new(EncryptionKeySet::new(
@@ -186,10 +182,7 @@ pub async fn bootstrap(
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
             use sha2::{Digest, Sha256};
             let digest = Sha256::digest(email.as_bytes());
-            let slug = format!(
-                "personal-{}",
-                URL_SAFE_NO_PAD.encode(&digest[..9])
-            );
+            let slug = format!("personal-{}", URL_SAFE_NO_PAD.encode(&digest[..9]));
             let display = format!("{}'s account", email);
             let id: uuid::Uuid = sqlx::query_scalar(
                 "INSERT INTO public.tenants (name, slug, kind, status)
@@ -229,13 +222,7 @@ pub async fn bootstrap(
     let login_url = std::env::var("MOKOSH_AUTH_LOGIN_URL")
         .ok()
         .and_then(|s| Url::parse(&s).ok())
-        .or_else(|| {
-            Url::parse(&format!(
-                "{}/login",
-                accept_base_url.trim_end_matches('/')
-            ))
-            .ok()
-        })
+        .or_else(|| Url::parse(&format!("{}/login", accept_base_url.trim_end_matches('/'))).ok())
         .unwrap_or_else(|| {
             let mut u = cfg.issuer.clone();
             u.path_segments_mut()
@@ -274,8 +261,7 @@ pub async fn bootstrap(
                 "outbound email enabled (LettreMailer)"
             );
             Arc::new(
-                LettreMailer::new(lettre_cfg)
-                    .map_err(|e| BootstrapError::Config(e.to_string()))?,
+                LettreMailer::new(lettre_cfg).map_err(|e| BootstrapError::Config(e.to_string()))?,
             )
         }
         None => {
@@ -362,16 +348,13 @@ fn is_local_issuer(u: &Url) -> bool {
 fn decode_hex_key(s: &str) -> Result<[u8; 32], String> {
     let s = s.trim();
     if s.len() != 64 {
-        return Err(format!(
-            "expected 64 hex chars (32 bytes), got {}",
-            s.len()
-        ));
+        return Err(format!("expected 64 hex chars (32 bytes), got {}", s.len()));
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         let chunk = &s[i * 2..i * 2 + 2];
-        *byte = u8::from_str_radix(chunk, 16)
-            .map_err(|e| format!("invalid hex at byte {i}: {e}"))?;
+        *byte =
+            u8::from_str_radix(chunk, 16).map_err(|e| format!("invalid hex at byte {i}: {e}"))?;
     }
     Ok(out)
 }
@@ -412,7 +395,9 @@ fn resolve_mailer_config(accept_base_url: &str) -> Result<Option<LettreConfig>, 
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let password = std::env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty());
+    let password = std::env::var("SMTP_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
     if username.is_some() && password.is_none() {
         return Err(BootstrapError::Config(
             "SMTP_USERNAME set but SMTP_PASSWORD missing".into(),
@@ -502,17 +487,18 @@ mod tests {
     #[test]
     fn empty_smtp_host_returns_none() {
         // Whitespace-only counts as unset; the resolver trims.
-        let cfg =
-            with_smtp_env(&[("SMTP_HOST", "  ")], || resolve_mailer_config("https://x")).unwrap();
+        let cfg = with_smtp_env(&[("SMTP_HOST", "  ")], || {
+            resolve_mailer_config("https://x")
+        })
+        .unwrap();
         assert!(cfg.is_none());
     }
 
     #[test]
     fn smtp_host_without_from_is_hard_error() {
-        let res = with_smtp_env(
-            &[("SMTP_HOST", "mailpit"), ("SMTP_PORT", "1025")],
-            || resolve_mailer_config("https://x"),
-        );
+        let res = with_smtp_env(&[("SMTP_HOST", "mailpit"), ("SMTP_PORT", "1025")], || {
+            resolve_mailer_config("https://x")
+        });
         assert!(matches!(res, Err(BootstrapError::Config(_))));
     }
 

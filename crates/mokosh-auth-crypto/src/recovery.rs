@@ -54,8 +54,7 @@ mod tests {
         assert_eq!(c.chars().nth(5), Some('-'));
         let body = c.replace('-', "");
         assert!(
-            body.chars()
-                .all(|c| matches!(c, 'A'..='Z' | '2'..='7')),
+            body.chars().all(|c| matches!(c, 'A'..='Z' | '2'..='7')),
             "unexpected chars in {c}"
         );
     }

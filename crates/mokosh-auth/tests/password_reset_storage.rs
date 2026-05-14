@@ -235,7 +235,10 @@ async fn complete_twice_returns_not_found_on_second_call(pool: PgPool) {
     fx.repo.issue(new_token).await.expect("issue");
 
     let new_hash = mokosh_auth_crypto::hash_password("Brand-NewPass!42").expect("hash");
-    fx.repo.complete(hash, &new_hash).await.expect("first complete");
+    fx.repo
+        .complete(hash, &new_hash)
+        .await
+        .expect("first complete");
 
     let second_hash = mokosh_auth_crypto::hash_password("Yet-Another!42").expect("hash");
     let err = fx

@@ -99,7 +99,10 @@ pub async fn start(
         return Err(HttpError(AuthError::InvalidRequest("invalid email".into())));
     }
 
-    if let Err(rl) = st.rate_limiter.check_password_reset_start(addr.ip(), &email) {
+    if let Err(rl) = st
+        .rate_limiter
+        .check_password_reset_start(addr.ip(), &email)
+    {
         return Ok(rl.into_response());
     }
 
@@ -174,12 +177,14 @@ pub async fn preview(
 ) -> Result<Response, HttpError> {
     let token_hash = mokosh_auth_crypto::hash_opaque_token(&token);
     let now = Utc::now();
-    match st.password_reset_tokens.find_by_token_hash(token_hash).await? {
-        Some(t) if t.is_open(now) => Ok((
-            StatusCode::OK,
-            Json(ResetPreview { email: t.email }),
-        )
-            .into_response()),
+    match st
+        .password_reset_tokens
+        .find_by_token_hash(token_hash)
+        .await?
+    {
+        Some(t) if t.is_open(now) => {
+            Ok((StatusCode::OK, Json(ResetPreview { email: t.email })).into_response())
+        }
         _ => {
             let _ = st
                 .provider
@@ -217,7 +222,10 @@ pub async fn complete(
     // The SERIALIZABLE complete re-checks under lock; this is just
     // an optimization that surfaces the common bad-token case fast.
     let now = Utc::now();
-    let preview = st.password_reset_tokens.find_by_token_hash(token_hash).await?;
+    let preview = st
+        .password_reset_tokens
+        .find_by_token_hash(token_hash)
+        .await?;
     if !preview.as_ref().map(|t| t.is_open(now)).unwrap_or(false) {
         let _ = st
             .provider

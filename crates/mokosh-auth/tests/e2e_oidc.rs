@@ -263,7 +263,11 @@ async fn full_oidc_flow_including_refresh_reuse(pool: PgPool) {
         .append_pair("code_challenge_method", "S256");
 
     let r = client.get(authorize.clone()).send().await.unwrap();
-    assert_eq!(r.status(), 302, "anonymous authorize must redirect to login");
+    assert_eq!(
+        r.status(),
+        302,
+        "anonymous authorize must redirect to login"
+    );
     let login_loc = r.headers()["location"].to_str().unwrap();
     assert!(
         login_loc.contains("/login?return_to="),
@@ -333,8 +337,14 @@ async fn full_oidc_flow_including_refresh_reuse(pool: PgPool) {
         .unwrap();
     assert_eq!(token_resp.status(), 200, "code exchange must succeed");
     let body: serde_json::Value = token_resp.json().await.unwrap();
-    let access_token = body["access_token"].as_str().expect("access_token").to_string();
-    let refresh_token = body["refresh_token"].as_str().expect("refresh_token").to_string();
+    let access_token = body["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+    let refresh_token = body["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_string();
     let id_token = body["id_token"].as_str().expect("id_token").to_string();
     assert_eq!(body["token_type"].as_str().unwrap(), "Bearer");
     assert!(body["expires_in"].as_i64().unwrap() > 0);
@@ -431,12 +441,17 @@ async fn revoke_kills_refresh_family(pool: PgPool) {
         .append_pair("code_challenge_method", "S256");
 
     let r = client.get(authorize).send().await.unwrap();
-    let return_to = Url::parse(env.base.join(r.headers()["location"].to_str().unwrap()).unwrap().as_str())
-        .unwrap()
-        .query_pairs()
-        .find(|(k, _)| k == "return_to")
-        .map(|(_, v)| v.into_owned())
-        .unwrap();
+    let return_to = Url::parse(
+        env.base
+            .join(r.headers()["location"].to_str().unwrap())
+            .unwrap()
+            .as_str(),
+    )
+    .unwrap()
+    .query_pairs()
+    .find(|(k, _)| k == "return_to")
+    .map(|(_, v)| v.into_owned())
+    .unwrap();
     let r = client
         .post(env.base.join("login").unwrap())
         .form(&[
@@ -449,7 +464,11 @@ async fn revoke_kills_refresh_family(pool: PgPool) {
         .await
         .unwrap();
     let resume = r.headers()["location"].to_str().unwrap().to_string();
-    let r = client.get(env.base.join(&resume).unwrap()).send().await.unwrap();
+    let r = client
+        .get(env.base.join(&resume).unwrap())
+        .send()
+        .await
+        .unwrap();
     let cb = Url::parse(r.headers()["location"].to_str().unwrap()).unwrap();
     let code = cb
         .query_pairs()
@@ -504,9 +523,7 @@ async fn revoke_kills_refresh_family(pool: PgPool) {
     let revoke_unknown = client
         .post(env.base.join("oauth2/revoke").unwrap())
         .basic_auth(env.client_id.to_string(), Some(&env.client_secret))
-        .form(&[
-            ("token", &"definitely-not-a-real-refresh-token".to_string()),
-        ])
+        .form(&[("token", &"definitely-not-a-real-refresh-token".to_string())])
         .send()
         .await
         .unwrap();
@@ -559,12 +576,17 @@ async fn pkce_mismatch_rejected(pool: PgPool) {
         .append_pair("code_challenge_method", "S256");
 
     let r = client.get(authorize).send().await.unwrap();
-    let return_to = Url::parse(env.base.join(r.headers()["location"].to_str().unwrap()).unwrap().as_str())
-        .unwrap()
-        .query_pairs()
-        .find(|(k, _)| k == "return_to")
-        .map(|(_, v)| v.into_owned())
-        .unwrap();
+    let return_to = Url::parse(
+        env.base
+            .join(r.headers()["location"].to_str().unwrap())
+            .unwrap()
+            .as_str(),
+    )
+    .unwrap()
+    .query_pairs()
+    .find(|(k, _)| k == "return_to")
+    .map(|(_, v)| v.into_owned())
+    .unwrap();
 
     let r = client
         .post(env.base.join("login").unwrap())

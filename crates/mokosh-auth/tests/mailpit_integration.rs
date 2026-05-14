@@ -32,8 +32,7 @@ fn api_base() -> String {
 }
 
 fn mailpit_base() -> String {
-    std::env::var("MOKOSH_E2E_MAILPIT_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8025".into())
+    std::env::var("MOKOSH_E2E_MAILPIT_URL").unwrap_or_else(|_| "http://127.0.0.1:8025".into())
 }
 
 fn admin_email() -> String {
@@ -84,10 +83,7 @@ async fn wait_for_email(c: &reqwest::Client, to_email: &str) -> Value {
         for m in messages {
             let matches_to = m["To"]
                 .as_array()
-                .map(|to| {
-                    to.iter()
-                        .any(|t| t["Address"].as_str() == Some(to_email))
-                })
+                .map(|to| to.iter().any(|t| t["Address"].as_str() == Some(to_email)))
                 .unwrap_or(false);
             if matches_to {
                 let id = m["ID"].as_str().expect("message id");
@@ -327,7 +323,11 @@ async fn password_reset_round_trip_via_mailpit() {
         .send()
         .await
         .expect("POST invite");
-    assert!(issue.status().is_success(), "invite seed: {}", issue.status());
+    assert!(
+        issue.status().is_success(),
+        "invite seed: {}",
+        issue.status()
+    );
     let invite_msg = wait_for_email(&c, &target_email).await;
     let invite_link = extract_link(invite_msg["Text"].as_str().expect("Text"));
     let invite_token = token_from_link(&invite_link);
@@ -433,13 +433,20 @@ async fn password_reset_round_trip_via_mailpit() {
         .send()
         .await
         .expect("GET sessions with old bearer");
-    assert_eq!(sessions.status(), StatusCode::OK, "old bearer JWT still verifies");
+    assert_eq!(
+        sessions.status(),
+        StatusCode::OK,
+        "old bearer JWT still verifies"
+    );
     let sessions_body: Value = sessions.json().await.expect("sessions json");
     let count = sessions_body["sessions"]
         .as_array()
         .map(|a| a.len())
         .unwrap_or_else(|| sessions_body.as_array().map(|a| a.len()).unwrap_or(0));
-    assert_eq!(count, 0, "all prior sessions must be revoked; got {sessions_body}");
+    assert_eq!(
+        count, 0,
+        "all prior sessions must be revoked; got {sessions_body}"
+    );
 
     // Old password no longer works.
     let old_login = c
@@ -461,7 +468,11 @@ async fn password_reset_round_trip_via_mailpit() {
         .send()
         .await
         .expect("POST new-pw login");
-    assert_eq!(new_login.status(), StatusCode::OK, "new password should log in");
+    assert_eq!(
+        new_login.status(),
+        StatusCode::OK,
+        "new password should log in"
+    );
 }
 
 // --- MFA -----------------------------------------------------------------
@@ -477,18 +488,30 @@ async fn seed_user(c: &reqwest::Client) -> (String, String) {
         .send()
         .await
         .expect("seed invite");
-    assert!(issue.status().is_success(), "seed invite: {}", issue.status());
+    assert!(
+        issue.status().is_success(),
+        "seed invite: {}",
+        issue.status()
+    );
     let msg = wait_for_email(c, &email).await;
     let link = extract_link(msg["Text"].as_str().expect("Text"));
     let token = token_from_link(&link);
     let password = "Aa!seed-pass-12".to_string();
     let accept = c
-        .post(format!("{}/v1/auth/invites/by-token/{}/accept", api_base(), token))
+        .post(format!(
+            "{}/v1/auth/invites/by-token/{}/accept",
+            api_base(),
+            token
+        ))
         .json(&json!({ "password": password }))
         .send()
         .await
         .expect("seed accept");
-    assert!(accept.status().is_success(), "seed accept: {}", accept.status());
+    assert!(
+        accept.status().is_success(),
+        "seed accept: {}",
+        accept.status()
+    );
     reset_mailpit(c).await;
     (email, password)
 }
@@ -548,7 +571,12 @@ async fn mfa_enroll_then_login_requires_challenge() {
         .send()
         .await
         .expect("POST confirm");
-    assert_eq!(confirm.status(), StatusCode::OK, "confirm: {}", confirm.text().await.unwrap_or_default());
+    assert_eq!(
+        confirm.status(),
+        StatusCode::OK,
+        "confirm: {}",
+        confirm.text().await.unwrap_or_default()
+    );
 
     // Next login must return a challenge, not tokens.
     let login = c
@@ -564,7 +592,10 @@ async fn mfa_enroll_then_login_requires_challenge() {
     assert_eq!(login.status(), StatusCode::OK);
     let login_body: Value = login.json().await.expect("login json");
     assert_eq!(login_body["mfa_required"], json!(true), "got {login_body}");
-    let challenge = login_body["challenge"].as_str().expect("challenge").to_string();
+    let challenge = login_body["challenge"]
+        .as_str()
+        .expect("challenge")
+        .to_string();
 
     // Compute a fresh TOTP code (the prior one is consumed for replay
     // defense, so we wait a step if we're on the same step boundary).
@@ -582,9 +613,17 @@ async fn mfa_enroll_then_login_requires_challenge() {
         .send()
         .await
         .expect("POST verify");
-    assert_eq!(verify.status(), StatusCode::OK, "verify: {}", verify.text().await.unwrap_or_default());
+    assert_eq!(
+        verify.status(),
+        StatusCode::OK,
+        "verify: {}",
+        verify.text().await.unwrap_or_default()
+    );
     let verify_body: Value = verify.json().await.expect("verify json");
-    assert!(verify_body["tokens"].is_object(), "verify must return tokens, got {verify_body}");
+    assert!(
+        verify_body["tokens"].is_object(),
+        "verify must return tokens, got {verify_body}"
+    );
 
     // Recovery-code path.
     let login2 = c

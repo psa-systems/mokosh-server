@@ -46,8 +46,17 @@ macro_rules! id_newtype {
 
 id_newtype!(TenantId, "Identifier for a tenant.");
 id_newtype!(UserId, "Identifier for a user.");
-id_newtype!(ClientId, "Identifier for an OAuth client (the public `client_id`).");
-id_newtype!(OpSessionId, "Identifier for an OP-side authentication session.");
+id_newtype!(
+    ClientId,
+    "Identifier for an OAuth client (the public `client_id`)."
+);
+id_newtype!(
+    OpSessionId,
+    "Identifier for an OP-side authentication session."
+);
 id_newtype!(RefreshFamilyId, "Identifier for a refresh-token family.");
 id_newtype!(RefreshTokenId, "Identifier for a single refresh token row.");
-id_newtype!(AuthCodeId, "Identifier for an authorization-code row (logical, not the hash).");
+id_newtype!(
+    AuthCodeId,
+    "Identifier for an authorization-code row (logical, not the hash)."
+);

@@ -61,10 +61,7 @@ impl TryFrom<ResetRow> for PasswordResetToken {
 
 #[async_trait]
 impl PasswordResetTokenRepository for PgPasswordResetTokenRepository {
-    async fn issue(
-        &self,
-        new: NewPasswordResetToken,
-    ) -> Result<PasswordResetToken, AuthError> {
+    async fn issue(&self, new: NewPasswordResetToken) -> Result<PasswordResetToken, AuthError> {
         let row: ResetRow = sqlx::query_as(
             "INSERT INTO mokosh_auth.password_reset_tokens (email, token_hash, expires_at)
              VALUES ($1, $2, $3)
@@ -88,13 +85,12 @@ impl PasswordResetTokenRepository for PgPasswordResetTokenRepository {
         &self,
         token_hash: [u8; 32],
     ) -> Result<Option<PasswordResetToken>, AuthError> {
-        let row: Option<ResetRow> = sqlx::query_as(&format!(
-            "{SELECT_RESET} WHERE token_hash = $1"
-        ))
-        .bind(&token_hash[..])
-        .fetch_optional(self.pool.pg())
-        .await
-        .map_err(db_err)?;
+        let row: Option<ResetRow> =
+            sqlx::query_as(&format!("{SELECT_RESET} WHERE token_hash = $1"))
+                .bind(&token_hash[..])
+                .fetch_optional(self.pool.pg())
+                .await
+                .map_err(db_err)?;
         row.map(PasswordResetToken::try_from).transpose()
     }
 

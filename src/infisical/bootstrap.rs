@@ -157,8 +157,11 @@ struct CreateFolderReq<'a> {
 ///
 /// Each Mokosh module gets its own top-level folder so the admin UI in
 /// Infisical groups them naturally.
-const MOKOSH_FOLDERS: &[(&str, &str)] =
-    &[("/", "mokosh"), ("/mokosh", "tenants"), ("/mokosh", "integrations")];
+const MOKOSH_FOLDERS: &[(&str, &str)] = &[
+    ("/", "mokosh"),
+    ("/mokosh", "tenants"),
+    ("/mokosh", "integrations"),
+];
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

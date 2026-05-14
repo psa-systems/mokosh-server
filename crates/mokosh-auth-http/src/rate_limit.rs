@@ -111,21 +111,44 @@ impl RateLimiter {
         let token_quota = Quota::per_minute(nz(60));
 
         let hour = Duration::from_secs(3600);
-        let invite_admin_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(30));
-        let invite_email_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(3));
+        let invite_admin_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(30));
+        let invite_email_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(3));
         let invite_lookup_ip_quota = Quota::per_minute(nz(30));
-        let invite_lookup_token_quota =
-            Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
-        let invite_accept_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
-        let signup_start_ip_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(5));
-        let signup_start_email_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(2));
-        let reset_start_ip_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(5));
-        let reset_start_email_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(2));
-        let reset_complete_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(10));
-        let mfa_setup_quota = Quota::with_period(hour).expect("non-zero").allow_burst(nz(3));
+        let invite_lookup_token_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(10));
+        let invite_accept_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(10));
+        let signup_start_ip_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(5));
+        let signup_start_email_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(2));
+        let reset_start_ip_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(5));
+        let reset_start_email_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(2));
+        let reset_complete_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(10));
+        let mfa_setup_quota = Quota::with_period(hour)
+            .expect("non-zero")
+            .allow_burst(nz(3));
         let fifteen_min = Duration::from_secs(900);
-        let mfa_confirm_quota = Quota::with_period(fifteen_min).expect("non-zero").allow_burst(nz(5));
-        let mfa_verify_quota = Quota::with_period(fifteen_min).expect("non-zero").allow_burst(nz(5));
+        let mfa_confirm_quota = Quota::with_period(fifteen_min)
+            .expect("non-zero")
+            .allow_burst(nz(5));
+        let mfa_verify_quota = Quota::with_period(fifteen_min)
+            .expect("non-zero")
+            .allow_burst(nz(5));
 
         Self {
             login_by_ip: std::sync::Arc::new(Governor::keyed(login_ip_quota)),
@@ -139,8 +162,12 @@ impl RateLimiter {
             signup_start_by_ip: std::sync::Arc::new(Governor::keyed(signup_start_ip_quota)),
             signup_start_by_email: std::sync::Arc::new(Governor::keyed(signup_start_email_quota)),
             password_reset_start_by_ip: std::sync::Arc::new(Governor::keyed(reset_start_ip_quota)),
-            password_reset_start_by_email: std::sync::Arc::new(Governor::keyed(reset_start_email_quota)),
-            password_reset_complete_by_ip: std::sync::Arc::new(Governor::keyed(reset_complete_quota)),
+            password_reset_start_by_email: std::sync::Arc::new(Governor::keyed(
+                reset_start_email_quota,
+            )),
+            password_reset_complete_by_ip: std::sync::Arc::new(Governor::keyed(
+                reset_complete_quota,
+            )),
             mfa_setup_by_user: std::sync::Arc::new(Governor::keyed(mfa_setup_quota)),
             mfa_confirm_by_user: std::sync::Arc::new(Governor::keyed(mfa_confirm_quota)),
             mfa_verify_by_ip: std::sync::Arc::new(Governor::keyed(mfa_verify_quota)),
@@ -167,11 +194,7 @@ impl RateLimiter {
 
     /// /v1/auth/password-reset rate-limit. Per-IP and per-email, both
     /// must allow. Mirrors check_signup_start.
-    pub fn check_password_reset_start(
-        &self,
-        ip: IpAddr,
-        email: &str,
-    ) -> Result<(), RateLimited> {
+    pub fn check_password_reset_start(&self, ip: IpAddr, email: &str) -> Result<(), RateLimited> {
         self.password_reset_start_by_ip
             .check_key(&ip)
             .map_err(|n| RateLimited::from_negative(&n))?;
@@ -276,14 +299,10 @@ impl RateLimiter {
 }
 
 impl RateLimited {
-    fn from_negative(
-        n: &governor::NotUntil<<DefaultClock as Clock>::Instant>,
-    ) -> Self {
+    fn from_negative(n: &governor::NotUntil<<DefaultClock as Clock>::Instant>) -> Self {
         // Round up so we never advise a wait shorter than the actual
         // refill interval.
-        let nanos = n
-            .wait_time_from(DefaultClock::default().now())
-            .as_nanos();
+        let nanos = n.wait_time_from(DefaultClock::default().now()).as_nanos();
         let secs = (nanos.div_ceil(1_000_000_000)) as u64;
         Self {
             retry_after_seconds: secs.max(1),

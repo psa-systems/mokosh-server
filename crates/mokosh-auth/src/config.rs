@@ -48,9 +48,9 @@ impl AuthConfig {
         }
         fn parse_u64(key: &'static str, default: u64) -> Result<u64, ConfigError> {
             match std::env::var(key) {
-                Ok(s) => s
-                    .parse()
-                    .map_err(|e: std::num::ParseIntError| ConfigError::InvalidEnv(key, e.to_string())),
+                Ok(s) => s.parse().map_err(|e: std::num::ParseIntError| {
+                    ConfigError::InvalidEnv(key, e.to_string())
+                }),
                 Err(_) => Ok(default),
             }
         }
@@ -59,7 +59,10 @@ impl AuthConfig {
                 Ok(s) => match s.as_str() {
                     "true" | "1" | "yes" => Ok(true),
                     "false" | "0" | "no" => Ok(false),
-                    other => Err(ConfigError::InvalidEnv(key, format!("expected bool, got {other}"))),
+                    other => Err(ConfigError::InvalidEnv(
+                        key,
+                        format!("expected bool, got {other}"),
+                    )),
                 },
                 Err(_) => Ok(default),
             }
@@ -76,13 +79,27 @@ impl AuthConfig {
             jwt_active_kid: req("MOKOSH_AUTH_JWT_ACTIVE_KID")?,
             jwt_public_keys_dir: PathBuf::from(req("MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR")?),
             data_encryption_key: SecretString::from(req("MOKOSH_AUTH_DATA_ENCRYPTION_KEY")?),
-            data_encryption_key_prev: opt("MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV").map(SecretString::from),
+            data_encryption_key_prev: opt("MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV")
+                .map(SecretString::from),
             data_key_version: parse_u64("MOKOSH_AUTH_DATA_KEY_VERSION", 1)? as u16,
-            access_token_ttl: Duration::seconds(parse_u64("MOKOSH_AUTH_ACCESS_TOKEN_TTL", 600)? as i64),
-            refresh_token_ttl: Duration::seconds(parse_u64("MOKOSH_AUTH_REFRESH_TOKEN_TTL", 2_592_000)? as i64),
-            refresh_idle_ttl: Duration::seconds(parse_u64("MOKOSH_AUTH_REFRESH_IDLE_TTL", 1_209_600)? as i64),
-            authorization_code_ttl: Duration::seconds(parse_u64("MOKOSH_AUTH_AUTHORIZATION_CODE_TTL", 60)? as i64),
-            op_session_ttl: Duration::seconds(parse_u64("MOKOSH_AUTH_OP_SESSION_TTL", 604_800)? as i64),
+            access_token_ttl: Duration::seconds(
+                parse_u64("MOKOSH_AUTH_ACCESS_TOKEN_TTL", 600)? as i64
+            ),
+            refresh_token_ttl: Duration::seconds(parse_u64(
+                "MOKOSH_AUTH_REFRESH_TOKEN_TTL",
+                2_592_000,
+            )? as i64),
+            refresh_idle_ttl: Duration::seconds(parse_u64(
+                "MOKOSH_AUTH_REFRESH_IDLE_TTL",
+                1_209_600,
+            )? as i64),
+            authorization_code_ttl: Duration::seconds(parse_u64(
+                "MOKOSH_AUTH_AUTHORIZATION_CODE_TTL",
+                60,
+            )? as i64),
+            op_session_ttl: Duration::seconds(
+                parse_u64("MOKOSH_AUTH_OP_SESSION_TTL", 604_800)? as i64
+            ),
             require_email_verification: parse_bool("MOKOSH_AUTH_REQUIRE_EMAIL_VERIFICATION", true)?,
             allow_signup: parse_bool("MOKOSH_AUTH_ALLOW_SIGNUP", false)?,
             allow_first_run: parse_bool("MOKOSH_AUTH_ALLOW_FIRST_RUN", false)?,
@@ -100,14 +117,20 @@ impl std::fmt::Debug for AuthConfig {
             .field("jwt_active_kid", &self.jwt_active_kid)
             .field("jwt_public_keys_dir", &self.jwt_public_keys_dir)
             .field("data_encryption_key", &"<redacted>")
-            .field("data_encryption_key_prev", &self.data_encryption_key_prev.as_ref().map(|_| "<redacted>"))
+            .field(
+                "data_encryption_key_prev",
+                &self.data_encryption_key_prev.as_ref().map(|_| "<redacted>"),
+            )
             .field("data_key_version", &self.data_key_version)
             .field("access_token_ttl", &self.access_token_ttl)
             .field("refresh_token_ttl", &self.refresh_token_ttl)
             .field("refresh_idle_ttl", &self.refresh_idle_ttl)
             .field("authorization_code_ttl", &self.authorization_code_ttl)
             .field("op_session_ttl", &self.op_session_ttl)
-            .field("require_email_verification", &self.require_email_verification)
+            .field(
+                "require_email_verification",
+                &self.require_email_verification,
+            )
             .field("allow_signup", &self.allow_signup)
             .field("allow_first_run", &self.allow_first_run)
             .field("federation_enabled", &self.federation_enabled)

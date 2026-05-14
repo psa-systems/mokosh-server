@@ -117,7 +117,9 @@ async fn exchange_code(
             // Best-effort: log a warning. Without the consumed row we
             // cannot identify which family to revoke, but we still refuse.
             tracing::warn!("authorization code consume failed: {e}");
-            return Err(AuthError::InvalidGrant("authorization code is invalid".into()));
+            return Err(AuthError::InvalidGrant(
+                "authorization code is invalid".into(),
+            ));
         }
     };
 
@@ -272,8 +274,13 @@ async fn exchange_refresh(
         Ok(r) => r,
         Err(AuthError::ReuseDetected) => {
             // Already revoked by the storage layer. Emit critical audit.
-            tracing::warn!("refresh token reuse detected for client {}", client.client_id);
-            return Err(AuthError::InvalidGrant("refresh token reuse detected".into()));
+            tracing::warn!(
+                "refresh token reuse detected for client {}",
+                client.client_id
+            );
+            return Err(AuthError::InvalidGrant(
+                "refresh token reuse detected".into(),
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -340,4 +347,3 @@ async fn exchange_refresh(
         id_token: None,
     })
 }
-
