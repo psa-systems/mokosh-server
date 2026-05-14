@@ -391,6 +391,27 @@ pub trait MembershipRepository: Send + Sync {
         org_role: MembershipRole,
     ) -> Result<(), AuthError>;
 
+    /// Mutate the global-style `role` (UserRole) on an existing
+    /// membership. Drives the user-management page's per-tenant role
+    /// taxonomy. Caller runs the last-admin guard via
+    /// `count_active_admins_in_tenant_excluding` before invoking on
+    /// a demote.
+    async fn set_role(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        role: UserRole,
+    ) -> Result<(), AuthError>;
+
+    /// Count active Admin memberships in the tenant, EXCLUDING
+    /// `excluded`. Replaces the global UserRepository version for the
+    /// per-tenant user-management surface.
+    async fn count_active_admins_in_tenant_excluding(
+        &self,
+        tenant_id: TenantId,
+        excluded: UserId,
+    ) -> Result<u64, AuthError>;
+
     /// Remove a membership outright. Caller is responsible for the
     /// last-owner guard. Returns `NotFound` if no matching row.
     async fn delete(&self, user_id: UserId, tenant_id: TenantId) -> Result<(), AuthError>;

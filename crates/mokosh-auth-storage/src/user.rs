@@ -325,8 +325,12 @@ impl UserRepository for PgUserRepository {
         tenant_id: TenantId,
         filter: UserListFilter,
     ) -> Result<(Vec<User>, u64), AuthError> {
-        // Clamp limit/offset defensively even though the handler is
-        // supposed to. Storage MUST NOT trust caller-supplied bounds.
+        // Tenant-scoped through the memberships join table, not the
+        // user's home `tenant_id`. A user with home tenant X but a
+        // membership in tenant Y must appear in tenant Y's admin
+        // list. We also surface the membership's `role` and `status`
+        // as the effective values on the returned User: the user-
+        // management page treats the tenant as its own admin domain.
         let limit = filter.limit.clamp(1, 200) as i64;
         let offset = filter.offset.min(i32::MAX as u32) as i64;
         let search = filter
@@ -336,24 +340,30 @@ impl UserRepository for PgUserRepository {
             .filter(|s| !s.is_empty());
         let search_pattern = search.map(|s| format!("%{s}%"));
 
-        // Same WHERE clause for the count + the page; build once.
-        // Postgres lets a NULL pass-through param disable the predicate,
-        // so a single template covers every filter combination.
+        // WHERE clause shared by COUNT and page. `m.role` /
+        // `m.status` drive the role + status filters; the user's
+        // home-tenant `users.role` / `users.status` are not consulted
+        // here (the BearerUser extractor handles the role-resolution
+        // side; this query handles the listing side).
         let where_sql = r#"
-            tenant_id = $1
-            AND deleted_at IS NULL
+            m.tenant_id = $1
+            AND u.deleted_at IS NULL
             AND ($2::text IS NULL OR
-                 (email || ' ' || COALESCE(first_name,'') || ' ' || COALESCE(last_name,''))
+                 (u.email || ' ' || COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''))
                  ILIKE $2)
-            AND ($3::text IS NULL OR role = $3)
-            AND ($4::text IS NULL OR status = $4)
-            AND ($5::bool IS NULL OR mfa_enrolled = $5)
+            AND ($3::text IS NULL OR m.role = $3)
+            AND ($4::text IS NULL OR m.status = $4)
+            AND ($5::bool IS NULL OR u.mfa_enrolled = $5)
         "#;
 
         let role = filter.role.map(|r| r.as_str().to_string());
         let status = filter.status.map(|s| s.as_str().to_string());
 
-        let count_sql = format!("SELECT COUNT(*) FROM mokosh_auth.users WHERE {where_sql}");
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM mokosh_auth.users u
+             JOIN mokosh_auth.memberships m ON m.user_id = u.id
+             WHERE {where_sql}"
+        );
         let total: (i64,) = sqlx::query_as(&count_sql)
             .bind(tenant_id.0)
             .bind(&search_pattern)
@@ -364,10 +374,24 @@ impl UserRepository for PgUserRepository {
             .await
             .map_err(db_err)?;
 
+        // Page query selects every column of `users` (so UserRow
+        // populates) BUT overwrites `role` and `status` with the
+        // membership's values so the caller sees the effective
+        // per-tenant role + status.
         let page_sql = format!(
-            "{SELECT_USER} WHERE {where_sql}
-             ORDER BY created_at DESC
-             LIMIT $6 OFFSET $7"
+            r#"
+            SELECT u.id, u.tenant_id, u.email, u.email_verified_at, u.password_hash,
+                   m.role AS role,
+                   m.status AS status,
+                   u.first_name, u.last_name, u.timezone, u.locale, u.avatar_url,
+                   u.mfa_enrolled, u.last_login_at, u.last_active_tenant,
+                   u.created_at, u.updated_at
+            FROM mokosh_auth.users u
+            JOIN mokosh_auth.memberships m ON m.user_id = u.id
+            WHERE {where_sql}
+            ORDER BY u.created_at DESC
+            LIMIT $6 OFFSET $7
+            "#
         );
         let rows: Vec<UserRow> = sqlx::query_as(&page_sql)
             .bind(tenant_id.0)

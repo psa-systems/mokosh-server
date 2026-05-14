@@ -196,4 +196,46 @@ impl MembershipRepository for PgMembershipRepository {
         .map_err(db_err)?;
         Ok(())
     }
+
+    async fn set_role(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        role: UserRole,
+    ) -> Result<(), AuthError> {
+        let affected = sqlx::query(
+            "UPDATE mokosh_auth.memberships
+             SET role = $1
+             WHERE user_id = $2 AND tenant_id = $3",
+        )
+        .bind(role.as_str())
+        .bind(user_id.0)
+        .bind(tenant_id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(AuthError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn count_active_admins_in_tenant_excluding(
+        &self,
+        tenant_id: TenantId,
+        excluded: UserId,
+    ) -> Result<u64, AuthError> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mokosh_auth.memberships
+             WHERE tenant_id = $1 AND role = 'admin'
+               AND status = 'active' AND user_id <> $2",
+        )
+        .bind(tenant_id.0)
+        .bind(excluded.0)
+        .fetch_one(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(n.max(0) as u64)
+    }
 }

@@ -149,18 +149,40 @@ fn parse_status(s: &str) -> Result<UserStatus, HttpError> {
 
 /// Resolve the target user, enforce tenant scope, return 404 on miss.
 /// Threaded into every per-user handler.
+/// Look up a target user in the calling admin's tenant via the
+/// memberships table, and return their User row with `role` /
+/// `status` / `tenant_id` overridden to the membership's values.
+/// 404 if no membership exists for (target, admin_tenant) - prevents
+/// cross-tenant probes via forged user_ids.
 async fn resolve_target(
     st: &AuthHttpState,
     admin_tenant: mokosh_auth_core::TenantId,
     target_user_id: UserId,
 ) -> Result<User, HttpError> {
-    st.provider
+    let m = st
+        .memberships
+        .find(target_user_id, admin_tenant)
+        .await
+        .map_err(HttpError)?
+        .ok_or(HttpError(AuthError::NotFound))?;
+    let mut user = st
+        .provider
         .users
         .find_by_id(target_user_id)
         .await
         .map_err(HttpError)?
-        .filter(|u| u.tenant_id == admin_tenant)
-        .ok_or(HttpError(AuthError::NotFound))
+        .ok_or(HttpError(AuthError::NotFound))?;
+    user.role = m.role;
+    user.tenant_id = m.tenant_id;
+    // Map membership.status -> user.status. MembershipStatus only has
+    // Active/Suspended; preserve users.status when the membership is
+    // active (the user could still be Pending or Deleted globally,
+    // but that's handled elsewhere) and downgrade to Suspended when
+    // the membership is suspended.
+    if matches!(m.status, mokosh_auth_core::MembershipStatus::Suspended) {
+        user.status = mokosh_auth_core::UserStatus::Suspended;
+    }
+    Ok(user)
 }
 
 /// Consume a step-up token that the supplied admin issued via
@@ -192,9 +214,8 @@ async fn available_role_transitions(
 ) -> Result<Vec<&'static str>, HttpError> {
     let demoting_out_of_admin_would_brick = if matches!(target.role, UserRole::Admin) {
         let others = st
-            .provider
-            .users
-            .count_active_admins_excluding(target.tenant_id, target.id)
+            .memberships
+            .count_active_admins_in_tenant_excluding(target.tenant_id, target.id)
             .await
             .map_err(HttpError)?;
         others == 0
@@ -317,9 +338,8 @@ async fn set_status(
         }
         if matches!(target.role, UserRole::Admin) {
             let others = st
-                .provider
-                .users
-                .count_active_admins_excluding(admin.tenant_id, target.id)
+                .memberships
+                .count_active_admins_in_tenant_excluding(admin.tenant_id, target.id)
                 .await
                 .map_err(HttpError)?;
             if others == 0 {
@@ -330,13 +350,26 @@ async fn set_status(
         }
     }
 
-    st.provider
-        .users
-        .set_status(user_id, new_status)
+    // Tenant-scoped: mutate the membership's status, not the user's
+    // global status. A user suspended in tenant A still has access to
+    // their other tenants. Map UserStatus -> MembershipStatus
+    // (Active/Suspended).
+    let membership_status = match new_status {
+        UserStatus::Active => mokosh_auth_core::MembershipStatus::Active,
+        UserStatus::Suspended | UserStatus::Pending | UserStatus::Deleted => {
+            mokosh_auth_core::MembershipStatus::Suspended
+        }
+    };
+    st.memberships
+        .set_status(user_id, admin.tenant_id, membership_status)
         .await
         .map_err(HttpError)?;
 
     if matches!(new_status, UserStatus::Suspended) {
+        // Sessions are global. Revoking everywhere on per-tenant
+        // suspend is heavy-handed but errs on the side of caution -
+        // the alternative is letting a tenant-suspended user keep an
+        // active session that the next tenant-switch unlocks.
         let _ = st.provider.sessions.revoke_all_for_user(user_id).await;
     }
 
@@ -417,9 +450,8 @@ pub async fn change_role(
         matches!(target.role, UserRole::Admin) && !matches!(new_role, UserRole::Admin);
     if demoting_admin {
         let others = st
-            .provider
-            .users
-            .count_active_admins_excluding(admin.tenant_id, target.id)
+            .memberships
+            .count_active_admins_in_tenant_excluding(admin.tenant_id, target.id)
             .await
             .map_err(HttpError)?;
         if others == 0 {
@@ -455,9 +487,11 @@ pub async fn change_role(
         }
     }
 
-    st.provider
-        .users
-        .set_role(target.id, new_role)
+    // Tenant-scoped: mutate the membership's role, not the user's
+    // global users.role. Switching tenants restores the user's role
+    // in their other tenants unchanged.
+    st.memberships
+        .set_role(target.id, admin.tenant_id, new_role)
         .await
         .map_err(HttpError)?;
 
@@ -522,12 +556,12 @@ pub async fn delete_user(
             .into_response());
     }
 
-    // Last-admin guard.
+    // Last-admin guard (membership-scoped: the target is the only
+    // active Admin in THIS tenant).
     if matches!(target.role, UserRole::Admin) {
         let others = st
-            .provider
-            .users
-            .count_active_admins_excluding(admin.tenant_id, target.id)
+            .memberships
+            .count_active_admins_in_tenant_excluding(admin.tenant_id, target.id)
             .await
             .map_err(HttpError)?;
         if others == 0 {
