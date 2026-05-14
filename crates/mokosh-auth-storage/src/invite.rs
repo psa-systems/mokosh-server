@@ -433,10 +433,15 @@ impl PgInviteRepository {
         //    surface that as Conflict so the handler can render a
         //    "you're already in this tenant" message rather than an
         //    error.
+        //
+        //    Admin-issued invites are tenant-membership invites: the
+        //    invitee gets admin-level access to the inviter's tenant.
+        //    Mirror the new-user path (see handlers/invites.rs accept
+        //    flow + signup) which also sets org_role='admin'.
         sqlx::query(
             "INSERT INTO mokosh_auth.memberships
-                (user_id, tenant_id, role, status)
-             VALUES ($1, $2, $3, 'active')",
+                (user_id, tenant_id, role, org_role, status)
+             VALUES ($1, $2, $3, 'admin', 'active')",
         )
         .bind(existing_user_id.0)
         .bind(row.tenant_id)
