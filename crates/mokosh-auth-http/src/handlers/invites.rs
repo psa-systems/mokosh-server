@@ -633,6 +633,10 @@ pub async fn accept_by_token(
             user_id: user.id,
             tenant_id: invite.tenant_id,
             role: invite.role,
+            // Admin-issued invites have historically been treated as
+            // admin-level access into the inviter's tenant; mirror
+            // that on the new org-role taxonomy.
+            org_role: mokosh_auth_core::MembershipRole::Admin,
             status: mokosh_auth_core::MembershipStatus::Active,
         })
         .await;

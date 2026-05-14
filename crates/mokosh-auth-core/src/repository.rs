@@ -380,6 +380,76 @@ pub trait MembershipRepository: Send + Sync {
         tenant_id: TenantId,
         status: MembershipStatus,
     ) -> Result<(), AuthError>;
+
+    /// Mutate the org-scoped role on an existing membership. Caller is
+    /// responsible for the last-owner guard (`count_owners_excluding`)
+    /// when demoting an Owner.
+    async fn change_org_role(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        org_role: MembershipRole,
+    ) -> Result<(), AuthError>;
+
+    /// Remove a membership outright. Caller is responsible for the
+    /// last-owner guard. Returns `NotFound` if no matching row.
+    async fn delete(&self, user_id: UserId, tenant_id: TenantId) -> Result<(), AuthError>;
+
+    /// Count active Owner memberships in the tenant, EXCLUDING
+    /// `excluded`. Used by the last-owner guard on demote / remove
+    /// inside the same SERIALIZABLE tx as the mutation.
+    async fn count_owners_excluding(
+        &self,
+        tenant_id: TenantId,
+        excluded: UserId,
+    ) -> Result<u64, AuthError>;
+}
+
+// ---------------------------------------------------------------------------
+// Tenants + Org invitations (the /v1/orgs/* surface)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait TenantRepository: Send + Sync {
+    async fn find_by_id(&self, id: TenantId) -> Result<Option<Tenant>, AuthError>;
+    async fn find_by_slug(&self, slug: &str) -> Result<Option<Tenant>, AuthError>;
+
+    /// Create an org-kind tenant and the founder's owner membership in
+    /// a single SERIALIZABLE transaction. The user's global `UserRole`
+    /// is mirrored onto the membership row as-is (typically `Member`);
+    /// the new `MembershipRole::Owner` distinguishes this membership
+    /// for the org-management surface.
+    async fn create_org(
+        &self,
+        name: &str,
+        slug: &str,
+        owner_user_id: UserId,
+        owner_global_role: UserRole,
+    ) -> Result<Tenant, AuthError>;
+}
+
+#[async_trait]
+pub trait OrgInvitationRepository: Send + Sync {
+    async fn issue(&self, new: NewOrgInvitation) -> Result<OrgInvitation, AuthError>;
+    async fn list_open_for_tenant(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Vec<OrgInvitation>, AuthError>;
+    async fn find_by_token_hash(
+        &self,
+        token_hash: [u8; 32],
+    ) -> Result<Option<OrgInvitation>, AuthError>;
+    async fn revoke(&self, id: uuid::Uuid, revoked_by: UserId) -> Result<(), AuthError>;
+    /// Atomic accept under SERIALIZABLE isolation: marks the invite
+    /// accepted, inserts the membership in one tx. Returns the
+    /// consumed invite. `AuthError::Conflict` if the user is already
+    /// a member.
+    async fn accept(
+        &self,
+        token_hash: [u8; 32],
+        accepting_user: UserId,
+        accepting_global_role: UserRole,
+    ) -> Result<OrgInvitation, AuthError>;
 }
 
 /// Persistent storage for one-shot self-signup tokens.

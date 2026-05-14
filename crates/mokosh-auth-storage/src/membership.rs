@@ -3,15 +3,15 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{
-    AuthError, Membership, MembershipRepository, MembershipStatus, NewMembership, TenantId, UserId,
-    UserRole,
+    AuthError, Membership, MembershipRepository, MembershipRole, MembershipStatus, NewMembership,
+    TenantId, UserId, UserRole,
 };
 
 use crate::conv::db_err;
 use crate::pool::AuthPool;
 
 const SELECT_MEMBERSHIP: &str = r#"
-    SELECT user_id, tenant_id, role, status, joined_at
+    SELECT user_id, tenant_id, role, org_role, status, joined_at
     FROM mokosh_auth.memberships
 "#;
 
@@ -30,6 +30,7 @@ struct MembershipRow {
     user_id: uuid::Uuid,
     tenant_id: uuid::Uuid,
     role: String,
+    org_role: String,
     status: String,
     joined_at: DateTime<Utc>,
 }
@@ -42,6 +43,8 @@ impl TryFrom<MembershipRow> for Membership {
             tenant_id: TenantId(r.tenant_id),
             role: UserRole::parse(&r.role)
                 .ok_or_else(|| AuthError::Storage(format!("invalid role: {}", r.role)))?,
+            org_role: MembershipRole::parse(&r.org_role)
+                .ok_or_else(|| AuthError::Storage(format!("invalid org_role: {}", r.org_role)))?,
             status: MembershipStatus::parse(&r.status)
                 .ok_or_else(|| AuthError::Storage(format!("invalid status: {}", r.status)))?,
             joined_at: r.joined_at,
@@ -92,13 +95,14 @@ impl MembershipRepository for PgMembershipRepository {
     async fn create(&self, m: NewMembership) -> Result<Membership, AuthError> {
         let row: MembershipRow = sqlx::query_as(
             "INSERT INTO mokosh_auth.memberships
-                (user_id, tenant_id, role, status)
-             VALUES ($1, $2, $3, $4)
-             RETURNING user_id, tenant_id, role, status, joined_at",
+                (user_id, tenant_id, role, org_role, status)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING user_id, tenant_id, role, org_role, status, joined_at",
         )
         .bind(m.user_id.0)
         .bind(m.tenant_id.0)
         .bind(m.role.as_str())
+        .bind(m.org_role.as_str())
         .bind(m.status.as_str())
         .fetch_one(self.pool.pg())
         .await
@@ -112,6 +116,65 @@ impl MembershipRepository for PgMembershipRepository {
             _ => db_err(e),
         })?;
         Membership::try_from(row)
+    }
+
+    async fn change_org_role(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        org_role: MembershipRole,
+    ) -> Result<(), AuthError> {
+        let affected = sqlx::query(
+            "UPDATE mokosh_auth.memberships
+             SET org_role = $1
+             WHERE user_id = $2 AND tenant_id = $3",
+        )
+        .bind(org_role.as_str())
+        .bind(user_id.0)
+        .bind(tenant_id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(AuthError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, user_id: UserId, tenant_id: TenantId) -> Result<(), AuthError> {
+        let affected = sqlx::query(
+            "DELETE FROM mokosh_auth.memberships
+             WHERE user_id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id.0)
+        .bind(tenant_id.0)
+        .execute(self.pool.pg())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(AuthError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn count_owners_excluding(
+        &self,
+        tenant_id: TenantId,
+        excluded: UserId,
+    ) -> Result<u64, AuthError> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mokosh_auth.memberships
+             WHERE tenant_id = $1 AND org_role = 'owner'
+               AND status = 'active' AND user_id <> $2",
+        )
+        .bind(tenant_id.0)
+        .bind(excluded.0)
+        .fetch_one(self.pool.pg())
+        .await
+        .map_err(db_err)?;
+        Ok(n.max(0) as u64)
     }
 
     async fn set_status(

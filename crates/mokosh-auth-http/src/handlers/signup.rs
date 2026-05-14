@@ -344,6 +344,9 @@ pub async fn complete(
             user_id: user.id,
             tenant_id,
             role: UserRole::Admin,
+            // Self-signup mints a personal tenant; the user is sole
+            // owner of their namespace.
+            org_role: mokosh_auth_core::MembershipRole::Owner,
             status: MembershipStatus::Active,
         })
         .await?;

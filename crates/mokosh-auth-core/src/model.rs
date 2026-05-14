@@ -304,11 +304,45 @@ impl MembershipStatus {
     }
 }
 
+/// Org-scoped membership role. Distinct from the global `UserRole`
+/// (5-state platform role): this is the 3-state taxonomy that
+/// `/v1/orgs/*` exposes. Owner is the founder of the org (last-owner
+/// guard); Admin can invite + manage roles; Member is a viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MembershipRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+impl MembershipRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Member => "member",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "owner" => Self::Owner,
+            "admin" => Self::Admin,
+            "member" => Self::Member,
+            _ => return None,
+        })
+    }
+    pub fn can_manage_members(&self) -> bool {
+        matches!(self, Self::Owner | Self::Admin)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Membership {
     pub user_id: UserId,
     pub tenant_id: TenantId,
     pub role: UserRole,
+    pub org_role: MembershipRole,
     pub status: MembershipStatus,
     pub joined_at: DateTime<Utc>,
 }
@@ -324,6 +358,7 @@ pub struct NewMembership {
     pub user_id: UserId,
     pub tenant_id: TenantId,
     pub role: UserRole,
+    pub org_role: MembershipRole,
     pub status: MembershipStatus,
 }
 
@@ -335,6 +370,78 @@ pub struct NewMembership {
 pub struct MembershipWithTenant {
     pub membership: Membership,
     pub tenant_name: String,
+}
+
+// --- Tenants (org CRUD) --------------------------------------------------
+//
+// `public.tenants` is host-owned (mokosh-server's PSA crate). Until
+// now the auth crates have only resolved it through name-lookup
+// closures; the org-management surface (POST /v1/orgs, etc.) needs to
+// CREATE rows there, so the auth crate now exposes a typed `Tenant`
+// domain object and a `TenantRepository` trait whose Pg impl is wired
+// up by the host.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TenantKind {
+    Personal,
+    Org,
+}
+
+impl TenantKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Org => "org",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "personal" => Self::Personal,
+            "org" => Self::Org,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Tenant {
+    pub id: TenantId,
+    pub name: String,
+    pub slug: String,
+    pub kind: TenantKind,
+    pub created_at: DateTime<Utc>,
+}
+
+// --- Org invitations -----------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct NewOrgInvitation {
+    pub tenant_id: TenantId,
+    pub email: String,
+    pub org_role: MembershipRole,
+    /// Caller-supplied raw token. Storage hashes (SHA-256) before
+    /// persistence; the raw value never lands on disk.
+    pub token: String,
+    pub invited_by: UserId,
+    pub expires_at: DateTime<Utc>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrgInvitation {
+    pub id: uuid::Uuid,
+    pub tenant_id: TenantId,
+    pub email: String,
+    pub org_role: MembershipRole,
+    pub invited_by: UserId,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub accepted_by: Option<UserId>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: Option<UserId>,
+    pub note: Option<String>,
 }
 
 // --- Self-signup --------------------------------------------------------
