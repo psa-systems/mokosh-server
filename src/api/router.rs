@@ -17,6 +17,7 @@ use tower_http::{
 use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
+use crate::modules::calendar::calendar_routes;
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
@@ -96,7 +97,8 @@ pub fn create_api_router(
         // Projects (stub)
         .nest("/projects", stub_routes())
         .nest("/tasks", stub_routes())
-        // Calendar (stub)
+        // Calendar
+        .nest("/calendar", calendar_routes())
         .nest("/appointments", stub_routes())
         .nest("/dispatch", stub_routes())
         // Contracts (stub)
