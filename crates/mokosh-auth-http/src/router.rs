@@ -7,8 +7,8 @@ use axum::Router;
 use futures_util::future::BoxFuture;
 use mokosh_auth_core::{
     AuthError, InviteRepository, MembershipRepository, MfaChallengeRepository,
-    PasswordResetTokenRepository, RecoveryCodeRepository, SignupTokenRepository, TenantId,
-    TotpRepository, TrustedDeviceRepository,
+    OrgInvitationRepository, PasswordResetTokenRepository, RecoveryCodeRepository,
+    SignupTokenRepository, TenantId, TenantRepository, TotpRepository, TrustedDeviceRepository,
 };
 use mokosh_auth_crypto::EncryptionKeySet;
 use mokosh_auth_oidc::OidcProvider;
@@ -67,6 +67,13 @@ pub struct AuthHttpState {
     /// just wires the repo; subsequent phases (self-signup,
     /// membership-aware invite-accept, tenant switcher) consume it.
     pub memberships: Arc<dyn MembershipRepository>,
+    /// Tenant CRUD for the org-management surface. Owns the cross-
+    /// schema bridge into `public.tenants`.
+    pub tenants: Arc<dyn TenantRepository>,
+    /// Org-scoped invitations. Distinct from `invites` above (which
+    /// mint new users); these add an existing user as a member of an
+    /// org tenant.
+    pub org_invitations: Arc<dyn OrgInvitationRepository>,
     /// Self-signup tokens. Issued by /v1/auth/signup, consumed by
     /// /v1/auth/signup/by-token/{token}/complete. Phase 2 of doc 10.
     pub signup_tokens: Arc<dyn SignupTokenRepository>,
