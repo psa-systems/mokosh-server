@@ -26,12 +26,12 @@ use mokosh_auth_http::{
 };
 use mokosh_auth_oidc::{EngineConfig, OidcProvider};
 use mokosh_auth_storage::{
-    run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgEntitlementRepository,
-    PgFeedbackRepository, PgInviteRepository, PgMembershipRepository, PgMfaChallengeRepository,
-    PgOAuthClientRepository, PgOpSessionRepository, PgOrgInvitationRepository,
-    PgPasswordResetTokenRepository, PgRecoveryCodeRepository, PgRefreshTokenRepository,
-    PgSignupTokenRepository, PgTenantRepository, PgTotpRepository, PgTrustedDeviceRepository,
-    PgUserRepository,
+    run_migrations, AuthPool, PgAuditLogger, PgAuthCodeRepository, PgBillingRepository,
+    PgEntitlementRepository, PgFeedbackRepository, PgInviteRepository, PgMembershipRepository,
+    PgMfaChallengeRepository, PgOAuthClientRepository, PgOpSessionRepository,
+    PgOrgInvitationRepository, PgPasswordResetTokenRepository, PgRecoveryCodeRepository,
+    PgRefreshTokenRepository, PgSignupTokenRepository, PgTenantRepository, PgTotpRepository,
+    PgTrustedDeviceRepository, PgUserRepository,
 };
 use secrecy::ExposeSecret;
 use std::sync::Arc;
@@ -137,6 +137,7 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
     let tenants = Arc::new(PgTenantRepository::new(auth_pool.clone()));
     let org_invitations = Arc::new(PgOrgInvitationRepository::new(auth_pool.clone()));
     let feedback = Arc::new(PgFeedbackRepository::new(auth_pool.clone()));
+    let billing = Arc::new(PgBillingRepository::new(auth_pool.clone()));
     let signup_tokens = Arc::new(PgSignupTokenRepository::new(auth_pool.clone()));
     let password_reset_tokens = Arc::new(PgPasswordResetTokenRepository::new(auth_pool.clone()));
     let totp = Arc::new(PgTotpRepository::new(auth_pool.clone()));
@@ -323,6 +324,7 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
         tenants,
         org_invitations,
         feedback,
+        billing,
         signup_tokens,
         password_reset_tokens,
         public_signup_enabled,

@@ -276,6 +276,24 @@ pub async fn create_org(
         }
     };
 
+    // Best-effort trial subscription. Failure here doesn't roll back
+    // the org (the org-create tx already committed); the SPA's billing
+    // page renders an empty plan if this is missing, which is the same
+    // shape it shows for orgs that pre-date the billing surface.
+    let trial_tier = "starter";
+    let trial_days = st
+        .billing
+        .find_tier(trial_tier)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t.trial_days as i64)
+        .unwrap_or(14);
+    let _ = st
+        .billing
+        .create_trial(tenant.id, trial_tier, trial_days)
+        .await;
+
     let _ = st
         .provider
         .audit

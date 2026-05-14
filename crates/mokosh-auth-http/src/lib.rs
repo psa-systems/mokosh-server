@@ -17,6 +17,7 @@ pub mod handlers {
     pub mod apps;
     pub mod audit;
     pub mod auth;
+    pub mod billing;
     pub mod discovery;
     pub mod feedback;
     pub mod invites;

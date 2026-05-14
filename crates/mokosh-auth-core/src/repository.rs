@@ -741,3 +741,28 @@ pub trait FeedbackRepository: Send + Sync {
         actor: UserId,
     ) -> Result<(), AuthError>;
 }
+
+// ---------------------------------------------------------------------------
+// Billing (audit doc 05; read-only surface, Stripe writes deferred)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait BillingRepository: Send + Sync {
+    /// Every public tier, ordered by `sort_order` ascending.
+    async fn list_public_tiers(&self) -> Result<Vec<BillingTier>, AuthError>;
+    async fn find_tier(&self, tier_key: &str) -> Result<Option<BillingTier>, AuthError>;
+    async fn get_subscription(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Option<Subscription>, AuthError>;
+    /// Insert a fresh trial subscription. Called by the org-create path
+    /// in the same transaction as the tenant + owner-membership inserts
+    /// so every new org has a billing row from day one. Idempotent on
+    /// `tenant_id` PK (returns Conflict if a row already exists).
+    async fn create_trial(
+        &self,
+        tenant_id: TenantId,
+        tier_key: &str,
+        trial_days: i64,
+    ) -> Result<Subscription, AuthError>;
+}

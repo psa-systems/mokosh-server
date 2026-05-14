@@ -6,9 +6,10 @@ use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use mokosh_auth_core::{
-    AuthError, FeedbackRepository, InviteRepository, MembershipRepository, MfaChallengeRepository,
-    OrgInvitationRepository, PasswordResetTokenRepository, RecoveryCodeRepository,
-    SignupTokenRepository, TenantId, TenantRepository, TotpRepository, TrustedDeviceRepository,
+    AuthError, BillingRepository, FeedbackRepository, InviteRepository, MembershipRepository,
+    MfaChallengeRepository, OrgInvitationRepository, PasswordResetTokenRepository,
+    RecoveryCodeRepository, SignupTokenRepository, TenantId, TenantRepository, TotpRepository,
+    TrustedDeviceRepository,
 };
 use mokosh_auth_crypto::EncryptionKeySet;
 use mokosh_auth_oidc::OidcProvider;
@@ -19,8 +20,8 @@ use url::Url;
 use crate::cookies::CookieConfig;
 use crate::email::Mailer;
 use crate::handlers::{
-    apps as apps_h, audit as audit_h, auth as auth_h, discovery as disc_h, feedback as feedback_h,
-    invites as invites_h, mfa as mfa_h, oidc as oidc_h, orgs as orgs_h,
+    apps as apps_h, audit as audit_h, auth as auth_h, billing as billing_h, discovery as disc_h,
+    feedback as feedback_h, invites as invites_h, mfa as mfa_h, oidc as oidc_h, orgs as orgs_h,
     password_reset as pwd_reset_h, profile as profile_h, sessions as sessions_h,
     signup as signup_h, tenants as tenants_h, users as users_h,
 };
@@ -78,6 +79,9 @@ pub struct AuthHttpState {
     /// In-app feedback inbox. Submit anonymous via /v1/feedback, triage
     /// via /v1/admin/feedback. See docs/mokosh-fixes/04-feedback-inbox.md.
     pub feedback: Arc<dyn FeedbackRepository>,
+    /// Billing catalogue + per-tenant subscriptions. Read-only API for
+    /// now; Stripe write integration deferred.
+    pub billing: Arc<dyn BillingRepository>,
     /// Self-signup tokens. Issued by /v1/auth/signup, consumed by
     /// /v1/auth/signup/by-token/{token}/complete. Phase 2 of doc 10.
     pub signup_tokens: Arc<dyn SignupTokenRepository>,
@@ -323,6 +327,9 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         )
         .route("/v1/invitations/lookup", get(orgs_h::lookup_invitation))
         .route("/v1/invitations/accept", post(orgs_h::accept_invitation))
+        // Billing read-only surface (doc 05).
+        .route("/v1/billing/tiers", get(billing_h::list_tiers))
+        .route("/v1/orgs/{slug}/billing", get(billing_h::get_org_billing))
         // Feedback inbox (doc 04).
         .route("/v1/feedback", post(feedback_h::submit))
         .route("/v1/admin/feedback", get(feedback_h::list_admin))

@@ -1087,3 +1087,62 @@ pub struct Feedback {
     pub created_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
 }
+
+// --- Billing (audit doc 05) --------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BillingTier {
+    pub tier_key: String,
+    pub display_name: String,
+    pub description: String,
+    pub monthly_price_cents: i32,
+    pub trial_days: i32,
+    pub seat_count: i32,
+    pub slot_limit: Option<i32>,
+    pub sort_order: i32,
+    pub features: Vec<String>,
+    pub is_public: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionStatus {
+    Trialing,
+    Active,
+    PastDue,
+    Canceled,
+    Lifetime,
+}
+
+impl SubscriptionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Trialing => "trialing",
+            Self::Active => "active",
+            Self::PastDue => "past_due",
+            Self::Canceled => "canceled",
+            Self::Lifetime => "lifetime",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "trialing" => Self::Trialing,
+            "active" => Self::Active,
+            "past_due" => Self::PastDue,
+            "canceled" => Self::Canceled,
+            "lifetime" => Self::Lifetime,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Subscription {
+    pub tenant_id: TenantId,
+    pub tier_key: String,
+    pub status: SubscriptionStatus,
+    pub trial_end: Option<DateTime<Utc>>,
+    pub current_period_end: Option<DateTime<Utc>>,
+    pub cancel_at_period_end: bool,
+    pub grace_period_end: Option<DateTime<Utc>>,
+}

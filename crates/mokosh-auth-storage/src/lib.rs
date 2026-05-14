@@ -6,6 +6,7 @@
 //! `sqlx::migrate!()`.
 
 pub mod audit;
+pub mod billing;
 pub mod client;
 pub mod code;
 pub mod conv;
@@ -28,6 +29,7 @@ pub mod trusted_device;
 pub mod user;
 
 pub use audit::PgAuditLogger;
+pub use billing::PgBillingRepository;
 pub use client::PgOAuthClientRepository;
 pub use code::PgAuthCodeRepository;
 pub use entitlement::PgEntitlementRepository;
