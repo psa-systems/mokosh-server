@@ -184,7 +184,38 @@ pub async fn login(
                 }
             }
         }
-        None => user.last_active_tenant.unwrap_or(user.tenant_id),
+        None => {
+            // Prefer last_active_tenant, then home tenant. But only if
+            // the user has an ACTIVE membership there - otherwise the
+            // login would succeed but every authenticated request after
+            // would 403 (BearerUser rejects suspended-in-active-tenant).
+            // If neither preferred tenant has an active membership,
+            // fall through to ANY active membership; if none exist,
+            // refuse with a clean error.
+            let preferred = [user.last_active_tenant, Some(user.tenant_id)];
+            let mut picked = None;
+            for cand in preferred.into_iter().flatten() {
+                if let Some(m) = st.memberships.find(user.id, cand).await? {
+                    if matches!(m.status, mokosh_auth_core::MembershipStatus::Active) {
+                        picked = Some(cand);
+                        break;
+                    }
+                }
+            }
+            if picked.is_none() {
+                // Last resort: any active membership.
+                let all = st.memberships.list_for_user(user.id).await?;
+                picked = all
+                    .into_iter()
+                    .find(|m| matches!(m.status, mokosh_auth_core::MembershipStatus::Active))
+                    .map(|m| m.tenant_id);
+            }
+            picked.ok_or_else(|| {
+                HttpError(mokosh_auth_core::AuthError::Forbidden(
+                    "your account is suspended in every tenant you belong to".into(),
+                ))
+            })?
+        }
     };
     let _ = st
         .provider
