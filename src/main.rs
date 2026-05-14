@@ -19,6 +19,11 @@ pub struct AppConfig {
     /// Exact origin allowed to receive `postMessage` from the Google
     /// OAuth callback HTML (the SPA's browser-visible origin).
     pub client_origin: String,
+    /// All origins permitted to make credentialed CORS requests against
+    /// the API. Defaults to `[client_origin]` if `CORS_ORIGIN` is unset.
+    /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
+    /// `https://msp.a8n.systems,https://a8n.systems`).
+    pub cors_origins: Vec<String>,
     /// Lowercased email-domain allowlist; first-time Google sign-ins
     /// from these domains are auto-promoted to role 'super_admin'.
     pub oauth_super_admin_domains: Vec<String>,
@@ -57,6 +62,19 @@ impl AppConfig {
                 .unwrap_or_else(|_| "32-byte-key-for-dev-only-change!".to_string()),
             client_origin: std::env::var("CLIENT_ORIGIN")
                 .unwrap_or_else(|_| "http://localhost:4301".to_string()),
+            cors_origins: std::env::var("CORS_ORIGIN")
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    vec![std::env::var("CLIENT_ORIGIN")
+                        .unwrap_or_else(|_| "http://localhost:4301".to_string())]
+                }),
             oauth_super_admin_domains,
         })
     }
@@ -155,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.jwt_secret,
         google_oauth,
         config.client_origin,
+        config.cors_origins,
         config.oauth_super_admin_domains,
         cookie_secure,
         at_jwt,

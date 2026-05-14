@@ -1,13 +1,18 @@
 //! API router configuration
 
 use axum::{
-    http::{header, HeaderValue, Method},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware,
+    response::{Html, IntoResponse},
     routing::get,
     Json, Router,
 };
 use std::sync::Arc;
-use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 
 use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
@@ -35,11 +40,18 @@ pub fn create_api_router(
     jwt_secret: String,
     google_oauth: Arc<google_oauth_flow::Client>,
     client_origin: String,
+    cors_origins: Vec<String>,
     super_admin_domains: Vec<String>,
     cookie_secure: bool,
     at_jwt: Option<AtJwtVerifier>,
 ) -> Router {
-    let cors_allowed_origin = client_origin.clone();
+    let cors_origin_values: Vec<HeaderValue> = cors_origins
+        .iter()
+        .map(|o| {
+            o.parse::<HeaderValue>()
+                .unwrap_or_else(|e| panic!("CORS_ORIGIN entry {o:?} is not a valid header value: {e}"))
+        })
+        .collect();
     // Create services
     let auth_service = AuthService::new(db.clone(), jwt_secret.clone(), super_admin_domains);
     let tenant_service = TenantService::new(db.clone());
@@ -131,18 +143,13 @@ pub fn create_api_router(
         // Portal KB
         .nest("/kb", stub_routes());
 
-    // Audit F13: previously CORS was Any/Any/Any (dev-friendly but unsafe
-    // for any deployment that's reachable from the public internet).
-    // Tighten to: only the configured CLIENT_ORIGIN, only the methods
-    // we actually serve, only the headers the client sends. SPA and API
-    // typically share an origin (via Dioxus proxy / outer reverse proxy)
-    // so CORS rarely fires in normal use - this is defense in depth.
+    // CORS: SPA at msp.<tld> talks to msp-api.<tld> from a different origin,
+    // so credentialed CORS must be tight (specific origins, not wildcard).
+    // The list comes from the CORS_ORIGIN env var (comma-separated). The
+    // bunyip apex is included so the SaaS shell can call mokosh endpoints
+    // in the future without losing credentials.
     let cors = CorsLayer::new()
-        .allow_origin(
-            cors_allowed_origin
-                .parse::<HeaderValue>()
-                .expect("CLIENT_ORIGIN must be a valid HTTP header value"),
-        )
+        .allow_origin(AllowOrigin::list(cors_origin_values))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -154,14 +161,51 @@ pub fn create_api_router(
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
         .allow_credentials(true);
 
-    // Combine everything
+    // Combine everything. The `.fallback` swallows any non-/api/v1/* request
+    // (including hitting `/` directly in a browser) with a small placeholder
+    // page that links the user back to the Mokosh frontend. This keeps
+    // msp-api.<tld> from leaking internal route info.
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/portal", portal_api)
+        .fallback(get(not_a_frontend))
         // Apply global middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(cors)
+}
+
+/// Fallback handler for any path outside `/api/v1/*`. Renders a small
+/// "this is an API endpoint" page so direct browser visits to
+/// `msp-api.<tld>` are friendly instead of leaking 404 internals. The
+/// link points at the Bunyip SaaS shell on the matching apex; if the
+/// host can't be parsed, falls back to the staging URL.
+async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let hub_link = host
+        .strip_prefix("msp-api.")
+        .map(|tld| format!("https://{tld}"))
+        .unwrap_or_else(|| "https://a8n.systems".to_string());
+    let body = format!(
+        "<!doctype html>\n\
+         <html lang=\"en\">\n\
+         <head>\n\
+         <meta charset=\"utf-8\">\n\
+         <title>Not a frontend</title>\n\
+         <meta name=\"robots\" content=\"noindex\">\n\
+         <style>body{{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#1a1a1a}}a{{color:#0066cc}}</style>\n\
+         </head>\n\
+         <body>\n\
+         <h1>This is an API endpoint.</h1>\n\
+         <p>You're looking at the Mokosh backend API. There is no user interface here.</p>\n\
+         <p>Visit <a href=\"{hub_link}\">{hub_link}</a> to reach the application.</p>\n\
+         </body>\n\
+         </html>\n"
+    );
+    (StatusCode::NOT_FOUND, Html(body))
 }
 
 /// Health check endpoint
