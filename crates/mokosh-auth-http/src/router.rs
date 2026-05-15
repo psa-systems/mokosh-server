@@ -236,6 +236,14 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         )
         .route("/v1/auth/users/{user_id}/role", post(users_h::change_role))
         .route(
+            "/v1/auth/users/{user_id}/sessions",
+            get(sessions_h::list_user_sessions_admin),
+        )
+        .route(
+            "/v1/auth/users/{user_id}/sessions/{session_id}/revoke",
+            post(sessions_h::revoke_user_session_admin),
+        )
+        .route(
             "/v1/auth/users/{user_id}/delete",
             post(users_h::delete_user),
         )

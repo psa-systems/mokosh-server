@@ -75,6 +75,120 @@ pub async fn list_my_sessions(
     Ok(Json(SessionListResponse { sessions: views }))
 }
 
+/// `GET /v1/auth/users/:user_id/sessions`
+///
+/// Admin-scoped variant of `list_my_sessions`. Returns the target
+/// user's active sessions. Tenant-scoped: the caller must have an
+/// Admin membership in the same tenant as the target user (via
+/// memberships.find), otherwise 404. Used by the user-detail page's
+/// Sessions section.
+pub async fn list_user_sessions_admin(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(admin): BearerUser,
+    Path(target_id): Path<uuid::Uuid>,
+) -> Result<Json<SessionListResponse>, HttpError> {
+    use mokosh_auth_core::UserRole;
+    if !matches!(admin.role, UserRole::Admin) {
+        return Err(HttpError(AuthError::Forbidden("admin required".into())));
+    }
+    // 404 unless the target has an active membership in the admin's tenant.
+    let m = st
+        .memberships
+        .find(mokosh_auth_core::UserId(target_id), admin.tenant_id)
+        .await
+        .map_err(HttpError)?
+        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+    let _ = m; // membership existence is the gate; we don't read fields off it.
+
+    let now = st.provider.clock.now();
+    let sessions = st
+        .provider
+        .sessions
+        .list_active_for_user(mokosh_auth_core::UserId(target_id), now)
+        .await
+        .map_err(HttpError)?;
+    let views: Vec<SessionView> = sessions
+        .into_iter()
+        .map(|s| SessionView {
+            is_current: false, // admin viewing another user's sessions
+            id: s.id.0.to_string(),
+            created_at: s.created_at,
+            last_active_at: s.last_active_at,
+            expires_at: s.expires_at,
+            user_agent: s.user_agent,
+            ip: s.ip.map(|i| i.to_string()),
+            display_name: s.display_name,
+        })
+        .collect();
+    Ok(Json(SessionListResponse { sessions: views }))
+}
+
+/// `POST /v1/auth/users/:user_id/sessions/:session_id/revoke`
+///
+/// Admin-scoped: force-revoke one of another user's sessions. Same
+/// tenant gating as the list endpoint. Also revokes any refresh
+/// families bound to the session, mirroring `revoke_my_session`.
+pub async fn revoke_user_session_admin(
+    State(st): State<Arc<AuthHttpState>>,
+    BearerUser(admin): BearerUser,
+    Path((target_id, session_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Result<Response, HttpError> {
+    use mokosh_auth_core::{AuditEvent, UserRole};
+    if !matches!(admin.role, UserRole::Admin) {
+        return Err(HttpError(AuthError::Forbidden("admin required".into())));
+    }
+    // Tenant gate.
+    let _ = st
+        .memberships
+        .find(mokosh_auth_core::UserId(target_id), admin.tenant_id)
+        .await
+        .map_err(HttpError)?
+        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+
+    let sid = OpSessionId(session_id);
+    let session = st
+        .provider
+        .sessions
+        .find_by_id(sid)
+        .await
+        .map_err(HttpError)?;
+    // Confirm the session belongs to the claimed target. 404 otherwise -
+    // prevents using this as a cross-user session-id enumeration oracle.
+    let owns = matches!(&session, Some(s) if s.user_id == mokosh_auth_core::UserId(target_id));
+    if !owns {
+        return Err(HttpError(AuthError::NotFound));
+    }
+
+    let now = st.provider.clock.now();
+    st.provider
+        .sessions
+        .revoke(sid, now)
+        .await
+        .map_err(HttpError)?;
+    let _ = st
+        .provider
+        .refresh
+        .revoke_families_for_session(sid, "admin_revoked_session", now)
+        .await;
+
+    let _ = st
+        .provider
+        .audit
+        .record(
+            Some(admin.tenant_id),
+            Some(admin.id),
+            None,
+            AuditEvent::AdminAction {
+                admin_id: admin.id,
+                action: "user_session_revoked".into(),
+                target: format!("{}/{}", target_id, session_id),
+            },
+        )
+        .await;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /v1/auth/sessions/revoke-others`
 ///
 /// Revoke every active op_session for the caller EXCEPT the current
