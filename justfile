@@ -103,6 +103,22 @@ register-bunyip-client: ensure-env
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=bunyip-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($hub_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($hub_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
 
+# Register lets-chat as a confidential OIDC client. Run once after
+# `just dev-sso` is up. Prints the client_id UUID + client_secret;
+# capture both:
+#   client_id     -> lets-chat/.env LETS_CHAT_SSO_CLIENT_ID
+#   client_secret -> lets-chat/.env LETS_CHAT_SSO_CLIENT_SECRET (gitignored)
+# The secret cannot be retrieved later, only rotated. Lose it = re-run
+# this recipe + update .env.
+[doc("Register lets-chat as a confidential OIDC client (one-shot, idempotent on (name))")]
+register-lets-chat-client: ensure-env
+    #!/usr/bin/env nu
+    let user = $env.USER
+    let api_origin = $"https://($user)-mokosh-api.a8n.run"
+    let chat_origin = $"https://($user)-chat.a8n.run"
+    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
+
 [doc("Register mokosh-clients as a public OIDC client (one-shot, idempotent on (name))")]
 register-client: ensure-env
     #!/usr/bin/env nu
