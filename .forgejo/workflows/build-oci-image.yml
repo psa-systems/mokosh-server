@@ -43,10 +43,17 @@ jobs:
           docker version
           docker buildx version
 
-      - name: Set up QEMU for multi-arch builds
-        uses: https://code.forgejo.org/docker/setup-qemu-action@v3
-        with:
-          platforms: linux/amd64,linux/arm64
+      # Register QEMU binfmt handlers for the non-native target archs so
+      # buildx can cross-build linux/arm64 on amd64 (and vice versa).
+      # Done inline with `tonistiigi/binfmt` because the upstream
+      # docker/setup-qemu-action@v3 writes into /opt/hostedtoolcache,
+      # which only exists on GitHub-hosted runners. On Forgejo's runners
+      # that path is missing and the action fails with EACCES. Running
+      # the image directly performs the same kernel-level binfmt
+      # registration without any tool-cache plumbing.
+      - name: Register QEMU binfmt handlers
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt:latest --install linux/amd64,linux/arm64
 
       - name: Create buildx builder
         run: |
