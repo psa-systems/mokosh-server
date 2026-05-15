@@ -163,17 +163,50 @@ Two Dockerfiles, two purposes.
 
 The repo root ships a `compose.yml` for operators: self-hosters and our own production stacks. It pulls a published image from the container registry (no local source build) and bundles the application Postgres.
 
+### Container registry access
+
+The default image lives in a private Forgejo registry at `dev.a8n.run/psa-systems-private/mokosh-api`. Pulling it requires authentication; `docker compose pull` against this default without credentials fails with `unauthorized`.
+
+Two options for operators:
+
+1. **Log in to the upstream registry.** Request a registry access token (read-only PAT scoped to `read:package`) from the maintainers, then on the deploy host:
+
+   ```nu
+   docker login dev.a8n.run --username <your-account> --password-stdin
+   # paste the token, then Ctrl-D
+   ```
+
+   The credentials are cached in `~/.docker/config.json`; `docker compose pull` will use them automatically from then on.
+
+2. **Point at your own mirror.** Pull the image once (with credentials) on a machine that has access, push it to a registry you control, and set `MOKOSH_IMAGE` in `.env` to the new path:
+
+   ```nu
+   "MOKOSH_IMAGE=registry.example.com/mokosh/mokosh-api\n" | save --append .env
+   "MOKOSH_VERSION=v0.2.0\n" | save --append .env
+   ```
+
+   This is the recommended pattern for partner MSPs and air-gapped deployments.
+
+### Quickstart
+
 ```nu
 # 1. Configure
 cp .env.example .env
 # Edit .env: set MOKOSH_PG_PASSWORD, JWT_SECRET, ENCRYPTION_KEY,
 # CORS_ORIGIN, BASE_URL, and (optionally) MOKOSH_VERSION to pin a tag.
+# To bootstrap the first admin user, also set ADMIN_EMAIL and
+# ADMIN_PASSWORD BEFORE the first `docker compose up` - the server
+# only creates the bootstrap account when the users table is empty.
 
-# 2. Pull and start
+# 2. Authenticate to the container registry (see "Container registry
+#    access" above) OR set MOKOSH_IMAGE to a mirror you control.
+docker login dev.a8n.run
+
+# 3. Pull and start
 docker compose pull
 docker compose up --detach
 
-# 3. Confirm
+# 4. Confirm
 curl --include http://localhost:8080/api/v1/health
 curl --silent http://localhost:8080/api/v1/version | jq
 ```
