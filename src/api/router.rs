@@ -22,6 +22,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::version::VersionInfo;
+use crate::version_check::VersionChecker;
 
 /// Application state shared across all routes
 #[derive(Clone)]
@@ -67,12 +68,26 @@ pub fn create_api_router(
         auth_middleware = auth_middleware.with_at_jwt(v);
     }
 
+    // Update-check service. Disabled when UPDATE_CHECK_URL is unset.
+    let version_checker = VersionChecker::from_env();
+
     // Build API v1 routes
     let api_v1 = Router::new()
         // Health check
         .route("/health", get(health_check))
         // Build / version info (public, used for diagnostics)
         .route("/version", get(version_info))
+        // Update check (public; operator-facing).
+        .route(
+            "/version/check",
+            get({
+                let vc = version_checker.clone();
+                move || {
+                    let vc = vc.clone();
+                    async move { Json(vc.check().await) }
+                }
+            }),
+        )
         // Auth routes
         .nest(
             "/auth",

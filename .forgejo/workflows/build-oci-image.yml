@@ -43,6 +43,16 @@ jobs:
           docker version
           docker buildx version
 
+      - name: Set up QEMU for multi-arch builds
+        uses: https://code.forgejo.org/docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Create buildx builder
+        run: |
+          docker buildx create --name multiarch --driver docker-container --use
+          docker buildx inspect --bootstrap
+
       - name: Set environment variables
         shell: nu {0}
         run: |
@@ -72,7 +82,7 @@ jobs:
           let tag_args = ($tags | each {|tag| [-t $"($registry)/($image):($tag)"]} | flatten)
           let cache_from = $"type=registry,ref=($registry)/($image):latest"
           print $"Building and pushing ($image) with tags: ($tags_str)"
-          ^docker buildx build --push --cache-from $cache_from --cache-to type=inline --build-arg $"GIT_SHA=($env.GITHUB_SHA)" ...$tag_args -f oci-build/Dockerfile .
+          ^docker buildx build --push --platform linux/amd64,linux/arm64 --cache-from $cache_from --cache-to type=inline --build-arg $"GIT_SHA=($env.GITHUB_SHA)" ...$tag_args -f oci-build/Dockerfile .
 
       - name: Print image URLs
         shell: nu {0}

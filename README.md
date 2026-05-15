@@ -157,7 +157,96 @@ Two Dockerfiles, two purposes.
 | File | Purpose |
 | --- | --- |
 | `Dockerfile` | Dev image. Debug build, source mounted from the host via volumes, `cargo run` as the entrypoint. Used by `compose.dev.yml`. |
-| `oci-build/Dockerfile` | Production image. Multi-stage Alpine build (musl + lld), release binaries, non-root `appuser`, healthcheck on `/api/v1/health`. Built and published by the Forgejo workflow in `.forgejo/workflows/build-oci-image.yml`. |
+| `oci-build/Dockerfile` | Production image. Multi-stage Alpine build (musl + lld), release binaries, non-root `appuser`, healthcheck on `/api/v1/health`. Built and published as a multi-arch image (`linux/amd64`, `linux/arm64`) by the Forgejo workflow in `.forgejo/workflows/build-oci-image.yml`. |
+
+## Operator deployment (`compose.yml`)
+
+The repo root ships a `compose.yml` for operators: self-hosters and our own production stacks. It pulls a published image from the container registry (no local source build) and bundles the application Postgres.
+
+### Container registry access
+
+The default image lives in a private Forgejo registry at `dev.a8n.run/psa-systems-private/mokosh-api`. Pulling it requires authentication; `docker compose pull` against this default without credentials fails with `unauthorized`.
+
+Two options for operators:
+
+1. **Log in to the upstream registry.** Request a registry access token (read-only PAT scoped to `read:package`) from the maintainers, then on the deploy host:
+
+   ```nu
+   docker login dev.a8n.run --username <your-account> --password-stdin
+   # paste the token, then Ctrl-D
+   ```
+
+   The credentials are cached in `~/.docker/config.json`; `docker compose pull` will use them automatically from then on.
+
+2. **Point at your own mirror.** Pull the image once (with credentials) on a machine that has access, push it to a registry you control, and set `MOKOSH_IMAGE` in `.env` to the new path:
+
+   ```nu
+   "MOKOSH_IMAGE=registry.example.com/mokosh/mokosh-api\n" | save --append .env
+   "MOKOSH_VERSION=v0.2.0\n" | save --append .env
+   ```
+
+   This is the recommended pattern for partner MSPs and air-gapped deployments.
+
+### Quickstart
+
+```nu
+# 1. Configure
+cp .env.example .env
+# Edit .env: set MOKOSH_PG_PASSWORD, JWT_SECRET, ENCRYPTION_KEY,
+# CORS_ORIGIN, BASE_URL, and (optionally) MOKOSH_VERSION to pin a tag.
+# To bootstrap the first admin user, also set ADMIN_EMAIL and
+# ADMIN_PASSWORD BEFORE the first `docker compose up` - the server
+# only creates the bootstrap account when the users table is empty.
+
+# 2. Authenticate to the container registry (see "Container registry
+#    access" above) OR set MOKOSH_IMAGE to a mirror you control.
+docker login dev.a8n.run
+
+# 3. Pull and start
+docker compose pull
+docker compose up --detach
+
+# 4. Confirm
+curl --include http://localhost:8080/api/v1/health
+curl --silent http://localhost:8080/api/v1/version | jq
+```
+
+### Applying updates
+
+Updates are deliberate operator actions. The running server exposes `GET /api/v1/version/check` which reports whether a newer release tag is available:
+
+```nu
+curl --silent http://localhost:8080/api/v1/version/check | jq
+# {
+#   "enabled": true,
+#   "running": "0.2.0",
+#   "latest": "v0.3.0",
+#   "update_available": true,
+#   "source_url": "https://dev.a8n.run/api/v1/repos/psa-systems/mokosh-server/releases/latest",
+#   "error": null
+# }
+```
+
+The lookup target is configured via `UPDATE_CHECK_URL` (any release feed that returns JSON with a `tag_name` field; defaults to the upstream Forgejo release endpoint). Leave `UPDATE_CHECK_URL` empty to disable - the endpoint then reports `enabled: false` and makes no network calls. Results are cached for 10 minutes inside the server process.
+
+To apply an available update:
+
+```nu
+# Optional: pin the new version in .env
+"MOKOSH_VERSION=v0.3.0\n" | save --append .env
+
+docker compose pull
+docker compose up --detach
+```
+
+### Image tags
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to `dev.a8n.run/psa-systems-private/mokosh-api` on every push to `main`. Operator tag policy:
+
+| Tag | Use |
+| --- | --- |
+| `:latest` | Tracks `main`. Acceptable for staging; not for production. |
+| `:vX.Y.Z` | Immutable release tag created by the `create-release` workflow. Use for production pins. |
 
 ## Repository layout
 
