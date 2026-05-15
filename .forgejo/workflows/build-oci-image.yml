@@ -44,19 +44,31 @@ jobs:
           docker buildx version
 
       # Register QEMU binfmt handlers for the non-native target archs so
-      # buildx can cross-build linux/arm64 on amd64 (and vice versa).
-      # Done inline with `tonistiigi/binfmt` because the upstream
+      # buildx can cross-build linux/arm64 on amd64. Done inline with
+      # `tonistiigi/binfmt` because the upstream
       # docker/setup-qemu-action@v3 writes into /opt/hostedtoolcache,
-      # which only exists on GitHub-hosted runners. On Forgejo's runners
-      # that path is missing and the action fails with EACCES. Running
-      # the image directly performs the same kernel-level binfmt
-      # registration without any tool-cache plumbing.
+      # which only exists on GitHub-hosted runners; on Forgejo runners
+      # that path is missing and the action fails with EACCES.
+      #
+      # Uninstall first to clear any stale registrations from a prior
+      # binfmt image on the host (mismatched registrations show up as
+      # `.buildkit_qemu_emulator: /bin/sh: Invalid ELF image for this
+      # architecture` once buildx tries to run the wrong emulator). Then
+      # install the canonical set via `--install all`, which is the
+      # exact invocation docker/setup-qemu-action uses internally.
       - name: Register QEMU binfmt handlers
         run: |
-          docker run --privileged --rm tonistiigi/binfmt:latest --install linux/amd64,linux/arm64
+          docker run --privileged --rm tonistiigi/binfmt:latest --uninstall 'qemu-*' || true
+          docker run --privileged --rm tonistiigi/binfmt:latest --install all
+          docker run --privileged --rm tonistiigi/binfmt:latest
 
+      # Re-create the multiarch builder from scratch so any cached
+      # QEMU emulator state from a previous (failed) run doesn't get
+      # reused. `buildx rm` is idempotent given `|| true`; the new
+      # container picks up the freshly-registered binfmt handlers.
       - name: Create buildx builder
         run: |
+          docker buildx rm multiarch || true
           docker buildx create --name multiarch --driver docker-container --use
           docker buildx inspect --bootstrap
 
