@@ -100,12 +100,18 @@ mod tests {
 
     #[test]
     fn derive_name_simple() {
-        assert_eq!(derive_name("admin@example.com"), ("Admin".into(), "Admin".into()));
+        assert_eq!(
+            derive_name("admin@example.com"),
+            ("Admin".into(), "Admin".into())
+        );
     }
 
     #[test]
     fn derive_name_dotted() {
-        assert_eq!(derive_name("jane.doe@example.com"), ("Jane".into(), "Doe".into()));
+        assert_eq!(
+            derive_name("jane.doe@example.com"),
+            ("Jane".into(), "Doe".into())
+        );
     }
 
     #[test]

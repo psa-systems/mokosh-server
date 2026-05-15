@@ -119,8 +119,7 @@ pub fn callback_html(payload: &JsonValue, client_origin: &str) -> Html<String> {
     // `serde_json::to_string` HTML-escapes `<`, `>`, and `&`, so this
     // is safe to embed inline in a <script> tag.
     let payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
-    let origin_json =
-        serde_json::to_string(client_origin).unwrap_or_else(|_| "\"\"".to_string());
+    let origin_json = serde_json::to_string(client_origin).unwrap_or_else(|_| "\"\"".to_string());
 
     let body = format!(
         r#"<!DOCTYPE html>

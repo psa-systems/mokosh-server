@@ -177,8 +177,7 @@ impl AuthService {
         let session_id = self
             .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
             .await?;
-        let (access_token, refresh_token, expires_at) =
-            self.generate_tokens(&user, session_id)?;
+        let (access_token, refresh_token, expires_at) = self.generate_tokens(&user, session_id)?;
         self.update_last_login(user.id).await?;
 
         Ok(LoginResponse {
@@ -203,11 +202,7 @@ impl AuthService {
             .or_else(|| google.email.split('@').nth(1).map(str::to_string))
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let role = if self
-            .super_admin_domains
-            .iter()
-            .any(|d| d == &domain)
-        {
+        let role = if self.super_admin_domains.iter().any(|d| d == &domain) {
             "super_admin"
         } else {
             "technician"
@@ -607,7 +602,14 @@ impl AuthService {
 
         let order_by = pagination.order_by(
             "created_at",
-            &["email", "first_name", "last_name", "role", "status", "created_at"],
+            &[
+                "email",
+                "first_name",
+                "last_name",
+                "role",
+                "status",
+                "created_at",
+            ],
         );
 
         let query = format!(
@@ -631,11 +633,10 @@ impl AuthService {
             .fetch_all(self.db.pool())
             .await?;
 
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
-                .bind(tenant_id)
-                .fetch_one(self.db.pool())
-                .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(self.db.pool())
+            .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }

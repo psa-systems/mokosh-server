@@ -1,4 +1,14 @@
-# Development Dockerfile - debug builds, source mounted via volumes
+# Development Dockerfile - debug builds. Source code (src/, crates/,
+# migrations/, Cargo.toml, Cargo.lock, build.rs) is mounted in via
+# compose volumes; the build target lives on a named volume so cargo's
+# incremental cache survives container restarts.
+#
+# The previous version of this image did a pre-build deps trick (stub
+# main.rs + cargo build) to populate /app/target. That was dead weight
+# in this setup because compose.dev.yml mounts mokosh-server-target
+# over /app/target, masking anything baked into the image. Each
+# developer's first `just dev` does the full compile into the named
+# volume; subsequent runs are incremental.
 FROM ghcr.io/niceguyit/rust-builder-glibc:v1.0.0-rust1.94-trixie
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
@@ -8,14 +18,6 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
 RUN mkdir --parents /app /data /config
 
 WORKDIR /app
-
-# Source code, manifests, migrations are all mounted from the host via
-# compose volumes. We deliberately do NOT pre-build with stub sources in
-# the image - that approach was leaving stale `target/` fingerprints
-# that confused cargo into a no-op rebuild when real sources arrived,
-# silently running an empty binary. First container start does a full
-# cargo build (~45s); subsequent starts hit the persisted target volume
-# cache.
 
 EXPOSE 4301
 

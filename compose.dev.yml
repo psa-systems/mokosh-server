@@ -126,6 +126,13 @@ services:
       POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
       POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
       POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
+      # Postgres 18 changed the default PGDATA from /var/lib/postgresql/
+      # data to /var/lib/postgresql/<major>/docker. We pin it back into
+      # the named volume so state survives container recreates regardless
+      # of the upstream image's default. Using a `pgdata` subdir of the
+      # mount point sidesteps the postgres-entrypoint quirk that refuses
+      # to initdb into a non-empty directory.
+      PGDATA: /var/lib/postgresql/data/pgdata
     networks:
       - private
     ports:
@@ -137,6 +144,60 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    # The postgres image only honours POSTGRES_PASSWORD on first
+    # volume init; subsequent runs against an existing volume keep
+    # whatever password was baked in originally. With dev volumes
+    # shared across session-rebuilds, that password regularly drifts
+    # from the current env value and the server fails to connect
+    # ("password authentication failed for user 'postgres'"). The
+    # entrypoint wrapper below runs the normal docker-entrypoint
+    # in the background, waits for the unix socket to come up
+    # (peer-trusted for the postgres user inside the container),
+    # idempotently `ALTER USER`s the password back to
+    # `$POSTGRES_PASSWORD`, then waits on the postgres process for
+    # the foreground. First-init paths still go through the standard
+    # docker-entrypoint flow; this only fixes the "existing volume,
+    # drifted password" case.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        docker-entrypoint.sh postgres &
+        pg_pid=$$!
+        # Wait for the unix socket (not TCP) so the ALTER below
+        # uses peer-trust, sidestepping the very password we want
+        # to reset.
+        until pg_isready -U "$$POSTGRES_USER" -h /var/run/postgresql -q 2>/dev/null; do
+            sleep 1
+        done
+        psql -U "$$POSTGRES_USER" -h /var/run/postgresql -d "$$POSTGRES_DB" \
+            -c "ALTER USER \"$$POSTGRES_USER\" WITH PASSWORD '$$POSTGRES_PASSWORD'" \
+            || echo "[entrypoint] ALTER USER failed (socket not trust-mode?); continuing"
+        wait "$$pg_pid"
+
+  # Mailpit captures every outgoing email locally. mokosh-server points
+  # SMTP_HOST=mailpit in the dev env (see the server service below); the
+  # web UI is at http://localhost:8025. State is intentionally
+  # ephemeral - no volume mount, restart clears the inbox. See
+  # docs/mokosh-smtp/01-dev-mailcatcher.md.
+  mailpit:
+    container_name: dev-mokosh-mailpit-${USER:?USER missing - run via just dev}
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_DELIVER: "false"
+    networks:
+      - private
+    ports:
+      # Loopback-only on both ports. Multiple developers on the same
+      # box can collide on the host's 1025/8025; if you hit that,
+      # publish on a different host port (mailpit's internal ports
+      # stay 1025/8025 either way).
+      - "127.0.0.1:1025:1025"  # SMTP submission (mokosh-server -> mailpit)
+      - "127.0.0.1:8025:8025"  # web UI (developer browser)
 
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
   # live reload via `cargo run`.
@@ -154,6 +215,21 @@ services:
       # Reach the in-stack postgres by service-DNS name.
       DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:-postgres}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
 
+      # Outbound email. Dev defaults point at the mailpit service
+      # alongside this one; messages land in http://localhost:8025.
+      # Production deploys override these via secrets; setting
+      # SMTP_HOST empty drops back to LogMailer (links go to docker
+      # logs). See docs/mokosh-smtp/03-config-and-bootstrap.md.
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # Display name MUST NOT contain unquoted parens; they're RFC 5322
+      # comment syntax. If you want "Mokosh (dev)" wrap it in quotes
+      # at the env-var level.
+      SMTP_FROM: ${SMTP_FROM:-Mokosh Dev <noreply@mokosh.localdev>}
+      SMTP_TLS: ${SMTP_TLS:-none}
+
       # Inside the compose network, reach Infisical by service-DNS, not the
       # published localhost port.
       INFISICAL_BASE_URL: http://infisical:8080
@@ -164,6 +240,24 @@ services:
 
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - run `just dev` (which copies .env.dev to .env)}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
+
+      # mokosh-auth (SSO / OIDC) configuration. The server boots without
+      # SSO if these are missing (legacy auth still serves /api/v1/*) so
+      # the optional `:-` form is intentional. Generate the keypair with
+      # `scripts/gen-oidc-key.sh`; the script writes into ./secrets which
+      # is mounted read-only into the container at /app/secrets below.
+      MOKOSH_AUTH_ISSUER: ${MOKOSH_AUTH_ISSUER:-}
+      MOKOSH_AUTH_COOKIE_DOMAIN: ${MOKOSH_AUTH_COOKIE_DOMAIN:-}
+      MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: ${MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH:-}
+      MOKOSH_AUTH_JWT_ACTIVE_KID: ${MOKOSH_AUTH_JWT_ACTIVE_KID:-}
+      MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: ${MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR:-}
+      MOKOSH_AUTH_DATA_ENCRYPTION_KEY: ${MOKOSH_AUTH_DATA_ENCRYPTION_KEY:-}
+      MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV: ${MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV:-}
+      MOKOSH_AUTH_DATA_KEY_VERSION: ${MOKOSH_AUTH_DATA_KEY_VERSION:-1}
+      MOKOSH_AUTH_ACCESS_TOKEN_TTL: ${MOKOSH_AUTH_ACCESS_TOKEN_TTL:-600}
+      MOKOSH_AUTH_REFRESH_TOKEN_TTL: ${MOKOSH_AUTH_REFRESH_TOKEN_TTL:-2592000}
+      MOKOSH_AUTH_REFRESH_IDLE_TTL: ${MOKOSH_AUTH_REFRESH_IDLE_TTL:-1209600}
+      MOKOSH_AUTH_OP_SESSION_TTL: ${MOKOSH_AUTH_OP_SESSION_TTL:-604800}
 
       # Google OAuth login. Consumed by the google-oauth-flow workspace
       # crate (Config::from_env()). The two secrets are required; the
@@ -199,13 +293,26 @@ services:
       - ./crates:/app/crates
       - ./Cargo.toml:/app/Cargo.toml
       - ./Cargo.lock:/app/Cargo.lock
+      # build.rs captures git hash / describe / build date as
+      # compile-time env vars consumed by src/version.rs. Without
+      # this mount cargo sees `build = "build.rs"` in Cargo.toml,
+      # cannot find the file, and fails the workspace compile.
+      - ./build.rs:/app/build.rs
       - ./migrations:/app/migrations
+      # OIDC signing keys generated by scripts/gen-oidc-key.sh. Mounted
+      # read-only so a container compromise cannot exfiltrate or rotate
+      # them in place.
+      - ./secrets:/app/secrets:ro
       - server-target:/app/target
     depends_on:
       postgres:
         condition: service_healthy
       infisical:
         condition: service_healthy
+      mailpit:
+        # No healthcheck on mailpit; it accepts SMTP from cold start.
+        # Wait for the container to be running, not healthy.
+        condition: service_started
 
 volumes:
   infisical-postgres-data:

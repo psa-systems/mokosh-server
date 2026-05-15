@@ -19,6 +19,11 @@ pub struct AppConfig {
     /// Exact origin allowed to receive `postMessage` from the Google
     /// OAuth callback HTML (the SPA's browser-visible origin).
     pub client_origin: String,
+    /// All origins permitted to make credentialed CORS requests against
+    /// the API. Defaults to `[client_origin]` if `CORS_ORIGIN` is unset.
+    /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
+    /// `https://msp.a8n.systems,https://a8n.systems`).
+    pub cors_origins: Vec<String>,
     /// Lowercased email-domain allowlist; first-time Google sign-ins
     /// from these domains are auto-promoted to role 'super_admin'.
     pub oauth_super_admin_domains: Vec<String>,
@@ -36,8 +41,9 @@ impl AppConfig {
             .collect();
 
         Ok(Self {
-            database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/mokosh".to_string()),
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
+            }),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -56,6 +62,19 @@ impl AppConfig {
                 .unwrap_or_else(|_| "32-byte-key-for-dev-only-change!".to_string()),
             client_origin: std::env::var("CLIENT_ORIGIN")
                 .unwrap_or_else(|_| "http://localhost:4301".to_string()),
+            cors_origins: std::env::var("CORS_ORIGIN")
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    vec![std::env::var("CLIENT_ORIGIN")
+                        .unwrap_or_else(|_| "http://localhost:4301".to_string())]
+                }),
             oauth_super_admin_domains,
         })
     }
@@ -110,6 +129,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Admin bootstrap failed: {}", e);
     }
 
+    // Try to bootstrap mokosh-auth first so the resulting key set can
+    // be passed into the PSA router as the at+jwt verifier. The PSA
+    // middleware then accepts SSO-issued access tokens alongside its
+    // own legacy HS256 cookies.
+    let (sso_router, at_jwt) = match try_bootstrap_sso(db.pool().clone()).await {
+        Ok(auth) => {
+            tracing::info!("SSO subsystem mounted (mokosh-auth)");
+            let issuer = auth.provider.cfg.issuer.as_str().to_string();
+            let verifier = mokosh_server::modules::auth::at_jwt::AtJwtVerifier::new(
+                auth.provider.keys.clone(),
+                issuer,
+            );
+            (Some(auth.router()), Some(verifier))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "SSO subsystem not mounted: {e}. The server will run with legacy auth only. \
+                 Set MOKOSH_AUTH_ISSUER, MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH, \
+                 MOKOSH_AUTH_JWT_ACTIVE_KID, MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, \
+                 and MOKOSH_AUTH_DATA_ENCRYPTION_KEY to enable SSO."
+            );
+            (None, None)
+        }
+    };
+
     // Build the Google OAuth client from env. Hard-fail at startup if the
     // env vars are missing - the /api/v1/auth/google routes would 500 on
     // every request otherwise, which is harder to diagnose.
@@ -124,14 +168,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in development. In any non-dev environment, set it.
     let cookie_secure = config.is_production();
 
-    let router = create_api_router(
-        db,
+    let psa_router = create_api_router(
+        db.clone(),
         config.jwt_secret,
         google_oauth,
         config.client_origin,
+        config.cors_origins,
         config.oauth_super_admin_domains,
         cookie_secure,
+        at_jwt,
     );
+    let router = match sso_router {
+        Some(sso) => psa_router.merge(sso),
+        None => psa_router,
+    };
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
@@ -144,4 +194,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     Ok(())
+}
+
+/// Try to bootstrap the SSO subsystem. Returns the full `MokoshAuth`
+/// handle so the caller can pull both the router and the key set out of
+/// it. On failure (typically required env vars not set in dev), the
+/// error is surfaced so the caller can fall back to legacy auth only.
+async fn try_bootstrap_sso(
+    pool: sqlx::PgPool,
+) -> Result<mokosh_auth::MokoshAuth, Box<dyn std::error::Error>> {
+    let auth_cfg = mokosh_auth::AuthConfig::from_env()?;
+    let auth = mokosh_auth::bootstrap(auth_cfg, pool).await?;
+    Ok(auth)
 }

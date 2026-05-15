@@ -1,0 +1,89 @@
+# Per-developer Traefik-routed dev instance for SSO testing.
+#
+# Layered ON TOP of compose.dev.yml:
+#   docker compose -f compose.dev.yml -f compose.dev-sso.yml up --build --detach
+#
+# `just dev-sso` is the supported entry point.
+#
+# What this overlay changes:
+#   - mokosh-server stops binding to the host LAN IP (Traefik does the
+#     terminating instead) and joins the shared `traefik-public` network.
+#   - Traefik labels route https://${USER}-mokosh-api.a8n.run to the
+#     container's $MOKOSH_PORT.
+#   - SSO env vars are pinned to the public URL so issued JWTs carry the
+#     right `iss` and the cookie domain spans `.a8n.run`.
+#
+# The project name is intentionally NOT redefined here. The base
+# compose.dev.yml already sets `name: dev-mokosh` and binds an explicit
+# non-prefixed network name (`dev-mokosh-private`); overriding the
+# project name would make compose see that network as foreign and
+# refuse to start. Per-developer isolation lives in container_name +
+# Traefik label keys, not in the project name.
+
+services:
+
+  # Service key MUST match the base file's `server`. main's
+  # ba236ae refactor renamed the base service from `mokosh-server` to
+  # `server`; if we use the old key here, compose treats this as a new
+  # service definition with neither image nor build context and
+  # refuses to start.
+  server:
+    container_name: dev-mokosh-server-${USER}
+    networks:
+      - private
+      - traefik-public
+    # Remove the LAN-IP host port binding from compose.dev.yml; Traefik
+    # is the only ingress for this profile.
+    ports: !reset []
+    labels:
+      traefik.enable: true
+      traefik.docker.network: network-traefik-public
+      traefik.http.routers.mokosh-api-${USER}.rule: Host(`${USER}-mokosh-api.a8n.run`)
+      traefik.http.routers.mokosh-api-${USER}.entrypoints: web-secure
+      traefik.http.routers.mokosh-api-${USER}.tls.certresolver: cert-cloudflare
+      traefik.http.services.mokosh-api-${USER}.loadbalancer.server.port: ${MOKOSH_PORT}
+    environment:
+      # Public URL the OP advertises to relying parties. The issuer goes
+      # into every signed JWT, the discovery doc, and JWKS URLs.
+      MOKOSH_AUTH_ISSUER: https://${USER}-mokosh-api.a8n.run
+      # Cross-subdomain SSO: cookies span every *.a8n.run app this user
+      # might add later. Mirrors saas / dmarc-reporter behaviour.
+      MOKOSH_AUTH_COOKIE_DOMAIN: .a8n.run
+      # Keys live in ./secrets, mounted at /app/secrets:ro by
+      # compose.dev.yml. `just ensure-oidc-keys` generates them if
+      # missing (kid=dev-key by convention).
+      MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: /app/secrets/dev-key.pem
+      MOKOSH_AUTH_JWT_ACTIVE_KID: dev-key
+      MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: /app/secrets
+      # Account-management email links (invites, password reset, signup
+      # complete) land on bunyip - it owns the user-account surface.
+      # mokosh-clients no longer hosts those pages once the bunyip hub
+      # is live; see docs/bunyip/07-sso-redirect-bridge.md.
+      MOKOSH_ACCEPT_BASE_URL: http://${USER}-bunyip.a8n.run
+      # Universal sign-in URL. /oauth2/authorize 302s unauthenticated
+      # users here with ?return_to=<authorize_query> so bunyip's login
+      # is the only sign-in screen any RP ever uses. Bunyip's LoginPage
+      # validates return_to, runs the password+MFA dance, then bounces
+      # to ${issuer}/oauth2/authorize?<return_to> so the freshly-set OP
+      # cookie closes the loop. See docs/bunyip/07-sso-redirect-bridge.md.
+      MOKOSH_AUTH_LOGIN_URL: http://${USER}-bunyip.a8n.run/login
+      # Enable public self-signup. PSA hub deploys keep this off
+      # (registration is admin-invite-gated); the a8n / individual SKU
+      # turns it on. Dev defaults on so we can smoke-test the flow.
+      # See docs/mokosh-auth/10-memberships-and-self-signup.md.
+      MOKOSH_PUBLIC_SIGNUP_ENABLED: "true"
+
+networks:
+  # The base compose.dev.yml normally owns and creates this network.
+  # We mark it external here so the overlay only ATTACHES rather than
+  # re-claiming ownership. Without this, compose refuses if the network
+  # exists with labels it doesn't recognise (e.g. from a prior
+  # project-name churn, or because another developer's worktree owns
+  # the same shared `name: dev-mokosh-private`). The just recipe runs
+  # `docker network create` defensively so a fresh host also works.
+  private:
+    external: true
+    name: dev-mokosh-private
+  traefik-public:
+    name: network-traefik-public
+    external: true
