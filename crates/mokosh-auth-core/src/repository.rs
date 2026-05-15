@@ -278,6 +278,35 @@ pub trait AuditLogger: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<AuditEntry>, AuthError>;
+
+    /// Filtered listing. Superset of `list_recent`: adds date-range,
+    /// free-text metadata search, and severity filter, plus a
+    /// `actor_email` LEFT JOIN on the users table so the SPA can
+    /// render names instead of raw UUIDs. The legacy `list_recent`
+    /// still exists for callers that haven't migrated.
+    async fn list_filtered(
+        &self,
+        tenant_id: TenantId,
+        filter: AuditListFilter,
+    ) -> Result<Vec<AuditEntry>, AuthError>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AuditListFilter {
+    pub kind: Option<String>,
+    pub actor_id: Option<UserId>,
+    /// Free-text search across the metadata JSON. ILIKE on
+    /// `metadata::text`, so callers should pass plain substrings.
+    pub search: Option<String>,
+    /// `info` / `warning` / `critical`. Other values are silently
+    /// ignored (no match).
+    pub severity: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub date_from: Option<DateTime<Utc>>,
+    /// Inclusive upper bound on `created_at`.
+    pub date_to: Option<DateTime<Utc>>,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +314,10 @@ pub struct AuditEntry {
     pub id: uuid::Uuid,
     pub tenant_id: Option<TenantId>,
     pub actor_id: Option<UserId>,
+    /// Email of the actor user, resolved via LEFT JOIN at query time.
+    /// `None` for system actions (`actor_id IS NULL`) or for actors
+    /// whose user row has been hard-deleted since.
+    pub actor_email: Option<String>,
     pub event_kind: String,
     pub severity: String,
     pub ip: Option<std::net::IpAddr>,
