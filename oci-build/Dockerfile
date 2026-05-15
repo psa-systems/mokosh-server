@@ -53,7 +53,6 @@ USER appuser
 
 ARG MOKOSH_GIT_HASH=""
 ARG MOKOSH_GIT_DESCRIBE=""
-LABEL org.opencontainers.image.source=https://dev.a8n.run/psa-systems/mokosh-server
 LABEL org.opencontainers.image.description="Mokosh Server"
 LABEL org.opencontainers.image.revision="${MOKOSH_GIT_HASH}"
 LABEL org.opencontainers.image.version="${MOKOSH_GIT_DESCRIBE}"
