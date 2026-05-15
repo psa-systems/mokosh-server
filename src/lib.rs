@@ -9,7 +9,6 @@ pub mod infisical;
 pub mod modules;
 pub mod utils;
 pub mod version;
-pub mod version_check;
 
 pub use db::Database;
 pub use modules::auth::{AuthState, CurrentUser};

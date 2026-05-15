@@ -43,35 +43,6 @@ jobs:
           docker version
           docker buildx version
 
-      # Register QEMU binfmt handlers for the non-native target archs so
-      # buildx can cross-build linux/arm64 on amd64. Done inline with
-      # `tonistiigi/binfmt` because the upstream
-      # docker/setup-qemu-action@v3 writes into /opt/hostedtoolcache,
-      # which only exists on GitHub-hosted runners; on Forgejo runners
-      # that path is missing and the action fails with EACCES.
-      #
-      # Uninstall first to clear any stale registrations from a prior
-      # binfmt image on the host (mismatched registrations show up as
-      # `.buildkit_qemu_emulator: /bin/sh: Invalid ELF image for this
-      # architecture` once buildx tries to run the wrong emulator). Then
-      # install the canonical set via `--install all`, which is the
-      # exact invocation docker/setup-qemu-action uses internally.
-      - name: Register QEMU binfmt handlers
-        run: |
-          docker run --privileged --rm tonistiigi/binfmt:latest --uninstall 'qemu-*' || true
-          docker run --privileged --rm tonistiigi/binfmt:latest --install all
-          docker run --privileged --rm tonistiigi/binfmt:latest
-
-      # Re-create the multiarch builder from scratch so any cached
-      # QEMU emulator state from a previous (failed) run doesn't get
-      # reused. `buildx rm` is idempotent given `|| true`; the new
-      # container picks up the freshly-registered binfmt handlers.
-      - name: Create buildx builder
-        run: |
-          docker buildx rm multiarch || true
-          docker buildx create --name multiarch --driver docker-container --use
-          docker buildx inspect --bootstrap
-
       - name: Set environment variables
         shell: nu {0}
         run: |
@@ -101,7 +72,7 @@ jobs:
           let tag_args = ($tags | each {|tag| [-t $"($registry)/($image):($tag)"]} | flatten)
           let cache_from = $"type=registry,ref=($registry)/($image):latest"
           print $"Building and pushing ($image) with tags: ($tags_str)"
-          ^docker buildx build --push --platform linux/amd64,linux/arm64 --cache-from $cache_from --cache-to type=inline --build-arg $"GIT_SHA=($env.GITHUB_SHA)" ...$tag_args -f oci-build/Dockerfile .
+          ^docker buildx build --push --cache-from $cache_from --cache-to type=inline --build-arg $"GIT_SHA=($env.GITHUB_SHA)" ...$tag_args -f oci-build/Dockerfile .
 
       - name: Print image URLs
         shell: nu {0}
