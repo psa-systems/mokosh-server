@@ -18,6 +18,7 @@ use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::calendar::calendar_routes;
+use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
@@ -58,6 +59,7 @@ pub fn create_api_router(
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
+    let settings_service = SettingsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -125,8 +127,8 @@ pub fn create_api_router(
         .nest("/rmm/devices", stub_routes())
         // Reports (stub)
         .nest("/reports", stub_routes())
-        // Settings (stub)
-        .nest("/settings", stub_routes())
+        // Settings: tenant settings + module configs. PMS-114.
+        .merge(settings_routes(settings_service))
         // Apply auth middleware
         .layer(middleware::from_fn_with_state(
             auth_middleware.clone(),
