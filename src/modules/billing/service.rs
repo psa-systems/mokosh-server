@@ -212,6 +212,218 @@ impl BillingService {
         self.get_invoice(tenant_id, invoice_id).await
     }
 
+    /// PMS-39: list payments. Optional filter on invoice_id and/or
+    /// company_id.
+    pub async fn list_payments(
+        &self,
+        tenant_id: Uuid,
+        filter: &PaymentFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<PaymentResponse>, u64)> {
+        let offset = pagination.offset() as i64;
+        let limit = pagination.limit() as i64;
+        let mut conditions = vec!["tenant_id = $1".to_string()];
+        let mut param_idx = 4;
+        if filter.invoice_id.is_some() {
+            conditions.push(format!("invoice_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if filter.company_id.is_some() {
+            conditions.push(format!("company_id = ${param_idx}"));
+        }
+        let where_clause = conditions.join(" AND ");
+        let order_by = pagination.order_by(
+            "payment_date DESC",
+            &["payment_date", "amount", "created_at"],
+        );
+        let query = format!(
+            r#"
+            SELECT id, tenant_id, invoice_id, company_id, payment_date, amount,
+                   payment_method, reference_number, gateway_transaction_id,
+                   notes, created_at
+            FROM payments
+            WHERE {where_clause}
+            ORDER BY {order_by}
+            LIMIT $2 OFFSET $3
+            "#
+        );
+        let count_query = format!("SELECT COUNT(*) FROM payments WHERE {where_clause}");
+        let mut q = sqlx::query_as::<_, PaymentRow>(&query)
+            .bind(tenant_id)
+            .bind(limit)
+            .bind(offset);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+        if let Some(iid) = filter.invoice_id {
+            q = q.bind(iid);
+            cq = cq.bind(iid);
+        }
+        if let Some(cid) = filter.company_id {
+            q = q.bind(cid);
+            cq = cq.bind(cid);
+        }
+        let rows = q.fetch_all(self.db.pool()).await?;
+        let total = cq.fetch_one(self.db.pool()).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// PMS-39: record a payment. When `invoice_id` is set, the linked
+    /// invoice's `amount_paid` is bumped and `balance_due` recomputed
+    /// in the same transaction; the status moves to `paid` (or
+    /// `partially_paid`) accordingly.
+    pub async fn create_payment(
+        &self,
+        tenant_id: Uuid,
+        request: &CreatePaymentRequest,
+    ) -> AppResult<PaymentResponse> {
+        let mut tx = self.db.pool().begin().await?;
+
+        let payment_id = Uuid::new_v4();
+        let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+            r#"
+            INSERT INTO payments (
+                id, tenant_id, invoice_id, company_id, payment_date, amount,
+                payment_method, reference_number, gateway_transaction_id, notes
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING created_at
+            "#,
+        )
+        .bind(payment_id)
+        .bind(tenant_id)
+        .bind(request.invoice_id)
+        .bind(request.company_id)
+        .bind(request.payment_date)
+        .bind(request.amount)
+        .bind(request.payment_method.as_str())
+        .bind(&request.reference_number)
+        .bind(&request.gateway_transaction_id)
+        .bind(&request.notes)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if let Some(invoice_id) = request.invoice_id {
+            // Pull the current totals + tenant guard.
+            let current: Option<(Decimal, Decimal)> = sqlx::query_as(
+                "SELECT total, amount_paid FROM invoices WHERE id = $1 AND tenant_id = $2",
+            )
+            .bind(invoice_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((total, prior_paid)) = current else {
+                return Err(AppError::NotFound("Invoice".to_string()));
+            };
+            let new_paid = prior_paid + request.amount;
+            let new_balance = total - new_paid;
+            let new_status = if new_balance <= Decimal::ZERO {
+                "paid"
+            } else if new_paid > Decimal::ZERO {
+                "partially_paid"
+            } else {
+                "sent"
+            };
+            let paid_at = if new_status == "paid" { Some(Utc::now()) } else { None };
+            sqlx::query(
+                r#"
+                UPDATE invoices SET
+                    amount_paid = $2,
+                    balance_due = $3,
+                    status      = $4,
+                    paid_at     = COALESCE($5, paid_at),
+                    updated_at  = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(invoice_id)
+            .bind(new_paid)
+            .bind(new_balance)
+            .bind(new_status)
+            .bind(paid_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(PaymentResponse {
+            id: payment_id,
+            tenant_id,
+            invoice_id: request.invoice_id,
+            company_id: request.company_id,
+            payment_date: request.payment_date,
+            amount: request.amount,
+            payment_method: request.payment_method,
+            reference_number: request.reference_number.clone(),
+            gateway_transaction_id: request.gateway_transaction_id.clone(),
+            notes: request.notes.clone(),
+            created_at,
+        })
+    }
+
+    /// PMS-39: delete a payment. Reverses the linked invoice's
+    /// `amount_paid` / `balance_due` / `status`. Hard delete is the
+    /// right call for unposted payments; once a payment has been
+    /// posted to accounting it should be voided through a credit
+    /// note instead - which is out of scope for this commit.
+    pub async fn delete_payment(&self, tenant_id: Uuid, payment_id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.pool().begin().await?;
+
+        let row: Option<(Option<Uuid>, Decimal)> = sqlx::query_as(
+            "SELECT invoice_id, amount FROM payments WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(payment_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((invoice_id, amount)) = row else {
+            return Err(AppError::NotFound("Payment".to_string()));
+        };
+
+        sqlx::query("DELETE FROM payments WHERE id = $1")
+            .bind(payment_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if let Some(invoice_id) = invoice_id {
+            let current: Option<(Decimal, Decimal)> = sqlx::query_as(
+                "SELECT total, amount_paid FROM invoices WHERE id = $1",
+            )
+            .bind(invoice_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((total, prior_paid)) = current {
+                let new_paid = (prior_paid - amount).max(Decimal::ZERO);
+                let new_balance = total - new_paid;
+                let new_status = if new_paid == Decimal::ZERO {
+                    "sent"
+                } else if new_balance <= Decimal::ZERO {
+                    "paid"
+                } else {
+                    "partially_paid"
+                };
+                sqlx::query(
+                    r#"
+                    UPDATE invoices SET
+                        amount_paid = $2,
+                        balance_due = $3,
+                        status      = $4,
+                        paid_at     = CASE WHEN $4 = 'paid' THEN paid_at ELSE NULL END,
+                        updated_at  = NOW()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(invoice_id)
+                .bind(new_paid)
+                .bind(new_balance)
+                .bind(new_status)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// PMS-38: update an invoice header and optionally replace its
     /// line items in one transaction. Rejects edits on
     /// `InvoiceStatus::is_frozen` invoices (sent, paid, partially paid,
@@ -367,6 +579,40 @@ impl BillingService {
         let mut resp: InvoiceResponse = row.into();
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         Ok(resp)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PaymentRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    invoice_id: Option<Uuid>,
+    company_id: Uuid,
+    payment_date: chrono::NaiveDate,
+    amount: Decimal,
+    payment_method: String,
+    reference_number: Option<String>,
+    gateway_transaction_id: Option<String>,
+    notes: Option<String>,
+    created_at: chrono::DateTime<Utc>,
+}
+
+impl From<PaymentRow> for PaymentResponse {
+    fn from(r: PaymentRow) -> Self {
+        Self {
+            id: r.id,
+            tenant_id: r.tenant_id,
+            invoice_id: r.invoice_id,
+            company_id: r.company_id,
+            payment_date: r.payment_date,
+            amount: r.amount,
+            payment_method: PaymentMethod::from_str(&r.payment_method)
+                .unwrap_or(PaymentMethod::Other),
+            reference_number: r.reference_number,
+            gateway_transaction_id: r.gateway_transaction_id,
+            notes: r.notes,
+            created_at: r.created_at,
+        }
     }
 }
 

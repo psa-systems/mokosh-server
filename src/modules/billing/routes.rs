@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use uuid::Uuid;
@@ -30,7 +30,45 @@ pub fn billing_routes(service: BillingService) -> Router {
     Router::new()
         .route("/invoices", get(list_invoices).post(create_invoice))
         .route("/invoices/{invoice_id}", get(get_invoice).put(update_invoice))
+        .route("/payments", get(list_payments).post(create_payment))
+        .route("/payments/{payment_id}", delete(delete_payment))
         .with_state(state)
+}
+
+async fn list_payments(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Query(filter): Query<PaymentFilter>,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<PaymentResponse>>> {
+    filter.validate()?;
+    let (payments, total) = state
+        .service
+        .list_payments(user.tenant_id, &filter, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(payments, &pagination, total)))
+}
+
+async fn create_payment(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Json(request): Json<CreatePaymentRequest>,
+) -> AppResult<Json<PaymentResponse>> {
+    request.validate()?;
+    let p = state.service.create_payment(user.tenant_id, &request).await?;
+    Ok(Json(p))
+}
+
+async fn delete_payment(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Path(payment_id): Path<Uuid>,
+) -> AppResult<()> {
+    state.service.delete_payment(user.tenant_id, payment_id).await?;
+    Ok(())
 }
 
 async fn update_invoice(
