@@ -49,6 +49,7 @@ pub fn portal_routes(service: PortalAuthService, tickets: TicketService) -> Rout
         .route("/tickets", get(list_tickets).post(create_ticket))
         .route("/tickets/{ticket_id}", get(get_ticket))
         .route("/invoices", get(list_invoices))
+        .route("/invoices/{invoice_id}", get(get_invoice))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -79,6 +80,15 @@ async fn list_invoices(
     // empty page so the portal frontend can render its "no invoices
     // yet" empty state without a follow-up branch on 501.
     Ok(Json(PaginatedResponse::from_params(vec![], &pagination, 0)))
+}
+
+async fn get_invoice(
+    RequirePortalAuth(_contact): RequirePortalAuth,
+    Path(_invoice_id): Path<Uuid>,
+) -> AppResult<Json<serde_json::Value>> {
+    // Same shape as list_invoices: 401 for unauth callers, 404 for
+    // everyone else, until billing lands.
+    Err(crate::utils::error::AppError::NotFound("Invoice".to_string()))
 }
 
 async fn get_ticket(
