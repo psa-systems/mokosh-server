@@ -50,6 +50,7 @@ pub fn portal_routes(service: PortalAuthService, tickets: TicketService) -> Rout
         .route("/tickets/{ticket_id}", get(get_ticket))
         .route("/invoices", get(list_invoices))
         .route("/invoices/{invoice_id}", get(get_invoice))
+        .route("/kb", get(list_kb))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -89,6 +90,18 @@ async fn get_invoice(
     // Same shape as list_invoices: 401 for unauth callers, 404 for
     // everyone else, until billing lands.
     Err(crate::utils::error::AppError::NotFound("Invoice".to_string()))
+}
+
+async fn list_kb(
+    RequirePortalAuth(_contact): RequirePortalAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<serde_json::Value>>> {
+    // Portal-visible KB articles. Will read against
+    // `knowledge_base.articles WHERE portal_visible = TRUE` (PMS-79
+    // story) once the KB module ships. Until then, an empty page lets
+    // the portal frontend render "no articles yet" without branching
+    // on 501.
+    Ok(Json(PaginatedResponse::from_params(vec![], &pagination, 0)))
 }
 
 async fn get_ticket(
