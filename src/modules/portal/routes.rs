@@ -48,6 +48,7 @@ pub fn portal_routes(service: PortalAuthService, tickets: TicketService) -> Rout
         .route("/auth/me", get(me))
         .route("/tickets", get(list_tickets).post(create_ticket))
         .route("/tickets/{ticket_id}", get(get_ticket))
+        .route("/invoices", get(list_invoices))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -66,6 +67,18 @@ async fn login(
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {
     Ok(Json(contact))
+}
+
+async fn list_invoices(
+    RequirePortalAuth(_contact): RequirePortalAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<serde_json::Value>>> {
+    // Auth is enforced (RequirePortalAuth) so unauthenticated callers
+    // still get 401 instead of an empty 200, but the read itself is a
+    // stub until the billing module (PMS-33 story) lands. Returns an
+    // empty page so the portal frontend can render its "no invoices
+    // yet" empty state without a follow-up branch on 501.
+    Ok(Json(PaginatedResponse::from_params(vec![], &pagination, 0)))
 }
 
 async fn get_ticket(
