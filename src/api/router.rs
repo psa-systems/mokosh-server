@@ -19,6 +19,7 @@ use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::calendar::calendar_routes;
 use crate::modules::contacts::{contact_routes, ContactService};
+use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::version::VersionInfo;
@@ -140,17 +141,13 @@ pub fn create_api_router(
             crate::modules::auth::middleware::auth_middleware,
         ));
 
-    // Build portal API routes (separate auth context)
+    // Build portal API routes. Portal identity is the contacts row,
+    // so this surface runs its own auth middleware (mounted inside
+    // `portal_routes`) and never sees `AuthMiddleware` / `AuthState`.
+    let portal_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
     let portal_api = Router::new()
         .route("/health", get(health_check))
-        // Portal auth
-        .nest("/auth", stub_routes())
-        // Portal tickets
-        .nest("/tickets", stub_routes())
-        // Portal invoices
-        .nest("/invoices", stub_routes())
-        // Portal KB
-        .nest("/kb", stub_routes());
+        .merge(portal_routes(portal_service));
 
     // CORS: SPA at msp.<tld> talks to msp-api.<tld> from a different origin,
     // so credentialed CORS must be tight (specific origins, not wildcard).
