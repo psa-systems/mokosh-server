@@ -18,6 +18,7 @@ use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::calendar::calendar_routes;
+use crate::modules::sla::{sla_routes, SlaService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
@@ -58,6 +59,7 @@ pub fn create_api_router(
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
+    let sla_service = SlaService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -104,9 +106,8 @@ pub fn create_api_router(
         // Contracts (stub)
         .nest("/contracts", stub_routes())
         .nest("/rate-cards", stub_routes())
-        // SLA (stub)
-        .nest("/sla-policies", stub_routes())
-        .nest("/business-hours", stub_routes())
+        // SLA: policies, targets, business hours, holidays, evaluator. PMS-107.
+        .merge(sla_routes(sla_service))
         // Billing (stub)
         .nest("/invoices", stub_routes())
         .nest("/payments", stub_routes())
