@@ -8,10 +8,11 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
+use uuid::Uuid;
 use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
@@ -46,6 +47,7 @@ pub fn portal_routes(service: PortalAuthService, tickets: TicketService) -> Rout
         // subsequent commits in this story.
         .route("/auth/me", get(me))
         .route("/tickets", get(list_tickets).post(create_ticket))
+        .route("/tickets/{ticket_id}", get(get_ticket))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -64,6 +66,18 @@ async fn login(
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {
     Ok(Json(contact))
+}
+
+async fn get_ticket(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(ticket_id): Path<Uuid>,
+) -> AppResult<Json<TicketResponse>> {
+    let resp = state
+        .tickets
+        .get_portal_ticket(contact.tenant_id, contact.company_id, ticket_id)
+        .await?;
+    Ok(Json(resp))
 }
 
 async fn list_tickets(
