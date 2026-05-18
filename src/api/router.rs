@@ -18,6 +18,7 @@ use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::calendar::calendar_routes;
+use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
@@ -58,6 +59,7 @@ pub fn create_api_router(
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
+    let kb_service = KbService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -114,9 +116,8 @@ pub fn create_api_router(
         .nest("/assets", stub_routes())
         .nest("/asset-types", stub_routes())
         .nest("/credentials", stub_routes())
-        // Knowledge base (stub)
-        .nest("/kb/articles", stub_routes())
-        .nest("/kb/categories", stub_routes())
+        // Knowledge base: categories + articles + versions + portal feed. PMS-80.
+        .merge(kb_routes(kb_service))
         // Notifications (stub)
         .nest("/notifications", stub_routes())
         .nest("/notification-channels", stub_routes())
