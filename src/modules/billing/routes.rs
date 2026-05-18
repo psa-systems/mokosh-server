@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use uuid::Uuid;
@@ -29,8 +29,23 @@ pub fn billing_routes(service: BillingService) -> Router {
     };
     Router::new()
         .route("/invoices", get(list_invoices).post(create_invoice))
-        .route("/invoices/{invoice_id}", get(get_invoice))
+        .route("/invoices/{invoice_id}", get(get_invoice).put(update_invoice))
         .with_state(state)
+}
+
+async fn update_invoice(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Path(invoice_id): Path<Uuid>,
+    Json(request): Json<UpdateInvoiceRequest>,
+) -> AppResult<Json<InvoiceResponse>> {
+    request.validate()?;
+    let inv = state
+        .service
+        .update_invoice(user.tenant_id, invoice_id, &request)
+        .await?;
+    Ok(Json(inv))
 }
 
 async fn create_invoice(

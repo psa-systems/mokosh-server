@@ -212,6 +212,121 @@ impl BillingService {
         self.get_invoice(tenant_id, invoice_id).await
     }
 
+    /// PMS-38: update an invoice header and optionally replace its
+    /// line items in one transaction. Rejects edits on
+    /// `InvoiceStatus::is_frozen` invoices (sent, paid, partially paid,
+    /// void, written off) - correction goes through a credit note,
+    /// which is out of scope for this commit.
+    pub async fn update_invoice(
+        &self,
+        tenant_id: Uuid,
+        invoice_id: Uuid,
+        request: &UpdateInvoiceRequest,
+    ) -> AppResult<InvoiceResponse> {
+        let current = self.get_invoice(tenant_id, invoice_id).await?;
+        if current.status.is_frozen() {
+            return Err(AppError::Conflict(format!(
+                "Invoice in status '{}' cannot be edited",
+                current.status.as_str()
+            )));
+        }
+
+        let mut tx = self.db.pool().begin().await?;
+
+        // Replace lines first (if requested) so the recomputed
+        // subtotal reflects the new set when we write the header.
+        let subtotal = if let Some(lines) = &request.lines {
+            sqlx::query("DELETE FROM invoice_lines WHERE invoice_id = $1")
+                .bind(invoice_id)
+                .execute(&mut *tx)
+                .await?;
+            let mut sub = Decimal::ZERO;
+            for line in lines {
+                let line_total = line.quantity * line.unit_price;
+                sub += line_total;
+                sqlx::query(
+                    r#"
+                    INSERT INTO invoice_lines (
+                        id, invoice_id, line_type, description, quantity,
+                        unit_price, total, ticket_id, project_id, sort_order
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    "#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(invoice_id)
+                .bind(line.line_type.as_str())
+                .bind(&line.description)
+                .bind(line.quantity)
+                .bind(line.unit_price)
+                .bind(line_total)
+                .bind(line.ticket_id)
+                .bind(line.project_id)
+                .bind(line.sort_order)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sub
+        } else {
+            current.subtotal
+        };
+
+        let tax = request.tax_amount.unwrap_or(current.tax_amount);
+        let discount = request.discount_amount.unwrap_or(current.discount_amount);
+        let total = subtotal + tax - discount;
+        let balance_due = total - current.amount_paid;
+
+        // `sent_at` is stamped when the status first moves to `sent`.
+        let status = request.status.unwrap_or(current.status);
+        let sent_at = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none() {
+            Some(Utc::now())
+        } else {
+            current.sent_at
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE invoices SET
+                billing_contact_id = COALESCE($2, billing_contact_id),
+                contract_id        = COALESCE($3, contract_id),
+                invoice_date       = COALESCE($4, invoice_date),
+                due_date           = COALESCE($5, due_date),
+                payment_terms      = COALESCE($6, payment_terms),
+                notes              = COALESCE($7, notes),
+                po_number          = COALESCE($8, po_number),
+                status             = $9,
+                subtotal           = $10,
+                tax_amount         = $11,
+                discount_amount    = $12,
+                total              = $13,
+                balance_due        = $14,
+                sent_at            = $15,
+                updated_at         = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(request.billing_contact_id)
+        .bind(request.contract_id)
+        .bind(request.invoice_date)
+        .bind(request.due_date)
+        .bind(request.payment_terms.as_deref())
+        .bind(request.notes.as_deref())
+        .bind(request.po_number.as_deref())
+        .bind(status.as_str())
+        .bind(subtotal)
+        .bind(tax)
+        .bind(discount)
+        .bind(total)
+        .bind(balance_due)
+        .bind(sent_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        self.get_invoice(tenant_id, invoice_id).await
+    }
+
     /// PMS-36: read a single invoice with `lines` populated. 404 when
     /// the id is outside the tenant.
     pub async fn get_invoice(
