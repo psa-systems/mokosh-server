@@ -766,6 +766,109 @@ impl AuthService {
         Ok(())
     }
 
+    /// Issue a personal API key. Returns the raw key once; thereafter
+    /// only the `key_prefix` and an argon2 hash of the full key are
+    /// persisted. The first 10 chars of `psa_xxxx...` become the
+    /// `key_prefix` lookup column so future bearer auth can find the
+    /// row in O(log n) before doing the expensive hash compare.
+    pub async fn create_api_key(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        request: &crate::modules::auth::models::CreateApiKeyRequest,
+    ) -> AppResult<crate::modules::auth::models::CreateApiKeyResponse> {
+        use crate::utils::crypto::generate_api_key;
+
+        let raw_key = generate_api_key();
+        // `psa_` + 40 alnum = 44 chars; prefix is 10 chars.
+        let key_prefix: String = raw_key.chars().take(10).collect();
+        let key_hash = hash_password(&raw_key)?;
+
+        let id = Uuid::new_v4();
+        let scopes = request.scopes.clone().unwrap_or_else(|| vec!["*".to_string()]);
+        let scopes_json = serde_json::to_value(&scopes).map_err(|e| {
+            AppError::Internal(format!("api key scopes serialise: {e}"))
+        })?;
+
+        let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+            r#"
+            INSERT INTO api_keys (
+                id, tenant_id, user_id, name, key_prefix, key_hash, scopes,
+                expires_at, is_active
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
+            RETURNING created_at
+            "#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(&request.name)
+        .bind(&key_prefix)
+        .bind(&key_hash)
+        .bind(scopes_json)
+        .bind(request.expires_at)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(crate::modules::auth::models::CreateApiKeyResponse {
+            id,
+            name: request.name.clone(),
+            key: raw_key,
+            key_prefix,
+            scopes,
+            expires_at: request.expires_at,
+            created_at,
+        })
+    }
+
+    /// List API keys owned by `user_id`. Never returns secret material.
+    pub async fn list_api_keys(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<Vec<crate::modules::auth::models::ApiKeyResponse>> {
+        let rows = sqlx::query_as::<_, ApiKeyRow>(
+            r#"
+            SELECT id, name, key_prefix, scopes, last_used_at, expires_at,
+                   is_active, created_at
+            FROM api_keys
+            WHERE tenant_id = $1 AND user_id = $2
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Revoke (hard-delete) an API key. Scoped to the calling user +
+    /// tenant so a stolen session for user A cannot kill user B's keys.
+    pub async fn revoke_api_key(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        key_id: Uuid,
+    ) -> AppResult<()> {
+        let affected = sqlx::query(
+            "DELETE FROM api_keys WHERE id = $1 AND tenant_id = $2 AND user_id = $3",
+        )
+        .bind(key_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+
+        if affected == 0 {
+            return Err(AppError::NotFound("API key".to_string()));
+        }
+        Ok(())
+    }
+
     /// List users in a tenant, paginated. Audit F1.
     pub async fn list_users(
         &self,
@@ -1072,6 +1175,45 @@ impl From<UserRow> for User {
             settings: row.settings,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+#[derive(sqlx::FromRow)]
+struct ApiKeyRow {
+    id: Uuid,
+    name: String,
+    key_prefix: String,
+    scopes: serde_json::Value,
+    last_used_at: Option<chrono::DateTime<Utc>>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    is_active: bool,
+    created_at: chrono::DateTime<Utc>,
+}
+
+#[cfg(feature = "server")]
+impl From<ApiKeyRow> for crate::modules::auth::models::ApiKeyResponse {
+    fn from(row: ApiKeyRow) -> Self {
+        // Stored as JSONB; tolerate either ["scope1", ...] or other
+        // shapes by falling back to `["*"]` rather than 500ing on a
+        // hand-edited DB.
+        let scopes = match row.scopes {
+            serde_json::Value::Array(arr) => arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => vec!["*".to_string()],
+        };
+        Self {
+            id: row.id,
+            name: row.name,
+            key_prefix: row.key_prefix,
+            scopes,
+            last_used_at: row.last_used_at,
+            expires_at: row.expires_at,
+            is_active: row.is_active,
+            created_at: row.created_at,
         }
     }
 }

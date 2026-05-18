@@ -15,10 +15,11 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    google_login, rate_limit, AuthService, ChangePasswordRequest, CreateUserRequest,
-    ForgotPasswordRequest, LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest,
-    MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest,
-    SessionInfo, UpdateUserRequest, UserResponse,
+    google_login, rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest,
+    CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest,
+    LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest, MfaSetupResponse,
+    RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest, SessionInfo,
+    UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
@@ -87,6 +88,10 @@ pub fn auth_routes(
         .route("/me/mfa/setup", post(start_mfa_enrollment))
         .route("/me/mfa/enable", post(enable_mfa))
         .route("/me/mfa/disable", post(disable_mfa))
+        // Personal API keys
+        .route("/me/api-keys", get(list_api_keys))
+        .route("/me/api-keys", post(create_api_key))
+        .route("/me/api-keys/{key_id}", delete(revoke_api_key))
         // User management (admin only)
         .route("/users", get(list_users))
         .route("/users", post(create_user))
@@ -299,6 +304,46 @@ async fn disable_mfa(
     state
         .auth_service
         .disable_mfa(user.id, &request.password)
+        .await?;
+    Ok(())
+}
+
+/// List the caller's personal API keys. Never includes secret material.
+async fn list_api_keys(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<Vec<ApiKeyResponse>>> {
+    let keys = state
+        .auth_service
+        .list_api_keys(user.tenant_id, user.id)
+        .await?;
+    Ok(Json(keys))
+}
+
+/// Mint a new personal API key. The raw key is returned ONCE in the
+/// response; callers must store it client-side immediately.
+async fn create_api_key(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<CreateApiKeyRequest>,
+) -> AppResult<Json<CreateApiKeyResponse>> {
+    request.validate()?;
+    let resp = state
+        .auth_service
+        .create_api_key(user.tenant_id, user.id, &request)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// Revoke an API key. Scoped to the calling user + tenant.
+async fn revoke_api_key(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(key_id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .auth_service
+        .revoke_api_key(user.tenant_id, user.id, key_id)
         .await?;
     Ok(())
 }

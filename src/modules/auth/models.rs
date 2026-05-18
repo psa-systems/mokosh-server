@@ -412,6 +412,51 @@ impl From<User> for UserResponse {
     }
 }
 
+/// Create a new personal API key. The raw key is returned ONCE in
+/// [`CreateApiKeyResponse::key`]; the database only ever stores the
+/// `key_prefix` (search index) and an argon2 hash of the rest. The
+/// scope list defaults to `["*"]` (full account access) to match the
+/// `api_keys.scopes` column default, but callers should pin a tighter
+/// list when the key only needs read access.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateApiKeyRequest {
+    #[validate(length(min = 1, max = 100, message = "Name must be 1-100 chars"))]
+    pub name: String,
+    /// Optional ISO-8601 expiry. `None` means the key never expires.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Optional scope list. `None` -> the existing schema default `["*"]`.
+    pub scopes: Option<Vec<String>>,
+}
+
+/// One-time create response. The raw `key` is shown once and never
+/// stored or returned again.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateApiKeyResponse {
+    pub id: Uuid,
+    pub name: String,
+    /// The raw bearer token. Surface this to the user immediately and
+    /// never echo it from any other endpoint.
+    pub key: String,
+    pub key_prefix: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Sanitised representation of an `api_keys` row. Used by list and
+/// get. Never carries the secret material.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub key_prefix: String,
+    pub scopes: Vec<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Session information
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
