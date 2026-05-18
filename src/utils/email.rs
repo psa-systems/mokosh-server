@@ -32,6 +32,12 @@ pub trait Mailer: Send + Sync {
         display_name: &str,
         setup_link: &str,
     ) -> AppResult<()>;
+
+    /// Generic plain-text mail. Escape hatch for notification flows
+    /// that don't fit a typed helper above (e.g. ticket-note
+    /// notifications, ad-hoc alerts). Prefer a typed helper when adding
+    /// a recurring template; reserve this for one-off bodies.
+    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()>;
 }
 
 /// Dev mailer. Writes the link to `tracing` so smoke tests work without
@@ -62,6 +68,17 @@ impl Mailer for LogMailer {
             name = %display_name,
             link = %setup_link,
             "[DEV] would send welcome email",
+        );
+        Ok(())
+    }
+
+    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
+        tracing::info!(
+            target: "mokosh_server.mailer",
+            to = %to,
+            subject = %subject,
+            body_len = body.len(),
+            "[DEV] would send text email",
         );
         Ok(())
     }
@@ -199,6 +216,19 @@ impl Mailer for SmtpMailer {
             .subject("Welcome to Mokosh")
             .multipart(MultiPart::alternative_plain_html(text, html))?;
 
+        self.transport.send(msg).await?;
+        Ok(())
+    }
+
+    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
+        let to_mailbox: Mailbox = to
+            .parse()
+            .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
+        let msg = Message::builder()
+            .from(self.from.clone())
+            .to(to_mailbox)
+            .subject(subject.to_string())
+            .body(body.to_string())?;
         self.transport.send(msg).await?;
         Ok(())
     }

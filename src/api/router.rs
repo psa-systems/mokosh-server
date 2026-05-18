@@ -59,12 +59,12 @@ pub fn create_api_router(
         db.clone(),
         jwt_secret.clone(),
         super_admin_domains,
-        mailer,
+        mailer.clone(),
         client_origin.clone(),
     );
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
-    let ticket_service = TicketService::new(db.clone());
+    let ticket_service = TicketService::with_mailer(db.clone(), mailer);
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of

@@ -1,9 +1,11 @@
 //! Ticket service implementation
 
 use chrono::Utc;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -15,12 +17,27 @@ use super::models::*;
 pub struct TicketService {
     db: Database,
     automation: AutomationEngine,
+    mailer: Arc<dyn Mailer>,
 }
 
 impl TicketService {
+    /// Build a TicketService backed by `LogMailer`. Kept so call sites
+    /// that don't need real SMTP (test factories, the legacy
+    /// constructor) keep compiling.
     pub fn new(db: Database) -> Self {
+        Self::with_mailer(db, Arc::new(LogMailer))
+    }
+
+    /// Build a TicketService wired to a specific mailer. Used from
+    /// `create_api_router` so add-note notifications share the SMTP
+    /// path as auth's password-reset / welcome emails.
+    pub fn with_mailer(db: Database, mailer: Arc<dyn Mailer>) -> Self {
         let automation = AutomationEngine::new(db.clone());
-        Self { db, automation }
+        Self {
+            db,
+            automation,
+            mailer,
+        }
     }
 
     /// Generate next ticket number for tenant
@@ -500,9 +517,81 @@ impl TicketService {
             .await?;
         }
 
-        // TODO: Send email if send_email is true
+        // PMS-15: customer notification on public notes. Internal notes
+        // never leave the building no matter what `send_email` says.
+        // The notifications module (PMS-85 story) will own templating
+        // and watcher fan-out; until then we send a single plain-text
+        // message to the ticket's contact and record success on the
+        // note row so the UI can show a "delivered" indicator.
+        if request.send_email && request.note_type == NoteType::Public {
+            self.send_note_email(tenant_id, ticket_id, note_id, &request.content)
+                .await;
+        }
 
         self.get_note(tenant_id, note_id).await
+    }
+
+    /// Fire-and-forget email for a public ticket note. Failures are
+    /// logged; we never surface a 5xx for a note add when only the
+    /// email side fails, because the note itself is already persisted
+    /// and visible to the agent.
+    async fn send_note_email(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        note_id: Uuid,
+        content: &str,
+    ) {
+        // One round-trip fetches ticket-number/title + contact email.
+        let row: Option<(String, String, Option<String>)> = match sqlx::query_as(
+            r#"
+            SELECT t.ticket_number, t.title, ct.email
+            FROM tickets t
+            LEFT JOIN contacts ct ON t.contact_id = ct.id
+            WHERE t.tenant_id = $1 AND t.id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(self.db.pool())
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(?e, %ticket_id, "fetch contact for note email failed");
+                return;
+            }
+        };
+
+        let Some((ticket_number, title, Some(email))) = row else {
+            tracing::debug!(
+                %ticket_id,
+                "skipping note email: ticket has no contact with an email",
+            );
+            return;
+        };
+
+        let subject = format!("[{ticket_number}] {title}");
+        let body = format!(
+            "A new update has been added to ticket {ticket_number}:\n\n{content}\n",
+        );
+
+        match self.mailer.send_text(&email, &subject, &body).await {
+            Ok(()) => {
+                if let Err(e) = sqlx::query(
+                    "UPDATE ticket_notes SET is_email_sent = TRUE, email_sent_at = NOW() WHERE id = $1",
+                )
+                .bind(note_id)
+                .execute(self.db.pool())
+                .await
+                {
+                    tracing::warn!(?e, %note_id, "mark is_email_sent failed");
+                } else {
+                    tracing::info!(%note_id, "ticket note email sent");
+                }
+            }
+            Err(e) => tracing::warn!(?e, %note_id, "ticket note email send failed"),
+        }
     }
 
     /// Get note by ID
