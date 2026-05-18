@@ -29,10 +29,11 @@ impl TicketService {
     }
 
     /// Build a TicketService wired to a specific mailer. Used from
-    /// `create_api_router` so add-note notifications share the SMTP
-    /// path as auth's password-reset / welcome emails.
+    /// `create_api_router` so add-note notifications and the
+    /// automation-rule send_notification action share the SMTP path as
+    /// auth's password-reset / welcome emails.
     pub fn with_mailer(db: Database, mailer: Arc<dyn Mailer>) -> Self {
-        let automation = AutomationEngine::new(db.clone());
+        let automation = AutomationEngine::with_deps(db.clone(), mailer.clone());
         Self {
             db,
             automation,

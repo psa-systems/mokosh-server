@@ -6,9 +6,13 @@
 //! - Scheduled triggers
 //! - SLA breach/warning triggers
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::AppResult;
 
 use super::models::*;
@@ -17,11 +21,26 @@ use super::models::*;
 #[derive(Clone)]
 pub struct AutomationEngine {
     db: Database,
+    mailer: Arc<dyn Mailer>,
+    http: reqwest::Client,
 }
 
 impl AutomationEngine {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self::with_deps(db, Arc::new(LogMailer))
+    }
+
+    /// Build with an explicit mailer. The HTTP client used for the
+    /// `webhook` action is created here with a 10-second timeout; one
+    /// misbehaving endpoint should not stall the rest of the rule
+    /// chain.
+    pub fn with_deps(db: Database, mailer: Arc<dyn Mailer>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent("mokosh-server/automation")
+            .build()
+            .expect("reqwest client builds with default config");
+        Self { db, mailer, http }
     }
 
     /// Process automation rules for a trigger type
@@ -232,20 +251,88 @@ impl AutomationEngine {
                     }
                 }
                 "send_notification" => {
-                    // TODO: Trigger notification through notification module
-                    tracing::info!(
-                        "Would send notification for ticket {} with params {:?}",
-                        ticket_id,
-                        action.params
-                    );
+                    // Today the rules engine speaks email only. When the
+                    // notifications module (PMS-85) lands, this branch
+                    // will hand off to its dispatcher so the rule author
+                    // gets channels + templates + watcher fan-out for
+                    // free. Until then, `params.to` is required.
+                    let to = action.params.get("to").and_then(|v| v.as_str());
+                    let subject = action
+                        .params
+                        .get("subject")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Mokosh ticket update");
+                    let body = action
+                        .params
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("A ticket you watch has been updated.");
+                    match to {
+                        Some(addr) if !addr.is_empty() => {
+                            if let Err(e) = self.mailer.send_text(addr, subject, body).await {
+                                tracing::warn!(
+                                    ?e, %ticket_id, rule = %rule.name,
+                                    "send_notification email failed",
+                                );
+                            }
+                        }
+                        _ => tracing::warn!(
+                            %ticket_id, rule = %rule.name,
+                            "send_notification action missing 'to' param",
+                        ),
+                    }
                 }
                 "webhook" => {
-                    // TODO: Execute webhook
-                    tracing::info!(
-                        "Would execute webhook for ticket {} with params {:?}",
-                        ticket_id,
-                        action.params
-                    );
+                    // Required: params.url. Optional: params.method
+                    // (default POST), params.payload (default a small
+                    // JSON envelope naming the ticket + rule). Failures
+                    // log and continue; one bad webhook should not abort
+                    // the rule chain.
+                    let Some(url) = action.params.get("url").and_then(|v| v.as_str()) else {
+                        tracing::warn!(
+                            %ticket_id, rule = %rule.name,
+                            "webhook action missing 'url' param",
+                        );
+                        continue;
+                    };
+                    let method = action
+                        .params
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("POST")
+                        .to_ascii_uppercase();
+                    let payload = action.params.get("payload").cloned().unwrap_or_else(|| {
+                        serde_json::json!({
+                            "tenant_id": tenant_id,
+                            "ticket_id": ticket_id,
+                            "rule_id": rule.id,
+                            "rule_name": rule.name,
+                        })
+                    });
+
+                    let request_builder = match method.as_str() {
+                        "GET" => self.http.get(url),
+                        "PUT" => self.http.put(url).json(&payload),
+                        "PATCH" => self.http.patch(url).json(&payload),
+                        "DELETE" => self.http.delete(url),
+                        _ => self.http.post(url).json(&payload),
+                    };
+                    match request_builder.send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            tracing::info!(
+                                %ticket_id, rule = %rule.name, status = %resp.status(),
+                                "automation webhook delivered",
+                            );
+                        }
+                        Ok(resp) => tracing::warn!(
+                            %ticket_id, rule = %rule.name, status = %resp.status(),
+                            "automation webhook returned non-2xx",
+                        ),
+                        Err(e) => tracing::warn!(
+                            ?e, %ticket_id, rule = %rule.name,
+                            "automation webhook send failed",
+                        ),
+                    }
                 }
                 _ => {
                     tracing::warn!("Unknown automation action type: {}", action.action_type);
