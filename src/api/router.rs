@@ -55,7 +55,10 @@ pub fn create_api_router(
         .collect();
     // Create services
     let auth_service = AuthService::new(db.clone(), jwt_secret.clone(), super_admin_domains);
+    #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
+    #[cfg(not(feature = "multi-tenant"))]
+    let _ = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
 
@@ -84,8 +87,13 @@ pub fn create_api_router(
                 cookie_secure,
             ),
         )
-        // Tenant management (multi-tenant mode)
-        .nest("/tenants", tenant_routes(tenant_service))
+        // Tenant management. Only mounted in multi-tenant builds: in a
+        // single-tenant deployment there is exactly one tenant and the
+        // CRUD endpoints would be a foot-gun. PMS-24.
+        ;
+    #[cfg(feature = "multi-tenant")]
+    let api_v1 = api_v1.nest("/tenants", tenant_routes(tenant_service));
+    let api_v1 = api_v1
         // Contact management
         .nest("/contacts", contact_routes(contact_service.clone()))
         .nest("/companies", Router::new()) // Alias handled by contact routes
