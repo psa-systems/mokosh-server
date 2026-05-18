@@ -64,6 +64,22 @@ pub struct PortalLoginResponse {
     pub contact: CurrentContact,
 }
 
+/// Customer-facing ticket creation. Intentionally narrower than the
+/// agent-side `CreateTicketRequest`: a contact can describe the
+/// problem and pick urgency, but everything else (assignment,
+/// scheduling, contract/SLA picks, billing flags) is the agent's
+/// call after triage. `company_id` and `contact_id` come from the
+/// `RequirePortalAuth` extractor; the source is hard-coded to
+/// `Portal`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreatePortalTicketRequest {
+    #[validate(length(min = 1, max = 200, message = "Title is required (1-200 chars)"))]
+    pub title: String,
+    pub description: Option<String>,
+    pub priority_id: Option<Uuid>,
+    pub type_id: Option<Uuid>,
+}
+
 /// JWT claim shape for portal access tokens. Kept separate from the
 /// agent-side `JwtClaims` to avoid type drift if one side learns new
 /// fields.

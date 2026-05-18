@@ -145,9 +145,10 @@ pub fn create_api_router(
     // so this surface runs its own auth middleware (mounted inside
     // `portal_routes`) and never sees `AuthMiddleware` / `AuthState`.
     let portal_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
+    let portal_ticket_service = TicketService::new(db.clone());
     let portal_api = Router::new()
         .route("/health", get(health_check))
-        .merge(portal_routes(portal_service));
+        .merge(portal_routes(portal_service, portal_ticket_service));
 
     // CORS: SPA at msp.<tld> talks to msp-api.<tld> from a different origin,
     // so credentialed CORS must be tight (specific origins, not wildcard).

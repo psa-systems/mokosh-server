@@ -16,29 +16,35 @@ use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
-use super::{CurrentContact, PortalLoginRequest, PortalLoginResponse};
+use super::{
+    CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse,
+};
+use crate::modules::tickets::{TicketResponse, TicketService};
 use crate::utils::error::AppResult;
 
 #[derive(Clone)]
 pub struct PortalRouterState {
     pub service: Arc<PortalAuthService>,
+    pub tickets: Arc<TicketService>,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
 /// at the outermost layer so every handler sees either a valid
 /// `PortalAuthState` or the default (unauthenticated) one.
-pub fn portal_routes(service: PortalAuthService) -> Router {
+pub fn portal_routes(service: PortalAuthService, tickets: TicketService) -> Router {
     let state = PortalRouterState {
         service: Arc::new(service.clone()),
+        tickets: Arc::new(tickets),
     };
     let mw = PortalAuthMiddleware::new(service);
 
     Router::new()
         // Public: login. No auth required to call this.
         .route("/auth/login", post(login))
-        // Protected: profile + the tickets/invoices/kb sub-routers
-        // mounted by other commits in this story.
+        // Protected: profile + ticket creation. List + get arrive in
+        // subsequent commits in this story.
         .route("/auth/me", get(me))
+        .route("/tickets", post(create_ticket))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -57,4 +63,25 @@ async fn login(
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {
     Ok(Json(contact))
+}
+
+async fn create_ticket(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Json(request): Json<CreatePortalTicketRequest>,
+) -> AppResult<Json<TicketResponse>> {
+    request.validate()?;
+    let resp = state
+        .tickets
+        .create_portal_ticket(
+            contact.tenant_id,
+            contact.company_id,
+            contact.id,
+            request.title,
+            request.description,
+            request.priority_id,
+            request.type_id,
+        )
+        .await?;
+    Ok(Json(resp))
 }
