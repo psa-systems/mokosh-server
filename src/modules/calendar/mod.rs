@@ -1,16 +1,19 @@
-//! Calendar / appointments module.
+//! Calendar / scheduling module.
 //!
-//! v0.1.0 scope: a tenant-scoped `GET /api/v1/calendar/events` endpoint that
-//! returns `Vec<CalendarEvent>` filtered by `from` / `to` query params. No
-//! persistence yet - the handler returns an empty vec so the frontend can
-//! wire up real fetch logic with a graceful fall-back to its demo data. A
-//! follow-up adds a `calendar_events` table, repository, and create/update/delete
-//! routes; the frontend's disabled "New Appointment" CTA enables itself once
-//! the create endpoint exists.
+//! Original v0.1.0 surface (`GET /api/v1/calendar/events`) stays; the
+//! PMS-58 story extends it with:
+//! - appointments CRUD (`/appointments`)
+//! - user availability windows (`/users/:id/availability`)
+//! - time off (`/time-off`)
+//! - on-call schedules + "who's on call now" (`/on-call-schedules`, `/on-call/now`)
 
+pub mod models;
 mod routes;
+pub mod service;
 
+pub use models::*;
 pub use routes::calendar_routes;
+pub use service::CalendarService;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
