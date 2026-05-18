@@ -86,9 +86,13 @@ pub fn create_api_router(
         )
         // Tenant management (multi-tenant mode)
         .nest("/tenants", tenant_routes(tenant_service))
-        // Contact management
+        // Contact management. The canonical company endpoints live
+        // under `/api/v1/contacts/companies/...` (one router for
+        // companies + contacts + sites); a previous `nest("/companies",
+        // Router::new())` here was dead - it matched nothing, so
+        // `/api/v1/companies` returned a misleading 404 with no
+        // explanation. Removed and documented (PMS-20).
         .nest("/contacts", contact_routes(contact_service.clone()))
-        .nest("/companies", Router::new()) // Alias handled by contact routes
         // Ticketing
         .nest("/tickets", ticket_routes(ticket_service))
         // Time tracking (stub)
