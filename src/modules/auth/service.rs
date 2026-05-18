@@ -540,8 +540,51 @@ impl AuthService {
         .await?;
 
         if request.send_welcome_email {
-            // TODO: Send welcome email with password setup link
-            tracing::info!("Welcome email would be sent to {}", request.email);
+            // Reuse the password_reset_tokens machinery so the recipient
+            // can pick a password without going through "Forgot password"
+            // first. 7-day window: long enough for admins who batch-create
+            // accounts ahead of an onboarding day, short enough that a
+            // leaked link is bounded.
+            let token = generate_token(64);
+            let token_hash = hash_password(&token)?;
+            let expires_at = Utc::now() + Duration::days(7);
+            sqlx::query(
+                r#"
+                INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(&token_hash)
+            .bind(expires_at)
+            .execute(self.db.pool())
+            .await?;
+
+            let setup_link =
+                format!("{}/reset-password/{}", self.frontend_base_url, token);
+            let display_name = match (
+                request.first_name.trim(),
+                request.last_name.trim(),
+            ) {
+                ("", "") => String::new(),
+                (f, "") => f.to_string(),
+                ("", l) => l.to_string(),
+                (f, l) => format!("{f} {l}"),
+            };
+            if let Err(e) = self
+                .mailer
+                .send_welcome(&request.email, &display_name, &setup_link)
+                .await
+            {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = ?e,
+                    "welcome email send failed; setup token persisted but unreachable",
+                );
+            } else {
+                tracing::info!(user_id = %user_id, "welcome email queued");
+            }
         }
 
         self.get_user_by_id(user_id).await
