@@ -34,7 +34,72 @@ pub fn billing_routes(service: BillingService) -> Router {
         .route("/payments/{payment_id}", delete(delete_payment))
         .route("/payment-gateways", get(list_payment_gateways).put(upsert_payment_gateway))
         .route("/payment-gateways/{provider}", delete(delete_payment_gateway))
+        .route("/tax-rates", get(list_tax_rates).post(create_tax_rate))
+        .route(
+            "/tax-rates/{id}",
+            put(update_tax_rate).delete(delete_tax_rate),
+        )
+        .route("/tax-rates/lookup", get(lookup_tax_rate))
         .with_state(state)
+}
+
+async fn list_tax_rates(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+) -> AppResult<Json<Vec<TaxRateResponse>>> {
+    let rates = state.service.list_tax_rates(user.tenant_id).await?;
+    Ok(Json(rates))
+}
+
+async fn create_tax_rate(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Json(request): Json<UpsertTaxRateRequest>,
+) -> AppResult<Json<TaxRateResponse>> {
+    request.validate()?;
+    let r = state.service.create_tax_rate(user.tenant_id, &request).await?;
+    Ok(Json(r))
+}
+
+async fn update_tax_rate(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertTaxRateRequest>,
+) -> AppResult<Json<TaxRateResponse>> {
+    request.validate()?;
+    let r = state
+        .service
+        .update_tax_rate(user.tenant_id, id, &request)
+        .await?;
+    Ok(Json(r))
+}
+
+async fn delete_tax_rate(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state.service.delete_tax_rate(user.tenant_id, id).await?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct LookupQuery {
+    name: String,
+}
+
+async fn lookup_tax_rate(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(q): Query<LookupQuery>,
+) -> AppResult<Json<TaxRateResponse>> {
+    let r = state.service.lookup_tax_rate(user.tenant_id, &q.name).await?;
+    Ok(Json(r))
 }
 
 async fn list_payment_gateways(

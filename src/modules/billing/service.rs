@@ -232,6 +232,165 @@ impl BillingService {
         self.get_invoice(tenant_id, invoice_id).await
     }
 
+    /// PMS-41: list all tax rates for the tenant. Includes inactive
+    /// ones so admins can see history; filter client-side as needed.
+    pub async fn list_tax_rates(&self, tenant_id: Uuid) -> AppResult<Vec<TaxRateResponse>> {
+        let rows = sqlx::query_as::<_, TaxRateRow>(
+            r#"
+            SELECT id, name, rate, is_default, is_active
+            FROM tax_rates
+            WHERE tenant_id = $1
+            ORDER BY is_default DESC, name
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// PMS-41: create a tax rate. If `is_default = true`, demote any
+    /// existing default first so only one rate is the tenant default.
+    pub async fn create_tax_rate(
+        &self,
+        tenant_id: Uuid,
+        request: &UpsertTaxRateRequest,
+    ) -> AppResult<TaxRateResponse> {
+        let mut tx = self.db.pool().begin().await?;
+        if request.is_default {
+            sqlx::query("UPDATE tax_rates SET is_default = FALSE WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO tax_rates (tenant_id, name, rate, is_default, is_active)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(request.rate)
+        .bind(request.is_default)
+        .bind(request.is_active)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(TaxRateResponse {
+            id,
+            name: request.name.clone(),
+            rate: request.rate,
+            is_default: request.is_default,
+            is_active: request.is_active,
+        })
+    }
+
+    /// PMS-41: update a tax rate. Same default-demote behaviour as create.
+    pub async fn update_tax_rate(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        request: &UpsertTaxRateRequest,
+    ) -> AppResult<TaxRateResponse> {
+        let mut tx = self.db.pool().begin().await?;
+        if request.is_default {
+            sqlx::query(
+                "UPDATE tax_rates SET is_default = FALSE WHERE tenant_id = $1 AND id <> $2",
+            )
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let affected = sqlx::query(
+            r#"
+            UPDATE tax_rates SET
+                name       = $3,
+                rate       = $4,
+                is_default = $5,
+                is_active  = $6,
+                updated_at = NOW()
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(request.rate)
+        .bind(request.is_default)
+        .bind(request.is_active)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(AppError::NotFound("TaxRate".to_string()));
+        }
+        tx.commit().await?;
+        Ok(TaxRateResponse {
+            id,
+            name: request.name.clone(),
+            rate: request.rate,
+            is_default: request.is_default,
+            is_active: request.is_active,
+        })
+    }
+
+    /// PMS-41: delete a tax rate.
+    pub async fn delete_tax_rate(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+        let affected = sqlx::query("DELETE FROM tax_rates WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(self.db.pool())
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(AppError::NotFound("TaxRate".to_string()));
+        }
+        Ok(())
+    }
+
+    /// PMS-41: jurisdiction lookup. The schema has no dedicated
+    /// jurisdiction column, so we treat `tax_rates.name` as the
+    /// jurisdiction key (e.g. "US-CA", "EU-DE"). Returns the active
+    /// rate for the supplied name, or the tenant's default if no name
+    /// matches.
+    pub async fn lookup_tax_rate(
+        &self,
+        tenant_id: Uuid,
+        jurisdiction: &str,
+    ) -> AppResult<TaxRateResponse> {
+        let row = sqlx::query_as::<_, TaxRateRow>(
+            r#"
+            SELECT id, name, rate, is_default, is_active
+            FROM tax_rates
+            WHERE tenant_id = $1 AND name = $2 AND is_active = TRUE
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(jurisdiction)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some(r) = row {
+            return Ok(r.into());
+        }
+        let fallback = sqlx::query_as::<_, TaxRateRow>(
+            r#"
+            SELECT id, name, rate, is_default, is_active
+            FROM tax_rates
+            WHERE tenant_id = $1 AND is_default = TRUE AND is_active = TRUE
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("TaxRate".to_string()))?;
+        Ok(fallback.into())
+    }
+
     /// PMS-40: list payment gateway configs for the tenant. Each
     /// response carries the *decrypted* config so a finance admin can
     /// confirm what's wired without an extra round-trip to a "reveal"
@@ -697,6 +856,27 @@ impl BillingService {
         let mut resp: InvoiceResponse = row.into();
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         Ok(resp)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct TaxRateRow {
+    id: Uuid,
+    name: String,
+    rate: Decimal,
+    is_default: bool,
+    is_active: bool,
+}
+
+impl From<TaxRateRow> for TaxRateResponse {
+    fn from(r: TaxRateRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            rate: r.rate,
+            is_default: r.is_default,
+            is_active: r.is_active,
+        }
     }
 }
 
