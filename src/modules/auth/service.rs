@@ -5,12 +5,16 @@ use chrono::{Duration, Utc};
 #[cfg(feature = "server")]
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 #[cfg(feature = "server")]
+use std::sync::Arc;
+#[cfg(feature = "server")]
 use uuid::Uuid;
 
 #[cfg(feature = "server")]
 use crate::db::Database;
 #[cfg(feature = "server")]
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
+#[cfg(feature = "server")]
+use crate::utils::email::{LogMailer, Mailer};
 #[cfg(feature = "server")]
 use crate::utils::error::{AppError, AppResult};
 
@@ -29,18 +33,46 @@ pub struct AuthService {
     /// auto-promoted to role 'super_admin'. Existing users are never
     /// re-roled.
     super_admin_domains: Vec<String>,
+    /// Outbound transactional email. Defaults to `LogMailer` so unit
+    /// constructions that do not need real SMTP keep working.
+    mailer: Arc<dyn Mailer>,
+    /// Public-facing SPA origin used as the prefix for password-reset
+    /// and welcome links sent in transactional email. Equal to
+    /// `AppConfig::client_origin`.
+    frontend_base_url: String,
 }
 
 #[cfg(feature = "server")]
 impl AuthService {
     /// Create a new auth service.
     pub fn new(db: Database, jwt_secret: String, super_admin_domains: Vec<String>) -> Self {
+        Self::with_mailer(
+            db,
+            jwt_secret,
+            super_admin_domains,
+            Arc::new(LogMailer),
+            "http://localhost:4301".to_string(),
+        )
+    }
+
+    /// Create a new auth service with an explicit mailer + frontend
+    /// origin. `frontend_base_url` is used as the prefix for any link
+    /// the service emails to a user (password reset, welcome).
+    pub fn with_mailer(
+        db: Database,
+        jwt_secret: String,
+        super_admin_domains: Vec<String>,
+        mailer: Arc<dyn Mailer>,
+        frontend_base_url: String,
+    ) -> Self {
         Self {
             db,
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
             super_admin_domains,
+            mailer,
+            frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -349,8 +381,18 @@ impl AuthService {
         .execute(self.db.pool())
         .await?;
 
-        // TODO: Send password reset email with token
-        tracing::info!("Password reset requested for user {}", user.id);
+        let reset_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
+        if let Err(e) = self.mailer.send_password_reset(&user.email, &reset_link).await {
+            // Log but do not leak details to the caller; the public
+            // surface stays enumeration-resistant either way.
+            tracing::warn!(
+                user_id = %user.id,
+                error = ?e,
+                "password reset email send failed; token is persisted but unreachable",
+            );
+        } else {
+            tracing::info!(user_id = %user.id, "password reset email queued");
+        }
 
         Ok(())
     }

@@ -126,10 +126,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Environment
 dotenvy = "0.15"
 
-# Email. The host crate uses lettre only for error-type conversions
-# in src/utils/error.rs. LettreMailer itself lives in
-# crates/mokosh-auth-http and pulls the same workspace dep there.
+# Email. Lettre powers the host-crate `Mailer` (utils/email.rs); the
+# SSO subsystem keeps its own LettreMailer in crates/mokosh-auth-http.
 lettre = { workspace = true }
+async-trait = { workspace = true }
+secrecy = { workspace = true }
 
 # HTTP client (for integrations)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
