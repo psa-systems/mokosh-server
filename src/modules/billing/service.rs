@@ -99,6 +99,119 @@ impl BillingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// PMS-37: create an invoice with its line items in one
+    /// transaction. Atomically increments `invoice_sequences.last_number`
+    /// (per tenant) for the human-readable invoice number; computes
+    /// `subtotal = sum(line.total)` and `total = subtotal + tax -
+    /// discount`. `balance_due` is initialised to `total`; payments
+    /// move it down via PMS-39.
+    pub async fn create_invoice(
+        &self,
+        tenant_id: Uuid,
+        request: &CreateInvoiceRequest,
+    ) -> AppResult<InvoiceResponse> {
+        let mut tx = self.db.pool().begin().await?;
+
+        // Per-tenant invoice sequence is row-locked by UPDATE
+        // RETURNING; concurrent invoice creates serialise on this row
+        // so numbers are dense and unique.
+        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
+            r#"
+            UPDATE invoice_sequences
+            SET last_number = last_number + 1
+            WHERE tenant_id = $1
+            RETURNING last_number, prefix
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (next_number, prefix) = match seq_row {
+            Some(v) => v,
+            None => {
+                // First invoice for this tenant: seed the sequence row.
+                sqlx::query(
+                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
+                )
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+                (1, Some("INV-".to_string()))
+            }
+        };
+        let invoice_number = format!("{}{:06}", prefix.unwrap_or_else(|| "INV-".to_string()), next_number);
+
+        // Compute totals from the supplied lines. Tax / discount are
+        // optional - default to 0.
+        let subtotal: Decimal = request
+            .lines
+            .iter()
+            .map(|l| l.quantity * l.unit_price)
+            .sum();
+        let tax = request.tax_amount.unwrap_or(Decimal::ZERO);
+        let discount = request.discount_amount.unwrap_or(Decimal::ZERO);
+        let total = subtotal + tax - discount;
+
+        let invoice_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO invoices (
+                id, tenant_id, invoice_number, company_id, billing_contact_id,
+                contract_id, status, invoice_date, due_date, payment_terms,
+                subtotal, tax_amount, discount_amount, total, amount_paid,
+                balance_due, currency, notes, po_number
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
+                    $12, $13, 0, $13, $14, $15, $16)
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(&invoice_number)
+        .bind(request.company_id)
+        .bind(request.billing_contact_id)
+        .bind(request.contract_id)
+        .bind(request.invoice_date)
+        .bind(request.due_date)
+        .bind(&request.payment_terms)
+        .bind(subtotal)
+        .bind(tax)
+        .bind(discount)
+        .bind(total)
+        .bind(request.currency.as_deref().unwrap_or("USD"))
+        .bind(&request.notes)
+        .bind(&request.po_number)
+        .execute(&mut *tx)
+        .await?;
+
+        for line in &request.lines {
+            sqlx::query(
+                r#"
+                INSERT INTO invoice_lines (
+                    id, invoice_id, line_type, description, quantity, unit_price,
+                    total, ticket_id, project_id, sort_order
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(invoice_id)
+            .bind(line.line_type.as_str())
+            .bind(&line.description)
+            .bind(line.quantity)
+            .bind(line.unit_price)
+            .bind(line.quantity * line.unit_price)
+            .bind(line.ticket_id)
+            .bind(line.project_id)
+            .bind(line.sort_order)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        self.get_invoice(tenant_id, invoice_id).await
+    }
+
     /// PMS-36: read a single invoice with `lines` populated. 404 when
     /// the id is outside the tenant.
     pub async fn get_invoice(
