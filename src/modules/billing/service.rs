@@ -14,11 +14,31 @@ use super::models::*;
 #[derive(Clone)]
 pub struct BillingService {
     db: Database,
+    /// 32-byte AES-256-GCM key used to encrypt
+    /// `payment_gateway_configs.config_encrypted` at rest. Sourced from
+    /// `AppConfig::encryption_key`; falls back to a zero-key for the
+    /// default `new()` constructor so non-production callers stay
+    /// compilable.
+    encryption_key: [u8; 32],
 }
 
 impl BillingService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            encryption_key: [0u8; 32],
+        }
+    }
+
+    /// Production constructor: takes the same `ENCRYPTION_KEY` env that
+    /// auth uses for token encryption. Hands the key down to the
+    /// payment-gateway-config write path so secrets never hit the DB
+    /// in cleartext.
+    pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
+        Self {
+            db,
+            encryption_key,
+        }
     }
 
     /// PMS-35: paginated + filterable invoice list. `lines` is left
@@ -210,6 +230,104 @@ impl BillingService {
 
         tx.commit().await?;
         self.get_invoice(tenant_id, invoice_id).await
+    }
+
+    /// PMS-40: list payment gateway configs for the tenant. Each
+    /// response carries the *decrypted* config so a finance admin can
+    /// confirm what's wired without an extra round-trip to a "reveal"
+    /// endpoint.
+    pub async fn list_payment_gateways(
+        &self,
+        tenant_id: Uuid,
+    ) -> AppResult<Vec<PaymentGatewayConfigResponse>> {
+        let rows = sqlx::query_as::<_, PaymentGatewayRow>(
+            r#"
+            SELECT id, provider, is_active, is_test_mode, config_encrypted
+            FROM payment_gateway_configs
+            WHERE tenant_id = $1
+            ORDER BY provider
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                let decrypted = crate::utils::crypto::decrypt(
+                    &r.config_encrypted,
+                    &self.encryption_key,
+                )?;
+                let config: serde_json::Value =
+                    serde_json::from_str(&decrypted).unwrap_or(serde_json::Value::Null);
+                Ok(PaymentGatewayConfigResponse {
+                    id: r.id,
+                    provider: GatewayProvider::from_str(&r.provider)
+                        .unwrap_or(GatewayProvider::Stripe),
+                    is_active: r.is_active,
+                    is_test_mode: r.is_test_mode,
+                    config,
+                })
+            })
+            .collect()
+    }
+
+    /// PMS-40: upsert a payment gateway config. `(tenant_id, provider)`
+    /// is unique in the schema, so the same call ends up insert-or-update.
+    /// Encrypts the `config` blob at rest with the host encryption key.
+    pub async fn upsert_payment_gateway(
+        &self,
+        tenant_id: Uuid,
+        request: &UpsertPaymentGatewayConfigRequest,
+    ) -> AppResult<PaymentGatewayConfigResponse> {
+        let plaintext = serde_json::to_string(&request.config).map_err(|e| {
+            AppError::BadRequest(format!("config must serialise to JSON: {e}"))
+        })?;
+        let encrypted =
+            crate::utils::crypto::encrypt(&plaintext, &self.encryption_key)?;
+
+        let id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO payment_gateway_configs
+                (tenant_id, provider, is_active, is_test_mode, config_encrypted)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (tenant_id, provider) DO UPDATE SET
+                is_active        = EXCLUDED.is_active,
+                is_test_mode     = EXCLUDED.is_test_mode,
+                config_encrypted = EXCLUDED.config_encrypted,
+                updated_at       = NOW()
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(request.provider.as_str())
+        .bind(request.is_active)
+        .bind(request.is_test_mode)
+        .bind(&encrypted)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(PaymentGatewayConfigResponse {
+            id,
+            provider: request.provider,
+            is_active: request.is_active,
+            is_test_mode: request.is_test_mode,
+            config: request.config.clone(),
+        })
+    }
+
+    /// PMS-40: delete a payment gateway config. No-op if absent.
+    pub async fn delete_payment_gateway(
+        &self,
+        tenant_id: Uuid,
+        provider: GatewayProvider,
+    ) -> AppResult<()> {
+        sqlx::query("DELETE FROM payment_gateway_configs WHERE tenant_id = $1 AND provider = $2")
+            .bind(tenant_id)
+            .bind(provider.as_str())
+            .execute(self.db.pool())
+            .await?;
+        Ok(())
     }
 
     /// PMS-39: list payments. Optional filter on invoice_id and/or
@@ -580,6 +698,15 @@ impl BillingService {
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         Ok(resp)
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct PaymentGatewayRow {
+    id: Uuid,
+    provider: String,
+    is_active: bool,
+    is_test_mode: bool,
+    config_encrypted: String,
 }
 
 #[derive(sqlx::FromRow)]

@@ -32,7 +32,48 @@ pub fn billing_routes(service: BillingService) -> Router {
         .route("/invoices/{invoice_id}", get(get_invoice).put(update_invoice))
         .route("/payments", get(list_payments).post(create_payment))
         .route("/payments/{payment_id}", delete(delete_payment))
+        .route("/payment-gateways", get(list_payment_gateways).put(upsert_payment_gateway))
+        .route("/payment-gateways/{provider}", delete(delete_payment_gateway))
         .with_state(state)
+}
+
+async fn list_payment_gateways(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+) -> AppResult<Json<Vec<PaymentGatewayConfigResponse>>> {
+    let gateways = state.service.list_payment_gateways(user.tenant_id).await?;
+    Ok(Json(gateways))
+}
+
+async fn upsert_payment_gateway(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Json(request): Json<UpsertPaymentGatewayConfigRequest>,
+) -> AppResult<Json<PaymentGatewayConfigResponse>> {
+    request.validate()?;
+    let g = state
+        .service
+        .upsert_payment_gateway(user.tenant_id, &request)
+        .await?;
+    Ok(Json(g))
+}
+
+async fn delete_payment_gateway(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Path(provider): Path<String>,
+) -> AppResult<()> {
+    let provider = GatewayProvider::from_str(&provider).ok_or_else(|| {
+        crate::utils::error::AppError::BadRequest(format!("unknown provider {provider:?}"))
+    })?;
+    state
+        .service
+        .delete_payment_gateway(user.tenant_id, provider)
+        .await?;
+    Ok(())
 }
 
 async fn list_payments(

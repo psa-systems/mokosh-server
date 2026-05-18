@@ -46,6 +46,9 @@ pub fn create_api_router(
     super_admin_domains: Vec<String>,
     cookie_secure: bool,
     at_jwt: Option<AtJwtVerifier>,
+    // 32-byte AES-256-GCM key. Used for at-rest encryption of any
+    // per-tenant secret material (today: payment-gateway configs).
+    encryption_key: [u8; 32],
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -59,7 +62,7 @@ pub fn create_api_router(
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
-    let billing_service = BillingService::new(db.clone());
+    let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of

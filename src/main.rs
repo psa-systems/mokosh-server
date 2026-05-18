@@ -168,6 +168,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in development. In any non-dev environment, set it.
     let cookie_secure = config.is_production();
 
+    let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
+        .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -177,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.oauth_super_admin_domains,
         cookie_secure,
         at_jwt,
+        encryption_key,
     );
     let router = match sso_router {
         Some(sso) => psa_router.merge(sso),
