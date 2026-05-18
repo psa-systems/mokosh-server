@@ -53,59 +53,11 @@ async fn list_tickets(
 ) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
     // F9: validate filter inputs.
     filter.validate()?;
-    let (tickets, total) = state
+    let (responses, total) = state
         .ticket_service
-        .list_tickets(user.tenant_id, &filter, &pagination)
+        .list_ticket_responses(user.tenant_id, &filter, &pagination)
         .await?;
-
-    // Convert to response format with related data
-    let responses: Vec<TicketResponse> = tickets
-        .into_iter()
-        .map(|t| {
-            let sla_status = t.sla_status();
-            TicketResponse {
-                id: t.id,
-                ticket_number: t.ticket_number,
-                title: t.title,
-                description: t.description,
-                status: super::TicketStatusSummary {
-                    id: t.status_id,
-                    name: String::new(), // Would be joined from DB
-                    color: String::new(),
-                    is_closed: false,
-                },
-                priority: super::TicketPrioritySummary {
-                    id: t.priority_id,
-                    name: String::new(),
-                    color: String::new(),
-                },
-                type_name: None,
-                category_name: None,
-                queue_name: String::new(),
-                source: t.source,
-                company_id: t.company_id,
-                company_name: String::new(),
-                contact_id: t.contact_id,
-                contact_name: None,
-                assigned_to_id: t.assigned_to_id,
-                assigned_to_name: None,
-                sla_due_date: t.sla_due_date,
-                sla_status,
-                is_billable: t.is_billable,
-                billing_status: t.billing_status,
-                estimated_hours: t.estimated_hours,
-                actual_hours: t.actual_hours,
-                tags: t.tags,
-                created_by_name: String::new(),
-                created_at: t.created_at,
-                updated_at: t.updated_at,
-            }
-        })
-        .collect();
-
-    let response = PaginatedResponse::from_params(responses, &pagination, total);
-
-    Ok(Json(response))
+    Ok(Json(PaginatedResponse::from_params(responses, &pagination, total)))
 }
 
 async fn create_ticket(
@@ -114,51 +66,15 @@ async fn create_ticket(
     Json(request): Json<CreateTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
     request.validate()?;
-
     let ticket = state
         .ticket_service
         .create_ticket(user.tenant_id, user.id, &request)
         .await?;
-
-    // Convert to response
-    let sla_status = ticket.sla_status();
-    Ok(Json(TicketResponse {
-        id: ticket.id,
-        ticket_number: ticket.ticket_number,
-        title: ticket.title,
-        description: ticket.description,
-        status: super::TicketStatusSummary {
-            id: ticket.status_id,
-            name: String::new(),
-            color: String::new(),
-            is_closed: false,
-        },
-        priority: super::TicketPrioritySummary {
-            id: ticket.priority_id,
-            name: String::new(),
-            color: String::new(),
-        },
-        type_name: None,
-        category_name: None,
-        queue_name: String::new(),
-        source: ticket.source,
-        company_id: ticket.company_id,
-        company_name: String::new(),
-        contact_id: ticket.contact_id,
-        contact_name: None,
-        assigned_to_id: ticket.assigned_to_id,
-        assigned_to_name: None,
-        sla_due_date: ticket.sla_due_date,
-        sla_status,
-        is_billable: ticket.is_billable,
-        billing_status: ticket.billing_status,
-        estimated_hours: ticket.estimated_hours,
-        actual_hours: ticket.actual_hours,
-        tags: ticket.tags,
-        created_by_name: user.full_name(),
-        created_at: ticket.created_at,
-        updated_at: ticket.updated_at,
-    }))
+    let resp = state
+        .ticket_service
+        .get_ticket_response(user.tenant_id, ticket.id)
+        .await?;
+    Ok(Json(resp))
 }
 
 async fn get_ticket(
@@ -166,49 +82,11 @@ async fn get_ticket(
     RequireAuth(user): RequireAuth,
     Path(ticket_id): Path<Uuid>,
 ) -> AppResult<Json<TicketResponse>> {
-    let ticket = state
+    let resp = state
         .ticket_service
-        .get_ticket(user.tenant_id, ticket_id)
+        .get_ticket_response(user.tenant_id, ticket_id)
         .await?;
-
-    let sla_status = ticket.sla_status();
-    Ok(Json(TicketResponse {
-        id: ticket.id,
-        ticket_number: ticket.ticket_number,
-        title: ticket.title,
-        description: ticket.description,
-        status: super::TicketStatusSummary {
-            id: ticket.status_id,
-            name: String::new(),
-            color: String::new(),
-            is_closed: false,
-        },
-        priority: super::TicketPrioritySummary {
-            id: ticket.priority_id,
-            name: String::new(),
-            color: String::new(),
-        },
-        type_name: None,
-        category_name: None,
-        queue_name: String::new(),
-        source: ticket.source,
-        company_id: ticket.company_id,
-        company_name: String::new(),
-        contact_id: ticket.contact_id,
-        contact_name: None,
-        assigned_to_id: ticket.assigned_to_id,
-        assigned_to_name: None,
-        sla_due_date: ticket.sla_due_date,
-        sla_status,
-        is_billable: ticket.is_billable,
-        billing_status: ticket.billing_status,
-        estimated_hours: ticket.estimated_hours,
-        actual_hours: ticket.actual_hours,
-        tags: ticket.tags,
-        created_by_name: String::new(),
-        created_at: ticket.created_at,
-        updated_at: ticket.updated_at,
-    }))
+    Ok(Json(resp))
 }
 
 async fn update_ticket(
@@ -218,50 +96,15 @@ async fn update_ticket(
     Json(request): Json<UpdateTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
     request.validate()?;
-
-    let ticket = state
+    state
         .ticket_service
         .update_ticket(user.tenant_id, ticket_id, user.id, &request)
         .await?;
-
-    let sla_status = ticket.sla_status();
-    Ok(Json(TicketResponse {
-        id: ticket.id,
-        ticket_number: ticket.ticket_number,
-        title: ticket.title,
-        description: ticket.description,
-        status: super::TicketStatusSummary {
-            id: ticket.status_id,
-            name: String::new(),
-            color: String::new(),
-            is_closed: false,
-        },
-        priority: super::TicketPrioritySummary {
-            id: ticket.priority_id,
-            name: String::new(),
-            color: String::new(),
-        },
-        type_name: None,
-        category_name: None,
-        queue_name: String::new(),
-        source: ticket.source,
-        company_id: ticket.company_id,
-        company_name: String::new(),
-        contact_id: ticket.contact_id,
-        contact_name: None,
-        assigned_to_id: ticket.assigned_to_id,
-        assigned_to_name: None,
-        sla_due_date: ticket.sla_due_date,
-        sla_status,
-        is_billable: ticket.is_billable,
-        billing_status: ticket.billing_status,
-        estimated_hours: ticket.estimated_hours,
-        actual_hours: ticket.actual_hours,
-        tags: ticket.tags,
-        created_by_name: String::new(),
-        created_at: ticket.created_at,
-        updated_at: ticket.updated_at,
-    }))
+    let resp = state
+        .ticket_service
+        .get_ticket_response(user.tenant_id, ticket_id)
+        .await?;
+    Ok(Json(resp))
 }
 
 #[derive(serde::Deserialize)]
@@ -275,49 +118,15 @@ async fn assign_ticket(
     Path(ticket_id): Path<Uuid>,
     Json(request): Json<AssignRequest>,
 ) -> AppResult<Json<TicketResponse>> {
-    let ticket = state
+    state
         .ticket_service
         .assign_ticket(user.tenant_id, ticket_id, request.assigned_to_id, user.id)
         .await?;
-
-    let sla_status = ticket.sla_status();
-    Ok(Json(TicketResponse {
-        id: ticket.id,
-        ticket_number: ticket.ticket_number,
-        title: ticket.title,
-        description: ticket.description,
-        status: super::TicketStatusSummary {
-            id: ticket.status_id,
-            name: String::new(),
-            color: String::new(),
-            is_closed: false,
-        },
-        priority: super::TicketPrioritySummary {
-            id: ticket.priority_id,
-            name: String::new(),
-            color: String::new(),
-        },
-        type_name: None,
-        category_name: None,
-        queue_name: String::new(),
-        source: ticket.source,
-        company_id: ticket.company_id,
-        company_name: String::new(),
-        contact_id: ticket.contact_id,
-        contact_name: None,
-        assigned_to_id: ticket.assigned_to_id,
-        assigned_to_name: None,
-        sla_due_date: ticket.sla_due_date,
-        sla_status,
-        is_billable: ticket.is_billable,
-        billing_status: ticket.billing_status,
-        estimated_hours: ticket.estimated_hours,
-        actual_hours: ticket.actual_hours,
-        tags: ticket.tags,
-        created_by_name: String::new(),
-        created_at: ticket.created_at,
-        updated_at: ticket.updated_at,
-    }))
+    let resp = state
+        .ticket_service
+        .get_ticket_response(user.tenant_id, ticket_id)
+        .await?;
+    Ok(Json(resp))
 }
 
 async fn get_ticket_notes(
