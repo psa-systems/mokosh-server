@@ -19,6 +19,7 @@ use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::calendar::calendar_routes;
 use crate::modules::contacts::{contact_routes, ContactService};
+use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::version::VersionInfo;
@@ -58,6 +59,7 @@ pub fn create_api_router(
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
+    let projects_service = ProjectsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -94,9 +96,9 @@ pub fn create_api_router(
         // Time tracking (stub)
         .nest("/time-entries", stub_routes())
         .nest("/timesheets", stub_routes())
-        // Projects (stub)
-        .nest("/projects", stub_routes())
-        .nest("/tasks", stub_routes())
+        // Projects: projects + phases + task statuses + tasks +
+        // dependencies. PMS-52.
+        .merge(projects_routes(projects_service))
         // Calendar
         .nest("/calendar", calendar_routes())
         .nest("/appointments", stub_routes())
