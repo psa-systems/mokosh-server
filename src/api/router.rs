@@ -17,6 +17,7 @@ use tower_http::{
 use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
+use crate::modules::audit::{audit_log_middleware, audit_routes, AuditService};
 use crate::modules::calendar::calendar_routes;
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::tenants::{tenant_routes, TenantService};
@@ -58,6 +59,7 @@ pub fn create_api_router(
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());
+    let audit_service = AuditService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -127,6 +129,17 @@ pub fn create_api_router(
         .nest("/reports", stub_routes())
         // Settings (stub)
         .nest("/settings", stub_routes())
+        // Audit log read. PMS-118.
+        .merge(audit_routes(audit_service.clone()))
+        // Audit log middleware. PMS-119. Fires per-request after
+        // auth_middleware has populated AuthState; only logs successful
+        // mutating requests.
+        .layer(middleware::from_fn_with_state(
+            crate::modules::audit::middleware::AuditMiddlewareState {
+                service: std::sync::Arc::new(audit_service),
+            },
+            audit_log_middleware,
+        ))
         // Apply auth middleware
         .layer(middleware::from_fn_with_state(
             auth_middleware.clone(),
