@@ -98,6 +98,77 @@ impl BillingService {
         let total = cq.fetch_one(self.db.pool()).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
+
+    /// PMS-36: read a single invoice with `lines` populated. 404 when
+    /// the id is outside the tenant.
+    pub async fn get_invoice(
+        &self,
+        tenant_id: Uuid,
+        invoice_id: Uuid,
+    ) -> AppResult<InvoiceResponse> {
+        let row = sqlx::query_as::<_, InvoiceRow>(
+            r#"
+            SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
+                   contract_id, status, invoice_date, due_date, payment_terms,
+                   subtotal, tax_amount, discount_amount, total, amount_paid,
+                   balance_due, currency, notes, po_number, sent_at, paid_at,
+                   created_at, updated_at
+            FROM invoices
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("Invoice".to_string()))?;
+
+        let line_rows = sqlx::query_as::<_, InvoiceLineRow>(
+            r#"
+            SELECT id, line_type, description, quantity, unit_price, total,
+                   ticket_id, project_id, sort_order
+            FROM invoice_lines
+            WHERE invoice_id = $1
+            ORDER BY sort_order, created_at
+            "#,
+        )
+        .bind(invoice_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut resp: InvoiceResponse = row.into();
+        resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
+        Ok(resp)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct InvoiceLineRow {
+    id: Uuid,
+    line_type: String,
+    description: String,
+    quantity: Decimal,
+    unit_price: Decimal,
+    total: Decimal,
+    ticket_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    sort_order: i32,
+}
+
+impl From<InvoiceLineRow> for InvoiceLineResponse {
+    fn from(r: InvoiceLineRow) -> Self {
+        Self {
+            id: r.id,
+            line_type: InvoiceLineType::from_str(&r.line_type).unwrap_or(InvoiceLineType::Service),
+            description: r.description,
+            quantity: r.quantity,
+            unit_price: r.unit_price,
+            total: r.total,
+            ticket_id: r.ticket_id,
+            project_id: r.project_id,
+            sort_order: r.sort_order,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]

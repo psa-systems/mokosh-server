@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
+use uuid::Uuid;
 use validator::Validate;
 
 use super::models::*;
@@ -28,7 +29,18 @@ pub fn billing_routes(service: BillingService) -> Router {
     };
     Router::new()
         .route("/invoices", get(list_invoices))
+        .route("/invoices/{invoice_id}", get(get_invoice))
         .with_state(state)
+}
+
+async fn get_invoice(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<InvoiceResponse>> {
+    let inv = state.service.get_invoice(user.tenant_id, invoice_id).await?;
+    Ok(Json(inv))
 }
 
 async fn list_invoices(
