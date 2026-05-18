@@ -113,9 +113,17 @@ impl AuthService {
                 });
             }
 
-            // TODO: Verify MFA code
-            let _mfa_code = request.mfa_code.as_ref().unwrap();
-            // Verify TOTP code against user.mfa_secret
+            let code = request.mfa_code.as_ref().unwrap();
+            let secret_b32 = user
+                .mfa_secret
+                .as_ref()
+                .ok_or_else(|| AppError::Internal("MFA enabled without secret".to_string()))?;
+            let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32)
+                .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+            // +-1 step (30s) tolerance handles modest clock skew.
+            if mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+                return Err(AppError::Unauthorized);
+            }
         }
 
         // Create session
@@ -674,6 +682,88 @@ impl AuthService {
         query_builder.execute(self.db.pool()).await?;
 
         self.get_user_by_id(user_id).await
+    }
+
+    /// Begin MFA enrollment. Generates a fresh TOTP secret, persists it
+    /// on `users.mfa_secret`, and returns the base32 secret plus the
+    /// `otpauth://` provisioning URI. `mfa_enabled` is NOT flipped here
+    /// — the caller must complete enrollment by submitting a valid code
+    /// via [`AuthService::enable_mfa`]. Refusing partial enrollment
+    /// guarantees that an authenticator that was misconfigured (wrong
+    /// time, wrong algorithm) cannot lock the user out.
+    pub async fn start_mfa_enrollment(
+        &self,
+        user_id: Uuid,
+    ) -> AppResult<crate::modules::auth::models::MfaSetupResponse> {
+        let user = self.get_user_by_id(user_id).await?;
+        if user.mfa_enabled {
+            return Err(AppError::Conflict("MFA is already enabled".to_string()));
+        }
+
+        let secret = mokosh_auth_crypto::totp::generate_secret();
+        let secret_b32 = mokosh_auth_crypto::totp::base32_encode(&secret);
+
+        sqlx::query("UPDATE users SET mfa_secret = $1, updated_at = NOW() WHERE id = $2")
+            .bind(&secret_b32)
+            .bind(user_id)
+            .execute(self.db.pool())
+            .await?;
+
+        let label = format!("Mokosh:{}", user.email);
+        let provisioning_uri =
+            mokosh_auth_crypto::totp::provisioning_uri(&secret_b32, &label, "Mokosh");
+
+        Ok(crate::modules::auth::models::MfaSetupResponse {
+            secret: secret_b32,
+            provisioning_uri,
+        })
+    }
+
+    /// Finish MFA enrollment. Verifies one TOTP code against the secret
+    /// staged by [`AuthService::start_mfa_enrollment`]; on success flips
+    /// `mfa_enabled = true`.
+    pub async fn enable_mfa(&self, user_id: Uuid, code: &str) -> AppResult<()> {
+        let user = self.get_user_by_id(user_id).await?;
+        let secret_b32 = user
+            .mfa_secret
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("MFA enrollment has not been started".to_string()))?;
+        let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32)
+            .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+        if mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+            return Err(AppError::BadRequest("Invalid MFA code".to_string()));
+        }
+
+        sqlx::query(
+            "UPDATE users SET mfa_enabled = TRUE, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(self.db.pool())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Disable MFA. Requires the user's current password (re-auth) so a
+    /// stolen session cannot quietly weaken the account.
+    pub async fn disable_mfa(&self, user_id: Uuid, password: &str) -> AppResult<()> {
+        let user = self.get_user_by_id(user_id).await?;
+        let hash = user
+            .password_hash
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("This account has no password".to_string()))?;
+        if !verify_password(password, hash)? {
+            return Err(AppError::Unauthorized);
+        }
+
+        sqlx::query(
+            "UPDATE users SET mfa_enabled = FALSE, mfa_secret = NULL, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(self.db.pool())
+        .await?;
+
+        Ok(())
     }
 
     /// List users in a tenant, paginated. Audit F1.

@@ -2040,6 +2040,7 @@ dependencies = [
  "minijinja",
  "moka",
  "mokosh-auth",
+ "mokosh-auth-crypto",
  "pulldown-cmark",
  "rand 0.9.4",
  "regex",

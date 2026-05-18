@@ -16,8 +16,9 @@ use validator::Validate;
 
 use super::{
     google_login, rate_limit, AuthService, ChangePasswordRequest, CreateUserRequest,
-    ForgotPasswordRequest, LoginRequest, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
-    ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
+    ForgotPasswordRequest, LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest,
+    MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest,
+    SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
@@ -82,6 +83,10 @@ pub fn auth_routes(
         .route("/me/password", put(change_password))
         .route("/me/sessions", get(get_sessions))
         .route("/me/sessions/{session_id}", delete(delete_session))
+        // MFA
+        .route("/me/mfa/setup", post(start_mfa_enrollment))
+        .route("/me/mfa/enable", post(enable_mfa))
+        .route("/me/mfa/disable", post(disable_mfa))
         // User management (admin only)
         .route("/users", get(list_users))
         .route("/users", post(create_user))
@@ -257,6 +262,43 @@ async fn delete_session(
     state
         .auth_service
         .delete_session(user.id, session_id)
+        .await?;
+    Ok(())
+}
+
+/// Begin TOTP enrollment. Generates and persists a fresh secret;
+/// `mfa_enabled` is not flipped until the user confirms via
+/// `POST /me/mfa/enable`.
+async fn start_mfa_enrollment(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<MfaSetupResponse>> {
+    let resp = state.auth_service.start_mfa_enrollment(user.id).await?;
+    Ok(Json(resp))
+}
+
+/// Confirm TOTP enrollment by verifying one code; flips `mfa_enabled`.
+async fn enable_mfa(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<MfaEnableRequest>,
+) -> AppResult<()> {
+    request.validate()?;
+    state.auth_service.enable_mfa(user.id, &request.code).await?;
+    Ok(())
+}
+
+/// Disable MFA. Requires re-auth with the current password so a stolen
+/// session cannot weaken the account quietly.
+async fn disable_mfa(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<MfaDisableRequest>,
+) -> AppResult<()> {
+    request.validate()?;
+    state
+        .auth_service
+        .disable_mfa(user.id, &request.password)
         .await?;
     Ok(())
 }
