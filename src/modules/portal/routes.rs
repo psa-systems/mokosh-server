@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -21,6 +21,7 @@ use super::{
 };
 use crate::modules::tickets::{TicketResponse, TicketService};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct PortalRouterState {
@@ -44,7 +45,7 @@ pub fn portal_routes(service: PortalAuthService, tickets: TicketService) -> Rout
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
         .route("/auth/me", get(me))
-        .route("/tickets", post(create_ticket))
+        .route("/tickets", get(list_tickets).post(create_ticket))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -63,6 +64,22 @@ async fn login(
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {
     Ok(Json(contact))
+}
+
+async fn list_tickets(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
+    let (tickets, total) = state
+        .tickets
+        .list_portal_tickets(contact.tenant_id, contact.company_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        tickets,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_ticket(
