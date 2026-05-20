@@ -45,6 +45,7 @@ pub fn create_api_router(
     super_admin_domains: Vec<String>,
     cookie_secure: bool,
     at_jwt: Option<AtJwtVerifier>,
+    mailer: Arc<dyn crate::utils::email::Mailer>,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -54,7 +55,13 @@ pub fn create_api_router(
         })
         .collect();
     // Create services
-    let auth_service = AuthService::new(db.clone(), jwt_secret.clone(), super_admin_domains);
+    let auth_service = AuthService::with_mailer(
+        db.clone(),
+        jwt_secret.clone(),
+        super_admin_domains,
+        mailer,
+        client_origin.clone(),
+    );
     let tenant_service = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::new(db.clone());

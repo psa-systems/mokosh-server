@@ -84,6 +84,10 @@ path = "src/lib.rs"
 [dependencies]
 # SSO / OIDC subsystem (workspace-internal, replaces legacy HS256 auth)
 mokosh-auth = { path = "crates/mokosh-auth" }
+# TOTP primitives (RFC 6238) live in the auth-crypto workspace member.
+# Reused here so the legacy HS256 auth flow can verify TOTP codes
+# without pulling in a redundant external crate.
+mokosh-auth-crypto = { path = "crates/mokosh-auth-crypto" }
 
 # Axum HTTP server
 axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
@@ -126,10 +130,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Environment
 dotenvy = "0.15"
 
-# Email. The host crate uses lettre only for error-type conversions
-# in src/utils/error.rs. LettreMailer itself lives in
-# crates/mokosh-auth-http and pulls the same workspace dep there.
+# Email. Lettre powers the host-crate `Mailer` (utils/email.rs); the
+# SSO subsystem keeps its own LettreMailer in crates/mokosh-auth-http.
 lettre = { workspace = true }
+async-trait = { workspace = true }
+secrecy = { workspace = true }
 
 # HTTP client (for integrations)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

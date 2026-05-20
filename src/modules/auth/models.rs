@@ -295,6 +295,36 @@ pub struct ResetPasswordRequest {
     pub confirm_password: String,
 }
 
+/// MFA enrollment start. The server generates a fresh TOTP secret,
+/// persists it on `users.mfa_secret` (base32), and returns the secret
+/// + provisioning URI for the client to display as a QR code. The
+/// `mfa_enabled` flag stays false until the user confirms ownership
+/// of the secret via [`MfaEnableRequest`].
+#[derive(Debug, Clone, Serialize)]
+pub struct MfaSetupResponse {
+    /// Base32-encoded secret, displayed for manual entry.
+    pub secret: String,
+    /// `otpauth://` URI suitable for QR-code encoding.
+    pub provisioning_uri: String,
+}
+
+/// MFA enrollment confirmation. The user types a 6-digit TOTP code
+/// from their authenticator; on success the server flips
+/// `users.mfa_enabled = true`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct MfaEnableRequest {
+    #[validate(length(min = 6, max = 8, message = "Code must be 6-8 digits"))]
+    pub code: String,
+}
+
+/// MFA disable. Requires the current password (re-auth) so a stolen
+/// session cannot disable MFA silently.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct MfaDisableRequest {
+    #[validate(length(min = 1, message = "Password is required"))]
+    pub password: String,
+}
+
 /// Change password request (when logged in)
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ChangePasswordRequest {
@@ -382,22 +412,49 @@ impl From<User> for UserResponse {
     }
 }
 
-/// MFA setup request
-#[derive(Debug, Clone, Deserialize)]
-pub struct MfaSetupRequest {
-    /// The TOTP code to verify setup
-    pub code: String,
+/// Create a new personal API key. The raw key is returned ONCE in
+/// [`CreateApiKeyResponse::key`]; the database only ever stores the
+/// `key_prefix` (search index) and an argon2 hash of the rest. The
+/// scope list defaults to `["*"]` (full account access) to match the
+/// `api_keys.scopes` column default, but callers should pin a tighter
+/// list when the key only needs read access.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateApiKeyRequest {
+    #[validate(length(min = 1, max = 100, message = "Name must be 1-100 chars"))]
+    pub name: String,
+    /// Optional ISO-8601 expiry. `None` means the key never expires.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Optional scope list. `None` -> the existing schema default `["*"]`.
+    pub scopes: Option<Vec<String>>,
 }
 
-/// MFA setup response
+/// One-time create response. The raw `key` is shown once and never
+/// stored or returned again.
 #[derive(Debug, Clone, Serialize)]
-pub struct MfaSetupResponse {
-    /// The secret to add to authenticator app
-    pub secret: String,
-    /// QR code data URL
-    pub qr_code: String,
-    /// Recovery codes
-    pub recovery_codes: Vec<String>,
+pub struct CreateApiKeyResponse {
+    pub id: Uuid,
+    pub name: String,
+    /// The raw bearer token. Surface this to the user immediately and
+    /// never echo it from any other endpoint.
+    pub key: String,
+    pub key_prefix: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Sanitised representation of an `api_keys` row. Used by list and
+/// get. Never carries the secret material.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub key_prefix: String,
+    pub scopes: Vec<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Session information
