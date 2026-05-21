@@ -24,6 +24,7 @@ use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::reports::{reports_routes, ReportsService};
 use crate::modules::rmm::{rmm_routes, RmmService};
+use crate::modules::sla::{sla_routes, SlaService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
@@ -91,6 +92,7 @@ pub fn create_api_router(
     let notifications_service = NotificationsService::new(db.clone());
     let reports_service = ReportsService::new(db.clone());
     let rmm_service = RmmService::new(db.clone());
+    let sla_service = SlaService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -146,9 +148,8 @@ pub fn create_api_router(
         .nest("/dispatch", stub_routes())
         // Contracts: contracts + items + hour balances + rate cards. PMS-65.
         .merge(contracts_routes(contracts_service))
-        // SLA (stub)
-        .nest("/sla-policies", stub_routes())
-        .nest("/business-hours", stub_routes())
+        // SLA: policies, targets, business hours, holidays, evaluator. PMS-107.
+        .merge(sla_routes(sla_service))
         // Billing: invoices + payments + payment-gateways + tax-rates.
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
