@@ -25,6 +25,7 @@ use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::reports::{reports_routes, ReportsService};
 use crate::modules::rmm::{rmm_routes, RmmService};
 use crate::modules::sla::{sla_routes, SlaService};
+use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
@@ -93,6 +94,7 @@ pub fn create_api_router(
     let reports_service = ReportsService::new(db.clone());
     let rmm_service = RmmService::new(db.clone());
     let sla_service = SlaService::new(db.clone());
+    let settings_service = SettingsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -146,6 +148,7 @@ pub fn create_api_router(
         // appear at their natural top-level paths.
         .merge(calendar_routes(calendar_service))
         .nest("/dispatch", stub_routes())
+<<<<<<< HEAD
         // Contracts: contracts + items + hour balances + rate cards. PMS-65.
         .merge(contracts_routes(contracts_service))
         // SLA: policies, targets, business hours, holidays, evaluator. PMS-107.
@@ -166,8 +169,8 @@ pub fn create_api_router(
         .merge(rmm_routes(rmm_service))
         // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
         .merge(reports_routes(reports_service))
-        // Settings (stub)
-        .nest("/settings", stub_routes())
+        // Settings: tenant settings + module configs. PMS-114.
+        .merge(settings_routes(settings_service))
         // Apply auth middleware
         .layer(middleware::from_fn_with_state(
             auth_middleware.clone(),
