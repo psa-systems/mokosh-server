@@ -498,7 +498,7 @@ pub async fn logout(
 /// /v1/auth/logout response doesn't wait on any RP. Each RP-side
 /// receiver is independently free to 200, 4xx, or time out; we log
 /// the outcome and move on.
-fn emit_backchannel_logouts(
+pub(crate) fn emit_backchannel_logouts(
     st: Arc<AuthHttpState>,
     user_id: mokosh_auth_core::UserId,
     tenant_id: mokosh_auth_core::TenantId,

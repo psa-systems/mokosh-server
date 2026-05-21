@@ -21,7 +21,7 @@ pub mod userinfo;
 pub use authorize::{handle_authorize, AuthorizeOutcome, AuthorizeRequest};
 pub use config::EngineConfig;
 pub use discovery::openid_configuration;
-pub use logout::{handle_logout, LogoutOutcome, LogoutRequest};
+pub use logout::{handle_logout, LogoutOutcome, LogoutRequest, RevokedSession};
 pub use provider::OidcProvider;
 pub use token::{handle_token, TokenGrant, TokenRequest, TokenResponse};
 pub use tokens::{AccessTokenClaims, IdTokenClaims, LogoutTokenClaims, MintedAccessToken};

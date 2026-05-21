@@ -290,13 +290,31 @@ pub async fn logout(
 
     let cleared = jar.remove(crate::cookies::clear_op_session_cookie(&st.cookie_cfg));
 
+    // Fan a Back-Channel Logout 1.0 token out to every other RP with a
+    // registered backchannel_logout_uri. Mirrors /v1/auth/logout so an
+    // RP-initiated sign-out at one app propagates to the others.
+    if let LogoutOutcome::LoggedOut {
+        revoked: Some(ref r),
+        ..
+    } = outcome
+    {
+        crate::handlers::auth::emit_backchannel_logouts(
+            st.clone(),
+            r.user_id,
+            r.tenant_id,
+            r.sid.clone(),
+            st.provider.clock.now(),
+        );
+    }
+
     match outcome {
         LogoutOutcome::LoggedOut {
             redirect_to: Some(to),
+            ..
         } => (cleared, Redirect::to(to.as_str())).into_response(),
-        LogoutOutcome::LoggedOut { redirect_to: None } => {
-            (cleared, StatusCode::NO_CONTENT).into_response()
-        }
+        LogoutOutcome::LoggedOut {
+            redirect_to: None, ..
+        } => (cleared, StatusCode::NO_CONTENT).into_response(),
         LogoutOutcome::NeedsConfirmation => (cleared, StatusCode::NO_CONTENT).into_response(),
         LogoutOutcome::Error(err) => HttpError(err).into_response(),
     }
