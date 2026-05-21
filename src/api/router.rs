@@ -21,6 +21,7 @@ use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::calendar::{calendar_routes, CalendarService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
+use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
@@ -85,6 +86,7 @@ pub fn create_api_router(
     let contracts_service = ContractsService::new(db.clone());
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());
+    let notifications_service = NotificationsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -152,9 +154,9 @@ pub fn create_api_router(
         .merge(assets_routes(assets_service))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
-        // Notifications (stub)
-        .nest("/notifications", stub_routes())
-        .nest("/notification-channels", stub_routes())
+        // Notifications: channels + templates + prefs + inbox + rules
+        // + dispatcher. PMS-86.
+        .merge(notifications_routes(notifications_service))
         // RMM (stub)
         .nest("/rmm/connections", stub_routes())
         .nest("/rmm/devices", stub_routes())
