@@ -768,6 +768,103 @@ impl TicketService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Create a portal-originated ticket. Used by `POST
+    /// /api/v1/portal/tickets`. Looks up an admin user in the tenant to
+    /// satisfy the NOT NULL FK on `tickets.created_by_id` (portal
+    /// contacts are not in the `users` table); the customer-visible
+    /// identity is captured by `contact_id`. Returns the fully-joined
+    /// response so the portal client renders names not UUIDs.
+    pub async fn create_portal_ticket(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        contact_id: Uuid,
+        title: String,
+        description: Option<String>,
+        priority_id: Option<Uuid>,
+        type_id: Option<Uuid>,
+    ) -> AppResult<TicketResponse> {
+        let default_creator: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM users
+            WHERE tenant_id = $1 AND status = 'active'
+              AND role IN ('super_admin', 'admin', 'manager')
+            ORDER BY created_at
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        let Some(creator) = default_creator else {
+            return Err(AppError::Configuration(
+                "Cannot create portal ticket: tenant has no admin/manager user to attribute it to"
+                    .to_string(),
+            ));
+        };
+
+        let request = CreateTicketRequest {
+            title,
+            description,
+            priority_id,
+            type_id,
+            category_id: None,
+            queue_id: None,
+            source: TicketSource::Portal,
+            company_id,
+            contact_id: Some(contact_id),
+            site_id: None,
+            assigned_to_id: None,
+            team_id: None,
+            contract_id: None,
+            sla_id: None,
+            scheduled_start: None,
+            scheduled_end: None,
+            estimated_hours: None,
+            is_billable: false,
+            asset_id: None,
+            custom_fields: serde_json::Value::Null,
+            tags: vec![],
+        };
+        let ticket = self.create_ticket(tenant_id, creator, &request).await?;
+        self.get_ticket_response(tenant_id, ticket.id).await
+    }
+
+    /// List tickets visible to a portal contact. Scoped to
+    /// `company_id`; the contact sees every ticket their company has
+    /// opened, not just ones where `contact_id = self`. This matches
+    /// the typical helpdesk model where employees of company X can
+    /// follow each other's tickets.
+    pub async fn list_portal_tickets(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketResponse>, u64)> {
+        let filter = TicketFilter {
+            company_id: Some(company_id),
+            ..Default::default()
+        };
+        self.list_ticket_responses(tenant_id, &filter, pagination).await
+    }
+
+    /// Get a single ticket scoped to a portal contact's company. 404
+    /// instead of 403 if the ticket exists in another company, so we
+    /// don't leak the existence of a ticket the contact can't see.
+    pub async fn get_portal_ticket(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        ticket_id: Uuid,
+    ) -> AppResult<TicketResponse> {
+        let resp = self.get_ticket_response(tenant_id, ticket_id).await?;
+        if resp.company_id != company_id {
+            return Err(AppError::NotFound("Ticket".to_string()));
+        }
+        Ok(resp)
+    }
+
     /// Fetch a fully-joined ticket response. Audit F3: the previous
     /// route-side construction populated `status.name`, `priority.name`,
     /// queue/company/contact/assigned/created-by names with empty
