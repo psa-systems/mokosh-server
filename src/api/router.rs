@@ -62,7 +62,10 @@ pub fn create_api_router(
         mailer.clone(),
         client_origin.clone(),
     );
+    #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
+    #[cfg(not(feature = "multi-tenant"))]
+    let _ = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::with_mailer(db.clone(), mailer);
 
@@ -91,8 +94,13 @@ pub fn create_api_router(
                 cookie_secure,
             ),
         )
-        // Tenant management (multi-tenant mode)
-        .nest("/tenants", tenant_routes(tenant_service))
+        // Tenant management. Only mounted in multi-tenant builds: in a
+        // single-tenant deployment there is exactly one tenant and the
+        // CRUD endpoints would be a foot-gun. PMS-24.
+        ;
+    #[cfg(feature = "multi-tenant")]
+    let api_v1 = api_v1.nest("/tenants", tenant_routes(tenant_service));
+    let api_v1 = api_v1
         // Contact management. The canonical company endpoints live
         // under `/api/v1/contacts/companies/...` (one router for
         // companies + contacts + sites); a previous `nest("/companies",
