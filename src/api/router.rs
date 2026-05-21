@@ -22,6 +22,7 @@ use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
+use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
@@ -79,6 +80,7 @@ pub fn create_api_router(
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
     let calendar_service = CalendarService::new(db.clone());
+    let contracts_service = ContractsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -132,9 +134,8 @@ pub fn create_api_router(
         // appear at their natural top-level paths.
         .merge(calendar_routes(calendar_service))
         .nest("/dispatch", stub_routes())
-        // Contracts (stub)
-        .nest("/contracts", stub_routes())
-        .nest("/rate-cards", stub_routes())
+        // Contracts: contracts + items + hour balances + rate cards. PMS-65.
+        .merge(contracts_routes(contracts_service))
         // SLA (stub)
         .nest("/sla-policies", stub_routes())
         .nest("/business-hours", stub_routes())
