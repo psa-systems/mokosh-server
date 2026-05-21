@@ -1,0 +1,249 @@
+# .forgejo/workflows/claude-fix.yml
+#
+# Manually-dispatched workflow that runs Claude Code against a failing PR.
+# Triggered by you from the Actions UI (or, later, by a comment-trigger workflow).
+#
+# What it does:
+#   1. Checks out the PR branch
+#   2. Installs Claude Code
+#   3. Pulls failure logs from the most recent failing run on this branch
+#   4. Runs Claude in headless mode with that context
+#   5. Commits and pushes any changes using a bot PAT (so CI re-runs)
+#   6. Comments on the PR with the outcome
+#
+# Required secrets (set in repo Settings > Actions > Secrets):
+#   ANTHROPIC_API_KEY   - from console.anthropic.com (NOT a subscription token)
+#   CLAUDE_BOT_PAT      - PAT for a bot user account, with repo write scope
+#
+# Recursion guard:
+#   The bot pushes with CLAUDE_BOT_PAT, which DOES re-trigger CI (that's the point).
+#   We prevent runaway loops by skipping this workflow if the triggering comment
+#   came from the bot itself. The comment-trigger workflow (next file) handles that.
+
+name: Claude Fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to fix"
+        required: true
+        type: string
+      failed_run_id:
+        description: "ID of the failed CI run (for log context). Leave blank to auto-detect latest failure on the branch."
+        required: false
+        type: string
+      extra_instructions:
+        description: "Optional extra instructions for Claude (e.g. 'only fix lint errors')"
+        required: false
+        type: string
+        default: ""
+
+# Only one Claude fix per PR at a time. If you dispatch again while one is running,
+# the old run is cancelled. Prevents two Claudes fighting over the same branch.
+concurrency:
+  group: claude-fix-pr-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  fix:
+    runs-on: docker
+    timeout-minutes: 20
+
+    steps:
+      # ---------------------------------------------------------------------
+      # Step 1: Look up the PR to get the branch name and head repo
+      # ---------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq jq unzip curl
+
+      - name: Get PR metadata
+        id: pr
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          PR_JSON=$(curl -sSf \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}")
+
+          BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref')
+          HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+
+          echo "PR #${{ inputs.pr_number }}: $PR_TITLE"
+          echo "Branch: $BRANCH"
+          echo "Head SHA: $HEAD_SHA"
+
+      # ---------------------------------------------------------------------
+      # Step 2: Check out the PR branch using the bot's PAT
+      # We use the PAT (not GITHUB_TOKEN) so that when we push later,
+      # CI will actually re-run on the fix.
+      # ---------------------------------------------------------------------
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.branch }}
+          token: ${{ secrets.CLAUDE_BOT_PAT }}
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------
+      # Step 3: Find and fetch the failed CI run's logs
+      # If failed_run_id was provided, use it. Otherwise, find the most
+      # recent failed run on this branch.
+      # ---------------------------------------------------------------------
+      - name: Build failure context
+        id: logs
+        run: |
+          set -e
+          mkdir -p /tmp/claude-context
+          {
+            echo "# Failed CI Run Context"
+            echo ""
+            echo "PR: #${{ inputs.pr_number }}: ${{ steps.pr.outputs.pr_title }}"
+            echo "Branch: ${{ steps.pr.outputs.branch }}"
+            echo "Commit: ${{ steps.pr.outputs.head_sha }}"
+            echo ""
+            echo "## Investigation"
+            echo ""
+            echo "The CI workflow in .forgejo/workflows/ failed on this branch."
+            echo "Read the workflow files to understand what checks run, then"
+            echo "investigate the repository to find what's causing the failure."
+          } > /tmp/claude-context/CONTEXT.md
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Step 4: Install Node.js and Claude Code
+      # ---------------------------------------------------------------------
+      - name: Setup Node.js
+        if: steps.logs.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        if: steps.logs.outputs.skip != 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      # ---------------------------------------------------------------------
+      # Step 5: Run Claude in bare/headless mode
+      # --bare: no OAuth, no keychain, no hooks, no .mcp.json — only flags count
+      # --allowedTools: pre-approve the tools we need so it doesn't prompt
+      # --output-format json: structured output we can post to the PR
+      # ---------------------------------------------------------------------
+      - name: Run Claude Code
+        if: steps.logs.outputs.skip != 'true'
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -e
+          PROMPT=$(cat <<'EOF'
+          You are fixing a failing CI build on a pull request.
+
+          The failure logs are in /tmp/claude-context/CONTEXT.md — read that first.
+          The repository is checked out in the current working directory.
+
+          Your job:
+            1. Read the failure context to understand what failed
+            2. Investigate the code that's causing the failure
+            3. Make the minimum change needed to fix it
+            4. Do NOT weaken tests, add retries to flaky tests, or skip checks
+            5. If the failure is something you can't safely fix (flaky test,
+               infra issue, ambiguous requirement), explain why and make no changes
+
+          When you're done, summarize what you changed and why in plain text.
+          EOF
+          )
+
+          # Append any extra instructions from the dispatcher
+          if [ -n "${{ inputs.extra_instructions }}" ]; then
+            PROMPT="$PROMPT
+
+          Additional instructions: ${{ inputs.extra_instructions }}"
+          fi
+
+          claude --bare -p "$PROMPT" \
+            --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
+            --output-format json \
+            > /tmp/claude-result.json
+
+          # Pull the summary out for the PR comment
+          SUMMARY=$(jq -r '.result // .text // "(no summary returned)"' /tmp/claude-result.json)
+          # Multi-line output for GITHUB_OUTPUT
+          {
+            echo "summary<<CLAUDE_EOF"
+            echo "$SUMMARY"
+            echo "CLAUDE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Step 6: Commit and push any changes
+      # The [skip claude] tag in the commit message is what the comment-trigger
+      # workflow will check to avoid re-triggering on Claude's own pushes.
+      # ---------------------------------------------------------------------
+      - name: Commit and push
+        if: steps.logs.outputs.skip != 'true'
+        id: push
+        env:
+          CLAUDE_SUMMARY: ${{ steps.claude.outputs.summary }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -e
+          git config user.name "claude-bot"
+          git config user.email "claude-bot@a8n.run"
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "Claude made no changes."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git add -A
+          # Write the commit message to a file to avoid shell quoting issues
+          {
+            echo "fix: Claude auto-fix for PR #${PR_NUMBER}"
+            echo ""
+            echo "${CLAUDE_SUMMARY}"
+            echo ""
+            echo "[skip claude]"
+          } > /tmp/commit-message.txt
+
+          git commit --file=/tmp/commit-message.txt
+          git push origin "${{ steps.pr.outputs.branch }}"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Step 7: Comment on the PR with the outcome
+      # ---------------------------------------------------------------------
+      - name: Post PR comment
+        if: always() && steps.logs.outputs.skip != 'true'
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLAUDE_SUMMARY: ${{ steps.claude.outputs.summary }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+        run: |
+          if [ "${PUSHED}" = "true" ]; then
+            HEADER="🤖 **Claude pushed a fix.**"
+            FOOTER=$'\n\nCI will re-run on the new commit. Review the diff before merging.'
+          else
+            HEADER="🤖 **Claude ran but made no changes.**"
+            FOOTER=""
+          fi
+
+          # Build the JSON body using jq, which handles escaping properly
+          BODY=$(printf '%s\n\n%s%s' "$HEADER" "$CLAUDE_SUMMARY" "$FOOTER")
+          JSON=$(jq -n --arg body "$BODY" '{body: $body}')
+
+          curl -sSf \
+            -X POST \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$JSON" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments"
