@@ -21,6 +21,7 @@ use crate::modules::calendar::calendar_routes;
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
+use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
@@ -76,6 +77,7 @@ pub fn create_api_router(
     let ticket_service = TicketService::with_mailer(db.clone(), mailer);
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
     let time_tracking_service = TimeTrackingService::new(db.clone());
+    let projects_service = ProjectsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -121,9 +123,9 @@ pub fn create_api_router(
         // Time tracking: time-entries, timesheets, timers, rounding,
         // work-types. PMS-43.
         .merge(time_tracking_routes(time_tracking_service))
-        // Projects (stub)
-        .nest("/projects", stub_routes())
-        .nest("/tasks", stub_routes())
+        // Projects: projects + phases + task statuses + tasks +
+        // dependencies. PMS-52.
+        .merge(projects_routes(projects_service))
         // Calendar
         .nest("/calendar", calendar_routes())
         .nest("/appointments", stub_routes())
