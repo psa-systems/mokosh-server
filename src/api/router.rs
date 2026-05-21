@@ -18,6 +18,7 @@ use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::calendar::calendar_routes;
+use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::tenants::{tenant_routes, TenantService};
@@ -47,6 +48,9 @@ pub fn create_api_router(
     cookie_secure: bool,
     at_jwt: Option<AtJwtVerifier>,
     mailer: Arc<dyn crate::utils::email::Mailer>,
+    // 32-byte AES-256-GCM key. Used for at-rest encryption of any
+    // per-tenant secret material (today: payment-gateway configs).
+    encryption_key: [u8; 32],
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -69,6 +73,7 @@ pub fn create_api_router(
     let _ = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::with_mailer(db.clone(), mailer);
+    let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -127,9 +132,10 @@ pub fn create_api_router(
         // SLA (stub)
         .nest("/sla-policies", stub_routes())
         .nest("/business-hours", stub_routes())
-        // Billing (stub)
-        .nest("/invoices", stub_routes())
-        .nest("/payments", stub_routes())
+        // Billing: invoices + payments + payment-gateways + tax-rates.
+        // `billing_routes` defines the full paths so the URL structure
+        // stays flat. PMS-34.
+        .merge(billing_routes(billing_service))
         // Assets (stub)
         .nest("/assets", stub_routes())
         .nest("/asset-types", stub_routes())
