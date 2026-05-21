@@ -101,7 +101,7 @@ async fn export_report(
     Path(report): Path<String>,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Response> {
-    if q.format.to_ascii_lowercase() != "csv" {
+    if !q.format.eq_ignore_ascii_case("csv") {
         return Err(AppError::BadRequest(format!(
             "format {:?} not yet supported; only 'csv' is implemented",
             q.format

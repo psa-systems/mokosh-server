@@ -188,7 +188,7 @@ async fn ingest_alert(
     let signature = headers
         .get("X-Signature")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized)?;
+        .ok_or(AppError::Unauthorized)?;
 
     // The body is parsed twice (axum + our HMAC compare) to avoid a
     // raw-body extractor; we re-serialise the parsed Json for HMAC.
@@ -197,12 +197,12 @@ async fn ingest_alert(
         .get("X-Tenant-Id")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or_else(|| AppError::Unauthorized)?;
+        .ok_or(AppError::Unauthorized)?;
     let secret = s
         .service
         .connection_api_secret(tenant_id, req.rmm_connection_id)
         .await?
-        .ok_or_else(|| AppError::Unauthorized)?;
+        .ok_or(AppError::Unauthorized)?;
     let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes())
         .map_err(|_| AppError::Internal("hmac key invalid".to_string()))?;
     mac.update(&body);

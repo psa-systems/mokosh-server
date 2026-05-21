@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    routing::{get, put},
+    routing::get,
     Json, Router,
 };
 use uuid::Uuid;

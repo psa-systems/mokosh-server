@@ -72,13 +72,11 @@ const SELECT_INVITE: &str = r#"
 impl InviteRepository for PgInviteRepository {
     async fn issue(&self, new: NewInvite) -> Result<Invite, AuthError> {
         let token_hash = mokosh_auth_crypto::hash_opaque_token(&new.token);
-        let row: InviteRow = sqlx::query_as(&format!(
-            "INSERT INTO mokosh_auth.admin_invites
+        let row: InviteRow = sqlx::query_as("INSERT INTO mokosh_auth.admin_invites
                 (tenant_id, email, role, token_hash, invited_by, expires_at, note)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, tenant_id, email, role, invited_by, issued_at, expires_at,
-                       used_at, used_by, revoked_at, revoked_by, revoke_reason, note",
-        ))
+                       used_at, used_by, revoked_at, revoked_by, revoke_reason, note")
         .bind(new.tenant_id.0)
         .bind(&new.email)
         .bind(new.role.as_str())
@@ -212,7 +210,7 @@ impl InviteRepository for PgInviteRepository {
         .fetch_optional(self.pool.pg())
         .await
         .map_err(db_err)?
-        .ok_or_else(|| AuthError::NotFound)?;
+        .ok_or(AuthError::NotFound)?;
         Ok((Invite::try_from(row)?, raw_token))
     }
 

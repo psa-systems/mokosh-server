@@ -95,7 +95,7 @@ impl AuthService {
         let password_hash = user
             .password_hash
             .as_ref()
-            .ok_or_else(|| AppError::Unauthorized)?;
+            .ok_or(AppError::Unauthorized)?;
 
         if !verify_password(&request.password, password_hash)? {
             return Err(AppError::Unauthorized);

@@ -115,6 +115,7 @@ impl UserStatus {
 
 /// Current authenticated user state
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct AuthState {
     /// Whether the user is authenticated
     pub is_authenticated: bool,
@@ -124,15 +125,6 @@ pub struct AuthState {
     pub tenant_id: Option<Uuid>,
 }
 
-impl Default for AuthState {
-    fn default() -> Self {
-        Self {
-            is_authenticated: false,
-            user: None,
-            tenant_id: None,
-        }
-    }
-}
 
 impl AuthState {
     /// Create an authenticated state

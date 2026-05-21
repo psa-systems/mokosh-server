@@ -131,7 +131,7 @@ pub async fn switch_active_tenant(
         .find(user.id, tenant_id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
     if !matches!(m.status, MembershipStatus::Active) {
         return Err(HttpError(AuthError::Forbidden(
             "membership is not active".into(),
@@ -152,7 +152,7 @@ pub async fn switch_active_tenant(
         .find_by_client_id(ClientId(body.client_id))
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::InvalidClient))?;
+        .ok_or(HttpError(AuthError::InvalidClient))?;
     if !client
         .allowed_grant_types
         .contains(&mokosh_auth_core::GrantType::AuthorizationCode)

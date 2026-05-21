@@ -16,7 +16,7 @@ use axum::Json;
 use chrono::{Duration, Utc};
 use mokosh_auth_core::{
     AuditEvent, AuthError, Membership, MembershipRole, MembershipStatus, NewOrgInvitation,
-    OrgInvitation, Tenant, TenantId, TenantKind, User, UserId, UserRole,
+    OrgInvitation, Tenant, TenantKind, User, UserId, UserRole,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -161,13 +161,13 @@ async fn require_member(
         .find_by_slug(slug)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
     let m = st
         .memberships
         .find(user_id, tenant.id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
     if !matches!(m.status, MembershipStatus::Active) {
         return Err(HttpError(AuthError::Forbidden(
             "membership is suspended".into(),
@@ -371,7 +371,7 @@ pub async fn change_member_role(
         .find(target_uid, tenant.id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
 
     // Last-owner guard: cannot demote the last remaining Owner.
     if matches!(target_m.org_role, MembershipRole::Owner)
@@ -436,7 +436,7 @@ pub async fn remove_member(
         .find(target_uid, tenant.id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
 
     // Last-owner guard.
     if matches!(target_m.org_role, MembershipRole::Owner) {
@@ -631,7 +631,7 @@ pub async fn accept_invitation(
         .find_by_id(invite.tenant_id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
 
     let _ = st
         .provider
@@ -678,7 +678,7 @@ pub async fn lookup_invitation(
         .find_by_token_hash(token_hash)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
     if invite.accepted_at.is_some() || invite.revoked_at.is_some() {
         return Err(HttpError(AuthError::NotFound));
     }
@@ -687,7 +687,7 @@ pub async fn lookup_invitation(
         .find_by_id(invite.tenant_id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
     let inviter_name = st
         .provider
         .users
