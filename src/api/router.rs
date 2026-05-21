@@ -17,6 +17,7 @@ use tower_http::{
 use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
+use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::calendar::{calendar_routes, CalendarService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::contacts::{contact_routes, ContactService};
@@ -81,6 +82,7 @@ pub fn create_api_router(
     let projects_service = ProjectsService::new(db.clone());
     let calendar_service = CalendarService::new(db.clone());
     let contracts_service = ContractsService::new(db.clone());
+    let assets_service = AssetsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -143,10 +145,9 @@ pub fn create_api_router(
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
         .merge(billing_routes(billing_service))
-        // Assets (stub)
-        .nest("/assets", stub_routes())
-        .nest("/asset-types", stub_routes())
-        .nest("/credentials", stub_routes())
+        // Assets / CMDB: types, assets, relationships, config items,
+        // credential vault, audit log. PMS-72.
+        .merge(assets_routes(assets_service))
         // Knowledge base (stub)
         .nest("/kb/articles", stub_routes())
         .nest("/kb/categories", stub_routes())
