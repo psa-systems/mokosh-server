@@ -17,7 +17,7 @@ use tower_http::{
 use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
-use crate::modules::calendar::calendar_routes;
+use crate::modules::calendar::{calendar_routes, CalendarService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
@@ -78,6 +78,7 @@ pub fn create_api_router(
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
+    let calendar_service = CalendarService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -126,9 +127,10 @@ pub fn create_api_router(
         // Projects: projects + phases + task statuses + tasks +
         // dependencies. PMS-52.
         .merge(projects_routes(projects_service))
-        // Calendar
-        .nest("/calendar", calendar_routes())
-        .nest("/appointments", stub_routes())
+        // Calendar / scheduling: events, appointments, availability,
+        // time-off, on-call. PMS-59. Mounted via merge so the routes
+        // appear at their natural top-level paths.
+        .merge(calendar_routes(calendar_service))
         .nest("/dispatch", stub_routes())
         // Contracts (stub)
         .nest("/contracts", stub_routes())
