@@ -22,6 +22,7 @@ use crate::modules::calendar::{calendar_routes, CalendarService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
+use crate::modules::reports::{reports_routes, ReportsService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
@@ -87,6 +88,7 @@ pub fn create_api_router(
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());
     let notifications_service = NotificationsService::new(db.clone());
+    let reports_service = ReportsService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -160,8 +162,8 @@ pub fn create_api_router(
         // RMM (stub)
         .nest("/rmm/connections", stub_routes())
         .nest("/rmm/devices", stub_routes())
-        // Reports (stub)
-        .nest("/reports", stub_routes())
+        // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
+        .merge(reports_routes(reports_service))
         // Settings (stub)
         .nest("/settings", stub_routes())
         // Apply auth middleware
