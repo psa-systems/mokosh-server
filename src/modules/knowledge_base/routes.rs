@@ -21,14 +21,22 @@ pub struct KbRouterState {
 }
 
 pub fn kb_routes(service: KbService) -> Router {
-    let state = KbRouterState { service: Arc::new(service) };
+    let state = KbRouterState {
+        service: Arc::new(service),
+    };
     Router::new()
         // Categories (PMS-81)
         .route("/kb/categories", get(list_categories).post(create_category))
-        .route("/kb/categories/{id}", put(update_category).delete(delete_category))
+        .route(
+            "/kb/categories/{id}",
+            put(update_category).delete(delete_category),
+        )
         // Articles (PMS-82) + versions (PMS-83)
         .route("/kb/articles", get(list_articles).post(create_article))
-        .route("/kb/articles/{id}", get(get_article).put(update_article).delete(delete_article))
+        .route(
+            "/kb/articles/{id}",
+            get(get_article).put(update_article).delete(delete_article),
+        )
         .route("/kb/articles/{id}/versions", get(list_article_versions))
         // Portal-visible (PMS-84). Internal callers can still reach this;
         // the portal mounts its own thin reader in PMS-32.
@@ -37,13 +45,16 @@ pub fn kb_routes(service: KbService) -> Router {
 }
 
 async fn list_categories(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
 ) -> AppResult<Json<Vec<KbCategoryResponse>>> {
     Ok(Json(s.service.list_categories(u.tenant_id).await?))
 }
 
 async fn create_category(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
     Json(req): Json<UpsertKbCategoryRequest>,
 ) -> AppResult<Json<KbCategoryResponse>> {
     req.validate()?;
@@ -51,20 +62,30 @@ async fn create_category(
 }
 
 async fn update_category(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
-    Path(id): Path<Uuid>, Json(req): Json<UpsertKbCategoryRequest>,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertKbCategoryRequest>,
 ) -> AppResult<Json<KbCategoryResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_category(u.tenant_id, id, &req).await?))
+    Ok(Json(
+        s.service.update_category(u.tenant_id, id, &req).await?,
+    ))
 }
 
 async fn delete_category(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_category(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_category(u.tenant_id, id).await
+}
 
 async fn list_articles(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
     Query(f): Query<KbArticleFilter>,
 ) -> AppResult<Json<Vec<KbArticleResponse>>> {
     f.validate()?;
@@ -72,40 +93,60 @@ async fn list_articles(
 }
 
 async fn create_article(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
     Json(req): Json<CreateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_article(u.tenant_id, u.id, &req).await?))
+    Ok(Json(
+        s.service.create_article(u.tenant_id, u.id, &req).await?,
+    ))
 }
 
 async fn get_article(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleResponse>> {
     Ok(Json(s.service.get_article(u.tenant_id, id).await?))
 }
 
 async fn update_article(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth,
-    Path(id): Path<Uuid>, Json(req): Json<UpdateKbArticleRequest>,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_article(u.tenant_id, id, u.id, &req).await?))
+    Ok(Json(
+        s.service
+            .update_article(u.tenant_id, id, u.id, &req)
+            .await?,
+    ))
 }
 
 async fn delete_article(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_article(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_article(u.tenant_id, id).await
+}
 
 async fn list_article_versions(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<KbArticleVersionResponse>>> {
-    Ok(Json(s.service.list_article_versions(u.tenant_id, id).await?))
+    Ok(Json(
+        s.service.list_article_versions(u.tenant_id, id).await?,
+    ))
 }
 
 async fn list_portal_articles(
-    State(s): State<KbRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
 ) -> AppResult<Json<Vec<KbArticleResponse>>> {
     Ok(Json(s.service.list_portal_articles(u.tenant_id).await?))
 }

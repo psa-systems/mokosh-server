@@ -35,10 +35,7 @@ impl BillingService {
     /// payment-gateway-config write path so secrets never hit the DB
     /// in cleartext.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        Self {
-            db,
-            encryption_key,
-        }
+        Self { db, encryption_key }
     }
 
     /// PMS-35: paginated + filterable invoice list. `lines` is left
@@ -68,7 +65,9 @@ impl BillingService {
             param_idx += 1;
         }
         if filter.q.is_some() {
-            conditions.push(format!("(invoice_number ILIKE ${param_idx} OR po_number ILIKE ${param_idx})"));
+            conditions.push(format!(
+                "(invoice_number ILIKE ${param_idx} OR po_number ILIKE ${param_idx})"
+            ));
         }
 
         let where_clause = conditions.join(" AND ");
@@ -159,7 +158,11 @@ impl BillingService {
                 (1, Some("INV-".to_string()))
             }
         };
-        let invoice_number = format!("{}{:06}", prefix.unwrap_or_else(|| "INV-".to_string()), next_number);
+        let invoice_number = format!(
+            "{}{:06}",
+            prefix.unwrap_or_else(|| "INV-".to_string()),
+            next_number
+        );
 
         // Compute totals from the supplied lines. Tax / discount are
         // optional - default to 0.
@@ -413,10 +416,8 @@ impl BillingService {
 
         rows.into_iter()
             .map(|r| {
-                let decrypted = crate::utils::crypto::decrypt(
-                    &r.config_encrypted,
-                    &self.encryption_key,
-                )?;
+                let decrypted =
+                    crate::utils::crypto::decrypt(&r.config_encrypted, &self.encryption_key)?;
                 let config: serde_json::Value =
                     serde_json::from_str(&decrypted).unwrap_or(serde_json::Value::Null);
                 Ok(PaymentGatewayConfigResponse {
@@ -439,11 +440,9 @@ impl BillingService {
         tenant_id: Uuid,
         request: &UpsertPaymentGatewayConfigRequest,
     ) -> AppResult<PaymentGatewayConfigResponse> {
-        let plaintext = serde_json::to_string(&request.config).map_err(|e| {
-            AppError::BadRequest(format!("config must serialise to JSON: {e}"))
-        })?;
-        let encrypted =
-            crate::utils::crypto::encrypt(&plaintext, &self.encryption_key)?;
+        let plaintext = serde_json::to_string(&request.config)
+            .map_err(|e| AppError::BadRequest(format!("config must serialise to JSON: {e}")))?;
+        let encrypted = crate::utils::crypto::encrypt(&plaintext, &self.encryption_key)?;
 
         let id: Uuid = sqlx::query_scalar(
             r#"
@@ -599,7 +598,11 @@ impl BillingService {
             } else {
                 "sent"
             };
-            let paid_at = if new_status == "paid" { Some(Utc::now()) } else { None };
+            let paid_at = if new_status == "paid" {
+                Some(Utc::now())
+            } else {
+                None
+            };
             sqlx::query(
                 r#"
                 UPDATE invoices SET
@@ -661,12 +664,11 @@ impl BillingService {
             .await?;
 
         if let Some(invoice_id) = invoice_id {
-            let current: Option<(Decimal, Decimal)> = sqlx::query_as(
-                "SELECT total, amount_paid FROM invoices WHERE id = $1",
-            )
-            .bind(invoice_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let current: Option<(Decimal, Decimal)> =
+                sqlx::query_as("SELECT total, amount_paid FROM invoices WHERE id = $1")
+                    .bind(invoice_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
             if let Some((total, prior_paid)) = current {
                 let new_paid = (prior_paid - amount).max(Decimal::ZERO);
                 let new_balance = total - new_paid;

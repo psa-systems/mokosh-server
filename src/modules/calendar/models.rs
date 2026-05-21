@@ -55,8 +55,12 @@ pub struct CreateAppointmentRequest {
     pub location: Option<String>,
 }
 
-fn default_other() -> String { "other".into() }
-fn default_utc() -> String { "UTC".into() }
+fn default_other() -> String {
+    "other".into()
+}
+fn default_utc() -> String {
+    "UTC".into()
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAppointmentRequest {
@@ -104,7 +108,9 @@ pub struct AvailabilityWindow {
     pub is_available: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ReplaceAvailabilityRequest {
@@ -181,7 +187,9 @@ pub struct UpsertOnCallScheduleRequest {
     pub is_active: bool,
 }
 
-fn default_weekly() -> String { "weekly".into() }
+fn default_weekly() -> String {
+    "weekly".into()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OnCallNowResponse {

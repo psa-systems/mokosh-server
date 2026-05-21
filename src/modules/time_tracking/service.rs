@@ -180,8 +180,10 @@ impl TimeTrackingService {
             conditions.push(format!("date <= ${idx}"));
         }
         let where_clause = conditions.join(" AND ");
-        let order_by =
-            pagination.order_by("date DESC, start_time DESC", &["date", "duration_minutes", "created_at"]);
+        let order_by = pagination.order_by(
+            "date DESC, start_time DESC",
+            &["date", "duration_minutes", "created_at"],
+        );
         let query = format!(
             r#"
             SELECT id, user_id, date, start_time, end_time, duration_minutes,
@@ -297,7 +299,9 @@ impl TimeTrackingService {
         } else if let (Some(s), Some(e)) = (start, end) {
             let m = (e - s).num_minutes();
             if m < 0 {
-                return Err(AppError::BadRequest("end_time must be after start_time".to_string()));
+                return Err(AppError::BadRequest(
+                    "end_time must be after start_time".to_string(),
+                ));
             }
             m as i32
         } else {
@@ -423,7 +427,8 @@ impl TimeTrackingService {
         week_start: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
         // Anchor to Monday (ISO week start).
-        let anchor = week_start - chrono::Duration::days(week_start.weekday().num_days_from_monday() as i64);
+        let anchor =
+            week_start - chrono::Duration::days(week_start.weekday().num_days_from_monday() as i64);
         let week_end = anchor + chrono::Duration::days(7);
 
         let affected = sqlx::query(
@@ -503,12 +508,11 @@ impl TimeTrackingService {
         // UNIQUE(user_id) on active_timers means we either upsert or
         // reject. We reject so the user explicitly stops + re-starts;
         // silent replacement loses the prior elapsed time.
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM active_timers WHERE user_id = $1)",
-        )
-        .bind(user_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM active_timers WHERE user_id = $1)")
+                .bind(user_id)
+                .fetch_one(self.db.pool())
+                .await?;
         if exists {
             return Err(AppError::Conflict(
                 "User already has an active timer; stop it first".to_string(),
@@ -550,7 +554,11 @@ impl TimeTrackingService {
 
     /// Stop a timer: removes the `active_timers` row and creates a
     /// `time_entries` row covering the elapsed window.
-    pub async fn stop_timer(&self, tenant_id: Uuid, timer_id: Uuid) -> AppResult<TimeEntryResponse> {
+    pub async fn stop_timer(
+        &self,
+        tenant_id: Uuid,
+        timer_id: Uuid,
+    ) -> AppResult<TimeEntryResponse> {
         let mut tx = self.db.pool().begin().await?;
         let timer: Option<ActiveTimerRow> = sqlx::query_as(
             "SELECT id, user_id, ticket_id, project_id, company_id, work_type_id, notes, started_at \
@@ -587,17 +595,15 @@ impl TimeTrackingService {
         };
         let company_id = match timer.company_id {
             Some(v) => v,
-            None => sqlx::query_scalar::<_, Uuid>(
-                "SELECT company_id FROM tickets WHERE id = $1",
-            )
-            .bind(timer.ticket_id.unwrap_or(Uuid::nil()))
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "Cannot stop timer without an inferable company_id".to_string(),
-                )
-            })?,
+            None => sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM tickets WHERE id = $1")
+                .bind(timer.ticket_id.unwrap_or(Uuid::nil()))
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Cannot stop timer without an inferable company_id".to_string(),
+                    )
+                })?,
         };
 
         let entry_id = Uuid::new_v4();

@@ -35,7 +35,9 @@ pub struct CreateRmmConnectionRequest {
     pub sync_interval_minutes: i32,
 }
 
-fn default_60() -> i32 { 60 }
+fn default_60() -> i32 {
+    60
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RmmDeviceMappingResponse {
@@ -87,7 +89,9 @@ pub struct UpsertRmmAlertRuleRequest {
     pub is_active: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// Body for `POST /api/v1/rmm/alerts`. The RMM agent fires this with an
 /// HMAC signature in the `X-Signature` header (HMAC-SHA256 of the raw

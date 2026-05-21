@@ -57,7 +57,11 @@ async fn list_tickets(
         .ticket_service
         .list_ticket_responses(user.tenant_id, &filter, &pagination)
         .await?;
-    Ok(Json(PaginatedResponse::from_params(responses, &pagination, total)))
+    Ok(Json(PaginatedResponse::from_params(
+        responses,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_ticket(

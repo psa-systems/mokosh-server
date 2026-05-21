@@ -47,18 +47,32 @@ pub async fn audit_log_middleware(
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let auth_state = request.extensions().get::<AuthState>().cloned().unwrap_or_default();
+    let auth_state = request
+        .extensions()
+        .get::<AuthState>()
+        .cloned()
+        .unwrap_or_default();
 
     let response = next.run(request).await;
 
     // Only audit successful mutating requests.
     if let Some(action) = action {
         if response.status().is_success() {
-            if let (Some(tenant_id), Some(user)) = (auth_state.tenant_id, auth_state.user.as_ref()) {
-                let _ = state.service.append(
-                    tenant_id, Some(user.id), action, &entity_type, None, None,
-                    Some(addr.ip().to_string()), user_agent,
-                ).await;
+            if let (Some(tenant_id), Some(user)) = (auth_state.tenant_id, auth_state.user.as_ref())
+            {
+                let _ = state
+                    .service
+                    .append(
+                        tenant_id,
+                        Some(user.id),
+                        action,
+                        &entity_type,
+                        None,
+                        None,
+                        Some(addr.ip().to_string()),
+                        user_agent,
+                    )
+                    .await;
             }
         }
     }

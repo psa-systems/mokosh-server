@@ -25,30 +25,54 @@ pub struct RmmRouterState {
 }
 
 pub fn rmm_routes(service: RmmService) -> Router {
-    let state = RmmRouterState { service: Arc::new(service) };
+    let state = RmmRouterState {
+        service: Arc::new(service),
+    };
     Router::new()
         // PMS-102 connections (+ PMS-105 second provider variant)
-        .route("/rmm/connections", get(list_connections).post(create_connection))
-        .route("/rmm/connections/{id}", axum::routing::delete(delete_connection))
+        .route(
+            "/rmm/connections",
+            get(list_connections).post(create_connection),
+        )
+        .route(
+            "/rmm/connections/{id}",
+            axum::routing::delete(delete_connection),
+        )
         .route("/rmm/connections/{id}/test", post(test_connection))
         // PMS-103 device mappings
-        .route("/rmm/device-mappings", get(list_device_mappings).post(create_device_mapping))
-        .route("/rmm/device-mappings/{id}", axum::routing::delete(delete_device_mapping))
+        .route(
+            "/rmm/device-mappings",
+            get(list_device_mappings).post(create_device_mapping),
+        )
+        .route(
+            "/rmm/device-mappings/{id}",
+            axum::routing::delete(delete_device_mapping),
+        )
         // PMS-104 alert rules + ingest
-        .route("/rmm/alert-rules", get(list_alert_rules).post(create_alert_rule))
-        .route("/rmm/alert-rules/{id}", axum::routing::delete(delete_alert_rule))
+        .route(
+            "/rmm/alert-rules",
+            get(list_alert_rules).post(create_alert_rule),
+        )
+        .route(
+            "/rmm/alert-rules/{id}",
+            axum::routing::delete(delete_alert_rule),
+        )
         .route("/rmm/alerts", post(ingest_alert))
         .with_state(state)
 }
 
 async fn list_connections(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
 ) -> AppResult<Json<Vec<RmmConnectionResponse>>> {
     Ok(Json(s.service.list_connections(u.tenant_id).await?))
 }
 
 async fn create_connection(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Json(req): Json<CreateRmmConnectionRequest>,
 ) -> AppResult<Json<RmmConnectionResponse>> {
     req.validate()?;
@@ -65,49 +89,77 @@ async fn create_connection(
 }
 
 async fn delete_connection(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_connection(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_connection(u.tenant_id, id).await
+}
 
 async fn test_connection(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
     Ok(Json(s.service.test_connection(u.tenant_id, id).await?))
 }
 
 #[derive(serde::Deserialize)]
-struct ConnQuery { rmm_connection_id: Option<Uuid> }
+struct ConnQuery {
+    rmm_connection_id: Option<Uuid>,
+}
 
 async fn list_device_mappings(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
     Query(q): Query<ConnQuery>,
 ) -> AppResult<Json<Vec<RmmDeviceMappingResponse>>> {
-    Ok(Json(s.service.list_device_mappings(u.tenant_id, q.rmm_connection_id).await?))
+    Ok(Json(
+        s.service
+            .list_device_mappings(u.tenant_id, q.rmm_connection_id)
+            .await?,
+    ))
 }
 
 async fn create_device_mapping(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Json(req): Json<CreateRmmDeviceMappingRequest>,
 ) -> AppResult<Json<RmmDeviceMappingResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_device_mapping(u.tenant_id, &req).await?))
+    Ok(Json(
+        s.service.create_device_mapping(u.tenant_id, &req).await?,
+    ))
 }
 
 async fn delete_device_mapping(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_device_mapping(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_device_mapping(u.tenant_id, id).await
+}
 
 async fn list_alert_rules(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
     Query(q): Query<ConnQuery>,
 ) -> AppResult<Json<Vec<RmmAlertRuleResponse>>> {
-    Ok(Json(s.service.list_alert_rules(u.tenant_id, q.rmm_connection_id).await?))
+    Ok(Json(
+        s.service
+            .list_alert_rules(u.tenant_id, q.rmm_connection_id)
+            .await?,
+    ))
 }
 
 async fn create_alert_rule(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Json(req): Json<UpsertRmmAlertRuleRequest>,
 ) -> AppResult<Json<RmmAlertRuleResponse>> {
     req.validate()?;
@@ -115,9 +167,13 @@ async fn create_alert_rule(
 }
 
 async fn delete_alert_rule(
-    State(s): State<RmmRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_alert_rule(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_alert_rule(u.tenant_id, id).await
+}
 
 /// `POST /api/v1/rmm/alerts` is callable by RMM agents (not internal
 /// users); it authenticates by verifying an HMAC-SHA256 signature in
@@ -129,18 +185,23 @@ async fn ingest_alert(
     Json(req): Json<IngestAlertRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     req.validate()?;
-    let signature = headers.get("X-Signature")
+    let signature = headers
+        .get("X-Signature")
         .and_then(|h| h.to_str().ok())
         .ok_or_else(|| AppError::Unauthorized)?;
 
     // The body is parsed twice (axum + our HMAC compare) to avoid a
     // raw-body extractor; we re-serialise the parsed Json for HMAC.
     let body = serde_json::to_vec(&req).map_err(|_| AppError::Unauthorized)?;
-    let tenant_id = headers.get("X-Tenant-Id")
+    let tenant_id = headers
+        .get("X-Tenant-Id")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or_else(|| AppError::Unauthorized)?;
-    let secret = s.service.connection_api_secret(tenant_id, req.rmm_connection_id).await?
+    let secret = s
+        .service
+        .connection_api_secret(tenant_id, req.rmm_connection_id)
+        .await?
         .ok_or_else(|| AppError::Unauthorized)?;
     let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes())
         .map_err(|_| AppError::Internal("hmac key invalid".to_string()))?;

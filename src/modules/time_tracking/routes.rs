@@ -40,11 +40,16 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
         )
         .route(
             "/time-entries/{id}",
-            get(get_time_entry).put(update_time_entry).delete(delete_time_entry),
+            get(get_time_entry)
+                .put(update_time_entry)
+                .delete(delete_time_entry),
         )
         // PMS-46 / PMS-47 timesheets
         .route("/timesheets", get(list_timesheets))
-        .route("/timesheets/{user_id}/{week_start}/submit", post(submit_timesheet))
+        .route(
+            "/timesheets/{user_id}/{week_start}/submit",
+            post(submit_timesheet),
+        )
         // PMS-48 active timers
         .route("/timers/active", get(list_active_timers))
         .route("/timers/start", post(start_timer))
@@ -80,7 +85,12 @@ async fn create_work_type(
     Json(request): Json<UpsertWorkTypeRequest>,
 ) -> AppResult<Json<WorkTypeResponse>> {
     request.validate()?;
-    Ok(Json(state.service.create_work_type(user.tenant_id, &request).await?))
+    Ok(Json(
+        state
+            .service
+            .create_work_type(user.tenant_id, &request)
+            .await?,
+    ))
 }
 
 async fn update_work_type(
@@ -92,7 +102,10 @@ async fn update_work_type(
 ) -> AppResult<Json<WorkTypeResponse>> {
     request.validate()?;
     Ok(Json(
-        state.service.update_work_type(user.tenant_id, id, &request).await?,
+        state
+            .service
+            .update_work_type(user.tenant_id, id, &request)
+            .await?,
     ))
 }
 
@@ -120,7 +133,11 @@ async fn list_time_entries(
         .service
         .list_time_entries(user.tenant_id, &filter, &pagination)
         .await?;
-    Ok(Json(PaginatedResponse::from_params(items, &pagination, total)))
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_time_entry(
@@ -133,7 +150,12 @@ async fn create_time_entry(
         request.user_id = user.id;
     }
     request.validate()?;
-    Ok(Json(state.service.create_time_entry(user.tenant_id, &request).await?))
+    Ok(Json(
+        state
+            .service
+            .create_time_entry(user.tenant_id, &request)
+            .await?,
+    ))
 }
 
 async fn get_time_entry(
@@ -141,7 +163,9 @@ async fn get_time_entry(
     RequireAuth(user): RequireAuth,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeEntryResponse>> {
-    Ok(Json(state.service.get_time_entry(user.tenant_id, id).await?))
+    Ok(Json(
+        state.service.get_time_entry(user.tenant_id, id).await?,
+    ))
 }
 
 async fn update_time_entry(
@@ -152,7 +176,10 @@ async fn update_time_entry(
 ) -> AppResult<Json<TimeEntryResponse>> {
     request.validate()?;
     Ok(Json(
-        state.service.update_time_entry(user.tenant_id, id, &request).await?,
+        state
+            .service
+            .update_time_entry(user.tenant_id, id, &request)
+            .await?,
     ))
 }
 
@@ -174,7 +201,12 @@ async fn list_timesheets(
     Query(filter): Query<TimesheetFilter>,
 ) -> AppResult<Json<Vec<TimesheetSummaryResponse>>> {
     filter.validate()?;
-    Ok(Json(state.service.list_timesheets(user.tenant_id, &filter).await?))
+    Ok(Json(
+        state
+            .service
+            .list_timesheets(user.tenant_id, &filter)
+            .await?,
+    ))
 }
 
 async fn submit_timesheet(
@@ -187,7 +219,12 @@ async fn submit_timesheet(
             "Cannot submit another user's timesheet".to_string(),
         ));
     }
-    Ok(Json(state.service.submit_timesheet(user.tenant_id, user_id, week_start).await?))
+    Ok(Json(
+        state
+            .service
+            .submit_timesheet(user.tenant_id, user_id, week_start)
+            .await?,
+    ))
 }
 
 // ============================================================================
@@ -210,7 +247,12 @@ async fn list_active_timers(
     } else {
         Some(user.id)
     };
-    Ok(Json(state.service.list_active_timers(user.tenant_id, user_filter).await?))
+    Ok(Json(
+        state
+            .service
+            .list_active_timers(user.tenant_id, user_filter)
+            .await?,
+    ))
 }
 
 async fn start_timer(
@@ -219,7 +261,12 @@ async fn start_timer(
     Json(request): Json<StartTimerRequest>,
 ) -> AppResult<Json<ActiveTimerResponse>> {
     request.validate()?;
-    Ok(Json(state.service.start_timer(user.tenant_id, user.id, &request).await?))
+    Ok(Json(
+        state
+            .service
+            .start_timer(user.tenant_id, user.id, &request)
+            .await?,
+    ))
 }
 
 async fn stop_timer(
@@ -238,7 +285,9 @@ async fn list_rounding_rules(
     State(state): State<TimeTrackingRouterState>,
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<Vec<TimeRoundingRuleResponse>>> {
-    Ok(Json(state.service.list_rounding_rules(user.tenant_id).await?))
+    Ok(Json(
+        state.service.list_rounding_rules(user.tenant_id).await?,
+    ))
 }
 
 async fn create_rounding_rule(
@@ -248,7 +297,12 @@ async fn create_rounding_rule(
     Json(request): Json<UpsertTimeRoundingRuleRequest>,
 ) -> AppResult<Json<TimeRoundingRuleResponse>> {
     request.validate()?;
-    Ok(Json(state.service.create_rounding_rule(user.tenant_id, &request).await?))
+    Ok(Json(
+        state
+            .service
+            .create_rounding_rule(user.tenant_id, &request)
+            .await?,
+    ))
 }
 
 async fn update_rounding_rule(
@@ -259,7 +313,12 @@ async fn update_rounding_rule(
     Json(request): Json<UpsertTimeRoundingRuleRequest>,
 ) -> AppResult<Json<TimeRoundingRuleResponse>> {
     request.validate()?;
-    Ok(Json(state.service.update_rounding_rule(user.tenant_id, id, &request).await?))
+    Ok(Json(
+        state
+            .service
+            .update_rounding_rule(user.tenant_id, id, &request)
+            .await?,
+    ))
 }
 
 async fn delete_rounding_rule(

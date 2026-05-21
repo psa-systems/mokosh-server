@@ -53,10 +53,18 @@ pub struct CreateProjectRequest {
     pub is_billable: bool,
 }
 
-fn default_client() -> String { "client".into() }
-fn default_planning() -> String { "planning".into() }
-fn default_tm() -> String { "time_and_materials".into() }
-fn default_true() -> bool { true }
+fn default_client() -> String {
+    "client".into()
+}
+fn default_planning() -> String {
+    "planning".into()
+}
+fn default_tm() -> String {
+    "time_and_materials".into()
+}
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateProjectRequest {
@@ -107,7 +115,9 @@ pub struct UpsertProjectPhaseRequest {
     pub status: String,
 }
 
-fn default_not_started() -> String { "not_started".into() }
+fn default_not_started() -> String {
+    "not_started".into()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskStatusResponse {
@@ -167,7 +177,9 @@ pub struct CreateTaskRequest {
     pub sort_order: i32,
 }
 
-fn default_medium() -> String { "medium".into() }
+fn default_medium() -> String {
+    "medium".into()
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateTaskRequest {

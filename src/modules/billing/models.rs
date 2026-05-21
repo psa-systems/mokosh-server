@@ -50,7 +50,10 @@ impl InvoiceStatus {
     /// freeze writes; correction goes through a credit note (out of
     /// scope here).
     pub fn is_frozen(&self) -> bool {
-        matches!(self, Self::Sent | Self::Paid | Self::PartiallyPaid | Self::Void | Self::WrittenOff)
+        matches!(
+            self,
+            Self::Sent | Self::Paid | Self::PartiallyPaid | Self::Void | Self::WrittenOff
+        )
     }
 }
 

@@ -21,20 +21,40 @@ pub struct SlaRouterState {
 }
 
 pub fn sla_routes(service: SlaService) -> Router {
-    let state = SlaRouterState { service: Arc::new(service) };
+    let state = SlaRouterState {
+        service: Arc::new(service),
+    };
     Router::new()
         // PMS-108 policies
         .route("/sla/policies", get(list_policies).post(create_policy))
-        .route("/sla/policies/{id}", get(get_policy).put(update_policy).delete(delete_policy))
+        .route(
+            "/sla/policies/{id}",
+            get(get_policy).put(update_policy).delete(delete_policy),
+        )
         // PMS-109 targets
-        .route("/sla/policies/{id}/targets", get(list_targets).post(upsert_target))
+        .route(
+            "/sla/policies/{id}/targets",
+            get(list_targets).post(upsert_target),
+        )
         .route("/sla/targets/{id}", axum::routing::delete(delete_target))
         // PMS-110 business hours
-        .route("/sla/business-hours", get(list_business_hours).post(create_business_hours))
-        .route("/sla/business-hours/{id}", put(update_business_hours).delete(delete_business_hours))
+        .route(
+            "/sla/business-hours",
+            get(list_business_hours).post(create_business_hours),
+        )
+        .route(
+            "/sla/business-hours/{id}",
+            put(update_business_hours).delete(delete_business_hours),
+        )
         // PMS-111 holiday calendars
-        .route("/sla/holiday-calendars", get(list_holiday_calendars).post(create_holiday_calendar))
-        .route("/sla/holiday-calendars/{id}", put(update_holiday_calendar).delete(delete_holiday_calendar))
+        .route(
+            "/sla/holiday-calendars",
+            get(list_holiday_calendars).post(create_holiday_calendar),
+        )
+        .route(
+            "/sla/holiday-calendars/{id}",
+            put(update_holiday_calendar).delete(delete_holiday_calendar),
+        )
         // PMS-112 evaluator (manual trigger; ticket service calls
         // SlaService::evaluate_for_ticket on create/status change in a
         // follow-up wire-up commit)
@@ -43,13 +63,16 @@ pub fn sla_routes(service: SlaService) -> Router {
 }
 
 async fn list_policies(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
 ) -> AppResult<Json<Vec<SlaPolicyResponse>>> {
     Ok(Json(s.service.list_policies(u.tenant_id).await?))
 }
 
 async fn create_policy(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Json(req): Json<UpsertSlaPolicyRequest>,
 ) -> AppResult<Json<SlaPolicyResponse>> {
     req.validate()?;
@@ -57,98 +80,152 @@ async fn create_policy(
 }
 
 async fn get_policy(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
 ) -> AppResult<Json<SlaPolicyResponse>> {
     Ok(Json(s.service.get_policy(u.tenant_id, id).await?))
 }
 
 async fn update_policy(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
-    Path(id): Path<Uuid>, Json(req): Json<UpsertSlaPolicyRequest>,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertSlaPolicyRequest>,
 ) -> AppResult<Json<SlaPolicyResponse>> {
     req.validate()?;
     Ok(Json(s.service.update_policy(u.tenant_id, id, &req).await?))
 }
 
 async fn delete_policy(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_policy(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_policy(u.tenant_id, id).await
+}
 
 async fn list_targets(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<SlaTargetResponse>>> {
     Ok(Json(s.service.list_targets(u.tenant_id, id).await?))
 }
 
 async fn upsert_target(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
-    Path(id): Path<Uuid>, Json(req): Json<UpsertSlaTargetRequest>,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertSlaTargetRequest>,
 ) -> AppResult<Json<SlaTargetResponse>> {
     req.validate()?;
     Ok(Json(s.service.upsert_target(u.tenant_id, id, &req).await?))
 }
 
 async fn delete_target(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_target(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_target(u.tenant_id, id).await
+}
 
 async fn list_business_hours(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
 ) -> AppResult<Json<Vec<BusinessHoursResponse>>> {
     Ok(Json(s.service.list_business_hours(u.tenant_id).await?))
 }
 
 async fn create_business_hours(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Json(req): Json<UpsertBusinessHoursRequest>,
 ) -> AppResult<Json<BusinessHoursResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_business_hours(u.tenant_id, &req).await?))
+    Ok(Json(
+        s.service.create_business_hours(u.tenant_id, &req).await?,
+    ))
 }
 
 async fn update_business_hours(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
-    Path(id): Path<Uuid>, Json(req): Json<UpsertBusinessHoursRequest>,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertBusinessHoursRequest>,
 ) -> AppResult<Json<BusinessHoursResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_business_hours(u.tenant_id, id, &req).await?))
+    Ok(Json(
+        s.service
+            .update_business_hours(u.tenant_id, id, &req)
+            .await?,
+    ))
 }
 
 async fn delete_business_hours(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_business_hours(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_business_hours(u.tenant_id, id).await
+}
 
 async fn list_holiday_calendars(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
 ) -> AppResult<Json<Vec<HolidayCalendarResponse>>> {
     Ok(Json(s.service.list_holiday_calendars(u.tenant_id).await?))
 }
 
 async fn create_holiday_calendar(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Json(req): Json<UpsertHolidayCalendarRequest>,
 ) -> AppResult<Json<HolidayCalendarResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_holiday_calendar(u.tenant_id, &req).await?))
+    Ok(Json(
+        s.service.create_holiday_calendar(u.tenant_id, &req).await?,
+    ))
 }
 
 async fn update_holiday_calendar(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
-    Path(id): Path<Uuid>, Json(req): Json<UpsertHolidayCalendarRequest>,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertHolidayCalendarRequest>,
 ) -> AppResult<Json<HolidayCalendarResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_holiday_calendar(u.tenant_id, id, &req).await?))
+    Ok(Json(
+        s.service
+            .update_holiday_calendar(u.tenant_id, id, &req)
+            .await?,
+    ))
 }
 
 async fn delete_holiday_calendar(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_holiday_calendar(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_holiday_calendar(u.tenant_id, id).await
+}
 
 async fn evaluate_for_ticket(
-    State(s): State<SlaRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<SlaRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.evaluate_for_ticket(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.evaluate_for_ticket(u.tenant_id, id).await
+}

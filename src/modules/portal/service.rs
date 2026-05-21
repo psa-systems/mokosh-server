@@ -37,20 +37,28 @@ impl PortalAuthService {
     /// and issue a portal JWT on success. Returns 401 on any failure
     /// path so the surface stays enumeration-resistant.
     pub async fn login(&self, request: &PortalLoginRequest) -> AppResult<PortalLoginResponse> {
-        let row: Option<(Uuid, Uuid, Uuid, String, String, String, bool, Option<String>)> =
-            sqlx::query_as(
-                r#"
+        let row: Option<(
+            Uuid,
+            Uuid,
+            Uuid,
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email, c.first_name,
                        c.last_name, c.is_portal_user, c.portal_password_hash
                 FROM contacts c
                 INNER JOIN tenants t ON c.tenant_id = t.id
                 WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
                 "#,
-            )
-            .bind(&request.tenant_slug)
-            .bind(&request.email)
-            .fetch_optional(self.db.pool())
-            .await?;
+        )
+        .bind(&request.tenant_slug)
+        .bind(&request.email)
+        .fetch_optional(self.db.pool())
+        .await?;
 
         let Some((id, tenant_id, company_id, email, first_name, last_name, is_portal_user, hash)) =
             row

@@ -390,7 +390,11 @@ impl AuthService {
         .await?;
 
         let reset_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
-        if let Err(e) = self.mailer.send_password_reset(&user.email, &reset_link).await {
+        if let Err(e) = self
+            .mailer
+            .send_password_reset(&user.email, &reset_link)
+            .await
+        {
             // Log but do not leak details to the caller; the public
             // surface stays enumeration-resistant either way.
             tracing::warn!(
@@ -569,12 +573,8 @@ impl AuthService {
             .execute(self.db.pool())
             .await?;
 
-            let setup_link =
-                format!("{}/reset-password/{}", self.frontend_base_url, token);
-            let display_name = match (
-                request.first_name.trim(),
-                request.last_name.trim(),
-            ) {
+            let setup_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
+            let display_name = match (request.first_name.trim(), request.last_name.trim()) {
                 ("", "") => String::new(),
                 (f, "") => f.to_string(),
                 ("", l) => l.to_string(),
@@ -724,22 +724,19 @@ impl AuthService {
     /// `mfa_enabled = true`.
     pub async fn enable_mfa(&self, user_id: Uuid, code: &str) -> AppResult<()> {
         let user = self.get_user_by_id(user_id).await?;
-        let secret_b32 = user
-            .mfa_secret
-            .as_ref()
-            .ok_or_else(|| AppError::BadRequest("MFA enrollment has not been started".to_string()))?;
+        let secret_b32 = user.mfa_secret.as_ref().ok_or_else(|| {
+            AppError::BadRequest("MFA enrollment has not been started".to_string())
+        })?;
         let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32)
             .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
         if mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1).is_none() {
             return Err(AppError::BadRequest("Invalid MFA code".to_string()));
         }
 
-        sqlx::query(
-            "UPDATE users SET mfa_enabled = TRUE, updated_at = NOW() WHERE id = $1",
-        )
-        .bind(user_id)
-        .execute(self.db.pool())
-        .await?;
+        sqlx::query("UPDATE users SET mfa_enabled = TRUE, updated_at = NOW() WHERE id = $1")
+            .bind(user_id)
+            .execute(self.db.pool())
+            .await?;
 
         Ok(())
     }
@@ -785,10 +782,12 @@ impl AuthService {
         let key_hash = hash_password(&raw_key)?;
 
         let id = Uuid::new_v4();
-        let scopes = request.scopes.clone().unwrap_or_else(|| vec!["*".to_string()]);
-        let scopes_json = serde_json::to_value(&scopes).map_err(|e| {
-            AppError::Internal(format!("api key scopes serialise: {e}"))
-        })?;
+        let scopes = request
+            .scopes
+            .clone()
+            .unwrap_or_else(|| vec!["*".to_string()]);
+        let scopes_json = serde_json::to_value(&scopes)
+            .map_err(|e| AppError::Internal(format!("api key scopes serialise: {e}")))?;
 
         let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
             r#"
@@ -853,15 +852,14 @@ impl AuthService {
         user_id: Uuid,
         key_id: Uuid,
     ) -> AppResult<()> {
-        let affected = sqlx::query(
-            "DELETE FROM api_keys WHERE id = $1 AND tenant_id = $2 AND user_id = $3",
-        )
-        .bind(key_id)
-        .bind(tenant_id)
-        .bind(user_id)
-        .execute(self.db.pool())
-        .await?
-        .rows_affected();
+        let affected =
+            sqlx::query("DELETE FROM api_keys WHERE id = $1 AND tenant_id = $2 AND user_id = $3")
+                .bind(key_id)
+                .bind(tenant_id)
+                .bind(user_id)
+                .execute(self.db.pool())
+                .await?
+                .rows_affected();
 
         if affected == 0 {
             return Err(AppError::NotFound("API key".to_string()));

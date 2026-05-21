@@ -289,7 +289,10 @@ async fn enable_mfa(
     Json(request): Json<MfaEnableRequest>,
 ) -> AppResult<()> {
     request.validate()?;
-    state.auth_service.enable_mfa(user.id, &request.code).await?;
+    state
+        .auth_service
+        .enable_mfa(user.id, &request.code)
+        .await?;
     Ok(())
 }
 

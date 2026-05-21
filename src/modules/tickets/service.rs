@@ -573,9 +573,8 @@ impl TicketService {
         };
 
         let subject = format!("[{ticket_number}] {title}");
-        let body = format!(
-            "A new update has been added to ticket {ticket_number}:\n\n{content}\n",
-        );
+        let body =
+            format!("A new update has been added to ticket {ticket_number}:\n\n{content}\n",);
 
         match self.mailer.send_text(&email, &subject, &body).await {
             Ok(()) => {
@@ -846,7 +845,8 @@ impl TicketService {
             company_id: Some(company_id),
             ..Default::default()
         };
-        self.list_ticket_responses(tenant_id, &filter, pagination).await
+        self.list_ticket_responses(tenant_id, &filter, pagination)
+            .await
     }
 
     /// Get a single ticket scoped to a portal contact's company. 404
@@ -875,7 +875,10 @@ impl TicketService {
         tenant_id: Uuid,
         ticket_id: Uuid,
     ) -> AppResult<TicketResponse> {
-        let sql = format!("{} WHERE t.tenant_id = $1 AND t.id = $2", TICKET_RESPONSE_SELECT);
+        let sql = format!(
+            "{} WHERE t.tenant_id = $1 AND t.id = $2",
+            TICKET_RESPONSE_SELECT
+        );
         let row = sqlx::query_as::<_, TicketResponseRow>(&sql)
             .bind(tenant_id)
             .bind(ticket_id)

@@ -56,8 +56,12 @@ pub struct CreateContractRequest {
     pub notes: Option<String>,
 }
 
-fn default_draft() -> String { "draft".into() }
-fn default_monthly() -> String { "monthly".into() }
+fn default_draft() -> String {
+    "draft".into()
+}
+fn default_monthly() -> String {
+    "monthly".into()
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateContractRequest {

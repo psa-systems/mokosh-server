@@ -29,11 +29,20 @@ pub fn billing_routes(service: BillingService) -> Router {
     };
     Router::new()
         .route("/invoices", get(list_invoices).post(create_invoice))
-        .route("/invoices/{invoice_id}", get(get_invoice).put(update_invoice))
+        .route(
+            "/invoices/{invoice_id}",
+            get(get_invoice).put(update_invoice),
+        )
         .route("/payments", get(list_payments).post(create_payment))
         .route("/payments/{payment_id}", delete(delete_payment))
-        .route("/payment-gateways", get(list_payment_gateways).put(upsert_payment_gateway))
-        .route("/payment-gateways/{provider}", delete(delete_payment_gateway))
+        .route(
+            "/payment-gateways",
+            get(list_payment_gateways).put(upsert_payment_gateway),
+        )
+        .route(
+            "/payment-gateways/{provider}",
+            delete(delete_payment_gateway),
+        )
         .route("/tax-rates", get(list_tax_rates).post(create_tax_rate))
         .route(
             "/tax-rates/{id}",
@@ -59,7 +68,10 @@ async fn create_tax_rate(
     Json(request): Json<UpsertTaxRateRequest>,
 ) -> AppResult<Json<TaxRateResponse>> {
     request.validate()?;
-    let r = state.service.create_tax_rate(user.tenant_id, &request).await?;
+    let r = state
+        .service
+        .create_tax_rate(user.tenant_id, &request)
+        .await?;
     Ok(Json(r))
 }
 
@@ -98,7 +110,10 @@ async fn lookup_tax_rate(
     RequireAuth(user): RequireAuth,
     Query(q): Query<LookupQuery>,
 ) -> AppResult<Json<TaxRateResponse>> {
-    let r = state.service.lookup_tax_rate(user.tenant_id, &q.name).await?;
+    let r = state
+        .service
+        .lookup_tax_rate(user.tenant_id, &q.name)
+        .await?;
     Ok(Json(r))
 }
 
@@ -153,7 +168,11 @@ async fn list_payments(
         .service
         .list_payments(user.tenant_id, &filter, &pagination)
         .await?;
-    Ok(Json(PaginatedResponse::from_params(payments, &pagination, total)))
+    Ok(Json(PaginatedResponse::from_params(
+        payments,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_payment(
@@ -163,7 +182,10 @@ async fn create_payment(
     Json(request): Json<CreatePaymentRequest>,
 ) -> AppResult<Json<PaymentResponse>> {
     request.validate()?;
-    let p = state.service.create_payment(user.tenant_id, &request).await?;
+    let p = state
+        .service
+        .create_payment(user.tenant_id, &request)
+        .await?;
     Ok(Json(p))
 }
 
@@ -173,7 +195,10 @@ async fn delete_payment(
     _finance: RequireFinance,
     Path(payment_id): Path<Uuid>,
 ) -> AppResult<()> {
-    state.service.delete_payment(user.tenant_id, payment_id).await?;
+    state
+        .service
+        .delete_payment(user.tenant_id, payment_id)
+        .await?;
     Ok(())
 }
 
@@ -199,7 +224,10 @@ async fn create_invoice(
     Json(request): Json<CreateInvoiceRequest>,
 ) -> AppResult<Json<InvoiceResponse>> {
     request.validate()?;
-    let inv = state.service.create_invoice(user.tenant_id, &request).await?;
+    let inv = state
+        .service
+        .create_invoice(user.tenant_id, &request)
+        .await?;
     Ok(Json(inv))
 }
 
@@ -209,7 +237,10 @@ async fn get_invoice(
     _finance: RequireFinance,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
-    let inv = state.service.get_invoice(user.tenant_id, invoice_id).await?;
+    let inv = state
+        .service
+        .get_invoice(user.tenant_id, invoice_id)
+        .await?;
     Ok(Json(inv))
 }
 
@@ -225,5 +256,9 @@ async fn list_invoices(
         .service
         .list_invoices(user.tenant_id, &filter, &pagination)
         .await?;
-    Ok(Json(PaginatedResponse::from_params(invoices, &pagination, total)))
+    Ok(Json(PaginatedResponse::from_params(
+        invoices,
+        &pagination,
+        total,
+    )))
 }

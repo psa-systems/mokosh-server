@@ -32,10 +32,15 @@ pub fn calendar_routes(service: CalendarService) -> Router {
         // Legacy events surface
         .route("/calendar/events", get(list_events))
         // PMS-60 appointments
-        .route("/appointments", get(list_appointments).post(create_appointment))
+        .route(
+            "/appointments",
+            get(list_appointments).post(create_appointment),
+        )
         .route(
             "/appointments/{id}",
-            get(get_appointment).put(update_appointment).delete(delete_appointment),
+            get(get_appointment)
+                .put(update_appointment)
+                .delete(delete_appointment),
         )
         // PMS-61 user availability
         .route(
@@ -44,16 +49,10 @@ pub fn calendar_routes(service: CalendarService) -> Router {
         )
         // PMS-62 time off
         .route("/time-off", get(list_time_off).post(create_time_off))
-        .route(
-            "/time-off/{id}",
-            get(get_time_off).delete(delete_time_off),
-        )
+        .route("/time-off/{id}", get(get_time_off).delete(delete_time_off))
         .route("/time-off/{id}/approval", post(approve_time_off))
         // PMS-63 on-call
-        .route(
-            "/on-call-schedules",
-            get(list_on_call).post(create_on_call),
-        )
+        .route("/on-call-schedules", get(list_on_call).post(create_on_call))
         .route(
             "/on-call-schedules/{id}",
             put(update_on_call).delete(delete_on_call),
@@ -71,7 +70,8 @@ async fn list_events(
 }
 
 async fn list_appointments(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
     Query(f): Query<AppointmentFilter>,
 ) -> AppResult<Json<Vec<AppointmentResponse>>> {
     f.validate()?;
@@ -79,7 +79,8 @@ async fn list_appointments(
 }
 
 async fn create_appointment(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
     Json(req): Json<CreateAppointmentRequest>,
 ) -> AppResult<Json<AppointmentResponse>> {
     req.validate()?;
@@ -87,32 +88,50 @@ async fn create_appointment(
 }
 
 async fn get_appointment(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
 ) -> AppResult<Json<AppointmentResponse>> {
     Ok(Json(s.service.get_appointment(u.tenant_id, id).await?))
 }
 
 async fn update_appointment(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
-    Path(id): Path<Uuid>, Json(req): Json<UpdateAppointmentRequest>,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateAppointmentRequest>,
 ) -> AppResult<Json<AppointmentResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_appointment(u.tenant_id, id, &req).await?))
+    Ok(Json(
+        s.service.update_appointment(u.tenant_id, id, &req).await?,
+    ))
 }
 
 async fn delete_appointment(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_appointment(u.tenant_id, id).await }
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    s.service.delete_appointment(u.tenant_id, id).await
+}
 
 async fn get_user_availability(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, Path(user_id): Path<Uuid>,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(user_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<UserAvailabilityResponse>>> {
-    Ok(Json(s.service.get_user_availability(u.tenant_id, user_id).await?))
+    Ok(Json(
+        s.service
+            .get_user_availability(u.tenant_id, user_id)
+            .await?,
+    ))
 }
 
 async fn replace_user_availability(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
-    Path(user_id): Path<Uuid>, Json(req): Json<ReplaceAvailabilityRequest>,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<ReplaceAvailabilityRequest>,
 ) -> AppResult<Json<Vec<UserAvailabilityResponse>>> {
     // Non-admins can only edit their own availability.
     if !u.role.is_admin() && user_id != u.id {
@@ -120,12 +139,19 @@ async fn replace_user_availability(
             "Cannot edit another user's availability".to_string(),
         ));
     }
-    for w in &req.windows { w.validate()?; }
-    Ok(Json(s.service.replace_user_availability(u.tenant_id, user_id, &req).await?))
+    for w in &req.windows {
+        w.validate()?;
+    }
+    Ok(Json(
+        s.service
+            .replace_user_availability(u.tenant_id, user_id, &req)
+            .await?,
+    ))
 }
 
 async fn list_time_off(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
     Query(f): Query<TimeOffFilter>,
 ) -> AppResult<Json<Vec<TimeOffResponse>>> {
     f.validate()?;
@@ -133,7 +159,8 @@ async fn list_time_off(
 }
 
 async fn create_time_off(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
     Json(mut req): Json<CreateTimeOffRequest>,
 ) -> AppResult<Json<TimeOffResponse>> {
     if !u.role.is_admin() && req.user_id != u.id {
@@ -144,52 +171,82 @@ async fn create_time_off(
 }
 
 async fn get_time_off(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeOffResponse>> {
     Ok(Json(s.service.get_time_off(u.tenant_id, id).await?))
 }
 
 async fn approve_time_off(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
-    Path(id): Path<Uuid>, Json(req): Json<ApproveTimeOffRequest>,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ApproveTimeOffRequest>,
 ) -> AppResult<Json<TimeOffResponse>> {
     req.validate()?;
-    Ok(Json(s.service.approve_time_off(u.tenant_id, id, u.id, &req.status).await?))
+    Ok(Json(
+        s.service
+            .approve_time_off(u.tenant_id, id, u.id, &req.status)
+            .await?,
+    ))
 }
 
 async fn delete_time_off(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_time_off(u.tenant_id, id).await }
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    s.service.delete_time_off(u.tenant_id, id).await
+}
 
 async fn list_on_call(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
 ) -> AppResult<Json<Vec<OnCallScheduleResponse>>> {
     Ok(Json(s.service.list_on_call_schedules(u.tenant_id).await?))
 }
 
 async fn create_on_call(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
     Json(req): Json<UpsertOnCallScheduleRequest>,
 ) -> AppResult<Json<OnCallScheduleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_on_call_schedule(u.tenant_id, &req).await?))
+    Ok(Json(
+        s.service.create_on_call_schedule(u.tenant_id, &req).await?,
+    ))
 }
 
 async fn update_on_call(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
-    Path(id): Path<Uuid>, Json(req): Json<UpsertOnCallScheduleRequest>,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertOnCallScheduleRequest>,
 ) -> AppResult<Json<OnCallScheduleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_on_call_schedule(u.tenant_id, id, &req).await?))
+    Ok(Json(
+        s.service
+            .update_on_call_schedule(u.tenant_id, id, &req)
+            .await?,
+    ))
 }
 
 async fn delete_on_call(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth, _m: RequireManager,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    _m: RequireManager,
     Path(id): Path<Uuid>,
-) -> AppResult<()> { s.service.delete_on_call_schedule(u.tenant_id, id).await }
+) -> AppResult<()> {
+    s.service.delete_on_call_schedule(u.tenant_id, id).await
+}
 
 async fn on_call_now(
-    State(s): State<CalendarRouterState>, RequireAuth(u): RequireAuth,
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
 ) -> AppResult<Json<Vec<OnCallNowResponse>>> {
     Ok(Json(s.service.on_call_now(u.tenant_id).await?))
 }

@@ -44,7 +44,9 @@ pub struct UpsertSlaTargetRequest {
     pub operational_hours: String,
 }
 
-fn default_24x7() -> String { "24x7".into() }
+fn default_24x7() -> String {
+    "24x7".into()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BusinessHoursResponse {
@@ -69,7 +71,9 @@ pub struct UpsertBusinessHoursRequest {
     pub is_default: bool,
 }
 
-fn default_utc() -> String { "UTC".into() }
+fn default_utc() -> String {
+    "UTC".into()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HolidayCalendarResponse {

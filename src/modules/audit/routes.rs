@@ -21,14 +21,18 @@ pub struct AuditRouterState {
 }
 
 pub fn audit_routes(service: AuditService) -> Router {
-    let state = AuditRouterState { service: Arc::new(service) };
+    let state = AuditRouterState {
+        service: Arc::new(service),
+    };
     Router::new()
         .route("/audit-log", get(list_audit_log))
         .with_state(state)
 }
 
 async fn list_audit_log(
-    State(s): State<AuditRouterState>, RequireAuth(u): RequireAuth, _a: RequireAdmin,
+    State(s): State<AuditRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
     Query(filter): Query<AuditLogFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AuditLogEntryResponse>>> {
@@ -38,5 +42,9 @@ async fn list_audit_log(
     // their own tenant.
     let scope = Some(u.tenant_id);
     let (items, total) = s.service.list(scope, &filter, &pagination).await?;
-    Ok(Json(PaginatedResponse::from_params(items, &pagination, total)))
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }

@@ -31,7 +31,9 @@ pub struct UpsertKbCategoryRequest {
     pub sort_order: i32,
 }
 
-fn default_internal() -> String { "internal".into() }
+fn default_internal() -> String {
+    "internal".into()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KbArticleResponse {
@@ -69,7 +71,9 @@ pub struct CreateKbArticleRequest {
     pub tags: Vec<String>,
 }
 
-fn default_draft() -> String { "draft".into() }
+fn default_draft() -> String {
+    "draft".into()
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateKbArticleRequest {

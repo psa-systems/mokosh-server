@@ -17,9 +17,7 @@ use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
-use super::{
-    CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse,
-};
+use super::{CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse};
 use crate::modules::tickets::{TicketResponse, TicketService};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -89,7 +87,9 @@ async fn get_invoice(
 ) -> AppResult<Json<serde_json::Value>> {
     // Same shape as list_invoices: 401 for unauth callers, 404 for
     // everyone else, until billing lands.
-    Err(crate::utils::error::AppError::NotFound("Invoice".to_string()))
+    Err(crate::utils::error::AppError::NotFound(
+        "Invoice".to_string(),
+    ))
 }
 
 async fn list_kb(

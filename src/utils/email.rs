@@ -26,12 +26,7 @@ pub trait Mailer: Send + Sync {
 
     /// Welcome / account-created mail for users provisioned by an
     /// admin. `setup_link` lands them on a "pick your password" page.
-    async fn send_welcome(
-        &self,
-        to: &str,
-        display_name: &str,
-        setup_link: &str,
-    ) -> AppResult<()>;
+    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()>;
 
     /// Generic plain-text mail. Escape hatch for notification flows
     /// that don't fit a typed helper above (e.g. ticket-note
@@ -56,12 +51,7 @@ impl Mailer for LogMailer {
         Ok(())
     }
 
-    async fn send_welcome(
-        &self,
-        to: &str,
-        display_name: &str,
-        setup_link: &str,
-    ) -> AppResult<()> {
+    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()> {
         tracing::info!(
             target: "mokosh_server.mailer",
             to = %to,
@@ -128,7 +118,9 @@ impl SmtpMailer {
             SmtpTls::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(host)
                 .map_err(|e| AppError::Configuration(format!("SMTP relay({host}): {e}")))?,
             SmtpTls::Starttls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
-                .map_err(|e| AppError::Configuration(format!("SMTP starttls_relay({host}): {e}")))?,
+                .map_err(|e| {
+                    AppError::Configuration(format!("SMTP starttls_relay({host}): {e}"))
+                })?,
             SmtpTls::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host),
         }
         .port(port)
@@ -180,12 +172,7 @@ impl Mailer for SmtpMailer {
         Ok(())
     }
 
-    async fn send_welcome(
-        &self,
-        to: &str,
-        display_name: &str,
-        setup_link: &str,
-    ) -> AppResult<()> {
+    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()> {
         let to_mailbox: Mailbox = to
             .parse()
             .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
@@ -253,7 +240,9 @@ impl MailerConfig {
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(587);
-        let username = std::env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty());
+        let username = std::env::var("SMTP_USERNAME")
+            .ok()
+            .filter(|s| !s.is_empty());
         let password = std::env::var("SMTP_PASSWORD")
             .ok()
             .filter(|s| !s.is_empty())

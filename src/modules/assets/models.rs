@@ -25,7 +25,9 @@ pub struct UpsertAssetTypeRequest {
     pub is_active: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AssetResponse {
@@ -75,7 +77,9 @@ pub struct CreateAssetRequest {
     pub end_of_life: Option<NaiveDate>,
 }
 
-fn default_active() -> String { "active".into() }
+fn default_active() -> String {
+    "active".into()
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAssetRequest {

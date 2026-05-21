@@ -15,22 +15,22 @@ use tower_http::{
 };
 
 use crate::db::Database;
-use crate::modules::auth::at_jwt::AtJwtVerifier;
-use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_log_middleware, audit_routes, AuditService};
-use crate::modules::calendar::{calendar_routes, CalendarService};
+use crate::modules::auth::at_jwt::AtJwtVerifier;
+use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::billing::{billing_routes, BillingService};
+use crate::modules::calendar::{calendar_routes, CalendarService};
+use crate::modules::contacts::{contact_routes, ContactService};
+use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
-use crate::modules::reports::{reports_routes, ReportsService};
-use crate::modules::rmm::{rmm_routes, RmmService};
-use crate::modules::sla::{sla_routes, SlaService};
-use crate::modules::settings::{settings_routes, SettingsService};
-use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
-use crate::modules::contracts::{contracts_routes, ContractsService};
+use crate::modules::reports::{reports_routes, ReportsService};
+use crate::modules::rmm::{rmm_routes, RmmService};
+use crate::modules::settings::{settings_routes, SettingsService};
+use crate::modules::sla::{sla_routes, SlaService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
@@ -66,8 +66,9 @@ pub fn create_api_router(
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
         .map(|o| {
-            o.parse::<HeaderValue>()
-                .unwrap_or_else(|e| panic!("CORS_ORIGIN entry {o:?} is not a valid header value: {e}"))
+            o.parse::<HeaderValue>().unwrap_or_else(|e| {
+                panic!("CORS_ORIGIN entry {o:?} is not a valid header value: {e}")
+            })
         })
         .collect();
     // Create services
