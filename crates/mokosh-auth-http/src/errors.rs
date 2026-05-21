@@ -28,6 +28,16 @@ struct OAuthErrorBody {
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         let (status, body) = oauth_status_and_body(&self.0);
+        // Always log 5xx with the underlying AuthError so operators can
+        // diagnose `server_error` responses; the response body deliberately
+        // omits the detail to avoid leaking internals to clients.
+        if status.is_server_error() {
+            tracing::error!(
+                error_code = body.error,
+                error_detail = ?self.0,
+                "mokosh-auth-http 5xx"
+            );
+        }
         let json = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
         (
             status,
