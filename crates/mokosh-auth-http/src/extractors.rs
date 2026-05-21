@@ -201,6 +201,38 @@ where
         let data = decode::<BearerClaims>(token, dk, &validation)
             .map_err(|_| HttpError(AuthError::AccessDenied("invalid token".into())))?;
 
+        // Op-session revocation check. The access token carries
+        // `mokosh_op_session_id`; we look up the op_sessions row and
+        // reject the token if the row is missing, revoked, or expired.
+        // Without this, an access token stays valid until its `exp`
+        // even after /v1/auth/logout revoked the originating session,
+        // which means a Bunyip sign-out doesn't immediately propagate
+        // to RP-side calls that talk back to mokosh (mokosh-clients's
+        // `/v1/auth/me`, etc.).
+        if let Some(sid_str) = data.claims.mokosh_op_session_id.as_deref() {
+            if let Ok(sid) = sid_str.parse::<uuid::Uuid>() {
+                let row = st
+                    .provider
+                    .sessions
+                    .find_by_id(mokosh_auth_core::OpSessionId(sid))
+                    .await
+                    .map_err(HttpError)?;
+                match row {
+                    Some(s) if s.is_active(st.provider.clock.now()) => { /* ok */ }
+                    Some(_) => {
+                        return Err(HttpError(AuthError::AccessDenied(
+                            "op session revoked".into(),
+                        )));
+                    }
+                    None => {
+                        return Err(HttpError(AuthError::AccessDenied(
+                            "op session not found".into(),
+                        )));
+                    }
+                }
+            }
+        }
+
         let user_id = data
             .claims
             .sub
@@ -263,4 +295,6 @@ struct BearerClaims {
     sub: String,
     #[serde(default)]
     mokosh_active_tenant: Option<String>,
+    #[serde(default)]
+    mokosh_op_session_id: Option<String>,
 }
