@@ -18,6 +18,7 @@ use crate::db::Database;
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::assets::{assets_routes, AssetsService};
+use crate::modules::audit::{audit_log_middleware, audit_routes, AuditService};
 use crate::modules::calendar::{calendar_routes, CalendarService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
@@ -95,6 +96,7 @@ pub fn create_api_router(
     let rmm_service = RmmService::new(db.clone());
     let sla_service = SlaService::new(db.clone());
     let settings_service = SettingsService::new(db.clone());
+    let audit_service = AuditService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -148,7 +150,6 @@ pub fn create_api_router(
         // appear at their natural top-level paths.
         .merge(calendar_routes(calendar_service))
         .nest("/dispatch", stub_routes())
-<<<<<<< HEAD
         // Contracts: contracts + items + hour balances + rate cards. PMS-65.
         .merge(contracts_routes(contracts_service))
         // SLA: policies, targets, business hours, holidays, evaluator. PMS-107.
@@ -171,6 +172,17 @@ pub fn create_api_router(
         .merge(reports_routes(reports_service))
         // Settings: tenant settings + module configs. PMS-114.
         .merge(settings_routes(settings_service))
+        // Audit log read. PMS-118.
+        .merge(audit_routes(audit_service.clone()))
+        // Audit log middleware. PMS-119. Fires per-request after
+        // auth_middleware has populated AuthState; only logs successful
+        // mutating requests.
+        .layer(middleware::from_fn_with_state(
+            crate::modules::audit::middleware::AuditMiddlewareState {
+                service: std::sync::Arc::new(audit_service),
+            },
+            audit_log_middleware,
+        ))
         // Apply auth middleware
         .layer(middleware::from_fn_with_state(
             auth_middleware.clone(),
