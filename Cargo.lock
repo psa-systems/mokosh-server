@@ -1967,6 +1967,7 @@ dependencies = [
  "mokosh-auth-federation",
  "mokosh-auth-oidc",
  "qrcode",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",

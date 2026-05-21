@@ -24,7 +24,7 @@ use mokosh_auth_core::{
     AuditEvent, AuthError, ClientId, NewRefreshToken, NewRefreshTokenFamily, RefreshTokenId,
 };
 use mokosh_auth_crypto::{generate_opaque_token, hash_opaque_token};
-use mokosh_auth_oidc::tokens::{mint_access_token, mint_id_token};
+use mokosh_auth_oidc::tokens::{mint_access_token, mint_id_token, mint_logout_token};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -480,7 +480,97 @@ pub async fn logout(
             .refresh
             .revoke_families_for_session(s.id, "logout", now)
             .await;
+
+        // OIDC Back-Channel Logout 1.0 §2.5: notify every RP that has
+        // a `backchannel_logout_uri` registered so their server-side
+        // state (BearerUser revocation, lifecycle effects) drops in
+        // sync with the OP session. Fire-and-forget; spec mandates a
+        // 200 from the RP within "a reasonable time" but doesn't
+        // require us to block the user's logout response on it.
+        emit_backchannel_logouts(st.clone(), s.user_id, s.tenant_id, s.sid.clone(), now);
     }
     let cleared = jar.remove(clear_op_session_cookie(&st.cookie_cfg));
     (cleared, StatusCode::NO_CONTENT).into_response()
+}
+
+/// Fan out a signed `logout_token` to every OAuth client registered
+/// with a `backchannel_logout_uri`. Sends in a background task so the
+/// /v1/auth/logout response doesn't wait on any RP. Each RP-side
+/// receiver is independently free to 200, 4xx, or time out; we log
+/// the outcome and move on.
+fn emit_backchannel_logouts(
+    st: Arc<AuthHttpState>,
+    user_id: mokosh_auth_core::UserId,
+    tenant_id: mokosh_auth_core::TenantId,
+    sid: String,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    tokio::spawn(async move {
+        let clients = match st.provider.clients.list_for_user(user_id, tenant_id).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "backchannel-logout fan-out: client list failed");
+                return;
+            }
+        };
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+
+        for client in clients {
+            let Some(url) = client.backchannel_logout_uri.as_ref() else {
+                continue;
+            };
+            let token = match mint_logout_token(
+                &st.provider.keys,
+                &st.provider.cfg,
+                user_id,
+                &sid,
+                client.client_id,
+                now,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = %client.client_id.0,
+                        error = %e,
+                        "backchannel-logout: mint failed"
+                    );
+                    continue;
+                }
+            };
+            let resp = http
+                .post(url.as_str())
+                .form(&[("logout_token", token.as_str())])
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    tracing::info!(
+                        client_id = %client.client_id.0,
+                        url = %url,
+                        "backchannel-logout delivered"
+                    );
+                }
+                Ok(r) => {
+                    tracing::warn!(
+                        client_id = %client.client_id.0,
+                        url = %url,
+                        status = %r.status(),
+                        "backchannel-logout: RP returned non-2xx"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = %client.client_id.0,
+                        url = %url,
+                        error = %e,
+                        "backchannel-logout: POST failed"
+                    );
+                }
+            }
+        }
+    });
 }
