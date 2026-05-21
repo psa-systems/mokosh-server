@@ -773,6 +773,7 @@ impl TicketService {
     /// contacts are not in the `users` table); the customer-visible
     /// identity is captured by `contact_id`. Returns the fully-joined
     /// response so the portal client renders names not UUIDs.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_portal_ticket(
         &self,
         tenant_id: Uuid,
@@ -927,7 +928,6 @@ impl TicketService {
         }
         if filter.assigned_to_id.is_some() {
             conditions.push(format!("t.assigned_to_id = ${}", param_idx));
-            param_idx += 1;
         }
         if filter.is_unassigned == Some(true) {
             conditions.push("t.assigned_to_id IS NULL".to_string());

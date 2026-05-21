@@ -1,5 +1,10 @@
 //! Billing DTOs.
 
+// These model enums expose `from_str(&str) -> Option<Self>` as a deliberate
+// infallible-style parser API; they intentionally do not implement
+// `std::str::FromStr` (which requires a `Result`).
+#![allow(clippy::should_implement_trait)]
+
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

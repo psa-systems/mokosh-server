@@ -36,7 +36,10 @@ use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::version::VersionInfo;
 
-/// Application state shared across all routes
+/// Application state shared across all routes. Not constructed yet - the
+/// router threads individual services directly; kept as the intended
+/// shared-state type for handlers that adopt it later.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
@@ -49,6 +52,7 @@ pub struct AppState {
 /// `mokosh-auth` (EdDSA `at+jwt`) in addition to the legacy HS256
 /// cookie. Pass `None` to run with legacy auth only (e.g. dev environments
 /// where SSO env vars are not configured).
+#[allow(clippy::too_many_arguments)]
 pub fn create_api_router(
     db: Database,
     jwt_secret: String,

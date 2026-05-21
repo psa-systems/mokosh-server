@@ -36,6 +36,7 @@ impl PortalAuthService {
     /// Verify (tenant_slug, email, password) against the contacts table
     /// and issue a portal JWT on success. Returns 401 on any failure
     /// path so the surface stays enumeration-resistant.
+    #[allow(clippy::type_complexity)]
     pub async fn login(&self, request: &PortalLoginRequest) -> AppResult<PortalLoginResponse> {
         let row: Option<(
             Uuid,

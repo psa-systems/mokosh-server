@@ -91,13 +91,15 @@ impl UserRepository for PgUserRepository {
     }
 
     async fn create(&self, new: NewUser) -> Result<User, AuthError> {
-        let row: UserRow = sqlx::query_as("INSERT INTO mokosh_auth.users
+        let row: UserRow = sqlx::query_as(
+            "INSERT INTO mokosh_auth.users
                 (tenant_id, email, password_hash, role, status, first_name, last_name)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, tenant_id, email, email_verified_at, password_hash,
                        role, status, first_name, last_name, timezone, locale,
                        avatar_url, mfa_enrolled, last_login_at, last_active_tenant,
-                       created_at, updated_at")
+                       created_at, updated_at",
+        )
         .bind(new.tenant_id.0)
         .bind(&new.email)
         .bind(&new.password_hash)

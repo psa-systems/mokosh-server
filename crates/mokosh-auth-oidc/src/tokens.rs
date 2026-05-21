@@ -107,6 +107,7 @@ pub struct MintedAccessToken {
 /// `tenant_id` body field at login, `users.last_active_tenant`, or
 /// home tenant) and passes it here; the claim flows to RPs as
 /// `mokosh_active_tenant`.
+#[allow(clippy::too_many_arguments)]
 pub fn mint_access_token(
     keys: &OidcKeySet,
     cfg: &EngineConfig,
@@ -155,6 +156,7 @@ pub fn mint_access_token(
 
 /// Mint an OIDC ID token. Must be called *after* the access token so its
 /// `at_hash` claim can be computed.
+#[allow(clippy::too_many_arguments)]
 pub fn mint_id_token(
     keys: &OidcKeySet,
     cfg: &EngineConfig,

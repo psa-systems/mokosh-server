@@ -13,7 +13,7 @@ pub const RECOVERY_CODE_BYTES: usize = 10;
 /// first 10 and split as 5-5 for readability. 80 bits of entropy.
 pub fn generate_code() -> String {
     let mut bytes = [0u8; RECOVERY_CODE_BYTES];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let raw = base32_encode(&bytes);
     let raw: String = raw.chars().take(10).collect();
     format!("{}-{}", &raw[..5], &raw[5..])

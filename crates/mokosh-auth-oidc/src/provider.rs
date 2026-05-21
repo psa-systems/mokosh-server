@@ -30,6 +30,7 @@ pub struct OidcProvider {
 }
 
 impl OidcProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: EngineConfig,
         keys: Arc<OidcKeySet>,

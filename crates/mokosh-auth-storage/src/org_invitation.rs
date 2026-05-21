@@ -72,11 +72,13 @@ const SELECT_ORG_INVITE: &str = r#"
 impl OrgInvitationRepository for PgOrgInvitationRepository {
     async fn issue(&self, new: NewOrgInvitation) -> Result<OrgInvitation, AuthError> {
         let token_hash = mokosh_auth_crypto::hash_opaque_token(&new.token);
-        let row: InvitationRow = sqlx::query_as("INSERT INTO mokosh_auth.org_invitations
+        let row: InvitationRow = sqlx::query_as(
+            "INSERT INTO mokosh_auth.org_invitations
                 (tenant_id, email, org_role, token_hash, invited_by, expires_at, note)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, tenant_id, email, org_role, invited_by, issued_at, expires_at,
-                       accepted_at, accepted_by, revoked_at, revoked_by, note")
+                       accepted_at, accepted_by, revoked_at, revoked_by, note",
+        )
         .bind(new.tenant_id.0)
         .bind(&new.email)
         .bind(new.org_role.as_str())
@@ -159,6 +161,8 @@ impl OrgInvitationRepository for PgOrgInvitationRepository {
         struct Locked {
             id: Uuid,
             tenant_id: Uuid,
+            // Selected for FromRow column parity; not read on this path.
+            #[allow(dead_code)]
             email: String,
             org_role: String,
             expires_at: DateTime<Utc>,

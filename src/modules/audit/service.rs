@@ -21,6 +21,7 @@ impl AuditService {
     /// Append a new entry. Called by the middleware on every mutating
     /// request; failures are swallowed so the request itself never
     /// fails because of a log write.
+    #[allow(clippy::too_many_arguments)]
     pub async fn append(
         &self,
         tenant_id: Uuid,
