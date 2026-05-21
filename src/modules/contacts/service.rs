@@ -334,7 +334,20 @@ impl ContactService {
         .execute(self.db.pool())
         .await?;
 
-        // TODO: If create_portal_access is true, set up portal access
+        // PMS-19: flip the contact's `is_portal_user` flag so the
+        // upcoming portal-login flow (PMS-26) can treat it as a valid
+        // identity. We deliberately do NOT mint a `portal_password_hash`
+        // here because the password-set step belongs to the customer,
+        // not the agent creating the contact - the portal-session work
+        // will own the setup-link / email-confirmation handshake.
+        if request.create_portal_access {
+            sqlx::query(
+                "UPDATE contacts SET is_portal_user = TRUE, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(contact_id)
+            .execute(self.db.pool())
+            .await?;
+        }
 
         self.get_contact(tenant_id, contact_id).await
     }

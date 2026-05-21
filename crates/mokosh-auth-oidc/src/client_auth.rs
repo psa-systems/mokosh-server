@@ -11,6 +11,9 @@
 //! Secret comparison goes through Argon2id verification (constant-time at
 //! the hash layer). We never log the secret.
 
+// The module-doc list above is intentionally column-aligned for readability.
+#![allow(clippy::doc_overindented_list_items)]
+
 use mokosh_auth_core::{AuthError, ClientAuthMethod, OAuthClient};
 use mokosh_auth_crypto::password::verify_password;
 

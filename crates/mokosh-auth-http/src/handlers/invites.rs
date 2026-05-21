@@ -9,7 +9,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{Duration, Utc};
-use mokosh_auth_core::{AuditEvent, AuditLogger, AuthError, Invite, NewInvite, UserRole};
+use mokosh_auth_core::{AuditEvent, AuthError, Invite, NewInvite, UserRole};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};

@@ -168,6 +168,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in development. In any non-dev environment, set it.
     let cookie_secure = config.is_production();
 
+    // Build the host-crate mailer (SmtpMailer when SMTP_HOST is set,
+    // LogMailer otherwise). Hard-fail on misconfiguration so an
+    // operator does not learn at 3am that SMTP_USERNAME without
+    // SMTP_PASSWORD silently degraded to LogMailer.
+    let mailer = mokosh_server::utils::email::MailerConfig::from_env()
+        .and_then(|c| c.build())
+        .expect("Failed to build Mailer from SMTP_* env (see .env.example)");
+
+    let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
+        .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -177,6 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.oauth_super_admin_domains,
         cookie_secure,
         at_jwt,
+        mailer,
+        encryption_key,
     );
     let router = match sso_router {
         Some(sso) => psa_router.merge(sso),

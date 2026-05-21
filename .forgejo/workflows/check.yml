@@ -1,0 +1,43 @@
+---
+
+# Validate code on every push and pull request: fmt, clippy, compile, tests.
+name: Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# sqlx compile-time query checks read the committed `.sqlx/` offline data
+# instead of connecting to a database.
+env:
+  SQLX_OFFLINE: "true"
+
+jobs:
+  check:
+    name: fmt + clippy + compile + tests
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+
+      - name: Cache Rust build
+        uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Unit tests
+        run: cargo test --lib

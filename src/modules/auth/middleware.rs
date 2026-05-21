@@ -9,7 +9,7 @@ use axum::{
 use std::sync::Arc;
 
 use super::at_jwt::{current_user_from_at_jwt, AtJwtVerifier};
-use super::{AuthService, AuthState, CurrentUser, JwtClaims, UserRole};
+use super::{AuthService, AuthState, CurrentUser};
 use crate::utils::error::AppError;
 
 /// Extension to hold the current auth state
@@ -133,6 +133,60 @@ where
 
         match auth_state.user {
             Some(user) => Ok(RequireAuth(user)),
+            None => Err(AppError::Unauthorized),
+        }
+    }
+}
+
+/// Tenant scope for a protected handler.
+///
+/// This extractor is the recommended way to access a tenant id inside a
+/// handler. The audit (PMS-23, cross-cutting #8) called out that every
+/// service method takes `tenant_id: Uuid`, but until now there was
+/// nothing in the route signature making it obvious where that id
+/// comes from — handlers were copying `user.tenant_id` by hand, and a
+/// new handler that forgot would have leaked across tenants.
+///
+/// Use it like `RequireAuth`:
+/// ```ignore
+/// async fn list_tickets(
+///     scope: TenantScope,
+///     ...
+/// ) -> AppResult<Json<...>> {
+///     state.ticket_service.list_tickets(scope.tenant_id, ...).await
+/// }
+/// ```
+///
+/// The `tenant_id` field is hard-bound to the authenticated user's
+/// claim; handlers that need to switch tenants (super-admin only) must
+/// take an additional path / query parameter and gate it on role.
+#[derive(Clone, Debug)]
+pub struct TenantScope {
+    pub tenant_id: uuid::Uuid,
+    pub user: CurrentUser,
+}
+
+impl<S> axum::extract::FromRequestParts<S> for TenantScope
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_state = parts
+            .extensions
+            .get::<AuthState>()
+            .cloned()
+            .unwrap_or_default();
+
+        match auth_state.user {
+            Some(user) => Ok(TenantScope {
+                tenant_id: user.tenant_id,
+                user,
+            }),
             None => Err(AppError::Unauthorized),
         }
     }

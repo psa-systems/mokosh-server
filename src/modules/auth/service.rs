@@ -5,12 +5,16 @@ use chrono::{Duration, Utc};
 #[cfg(feature = "server")]
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 #[cfg(feature = "server")]
+use std::sync::Arc;
+#[cfg(feature = "server")]
 use uuid::Uuid;
 
 #[cfg(feature = "server")]
 use crate::db::Database;
 #[cfg(feature = "server")]
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
+#[cfg(feature = "server")]
+use crate::utils::email::{LogMailer, Mailer};
 #[cfg(feature = "server")]
 use crate::utils::error::{AppError, AppResult};
 
@@ -29,18 +33,46 @@ pub struct AuthService {
     /// auto-promoted to role 'super_admin'. Existing users are never
     /// re-roled.
     super_admin_domains: Vec<String>,
+    /// Outbound transactional email. Defaults to `LogMailer` so unit
+    /// constructions that do not need real SMTP keep working.
+    mailer: Arc<dyn Mailer>,
+    /// Public-facing SPA origin used as the prefix for password-reset
+    /// and welcome links sent in transactional email. Equal to
+    /// `AppConfig::client_origin`.
+    frontend_base_url: String,
 }
 
 #[cfg(feature = "server")]
 impl AuthService {
     /// Create a new auth service.
     pub fn new(db: Database, jwt_secret: String, super_admin_domains: Vec<String>) -> Self {
+        Self::with_mailer(
+            db,
+            jwt_secret,
+            super_admin_domains,
+            Arc::new(LogMailer),
+            "http://localhost:4301".to_string(),
+        )
+    }
+
+    /// Create a new auth service with an explicit mailer + frontend
+    /// origin. `frontend_base_url` is used as the prefix for any link
+    /// the service emails to a user (password reset, welcome).
+    pub fn with_mailer(
+        db: Database,
+        jwt_secret: String,
+        super_admin_domains: Vec<String>,
+        mailer: Arc<dyn Mailer>,
+        frontend_base_url: String,
+    ) -> Self {
         Self {
             db,
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
             super_admin_domains,
+            mailer,
+            frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -60,10 +92,7 @@ impl AuthService {
         }
 
         // Verify password
-        let password_hash = user
-            .password_hash
-            .as_ref()
-            .ok_or_else(|| AppError::Unauthorized)?;
+        let password_hash = user.password_hash.as_ref().ok_or(AppError::Unauthorized)?;
 
         if !verify_password(&request.password, password_hash)? {
             return Err(AppError::Unauthorized);
@@ -81,9 +110,17 @@ impl AuthService {
                 });
             }
 
-            // TODO: Verify MFA code
-            let _mfa_code = request.mfa_code.as_ref().unwrap();
-            // Verify TOTP code against user.mfa_secret
+            let code = request.mfa_code.as_ref().unwrap();
+            let secret_b32 = user
+                .mfa_secret
+                .as_ref()
+                .ok_or_else(|| AppError::Internal("MFA enabled without secret".to_string()))?;
+            let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32)
+                .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+            // +-1 step (30s) tolerance handles modest clock skew.
+            if mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+                return Err(AppError::Unauthorized);
+            }
         }
 
         // Create session
@@ -349,8 +386,22 @@ impl AuthService {
         .execute(self.db.pool())
         .await?;
 
-        // TODO: Send password reset email with token
-        tracing::info!("Password reset requested for user {}", user.id);
+        let reset_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
+        if let Err(e) = self
+            .mailer
+            .send_password_reset(&user.email, &reset_link)
+            .await
+        {
+            // Log but do not leak details to the caller; the public
+            // surface stays enumeration-resistant either way.
+            tracing::warn!(
+                user_id = %user.id,
+                error = ?e,
+                "password reset email send failed; token is persisted but unreachable",
+            );
+        } else {
+            tracing::info!(user_id = %user.id, "password reset email queued");
+        }
 
         Ok(())
     }
@@ -498,8 +549,47 @@ impl AuthService {
         .await?;
 
         if request.send_welcome_email {
-            // TODO: Send welcome email with password setup link
-            tracing::info!("Welcome email would be sent to {}", request.email);
+            // Reuse the password_reset_tokens machinery so the recipient
+            // can pick a password without going through "Forgot password"
+            // first. 7-day window: long enough for admins who batch-create
+            // accounts ahead of an onboarding day, short enough that a
+            // leaked link is bounded.
+            let token = generate_token(64);
+            let token_hash = hash_password(&token)?;
+            let expires_at = Utc::now() + Duration::days(7);
+            sqlx::query(
+                r#"
+                INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(&token_hash)
+            .bind(expires_at)
+            .execute(self.db.pool())
+            .await?;
+
+            let setup_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
+            let display_name = match (request.first_name.trim(), request.last_name.trim()) {
+                ("", "") => String::new(),
+                (f, "") => f.to_string(),
+                ("", l) => l.to_string(),
+                (f, l) => format!("{f} {l}"),
+            };
+            if let Err(e) = self
+                .mailer
+                .send_welcome(&request.email, &display_name, &setup_link)
+                .await
+            {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = ?e,
+                    "welcome email send failed; setup token persisted but unreachable",
+                );
+            } else {
+                tracing::info!(user_id = %user_id, "welcome email queued");
+            }
         }
 
         self.get_user_by_id(user_id).await
@@ -589,6 +679,189 @@ impl AuthService {
         query_builder.execute(self.db.pool()).await?;
 
         self.get_user_by_id(user_id).await
+    }
+
+    /// Begin MFA enrollment. Generates a fresh TOTP secret, persists it
+    /// on `users.mfa_secret`, and returns the base32 secret plus the
+    /// `otpauth://` provisioning URI. `mfa_enabled` is NOT flipped here
+    /// — the caller must complete enrollment by submitting a valid code
+    /// via [`AuthService::enable_mfa`]. Refusing partial enrollment
+    /// guarantees that an authenticator that was misconfigured (wrong
+    /// time, wrong algorithm) cannot lock the user out.
+    pub async fn start_mfa_enrollment(
+        &self,
+        user_id: Uuid,
+    ) -> AppResult<crate::modules::auth::models::MfaSetupResponse> {
+        let user = self.get_user_by_id(user_id).await?;
+        if user.mfa_enabled {
+            return Err(AppError::Conflict("MFA is already enabled".to_string()));
+        }
+
+        let secret = mokosh_auth_crypto::totp::generate_secret();
+        let secret_b32 = mokosh_auth_crypto::totp::base32_encode(&secret);
+
+        sqlx::query("UPDATE users SET mfa_secret = $1, updated_at = NOW() WHERE id = $2")
+            .bind(&secret_b32)
+            .bind(user_id)
+            .execute(self.db.pool())
+            .await?;
+
+        let label = format!("Mokosh:{}", user.email);
+        let provisioning_uri =
+            mokosh_auth_crypto::totp::provisioning_uri(&secret_b32, &label, "Mokosh");
+
+        Ok(crate::modules::auth::models::MfaSetupResponse {
+            secret: secret_b32,
+            provisioning_uri,
+        })
+    }
+
+    /// Finish MFA enrollment. Verifies one TOTP code against the secret
+    /// staged by [`AuthService::start_mfa_enrollment`]; on success flips
+    /// `mfa_enabled = true`.
+    pub async fn enable_mfa(&self, user_id: Uuid, code: &str) -> AppResult<()> {
+        let user = self.get_user_by_id(user_id).await?;
+        let secret_b32 = user.mfa_secret.as_ref().ok_or_else(|| {
+            AppError::BadRequest("MFA enrollment has not been started".to_string())
+        })?;
+        let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32)
+            .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+        if mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+            return Err(AppError::BadRequest("Invalid MFA code".to_string()));
+        }
+
+        sqlx::query("UPDATE users SET mfa_enabled = TRUE, updated_at = NOW() WHERE id = $1")
+            .bind(user_id)
+            .execute(self.db.pool())
+            .await?;
+
+        Ok(())
+    }
+
+    /// Disable MFA. Requires the user's current password (re-auth) so a
+    /// stolen session cannot quietly weaken the account.
+    pub async fn disable_mfa(&self, user_id: Uuid, password: &str) -> AppResult<()> {
+        let user = self.get_user_by_id(user_id).await?;
+        let hash = user
+            .password_hash
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("This account has no password".to_string()))?;
+        if !verify_password(password, hash)? {
+            return Err(AppError::Unauthorized);
+        }
+
+        sqlx::query(
+            "UPDATE users SET mfa_enabled = FALSE, mfa_secret = NULL, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(self.db.pool())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Issue a personal API key. Returns the raw key once; thereafter
+    /// only the `key_prefix` and an argon2 hash of the full key are
+    /// persisted. The first 10 chars of `psa_xxxx...` become the
+    /// `key_prefix` lookup column so future bearer auth can find the
+    /// row in O(log n) before doing the expensive hash compare.
+    pub async fn create_api_key(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        request: &crate::modules::auth::models::CreateApiKeyRequest,
+    ) -> AppResult<crate::modules::auth::models::CreateApiKeyResponse> {
+        use crate::utils::crypto::generate_api_key;
+
+        let raw_key = generate_api_key();
+        // `psa_` + 40 alnum = 44 chars; prefix is 10 chars.
+        let key_prefix: String = raw_key.chars().take(10).collect();
+        let key_hash = hash_password(&raw_key)?;
+
+        let id = Uuid::new_v4();
+        let scopes = request
+            .scopes
+            .clone()
+            .unwrap_or_else(|| vec!["*".to_string()]);
+        let scopes_json = serde_json::to_value(&scopes)
+            .map_err(|e| AppError::Internal(format!("api key scopes serialise: {e}")))?;
+
+        let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+            r#"
+            INSERT INTO api_keys (
+                id, tenant_id, user_id, name, key_prefix, key_hash, scopes,
+                expires_at, is_active
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
+            RETURNING created_at
+            "#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(&request.name)
+        .bind(&key_prefix)
+        .bind(&key_hash)
+        .bind(scopes_json)
+        .bind(request.expires_at)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(crate::modules::auth::models::CreateApiKeyResponse {
+            id,
+            name: request.name.clone(),
+            key: raw_key,
+            key_prefix,
+            scopes,
+            expires_at: request.expires_at,
+            created_at,
+        })
+    }
+
+    /// List API keys owned by `user_id`. Never returns secret material.
+    pub async fn list_api_keys(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<Vec<crate::modules::auth::models::ApiKeyResponse>> {
+        let rows = sqlx::query_as::<_, ApiKeyRow>(
+            r#"
+            SELECT id, name, key_prefix, scopes, last_used_at, expires_at,
+                   is_active, created_at
+            FROM api_keys
+            WHERE tenant_id = $1 AND user_id = $2
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Revoke (hard-delete) an API key. Scoped to the calling user +
+    /// tenant so a stolen session for user A cannot kill user B's keys.
+    pub async fn revoke_api_key(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        key_id: Uuid,
+    ) -> AppResult<()> {
+        let affected =
+            sqlx::query("DELETE FROM api_keys WHERE id = $1 AND tenant_id = $2 AND user_id = $3")
+                .bind(key_id)
+                .bind(tenant_id)
+                .bind(user_id)
+                .execute(self.db.pool())
+                .await?
+                .rows_affected();
+
+        if affected == 0 {
+            return Err(AppError::NotFound("API key".to_string()));
+        }
+        Ok(())
     }
 
     /// List users in a tenant, paginated. Audit F1.
@@ -897,6 +1170,45 @@ impl From<UserRow> for User {
             settings: row.settings,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+#[derive(sqlx::FromRow)]
+struct ApiKeyRow {
+    id: Uuid,
+    name: String,
+    key_prefix: String,
+    scopes: serde_json::Value,
+    last_used_at: Option<chrono::DateTime<Utc>>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    is_active: bool,
+    created_at: chrono::DateTime<Utc>,
+}
+
+#[cfg(feature = "server")]
+impl From<ApiKeyRow> for crate::modules::auth::models::ApiKeyResponse {
+    fn from(row: ApiKeyRow) -> Self {
+        // Stored as JSONB; tolerate either ["scope1", ...] or other
+        // shapes by falling back to `["*"]` rather than 500ing on a
+        // hand-edited DB.
+        let scopes = match row.scopes {
+            serde_json::Value::Array(arr) => arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => vec!["*".to_string()],
+        };
+        Self {
+            id: row.id,
+            name: row.name,
+            key_prefix: row.key_prefix,
+            scopes,
+            last_used_at: row.last_used_at,
+            expires_at: row.expires_at,
+            is_active: row.is_active,
+            created_at: row.created_at,
         }
     }
 }
