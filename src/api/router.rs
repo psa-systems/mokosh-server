@@ -23,6 +23,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
+use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::version::VersionInfo;
 
 /// Application state shared across all routes
@@ -74,6 +75,7 @@ pub fn create_api_router(
     let contact_service = ContactService::new(db.clone());
     let ticket_service = TicketService::with_mailer(db.clone(), mailer);
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
+    let time_tracking_service = TimeTrackingService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -116,9 +118,9 @@ pub fn create_api_router(
         .nest("/contacts", contact_routes(contact_service.clone()))
         // Ticketing
         .nest("/tickets", ticket_routes(ticket_service))
-        // Time tracking (stub)
-        .nest("/time-entries", stub_routes())
-        .nest("/timesheets", stub_routes())
+        // Time tracking: time-entries, timesheets, timers, rounding,
+        // work-types. PMS-43.
+        .merge(time_tracking_routes(time_tracking_service))
         // Projects (stub)
         .nest("/projects", stub_routes())
         .nest("/tasks", stub_routes())
