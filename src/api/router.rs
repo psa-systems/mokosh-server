@@ -23,6 +23,7 @@ use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::reports::{reports_routes, ReportsService};
+use crate::modules::rmm::{rmm_routes, RmmService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
@@ -89,6 +90,7 @@ pub fn create_api_router(
     let kb_service = KbService::new(db.clone());
     let notifications_service = NotificationsService::new(db.clone());
     let reports_service = ReportsService::new(db.clone());
+    let rmm_service = RmmService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
     // attached so the same middleware can authenticate either kind of
@@ -159,9 +161,8 @@ pub fn create_api_router(
         // Notifications: channels + templates + prefs + inbox + rules
         // + dispatcher. PMS-86.
         .merge(notifications_routes(notifications_service))
-        // RMM (stub)
-        .nest("/rmm/connections", stub_routes())
-        .nest("/rmm/devices", stub_routes())
+        // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
+        .merge(rmm_routes(rmm_service))
         // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
         .merge(reports_routes(reports_service))
         // Settings (stub)

@@ -140,10 +140,14 @@ secrecy = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 urlencoding = "2"
 
-# Encryption
+# Encryption + HMAC (RMM alert ingest signs bodies with HMAC-SHA256;
+# PMS-104.)
 aes-gcm = "0.10"
 base64 = "0.22"
 rand = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+constant_time_eq = "0.3"
 
 # Rate limiting
 governor = "0.8"
