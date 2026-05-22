@@ -1,9 +1,11 @@
 //! Ticket service implementation
 
 use chrono::Utc;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -15,12 +17,28 @@ use super::models::*;
 pub struct TicketService {
     db: Database,
     automation: AutomationEngine,
+    mailer: Arc<dyn Mailer>,
 }
 
 impl TicketService {
+    /// Build a TicketService backed by `LogMailer`. Kept so call sites
+    /// that don't need real SMTP (test factories, the legacy
+    /// constructor) keep compiling.
     pub fn new(db: Database) -> Self {
-        let automation = AutomationEngine::new(db.clone());
-        Self { db, automation }
+        Self::with_mailer(db, Arc::new(LogMailer))
+    }
+
+    /// Build a TicketService wired to a specific mailer. Used from
+    /// `create_api_router` so add-note notifications and the
+    /// automation-rule send_notification action share the SMTP path as
+    /// auth's password-reset / welcome emails.
+    pub fn with_mailer(db: Database, mailer: Arc<dyn Mailer>) -> Self {
+        let automation = AutomationEngine::with_deps(db.clone(), mailer.clone());
+        Self {
+            db,
+            automation,
+            mailer,
+        }
     }
 
     /// Generate next ticket number for tenant
@@ -500,9 +518,80 @@ impl TicketService {
             .await?;
         }
 
-        // TODO: Send email if send_email is true
+        // PMS-15: customer notification on public notes. Internal notes
+        // never leave the building no matter what `send_email` says.
+        // The notifications module (PMS-85 story) will own templating
+        // and watcher fan-out; until then we send a single plain-text
+        // message to the ticket's contact and record success on the
+        // note row so the UI can show a "delivered" indicator.
+        if request.send_email && request.note_type == NoteType::Public {
+            self.send_note_email(tenant_id, ticket_id, note_id, &request.content)
+                .await;
+        }
 
         self.get_note(tenant_id, note_id).await
+    }
+
+    /// Fire-and-forget email for a public ticket note. Failures are
+    /// logged; we never surface a 5xx for a note add when only the
+    /// email side fails, because the note itself is already persisted
+    /// and visible to the agent.
+    async fn send_note_email(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        note_id: Uuid,
+        content: &str,
+    ) {
+        // One round-trip fetches ticket-number/title + contact email.
+        let row: Option<(String, String, Option<String>)> = match sqlx::query_as(
+            r#"
+            SELECT t.ticket_number, t.title, ct.email
+            FROM tickets t
+            LEFT JOIN contacts ct ON t.contact_id = ct.id
+            WHERE t.tenant_id = $1 AND t.id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(self.db.pool())
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(?e, %ticket_id, "fetch contact for note email failed");
+                return;
+            }
+        };
+
+        let Some((ticket_number, title, Some(email))) = row else {
+            tracing::debug!(
+                %ticket_id,
+                "skipping note email: ticket has no contact with an email",
+            );
+            return;
+        };
+
+        let subject = format!("[{ticket_number}] {title}");
+        let body =
+            format!("A new update has been added to ticket {ticket_number}:\n\n{content}\n",);
+
+        match self.mailer.send_text(&email, &subject, &body).await {
+            Ok(()) => {
+                if let Err(e) = sqlx::query(
+                    "UPDATE ticket_notes SET is_email_sent = TRUE, email_sent_at = NOW() WHERE id = $1",
+                )
+                .bind(note_id)
+                .execute(self.db.pool())
+                .await
+                {
+                    tracing::warn!(?e, %note_id, "mark is_email_sent failed");
+                } else {
+                    tracing::info!(%note_id, "ticket note email sent");
+                }
+            }
+            Err(e) => tracing::warn!(?e, %note_id, "ticket note email send failed"),
+        }
     }
 
     /// Get note by ID
@@ -677,7 +766,266 @@ impl TicketService {
 
         Ok(rows.into_iter().map(Into::into).collect())
     }
+
+    /// Create a portal-originated ticket. Used by `POST
+    /// /api/v1/portal/tickets`. Looks up an admin user in the tenant to
+    /// satisfy the NOT NULL FK on `tickets.created_by_id` (portal
+    /// contacts are not in the `users` table); the customer-visible
+    /// identity is captured by `contact_id`. Returns the fully-joined
+    /// response so the portal client renders names not UUIDs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_portal_ticket(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        contact_id: Uuid,
+        title: String,
+        description: Option<String>,
+        priority_id: Option<Uuid>,
+        type_id: Option<Uuid>,
+    ) -> AppResult<TicketResponse> {
+        let default_creator: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM users
+            WHERE tenant_id = $1 AND status = 'active'
+              AND role IN ('super_admin', 'admin', 'manager')
+            ORDER BY created_at
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        let Some(creator) = default_creator else {
+            return Err(AppError::Configuration(
+                "Cannot create portal ticket: tenant has no admin/manager user to attribute it to"
+                    .to_string(),
+            ));
+        };
+
+        let request = CreateTicketRequest {
+            title,
+            description,
+            priority_id,
+            type_id,
+            category_id: None,
+            queue_id: None,
+            source: TicketSource::Portal,
+            company_id,
+            contact_id: Some(contact_id),
+            site_id: None,
+            assigned_to_id: None,
+            team_id: None,
+            contract_id: None,
+            sla_id: None,
+            scheduled_start: None,
+            scheduled_end: None,
+            estimated_hours: None,
+            is_billable: false,
+            asset_id: None,
+            custom_fields: serde_json::Value::Null,
+            tags: vec![],
+        };
+        let ticket = self.create_ticket(tenant_id, creator, &request).await?;
+        self.get_ticket_response(tenant_id, ticket.id).await
+    }
+
+    /// List tickets visible to a portal contact. Scoped to
+    /// `company_id`; the contact sees every ticket their company has
+    /// opened, not just ones where `contact_id = self`. This matches
+    /// the typical helpdesk model where employees of company X can
+    /// follow each other's tickets.
+    pub async fn list_portal_tickets(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketResponse>, u64)> {
+        let filter = TicketFilter {
+            company_id: Some(company_id),
+            ..Default::default()
+        };
+        self.list_ticket_responses(tenant_id, &filter, pagination)
+            .await
+    }
+
+    /// Get a single ticket scoped to a portal contact's company. 404
+    /// instead of 403 if the ticket exists in another company, so we
+    /// don't leak the existence of a ticket the contact can't see.
+    pub async fn get_portal_ticket(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        ticket_id: Uuid,
+    ) -> AppResult<TicketResponse> {
+        let resp = self.get_ticket_response(tenant_id, ticket_id).await?;
+        if resp.company_id != company_id {
+            return Err(AppError::NotFound("Ticket".to_string()));
+        }
+        Ok(resp)
+    }
+
+    /// Fetch a fully-joined ticket response. Audit F3: the previous
+    /// route-side construction populated `status.name`, `priority.name`,
+    /// queue/company/contact/assigned/created-by names with empty
+    /// strings; this method joins the lookup tables in one round-trip
+    /// and produces a complete DTO ready for the wire.
+    pub async fn get_ticket_response(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+    ) -> AppResult<TicketResponse> {
+        let sql = format!(
+            "{} WHERE t.tenant_id = $1 AND t.id = $2",
+            TICKET_RESPONSE_SELECT
+        );
+        let row = sqlx::query_as::<_, TicketResponseRow>(&sql)
+            .bind(tenant_id)
+            .bind(ticket_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
+        Ok(row.into())
+    }
+
+    /// List fully-joined ticket responses + total. Mirrors the filter
+    /// semantics of [`TicketService::list_tickets`] but produces
+    /// response DTOs directly. Audit F3.
+    pub async fn list_ticket_responses(
+        &self,
+        tenant_id: Uuid,
+        filter: &TicketFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketResponse>, u64)> {
+        let offset = pagination.offset() as i32;
+        let limit = pagination.limit() as i32;
+
+        let mut conditions = vec!["t.tenant_id = $1".to_string()];
+        let mut param_idx = 4;
+        if filter.q.is_some() {
+            conditions.push(format!(
+                "(t.title ILIKE ${} OR t.ticket_number ILIKE ${})",
+                param_idx, param_idx
+            ));
+            param_idx += 1;
+        }
+        if filter.status_id.is_some() {
+            conditions.push(format!("t.status_id = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.priority_id.is_some() {
+            conditions.push(format!("t.priority_id = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.queue_id.is_some() {
+            conditions.push(format!("t.queue_id = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.company_id.is_some() {
+            conditions.push(format!("t.company_id = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filter.assigned_to_id.is_some() {
+            conditions.push(format!("t.assigned_to_id = ${}", param_idx));
+        }
+        if filter.is_unassigned == Some(true) {
+            conditions.push("t.assigned_to_id IS NULL".to_string());
+        }
+        if filter.is_overdue == Some(true) {
+            conditions.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
+        }
+        if filter.is_open == Some(true) {
+            conditions.push("ts.is_closed = FALSE".to_string());
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let order_by = pagination.order_by(
+            "t.created_at",
+            &["created_at", "updated_at", "sla_due_date", "priority_id"],
+        );
+
+        let query = format!(
+            "{select} WHERE {where_clause} ORDER BY {order_by} LIMIT $2 OFFSET $3",
+            select = TICKET_RESPONSE_SELECT,
+        );
+        let count_query =
+            format!("SELECT COUNT(*) FROM tickets t INNER JOIN ticket_statuses ts ON t.status_id = ts.id WHERE {}", where_clause);
+
+        let mut query_builder = sqlx::query_as::<_, TicketResponseRow>(&query)
+            .bind(tenant_id)
+            .bind(limit)
+            .bind(offset);
+        let mut count_builder = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+
+        if let Some(ref q) = filter.q {
+            let search = format!("%{}%", q);
+            query_builder = query_builder.bind(search.clone());
+            count_builder = count_builder.bind(search);
+        }
+        if let Some(ref status_id) = filter.status_id {
+            query_builder = query_builder.bind(status_id);
+            count_builder = count_builder.bind(status_id);
+        }
+        if let Some(ref priority_id) = filter.priority_id {
+            query_builder = query_builder.bind(priority_id);
+            count_builder = count_builder.bind(priority_id);
+        }
+        if let Some(ref queue_id) = filter.queue_id {
+            query_builder = query_builder.bind(queue_id);
+            count_builder = count_builder.bind(queue_id);
+        }
+        if let Some(ref company_id) = filter.company_id {
+            query_builder = query_builder.bind(company_id);
+            count_builder = count_builder.bind(company_id);
+        }
+        if let Some(ref assigned_to_id) = filter.assigned_to_id {
+            query_builder = query_builder.bind(assigned_to_id);
+            count_builder = count_builder.bind(assigned_to_id);
+        }
+
+        let rows = query_builder.fetch_all(self.db.pool()).await?;
+        let total = count_builder.fetch_one(self.db.pool()).await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
 }
+
+/// SELECT clause shared by [`TicketService::get_ticket_response`] and
+/// [`TicketService::list_ticket_responses`]. Centralised so the column
+/// list, JOIN graph, and alias names stay in sync between the two.
+const TICKET_RESPONSE_SELECT: &str = r#"
+SELECT
+    t.id, t.ticket_number, t.title, t.description,
+    t.source, t.company_id, t.contact_id, t.assigned_to_id,
+    t.sla_due_date, t.is_billable, t.billing_status,
+    t.estimated_hours, t.actual_hours, t.tags,
+    t.closed_at, t.created_at, t.updated_at,
+    ts.id   AS status_id,
+    ts.name AS status_name,
+    ts.color AS status_color,
+    ts.is_closed AS status_is_closed,
+    tp.id   AS priority_id,
+    tp.name AS priority_name,
+    tp.color AS priority_color,
+    tq.name AS queue_name,
+    tt.name AS type_name,
+    tc.name AS category_name,
+    co.name AS company_name,
+    NULLIF(TRIM(COALESCE(ct.first_name, '') || ' ' || COALESCE(ct.last_name, '')), '') AS contact_name,
+    NULLIF(TRIM(COALESCE(au.first_name, '') || ' ' || COALESCE(au.last_name, '')), '') AS assigned_to_name,
+    COALESCE(TRIM(cu.first_name || ' ' || cu.last_name), '') AS created_by_name
+FROM tickets t
+INNER JOIN ticket_statuses    ts ON t.status_id   = ts.id
+INNER JOIN ticket_priorities  tp ON t.priority_id = tp.id
+INNER JOIN ticket_queues      tq ON t.queue_id    = tq.id
+LEFT  JOIN ticket_types       tt ON t.type_id     = tt.id
+LEFT  JOIN ticket_categories  tc ON t.category_id = tc.id
+INNER JOIN companies          co ON t.company_id  = co.id
+LEFT  JOIN contacts           ct ON t.contact_id  = ct.id
+LEFT  JOIN users              au ON t.assigned_to_id = au.id
+LEFT  JOIN users              cu ON t.created_by_id  = cu.id
+"#;
 
 // ============================================================================
 // DATABASE ROW TYPES
@@ -770,6 +1118,106 @@ impl From<TicketRow> for Ticket {
             last_updated_by_id: row.last_updated_by_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+/// JOINed row built by [`TICKET_RESPONSE_SELECT`]. Lives next to the
+/// `From` impl that turns it into a wire-shaped [`TicketResponse`].
+#[derive(sqlx::FromRow)]
+struct TicketResponseRow {
+    id: Uuid,
+    ticket_number: String,
+    title: String,
+    description: Option<String>,
+    source: String,
+    company_id: Uuid,
+    contact_id: Option<Uuid>,
+    assigned_to_id: Option<Uuid>,
+    sla_due_date: Option<chrono::DateTime<Utc>>,
+    is_billable: bool,
+    billing_status: String,
+    estimated_hours: Option<rust_decimal::Decimal>,
+    actual_hours: rust_decimal::Decimal,
+    tags: Vec<String>,
+    closed_at: Option<chrono::DateTime<Utc>>,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+    status_id: Uuid,
+    status_name: String,
+    status_color: String,
+    status_is_closed: Option<bool>,
+    priority_id: Uuid,
+    priority_name: String,
+    priority_color: String,
+    queue_name: String,
+    type_name: Option<String>,
+    category_name: Option<String>,
+    company_name: String,
+    contact_name: Option<String>,
+    assigned_to_name: Option<String>,
+    created_by_name: String,
+}
+
+impl From<TicketResponseRow> for TicketResponse {
+    fn from(r: TicketResponseRow) -> Self {
+        // Local mirror of [`Ticket::sla_status`] — kept here because
+        // the joined row already carries everything needed, and pulling
+        // the rest of the Ticket struct just to call the method would
+        // double the bookkeeping.
+        let sla_status = if r.closed_at.is_some() {
+            SlaStatus::NotApplicable
+        } else if let Some(due) = r.sla_due_date {
+            let now = Utc::now();
+            if now > due {
+                SlaStatus::Breached
+            } else if (due - now).num_hours() < 2 {
+                SlaStatus::Warning
+            } else {
+                SlaStatus::OnTrack
+            }
+        } else {
+            SlaStatus::NotApplicable
+        };
+
+        TicketResponse {
+            id: r.id,
+            ticket_number: r.ticket_number,
+            title: r.title,
+            description: r.description,
+            status: TicketStatusSummary {
+                id: r.status_id,
+                name: r.status_name,
+                color: r.status_color,
+                is_closed: r.status_is_closed.unwrap_or(false),
+            },
+            priority: TicketPrioritySummary {
+                id: r.priority_id,
+                name: r.priority_name,
+                color: r.priority_color,
+            },
+            type_name: r.type_name,
+            category_name: r.category_name,
+            queue_name: r.queue_name,
+            source: TicketSource::from_str(&r.source).unwrap_or_default(),
+            company_id: r.company_id,
+            company_name: r.company_name,
+            contact_id: r.contact_id,
+            contact_name: r.contact_name,
+            assigned_to_id: r.assigned_to_id,
+            assigned_to_name: r.assigned_to_name,
+            sla_due_date: r.sla_due_date,
+            sla_status,
+            is_billable: r.is_billable,
+            billing_status: BillingStatus::from_str(&r.billing_status).unwrap_or_default(),
+            estimated_hours: r
+                .estimated_hours
+                .map(|d| d.to_string().parse().unwrap_or(0.0)),
+            actual_hours: r.actual_hours.to_string().parse().unwrap_or(0.0),
+            tags: r.tags,
+            created_by_name: r.created_by_name,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         }
     }
 }

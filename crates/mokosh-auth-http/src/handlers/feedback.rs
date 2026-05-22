@@ -12,6 +12,9 @@
 //! - `PATCH /v1/admin/feedback/:id` - admin-gated. Body `{status}`. Writes
 //!                                    an `AdminAction` audit row.
 
+// The module-doc route list above is intentionally column-aligned.
+#![allow(clippy::doc_overindented_list_items)]
+
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};

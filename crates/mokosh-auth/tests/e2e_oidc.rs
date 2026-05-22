@@ -361,7 +361,7 @@ async fn full_oidc_flow_including_refresh_reuse(pool: PgPool) {
     let info: serde_json::Value = userinfo.json().await.unwrap();
     assert_eq!(info["sub"].as_str().unwrap(), env.user_id.to_string());
     assert_eq!(info["email"].as_str().unwrap(), env.user_email);
-    assert_eq!(info["email_verified"].as_bool().unwrap(), true);
+    assert!(info["email_verified"].as_bool().unwrap());
 
     // --- Step 6: refresh -> rotated tokens -------------------------------
     let refresh_resp = client

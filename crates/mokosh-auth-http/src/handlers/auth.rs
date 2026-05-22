@@ -139,16 +139,13 @@ pub async fn login(
         .map(|c| c.value().to_string())
     {
         let now = st.provider.clock.now();
-        match st.provider.sessions.find_by_sid(&prior_sid).await {
-            Ok(Some(prior)) => {
-                let _ = st.provider.sessions.revoke(prior.id, now).await;
-                let _ = st
-                    .provider
-                    .refresh
-                    .revoke_families_for_session(prior.id, "superseded_by_login", now)
-                    .await;
-            }
-            _ => {}
+        if let Ok(Some(prior)) = st.provider.sessions.find_by_sid(&prior_sid).await {
+            let _ = st.provider.sessions.revoke(prior.id, now).await;
+            let _ = st
+                .provider
+                .refresh
+                .revoke_families_for_session(prior.id, "superseded_by_login", now)
+                .await;
         }
     }
 

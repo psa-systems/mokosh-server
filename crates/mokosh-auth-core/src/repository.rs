@@ -119,6 +119,7 @@ pub trait OAuthClientRepository: Send + Sync {
 
 #[async_trait]
 pub trait OpSessionRepository: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn create(
         &self,
         user_id: UserId,

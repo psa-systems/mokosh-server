@@ -15,9 +15,11 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    google_login, rate_limit, AuthService, ChangePasswordRequest, CreateUserRequest,
-    ForgotPasswordRequest, LoginRequest, LoginResponse, RefreshTokenRequest, RefreshTokenResponse,
-    ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
+    google_login, rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest,
+    CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest,
+    LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest, MfaSetupResponse,
+    RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest, SessionInfo,
+    UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
@@ -82,6 +84,14 @@ pub fn auth_routes(
         .route("/me/password", put(change_password))
         .route("/me/sessions", get(get_sessions))
         .route("/me/sessions/{session_id}", delete(delete_session))
+        // MFA
+        .route("/me/mfa/setup", post(start_mfa_enrollment))
+        .route("/me/mfa/enable", post(enable_mfa))
+        .route("/me/mfa/disable", post(disable_mfa))
+        // Personal API keys
+        .route("/me/api-keys", get(list_api_keys))
+        .route("/me/api-keys", post(create_api_key))
+        .route("/me/api-keys/{key_id}", delete(revoke_api_key))
         // User management (admin only)
         .route("/users", get(list_users))
         .route("/users", post(create_user))
@@ -257,6 +267,86 @@ async fn delete_session(
     state
         .auth_service
         .delete_session(user.id, session_id)
+        .await?;
+    Ok(())
+}
+
+/// Begin TOTP enrollment. Generates and persists a fresh secret;
+/// `mfa_enabled` is not flipped until the user confirms via
+/// `POST /me/mfa/enable`.
+async fn start_mfa_enrollment(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<MfaSetupResponse>> {
+    let resp = state.auth_service.start_mfa_enrollment(user.id).await?;
+    Ok(Json(resp))
+}
+
+/// Confirm TOTP enrollment by verifying one code; flips `mfa_enabled`.
+async fn enable_mfa(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<MfaEnableRequest>,
+) -> AppResult<()> {
+    request.validate()?;
+    state
+        .auth_service
+        .enable_mfa(user.id, &request.code)
+        .await?;
+    Ok(())
+}
+
+/// Disable MFA. Requires re-auth with the current password so a stolen
+/// session cannot weaken the account quietly.
+async fn disable_mfa(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<MfaDisableRequest>,
+) -> AppResult<()> {
+    request.validate()?;
+    state
+        .auth_service
+        .disable_mfa(user.id, &request.password)
+        .await?;
+    Ok(())
+}
+
+/// List the caller's personal API keys. Never includes secret material.
+async fn list_api_keys(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<Vec<ApiKeyResponse>>> {
+    let keys = state
+        .auth_service
+        .list_api_keys(user.tenant_id, user.id)
+        .await?;
+    Ok(Json(keys))
+}
+
+/// Mint a new personal API key. The raw key is returned ONCE in the
+/// response; callers must store it client-side immediately.
+async fn create_api_key(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<CreateApiKeyRequest>,
+) -> AppResult<Json<CreateApiKeyResponse>> {
+    request.validate()?;
+    let resp = state
+        .auth_service
+        .create_api_key(user.tenant_id, user.id, &request)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// Revoke an API key. Scoped to the calling user + tenant.
+async fn revoke_api_key(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(key_id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .auth_service
+        .revoke_api_key(user.tenant_id, user.id, key_id)
         .await?;
     Ok(())
 }

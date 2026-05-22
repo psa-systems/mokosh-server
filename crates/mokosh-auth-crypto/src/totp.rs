@@ -20,7 +20,7 @@ pub enum TotpError {
 /// Generate a fresh 20-byte (160-bit) secret.
 pub fn generate_secret() -> [u8; TOTP_SECRET_BYTES] {
     let mut s = [0u8; TOTP_SECRET_BYTES];
-    rand::thread_rng().fill_bytes(&mut s);
+    rand::rng().fill_bytes(&mut s);
     s
 }
 

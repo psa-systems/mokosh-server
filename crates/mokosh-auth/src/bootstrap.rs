@@ -14,6 +14,9 @@
 //! Migrations are applied here on startup so a fresh deploy comes up with
 //! the schema in place.
 
+// A doc-comment list below uses column-aligned continuations.
+#![allow(clippy::doc_overindented_list_items)]
+
 use axum::Router;
 use chrono::Duration;
 use mokosh_auth_core::TenantId;

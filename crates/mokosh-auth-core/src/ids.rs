@@ -16,6 +16,9 @@ macro_rules! id_newtype {
         #[serde(transparent)]
         pub struct $name(pub Uuid);
 
+        // `new()` mints a fresh random UUID; a `Default` impl would just
+        // duplicate that with confusing "default = random" semantics.
+        #[allow(clippy::new_without_default)]
         impl $name {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())

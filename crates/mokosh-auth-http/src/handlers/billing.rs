@@ -98,14 +98,14 @@ pub async fn get_org_billing(
         .find_by_slug(&slug)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
 
     let membership = st
         .memberships
         .find(caller.id, tenant.id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
     if !matches!(membership.status, MembershipStatus::Active) {
         return Err(HttpError(AuthError::Forbidden(
             "membership is suspended".into(),

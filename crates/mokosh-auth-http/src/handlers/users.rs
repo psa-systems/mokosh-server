@@ -271,7 +271,7 @@ async fn available_role_transitions(
             // hide every non-admin option from the dropdown so the
             // SPA doesn't even render a button that the server will
             // refuse.
-            !(demoting_out_of_admin_would_brick && !matches!(r, UserRole::Admin))
+            !demoting_out_of_admin_would_brick || matches!(r, UserRole::Admin)
         })
         .map(|(_, s)| *s)
         .collect())

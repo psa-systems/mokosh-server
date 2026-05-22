@@ -31,14 +31,14 @@ where
         let sid = jar
             .get(OP_SESSION_COOKIE)
             .map(|c| c.value().to_string())
-            .ok_or_else(|| HttpError(mokosh_auth_core::AuthError::LoginRequired))?;
+            .ok_or(HttpError(mokosh_auth_core::AuthError::LoginRequired))?;
         let session = st
             .provider
             .sessions
             .find_by_sid(&sid)
             .await
             .map_err(HttpError)?
-            .ok_or_else(|| HttpError(mokosh_auth_core::AuthError::LoginRequired))?;
+            .ok_or(HttpError(mokosh_auth_core::AuthError::LoginRequired))?;
         if !session.is_active(st.provider.clock.now()) {
             return Err(HttpError(mokosh_auth_core::AuthError::LoginRequired));
         }
@@ -66,7 +66,7 @@ where
             .find_by_id(session.user_id)
             .await
             .map_err(HttpError)?
-            .ok_or_else(|| HttpError(mokosh_auth_core::AuthError::LoginRequired))?;
+            .ok_or(HttpError(mokosh_auth_core::AuthError::LoginRequired))?;
         if !matches!(user.status, UserStatus::Active) {
             return Err(HttpError(mokosh_auth_core::AuthError::Forbidden(
                 "user not active".into(),
@@ -114,7 +114,7 @@ where
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.strip_prefix("bearer "))
             })
-            .ok_or_else(|| HttpError(AuthError::LoginRequired))?
+            .ok_or(HttpError(AuthError::LoginRequired))?
             .trim();
 
         let header_data = decode_header(token)
@@ -171,7 +171,7 @@ where
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.strip_prefix("bearer "))
             })
-            .ok_or_else(|| HttpError(AuthError::LoginRequired))?
+            .ok_or(HttpError(AuthError::LoginRequired))?
             .trim();
 
         let header_data = decode_header(token)

@@ -74,7 +74,7 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
 fn derive_name(email: &str) -> (String, String) {
     let local = email.split('@').next().unwrap_or("");
     let parts: Vec<String> = local
-        .split(|c: char| c == '.' || c == '_' || c == '-' || c == '+')
+        .split(['.', '_', '-', '+'])
         .filter(|s| !s.is_empty())
         .map(capitalize)
         .collect();

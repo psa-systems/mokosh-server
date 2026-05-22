@@ -8,11 +8,13 @@ default:
 
 # Create .env from .env.dev if missing
 [private]
+[group: 'hooks']
 ensure-env:
     @test -f .env || cp .env.dev .env
 
 # Bring up the dev stack (mokosh-server + Infisical + Postgres + Valkey). Trailing args go to `docker compose up` (e.g. --detach).
 [doc("Start the dev stack in Docker. Trailing args go to `docker compose up` (e.g. --detach).")]
+[group: 'dev']
 dev *args: ensure-env
     #!/usr/bin/env nu
     let bind_ip = (
@@ -65,6 +67,7 @@ ensure-private-network:
     @docker network inspect dev-mokosh-private >/dev/null 2>&1 || docker network create dev-mokosh-private >/dev/null
 
 [doc("Start the SSO dev stack (Traefik-routed at *.a8n.run)")]
+[group: 'dev']
 dev-sso: ensure-env ensure-oidc-keys ensure-private-network
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml up --build --detach
     @echo ""
@@ -79,6 +82,7 @@ dev-sso: ensure-env ensure-oidc-keys ensure-private-network
 
 # Stop the SSO dev stack.
 [doc("Stop the SSO dev stack")]
+[group: 'dev']
 dev-sso-down: ensure-env
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml down
 
@@ -89,6 +93,7 @@ dev-sso-down: ensure-env
 # compose down blocks until removal completes) and `dev-sso` uses
 # `--detach`, so this returns once the new stack is up.
 [doc("Stop the dev stack and start dev-sso fresh.")]
+[group: 'dev']
 restart: down dev-sso
 
 # Register mokosh-clients as a public OIDC client. Run once after
@@ -139,16 +144,19 @@ register-client: ensure-env
 # other file does not declare (e.g. the SSO postgres if you only ran
 # `just dev` historically).
 [doc("Stop the entire dev stack (LAN-IP and SSO modes). Volumes preserved.")]
+[group: 'dev']
 down: ensure-env
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
 
 # Stop the dev secrets-management stack. Volumes are preserved.
 [doc("Stop Infisical and its sidecars (volumes preserved)")]
+[group: 'dev']
 dev-down: ensure-env
     docker compose --file {{ compose_file }} down
 
 # Wipe the dev secrets-management stack: stop, remove volumes, remove .env.
 [doc("Wipe Infisical volumes and .env. Preserves .env.infisical.")]
+[group: 'dev']
 dev-clean: ensure-env
     #!/usr/bin/env nu
     docker compose --file {{ compose_file }} down --volumes
@@ -174,33 +182,41 @@ infisical-bootstrap: ensure-env
     }
 
 # Run all checks (compile, clippy, fmt)
+[group: 'check']
 check: check-compile check-clippy check-fmt
 
 # Check compilation
+[group: 'check']
 check-compile:
     cargo check --all-targets
 
 # Run clippy lints
+[group: 'check']
 check-clippy:
     cargo clippy --all-targets
 
 # Check formatting
+[group: 'check']
 check-fmt:
     cargo fmt --all --check
 
 # Format code
+[group: 'format']
 fmt:
     cargo fmt --all
 
 # Run tests
+[group: 'test']
 test:
     cargo test
 
 # Build release binaries
+[group: 'build']
 build:
     cargo build --release --bins
 
 # Build OCI image for validation (builder stage)
+[group: 'check']
 check-docker:
     #!/usr/bin/env nu
     let git_hash = (^git rev-parse --short=12 HEAD | str trim)
@@ -209,6 +225,7 @@ check-docker:
     docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
 # Build OCI image
+[group: 'build']
 build-docker:
     #!/usr/bin/env nu
     let git_hash = (^git rev-parse --short=12 HEAD | str trim)
@@ -217,14 +234,17 @@ build-docker:
     docker buildx build --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:local --file oci-build/Dockerfile .
 
 # Run database migrations against the running database
+[group: 'db']
 migrate-run:
     sqlx migrate run
 
 # Create a new migration
+[group: 'db']
 migrate-create name:
     sqlx migrate add {{ name }}
 
 # Create a release: bump version, push branch, print PR link
+[group: 'release']
 create-release bump:
     #!/usr/bin/env nu
     let bump = "{{ bump }}"
@@ -261,12 +281,41 @@ create-release bump:
 
     git push --set-upstream origin $release_branch
 
-    let remote = git remote get-url origin
+    # Open the release PR via fj. Body lives in a tempfile so the
+    # changelog can grow later without inline escaping pain.
+    let body_file = (mktemp --tmpdir --suffix .md)
+    [
+        $"Automated release PR for ($tag)."
+        ""
+        $"After merge, `.forgejo/workflows/create-release.yml` tags and publishes ($tag) to the Generic Packages registry."
+    ] | str join "\n" | save --force $body_file
+    let fj_result = (^fj --host dev.a8n.run pr create $"Release ($tag)" --body-file $body_file | complete)
+    rm $body_file
+    if $fj_result.exit_code != 0 {
+        print $"(ansi red)fj pr create failed(ansi reset)"
+        print $fj_result.stderr
+        exit 1
+    }
+
+    # `fj pr create` prints `created pull request #N: <title>` on success.
+    # Parse the number out and build the PR URL from `origin`.
+    let pr_num = (
+        $fj_result.stdout
+        | str trim
+        | parse --regex 'created pull request #(?P<num>\d+)'
+        | get num.0?
+    )
+    let remote = (git remote get-url origin | str trim)
     let base_url = if ($remote | str starts-with "ssh://") {
         $remote | str replace "ssh://git@" "https://" | str replace "git.a8n.run" "dev.a8n.run" | str replace ".git" ""
     } else {
         $remote | str replace --regex "git@([^:]+):" "https://$1/" | str replace "git.a8n.run" "dev.a8n.run" | str replace ".git" ""
     }
     print $"(ansi green)Pushed ($release_branch)(ansi reset)"
-    print $"Create PR: ($base_url)/compare/main...($release_branch)"
+    if ($pr_num | is-not-empty) {
+        print $"PR: ($base_url)/pulls/($pr_num)"
+    } else {
+        # fj output format drifted; fall back to whatever it said.
+        print $"fj output: ($fj_result.stdout | str trim)"
+    }
     print $"After merging, the create-release workflow will tag and release ($tag) automatically."

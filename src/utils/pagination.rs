@@ -41,7 +41,7 @@ impl PaginationParams {
 
     /// Get the per_page value, clamped to MAX_PER_PAGE
     pub fn per_page(&self) -> u32 {
-        self.per_page.min(Self::MAX_PER_PAGE).max(1)
+        self.per_page.clamp(1, Self::MAX_PER_PAGE)
     }
 
     /// Get the limit for database queries
