@@ -97,7 +97,7 @@ pub async fn list_user_sessions_admin(
         .find(mokosh_auth_core::UserId(target_id), admin.tenant_id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
     let _ = m; // membership existence is the gate; we don't read fields off it.
 
     let now = st.provider.clock.now();
@@ -143,7 +143,7 @@ pub async fn revoke_user_session_admin(
         .find(mokosh_auth_core::UserId(target_id), admin.tenant_id)
         .await
         .map_err(HttpError)?
-        .ok_or_else(|| HttpError(AuthError::NotFound))?;
+        .ok_or(HttpError(AuthError::NotFound))?;
 
     let sid = OpSessionId(session_id);
     let session = st
