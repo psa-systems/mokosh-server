@@ -236,6 +236,14 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         )
         .route("/v1/auth/users/{user_id}/role", post(users_h::change_role))
         .route(
+            "/v1/auth/users/{user_id}/sessions",
+            get(sessions_h::list_user_sessions_admin),
+        )
+        .route(
+            "/v1/auth/users/{user_id}/sessions/{session_id}/revoke",
+            post(sessions_h::revoke_user_session_admin),
+        )
+        .route(
             "/v1/auth/users/{user_id}/delete",
             post(users_h::delete_user),
         )
@@ -269,6 +277,10 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
         // MFA enrollment (Bearer-authed; user enrolls themselves).
         // Admin audit log reader.
         .route("/v1/auth/audit-logs", axum::routing::get(audit_h::list))
+        .route(
+            "/v1/auth/audit-logs.csv",
+            axum::routing::get(audit_h::list_csv),
+        )
         .route("/v1/auth/audit/launched-app", post(audit_h::launched_app))
         // App launcher: list OAuth clients the signed-in user can launch.
         .route("/v1/auth/apps", get(apps_h::list_apps))

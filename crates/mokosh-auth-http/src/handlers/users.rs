@@ -49,13 +49,19 @@ pub struct UserView {
     pub last_name: Option<String>,
     pub email_verified: bool,
     pub mfa_enrolled: bool,
+    /// True when this user's membership in the calling admin's tenant
+    /// has `org_role = 'owner'`. Owners cannot be demoted / suspended /
+    /// removed by other admins; the SPA hides the per-row mutation
+    /// buttons + shows an Owner badge.
+    #[serde(default)]
+    pub is_owner: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
-impl From<User> for UserView {
-    fn from(u: User) -> Self {
+impl UserView {
+    fn from_user(u: User, is_owner: bool) -> Self {
         Self {
             id: u.id.0.to_string(),
             email: u.email,
@@ -65,6 +71,7 @@ impl From<User> for UserView {
             last_name: u.last_name,
             email_verified: u.email_verified_at.is_some(),
             mfa_enrolled: u.mfa_enrolled,
+            is_owner,
             last_login_at: u.last_login_at,
             created_at: u.created_at,
         }
@@ -154,11 +161,22 @@ fn parse_status(s: &str) -> Result<UserStatus, HttpError> {
 /// `status` / `tenant_id` overridden to the membership's values.
 /// 404 if no membership exists for (target, admin_tenant) - prevents
 /// cross-tenant probes via forged user_ids.
+/// Resolution result. `user` has its `role` / `tenant_id` / `status`
+/// overridden from the membership row. `is_owner` reflects the
+/// target's `org_role == Owner` in the admin's tenant; mutation
+/// handlers refuse to touch Owner rows (the founder of a personal
+/// tenant or org cannot be demoted / suspended / deleted by another
+/// admin, even if that admin holds UserRole::Admin in the same tenant).
+struct ResolvedTarget {
+    user: User,
+    is_owner: bool,
+}
+
 async fn resolve_target(
     st: &AuthHttpState,
     admin_tenant: mokosh_auth_core::TenantId,
     target_user_id: UserId,
-) -> Result<User, HttpError> {
+) -> Result<ResolvedTarget, HttpError> {
     let m = st
         .memberships
         .find(target_user_id, admin_tenant)
@@ -182,7 +200,15 @@ async fn resolve_target(
     if matches!(m.status, mokosh_auth_core::MembershipStatus::Suspended) {
         user.status = mokosh_auth_core::UserStatus::Suspended;
     }
-    Ok(user)
+    let is_owner = matches!(m.org_role, mokosh_auth_core::MembershipRole::Owner);
+    Ok(ResolvedTarget { user, is_owner })
+}
+
+/// Sentinel error for mutation attempts on an Owner membership.
+fn owner_protected() -> HttpError {
+    HttpError(AuthError::Forbidden(
+        "this user is the owner of the tenant and cannot be modified by other admins".into(),
+    ))
 }
 
 /// Consume a step-up token that the supplied admin issued via
@@ -211,7 +237,12 @@ async fn consume_step_up(
 async fn available_role_transitions(
     st: &AuthHttpState,
     target: &User,
+    is_owner: bool,
 ) -> Result<Vec<&'static str>, HttpError> {
+    // Owners are immovable from this surface; no legal transitions.
+    if is_owner {
+        return Ok(Vec::new());
+    }
     let demoting_out_of_admin_would_brick = if matches!(target.role, UserRole::Admin) {
         let others = st
             .memberships
@@ -288,8 +319,26 @@ pub async fn list_users(
         .await
         .map_err(HttpError)?;
 
+    // One extra query to identify owners in this tenant. Cheaper than
+    // an N+1 lookup per user; the result is a small HashSet.
+    let owner_ids: std::collections::HashSet<uuid::Uuid> = st
+        .memberships
+        .list_for_tenant(admin.tenant_id)
+        .await
+        .map_err(HttpError)?
+        .into_iter()
+        .filter(|m| matches!(m.org_role, mokosh_auth_core::MembershipRole::Owner))
+        .map(|m| m.user_id.0)
+        .collect();
+
     Ok(Json(UserListResponse {
-        users: rows.into_iter().map(UserView::from).collect(),
+        users: rows
+            .into_iter()
+            .map(|u| {
+                let is_owner = owner_ids.contains(&u.id.0);
+                UserView::from_user(u, is_owner)
+            })
+            .collect(),
         total,
         limit: filter.limit,
         offset: filter.offset,
@@ -311,10 +360,11 @@ pub async fn get_one(
             "only admins or managers may view user detail".into(),
         )));
     }
-    let target = resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
-    let available = available_role_transitions(&st, &target).await?;
+    let ResolvedTarget { user, is_owner } =
+        resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
+    let available = available_role_transitions(&st, &user, is_owner).await?;
     Ok(Json(UserDetailResponse {
-        user: target.into(),
+        user: UserView::from_user(user, is_owner),
         available_role_transitions: available,
     }))
 }
@@ -328,7 +378,16 @@ async fn set_status(
     new_status: UserStatus,
 ) -> Result<Response, HttpError> {
     require_admin(admin)?;
-    let target = resolve_target(st, admin.tenant_id, user_id).await?;
+    let ResolvedTarget {
+        user: target,
+        is_owner,
+    } = resolve_target(st, admin.tenant_id, user_id).await?;
+
+    // Owner is immovable from this surface (suspend or reactivate);
+    // covers both personal-tenant founders and org owners.
+    if is_owner {
+        return Err(owner_protected());
+    }
 
     if matches!(new_status, UserStatus::Suspended) {
         if target.id == admin.id {
@@ -424,7 +483,14 @@ pub async fn change_role(
     }
 
     let new_role = parse_role(&body.role)?;
-    let target = resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
+    let ResolvedTarget {
+        user: target,
+        is_owner,
+    } = resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
+
+    if is_owner {
+        return Err(owner_protected());
+    }
 
     // Self-guard: admins cannot change their own role.
     if target.id == admin.id {
@@ -537,7 +603,14 @@ pub async fn delete_user(
         ))));
     }
 
-    let target = resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
+    let ResolvedTarget {
+        user: target,
+        is_owner,
+    } = resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
+
+    if is_owner {
+        return Err(owner_protected());
+    }
 
     if target.id == admin.id {
         return Ok((
@@ -640,7 +713,9 @@ pub async fn resend_verify(
     Path(user_id): Path<uuid::Uuid>,
 ) -> Result<Response, HttpError> {
     require_admin(&admin)?;
-    let target = resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
+    let target = resolve_target(&st, admin.tenant_id, UserId(user_id))
+        .await?
+        .user;
 
     if target.email_verified_at.is_some() {
         return Ok((
@@ -710,7 +785,9 @@ pub async fn admin_trigger_password_reset(
     Path(user_id): Path<uuid::Uuid>,
 ) -> Result<Response, HttpError> {
     require_admin(&admin)?;
-    let target = resolve_target(&st, admin.tenant_id, UserId(user_id)).await?;
+    let target = resolve_target(&st, admin.tenant_id, UserId(user_id))
+        .await?
+        .user;
 
     if matches!(target.status, UserStatus::Deleted) {
         return Err(HttpError(AuthError::NotFound));

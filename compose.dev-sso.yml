@@ -66,7 +66,7 @@ services:
       # validates return_to, runs the password+MFA dance, then bounces
       # to ${issuer}/oauth2/authorize?<return_to> so the freshly-set OP
       # cookie closes the loop. See docs/bunyip/07-sso-redirect-bridge.md.
-      MOKOSH_AUTH_LOGIN_URL: http://${USER}-bunyip.a8n.run/login
+      MOKOSH_AUTH_LOGIN_URL: https://${USER}-bunyip.a8n.run/login
       # Enable public self-signup. PSA hub deploys keep this off
       # (registration is admin-invite-gated); the a8n / individual SKU
       # turns it on. Dev defaults on so we can smoke-test the flow.

@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
-use mokosh_auth_core::{AuditEntry, AuditEvent, AuditLogger, AuthError, TenantId, UserId};
+use mokosh_auth_core::{
+    AuditEntry, AuditEvent, AuditListFilter, AuditLogger, AuthError, TenantId, UserId,
+};
 use uuid::Uuid;
 
 use crate::conv::{db_err, ip_to_inet};
@@ -108,42 +110,99 @@ impl AuditLogger for PgAuditLogger {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<AuditEntry>, AuthError> {
-        let limit = limit.clamp(1, 200);
-        let offset = offset.max(0);
+        // Legacy thin wrapper around list_filtered for callers that
+        // haven't migrated to the filter struct.
+        self.list_filtered(
+            tenant_id,
+            AuditListFilter {
+                kind: kind.map(str::to_string),
+                actor_id,
+                limit,
+                offset,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn list_filtered(
+        &self,
+        tenant_id: TenantId,
+        filter: AuditListFilter,
+    ) -> Result<Vec<AuditEntry>, AuthError> {
+        let limit = filter.limit.clamp(1, 10_000); // CSV path passes up to 10k; UI path clamps lower in the handler.
+        let offset = filter.offset.max(0);
+
         #[derive(sqlx::FromRow)]
         struct Row {
             id: Uuid,
             tenant_id: Option<Uuid>,
             actor_id: Option<Uuid>,
+            actor_email: Option<String>,
             event_kind: String,
             severity: String,
             ip: Option<IpNetwork>,
             metadata: serde_json::Value,
             created_at: DateTime<Utc>,
         }
+
+        let search_pattern = filter
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{s}%"));
+
+        let severity = filter
+            .severity
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| matches!(*s, "info" | "warning" | "critical"));
+
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT id, tenant_id, actor_id, event_kind, severity, ip, metadata, created_at
-             FROM mokosh_auth.audit_logs
-             WHERE tenant_id = $1
-               AND ($2::TEXT IS NULL OR event_kind = $2)
-               AND ($3::UUID IS NULL OR actor_id = $3)
-             ORDER BY created_at DESC
-             LIMIT $4 OFFSET $5",
+            r#"
+            SELECT a.id,
+                   a.tenant_id,
+                   a.actor_id,
+                   u.email AS actor_email,
+                   a.event_kind,
+                   a.severity,
+                   a.ip,
+                   a.metadata,
+                   a.created_at
+            FROM mokosh_auth.audit_logs a
+            LEFT JOIN mokosh_auth.users u ON u.id = a.actor_id
+            WHERE a.tenant_id = $1
+              AND ($2::TEXT      IS NULL OR a.event_kind = $2)
+              AND ($3::UUID      IS NULL OR a.actor_id   = $3)
+              AND ($4::TEXT      IS NULL OR a.metadata::text ILIKE $4)
+              AND ($5::TEXT      IS NULL OR a.severity   = $5)
+              AND ($6::TIMESTAMPTZ IS NULL OR a.created_at >= $6)
+              AND ($7::TIMESTAMPTZ IS NULL OR a.created_at <= $7)
+            ORDER BY a.created_at DESC
+            LIMIT $8 OFFSET $9
+            "#,
         )
         .bind(tenant_id.0)
-        .bind(kind)
-        .bind(actor_id.map(|a| a.0))
+        .bind(filter.kind.as_deref())
+        .bind(filter.actor_id.map(|a| a.0))
+        .bind(&search_pattern)
+        .bind(severity)
+        .bind(filter.date_from)
+        .bind(filter.date_to)
         .bind(limit)
         .bind(offset)
         .fetch_all(self.pool.pg())
         .await
         .map_err(db_err)?;
+
         Ok(rows
             .into_iter()
             .map(|r| AuditEntry {
                 id: r.id,
                 tenant_id: r.tenant_id.map(TenantId),
                 actor_id: r.actor_id.map(UserId),
+                actor_email: r.actor_email,
                 event_kind: r.event_kind,
                 severity: r.severity,
                 ip: r.ip.map(|n| n.ip()),

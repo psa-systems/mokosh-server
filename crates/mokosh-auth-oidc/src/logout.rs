@@ -9,7 +9,7 @@
 //!  3. Revoke the OP session matching the token's `sid` claim (if any).
 //!  4. Return an outcome the HTTP layer can act on.
 
-use mokosh_auth_core::{AuditEvent, AuthError, ClientId};
+use mokosh_auth_core::{AuditEvent, AuthError, ClientId, TenantId, UserId};
 use serde::Deserialize;
 use url::Url;
 
@@ -23,12 +23,29 @@ pub struct LogoutRequest {
     pub state: Option<String>,
 }
 
+/// Identifies the OP session that this logout invocation revoked, so the
+/// HTTP layer can fan a Back-Channel Logout 1.0 token out to every other
+/// RP registered with a `backchannel_logout_uri`. None when no session
+/// matched the id_token_hint's `sid` (already logged out, or hint
+/// carried no sid).
+#[derive(Debug, Clone)]
+pub struct RevokedSession {
+    pub user_id: UserId,
+    pub tenant_id: TenantId,
+    pub sid: String,
+}
+
 #[derive(Debug)]
 pub enum LogoutOutcome {
     /// Browser was logged in; we revoked the session. If `redirect_to`
     /// is set, the HTTP layer should send a 302 there with `state` in
-    /// the query.
-    LoggedOut { redirect_to: Option<Url> },
+    /// the query. `revoked` carries the session identifiers when a
+    /// session was actually killed, so the HTTP layer can emit
+    /// Back-Channel Logout tokens to other RPs.
+    LoggedOut {
+        redirect_to: Option<Url>,
+        revoked: Option<RevokedSession>,
+    },
     /// No usable id_token_hint; we cannot validate redirect, so we
     /// surface a confirmation page (or simply clear the cookie and end).
     NeedsConfirmation,
@@ -114,10 +131,20 @@ pub async fn handle_logout(p: &OidcProvider, req: LogoutRequest) -> LogoutOutcom
         None => None,
     };
 
-    // 4. Revoke the OP session by sid.
+    // 4. Revoke the OP session by sid. Also revoke every refresh-token
+    //    family issued from it - otherwise an RP that holds a refresh
+    //    token can mint a fresh access token after we just told the
+    //    user "you're signed out", which is the exact scenario
+    //    Back-Channel Logout is supposed to close.
+    let mut revoked: Option<RevokedSession> = None;
     if let Some(sid) = claims.sid.as_deref() {
         if let Ok(Some(session)) = p.sessions.find_by_sid(sid).await {
-            let _ = p.sessions.revoke(session.id, p.clock.now()).await;
+            let now = p.clock.now();
+            let _ = p.sessions.revoke(session.id, now).await;
+            let _ = p
+                .refresh
+                .revoke_families_for_session(session.id, "rp_initiated_logout", now)
+                .await;
             let _ = p
                 .audit
                 .record(
@@ -131,6 +158,11 @@ pub async fn handle_logout(p: &OidcProvider, req: LogoutRequest) -> LogoutOutcom
                     },
                 )
                 .await;
+            revoked = Some(RevokedSession {
+                user_id: session.user_id,
+                tenant_id: session.tenant_id,
+                sid: sid.to_string(),
+            });
         }
     }
 
@@ -142,5 +174,8 @@ pub async fn handle_logout(p: &OidcProvider, req: LogoutRequest) -> LogoutOutcom
         u
     });
 
-    LogoutOutcome::LoggedOut { redirect_to: to }
+    LogoutOutcome::LoggedOut {
+        redirect_to: to,
+        revoked,
+    }
 }

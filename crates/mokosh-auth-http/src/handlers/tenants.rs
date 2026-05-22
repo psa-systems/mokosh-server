@@ -121,6 +121,7 @@ const DEFAULT_FIRST_PARTY_SCOPE: &[&str] = &["openid", "email", "offline_access"
 pub async fn switch_active_tenant(
     State(st): State<Arc<AuthHttpState>>,
     BearerUser(user): BearerUser,
+    crate::extractors::BearerSessionId(current_sid): crate::extractors::BearerSessionId,
     Json(body): Json<SwitchBody>,
 ) -> Result<Response, HttpError> {
     let tenant_id = TenantId(body.tenant_id);
@@ -187,10 +188,14 @@ pub async fn switch_active_tenant(
         acr,
         &amr,
         tenant_id,
-        // Switching tenant doesn't currently re-bind to an OP session;
-        // the new family is session-less and the access token omits
-        // the claim. The previous session (if any) stays alive.
-        None,
+        // Re-bind the new access token to the caller's existing OP
+        // session so the SPA's "Current session" badge survives a
+        // tenant switch. The OP cookie is the same browser device; the
+        // tenant scope changes but the device identity doesn't. None
+        // when the caller's token had no sid claim (e.g. nested
+        // tenant-switched grant); in that case the badge silently
+        // disappears, same as the pre-rebind behavior.
+        current_sid,
         now,
     )
     .map_err(HttpError)?;
@@ -228,7 +233,7 @@ pub async fn switch_active_tenant(
         client_id: client.client_id,
         user_id: user.id,
         tenant_id: user.tenant_id,
-        op_session_id: None,
+        op_session_id: current_sid,
     };
     provider
         .refresh
