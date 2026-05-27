@@ -11,12 +11,19 @@ on:
       - "v*"
     paths:
       - "src/**"
+      # Workspace crates also produce compiled output; without this
+      # glob, edits limited to e.g. crates/mokosh-auth-http/src/...
+      # never re-publish :latest.
+      - "crates/**"
       - "migrations/**"
       - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "oci-build/**"
       - ".forgejo/workflows/build-oci-image.yml"
+  # Manual trigger so we can force a fresh :latest publish without
+  # waiting for a code change that happens to hit the path filter.
+  workflow_dispatch:
 
 jobs:
   build-and-push:
