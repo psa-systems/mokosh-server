@@ -102,6 +102,7 @@ jobs:
         id: logs
         run: |
           set -e
+          : "${RUNNER_TEMP:?RUNNER_TEMP is not set}"
           mkdir -p "${RUNNER_TEMP}/claude-context"
           {
             echo "# Failed CI Run Context"
@@ -144,6 +145,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -e
+          : "${RUNNER_TEMP:?RUNNER_TEMP is not set}"
           CONTEXT_FILE="${RUNNER_TEMP}/claude-context/CONTEXT.md"
           PROMPT=$(cat <<EOF
           You are fixing a failing CI build on a pull request.
@@ -197,6 +199,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -e
+          : "${RUNNER_TEMP:?RUNNER_TEMP is not set}"
           git config user.name "claude-bot"
           git config user.email "claude-bot@a8n.run"
 
