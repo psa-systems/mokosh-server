@@ -102,7 +102,7 @@ jobs:
         id: logs
         run: |
           set -e
-          mkdir -p /tmp/claude-context
+          mkdir -p "${RUNNER_TEMP}/claude-context"
           {
             echo "# Failed CI Run Context"
             echo ""
@@ -115,7 +115,7 @@ jobs:
             echo "The CI workflow in .forgejo/workflows/ failed on this branch."
             echo "Read the workflow files to understand what checks run, then"
             echo "investigate the repository to find what's causing the failure."
-          } > /tmp/claude-context/CONTEXT.md
+          } > "${RUNNER_TEMP}/claude-context/CONTEXT.md"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------
@@ -144,10 +144,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -e
-          PROMPT=$(cat <<'EOF'
+          CONTEXT_FILE="${RUNNER_TEMP}/claude-context/CONTEXT.md"
+          PROMPT=$(cat <<EOF
           You are fixing a failing CI build on a pull request.
 
-          The failure logs are in /tmp/claude-context/CONTEXT.md — read that first.
+          The failure logs are in ${CONTEXT_FILE} - read that first.
           The repository is checked out in the current working directory.
 
           Your job:
@@ -172,10 +173,10 @@ jobs:
           claude --bare -p "$PROMPT" \
             --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
             --output-format json \
-            > /tmp/claude-result.json
+            > "${RUNNER_TEMP}/claude-result.json"
 
           # Pull the summary out for the PR comment
-          SUMMARY=$(jq -r '.result // .text // "(no summary returned)"' /tmp/claude-result.json)
+          SUMMARY=$(jq -r '.result // .text // "(no summary returned)"' "${RUNNER_TEMP}/claude-result.json")
           # Multi-line output for GITHUB_OUTPUT
           {
             echo "summary<<CLAUDE_EOF"
@@ -213,9 +214,9 @@ jobs:
             echo "${CLAUDE_SUMMARY}"
             echo ""
             echo "[skip claude]"
-          } > /tmp/commit-message.txt
+          } > "${RUNNER_TEMP}/commit-message.txt"
 
-          git commit --file=/tmp/commit-message.txt
+          git commit --file="${RUNNER_TEMP}/commit-message.txt"
           git push origin "${{ steps.pr.outputs.branch }}"
           echo "pushed=true" >> "$GITHUB_OUTPUT"
 
