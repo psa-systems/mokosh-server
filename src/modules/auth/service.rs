@@ -29,10 +29,11 @@ pub struct AuthService {
     jwt_secret: String,
     access_token_ttl: Duration,
     refresh_token_ttl: Duration,
-    /// Lowercased email domains whose first-time Google sign-ins are
-    /// auto-promoted to role 'super_admin'. Existing users are never
-    /// re-roled.
-    super_admin_domains: Vec<String>,
+    /// Lowercased exact email addresses allowed to auto-provision a
+    /// super_admin account on first Google sign-in. Any other unrecognized
+    /// Google identity is rejected (fail-closed) rather than auto-created in
+    /// the default tenant. Existing users are never re-roled.
+    super_admin_emails: Vec<String>,
     /// Outbound transactional email. Defaults to `LogMailer` so unit
     /// constructions that do not need real SMTP keep working.
     mailer: Arc<dyn Mailer>,
@@ -45,11 +46,11 @@ pub struct AuthService {
 #[cfg(feature = "server")]
 impl AuthService {
     /// Create a new auth service.
-    pub fn new(db: Database, jwt_secret: String, super_admin_domains: Vec<String>) -> Self {
+    pub fn new(db: Database, jwt_secret: String, super_admin_emails: Vec<String>) -> Self {
         Self::with_mailer(
             db,
             jwt_secret,
-            super_admin_domains,
+            super_admin_emails,
             Arc::new(LogMailer),
             "http://localhost:4301".to_string(),
         )
@@ -61,7 +62,7 @@ impl AuthService {
     pub fn with_mailer(
         db: Database,
         jwt_secret: String,
-        super_admin_domains: Vec<String>,
+        super_admin_emails: Vec<String>,
         mailer: Arc<dyn Mailer>,
         frontend_base_url: String,
     ) -> Self {
@@ -70,7 +71,7 @@ impl AuthService {
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
-            super_admin_domains,
+            super_admin_emails,
             mailer,
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
         }
@@ -210,6 +211,15 @@ impl AuthService {
             // 2. No identity row yet - find or create the user by email.
             match self.find_user_by_email_optional(&google.email).await? {
                 Some(existing) => {
+                    // Only auto-link to an existing local account whose own
+                    // email is verified. Otherwise someone who registered a
+                    // password account under another person's email could
+                    // capture that person's Google sign-in.
+                    if existing.email_verified_at.is_none() {
+                        return Err(AppError::Forbidden(
+                            "An account with this email exists but is not verified. Sign in with your password first to link Google.".to_string(),
+                        ));
+                    }
                     // Link new identity to existing user; do NOT change role.
                     sqlx::query(
                         "INSERT INTO user_oauth_identities \
@@ -249,27 +259,27 @@ impl AuthService {
         })
     }
 
-    /// Auto-provision a brand-new user from a verified Google identity.
-    /// Role is `super_admin` if the hosted domain (or email domain) is
-    /// in `self.super_admin_domains`, else `technician`.
+    /// Auto-provision a user from a verified Google identity. FAIL-CLOSED:
+    /// only exact emails in `self.super_admin_emails` may auto-provision (as
+    /// super_admin, to bootstrap administrators). Any other unrecognized
+    /// Google identity is rejected - real users must be invited rather than
+    /// silently dropped into the default tenant.
     async fn provision_user_from_google(
         &self,
         google: &google_oauth_flow::GoogleUserInfo,
     ) -> AppResult<User> {
-        let domain = google
-            .hd
-            .clone()
-            .or_else(|| google.email.split('@').nth(1).map(str::to_string))
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let role = if self.super_admin_domains.iter().any(|d| d == &domain) {
-            "super_admin"
-        } else {
-            "technician"
-        };
+        let email = google.email.to_ascii_lowercase();
+        if !self.super_admin_emails.iter().any(|e| e == &email) {
+            return Err(AppError::Forbidden(
+                "No account is provisioned for this Google identity. Ask an administrator for an invite.".to_string(),
+            ));
+        }
+        let role = "super_admin";
 
         let user_id = Uuid::new_v4();
-        // Default tenant seeded by migrations/002_seed_data.sql.
+        // Bootstrap super-admins land in the default tenant seeded by
+        // migrations/002_seed_data.sql. Everyone else is invited into a
+        // specific tenant via the invite flow, not this path.
         let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001")
             .expect("default tenant UUID is valid");
 

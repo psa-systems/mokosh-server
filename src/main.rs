@@ -24,17 +24,20 @@ pub struct AppConfig {
     /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
     /// `https://msp.a8n.systems,https://a8n.systems`).
     pub cors_origins: Vec<String>,
-    /// Lowercased email-domain allowlist; first-time Google sign-ins
-    /// from these domains are auto-promoted to role 'super_admin'.
-    pub oauth_super_admin_domains: Vec<String>,
+    /// Lowercased exact-email allowlist; only these emails may auto-provision
+    /// a super_admin on first Google sign-in (everyone else is rejected).
+    pub oauth_super_admin_emails: Vec<String>,
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         dotenvy::dotenv().ok();
 
-        let oauth_super_admin_domains = std::env::var("OAUTH_SUPER_ADMIN_DOMAINS")
-            .unwrap_or_else(|_| "niceguyit.biz".to_string())
+        // Exact-email allowlist (fail-closed): empty by default so no Google
+        // identity can self-provision a super_admin until an operator sets
+        // OAUTH_SUPER_ADMIN_EMAILS explicitly.
+        let oauth_super_admin_emails = std::env::var("OAUTH_SUPER_ADMIN_EMAILS")
+            .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
@@ -75,7 +78,7 @@ impl AppConfig {
                     vec![std::env::var("CLIENT_ORIGIN")
                         .unwrap_or_else(|_| "http://localhost:4301".to_string())]
                 }),
-            oauth_super_admin_domains,
+            oauth_super_admin_emails,
         })
     }
 
@@ -185,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         google_oauth,
         config.client_origin,
         config.cors_origins,
-        config.oauth_super_admin_domains,
+        config.oauth_super_admin_emails,
         cookie_secure,
         at_jwt,
         mailer,

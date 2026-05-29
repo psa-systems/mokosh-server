@@ -59,7 +59,7 @@ pub fn create_api_router(
     google_oauth: Arc<google_oauth_flow::Client>,
     client_origin: String,
     cors_origins: Vec<String>,
-    super_admin_domains: Vec<String>,
+    super_admin_emails: Vec<String>,
     cookie_secure: bool,
     at_jwt: Option<AtJwtVerifier>,
     mailer: Arc<dyn crate::utils::email::Mailer>,
@@ -79,7 +79,7 @@ pub fn create_api_router(
     let auth_service = AuthService::with_mailer(
         db.clone(),
         jwt_secret.clone(),
-        super_admin_domains,
+        super_admin_emails,
         mailer.clone(),
         client_origin.clone(),
     );
