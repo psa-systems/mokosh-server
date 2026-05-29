@@ -1305,8 +1305,8 @@ mod tests {
     #[test]
     fn parse_user_bound_token_splits_valid() {
         let uid = Uuid::new_v4();
-        let (got, secret) =
-            parse_user_bound_token(&format!("{uid}.secretpart")).expect("valid token parses");
+        let token = format!("{uid}.secretpart");
+        let (got, secret) = parse_user_bound_token(&token).expect("valid token parses");
         assert_eq!(got, uid);
         assert_eq!(secret, "secretpart");
     }
@@ -1326,7 +1326,8 @@ mod tests {
     fn parse_user_bound_token_keeps_dots_in_secret() {
         // split_once stops at the first '.', so a dotted secret stays intact.
         let uid = Uuid::new_v4();
-        let (_, secret) = parse_user_bound_token(&format!("{uid}.a.b.c")).unwrap();
+        let token = format!("{uid}.a.b.c");
+        let (_, secret) = parse_user_bound_token(&token).unwrap();
         assert_eq!(secret, "a.b.c");
     }
 
