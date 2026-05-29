@@ -91,6 +91,10 @@ impl AuthService {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
 
+        // Reject sign-in when the owning tenant is suspended/cancelled, so a
+        // tenant-level suspension takes effect immediately.
+        self.ensure_tenant_active(user.tenant_id).await?;
+
         // Verify password
         let password_hash = user.password_hash.as_ref().ok_or(AppError::Unauthorized)?;
 
@@ -149,6 +153,24 @@ impl AuthService {
         })
     }
 
+    /// Reject access when the owning tenant is not active (suspended or
+    /// cancelled). Threaded into every session-minting path (password login,
+    /// Google login, refresh) so a tenant suspension takes effect immediately
+    /// instead of lingering until token expiry.
+    async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+        match status.as_deref() {
+            Some("active") => Ok(()),
+            _ => Err(AppError::Forbidden(
+                "This organization is not active".to_string(),
+            )),
+        }
+    }
+
     /// Authenticate (or auto-provision) a user from a Google OAuth
     /// userinfo response. The caller is responsible for verifying the
     /// CSRF state and exchanging the authorization code via the
@@ -205,10 +227,11 @@ impl AuthService {
             }
         };
 
-        // 3. Reject inactive users.
+        // 3. Reject inactive users and suspended/cancelled tenants.
         if user.status != UserStatus::Active {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
+        self.ensure_tenant_active(user.tenant_id).await?;
 
         // 4. Issue session + tokens identically to the password flow.
         let session_id = self
@@ -324,6 +347,9 @@ impl AuthService {
         if user.status != UserStatus::Active {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
+        // A tenant suspended after the session was minted is rejected here, so
+        // refreshing can't outlive the suspension.
+        self.ensure_tenant_active(user.tenant_id).await?;
 
         // Generate new tokens
         let (access_token, new_refresh_token, expires_at) =
@@ -367,9 +393,12 @@ impl AuthService {
             Err(_) => return Ok(()), // Silently succeed to not reveal user existence
         };
 
-        // Generate reset token
-        let token = generate_token(64);
-        let token_hash = hash_password(&token)?;
+        // Generate a reset token bound to the user. The emailed token is
+        // `{user_id}.{secret}`; only the secret is hashed and stored so
+        // reset_password can scope its lookup to this user.
+        let secret = generate_token(64);
+        let token_hash = hash_password(&secret)?;
+        let token = format!("{}.{}", user.id, secret);
         let expires_at = Utc::now() + Duration::hours(24);
 
         // Store token
@@ -415,25 +444,43 @@ impl AuthService {
             ));
         }
 
-        // Find valid token
-        let token_record = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+        // The emailed token is `{user_id}.{secret}`; only the secret half is
+        // hashed and stored. Bind the lookup to that user so a leaked or
+        // guessed token can only reset its own account. (Tokens are salted
+        // Argon2 hashes and cannot be looked up by value, which is why the old
+        // code grabbed the most-recent token across ALL users - the bug.)
+        let (user_id_str, secret) = request
+            .token
+            .split_once('.')
+            .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
+        let user_id = Uuid::parse_str(user_id_str)
+            .map_err(|_| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
+
+        let candidates = sqlx::query_as::<_, (String,)>(
             r#"
-            SELECT user_id, tenant_id, token_hash
+            SELECT token_hash
             FROM password_reset_tokens
-            WHERE used_at IS NULL AND expires_at > NOW()
+            WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()
             ORDER BY created_at DESC
-            LIMIT 1
             "#,
         )
-        .fetch_optional(self.db.pool())
+        .bind(user_id)
+        .fetch_all(self.db.pool())
         .await?;
 
-        let (user_id, _tenant_id, token_hash) = token_record
-            .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
-
-        // Verify token
-        if !verify_password(&request.token, &token_hash)? {
-            return Err(AppError::BadRequest("Invalid reset token".to_string()));
+        let token_valid = candidates
+            .iter()
+            .try_fold(false, |found, (token_hash,)| {
+                if found {
+                    Ok(true)
+                } else {
+                    verify_password(secret, token_hash)
+                }
+            })?;
+        if !token_valid {
+            return Err(AppError::BadRequest(
+                "Invalid or expired reset token".to_string(),
+            ));
         }
 
         // Hash new password
@@ -554,8 +601,11 @@ impl AuthService {
             // first. 7-day window: long enough for admins who batch-create
             // accounts ahead of an onboarding day, short enough that a
             // leaked link is bounded.
-            let token = generate_token(64);
-            let token_hash = hash_password(&token)?;
+            // Same user-bound `{user_id}.{secret}` token shape as
+            // request_password_reset so reset_password can scope the lookup.
+            let secret = generate_token(64);
+            let token_hash = hash_password(&secret)?;
+            let token = format!("{}.{}", user_id, secret);
             let expires_at = Utc::now() + Duration::days(7);
             sqlx::query(
                 r#"
