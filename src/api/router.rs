@@ -203,7 +203,7 @@ pub fn create_api_router(
         .route("/health", get(health_check))
         .merge(portal_routes(portal_service, portal_ticket_service));
 
-    // CORS: SPA at msp.<tld> talks to msp-api.<tld> from a different origin,
+    // CORS: SPA at msp.<tld> talks to api.msp.<tld> from a different origin,
     // so credentialed CORS must be tight (specific origins, not wildcard).
     // The list comes from the CORS_ORIGIN env var (comma-separated). The
     // bunyip apex is included so the SaaS shell can call mokosh endpoints
@@ -224,7 +224,7 @@ pub fn create_api_router(
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
     // page that links the user back to the Mokosh frontend. This keeps
-    // msp-api.<tld> from leaking internal route info.
+    // api.msp.<tld> from leaking internal route info.
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/portal", portal_api)
@@ -237,7 +237,7 @@ pub fn create_api_router(
 
 /// Fallback handler for any path outside `/api/v1/*`. Renders a small
 /// "this is an API endpoint" page so direct browser visits to
-/// `msp-api.<tld>` are friendly instead of leaking 404 internals. The
+/// `api.msp.<tld>` are friendly instead of leaking 404 internals. The
 /// link points at the Bunyip SaaS shell on the matching apex; if the
 /// host can't be parsed, falls back to the staging URL.
 async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
@@ -246,7 +246,7 @@ async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let hub_link = host
-        .strip_prefix("msp-api.")
+        .strip_prefix("api.msp.")
         .map(|tld| format!("https://{tld}"))
         .unwrap_or_else(|| "https://a8n.systems".to_string());
     let body = format!(
