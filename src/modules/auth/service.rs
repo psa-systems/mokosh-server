@@ -29,10 +29,11 @@ pub struct AuthService {
     jwt_secret: String,
     access_token_ttl: Duration,
     refresh_token_ttl: Duration,
-    /// Lowercased email domains whose first-time Google sign-ins are
-    /// auto-promoted to role 'super_admin'. Existing users are never
-    /// re-roled.
-    super_admin_domains: Vec<String>,
+    /// Lowercased exact email addresses allowed to auto-provision a
+    /// super_admin account on first Google sign-in. Any other unrecognized
+    /// Google identity is rejected (fail-closed) rather than auto-created in
+    /// the default tenant. Existing users are never re-roled.
+    super_admin_emails: Vec<String>,
     /// Outbound transactional email. Defaults to `LogMailer` so unit
     /// constructions that do not need real SMTP keep working.
     mailer: Arc<dyn Mailer>,
@@ -45,11 +46,11 @@ pub struct AuthService {
 #[cfg(feature = "server")]
 impl AuthService {
     /// Create a new auth service.
-    pub fn new(db: Database, jwt_secret: String, super_admin_domains: Vec<String>) -> Self {
+    pub fn new(db: Database, jwt_secret: String, super_admin_emails: Vec<String>) -> Self {
         Self::with_mailer(
             db,
             jwt_secret,
-            super_admin_domains,
+            super_admin_emails,
             Arc::new(LogMailer),
             "http://localhost:4301".to_string(),
         )
@@ -61,7 +62,7 @@ impl AuthService {
     pub fn with_mailer(
         db: Database,
         jwt_secret: String,
-        super_admin_domains: Vec<String>,
+        super_admin_emails: Vec<String>,
         mailer: Arc<dyn Mailer>,
         frontend_base_url: String,
     ) -> Self {
@@ -70,7 +71,7 @@ impl AuthService {
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
-            super_admin_domains,
+            super_admin_emails,
             mailer,
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
         }
@@ -90,6 +91,10 @@ impl AuthService {
         if user.status != UserStatus::Active {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
+
+        // Reject sign-in when the owning tenant is suspended/cancelled, so a
+        // tenant-level suspension takes effect immediately.
+        self.ensure_tenant_active(user.tenant_id).await?;
 
         // Verify password
         let password_hash = user.password_hash.as_ref().ok_or(AppError::Unauthorized)?;
@@ -149,6 +154,23 @@ impl AuthService {
         })
     }
 
+    /// Reject access when the owning tenant is not active (suspended or
+    /// cancelled). Threaded into every session-minting path (password login,
+    /// Google login, refresh) so a tenant suspension takes effect immediately
+    /// instead of lingering until token expiry.
+    async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+        match status.as_deref() {
+            Some("active") => Ok(()),
+            _ => Err(AppError::Forbidden(
+                "This organization is not active".to_string(),
+            )),
+        }
+    }
+
     /// Authenticate (or auto-provision) a user from a Google OAuth
     /// userinfo response. The caller is responsible for verifying the
     /// CSRF state and exchanging the authorization code via the
@@ -188,6 +210,15 @@ impl AuthService {
             // 2. No identity row yet - find or create the user by email.
             match self.find_user_by_email_optional(&google.email).await? {
                 Some(existing) => {
+                    // Only auto-link to an existing local account whose own
+                    // email is verified. Otherwise someone who registered a
+                    // password account under another person's email could
+                    // capture that person's Google sign-in.
+                    if existing.email_verified_at.is_none() {
+                        return Err(AppError::Forbidden(
+                            "An account with this email exists but is not verified. Sign in with your password first to link Google.".to_string(),
+                        ));
+                    }
                     // Link new identity to existing user; do NOT change role.
                     sqlx::query(
                         "INSERT INTO user_oauth_identities \
@@ -205,10 +236,11 @@ impl AuthService {
             }
         };
 
-        // 3. Reject inactive users.
+        // 3. Reject inactive users and suspended/cancelled tenants.
         if user.status != UserStatus::Active {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
+        self.ensure_tenant_active(user.tenant_id).await?;
 
         // 4. Issue session + tokens identically to the password flow.
         let session_id = self
@@ -226,27 +258,26 @@ impl AuthService {
         })
     }
 
-    /// Auto-provision a brand-new user from a verified Google identity.
-    /// Role is `super_admin` if the hosted domain (or email domain) is
-    /// in `self.super_admin_domains`, else `technician`.
+    /// Auto-provision a user from a verified Google identity. FAIL-CLOSED:
+    /// only exact emails in `self.super_admin_emails` may auto-provision (as
+    /// super_admin, to bootstrap administrators). Any other unrecognized
+    /// Google identity is rejected - real users must be invited rather than
+    /// silently dropped into the default tenant.
     async fn provision_user_from_google(
         &self,
         google: &google_oauth_flow::GoogleUserInfo,
     ) -> AppResult<User> {
-        let domain = google
-            .hd
-            .clone()
-            .or_else(|| google.email.split('@').nth(1).map(str::to_string))
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let role = if self.super_admin_domains.iter().any(|d| d == &domain) {
-            "super_admin"
-        } else {
-            "technician"
-        };
+        if !is_allowlisted_email(&self.super_admin_emails, &google.email) {
+            return Err(AppError::Forbidden(
+                "No account is provisioned for this Google identity. Ask an administrator for an invite.".to_string(),
+            ));
+        }
+        let role = "super_admin";
 
         let user_id = Uuid::new_v4();
-        // Default tenant seeded by migrations/002_seed_data.sql.
+        // Bootstrap super-admins land in the default tenant seeded by
+        // migrations/002_seed_data.sql. Everyone else is invited into a
+        // specific tenant via the invite flow, not this path.
         let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001")
             .expect("default tenant UUID is valid");
 
@@ -324,6 +355,9 @@ impl AuthService {
         if user.status != UserStatus::Active {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
+        // A tenant suspended after the session was minted is rejected here, so
+        // refreshing can't outlive the suspension.
+        self.ensure_tenant_active(user.tenant_id).await?;
 
         // Generate new tokens
         let (access_token, new_refresh_token, expires_at) =
@@ -367,9 +401,12 @@ impl AuthService {
             Err(_) => return Ok(()), // Silently succeed to not reveal user existence
         };
 
-        // Generate reset token
-        let token = generate_token(64);
-        let token_hash = hash_password(&token)?;
+        // Generate a reset token bound to the user. The emailed token is
+        // `{user_id}.{secret}`; only the secret is hashed and stored so
+        // reset_password can scope its lookup to this user.
+        let secret = generate_token(64);
+        let token_hash = hash_password(&secret)?;
+        let token = format!("{}.{}", user.id, secret);
         let expires_at = Utc::now() + Duration::hours(24);
 
         // Store token
@@ -415,25 +452,37 @@ impl AuthService {
             ));
         }
 
-        // Find valid token
-        let token_record = sqlx::query_as::<_, (Uuid, Uuid, String)>(
-            r#"
-            SELECT user_id, tenant_id, token_hash
-            FROM password_reset_tokens
-            WHERE used_at IS NULL AND expires_at > NOW()
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(self.db.pool())
-        .await?;
-
-        let (user_id, _tenant_id, token_hash) = token_record
+        // The emailed token is `{user_id}.{secret}`; only the secret half is
+        // hashed and stored. Bind the lookup to that user so a leaked or
+        // guessed token can only reset its own account. (Tokens are salted
+        // Argon2 hashes and cannot be looked up by value, which is why the old
+        // code grabbed the most-recent token across ALL users - the bug.)
+        let (user_id, secret) = parse_user_bound_token(&request.token)
             .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
 
-        // Verify token
-        if !verify_password(&request.token, &token_hash)? {
-            return Err(AppError::BadRequest("Invalid reset token".to_string()));
+        let candidates = sqlx::query_as::<_, (String,)>(
+            r#"
+            SELECT token_hash
+            FROM password_reset_tokens
+            WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let token_valid = candidates.iter().try_fold(false, |found, (token_hash,)| {
+            if found {
+                Ok(true)
+            } else {
+                verify_password(secret, token_hash)
+            }
+        })?;
+        if !token_valid {
+            return Err(AppError::BadRequest(
+                "Invalid or expired reset token".to_string(),
+            ));
         }
 
         // Hash new password
@@ -554,8 +603,11 @@ impl AuthService {
             // first. 7-day window: long enough for admins who batch-create
             // accounts ahead of an onboarding day, short enough that a
             // leaked link is bounded.
-            let token = generate_token(64);
-            let token_hash = hash_password(&token)?;
+            // Same user-bound `{user_id}.{secret}` token shape as
+            // request_password_reset so reset_password can scope the lookup.
+            let secret = generate_token(64);
+            let token_hash = hash_password(&secret)?;
+            let token = format!("{}.{}", user_id, secret);
             let expires_at = Utc::now() + Duration::days(7);
             sqlx::query(
                 r#"
@@ -1221,4 +1273,72 @@ struct SessionRow {
     user_agent: Option<String>,
     last_activity_at: chrono::DateTime<Utc>,
     created_at: chrono::DateTime<Utc>,
+}
+
+/// Split a user-bound credential token of the form `{user_id}.{secret}` into
+/// its parts. Returns None if the shape is wrong or either half is empty. Lets
+/// password-reset / welcome-setup verification scope its lookup to the user the
+/// token was minted for instead of grabbing any user's token.
+#[cfg(feature = "server")]
+fn parse_user_bound_token(token: &str) -> Option<(Uuid, &str)> {
+    let (id, secret) = token.split_once('.')?;
+    if secret.is_empty() {
+        return None;
+    }
+    let user_id = Uuid::parse_str(id).ok()?;
+    Some((user_id, secret))
+}
+
+/// Case-insensitive exact-match against an email allowlist. Allowlist entries
+/// are expected already lowercased (config parsing lowercases them); the
+/// candidate is lowercased here for safety.
+#[cfg(feature = "server")]
+fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
+    let email = email.to_ascii_lowercase();
+    allowlist.iter().any(|e| e == &email)
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_user_bound_token_splits_valid() {
+        let uid = Uuid::new_v4();
+        let token = format!("{uid}.secretpart");
+        let (got, secret) = parse_user_bound_token(&token).expect("valid token parses");
+        assert_eq!(got, uid);
+        assert_eq!(secret, "secretpart");
+    }
+
+    #[test]
+    fn parse_user_bound_token_rejects_bad_shapes() {
+        assert!(parse_user_bound_token("no-dot-here").is_none());
+        assert!(parse_user_bound_token("not-a-uuid.secret").is_none());
+        let uid = Uuid::new_v4();
+        assert!(
+            parse_user_bound_token(&format!("{uid}.")).is_none(),
+            "empty secret rejected"
+        );
+    }
+
+    #[test]
+    fn parse_user_bound_token_keeps_dots_in_secret() {
+        // split_once stops at the first '.', so a dotted secret stays intact.
+        let uid = Uuid::new_v4();
+        let token = format!("{uid}.a.b.c");
+        let (_, secret) = parse_user_bound_token(&token).unwrap();
+        assert_eq!(secret, "a.b.c");
+    }
+
+    #[test]
+    fn allowlist_matches_case_insensitively() {
+        let allow = vec!["admin@niceguyit.biz".to_string()];
+        assert!(is_allowlisted_email(&allow, "Admin@NiceGuyIT.biz"));
+        assert!(!is_allowlisted_email(&allow, "other@niceguyit.biz"));
+        assert!(
+            !is_allowlisted_email(&[], "admin@niceguyit.biz"),
+            "empty allowlist matches nothing"
+        );
+    }
 }

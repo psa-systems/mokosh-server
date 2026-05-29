@@ -69,12 +69,12 @@ jobs:
         run: |
           ^docker login --username $env.REGISTRY_USER --password $env.REGISTRY_PASSWORD $env.REGISTRY_PROVIDER
 
-      - name: Build and push mokosh-api image
+      - name: Build and push mokosh-server image
         shell: nu {0}
         run: |
           let tags_str = "${{ steps.get-tags.outputs.tags }}"
           let tags = ($tags_str | split row ",")
-          let image = "mokosh-api"
+          let image = "mokosh-server"
           let registry = $env.IMAGE_REGISTRY
           let tag_args = ($tags | each {|tag| [-t $"($registry)/($image):($tag)"]} | flatten)
           let cache_from = $"type=registry,ref=($registry)/($image):latest"
@@ -86,7 +86,7 @@ jobs:
         run: |
           let tags_str = "${{ steps.get-tags.outputs.tags }}"
           let tags = ($tags_str | split row ",")
-          let image = "mokosh-api"
+          let image = "mokosh-server"
           let registry = $env.IMAGE_REGISTRY
           for tag in $tags {
             print $"Image pushed to ($registry)/($image):($tag)"
