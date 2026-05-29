@@ -19,6 +19,43 @@ impl ContactService {
         Self { db }
     }
 
+    /// Reject a foreign id that does not belong to this tenant, so a request
+    /// body cannot link a row to another tenant's data. `table` is a
+    /// compile-time constant, never user input.
+    async fn validate_fk(
+        &self,
+        tenant_id: Uuid,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
+        let exists: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
+        ))
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if exists {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest(format!(
+                "Referenced {table} not found in this tenant"
+            )))
+        }
+    }
+
+    async fn validate_fk_opt(
+        &self,
+        tenant_id: Uuid,
+        table: &'static str,
+        id: Option<Uuid>,
+    ) -> AppResult<()> {
+        match id {
+            Some(id) => self.validate_fk(tenant_id, table, id).await,
+            None => Ok(()),
+        }
+    }
+
     // ========================================================================
     // COMPANIES
     // ========================================================================
@@ -32,6 +69,15 @@ impl ContactService {
         let company_id = Uuid::new_v4();
         let address = request.address.clone().unwrap_or_default();
         let billing_address = request.billing_address.clone().unwrap_or_default();
+
+        // PSA audit: every foreign id from the request body must belong to
+        // this tenant before it is linked.
+        self.validate_fk_opt(tenant_id, "companies", request.parent_company_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "users", request.account_manager_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
+            .await?;
 
         sqlx::query(
             r#"
@@ -217,6 +263,15 @@ impl ContactService {
     ) -> AppResult<Company> {
         // Verify company exists
         self.get_company(tenant_id, company_id).await?;
+
+        // PSA audit: validate any foreign id being set so an update cannot
+        // re-link this company to another tenant's rows.
+        self.validate_fk_opt(tenant_id, "companies", request.parent_company_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "users", request.account_manager_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
+            .await?;
 
         // Build update query dynamically
         let mut updates = vec!["updated_at = NOW()".to_string()];

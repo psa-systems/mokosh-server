@@ -18,6 +18,43 @@ impl CalendarService {
         Self { db }
     }
 
+    /// Reject a foreign id that does not belong to this tenant, so a request
+    /// body cannot link a row to another tenant's data. `table` is a
+    /// compile-time constant, never user input.
+    async fn validate_fk(
+        &self,
+        tenant_id: Uuid,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
+        let exists: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
+        ))
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if exists {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest(format!(
+                "Referenced {table} not found in this tenant"
+            )))
+        }
+    }
+
+    async fn validate_fk_opt(
+        &self,
+        tenant_id: Uuid,
+        table: &'static str,
+        id: Option<Uuid>,
+    ) -> AppResult<()> {
+        match id {
+            Some(id) => self.validate_fk(tenant_id, table, id).await,
+            None => Ok(()),
+        }
+    }
+
     // ========================================================================
     // PMS-60 appointments
     // ========================================================================
@@ -80,6 +117,22 @@ impl CalendarService {
                 "end_time must be >= start_time".to_string(),
             ));
         }
+        // PSA audit: every foreign id from the request body must belong to
+        // this tenant before it is linked.
+        self.validate_fk(tenant_id, "users", request.assigned_to_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "companies", request.company_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "sites", request.site_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "tickets", request.ticket_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "projects", request.project_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "tasks", request.task_id)
+            .await?;
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO appointments (
@@ -136,6 +189,10 @@ impl CalendarService {
         id: Uuid,
         request: &UpdateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
+        // PSA audit: validate the foreign id being set so an update cannot
+        // re-link this appointment to another tenant's user.
+        self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
+            .await?;
         let n = sqlx::query(
             r#"UPDATE appointments SET
                 title = COALESCE($3, title),

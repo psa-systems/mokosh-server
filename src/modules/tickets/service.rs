@@ -41,6 +41,43 @@ impl TicketService {
         }
     }
 
+    /// Reject a foreign id that does not belong to this tenant, so a request
+    /// body cannot link a row to another tenant's data. `table` is a
+    /// compile-time constant, never user input.
+    async fn validate_fk(
+        &self,
+        tenant_id: Uuid,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
+        let exists: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
+        ))
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if exists {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest(format!(
+                "Referenced {table} not found in this tenant"
+            )))
+        }
+    }
+
+    async fn validate_fk_opt(
+        &self,
+        tenant_id: Uuid,
+        table: &'static str,
+        id: Option<Uuid>,
+    ) -> AppResult<()> {
+        match id {
+            Some(id) => self.validate_fk(tenant_id, table, id).await,
+            None => Ok(()),
+        }
+    }
+
     /// Generate next ticket number for tenant
     async fn next_ticket_number(&self, tenant_id: Uuid) -> AppResult<String> {
         let row = sqlx::query_as::<_, (i32,)>(
@@ -102,6 +139,26 @@ impl TicketService {
             .await?
             .ok_or_else(|| AppError::Configuration("No default queue configured".to_string()))?,
         };
+
+        // PSA audit: every foreign id from the request body must belong to
+        // this tenant before it is linked, so a request cannot point a
+        // ticket at another tenant's company/contact/site/etc.
+        self.validate_fk(tenant_id, "companies", request.company_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "sites", request.site_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "teams", request.team_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "contracts", request.contract_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "assets", request.asset_id)
+            .await?;
 
         sqlx::query(
             r#"
@@ -356,6 +413,24 @@ impl TicketService {
         // Captured for a future "status changed" automation trigger;
         // the F11 wiring only fires the generic OnUpdate today.
         let _old_status_id = ticket.status_id;
+
+        // PSA audit: validate any foreign id being set so an update cannot
+        // re-link this ticket to another tenant's rows. Option fields are
+        // only checked when present.
+        self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "sites", request.site_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "teams", request.team_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "contracts", request.contract_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "assets", request.asset_id)
+            .await?;
 
         // Build update
         if let Some(ref title) = request.title {
