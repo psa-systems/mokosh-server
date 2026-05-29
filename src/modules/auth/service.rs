@@ -159,11 +159,10 @@ impl AuthService {
     /// Google login, refresh) so a tenant suspension takes effect immediately
     /// instead of lingering until token expiry.
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
-                .bind(tenant_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(self.db.pool())
+            .await?;
         match status.as_deref() {
             Some("active") => Ok(()),
             _ => Err(AppError::Forbidden(
@@ -473,15 +472,13 @@ impl AuthService {
         .fetch_all(self.db.pool())
         .await?;
 
-        let token_valid = candidates
-            .iter()
-            .try_fold(false, |found, (token_hash,)| {
-                if found {
-                    Ok(true)
-                } else {
-                    verify_password(secret, token_hash)
-                }
-            })?;
+        let token_valid = candidates.iter().try_fold(false, |found, (token_hash,)| {
+            if found {
+                Ok(true)
+            } else {
+                verify_password(secret, token_hash)
+            }
+        })?;
         if !token_valid {
             return Err(AppError::BadRequest(
                 "Invalid or expired reset token".to_string(),
