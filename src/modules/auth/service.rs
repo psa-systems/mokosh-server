@@ -268,8 +268,7 @@ impl AuthService {
         &self,
         google: &google_oauth_flow::GoogleUserInfo,
     ) -> AppResult<User> {
-        let email = google.email.to_ascii_lowercase();
-        if !self.super_admin_emails.iter().any(|e| e == &email) {
+        if !is_allowlisted_email(&self.super_admin_emails, &google.email) {
             return Err(AppError::Forbidden(
                 "No account is provisioned for this Google identity. Ask an administrator for an invite.".to_string(),
             ));
@@ -459,12 +458,8 @@ impl AuthService {
         // guessed token can only reset its own account. (Tokens are salted
         // Argon2 hashes and cannot be looked up by value, which is why the old
         // code grabbed the most-recent token across ALL users - the bug.)
-        let (user_id_str, secret) = request
-            .token
-            .split_once('.')
+        let (user_id, secret) = parse_user_bound_token(&request.token)
             .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
-        let user_id = Uuid::parse_str(user_id_str)
-            .map_err(|_| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
 
         let candidates = sqlx::query_as::<_, (String,)>(
             r#"
@@ -1281,4 +1276,71 @@ struct SessionRow {
     user_agent: Option<String>,
     last_activity_at: chrono::DateTime<Utc>,
     created_at: chrono::DateTime<Utc>,
+}
+
+/// Split a user-bound credential token of the form `{user_id}.{secret}` into
+/// its parts. Returns None if the shape is wrong or either half is empty. Lets
+/// password-reset / welcome-setup verification scope its lookup to the user the
+/// token was minted for instead of grabbing any user's token.
+#[cfg(feature = "server")]
+fn parse_user_bound_token(token: &str) -> Option<(Uuid, &str)> {
+    let (id, secret) = token.split_once('.')?;
+    if secret.is_empty() {
+        return None;
+    }
+    let user_id = Uuid::parse_str(id).ok()?;
+    Some((user_id, secret))
+}
+
+/// Case-insensitive exact-match against an email allowlist. Allowlist entries
+/// are expected already lowercased (config parsing lowercases them); the
+/// candidate is lowercased here for safety.
+#[cfg(feature = "server")]
+fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
+    let email = email.to_ascii_lowercase();
+    allowlist.iter().any(|e| e == &email)
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_user_bound_token_splits_valid() {
+        let uid = Uuid::new_v4();
+        let (got, secret) =
+            parse_user_bound_token(&format!("{uid}.secretpart")).expect("valid token parses");
+        assert_eq!(got, uid);
+        assert_eq!(secret, "secretpart");
+    }
+
+    #[test]
+    fn parse_user_bound_token_rejects_bad_shapes() {
+        assert!(parse_user_bound_token("no-dot-here").is_none());
+        assert!(parse_user_bound_token("not-a-uuid.secret").is_none());
+        let uid = Uuid::new_v4();
+        assert!(
+            parse_user_bound_token(&format!("{uid}.")).is_none(),
+            "empty secret rejected"
+        );
+    }
+
+    #[test]
+    fn parse_user_bound_token_keeps_dots_in_secret() {
+        // split_once stops at the first '.', so a dotted secret stays intact.
+        let uid = Uuid::new_v4();
+        let (_, secret) = parse_user_bound_token(&format!("{uid}.a.b.c")).unwrap();
+        assert_eq!(secret, "a.b.c");
+    }
+
+    #[test]
+    fn allowlist_matches_case_insensitively() {
+        let allow = vec!["admin@niceguyit.biz".to_string()];
+        assert!(is_allowlisted_email(&allow, "Admin@NiceGuyIT.biz"));
+        assert!(!is_allowlisted_email(&allow, "other@niceguyit.biz"));
+        assert!(
+            !is_allowlisted_email(&[], "admin@niceguyit.biz"),
+            "empty allowlist matches nothing"
+        );
+    }
 }
