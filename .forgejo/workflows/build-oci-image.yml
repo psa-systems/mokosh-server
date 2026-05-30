@@ -3,10 +3,12 @@
 # Build OCI image and push to Forgejo Container Registry.
 name: Build OCI container
 
+
 on:
   push:
     branches:
       - "main"
+      - "**"
     tags:
       - "v*"
     paths:
