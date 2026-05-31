@@ -38,7 +38,7 @@ jobs:
           let tag = ($branch | str replace "release/" "")
 
           # Build changelog from commits since the previous tag
-          let prev_tag = (do { ^git describe --tags --abbrev=0 $"($tag)^" } | complete)
+          let prev_tag = (do { ^git describe --tags --abbrev=0 HEAD^ } | complete)
           let changelog = if $prev_tag.exit_code == 0 {
             let prev = ($prev_tag.stdout | str trim)
             ^git log --oneline $"($prev)..HEAD" | str trim
