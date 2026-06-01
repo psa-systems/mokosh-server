@@ -154,13 +154,13 @@ register-client: ensure-env
 down: ensure-env
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
 
-# Stop the dev secrets-management stack. Volumes are preserved.
-[doc("Stop Infisical and its sidecars (volumes preserved)")]
+# Stop the dev stack (compose.dev.yml). Volumes preserved.
+[doc("Stop the dev stack (volumes preserved)")]
 [group: 'dev']
 dev-down: ensure-env
     docker compose --file {{ compose_file }} down
 
-# Wipe the dev secrets-management stack: stop, remove volumes, remove .env.
+# Wipe the dev stack: stop, remove volumes, remove .env. Preserves .env.infisical.
 [doc("Wipe Infisical volumes and .env. Preserves .env.infisical.")]
 [group: 'dev']
 dev-clean: ensure-env
