@@ -12,7 +12,7 @@ default:
 ensure-env:
     @test -f .env || cp .env.dev .env
 
-# Bring up the dev stack (mokosh-server + Infisical + Postgres + Valkey). Trailing args go to `docker compose up` (e.g. --detach).
+# Bring up the dev stack (mokosh-server + Postgres + Valkey (no Infisical — use just dev-infisical)). Trailing args go to `docker compose up` (e.g. --detach).
 [doc("Start the dev stack in Docker. Trailing args go to `docker compose up` (e.g. --detach).")]
 [group: 'dev']
 dev *args: ensure-env
@@ -40,6 +40,12 @@ dev *args: ensure-env
     $"($updated)\n" | save .env.new
     mv .env.new .env
     docker compose --file {{ compose_file }} up {{ args }}
+
+# Start only Infisical + its Postgres (opt-in; not started by `just dev`).
+[doc("Start Infisical and its Postgres sidecar (compose profile: infisical)")]
+[group: 'dev']
+dev-infisical *args: ensure-env
+    docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
 
 # Generate the dev OIDC Ed25519 keypair (kid=dev-key) if missing.
 # Each per-developer instance must generate its own; the repo does not
@@ -148,13 +154,13 @@ register-client: ensure-env
 down: ensure-env
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
 
-# Stop the dev secrets-management stack. Volumes are preserved.
-[doc("Stop Infisical and its sidecars (volumes preserved)")]
+# Stop the dev stack (compose.dev.yml). Volumes preserved.
+[doc("Stop the dev stack (volumes preserved)")]
 [group: 'dev']
 dev-down: ensure-env
     docker compose --file {{ compose_file }} down
 
-# Wipe the dev secrets-management stack: stop, remove volumes, remove .env.
+# Wipe the dev stack: stop, remove volumes, remove .env. Preserves .env.infisical.
 [doc("Wipe Infisical volumes and .env. Preserves .env.infisical.")]
 [group: 'dev']
 dev-clean: ensure-env

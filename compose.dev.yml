@@ -53,6 +53,7 @@ services:
 
   # PostgreSQL database for Infisical (internal only).
   infisical-postgres:
+    profiles: ["infisical"]
     container_name: dev-mokosh-infisical-postgres-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/_/postgres
     image: postgres:18.2-alpine3.23
@@ -89,6 +90,7 @@ services:
 
   # Infisical secrets manager (admin UI reachable from the host).
   infisical:
+    profiles: ["infisical"]
     container_name: dev-mokosh-infisical-${USER:?USER missing - run via just dev}
     image: infisical/infisical:latest
     environment:
