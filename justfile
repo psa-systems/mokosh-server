@@ -41,6 +41,12 @@ dev *args: ensure-env
     mv .env.new .env
     docker compose --file {{ compose_file }} up {{ args }}
 
+# Start only Infisical + its Postgres (opt-in; not started by `just dev`).
+[doc("Start Infisical and its Postgres sidecar (compose profile: infisical)")]
+[group: 'dev']
+dev-infisical *args: ensure-env
+    docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
+    
 # Generate the dev OIDC Ed25519 keypair (kid=dev-key) if missing.
 # Each per-developer instance must generate its own; the repo does not
 # ship private keys (see secrets/ in .gitignore). Without these the
