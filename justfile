@@ -12,7 +12,7 @@ default:
 ensure-env:
     @test -f .env || cp .env.dev .env
 
-# Bring up the dev stack (mokosh-server + Infisical + Postgres + Valkey). Trailing args go to `docker compose up` (e.g. --detach).
+# Bring up the dev stack (mokosh-server + Postgres + Valkey (no Infisical — use just dev-infisical)). Trailing args go to `docker compose up` (e.g. --detach).
 [doc("Start the dev stack in Docker. Trailing args go to `docker compose up` (e.g. --detach).")]
 [group: 'dev']
 dev *args: ensure-env
@@ -46,7 +46,7 @@ dev *args: ensure-env
 [group: 'dev']
 dev-infisical *args: ensure-env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
-    
+
 # Generate the dev OIDC Ed25519 keypair (kid=dev-key) if missing.
 # Each per-developer instance must generate its own; the repo does not
 # ship private keys (see secrets/ in .gitignore). Without these the
