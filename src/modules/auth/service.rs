@@ -987,6 +987,35 @@ impl AuthService {
         Ok(row.into())
     }
 
+    /// JIT-mirror an OIDC subject into the local `users` table.
+    ///
+    /// Called from `AuthMiddleware` on first sight of a bunyip-issued `at+jwt`
+    /// whose `sub` doesn't yet match a local row. The local `users.id` is set
+    /// to `sub` so subsequent requests resolve via `get_user_by_id` without
+    /// another userinfo round-trip. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md §3.3.
+    pub async fn upsert_user_from_oidc(
+        &self,
+        sub: Uuid,
+        tenant_id: Uuid,
+        email: &str,
+        role: UserRole,
+    ) -> AppResult<User> {
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, tenant_id, email, role, status, email_verified_at, timezone)
+            VALUES ($1, $2, $3, $4, 'active', NOW(), 'UTC')
+            ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, updated_at = NOW()
+            "#,
+        )
+        .bind(sub)
+        .bind(tenant_id)
+        .bind(email)
+        .bind(role.as_str())
+        .execute(self.db.pool())
+        .await?;
+        self.get_user_by_id(sub).await
+    }
+
     /// Find user by email
     async fn find_user_by_email(&self, email: &str) -> AppResult<User> {
         let row = sqlx::query_as::<_, UserRow>(
