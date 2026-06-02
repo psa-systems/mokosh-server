@@ -182,6 +182,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
         .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
 
+    // Bunyip-as-OP Resource-Server verifier. Initialised when OIDC_ISSUER +
+    // OIDC_AUDIENCE are set; otherwise the middleware falls back to the legacy
+    // mokosh-auth at+jwt + HS256 cookie paths. See
+    // docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
+    let bunyip_verifier = match mokosh_server::modules::auth::oidc_rs::VerifierConfig::from_env() {
+        Ok(cfg) => {
+            tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "Bunyip RS verifier mounted");
+            Some(mokosh_server::modules::auth::oidc_rs::Verifier::new(cfg))
+        }
+        Err(reason) => {
+            tracing::info!(reason = %reason, "Bunyip RS verifier disabled");
+            None
+        }
+    };
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -191,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.oauth_super_admin_emails,
         cookie_secure,
         at_jwt,
+        bunyip_verifier,
         mailer,
         encryption_key,
     );

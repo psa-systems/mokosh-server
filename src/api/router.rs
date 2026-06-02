@@ -62,6 +62,7 @@ pub fn create_api_router(
     super_admin_emails: Vec<String>,
     cookie_secure: bool,
     at_jwt: Option<AtJwtVerifier>,
+    bunyip_verifier: Option<crate::modules::auth::oidc_rs::Verifier>,
     mailer: Arc<dyn crate::utils::email::Mailer>,
     // 32-byte AES-256-GCM key. Used for at-rest encryption of any
     // per-tenant secret material (today: payment-gateway configs).
@@ -109,6 +110,9 @@ pub fn create_api_router(
     let mut auth_middleware = AuthMiddleware::new(auth_service.clone());
     if let Some(v) = at_jwt {
         auth_middleware = auth_middleware.with_at_jwt(v);
+    }
+    if let Some(v) = bunyip_verifier {
+        auth_middleware = auth_middleware.with_bunyip(v);
     }
 
     // Build API v1 routes

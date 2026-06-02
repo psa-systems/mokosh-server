@@ -9,7 +9,8 @@ use axum::{
 use std::sync::Arc;
 
 use super::at_jwt::{current_user_from_at_jwt, AtJwtVerifier};
-use super::{AuthService, AuthState, CurrentUser};
+use super::oidc_rs::Verifier as BunyipVerifier;
+use super::{AuthService, AuthState, CurrentUser, UserRole};
 use crate::utils::error::AppError;
 
 /// Extension to hold the current auth state
@@ -22,6 +23,11 @@ pub struct AuthMiddleware {
     /// recognisable as an `at+jwt`. This is how PSA endpoints accept
     /// access tokens minted by SSO during the transition window.
     pub at_jwt: Option<AtJwtVerifier>,
+    /// Optional Resource-Server verifier for the bunyip-as-OP cutover.
+    /// When set, the middleware verifies Bearer tokens against bunyip-api's
+    /// JWKS first; on success it JIT-mirrors the (sub, email) into the local
+    /// users table. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
+    pub bunyip: Option<Arc<BunyipVerifier>>,
 }
 
 impl AuthMiddleware {
@@ -29,6 +35,7 @@ impl AuthMiddleware {
         Self {
             auth_service: Arc::new(auth_service),
             at_jwt: None,
+            bunyip: None,
         }
     }
 
@@ -36,6 +43,13 @@ impl AuthMiddleware {
     /// `OidcKeySet` returned from `mokosh_auth::bootstrap`.
     pub fn with_at_jwt(mut self, verifier: AtJwtVerifier) -> Self {
         self.at_jwt = Some(verifier);
+        self
+    }
+
+    /// Attach the bunyip-as-OP Resource-Server verifier. Call this at startup
+    /// once `OIDC_ISSUER` + `OIDC_AUDIENCE` are set; see `oidc_rs::VerifierConfig`.
+    pub fn with_bunyip(mut self, verifier: BunyipVerifier) -> Self {
+        self.bunyip = Some(Arc::new(verifier));
         self
     }
 }
@@ -52,17 +66,36 @@ pub async fn auth_middleware(
     // is what keeps existing sessions working during transition.
     let auth_state = match bearer(&request) {
         Some(token) => {
-            // 1. SSO at+jwt path.
-            let from_sso = auth_middleware
+            // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
+            //    bunyip-api carry typ=at+jwt + iss=bunyip's OIDC_ISSUER.
+            let from_bunyip = match auth_middleware.bunyip.as_ref() {
+                Some(v) => match v.verify_at_jwt(token).await {
+                    Ok(claims) => {
+                        ensure_user_from_bunyip(
+                            &auth_middleware.auth_service,
+                            v.as_ref(),
+                            token,
+                            &claims,
+                        )
+                        .await
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            if let Some(state) = from_bunyip {
+                state
+            } else if let Some(verified) = auth_middleware
                 .at_jwt
                 .as_ref()
-                .and_then(|v| v.try_verify(token));
-            if let Some(verified) = from_sso {
+                .and_then(|v| v.try_verify(token))
+            {
+                // 2. Legacy SSO at+jwt path (mokosh-auth IdP - transitional).
                 let tenant_id = verified.tenant_id;
                 let user = current_user_from_at_jwt(&verified);
                 AuthState::authenticated(user, tenant_id)
             } else {
-                // 2. Legacy HS256 path.
+                // 3. Legacy HS256 cookie path.
                 match auth_middleware.auth_service.decode_token(token) {
                     Ok(claims) => match auth_middleware
                         .auth_service
@@ -275,4 +308,56 @@ pub fn get_current_user(request: &Request) -> Option<CurrentUser> {
         .extensions()
         .get::<AuthState>()
         .and_then(|state| state.user.clone())
+}
+
+// ── Bunyip RS helper ─────────────────────────────────────────────────────────
+
+/// Resolve a Bunyip-issued at+jwt claim set into an `AuthState`.
+///
+/// First looks up the local users row by `claims.sub` (which equals bunyip's
+/// internal user UUID). On first sight of a new sub, calls bunyip's
+/// `/oauth2/userinfo` to get `email`, then JIT-inserts a row into
+/// `public.users`.
+///
+/// `tenant_id` falls back to `OIDC_DEFAULT_TENANT_ID` (or the all-zeros UUID
+/// with a 1 in the low bits, matching `auth::bootstrap::default_tenant_id`)
+/// per docs §3.3: multi-tenant claim plumbing is out of scope for v1.
+///
+/// Returns `None` only when the user can't be resolved AND can't be created.
+/// The caller treats `None` as "drop the bunyip path" and falls back to legacy.
+async fn ensure_user_from_bunyip(
+    auth_service: &Arc<AuthService>,
+    verifier: &BunyipVerifier,
+    bearer: &str,
+    claims: &super::oidc_rs::AtClaims,
+) -> Option<AuthState> {
+    let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
+
+    // Happy path: row already exists.
+    if let Ok(user) = auth_service.get_user_by_id(sub).await {
+        let tenant_id = user.tenant_id;
+        return Some(AuthState::authenticated(user.to_current_user(), tenant_id));
+    }
+
+    // JIT path: fetch email from /oauth2/userinfo and insert.
+    let info = verifier.userinfo(bearer).await;
+    let email = info
+        .as_ref()
+        .and_then(|i| i.email.clone())
+        .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
+    let tenant_id = default_bunyip_tenant_id();
+
+    let user = auth_service
+        .upsert_user_from_oidc(sub, tenant_id, &email, UserRole::default())
+        .await
+        .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
+        .ok()?;
+    Some(AuthState::authenticated(user.to_current_user(), tenant_id))
+}
+
+fn default_bunyip_tenant_id() -> uuid::Uuid {
+    std::env::var("OIDC_DEFAULT_TENANT_ID")
+        .ok()
+        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .unwrap_or_else(|| uuid::Uuid::from_u128(1))
 }
