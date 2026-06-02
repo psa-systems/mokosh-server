@@ -282,8 +282,7 @@ impl Verifier {
 
     async fn refresh_jwks(&self) -> Result<(), VerifyError> {
         // 1. Discovery doc.
-        let discovery_url =
-            format!("{}/.well-known/openid-configuration", self.config.issuer);
+        let discovery_url = format!("{}/.well-known/openid-configuration", self.config.issuer);
         let discovery: DiscoveryDoc = self
             .http
             .get(&discovery_url)
