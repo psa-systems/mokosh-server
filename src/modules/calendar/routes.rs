@@ -64,8 +64,9 @@ pub fn calendar_routes(service: CalendarService) -> Router {
 /// `GET /api/v1/calendar/events?from=<rfc3339>&to=<rfc3339>`
 async fn list_events(
     RequireAuth(_user): RequireAuth,
-    Query(_filter): Query<CalendarEventFilter>,
+    Query(filter): Query<CalendarEventFilter>,
 ) -> AppResult<Json<Vec<CalendarEvent>>> {
+    filter.validate()?;
     Ok(Json(Vec::new()))
 }
 

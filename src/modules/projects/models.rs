@@ -86,6 +86,7 @@ pub struct UpdateProjectRequest {
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct ProjectFilter {
     pub company_id: Option<Uuid>,
+    #[validate(length(max = 100))]
     pub status: Option<String>,
     pub project_manager_id: Option<Uuid>,
 }

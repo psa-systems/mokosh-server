@@ -90,8 +90,11 @@ pub struct UpdateKbArticleRequest {
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct KbArticleFilter {
     pub category_id: Option<Uuid>,
+    #[validate(length(max = 100))]
     pub status: Option<String>,
+    #[validate(length(max = 100))]
     pub visibility: Option<String>,
+    #[validate(length(max = 200))]
     pub q: Option<String>,
 }
 

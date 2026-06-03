@@ -79,6 +79,7 @@ pub struct UpdateAppointmentRequest {
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct AppointmentFilter {
     pub user_id: Option<Uuid>,
+    #[validate(length(max = 100))]
     pub appointment_type: Option<String>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
@@ -149,6 +150,7 @@ pub struct CreateTimeOffRequest {
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct TimeOffFilter {
     pub user_id: Option<Uuid>,
+    #[validate(length(max = 100))]
     pub status: Option<String>,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,

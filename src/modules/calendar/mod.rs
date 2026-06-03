@@ -37,7 +37,7 @@ pub struct CalendarEvent {
 
 /// Filter for the list endpoint. Both bounds are optional; an unbounded
 /// request returns every event the tenant has access to.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, validator::Validate)]
 pub struct CalendarEventFilter {
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,

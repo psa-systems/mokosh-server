@@ -54,6 +54,7 @@ pub struct AssetResponse {
 pub struct AssetFilter {
     pub company_id: Option<Uuid>,
     pub asset_type_id: Option<Uuid>,
+    #[validate(length(max = 100))]
     pub status: Option<String>,
 }
 

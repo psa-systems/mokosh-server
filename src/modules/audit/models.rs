@@ -22,7 +22,9 @@ pub struct AuditLogEntryResponse {
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct AuditLogFilter {
     pub user_id: Option<Uuid>,
+    #[validate(length(max = 100))]
     pub entity_type: Option<String>,
+    #[validate(length(max = 100))]
     pub action: Option<String>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
