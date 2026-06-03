@@ -8,11 +8,12 @@ use sqlx::PgPool;
 async fn list_tenants_returns_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
-    common::login(&app, &email, &password).await;
+    let token = common::login(&app, &email, &password).await;
 
     let resp = app
         .client
         .get(app.url("/api/v1/tenants"))
+        .bearer_auth(&token)
         .send()
         .await
         .expect("send list tenants");

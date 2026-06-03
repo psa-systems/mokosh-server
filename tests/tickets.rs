@@ -32,7 +32,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = seed_company(&pool).await;
     let app = common::boot(pool).await;
-    common::login(&app, &email, &password).await;
+    let token = common::login(&app, &email, &password).await;
 
     // CREATE
     let create_body = serde_json::json!({
@@ -43,6 +43,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let create_resp = app
         .client
         .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
         .json(&create_body)
         .send()
         .await
@@ -63,6 +64,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let list_resp = app
         .client
         .get(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
         .send()
         .await
         .expect("send list tickets");
@@ -78,6 +80,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let get_resp = app
         .client
         .get(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
         .send()
         .await
         .expect("send get ticket");
@@ -89,6 +92,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let update_resp = app
         .client
         .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
         .json(&serde_json::json!({ "title": "Server is now smouldering" }))
         .send()
         .await
@@ -105,6 +109,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let note_resp = app
         .client
         .post(app.url(&format!("/api/v1/tickets/{ticket_id}/notes")))
+        .bearer_auth(&token)
         .json(&serde_json::json!({ "content": "Operator on-site, found wet wires." }))
         .send()
         .await

@@ -1,9 +1,13 @@
 //! Shared integration-test harness.
 //!
 //! `boot(pool)` spins the real PSA router up on a per-test TCP socket and
-//! returns a `TestApp` with a cookie-aware reqwest client. The SSO
-//! subsystem is intentionally NOT mounted: tests cover the legacy
-//! HS256-cookie auth path that 99% of PSA endpoints still go through.
+//! returns a `TestApp` with a reqwest client and (after `login`) a Bearer
+//! access token. The SSO subsystem is intentionally NOT mounted: tests
+//! cover the legacy HS256 path that 99% of PSA endpoints still go through.
+//! The legacy `AuthMiddleware` reads `Authorization: Bearer <token>`
+//! (`src/modules/auth/middleware.rs:123-126`), so tests authenticate by
+//! pulling `access_token` out of the login JSON response and attaching
+//! it via `.bearer_auth()` on subsequent requests.
 //!
 //! Each #[sqlx::test] gets a fresh database with the PSA migrations
 //! pre-applied. The `seed_admin` helper inserts a super_admin user under
@@ -28,8 +32,8 @@ pub const DEFAULT_TENANT_ID: Uuid = Uuid::from_u128(1);
 pub struct TestApp {
     /// `http://127.0.0.1:<random>` - the per-test base URL.
     pub base: String,
-    /// reqwest client with a cookie jar so `Set-Cookie` from `/login`
-    /// carries forward into subsequent requests automatically.
+    /// Plain reqwest client. Tests attach the bearer token themselves
+    /// via `.bearer_auth(&token)` per request.
     pub client: reqwest::Client,
     /// Per-test DB pool. Tests use it to seed fixtures or assert state.
     pub pool: PgPool,
@@ -65,7 +69,7 @@ pub async fn boot(pool: PgPool) -> TestApp {
         "http://localhost".into(),
         vec!["http://localhost".into()],
         Vec::new(),
-        false, // cookie_secure: false so the test client accepts cookies over HTTP
+        false, // cookie_secure: irrelevant for bearer-token tests
         None,  // at_jwt verifier disabled in tests
         None,  // bunyip RS verifier disabled in tests
         mailer,
@@ -87,7 +91,6 @@ pub async fn boot(pool: PgPool) -> TestApp {
     });
 
     let client = reqwest::Client::builder()
-        .cookie_store(true)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build reqwest client");
@@ -128,13 +131,26 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     (user_id, email, password)
 }
 
-/// Drive `POST /api/v1/auth/login`. On success the cookie jar inside
-/// `app.client` is populated, so subsequent calls are authenticated.
-pub async fn login(app: &TestApp, email: &str, password: &str) -> reqwest::Response {
-    app.client
+/// Drive `POST /api/v1/auth/login` and return the `access_token` the
+/// caller should attach as `Authorization: Bearer ...` on subsequent
+/// requests. Panics on a non-2xx login because tests that get this far
+/// already seeded a valid admin.
+pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
+    let resp = app
+        .client
         .post(app.url("/api/v1/auth/login"))
         .json(&serde_json::json!({ "email": email, "password": password }))
         .send()
         .await
-        .expect("send /login request")
+        .expect("send /login request");
+    assert!(
+        resp.status().is_success(),
+        "login expected 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("/login JSON body");
+    body["access_token"]
+        .as_str()
+        .expect("login response has access_token")
+        .to_string()
 }

@@ -11,13 +11,14 @@ use sqlx::PgPool;
 async fn company_crud_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
-    common::login(&app, &email, &password).await;
+    let token = common::login(&app, &email, &password).await;
 
     // CREATE
     let create_body = serde_json::json!({ "name": "Acme Co" });
     let create_resp = app
         .client
         .post(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(&token)
         .json(&create_body)
         .send()
         .await
@@ -37,6 +38,7 @@ async fn company_crud_happy_path(pool: PgPool) {
     let list_resp = app
         .client
         .get(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(&token)
         .send()
         .await
         .expect("send list companies");
@@ -52,6 +54,7 @@ async fn company_crud_happy_path(pool: PgPool) {
     let get_resp = app
         .client
         .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
         .send()
         .await
         .expect("send get company");
@@ -63,6 +66,7 @@ async fn company_crud_happy_path(pool: PgPool) {
     let delete_resp = app
         .client
         .delete(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
         .send()
         .await
         .expect("send delete company");
