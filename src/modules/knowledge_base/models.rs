@@ -94,6 +94,7 @@ pub struct KbArticleFilter {
     pub status: Option<String>,
     #[validate(length(max = 100))]
     pub visibility: Option<String>,
+    /// Free-text search; capped to 200 chars to keep ILIKE patterns sane.
     #[validate(length(max = 200))]
     pub q: Option<String>,
 }
