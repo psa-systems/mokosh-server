@@ -107,8 +107,8 @@ pub async fn boot(pool: PgPool) -> TestApp {
 pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     let email = "test-admin@example.com".to_string();
     let password = "test-password-12345".to_string();
-    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
-        .expect("hash test admin password");
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password(&password).expect("hash test admin password");
     let user_id = Uuid::new_v4();
 
     sqlx::query(
