@@ -30,7 +30,9 @@ pub struct ContractResponse {
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct ContractFilter {
     pub company_id: Option<Uuid>,
+    #[validate(length(max = 100))]
     pub contract_type: Option<String>,
+    #[validate(length(max = 100))]
     pub status: Option<String>,
 }
 
