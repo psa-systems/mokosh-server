@@ -29,6 +29,13 @@ impl Database {
         Ok(Self { pool })
     }
 
+    /// Wrap an existing `PgPool`. Used by the integration-test harness
+    /// (`tests/common/`) where `#[sqlx::test]` provisions the pool against
+    /// a per-test database.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     /// Get a reference to the connection pool
     pub fn pool(&self) -> &PgPool {
         &self.pool

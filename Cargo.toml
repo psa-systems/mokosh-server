@@ -182,6 +182,14 @@ google-oauth-flow = { path = "crates/google-oauth-flow" }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+# Integration-test HTTP client. Tests pull the bearer token out of the
+# login JSON body and attach it via `.bearer_auth(&token)` on each call,
+# so no cookie jar is required (the legacy AuthMiddleware authenticates
+# from `Authorization: Bearer ...`, not from a cookie).
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# Drive #[sqlx::test] from this crate's test binaries. The macro reads
+# DATABASE_URL and provisions a fresh database per test invocation.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
 
 [profile.release]
 lto = true

@@ -1,6 +1,7 @@
 ---
 
-# Validate code on every push and pull request: fmt, clippy, compile, tests.
+# Validate code on every push and pull request: fmt, clippy, compile,
+# unit tests, integration tests.
 name: Check
 
 on:
@@ -12,7 +13,8 @@ on:
       - main
 
 # sqlx compile-time query checks read the committed `.sqlx/` offline data
-# instead of connecting to a database.
+# instead of connecting to a database. Runtime sqlx calls in the
+# integration tests still hit the live Postgres service below.
 env:
   SQLX_OFFLINE: "true"
 
@@ -20,6 +22,27 @@ jobs:
   check:
     name: fmt + clippy + compile + tests
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+
+    # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
+    # fresh database per invocation against the URL in DATABASE_URL, so
+    # this single instance fans out to all integration tests.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
     steps:
       - name: Clone the repository
@@ -41,3 +64,6 @@ jobs:
 
       - name: Unit tests
         run: cargo test --lib
+
+      - name: Integration tests
+        run: cargo test --test auth --test contacts --test tenants --test tickets
