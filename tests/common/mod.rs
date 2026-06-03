@@ -26,6 +26,11 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 /// Default tenant the PSA seed migration always inserts.
+///
+/// `#[allow(dead_code)]` because each integration-test binary compiles
+/// its own copy of `common::` and clippy's per-binary dead-code analysis
+/// fires when a binary does not happen to reference this constant.
+#[allow(dead_code)]
 pub const DEFAULT_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 /// Handle a test holds while exercising the API.
@@ -35,7 +40,12 @@ pub struct TestApp {
     /// Plain reqwest client. Tests attach the bearer token themselves
     /// via `.bearer_auth(&token)` per request.
     pub client: reqwest::Client,
-    /// Per-test DB pool. Tests use it to seed fixtures or assert state.
+    /// Per-test DB pool, kept on the handle so future tests can assert
+    /// post-mutation state directly. Clippy runs dead-code analysis per
+    /// integration-test binary and not every test reads `app.pool`
+    /// today, so silence the per-binary `dead_code` warning rather
+    /// than drop the field.
+    #[allow(dead_code)]
     pub pool: PgPool,
 }
 
