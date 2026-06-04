@@ -1000,17 +1000,33 @@ impl AuthService {
         email: &str,
         role: UserRole,
     ) -> AppResult<User> {
+        // `users.first_name` and `users.last_name` are NOT NULL. Bunyip's
+        // at+jwt deliberately doesn't carry name claims (RFC 9068), and
+        // /oauth2/userinfo only resolves `email`, so on first JIT insert
+        // we have nothing better to seed with. Derive a placeholder from
+        // the email local-part so the row satisfies the schema; the user
+        // can edit their real name from Settings whenever they like, and
+        // a later refresh of userinfo (or an explicit profile sync) can
+        // overwrite this default.
+        let (default_first, default_last) = synthetic_name_from_email(email);
         sqlx::query(
             r#"
-            INSERT INTO users (id, tenant_id, email, role, status, email_verified_at, timezone)
-            VALUES ($1, $2, $3, $4, 'active', NOW(), 'UTC')
-            ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, updated_at = NOW()
+            INSERT INTO users (
+                id, tenant_id, email, role, status, email_verified_at, timezone,
+                first_name, last_name
+            )
+            VALUES ($1, $2, $3, $4, 'active', NOW(), 'UTC', $5, $6)
+            ON CONFLICT (id) DO UPDATE SET
+                email = EXCLUDED.email,
+                updated_at = NOW()
             "#,
         )
         .bind(sub)
         .bind(tenant_id)
         .bind(email)
         .bind(role.as_str())
+        .bind(&default_first)
+        .bind(&default_last)
         .execute(self.db.pool())
         .await?;
         self.get_user_by_id(sub).await
@@ -1325,6 +1341,37 @@ fn parse_user_bound_token(token: &str) -> Option<(Uuid, &str)> {
 fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
     let email = email.to_ascii_lowercase();
     allowlist.iter().any(|e| e == &email)
+}
+
+/// Build a placeholder `(first_name, last_name)` from an email for JIT
+/// inserts. The OIDC at+jwt has no name claims so the local row needs a
+/// default for the NOT NULL schema columns. Splits the local-part on
+/// `.`, `_`, or `-` and title-cases the first two segments; the user is
+/// expected to overwrite this later from Settings.
+///
+/// `(first, last)` falls back to `("User", "")` when the email is
+/// shaped like `…@unresolved.invalid` or otherwise has no usable local
+/// part. Empty strings are still valid VARCHAR values for NOT NULL
+/// columns, so the insert always succeeds.
+#[cfg(feature = "server")]
+fn synthetic_name_from_email(email: &str) -> (String, String) {
+    let local = email.split_once('@').map(|(l, _)| l).unwrap_or(email);
+    let parts: Vec<&str> = local
+        .split(['.', '_', '-'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let titlecase = |s: &str| {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    };
+    match parts.as_slice() {
+        [] => ("User".to_string(), String::new()),
+        [one] => (titlecase(one), String::new()),
+        [one, two, ..] => (titlecase(one), titlecase(two)),
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
