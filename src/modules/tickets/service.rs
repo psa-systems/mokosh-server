@@ -734,10 +734,15 @@ impl TicketService {
             }
         };
 
-        // Get SLA targets for this priority
+        // Get SLA targets for this priority. The columns are declared
+        // DECIMAL(10, 2); cast to float8 in SQL so sqlx can decode them
+        // into `Option<f64>` without a column-type mismatch (the test
+        // harness in `tests/tickets.rs` surfaced this as
+        // `ColumnDecode { ... Rust type Option<f64> is not compatible
+        // with SQL type NUMERIC }`).
         let targets = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
             r#"
-            SELECT first_response_hours, resolution_hours
+            SELECT first_response_hours::float8, resolution_hours::float8
             FROM sla_targets
             WHERE sla_policy_id = $1 AND priority_id = $2
             "#,

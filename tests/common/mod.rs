@@ -26,6 +26,11 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 /// Default tenant the PSA seed migration always inserts.
+///
+/// `#[allow(dead_code)]` because each integration-test binary compiles
+/// its own copy of `common::` and clippy's per-binary dead-code analysis
+/// fires when a binary does not happen to reference this constant.
+#[allow(dead_code)]
 pub const DEFAULT_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 /// Handle a test holds while exercising the API.
@@ -35,7 +40,12 @@ pub struct TestApp {
     /// Plain reqwest client. Tests attach the bearer token themselves
     /// via `.bearer_auth(&token)` per request.
     pub client: reqwest::Client,
-    /// Per-test DB pool. Tests use it to seed fixtures or assert state.
+    /// Per-test DB pool, kept on the handle so future tests can assert
+    /// post-mutation state directly. Clippy runs dead-code analysis per
+    /// integration-test binary and not every test reads `app.pool`
+    /// today, so silence the per-binary `dead_code` warning rather
+    /// than drop the field.
+    #[allow(dead_code)]
     pub pool: PgPool,
 }
 
@@ -47,6 +57,19 @@ impl TestApp {
 
 /// Bring up the API against `pool` on a random localhost port.
 pub async fn boot(pool: PgPool) -> TestApp {
+    // Route the server's tracing events to libtest's per-thread capture so
+    // a failing test surfaces the real cause in its panic output (e.g. the
+    // sqlx error swallowed by `AppError::Database("Database operation
+    // failed")` in `src/utils/error.rs`). `try_init` because concurrent
+    // tests in the same binary share the global subscriber.
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error,mokosh_server=info")),
+        )
+        .try_init();
+
     let db = Database::from_pool(pool.clone());
 
     // Stub Google OAuth client - tests never drive the Google flow.
@@ -107,8 +130,8 @@ pub async fn boot(pool: PgPool) -> TestApp {
 pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     let email = "test-admin@example.com".to_string();
     let password = "test-password-12345".to_string();
-    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
-        .expect("hash test admin password");
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password(&password).expect("hash test admin password");
     let user_id = Uuid::new_v4();
 
     sqlx::query(
