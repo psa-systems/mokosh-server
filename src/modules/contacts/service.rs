@@ -583,7 +583,16 @@ impl ContactService {
         &self,
         tenant_id: Uuid,
         company_id: Uuid,
-    ) -> AppResult<Vec<Contact>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<Contact>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM contacts WHERE tenant_id = $1 AND company_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, ContactRow>(
             r#"
             SELECT id, tenant_id, company_id, first_name, last_name, email,
@@ -594,14 +603,17 @@ impl ContactService {
             FROM contacts
             WHERE tenant_id = $1 AND company_id = $2
             ORDER BY contact_type, last_name
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id)
         .bind(company_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Update contact
@@ -868,7 +880,16 @@ impl ContactService {
         &self,
         tenant_id: Uuid,
         company_id: Uuid,
-    ) -> AppResult<Vec<Site>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<Site>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sites WHERE tenant_id = $1 AND company_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, SiteRow>(
             r#"
             SELECT id, tenant_id, company_id, name,
@@ -878,14 +899,17 @@ impl ContactService {
             FROM sites
             WHERE tenant_id = $1 AND company_id = $2
             ORDER BY is_primary DESC, name
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id)
         .bind(company_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Delete site

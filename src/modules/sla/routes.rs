@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post, put},
     Json, Router,
 };
@@ -14,6 +14,7 @@ use super::models::*;
 use super::service::SlaService;
 use crate::modules::auth::{RequireAdmin, RequireAuth};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct SlaRouterState {
@@ -65,8 +66,14 @@ pub fn sla_routes(service: SlaService) -> Router {
 async fn list_policies(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<SlaPolicyResponse>>> {
-    Ok(Json(s.service.list_policies(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<SlaPolicyResponse>>> {
+    let (items, total) = s.service.list_policies(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_policy(
@@ -111,8 +118,14 @@ async fn list_targets(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<SlaTargetResponse>>> {
-    Ok(Json(s.service.list_targets(u.tenant_id, id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<SlaTargetResponse>>> {
+    let (items, total) = s.service.list_targets(u.tenant_id, id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn upsert_target(
@@ -138,8 +151,17 @@ async fn delete_target(
 async fn list_business_hours(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<BusinessHoursResponse>>> {
-    Ok(Json(s.service.list_business_hours(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<BusinessHoursResponse>>> {
+    let (items, total) = s
+        .service
+        .list_business_hours(u.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_business_hours(
@@ -181,8 +203,17 @@ async fn delete_business_hours(
 async fn list_holiday_calendars(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<HolidayCalendarResponse>>> {
-    Ok(Json(s.service.list_holiday_calendars(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<HolidayCalendarResponse>>> {
+    let (items, total) = s
+        .service
+        .list_holiday_calendars(u.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_holiday_calendar(

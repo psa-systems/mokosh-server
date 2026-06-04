@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -19,15 +20,29 @@ impl KbService {
 
     // PMS-81 categories -------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_categories(&self, tenant_id: Uuid) -> AppResult<Vec<KbCategoryResponse>> {
+    pub async fn list_categories(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbCategoryResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM kb_categories WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, CatRow>(
             r#"SELECT id, name, description, parent_id, slug, visibility, sort_order
-               FROM kb_categories WHERE tenant_id = $1 ORDER BY sort_order, name"#,
+               FROM kb_categories WHERE tenant_id = $1
+               ORDER BY sort_order, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -121,7 +136,8 @@ impl KbService {
         &self,
         tenant_id: Uuid,
         filter: &KbArticleFilter,
-    ) -> AppResult<Vec<KbArticleResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
         let mut conditions = vec!["tenant_id = $1".to_string()];
         let mut idx = 2;
         if filter.category_id.is_some() {
@@ -138,28 +154,45 @@ impl KbService {
         }
         if filter.q.is_some() {
             conditions.push(format!("(title ILIKE ${idx} OR content ILIKE ${idx})"));
+            idx += 1;
         }
         let where_clause = conditions.join(" AND ");
+        let limit_placeholder = idx;
+        let offset_placeholder = idx + 1;
         let query = format!(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
                       author_id, view_count, helpful_count, tags, created_at, updated_at
-               FROM kb_articles WHERE {where_clause} ORDER BY updated_at DESC"#
+               FROM kb_articles WHERE {where_clause}
+               ORDER BY updated_at DESC
+               LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
         );
+        let count_query = format!("SELECT COUNT(*) FROM kb_articles WHERE {where_clause}");
         let mut q = sqlx::query_as::<_, ArticleRow>(&query).bind(tenant_id);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
         if let Some(v) = filter.category_id {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = &filter.status {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = &filter.visibility {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = &filter.q {
-            q = q.bind(format!("%{v}%"));
+            let pat = format!("%{v}%");
+            q = q.bind(pat.clone());
+            cq = cq.bind(pat);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let rows = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.pool())
+            .await?;
+        let total = cq.fetch_one(self.db.pool()).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -310,7 +343,8 @@ impl KbService {
         &self,
         tenant_id: Uuid,
         article_id: Uuid,
-    ) -> AppResult<Vec<KbArticleVersionResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbArticleVersionResponse>, u64)> {
         // Verify article belongs to tenant.
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
@@ -322,32 +356,56 @@ impl KbService {
         if !exists {
             return Err(AppError::NotFound("KbArticle".to_string()));
         }
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM kb_article_versions WHERE article_id = $1")
+                .bind(article_id)
+                .fetch_one(self.db.pool())
+                .await?;
         let rows = sqlx::query_as::<_, VersionRow>(
             r#"SELECT id, article_id, version_number, title, content, edited_by_id, created_at
                FROM kb_article_versions WHERE article_id = $1
-               ORDER BY version_number DESC"#,
+               ORDER BY version_number DESC
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(article_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     // PMS-84 portal-visible helper -------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_portal_articles(&self, tenant_id: Uuid) -> AppResult<Vec<KbArticleResponse>> {
+    pub async fn list_portal_articles(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM kb_articles
+               WHERE tenant_id = $1 AND status = 'published'
+                 AND visibility IN ('public', 'client_specific')"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
                       author_id, view_count, helpful_count, tags, created_at, updated_at
                FROM kb_articles
                WHERE tenant_id = $1 AND status = 'published'
                  AND visibility IN ('public', 'client_specific')
-               ORDER BY updated_at DESC"#,
+               ORDER BY updated_at DESC
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 }
 

@@ -14,6 +14,7 @@ use super::models::*;
 use super::service::KbService;
 use crate::modules::auth::{RequireAuth, RequireManager};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct KbRouterState {
@@ -47,8 +48,14 @@ pub fn kb_routes(service: KbService) -> Router {
 async fn list_categories(
     State(s): State<KbRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<KbCategoryResponse>>> {
-    Ok(Json(s.service.list_categories(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<KbCategoryResponse>>> {
+    let (items, total) = s.service.list_categories(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_category(
@@ -87,9 +94,18 @@ async fn list_articles(
     State(s): State<KbRouterState>,
     RequireAuth(u): RequireAuth,
     Query(f): Query<KbArticleFilter>,
-) -> AppResult<Json<Vec<KbArticleResponse>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
     f.validate()?;
-    Ok(Json(s.service.list_articles(u.tenant_id, &f).await?))
+    let (items, total) = s
+        .service
+        .list_articles(u.tenant_id, &f, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_article(
@@ -138,15 +154,31 @@ async fn list_article_versions(
     State(s): State<KbRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<KbArticleVersionResponse>>> {
-    Ok(Json(
-        s.service.list_article_versions(u.tenant_id, id).await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<KbArticleVersionResponse>>> {
+    let (items, total) = s
+        .service
+        .list_article_versions(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn list_portal_articles(
     State(s): State<KbRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<KbArticleResponse>>> {
-    Ok(Json(s.service.list_portal_articles(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
+    let (items, total) = s
+        .service
+        .list_portal_articles(u.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }

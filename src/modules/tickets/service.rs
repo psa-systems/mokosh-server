@@ -752,7 +752,16 @@ impl TicketService {
         &self,
         tenant_id: Uuid,
         ticket_id: Uuid,
-    ) -> AppResult<Vec<TicketNote>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketNote>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ticket_notes WHERE tenant_id = $1 AND ticket_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, TicketNoteRow>(
             r#"
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
@@ -762,14 +771,17 @@ impl TicketService {
             LEFT JOIN users u ON n.created_by_id = u.id
             WHERE n.tenant_id = $1 AND n.ticket_id = $2
             ORDER BY n.created_at DESC
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id)
         .bind(ticket_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Calculate SLA due dates for a ticket
@@ -838,74 +850,127 @@ impl TicketService {
 
     /// Get ticket statuses for tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_statuses(&self, tenant_id: Uuid) -> AppResult<Vec<TicketStatus>> {
+    pub async fn get_statuses(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketStatus>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, TicketStatusRow>(
             r#"
             SELECT id, tenant_id, name, color, is_closed, is_default, sort_order
             FROM ticket_statuses
             WHERE tenant_id = $1
             ORDER BY sort_order
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Get ticket priorities for tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_priorities(&self, tenant_id: Uuid) -> AppResult<Vec<TicketPriority>> {
+    pub async fn get_priorities(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketPriority>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ticket_priorities WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, TicketPriorityRow>(
             r#"
             SELECT id, tenant_id, name, color, icon, sla_multiplier, sort_order, is_default
             FROM ticket_priorities
             WHERE tenant_id = $1
             ORDER BY sort_order
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Get ticket queues for tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_queues(&self, tenant_id: Uuid) -> AppResult<Vec<TicketQueue>> {
+    pub async fn get_queues(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketQueue>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ticket_queues WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, TicketQueueRow>(
             r#"
             SELECT id, tenant_id, name, description, color, icon, is_default, sort_order
             FROM ticket_queues
             WHERE tenant_id = $1
             ORDER BY sort_order
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Get ticket types for tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_types(&self, tenant_id: Uuid) -> AppResult<Vec<TicketType>> {
+    pub async fn get_types(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketType>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ticket_types WHERE tenant_id = $1 AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, TicketTypeRow>(
             r#"
             SELECT id, tenant_id, name, description, icon, is_active, sort_order
             FROM ticket_types
             WHERE tenant_id = $1 AND is_active = TRUE
             ORDER BY sort_order
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Create a portal-originated ticket. Used by `POST

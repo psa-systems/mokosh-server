@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -28,15 +29,28 @@ impl AssetsService {
 
     // PMS-73 asset types ------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_asset_types(&self, tenant_id: Uuid) -> AppResult<Vec<AssetTypeResponse>> {
+    pub async fn list_asset_types(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<AssetTypeResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM asset_types WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, AssetTypeRow>(
             r#"SELECT id, name, icon, parent_type_id, is_active
-               FROM asset_types WHERE tenant_id = $1 ORDER BY name"#,
+               FROM asset_types WHERE tenant_id = $1 ORDER BY name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -120,7 +134,8 @@ impl AssetsService {
         &self,
         tenant_id: Uuid,
         filter: &AssetFilter,
-    ) -> AppResult<Vec<AssetResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<AssetResponse>, u64)> {
         let mut conditions = vec!["tenant_id = $1".to_string()];
         let mut idx = 2;
         if filter.company_id.is_some() {
@@ -133,13 +148,31 @@ impl AssetsService {
         }
         if filter.status.is_some() {
             conditions.push(format!("status = ${idx}"));
+            idx += 1;
         }
         let where_clause = conditions.join(" AND ");
+
+        let count_query = format!("SELECT COUNT(*) FROM assets WHERE {where_clause}");
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+        if let Some(v) = filter.company_id {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.asset_type_id {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.status {
+            cq = cq.bind(v);
+        }
+        let total: i64 = cq.fetch_one(self.db.pool()).await?;
+
         let query = format!(
             r#"SELECT id, asset_tag, name, asset_type_id, company_id, site_id, contact_id,
                       status, manufacturer, model, serial_number, purchase_date,
                       purchase_price, warranty_expiry, end_of_life, created_at, updated_at
-               FROM assets WHERE {where_clause} ORDER BY name"#
+               FROM assets WHERE {where_clause} ORDER BY name
+               LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
+            limit_idx = idx,
+            offset_idx = idx + 1,
         );
         let mut q = sqlx::query_as::<_, AssetRow>(&query).bind(tenant_id);
         if let Some(v) = filter.company_id {
@@ -151,8 +184,11 @@ impl AssetsService {
         if let Some(v) = &filter.status {
             q = q.bind(v);
         }
+        q = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64);
         let rows = q.fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -305,17 +341,30 @@ impl AssetsService {
         &self,
         tenant_id: Uuid,
         asset_id: Uuid,
-    ) -> AppResult<Vec<AssetRelationshipResponse>> {
-        let rows = sqlx::query_as::<_, RelRow>(
-            r#"SELECT id, parent_asset_id, child_asset_id, relationship_type
-               FROM asset_relationships
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<AssetRelationshipResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM asset_relationships
                WHERE tenant_id = $1 AND (parent_asset_id = $2 OR child_asset_id = $2)"#,
         )
         .bind(tenant_id)
         .bind(asset_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, RelRow>(
+            r#"SELECT id, parent_asset_id, child_asset_id, relationship_type
+               FROM asset_relationships
+               WHERE tenant_id = $1 AND (parent_asset_id = $2 OR child_asset_id = $2)
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(asset_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -366,17 +415,30 @@ impl AssetsService {
         &self,
         tenant_id: Uuid,
         asset_id: Uuid,
-    ) -> AppResult<Vec<ConfigurationItemResponse>> {
-        let rows = sqlx::query_as::<_, ConfigItemRow>(
-            r#"SELECT id, asset_id, name, category, value_encrypted, notes, created_at
-               FROM configuration_items WHERE tenant_id = $1 AND asset_id = $2
-               ORDER BY name"#,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ConfigurationItemResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM configuration_items WHERE tenant_id = $1 AND asset_id = $2",
         )
         .bind(tenant_id)
         .bind(asset_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, ConfigItemRow>(
+            r#"SELECT id, asset_id, name, category, value_encrypted, notes, created_at
+               FROM configuration_items WHERE tenant_id = $1 AND asset_id = $2
+               ORDER BY name
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(asset_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        rows.into_iter()
+        let decrypted: Vec<ConfigurationItemResponse> = rows
+            .into_iter()
             .map(|r| {
                 let value =
                     crate::utils::crypto::decrypt(&r.value_encrypted, &self.encryption_key)?;
@@ -390,7 +452,8 @@ impl AssetsService {
                     created_at: r.created_at,
                 })
             })
-            .collect()
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok((decrypted, total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -448,16 +511,28 @@ impl AssetsService {
         tenant_id: Uuid,
         asset_id: Uuid,
         performer: Uuid,
-    ) -> AppResult<Vec<CredentialResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<CredentialResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credential_vault WHERE tenant_id = $1 AND asset_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(asset_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, CredRow>(
             r#"SELECT id, name, company_id, asset_id, credential_type,
                       username_encrypted, password_encrypted, url, notes_encrypted,
                       last_rotated, created_at
                FROM credential_vault WHERE tenant_id = $1 AND asset_id = $2
-               ORDER BY name"#,
+               ORDER BY name
+               LIMIT $3 OFFSET $4"#,
         )
         .bind(tenant_id)
         .bind(asset_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
@@ -473,7 +548,8 @@ impl AssetsService {
         .execute(self.db.pool())
         .await?;
 
-        rows.into_iter()
+        let decrypted: Vec<CredentialResponse> = rows
+            .into_iter()
             .map(|r| {
                 let username =
                     crate::utils::crypto::decrypt(&r.username_encrypted, &self.encryption_key)?;
@@ -497,7 +573,8 @@ impl AssetsService {
                     created_at: r.created_at,
                 })
             })
-            .collect()
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok((decrypted, total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -588,17 +665,29 @@ impl AssetsService {
         &self,
         tenant_id: Uuid,
         asset_id: Uuid,
-    ) -> AppResult<Vec<AssetAuditLogResponse>> {
-        let rows = sqlx::query_as::<_, AuditRow>(
-            r#"SELECT id, asset_id, action, changes, performed_by_id, performed_at
-               FROM asset_audit_log WHERE tenant_id = $1 AND asset_id = $2
-               ORDER BY performed_at DESC LIMIT 500"#,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<AssetAuditLogResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM asset_audit_log WHERE tenant_id = $1 AND asset_id = $2",
         )
         .bind(tenant_id)
         .bind(asset_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, AuditRow>(
+            r#"SELECT id, asset_id, action, changes, performed_by_id, performed_at
+               FROM asset_audit_log WHERE tenant_id = $1 AND asset_id = $2
+               ORDER BY performed_at DESC
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(asset_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 }
 

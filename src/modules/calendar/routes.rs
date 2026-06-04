@@ -15,6 +15,7 @@ use super::service::CalendarService;
 use super::{CalendarEvent, CalendarEventFilter};
 use crate::modules::auth::{RequireAuth, RequireManager};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct CalendarRouterState {
@@ -65,18 +66,32 @@ pub fn calendar_routes(service: CalendarService) -> Router {
 async fn list_events(
     RequireAuth(_user): RequireAuth,
     Query(filter): Query<CalendarEventFilter>,
-) -> AppResult<Json<Vec<CalendarEvent>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<CalendarEvent>>> {
     filter.validate()?;
-    Ok(Json(Vec::new()))
+    Ok(Json(PaginatedResponse::from_params(
+        Vec::new(),
+        &pagination,
+        0,
+    )))
 }
 
 async fn list_appointments(
     State(s): State<CalendarRouterState>,
     RequireAuth(u): RequireAuth,
     Query(f): Query<AppointmentFilter>,
-) -> AppResult<Json<Vec<AppointmentResponse>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<AppointmentResponse>>> {
     f.validate()?;
-    Ok(Json(s.service.list_appointments(u.tenant_id, &f).await?))
+    let (items, total) = s
+        .service
+        .list_appointments(u.tenant_id, &f, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_appointment(
@@ -120,20 +135,26 @@ async fn get_user_availability(
     State(s): State<CalendarRouterState>,
     RequireAuth(u): RequireAuth,
     Path(user_id): Path<Uuid>,
-) -> AppResult<Json<Vec<UserAvailabilityResponse>>> {
-    Ok(Json(
-        s.service
-            .get_user_availability(u.tenant_id, user_id)
-            .await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<UserAvailabilityResponse>>> {
+    let (items, total) = s
+        .service
+        .get_user_availability(u.tenant_id, user_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn replace_user_availability(
     State(s): State<CalendarRouterState>,
     RequireAuth(u): RequireAuth,
     Path(user_id): Path<Uuid>,
+    Query(pagination): Query<PaginationParams>,
     Json(req): Json<ReplaceAvailabilityRequest>,
-) -> AppResult<Json<Vec<UserAvailabilityResponse>>> {
+) -> AppResult<Json<PaginatedResponse<UserAvailabilityResponse>>> {
     // Non-admins can only edit their own availability.
     if !u.role.is_admin() && user_id != u.id {
         return Err(crate::utils::error::AppError::Forbidden(
@@ -143,20 +164,33 @@ async fn replace_user_availability(
     for w in &req.windows {
         w.validate()?;
     }
-    Ok(Json(
-        s.service
-            .replace_user_availability(u.tenant_id, user_id, &req)
-            .await?,
-    ))
+    let (items, total) = s
+        .service
+        .replace_user_availability(u.tenant_id, user_id, &req, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn list_time_off(
     State(s): State<CalendarRouterState>,
     RequireAuth(u): RequireAuth,
     Query(f): Query<TimeOffFilter>,
-) -> AppResult<Json<Vec<TimeOffResponse>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TimeOffResponse>>> {
     f.validate()?;
-    Ok(Json(s.service.list_time_off(u.tenant_id, &f).await?))
+    let (items, total) = s
+        .service
+        .list_time_off(u.tenant_id, &f, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_time_off(
@@ -205,8 +239,17 @@ async fn delete_time_off(
 async fn list_on_call(
     State(s): State<CalendarRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<OnCallScheduleResponse>>> {
-    Ok(Json(s.service.list_on_call_schedules(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<OnCallScheduleResponse>>> {
+    let (items, total) = s
+        .service
+        .list_on_call_schedules(u.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_on_call(

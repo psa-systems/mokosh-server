@@ -195,7 +195,9 @@ async fn dispatch_respects_preferences_and_worker_marks_sent(pool: PgPool) {
         .expect("send inbox");
     assert_eq!(inbox_resp.status(), reqwest::StatusCode::OK);
     let inbox: serde_json::Value = inbox_resp.json().await.expect("inbox JSON");
-    let items = inbox.as_array().expect("inbox returns an array");
+    let items = inbox["data"]
+        .as_array()
+        .expect("inbox returns a paginated data array");
     assert!(
         items
             .iter()

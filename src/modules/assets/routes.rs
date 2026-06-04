@@ -14,6 +14,7 @@ use super::models::*;
 use super::service::AssetsService;
 use crate::modules::auth::{RequireAdmin, RequireAuth};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct AssetsRouterState {
@@ -75,8 +76,14 @@ pub fn assets_routes(service: AssetsService) -> Router {
 async fn list_asset_types(
     State(s): State<AssetsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<AssetTypeResponse>>> {
-    Ok(Json(s.service.list_asset_types(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<AssetTypeResponse>>> {
+    let (items, total) = s.service.list_asset_types(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_asset_type(
@@ -115,9 +122,15 @@ async fn list_assets(
     State(s): State<AssetsRouterState>,
     RequireAuth(u): RequireAuth,
     Query(f): Query<AssetFilter>,
-) -> AppResult<Json<Vec<AssetResponse>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<AssetResponse>>> {
     f.validate()?;
-    Ok(Json(s.service.list_assets(u.tenant_id, &f).await?))
+    let (items, total) = s.service.list_assets(u.tenant_id, &f, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_asset(
@@ -162,10 +175,17 @@ async fn list_asset_relationships(
     State(s): State<AssetsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<AssetRelationshipResponse>>> {
-    Ok(Json(
-        s.service.list_asset_relationships(u.tenant_id, id).await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<AssetRelationshipResponse>>> {
+    let (items, total) = s
+        .service
+        .list_asset_relationships(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_asset_relationship(
@@ -194,10 +214,17 @@ async fn list_configuration_items(
     State(s): State<AssetsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<ConfigurationItemResponse>>> {
-    Ok(Json(
-        s.service.list_configuration_items(u.tenant_id, id).await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ConfigurationItemResponse>>> {
+    let (items, total) = s
+        .service
+        .list_configuration_items(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_configuration_item(
@@ -226,10 +253,17 @@ async fn list_credentials(
     State(s): State<AssetsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<CredentialResponse>>> {
-    Ok(Json(
-        s.service.list_credentials(u.tenant_id, id, u.id).await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<CredentialResponse>>> {
+    let (items, total) = s
+        .service
+        .list_credentials(u.tenant_id, id, u.id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_credential(
@@ -259,6 +293,15 @@ async fn list_asset_audit_log(
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<AssetAuditLogResponse>>> {
-    Ok(Json(s.service.list_asset_audit_log(u.tenant_id, id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<AssetAuditLogResponse>>> {
+    let (items, total) = s
+        .service
+        .list_asset_audit_log(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }

@@ -8,6 +8,7 @@ use crate::db::Database;
 use crate::modules::notifications::render_template;
 use crate::modules::tickets::{CreateTicketRequest, TicketService, TicketSource};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -63,16 +64,30 @@ impl RmmService {
 
     // PMS-102 connections CRUD ------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_connections(&self, tenant_id: Uuid) -> AppResult<Vec<RmmConnectionResponse>> {
+    pub async fn list_connections(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<RmmConnectionResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rmm_connections WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, ConnRow>(
             r#"SELECT id, name, provider, api_url, is_active, sync_interval_minutes,
                       last_sync_at, sync_status, last_error, created_at
-               FROM rmm_connections WHERE tenant_id = $1 ORDER BY name"#,
+               FROM rmm_connections WHERE tenant_id = $1
+               ORDER BY name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -251,29 +266,53 @@ impl RmmService {
         &self,
         tenant_id: Uuid,
         connection_id: Option<Uuid>,
-    ) -> AppResult<Vec<RmmDeviceMappingResponse>> {
-        let rows = if let Some(cid) = connection_id {
-            sqlx::query_as::<_, DevMapRow>(
-                r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
-                          device_name, last_seen, sync_status
-                   FROM rmm_device_mappings WHERE tenant_id = $1 AND rmm_connection_id = $2
-                   ORDER BY device_name"#,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<RmmDeviceMappingResponse>, u64)> {
+        let (total, rows) = if let Some(cid) = connection_id {
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = $1 AND rmm_connection_id = $2",
             )
             .bind(tenant_id)
             .bind(cid)
-            .fetch_all(self.db.pool())
-            .await?
-        } else {
-            sqlx::query_as::<_, DevMapRow>(
+            .fetch_one(self.db.pool())
+            .await?;
+
+            let rows = sqlx::query_as::<_, DevMapRow>(
                 r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
                           device_name, last_seen, sync_status
-                   FROM rmm_device_mappings WHERE tenant_id = $1 ORDER BY device_name"#,
+                   FROM rmm_device_mappings WHERE tenant_id = $1 AND rmm_connection_id = $2
+                   ORDER BY device_name
+                   LIMIT $3 OFFSET $4"#,
             )
             .bind(tenant_id)
+            .bind(cid)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
             .fetch_all(self.db.pool())
-            .await?
+            .await?;
+            (total, rows)
+        } else {
+            let total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = $1")
+                    .bind(tenant_id)
+                    .fetch_one(self.db.pool())
+                    .await?;
+
+            let rows = sqlx::query_as::<_, DevMapRow>(
+                r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
+                          device_name, last_seen, sync_status
+                   FROM rmm_device_mappings WHERE tenant_id = $1
+                   ORDER BY device_name
+                   LIMIT $2 OFFSET $3"#,
+            )
+            .bind(tenant_id)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.pool())
+            .await?;
+            (total, rows)
         };
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -329,29 +368,53 @@ impl RmmService {
         &self,
         tenant_id: Uuid,
         connection_id: Option<Uuid>,
-    ) -> AppResult<Vec<RmmAlertRuleResponse>> {
-        let rows = if let Some(cid) = connection_id {
-            sqlx::query_as::<_, AlertRuleRow>(
-                r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
-                          assign_to_id, queue_id, is_active, ticket_template, suppression_rules
-                   FROM rmm_alert_rules WHERE tenant_id = $1 AND rmm_connection_id = $2
-                   ORDER BY name"#,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<RmmAlertRuleResponse>, u64)> {
+        let (total, rows) = if let Some(cid) = connection_id {
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM rmm_alert_rules WHERE tenant_id = $1 AND rmm_connection_id = $2",
             )
             .bind(tenant_id)
             .bind(cid)
-            .fetch_all(self.db.pool())
-            .await?
-        } else {
-            sqlx::query_as::<_, AlertRuleRow>(
+            .fetch_one(self.db.pool())
+            .await?;
+
+            let rows = sqlx::query_as::<_, AlertRuleRow>(
                 r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
                           assign_to_id, queue_id, is_active, ticket_template, suppression_rules
-                   FROM rmm_alert_rules WHERE tenant_id = $1 ORDER BY name"#,
+                   FROM rmm_alert_rules WHERE tenant_id = $1 AND rmm_connection_id = $2
+                   ORDER BY name
+                   LIMIT $3 OFFSET $4"#,
             )
             .bind(tenant_id)
+            .bind(cid)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
             .fetch_all(self.db.pool())
-            .await?
+            .await?;
+            (total, rows)
+        } else {
+            let total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM rmm_alert_rules WHERE tenant_id = $1")
+                    .bind(tenant_id)
+                    .fetch_one(self.db.pool())
+                    .await?;
+
+            let rows = sqlx::query_as::<_, AlertRuleRow>(
+                r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
+                          assign_to_id, queue_id, is_active, ticket_template, suppression_rules
+                   FROM rmm_alert_rules WHERE tenant_id = $1
+                   ORDER BY name
+                   LIMIT $2 OFFSET $3"#,
+            )
+            .bind(tenant_id)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.pool())
+            .await?;
+            (total, rows)
         };
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

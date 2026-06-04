@@ -57,10 +57,7 @@ async fn list_tenants(
         ));
     }
 
-    let (tenants, total) = state
-        .tenant_service
-        .list_tenants(pagination.page, pagination.per_page())
-        .await?;
+    let (tenants, total) = state.tenant_service.list_tenants(&pagination).await?;
 
     let response = PaginatedResponse::from_params(
         tenants.into_iter().map(TenantResponse::from).collect(),

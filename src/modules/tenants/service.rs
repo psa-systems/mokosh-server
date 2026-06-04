@@ -134,9 +134,10 @@ impl TenantService {
 
     /// List all tenants
     #[tracing::instrument(skip_all)]
-    pub async fn list_tenants(&self, page: u32, per_page: u32) -> AppResult<(Vec<Tenant>, u64)> {
-        let offset = (page.saturating_sub(1)) * per_page;
-
+    pub async fn list_tenants(
+        &self,
+        pagination: &crate::utils::pagination::PaginationParams,
+    ) -> AppResult<(Vec<Tenant>, u64)> {
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
             .fetch_one(self.db.pool())
             .await?;
@@ -151,8 +152,8 @@ impl TenantService {
             LIMIT $1 OFFSET $2
             "#,
         )
-        .bind(per_page as i32)
-        .bind(offset as i32)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 

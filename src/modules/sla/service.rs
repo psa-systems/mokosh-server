@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -21,15 +22,29 @@ impl SlaService {
 
     // PMS-108 policies --------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_policies(&self, tenant_id: Uuid) -> AppResult<Vec<SlaPolicyResponse>> {
+    pub async fn list_policies(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<SlaPolicyResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sla_policies WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, PolicyRow>(
             r#"SELECT id, name, description, business_hours_id, is_default
-               FROM sla_policies WHERE tenant_id = $1 ORDER BY is_default DESC, name"#,
+               FROM sla_policies WHERE tenant_id = $1
+               ORDER BY is_default DESC, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -141,20 +156,34 @@ impl SlaService {
         &self,
         tenant_id: Uuid,
         policy_id: Uuid,
-    ) -> AppResult<Vec<SlaTargetResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<SlaTargetResponse>, u64)> {
         // Tenant scoping via the policy join so a caller cannot list another tenant's targets.
-        let rows = sqlx::query_as::<_, TargetRow>(
-            r#"SELECT t.id, t.sla_policy_id, t.priority_id, t.first_response_hours,
-                      t.resolution_hours, t.operational_hours
-               FROM sla_targets t
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM sla_targets t
                INNER JOIN sla_policies p ON t.sla_policy_id = p.id
                WHERE p.tenant_id = $1 AND p.id = $2"#,
         )
         .bind(tenant_id)
         .bind(policy_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, TargetRow>(
+            r#"SELECT t.id, t.sla_policy_id, t.priority_id, t.first_response_hours,
+                      t.resolution_hours, t.operational_hours
+               FROM sla_targets t
+               INNER JOIN sla_policies p ON t.sla_policy_id = p.id
+               WHERE p.tenant_id = $1 AND p.id = $2
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(policy_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -221,15 +250,26 @@ impl SlaService {
     pub async fn list_business_hours(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<BusinessHoursResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<BusinessHoursResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM business_hours WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, BhRow>(
             r#"SELECT id, name, timezone, schedule, is_default
-               FROM business_hours WHERE tenant_id = $1 ORDER BY is_default DESC, name"#,
+               FROM business_hours WHERE tenant_id = $1
+               ORDER BY is_default DESC, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -320,15 +360,26 @@ impl SlaService {
     pub async fn list_holiday_calendars(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<HolidayCalendarResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<HolidayCalendarResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM holiday_calendars WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, HolidayRow>(
             r#"SELECT id, name, holidays FROM holiday_calendars
-               WHERE tenant_id = $1 ORDER BY name"#,
+               WHERE tenant_id = $1
+               ORDER BY name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

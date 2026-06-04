@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -22,15 +23,26 @@ impl SettingsService {
     pub async fn list_tenant_settings(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<TenantSettingResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TenantSettingResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM tenant_settings WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, SettingRow>(
             r#"SELECT id, category, key, value FROM tenant_settings
-               WHERE tenant_id = $1 ORDER BY category, key"#,
+               WHERE tenant_id = $1
+               ORDER BY category, key
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -82,15 +94,26 @@ impl SettingsService {
     pub async fn list_module_configs(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<ModuleConfigResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ModuleConfigResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM module_config WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, ModCfgRow>(
             r#"SELECT id, module_name, is_enabled, config FROM module_config
-               WHERE tenant_id = $1 ORDER BY module_name"#,
+               WHERE tenant_id = $1
+               ORDER BY module_name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

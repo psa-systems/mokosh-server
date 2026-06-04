@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -24,7 +25,8 @@ impl ContractsService {
         &self,
         tenant_id: Uuid,
         filter: &ContractFilter,
-    ) -> AppResult<Vec<ContractResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ContractResponse>, u64)> {
         let mut conditions = vec!["tenant_id = $1".to_string()];
         let mut idx = 2;
         if filter.company_id.is_some() {
@@ -37,13 +39,32 @@ impl ContractsService {
         }
         if filter.status.is_some() {
             conditions.push(format!("status = ${idx}"));
+            idx += 1;
         }
         let where_clause = conditions.join(" AND ");
+
+        let count_query = format!("SELECT COUNT(*) FROM contracts WHERE {where_clause}");
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+        if let Some(v) = filter.company_id {
+            count_q = count_q.bind(v);
+        }
+        if let Some(v) = &filter.contract_type {
+            count_q = count_q.bind(v);
+        }
+        if let Some(v) = &filter.status {
+            count_q = count_q.bind(v);
+        }
+        let total: i64 = count_q.fetch_one(self.db.pool()).await?;
+
         let query = format!(
             r#"SELECT id, contract_number, name, company_id, contract_type, status,
                       start_date, end_date, auto_renew, billing_cycle, billing_amount,
                       sla_id, signed_date, signed_by_contact_id, notes, created_at, updated_at
-               FROM contracts WHERE {where_clause} ORDER BY start_date DESC"#
+               FROM contracts WHERE {where_clause}
+               ORDER BY start_date DESC
+               LIMIT ${} OFFSET ${}"#,
+            idx,
+            idx + 1
         );
         let mut q = sqlx::query_as::<_, ContractRow>(&query).bind(tenant_id);
         if let Some(v) = filter.company_id {
@@ -55,8 +76,11 @@ impl ContractsService {
         if let Some(v) = &filter.status {
             q = q.bind(v);
         }
+        q = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64);
         let rows = q.fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -175,19 +199,31 @@ impl ContractsService {
         &self,
         tenant_id: Uuid,
         contract_id: Uuid,
-    ) -> AppResult<Vec<ContractItemResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ContractItemResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM contract_items WHERE tenant_id = $1 AND contract_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, ContractItemRow>(
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
                       overage_rate, rollover_enabled, max_rollover_hours, sort_order
                FROM contract_items WHERE tenant_id = $1 AND contract_id = $2
-               ORDER BY sort_order"#,
+               ORDER BY sort_order
+               LIMIT $3 OFFSET $4"#,
         )
         .bind(tenant_id)
         .bind(contract_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -307,31 +343,56 @@ impl ContractsService {
         &self,
         tenant_id: Uuid,
         contract_id: Uuid,
-    ) -> AppResult<Vec<ContractHourBalanceResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ContractHourBalanceResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM contract_hour_balances WHERE tenant_id = $1 AND contract_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, BalanceRow>(
             r#"SELECT id, contract_id, contract_item_id, period_start, period_end,
                       hours_included, hours_used, hours_remaining, rollover_hours
                FROM contract_hour_balances WHERE tenant_id = $1 AND contract_id = $2
-               ORDER BY period_start"#,
+               ORDER BY period_start
+               LIMIT $3 OFFSET $4"#,
         )
         .bind(tenant_id)
         .bind(contract_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     // PMS-69 rate cards -------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_rate_cards(&self, tenant_id: Uuid) -> AppResult<Vec<RateCardResponse>> {
+    pub async fn list_rate_cards(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<RateCardResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rate_cards WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(self.db.pool())
+            .await?;
+
         let rows = sqlx::query_as::<_, RateCardRow>(
             r#"SELECT id, name, description, is_default
-               FROM rate_cards WHERE tenant_id = $1 ORDER BY is_default DESC, name"#,
+               FROM rate_cards WHERE tenant_id = $1
+               ORDER BY is_default DESC, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -423,19 +484,34 @@ impl ContractsService {
         &self,
         tenant_id: Uuid,
         rate_card_id: Uuid,
-    ) -> AppResult<Vec<RateCardItemResponse>> {
-        let rows = sqlx::query_as::<_, RateCardItemRow>(
-            r#"SELECT rci.id, rci.rate_card_id, rci.work_type_id, rci.hourly_rate,
-                      rci.after_hours_rate, rci.emergency_rate
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<RateCardItemResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
                FROM rate_card_items rci
                INNER JOIN rate_cards rc ON rci.rate_card_id = rc.id
                WHERE rc.tenant_id = $1 AND rci.rate_card_id = $2"#,
         )
         .bind(tenant_id)
         .bind(rate_card_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, RateCardItemRow>(
+            r#"SELECT rci.id, rci.rate_card_id, rci.work_type_id, rci.hourly_rate,
+                      rci.after_hours_rate, rci.emergency_rate
+               FROM rate_card_items rci
+               INNER JOIN rate_cards rc ON rci.rate_card_id = rc.id
+               WHERE rc.tenant_id = $1 AND rci.rate_card_id = $2
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(rate_card_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

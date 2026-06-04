@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -14,6 +14,7 @@ use super::models::*;
 use super::service::SettingsService;
 use crate::modules::auth::{RequireAdmin, RequireAuth};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct SettingsRouterState {
@@ -41,8 +42,17 @@ pub fn settings_routes(service: SettingsService) -> Router {
 async fn list_settings(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<TenantSettingResponse>>> {
-    Ok(Json(s.service.list_tenant_settings(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TenantSettingResponse>>> {
+    let (items, total) = s
+        .service
+        .list_tenant_settings(u.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn upsert_setting(
@@ -69,8 +79,17 @@ async fn delete_setting(
 async fn list_module_configs(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<ModuleConfigResponse>>> {
-    Ok(Json(s.service.list_module_configs(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ModuleConfigResponse>>> {
+    let (items, total) = s
+        .service
+        .list_module_configs(u.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn get_module_config(

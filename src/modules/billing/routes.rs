@@ -56,9 +56,17 @@ async fn list_tax_rates(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
-) -> AppResult<Json<Vec<TaxRateResponse>>> {
-    let rates = state.service.list_tax_rates(user.tenant_id).await?;
-    Ok(Json(rates))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TaxRateResponse>>> {
+    let (rates, total) = state
+        .service
+        .list_tax_rates(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        rates,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_tax_rate(
@@ -121,9 +129,17 @@ async fn list_payment_gateways(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
-) -> AppResult<Json<Vec<PaymentGatewayConfigResponse>>> {
-    let gateways = state.service.list_payment_gateways(user.tenant_id).await?;
-    Ok(Json(gateways))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<PaymentGatewayConfigResponse>>> {
+    let (gateways, total) = state
+        .service
+        .list_payment_gateways(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        gateways,
+        &pagination,
+        total,
+    )))
 }
 
 async fn upsert_payment_gateway(

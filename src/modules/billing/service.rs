@@ -240,19 +240,31 @@ impl BillingService {
     /// PMS-41: list all tax rates for the tenant. Includes inactive
     /// ones so admins can see history; filter client-side as needed.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_tax_rates(&self, tenant_id: Uuid) -> AppResult<Vec<TaxRateResponse>> {
+    pub async fn list_tax_rates(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TaxRateResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tax_rates WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(self.db.pool())
+            .await?;
+
         let rows = sqlx::query_as::<_, TaxRateRow>(
             r#"
             SELECT id, name, rate, is_default, is_active
             FROM tax_rates
             WHERE tenant_id = $1
             ORDER BY is_default DESC, name
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// PMS-41: create a tax rate. If `is_default = true`, demote any
@@ -409,20 +421,31 @@ impl BillingService {
     pub async fn list_payment_gateways(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<PaymentGatewayConfigResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<PaymentGatewayConfigResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payment_gateway_configs WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, PaymentGatewayRow>(
             r#"
             SELECT id, provider, is_active, is_test_mode, config_encrypted
             FROM payment_gateway_configs
             WHERE tenant_id = $1
             ORDER BY provider
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        rows.into_iter()
+        let decrypted: Vec<PaymentGatewayConfigResponse> = rows
+            .into_iter()
             .map(|r| {
                 let decrypted =
                     crate::utils::crypto::decrypt(&r.config_encrypted, &self.encryption_key)?;
@@ -437,7 +460,9 @@ impl BillingService {
                     config,
                 })
             })
-            .collect()
+            .collect::<AppResult<Vec<_>>>()?;
+
+        Ok((decrypted, total as u64))
     }
 
     /// PMS-40: upsert a payment gateway config. `(tenant_id, provider)`

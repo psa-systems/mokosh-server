@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -14,6 +14,7 @@ use super::models::*;
 use super::service::NotificationsService;
 use crate::modules::auth::{RequireAdmin, RequireAuth};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct NotificationsRouterState {
@@ -67,8 +68,14 @@ async fn list_channels(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
-) -> AppResult<Json<Vec<NotificationChannelResponse>>> {
-    Ok(Json(s.service.list_channels(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<NotificationChannelResponse>>> {
+    let (items, total) = s.service.list_channels(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_channel(
@@ -93,8 +100,14 @@ async fn delete_channel(
 async fn list_templates(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<NotificationTemplateResponse>>> {
-    Ok(Json(s.service.list_templates(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<NotificationTemplateResponse>>> {
+    let (items, total) = s.service.list_templates(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_template(
@@ -119,10 +132,17 @@ async fn delete_template(
 async fn list_user_prefs(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<UserNotificationPreferenceResponse>>> {
-    Ok(Json(
-        s.service.list_user_preferences(u.tenant_id, u.id).await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<UserNotificationPreferenceResponse>>> {
+    let (items, total) = s
+        .service
+        .list_user_preferences(u.tenant_id, u.id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn upsert_user_pref(
@@ -141,8 +161,14 @@ async fn upsert_user_pref(
 async fn list_inbox(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<NotificationInboxItemResponse>>> {
-    Ok(Json(s.service.list_inbox(u.tenant_id, u.id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<NotificationInboxItemResponse>>> {
+    let (items, total) = s.service.list_inbox(u.tenant_id, u.id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn mark_read(
@@ -156,8 +182,14 @@ async fn mark_read(
 async fn list_rules(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<NotificationRuleResponse>>> {
-    Ok(Json(s.service.list_rules(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<NotificationRuleResponse>>> {
+    let (items, total) = s.service.list_rules(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_rule(

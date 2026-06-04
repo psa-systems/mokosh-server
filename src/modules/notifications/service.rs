@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -42,15 +43,27 @@ impl NotificationsService {
     pub async fn list_channels(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<NotificationChannelResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<NotificationChannelResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM notification_channels WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, ChannelRow>(
             r#"SELECT id, channel_type, name, config_encrypted, is_active, is_default
-               FROM notification_channels WHERE tenant_id = $1 ORDER BY channel_type, name"#,
+               FROM notification_channels WHERE tenant_id = $1
+               ORDER BY channel_type, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        rows.into_iter()
+        let items = rows
+            .into_iter()
             .map(|r| {
                 let plain =
                     crate::utils::crypto::decrypt(&r.config_encrypted, &self.encryption_key)?;
@@ -65,7 +78,8 @@ impl NotificationsService {
                     is_default: r.is_default.unwrap_or(false),
                 })
             })
-            .collect()
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok((items, total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -121,16 +135,26 @@ impl NotificationsService {
     pub async fn list_templates(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<NotificationTemplateResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<NotificationTemplateResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM notification_templates WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, TemplateRow>(
             r#"SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active
                FROM notification_templates WHERE tenant_id = $1
-               ORDER BY event_type, channel_type, name"#,
+               ORDER BY event_type, channel_type, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -181,17 +205,30 @@ impl NotificationsService {
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
-    ) -> AppResult<Vec<UserNotificationPreferenceResponse>> {
-        let rows = sqlx::query_as::<_, PrefRow>(
-            r#"SELECT id, user_id, event_type, channel_types, is_enabled
-               FROM user_notification_preferences
-               WHERE tenant_id = $1 AND user_id = $2 ORDER BY event_type"#,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<UserNotificationPreferenceResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_notification_preferences WHERE tenant_id = $1 AND user_id = $2",
         )
         .bind(tenant_id)
         .bind(user_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, PrefRow>(
+            r#"SELECT id, user_id, event_type, channel_types, is_enabled
+               FROM user_notification_preferences
+               WHERE tenant_id = $1 AND user_id = $2
+               ORDER BY event_type
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -233,18 +270,31 @@ impl NotificationsService {
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
-    ) -> AppResult<Vec<NotificationInboxItemResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<NotificationInboxItemResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM notifications
+               WHERE tenant_id = $1 AND user_id = $2 AND channel_type = 'in_app'"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, InboxRow>(
             r#"SELECT id, channel_type, subject, body, status, sent_at, read_at, created_at
                FROM notifications
                WHERE tenant_id = $1 AND user_id = $2 AND channel_type = 'in_app'
-               ORDER BY created_at DESC LIMIT 200"#,
+               ORDER BY created_at DESC
+               LIMIT $3 OFFSET $4"#,
         )
         .bind(tenant_id)
         .bind(user_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -263,15 +313,29 @@ impl NotificationsService {
 
     // PMS-91 rules CRUD -------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_rules(&self, tenant_id: Uuid) -> AppResult<Vec<NotificationRuleResponse>> {
+    pub async fn list_rules(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<NotificationRuleResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM notification_rules WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, RuleRow>(
             r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
-               FROM notification_rules WHERE tenant_id = $1 ORDER BY event_type, name"#,
+               FROM notification_rules WHERE tenant_id = $1
+               ORDER BY event_type, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

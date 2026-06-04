@@ -137,10 +137,11 @@ async fn get_ticket_notes(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
     Path(ticket_id): Path<Uuid>,
-) -> AppResult<Json<Vec<TicketNoteResponse>>> {
-    let notes = state
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
+    let (notes, total) = state
         .ticket_service
-        .get_ticket_notes(user.tenant_id, ticket_id)
+        .get_ticket_notes(user.tenant_id, ticket_id, &pagination)
         .await?;
 
     let responses: Vec<TicketNoteResponse> = notes
@@ -156,7 +157,11 @@ async fn get_ticket_notes(
         })
         .collect();
 
-    Ok(Json(responses))
+    Ok(Json(PaginatedResponse::from_params(
+        responses,
+        &pagination,
+        total,
+    )))
 }
 
 async fn add_note(
@@ -186,31 +191,63 @@ async fn add_note(
 async fn get_statuses(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<TicketStatus>>> {
-    let statuses = state.ticket_service.get_statuses(user.tenant_id).await?;
-    Ok(Json(statuses))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketStatus>>> {
+    let (statuses, total) = state
+        .ticket_service
+        .get_statuses(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        statuses,
+        &pagination,
+        total,
+    )))
 }
 
 async fn get_priorities(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<TicketPriority>>> {
-    let priorities = state.ticket_service.get_priorities(user.tenant_id).await?;
-    Ok(Json(priorities))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketPriority>>> {
+    let (priorities, total) = state
+        .ticket_service
+        .get_priorities(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        priorities,
+        &pagination,
+        total,
+    )))
 }
 
 async fn get_queues(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<TicketQueue>>> {
-    let queues = state.ticket_service.get_queues(user.tenant_id).await?;
-    Ok(Json(queues))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketQueue>>> {
+    let (queues, total) = state
+        .ticket_service
+        .get_queues(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        queues,
+        &pagination,
+        total,
+    )))
 }
 
 async fn get_types(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<TicketType>>> {
-    let types = state.ticket_service.get_types(user.tenant_id).await?;
-    Ok(Json(types))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketType>>> {
+    let (types, total) = state
+        .ticket_service
+        .get_types(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        types,
+        &pagination,
+        total,
+    )))
 }
