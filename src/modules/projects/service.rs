@@ -212,16 +212,28 @@ impl ProjectsService {
         &self,
         tenant_id: Uuid,
         project_id: Uuid,
-    ) -> AppResult<Vec<ProjectPhaseResponse>> {
-        let rows = sqlx::query_as::<_, PhaseRow>(
-            r#"SELECT id, project_id, name, description, sort_order, start_date, end_date, status
-               FROM project_phases WHERE tenant_id = $1 AND project_id = $2 ORDER BY sort_order"#,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ProjectPhaseResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_phases WHERE tenant_id = $1 AND project_id = $2",
         )
         .bind(tenant_id)
         .bind(project_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, PhaseRow>(
+            r#"SELECT id, project_id, name, description, sort_order, start_date, end_date, status
+               FROM project_phases WHERE tenant_id = $1 AND project_id = $2 ORDER BY sort_order
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -308,15 +320,28 @@ impl ProjectsService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_task_statuses(&self, tenant_id: Uuid) -> AppResult<Vec<TaskStatusResponse>> {
+    pub async fn list_task_statuses(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TaskStatusResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_statuses WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, TaskStatusRow>(
             r#"SELECT id, name, color, is_completed, sort_order
-               FROM task_statuses WHERE tenant_id = $1 ORDER BY sort_order, name"#,
+               FROM task_statuses WHERE tenant_id = $1 ORDER BY sort_order, name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -403,14 +428,30 @@ impl ProjectsService {
         &self,
         tenant_id: Uuid,
         project_id: Uuid,
-    ) -> AppResult<Vec<TaskResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TaskResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE tenant_id = $1 AND project_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
                       priority, assigned_to_id, estimated_hours, actual_hours, start_date,
                       due_date, completed_at, sort_order
-               FROM tasks WHERE tenant_id = $1 AND project_id = $2 ORDER BY sort_order, created_at"#,
-        ).bind(tenant_id).bind(project_id).fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+               FROM tasks WHERE tenant_id = $1 AND project_id = $2 ORDER BY sort_order, created_at
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

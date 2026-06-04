@@ -230,7 +230,8 @@ async fn get_sessions(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
     headers: HeaderMap,
-) -> AppResult<Json<Vec<SessionInfo>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<SessionInfo>>> {
     // Get current session ID from token
     let current_session_id = if let Some(auth_header) = headers.get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
@@ -250,12 +251,16 @@ async fn get_sessions(
         Uuid::nil()
     };
 
-    let sessions = state
+    let (sessions, total) = state
         .auth_service
-        .get_user_sessions(user.id, current_session_id)
+        .get_user_sessions(user.id, current_session_id, &pagination)
         .await?;
 
-    Ok(Json(sessions))
+    Ok(Json(PaginatedResponse::from_params(
+        sessions,
+        &pagination,
+        total,
+    )))
 }
 
 /// Delete a session
@@ -315,12 +320,17 @@ async fn disable_mfa(
 async fn list_api_keys(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<ApiKeyResponse>>> {
-    let keys = state
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ApiKeyResponse>>> {
+    let (keys, total) = state
         .auth_service
-        .list_api_keys(user.tenant_id, user.id)
+        .list_api_keys(user.tenant_id, user.id, &pagination)
         .await?;
-    Ok(Json(keys))
+    Ok(Json(PaginatedResponse::from_params(
+        keys,
+        &pagination,
+        total,
+    )))
 }
 
 /// Mint a new personal API key. The raw key is returned ONCE in the

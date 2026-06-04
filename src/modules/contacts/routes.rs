@@ -149,28 +149,38 @@ async fn get_company_contacts(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
     Path(company_id): Path<Uuid>,
-) -> AppResult<Json<Vec<ContactResponse>>> {
-    let contacts = state
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ContactResponse>>> {
+    let (contacts, total) = state
         .contact_service
-        .get_company_contacts(user.tenant_id, company_id)
+        .get_company_contacts(user.tenant_id, company_id, &pagination)
         .await?;
 
-    Ok(Json(
-        contacts.into_iter().map(ContactResponse::from).collect(),
-    ))
+    let items: Vec<ContactResponse> = contacts.into_iter().map(ContactResponse::from).collect();
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn get_company_sites(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
     Path(company_id): Path<Uuid>,
-) -> AppResult<Json<Vec<SiteResponse>>> {
-    let sites = state
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<SiteResponse>>> {
+    let (sites, total) = state
         .contact_service
-        .get_company_sites(user.tenant_id, company_id)
+        .get_company_sites(user.tenant_id, company_id, &pagination)
         .await?;
 
-    Ok(Json(sites.into_iter().map(SiteResponse::from).collect()))
+    let items: Vec<SiteResponse> = sites.into_iter().map(SiteResponse::from).collect();
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 // ============================================================================

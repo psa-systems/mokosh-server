@@ -971,7 +971,16 @@ impl AuthService {
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
-    ) -> AppResult<Vec<crate::modules::auth::models::ApiKeyResponse>> {
+        pagination: &crate::utils::pagination::PaginationParams,
+    ) -> AppResult<(Vec<crate::modules::auth::models::ApiKeyResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_keys WHERE tenant_id = $1 AND user_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             SELECT id, name, key_prefix, scopes, last_used_at, expires_at,
@@ -979,14 +988,17 @@ impl AuthService {
             FROM api_keys
             WHERE tenant_id = $1 AND user_id = $2
             ORDER BY created_at DESC
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id)
         .bind(user_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Revoke (hard-delete) an API key. Scoped to the calling user +
@@ -1276,20 +1288,31 @@ impl AuthService {
         &self,
         user_id: Uuid,
         current_session_id: Uuid,
-    ) -> AppResult<Vec<SessionInfo>> {
+        pagination: &crate::utils::pagination::PaginationParams,
+    ) -> AppResult<(Vec<SessionInfo>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_sessions WHERE user_id = $1 AND expires_at > NOW()",
+        )
+        .bind(user_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
         let rows = sqlx::query_as::<_, SessionRow>(
             r#"
             SELECT id, ip_address, user_agent, last_activity_at, created_at
             FROM user_sessions
             WHERE user_id = $1 AND expires_at > NOW()
             ORDER BY last_activity_at DESC
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(user_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
 
-        Ok(rows
+        let items = rows
             .into_iter()
             .map(|r| SessionInfo {
                 id: r.id,
@@ -1299,7 +1322,8 @@ impl AuthService {
                 created_at: r.created_at,
                 is_current: r.id == current_session_id,
             })
-            .collect())
+            .collect();
+        Ok((items, total as u64))
     }
 
     /// Delete a specific session

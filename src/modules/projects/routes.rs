@@ -118,8 +118,17 @@ async fn list_project_phases(
     State(s): State<ProjectsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<ProjectPhaseResponse>>> {
-    Ok(Json(s.service.list_project_phases(u.tenant_id, id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ProjectPhaseResponse>>> {
+    let (items, total) = s
+        .service
+        .list_project_phases(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_project_phase(
@@ -161,8 +170,17 @@ async fn delete_project_phase(
 async fn list_task_statuses(
     State(s): State<ProjectsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<TaskStatusResponse>>> {
-    Ok(Json(s.service.list_task_statuses(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TaskStatusResponse>>> {
+    let (items, total) = s
+        .service
+        .list_task_statuses(u.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_task_status(
@@ -201,8 +219,17 @@ async fn list_project_tasks(
     State(s): State<ProjectsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<TaskResponse>>> {
-    Ok(Json(s.service.list_project_tasks(u.tenant_id, id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TaskResponse>>> {
+    let (items, total) = s
+        .service
+        .list_project_tasks(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_task(

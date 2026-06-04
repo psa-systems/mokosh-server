@@ -14,6 +14,7 @@ use super::models::*;
 use super::service::ContractsService;
 use crate::modules::auth::{RequireAuth, RequireFinance};
 use crate::utils::error::AppResult;
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct ContractsRouterState {
@@ -61,9 +62,18 @@ async fn list_contracts(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     Query(f): Query<ContractFilter>,
-) -> AppResult<Json<Vec<ContractResponse>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ContractResponse>>> {
     f.validate()?;
-    Ok(Json(s.service.list_contracts(u.tenant_id, &f).await?))
+    let (items, total) = s
+        .service
+        .list_contracts(u.tenant_id, &f, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_contract(
@@ -110,8 +120,17 @@ async fn list_contract_items(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<ContractItemResponse>>> {
-    Ok(Json(s.service.list_contract_items(u.tenant_id, id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ContractItemResponse>>> {
+    let (items, total) = s
+        .service
+        .list_contract_items(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_contract_item(
@@ -157,15 +176,30 @@ async fn get_hour_balance(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<ContractHourBalanceResponse>>> {
-    Ok(Json(s.service.get_hour_balance(u.tenant_id, id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ContractHourBalanceResponse>>> {
+    let (items, total) = s
+        .service
+        .get_hour_balance(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn list_rate_cards(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
-) -> AppResult<Json<Vec<RateCardResponse>>> {
-    Ok(Json(s.service.list_rate_cards(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<RateCardResponse>>> {
+    let (items, total) = s.service.list_rate_cards(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_rate_card(
@@ -204,8 +238,17 @@ async fn list_rate_card_items(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<RateCardItemResponse>>> {
-    Ok(Json(s.service.list_rate_card_items(u.tenant_id, id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<RateCardItemResponse>>> {
+    let (items, total) = s
+        .service
+        .list_rate_card_items(u.tenant_id, id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn upsert_rate_card_item(

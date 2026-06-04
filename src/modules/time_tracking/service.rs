@@ -25,7 +25,16 @@ impl TimeTrackingService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_work_types(&self, tenant_id: Uuid) -> AppResult<Vec<WorkTypeResponse>> {
+    pub async fn list_work_types(
+        &self,
+        tenant_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<WorkTypeResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_types WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(self.db.pool())
+            .await?;
+
         let rows = sqlx::query_as::<_, WorkTypeRow>(
             r#"
             SELECT id, name, description, default_billable, default_rate,
@@ -33,12 +42,15 @@ impl TimeTrackingService {
             FROM work_types
             WHERE tenant_id = $1
             ORDER BY sort_order, name
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -398,7 +410,8 @@ impl TimeTrackingService {
         &self,
         tenant_id: Uuid,
         filter: &TimesheetFilter,
-    ) -> AppResult<Vec<TimesheetSummaryResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TimesheetSummaryResponse>, u64)> {
         // Anchor week_start to Monday. Postgres DATE_TRUNC('week', ...)
         // does ISO week (Monday-start) by default.
         let mut conditions = vec!["tenant_id = $1".to_string()];
@@ -412,8 +425,11 @@ impl TimeTrackingService {
                 "date >= DATE_TRUNC('week', ${idx}::date)::date \
                  AND date < (DATE_TRUNC('week', ${idx}::date) + INTERVAL '7 days')::date"
             ));
+            idx += 1;
         }
         let where_clause = conditions.join(" AND ");
+        let limit_placeholder = idx;
+        let offset_placeholder = idx + 1;
         let query = format!(
             r#"
             SELECT
@@ -432,17 +448,37 @@ impl TimeTrackingService {
             WHERE {where_clause}
             GROUP BY user_id, DATE_TRUNC('week', date)
             ORDER BY week_start DESC, user_id
+            LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}
+            "#
+        );
+        // Count distinct (user_id, week) groups matching the same WHERE.
+        let count_query = format!(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT 1
+                FROM time_entries
+                WHERE {where_clause}
+                GROUP BY user_id, DATE_TRUNC('week', date)
+            ) AS s
             "#
         );
         let mut q = sqlx::query_as::<_, TimesheetRow>(&query).bind(tenant_id);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
         if let Some(uid) = filter.user_id {
             q = q.bind(uid);
+            cq = cq.bind(uid);
         }
         if let Some(w) = filter.week {
             q = q.bind(w);
+            cq = cq.bind(w);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let rows = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.pool())
+            .await?;
+        let total = cq.fetch_one(self.db.pool()).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     // ========================================================================
@@ -580,7 +616,12 @@ impl TimeTrackingService {
             user_id: Some(user_id),
             week: Some(anchor),
         };
-        let summaries = self.list_timesheets(tenant_id, &filter).await?;
+        // A single user_id+week pair yields at most one row; the default
+        // pagination window is more than enough.
+        let pagination = PaginationParams::default();
+        let (summaries, _total) = self
+            .list_timesheets(tenant_id, &filter, &pagination)
+            .await?;
         Ok(summaries
             .into_iter()
             .find(|s| s.user_id == user_id && s.week_start == anchor)
@@ -603,26 +644,38 @@ impl TimeTrackingService {
         &self,
         tenant_id: Uuid,
         user_id: Option<Uuid>,
-    ) -> AppResult<Vec<ActiveTimerResponse>> {
-        let (sql, has_user) = if user_id.is_some() {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ActiveTimerResponse>, u64)> {
+        let (sql, count_sql, has_user) = if user_id.is_some() {
             (
                 "SELECT id, user_id, ticket_id, project_id, company_id, work_type_id, notes, started_at \
-                 FROM active_timers WHERE tenant_id = $1 AND user_id = $2",
+                 FROM active_timers WHERE tenant_id = $1 AND user_id = $2 \
+                 ORDER BY started_at DESC LIMIT $3 OFFSET $4",
+                "SELECT COUNT(*) FROM active_timers WHERE tenant_id = $1 AND user_id = $2",
                 true,
             )
         } else {
             (
                 "SELECT id, user_id, ticket_id, project_id, company_id, work_type_id, notes, started_at \
-                 FROM active_timers WHERE tenant_id = $1",
+                 FROM active_timers WHERE tenant_id = $1 \
+                 ORDER BY started_at DESC LIMIT $2 OFFSET $3",
+                "SELECT COUNT(*) FROM active_timers WHERE tenant_id = $1",
                 false,
             )
         };
         let mut q = sqlx::query_as::<_, ActiveTimerRow>(sql).bind(tenant_id);
+        let mut cq = sqlx::query_scalar::<_, i64>(count_sql).bind(tenant_id);
         if has_user {
             q = q.bind(user_id.unwrap());
+            cq = cq.bind(user_id.unwrap());
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let rows = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.pool())
+            .await?;
+        let total = cq.fetch_one(self.db.pool()).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -822,19 +875,29 @@ impl TimeTrackingService {
     pub async fn list_rounding_rules(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<TimeRoundingRuleResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TimeRoundingRuleResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM time_rounding_rules WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, RoundingRuleRow>(
             r#"
             SELECT id, name, increment_minutes, rounding_method, minimum_minutes, is_default
             FROM time_rounding_rules
             WHERE tenant_id = $1
             ORDER BY is_default DESC, name
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

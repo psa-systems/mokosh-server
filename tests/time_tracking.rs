@@ -82,7 +82,7 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
         .json()
         .await
         .expect("work types JSON");
-    let work_type_id = work_types[0]["id"]
+    let work_type_id = work_types["data"][0]["id"]
         .as_str()
         .expect("seed has at least one work type")
         .to_string();

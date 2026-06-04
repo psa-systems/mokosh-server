@@ -81,9 +81,17 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
 async fn list_work_types(
     State(state): State<TimeTrackingRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<WorkTypeResponse>>> {
-    let items = state.service.list_work_types(user.tenant_id).await?;
-    Ok(Json(items))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<WorkTypeResponse>>> {
+    let (items, total) = state
+        .service
+        .list_work_types(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_work_type(
@@ -207,14 +215,18 @@ async fn list_timesheets(
     State(state): State<TimeTrackingRouterState>,
     RequireAuth(user): RequireAuth,
     Query(filter): Query<TimesheetFilter>,
-) -> AppResult<Json<Vec<TimesheetSummaryResponse>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TimesheetSummaryResponse>>> {
     filter.validate()?;
-    Ok(Json(
-        state
-            .service
-            .list_timesheets(user.tenant_id, &filter)
-            .await?,
-    ))
+    let (items, total) = state
+        .service
+        .list_timesheets(user.tenant_id, &filter, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn submit_timesheet(
@@ -284,19 +296,23 @@ async fn list_active_timers(
     State(state): State<TimeTrackingRouterState>,
     RequireAuth(user): RequireAuth,
     Query(q): Query<ActiveTimersQuery>,
-) -> AppResult<Json<Vec<ActiveTimerResponse>>> {
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ActiveTimerResponse>>> {
     // Non-admins always see only their own timer.
     let user_filter = if user.role.is_admin() {
         q.user_id
     } else {
         Some(user.id)
     };
-    Ok(Json(
-        state
-            .service
-            .list_active_timers(user.tenant_id, user_filter)
-            .await?,
-    ))
+    let (items, total) = state
+        .service
+        .list_active_timers(user.tenant_id, user_filter, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn start_timer(
@@ -328,10 +344,17 @@ async fn stop_timer(
 async fn list_rounding_rules(
     State(state): State<TimeTrackingRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<TimeRoundingRuleResponse>>> {
-    Ok(Json(
-        state.service.list_rounding_rules(user.tenant_id).await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TimeRoundingRuleResponse>>> {
+    let (items, total) = state
+        .service
+        .list_rounding_rules(user.tenant_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_rounding_rule(

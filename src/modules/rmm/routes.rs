@@ -18,6 +18,7 @@ use super::models::*;
 use super::service::RmmService;
 use crate::modules::auth::{RequireAdmin, RequireAuth};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct RmmRouterState {
@@ -67,8 +68,14 @@ async fn list_connections(
     State(s): State<RmmRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
-) -> AppResult<Json<Vec<RmmConnectionResponse>>> {
-    Ok(Json(s.service.list_connections(u.tenant_id).await?))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<RmmConnectionResponse>>> {
+    let (items, total) = s.service.list_connections(u.tenant_id, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_connection(
@@ -139,12 +146,17 @@ async fn list_device_mappings(
     State(s): State<RmmRouterState>,
     RequireAuth(u): RequireAuth,
     Query(q): Query<ConnQuery>,
-) -> AppResult<Json<Vec<RmmDeviceMappingResponse>>> {
-    Ok(Json(
-        s.service
-            .list_device_mappings(u.tenant_id, q.rmm_connection_id)
-            .await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<RmmDeviceMappingResponse>>> {
+    let (items, total) = s
+        .service
+        .list_device_mappings(u.tenant_id, q.rmm_connection_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_device_mapping(
@@ -172,12 +184,17 @@ async fn list_alert_rules(
     State(s): State<RmmRouterState>,
     RequireAuth(u): RequireAuth,
     Query(q): Query<ConnQuery>,
-) -> AppResult<Json<Vec<RmmAlertRuleResponse>>> {
-    Ok(Json(
-        s.service
-            .list_alert_rules(u.tenant_id, q.rmm_connection_id)
-            .await?,
-    ))
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<RmmAlertRuleResponse>>> {
+    let (items, total) = s
+        .service
+        .list_alert_rules(u.tenant_id, q.rmm_connection_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn create_alert_rule(

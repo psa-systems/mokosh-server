@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -59,7 +60,8 @@ impl CalendarService {
         &self,
         tenant_id: Uuid,
         filter: &AppointmentFilter,
-    ) -> AppResult<Vec<AppointmentResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<AppointmentResponse>, u64)> {
         let mut conditions = vec!["tenant_id = $1".to_string()];
         let mut idx = 2;
         if filter.user_id.is_some() {
@@ -76,31 +78,46 @@ impl CalendarService {
         }
         if filter.to.is_some() {
             conditions.push(format!("start_time <= ${idx}"));
+            idx += 1;
         }
         let where_clause = conditions.join(" AND ");
+        let limit_placeholder = idx;
+        let offset_placeholder = idx + 1;
         let query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
                       created_at, updated_at
                FROM appointments WHERE {where_clause}
-               ORDER BY start_time"#
+               ORDER BY start_time
+               LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
         );
+        let count_query = format!("SELECT COUNT(*) FROM appointments WHERE {where_clause}");
         let mut q = sqlx::query_as::<_, AppointmentRow>(&query).bind(tenant_id);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
         if let Some(v) = filter.user_id {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = &filter.appointment_type {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = filter.from {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = filter.to {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let rows = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.pool())
+            .await?;
+        let total = cq.fetch_one(self.db.pool()).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -251,17 +268,29 @@ impl CalendarService {
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
-    ) -> AppResult<Vec<UserAvailabilityResponse>> {
-        let rows = sqlx::query_as::<_, AvailRow>(
-            r#"SELECT id, user_id, day_of_week, start_time, end_time, is_available
-               FROM user_availability WHERE tenant_id = $1 AND user_id = $2
-               ORDER BY day_of_week, start_time"#,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<UserAvailabilityResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_availability WHERE tenant_id = $1 AND user_id = $2",
         )
         .bind(tenant_id)
         .bind(user_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, AvailRow>(
+            r#"SELECT id, user_id, day_of_week, start_time, end_time, is_available
+               FROM user_availability WHERE tenant_id = $1 AND user_id = $2
+               ORDER BY day_of_week, start_time
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// PUT semantics: replace the entire availability set for a user
@@ -274,7 +303,8 @@ impl CalendarService {
         tenant_id: Uuid,
         user_id: Uuid,
         request: &ReplaceAvailabilityRequest,
-    ) -> AppResult<Vec<UserAvailabilityResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<UserAvailabilityResponse>, u64)> {
         let mut tx = self.db.pool().begin().await?;
         sqlx::query("DELETE FROM user_availability WHERE tenant_id = $1 AND user_id = $2")
             .bind(tenant_id)
@@ -303,7 +333,8 @@ impl CalendarService {
             .await?;
         }
         tx.commit().await?;
-        self.get_user_availability(tenant_id, user_id).await
+        self.get_user_availability(tenant_id, user_id, pagination)
+            .await
     }
 
     // ========================================================================
@@ -315,7 +346,8 @@ impl CalendarService {
         &self,
         tenant_id: Uuid,
         filter: &TimeOffFilter,
-    ) -> AppResult<Vec<TimeOffResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TimeOffResponse>, u64)> {
         let mut conditions = vec!["tenant_id = $1".to_string()];
         let mut idx = 2;
         if filter.user_id.is_some() {
@@ -332,28 +364,43 @@ impl CalendarService {
         }
         if filter.to.is_some() {
             conditions.push(format!("start_date <= ${idx}"));
+            idx += 1;
         }
         let where_clause = conditions.join(" AND ");
+        let limit_placeholder = idx;
+        let offset_placeholder = idx + 1;
         let query = format!(
             r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
                FROM time_off WHERE {where_clause}
-               ORDER BY start_date DESC"#
+               ORDER BY start_date DESC
+               LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
         );
+        let count_query = format!("SELECT COUNT(*) FROM time_off WHERE {where_clause}");
         let mut q = sqlx::query_as::<_, TimeOffRow>(&query).bind(tenant_id);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
         if let Some(v) = filter.user_id {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = &filter.status {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = filter.from {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
         if let Some(v) = filter.to {
             q = q.bind(v);
+            cq = cq.bind(v);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let rows = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.pool())
+            .await?;
+        let total = cq.fetch_one(self.db.pool()).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -446,16 +493,26 @@ impl CalendarService {
     pub async fn list_on_call_schedules(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Vec<OnCallScheduleResponse>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<OnCallScheduleResponse>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM on_call_schedules WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
         let rows = sqlx::query_as::<_, OnCallRow>(
             r#"SELECT id, name, team_id, rotation_type, rotation_config, is_active
                FROM on_call_schedules WHERE tenant_id = $1
-               ORDER BY name"#,
+               ORDER BY name
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
