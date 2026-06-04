@@ -39,7 +39,10 @@ async fn dispatch_stub_returns_self_documenting_501(pool: PgPool) {
     let endpoints = body["planned_endpoints"]
         .as_array()
         .expect("planned_endpoints must be an array");
-    assert!(!endpoints.is_empty(), "planned_endpoints must list at least one entry");
+    assert!(
+        !endpoints.is_empty(),
+        "planned_endpoints must list at least one entry"
+    );
     for ep in endpoints {
         assert!(ep["method"].is_string(), "endpoint missing method: {ep}");
         assert!(ep["path"].is_string(), "endpoint missing path: {ep}");
