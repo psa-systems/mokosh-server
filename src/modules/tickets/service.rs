@@ -5,6 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::notifications::NotificationsService;
 use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -18,6 +19,12 @@ pub struct TicketService {
     db: Database,
     automation: AutomationEngine,
     mailer: Arc<dyn Mailer>,
+    /// When `Some`, ticket-note emails are enqueued via the
+    /// notifications dispatcher (template + worker delivery) instead
+    /// of being sent inline through `mailer`. The legacy mailer path
+    /// is retained so test fixtures that build `TicketService::new`
+    /// keep compiling.
+    notifications: Option<NotificationsService>,
 }
 
 impl TicketService {
@@ -38,6 +45,27 @@ impl TicketService {
             db,
             automation,
             mailer,
+            notifications: None,
+        }
+    }
+
+    /// Like [`Self::with_mailer`] but additionally wires the
+    /// notifications dispatcher. The server uses this constructor in
+    /// `create_api_router` so ticket-note emails and the automation
+    /// engine's `send_notification` action flow through the queue
+    /// (delivery handled by `DispatcherWorker`).
+    pub fn with_dispatcher(
+        db: Database,
+        mailer: Arc<dyn Mailer>,
+        notifications: NotificationsService,
+    ) -> Self {
+        let automation =
+            AutomationEngine::with_dispatcher(db.clone(), mailer.clone(), notifications.clone());
+        Self {
+            db,
+            automation,
+            mailer,
+            notifications: Some(notifications),
         }
     }
 
@@ -646,7 +674,32 @@ impl TicketService {
         let body =
             format!("A new update has been added to ticket {ticket_number}:\n\n{content}\n",);
 
-        match self.mailer.send_text(&email, &subject, &body).await {
+        // Prefer the notifications dispatcher so the row is durable
+        // and the worker retries on transient SMTP failures. Fall
+        // through to the legacy direct-mailer path if the service was
+        // built without a dispatcher (older test fixtures).
+        let send_result: Result<(), String> = match &self.notifications {
+            Some(notify) => {
+                let context = serde_json::json!({
+                    "recipient_email": email,
+                    "ticket_number": ticket_number,
+                    "ticket_title": title,
+                    "content": content,
+                });
+                notify
+                    .dispatch(tenant_id, "ticket.note_added", &context)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("notify dispatch: {e}"))
+            }
+            None => self
+                .mailer
+                .send_text(&email, &subject, &body)
+                .await
+                .map_err(|e| format!("mailer send_text: {e}")),
+        };
+
+        match send_result {
             Ok(()) => {
                 if let Err(e) = sqlx::query(
                     "UPDATE ticket_notes SET is_email_sent = TRUE, email_sent_at = NOW() WHERE id = $1",
@@ -657,10 +710,10 @@ impl TicketService {
                 {
                     tracing::warn!(?e, %note_id, "mark is_email_sent failed");
                 } else {
-                    tracing::info!(%note_id, "ticket note email sent");
+                    tracing::info!(%note_id, "ticket note email queued");
                 }
             }
-            Err(e) => tracing::warn!(?e, %note_id, "ticket note email send failed"),
+            Err(e) => tracing::warn!(error = %e, %note_id, "ticket note email enqueue failed"),
         }
     }
 

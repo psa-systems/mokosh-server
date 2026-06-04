@@ -76,20 +76,29 @@ pub fn create_api_router(
             })
         })
         .collect();
-    // Create services
-    let auth_service = AuthService::with_mailer(
+    // Create services. NotificationsService is constructed first so a
+    // shared clone can be threaded into AuthService and TicketService,
+    // letting them dispatch transactional messages (password reset,
+    // welcome, ticket-note email) through the notifications queue
+    // instead of calling the Mailer directly. The dispatcher worker
+    // spawned from main.rs drains those rows.
+    let notifications_service =
+        NotificationsService::with_encryption_key(db.clone(), encryption_key);
+    let auth_service = AuthService::with_dispatcher(
         db.clone(),
         jwt_secret.clone(),
         super_admin_emails,
         mailer.clone(),
         client_origin.clone(),
+        notifications_service.clone(),
     );
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
     #[cfg(not(feature = "multi-tenant"))]
     let _ = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
-    let ticket_service = TicketService::with_mailer(db.clone(), mailer);
+    let ticket_service =
+        TicketService::with_dispatcher(db.clone(), mailer, notifications_service.clone());
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
@@ -97,7 +106,6 @@ pub fn create_api_router(
     let contracts_service = ContractsService::new(db.clone());
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());
-    let notifications_service = NotificationsService::new(db.clone());
     let reports_service = ReportsService::new(db.clone());
     let rmm_service = RmmService::new(db.clone());
     let sla_service = SlaService::new(db.clone());

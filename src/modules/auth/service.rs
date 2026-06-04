@@ -12,6 +12,8 @@ use uuid::Uuid;
 #[cfg(feature = "server")]
 use crate::db::Database;
 #[cfg(feature = "server")]
+use crate::modules::notifications::NotificationsService;
+#[cfg(feature = "server")]
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
 #[cfg(feature = "server")]
 use crate::utils::email::{LogMailer, Mailer};
@@ -35,8 +37,16 @@ pub struct AuthService {
     /// the default tenant. Existing users are never re-roled.
     super_admin_emails: Vec<String>,
     /// Outbound transactional email. Defaults to `LogMailer` so unit
-    /// constructions that do not need real SMTP keep working.
+    /// constructions that do not need real SMTP keep working. Kept as
+    /// a fallback for builds that do not wire a `NotificationsService`
+    /// (e.g. older test fixtures); see [`Self::with_dispatcher`].
     mailer: Arc<dyn Mailer>,
+    /// When `Some`, password-reset and welcome emails are enqueued via
+    /// the notifications dispatcher (templates from
+    /// `notification_templates`, delivery driven by `DispatcherWorker`).
+    /// When `None`, the service falls back to calling `mailer`
+    /// directly for backwards-compatible test fixtures.
+    notifications: Option<NotificationsService>,
     /// Public-facing SPA origin used as the prefix for password-reset
     /// and welcome links sent in transactional email. Equal to
     /// `AppConfig::client_origin`.
@@ -73,6 +83,35 @@ impl AuthService {
             refresh_token_ttl: Duration::days(7),
             super_admin_emails,
             mailer,
+            notifications: None,
+            frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// Like [`Self::with_mailer`] but additionally wires the
+    /// notifications dispatcher. The server uses this constructor in
+    /// `create_api_router` so password-reset and welcome emails flow
+    /// through the queue (templates from `notification_templates`,
+    /// retries handled by `DispatcherWorker`) instead of calling SMTP
+    /// inline. The `mailer` argument is retained so any future
+    /// short-circuit path (or operator that disables the worker) keeps
+    /// the direct send available.
+    pub fn with_dispatcher(
+        db: Database,
+        jwt_secret: String,
+        super_admin_emails: Vec<String>,
+        mailer: Arc<dyn Mailer>,
+        frontend_base_url: String,
+        notifications: NotificationsService,
+    ) -> Self {
+        Self {
+            db,
+            jwt_secret,
+            access_token_ttl: Duration::hours(1),
+            refresh_token_ttl: Duration::days(7),
+            super_admin_emails,
+            mailer,
+            notifications: Some(notifications),
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
         }
     }
@@ -424,20 +463,41 @@ impl AuthService {
         .await?;
 
         let reset_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
-        if let Err(e) = self
-            .mailer
-            .send_password_reset(&user.email, &reset_link)
-            .await
-        {
-            // Log but do not leak details to the caller; the public
-            // surface stays enumeration-resistant either way.
-            tracing::warn!(
-                user_id = %user.id,
-                error = ?e,
-                "password reset email send failed; token is persisted but unreachable",
-            );
-        } else {
-            tracing::info!(user_id = %user.id, "password reset email queued");
+        match &self.notifications {
+            Some(notify) => {
+                let context = serde_json::json!({
+                    "recipient_user_id": user.id.to_string(),
+                    "recipient_email": user.email,
+                    "reset_link": reset_link,
+                });
+                if let Err(e) = notify
+                    .dispatch(user.tenant_id, "auth.password_reset", &context)
+                    .await
+                {
+                    tracing::warn!(
+                        user_id = %user.id,
+                        error = ?e,
+                        "password reset notify dispatch failed; token persisted but no message queued",
+                    );
+                } else {
+                    tracing::info!(user_id = %user.id, "password reset queued via notifications dispatcher");
+                }
+            }
+            None => {
+                if let Err(e) = self
+                    .mailer
+                    .send_password_reset(&user.email, &reset_link)
+                    .await
+                {
+                    tracing::warn!(
+                        user_id = %user.id,
+                        error = ?e,
+                        "password reset email send failed; token is persisted but unreachable",
+                    );
+                } else {
+                    tracing::info!(user_id = %user.id, "password reset email sent (legacy mailer path)");
+                }
+            }
         }
 
         Ok(())
@@ -629,18 +689,39 @@ impl AuthService {
                 ("", l) => l.to_string(),
                 (f, l) => format!("{f} {l}"),
             };
-            if let Err(e) = self
-                .mailer
-                .send_welcome(&request.email, &display_name, &setup_link)
-                .await
-            {
-                tracing::warn!(
-                    user_id = %user_id,
-                    error = ?e,
-                    "welcome email send failed; setup token persisted but unreachable",
-                );
-            } else {
-                tracing::info!(user_id = %user_id, "welcome email queued");
+            match &self.notifications {
+                Some(notify) => {
+                    let context = serde_json::json!({
+                        "recipient_user_id": user_id.to_string(),
+                        "recipient_email": request.email,
+                        "display_name": display_name,
+                        "setup_link": setup_link,
+                    });
+                    if let Err(e) = notify.dispatch(tenant_id, "auth.welcome", &context).await {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = ?e,
+                            "welcome notify dispatch failed; setup token persisted but no message queued",
+                        );
+                    } else {
+                        tracing::info!(user_id = %user_id, "welcome email queued via notifications dispatcher");
+                    }
+                }
+                None => {
+                    if let Err(e) = self
+                        .mailer
+                        .send_welcome(&request.email, &display_name, &setup_link)
+                        .await
+                    {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = ?e,
+                            "welcome email send failed; setup token persisted but unreachable",
+                        );
+                    } else {
+                        tracing::info!(user_id = %user_id, "welcome email sent (legacy mailer path)");
+                    }
+                }
             }
         }
 
