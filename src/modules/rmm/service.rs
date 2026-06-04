@@ -61,18 +61,6 @@ impl RmmService {
         }
     }
 
-    /// Read-only accessor used by the sync worker and the integration
-    /// test harness so they can decrypt connection credentials without
-    /// re-implementing the AES-256-GCM dance.
-    pub(crate) fn encryption_key(&self) -> &[u8; 32] {
-        &self.encryption_key
-    }
-
-    /// Read-only accessor used by the sync worker.
-    pub(crate) fn db(&self) -> &Database {
-        &self.db
-    }
-
     // PMS-102 connections CRUD ------------------------------------------------
     pub async fn list_connections(&self, tenant_id: Uuid) -> AppResult<Vec<RmmConnectionResponse>> {
         let rows = sqlx::query_as::<_, ConnRow>(
