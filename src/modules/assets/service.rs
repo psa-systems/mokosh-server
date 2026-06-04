@@ -660,6 +660,14 @@ impl AssetsService {
     }
 
     // PMS-78 audit log read --------------------------------------------------
+    //
+    // Previously hard-capped at `LIMIT 500` in a single SELECT. PMS-127
+    // replaced the hard cap with the standard pagination clamp
+    // (`PaginationParams::MAX_PER_PAGE = 100`), so a single response is
+    // bounded *more strictly* than before. A caller can still enumerate
+    // the full history page by page; that is the explicit point of an
+    // audit log read endpoint, so the enumeration cost is intentional
+    // (and rate-limited via the per-page clamp).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_audit_log(
         &self,

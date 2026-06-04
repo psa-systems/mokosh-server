@@ -1,4 +1,19 @@
-//! Pagination utilities for API responses
+//! Pagination utilities for API responses.
+//!
+//! Handler convention (PMS-127): every paginated `list_*` handler
+//! takes `Query<PaginationParams>`, calls the service with
+//! `&PaginationParams`, and wraps the result in
+//! `PaginatedResponse::from_params(items, &pagination, total)`. When
+//! a handler also accepts a filter, both extractors live side-by-side
+//! (`Query<XxxFilter>` + `Query<PaginationParams>`) and axum parses
+//! the same query string twice. This relies on every `*Filter` type
+//! (and `PaginationParams` itself) using serde defaults for missing
+//! fields and NOT setting `#[serde(deny_unknown_fields)]`. Adding
+//! `deny_unknown_fields` to a filter type would silently 400 every
+//! `?page=2`-style request hitting that handler. If a future filter
+//! must be strict, fold pagination into the same struct via
+//! `#[serde(flatten)] pagination: PaginationParams` instead of
+//! stacking two `Query<_>` extractors.
 
 use serde::{Deserialize, Serialize};
 
