@@ -126,8 +126,20 @@ pub fn create_api_router(
 
     // Build API v1 routes
     let api_v1 = Router::new()
-        // Health check
+        // Liveness probe: cheap, never touches downstream deps. Used by
+        // orchestrators to decide whether to restart the container.
         .route("/health", get(health_check))
+        // Readiness probe (PMS-130): also pings the DB, and best-effort
+        // pings Infisical when `INFISICAL_BASE_URL` is set. Returns 503
+        // with a JSON breakdown when a dependency is down so the
+        // orchestrator drains traffic until the probe goes green.
+        .route(
+            "/ready",
+            get({
+                let db = db.clone();
+                move || ready_check(db.clone())
+            }),
+        )
         // Build / version info (public, used for diagnostics)
         .route("/version", get(version_info))
         // Auth routes
@@ -304,6 +316,101 @@ async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
 /// Health check endpoint
 async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Readiness probe (PMS-130). Pings every external dependency the
+/// running server actually talks to:
+///
+/// - **Database** (always): `SELECT 1` against the pool. The legacy
+///   `health_check()` returns `"OK"` unconditionally; this is the
+///   first probe that distinguishes a process that booted from one
+///   that can actually serve a request.
+/// - **Infisical** (best-effort): if the operator set
+///   `INFISICAL_BASE_URL`, a 2-second HTTP probe against
+///   `<base>/api/status`. Mokosh-server loads Infisical secrets at
+///   boot time only, so a transient Infisical outage does not break
+///   in-flight requests; nonetheless an orchestrator wants to know
+///   when the secret store is unreachable because the next restart
+///   would fail. The probe is skipped entirely when the env var is
+///   unset (single-machine deployments without an Infisical
+///   sibling).
+///
+/// Response shape on 200:
+/// ```json
+/// {"status":"ready","checks":{"db":"ok","infisical":"ok"|"skipped"}}
+/// ```
+///
+/// On 503 the same shape is returned with the failing dependency's
+/// value replaced by a short error string so the orchestrator log
+/// shows the root cause without a separate metrics scrape.
+async fn ready_check(
+    db: crate::db::Database,
+) -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    String,
+) {
+    let db_result = db.health_check().await;
+    let infisical_result = probe_infisical().await;
+
+    let db_value = match &db_result {
+        Ok(()) => serde_json::Value::String("ok".into()),
+        Err(e) => serde_json::Value::String(format!("error: {e}")),
+    };
+    let infisical_value = match &infisical_result {
+        Ok(true) => serde_json::Value::String("ok".into()),
+        Ok(false) => serde_json::Value::String("skipped".into()),
+        Err(e) => serde_json::Value::String(format!("error: {e}")),
+    };
+
+    let any_failed = db_result.is_err() || infisical_result.is_err();
+    let status_label = if any_failed { "not_ready" } else { "ready" };
+    let status_code = if any_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+
+    let body = serde_json::json!({
+        "status": status_label,
+        "checks": {
+            "db": db_value,
+            "infisical": infisical_value,
+        },
+    });
+    (
+        status_code,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+}
+
+/// Probe Infisical's `/api/status` endpoint when the operator opted
+/// in via `INFISICAL_BASE_URL`. Returns:
+///
+/// - `Ok(true)` - probe ran and got a 2xx response
+/// - `Ok(false)` - probe skipped (env var unset)
+/// - `Err(_)` - env var set, but the probe failed (DNS, TCP, non-2xx
+///   response, or 2s timeout)
+async fn probe_infisical() -> Result<bool, String> {
+    let Ok(base) = std::env::var("INFISICAL_BASE_URL") else {
+        return Ok(false);
+    };
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/api/status");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("{url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("{url}: status {}", resp.status()));
+    }
+    Ok(true)
 }
 
 /// Build / version info endpoint. Returns the package version, the
