@@ -22,6 +22,7 @@ impl AuditService {
     /// request; failures are swallowed so the request itself never
     /// fails because of a log write.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn append(
         &self,
         tenant_id: Uuid,
@@ -52,6 +53,7 @@ impl AuditService {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = ?tenant_id))]
     pub async fn list(
         &self,
         tenant_id: Option<Uuid>,

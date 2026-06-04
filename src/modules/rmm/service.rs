@@ -62,6 +62,7 @@ impl RmmService {
     }
 
     // PMS-102 connections CRUD ------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_connections(&self, tenant_id: Uuid) -> AppResult<Vec<RmmConnectionResponse>> {
         let rows = sqlx::query_as::<_, ConnRow>(
             r#"SELECT id, name, provider, api_url, is_active, sync_interval_minutes,
@@ -74,6 +75,7 @@ impl RmmService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_connection(
         &self,
         tenant_id: Uuid,
@@ -118,6 +120,7 @@ impl RmmService {
 
     /// `GET /api/v1/rmm/connections/{id}`. Returns 404 when the row
     /// does not exist in the caller's tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_connection(
         &self,
         tenant_id: Uuid,
@@ -142,6 +145,7 @@ impl RmmService {
     /// supplied; this lets an admin toggle `is_active` without
     /// re-typing the credential. The returned row reflects post-update
     /// state.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_connection(
         &self,
         tenant_id: Uuid,
@@ -184,6 +188,7 @@ impl RmmService {
         self.get_connection(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_connection(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM rmm_connections WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -200,6 +205,7 @@ impl RmmService {
     /// `POST /api/v1/rmm/connections/:id/test`: probe the RMM endpoint.
     /// v1 just decrypts the credentials and HEADs the api_url to confirm
     /// reachability; per-provider auth check is the next commit.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn test_connection(&self, tenant_id: Uuid, id: Uuid) -> AppResult<serde_json::Value> {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT api_url, api_key_encrypted FROM rmm_connections WHERE tenant_id = $1 AND id = $2",
@@ -240,6 +246,7 @@ impl RmmService {
     }
 
     // PMS-103 device mappings -------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_device_mappings(
         &self,
         tenant_id: Uuid,
@@ -269,6 +276,7 @@ impl RmmService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_device_mapping(
         &self,
         tenant_id: Uuid,
@@ -301,6 +309,7 @@ impl RmmService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_device_mapping(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM rmm_device_mappings WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -315,6 +324,7 @@ impl RmmService {
     }
 
     // PMS-104 alert rules + ingestion ----------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_alert_rules(
         &self,
         tenant_id: Uuid,
@@ -344,6 +354,7 @@ impl RmmService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_alert_rule(
         &self,
         tenant_id: Uuid,
@@ -380,6 +391,7 @@ impl RmmService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_alert_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM rmm_alert_rules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -407,6 +419,7 @@ impl RmmService {
     /// missing fields fall back to the raw `IngestAlertRequest` body.
     ///
     /// HMAC verification is the caller's responsibility (route handler).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn ingest_alert(
         &self,
         tenant_id: Uuid,
@@ -626,6 +639,7 @@ impl RmmService {
     /// PMS-105: verify the HMAC-SHA256 signature on an inbound alert.
     /// Returns the connection's stored secret; the route handler does
     /// the constant-time compare.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn connection_api_secret(
         &self,
         tenant_id: Uuid,

@@ -38,6 +38,7 @@ impl NotificationsService {
     }
 
     // PMS-87 channels CRUD ----------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_channels(
         &self,
         tenant_id: Uuid,
@@ -67,6 +68,7 @@ impl NotificationsService {
             .collect()
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_channel(
         &self,
         tenant_id: Uuid,
@@ -100,6 +102,7 @@ impl NotificationsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_channel(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM notification_channels WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -114,6 +117,7 @@ impl NotificationsService {
     }
 
     // PMS-88 templates CRUD ---------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_templates(
         &self,
         tenant_id: Uuid,
@@ -129,6 +133,7 @@ impl NotificationsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_template(
         &self,
         tenant_id: Uuid,
@@ -156,6 +161,7 @@ impl NotificationsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_template(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM notification_templates WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -170,6 +176,7 @@ impl NotificationsService {
     }
 
     // PMS-89 user preferences -------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_user_preferences(
         &self,
         tenant_id: Uuid,
@@ -187,6 +194,7 @@ impl NotificationsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_user_preference(
         &self,
         tenant_id: Uuid,
@@ -220,6 +228,7 @@ impl NotificationsService {
     }
 
     // PMS-90 inbox ------------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_inbox(
         &self,
         tenant_id: Uuid,
@@ -238,6 +247,7 @@ impl NotificationsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn mark_read(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
         sqlx::query(
             r#"UPDATE notifications SET read_at = NOW()
@@ -252,6 +262,7 @@ impl NotificationsService {
     }
 
     // PMS-91 rules CRUD -------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rules(&self, tenant_id: Uuid) -> AppResult<Vec<NotificationRuleResponse>> {
         let rows = sqlx::query_as::<_, RuleRow>(
             r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
@@ -263,6 +274,7 @@ impl NotificationsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rule(
         &self,
         tenant_id: Uuid,
@@ -298,6 +310,7 @@ impl NotificationsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM notification_rules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -333,6 +346,7 @@ impl NotificationsService {
     /// `is_enabled = false` OR whose `channel_types` does not include
     /// the channel, that row is skipped. Absent preferences = send (the
     /// project default).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch(
         &self,
         tenant_id: Uuid,

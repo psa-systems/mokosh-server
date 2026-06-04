@@ -24,6 +24,7 @@ impl ProjectsService {
     // PMS-53 projects CRUD
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_projects(
         &self,
         tenant_id: Uuid,
@@ -81,6 +82,7 @@ impl ProjectsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_project(
         &self,
         tenant_id: Uuid,
@@ -119,6 +121,7 @@ impl ProjectsService {
         self.get_project(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_project(&self, tenant_id: Uuid, id: Uuid) -> AppResult<ProjectResponse> {
         let row = sqlx::query_as::<_, ProjectRow>(
             r#"
@@ -137,6 +140,7 @@ impl ProjectsService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_project(
         &self,
         tenant_id: Uuid,
@@ -185,6 +189,7 @@ impl ProjectsService {
         self.get_project(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_project(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM projects WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -202,6 +207,7 @@ impl ProjectsService {
     // PMS-54 project phases CRUD
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_project_phases(
         &self,
         tenant_id: Uuid,
@@ -218,6 +224,7 @@ impl ProjectsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_project_phase(
         &self,
         tenant_id: Uuid,
@@ -245,6 +252,7 @@ impl ProjectsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_project_phase(
         &self,
         tenant_id: Uuid,
@@ -281,6 +289,7 @@ impl ProjectsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_project_phase(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM project_phases WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -298,6 +307,7 @@ impl ProjectsService {
     // PMS-55 task statuses
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_task_statuses(&self, tenant_id: Uuid) -> AppResult<Vec<TaskStatusResponse>> {
         let rows = sqlx::query_as::<_, TaskStatusRow>(
             r#"SELECT id, name, color, is_completed, sort_order
@@ -309,6 +319,7 @@ impl ProjectsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_task_status(
         &self,
         tenant_id: Uuid,
@@ -336,6 +347,7 @@ impl ProjectsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_task_status(
         &self,
         tenant_id: Uuid,
@@ -368,6 +380,7 @@ impl ProjectsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_task_status(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM task_statuses WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -385,6 +398,7 @@ impl ProjectsService {
     // PMS-56 tasks CRUD
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_project_tasks(
         &self,
         tenant_id: Uuid,
@@ -399,6 +413,7 @@ impl ProjectsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_task(
         &self,
         tenant_id: Uuid,
@@ -431,6 +446,7 @@ impl ProjectsService {
         self.get_task(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_task(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TaskResponse> {
         let row = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
@@ -446,6 +462,7 @@ impl ProjectsService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_task(
         &self,
         tenant_id: Uuid,
@@ -502,6 +519,7 @@ impl ProjectsService {
         self.get_task(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_task(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM tasks WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -519,6 +537,7 @@ impl ProjectsService {
     // PMS-57 task dependencies (with cycle detection)
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_task_dependency(
         &self,
         tenant_id: Uuid,
@@ -568,6 +587,7 @@ impl ProjectsService {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn remove_task_dependency(
         &self,
         tenant_id: Uuid,

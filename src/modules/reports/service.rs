@@ -20,6 +20,7 @@ impl ReportsService {
     }
 
     // PMS-95 dashboard --------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dashboard(&self, tenant_id: Uuid) -> AppResult<DashboardResponse> {
         let open_by_priority: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT tp.name, COUNT(*)::bigint
@@ -75,6 +76,7 @@ impl ReportsService {
     }
 
     // PMS-96 tickets ----------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn tickets(
         &self,
         tenant_id: Uuid,
@@ -137,6 +139,7 @@ impl ReportsService {
     }
 
     // PMS-97 time -------------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn time(
         &self,
         tenant_id: Uuid,
@@ -182,6 +185,7 @@ impl ReportsService {
     }
 
     // PMS-98 billing ----------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn billing(
         &self,
         tenant_id: Uuid,

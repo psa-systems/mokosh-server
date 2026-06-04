@@ -18,6 +18,7 @@ impl SettingsService {
     }
 
     // PMS-115 tenant settings -------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tenant_settings(
         &self,
         tenant_id: Uuid,
@@ -32,6 +33,7 @@ impl SettingsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_tenant_setting(
         &self,
         tenant_id: Uuid,
@@ -58,6 +60,7 @@ impl SettingsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_tenant_setting(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM tenant_settings WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -75,6 +78,7 @@ impl SettingsService {
     // own implementation reachable at /api/v1/tenants/:tenant_id/modules/:module
     // -- this one lives under /api/v1/settings so the client can find it
     // without knowing the tenant id) ----------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_module_configs(
         &self,
         tenant_id: Uuid,
@@ -89,6 +93,7 @@ impl SettingsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_module_config(
         &self,
         tenant_id: Uuid,
@@ -106,6 +111,7 @@ impl SettingsService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_module_config(
         &self,
         tenant_id: Uuid,

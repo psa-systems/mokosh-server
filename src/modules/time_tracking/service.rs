@@ -24,6 +24,7 @@ impl TimeTrackingService {
     // PMS-50 work types
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_work_types(&self, tenant_id: Uuid) -> AppResult<Vec<WorkTypeResponse>> {
         let rows = sqlx::query_as::<_, WorkTypeRow>(
             r#"
@@ -40,6 +41,7 @@ impl TimeTrackingService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_work_type(
         &self,
         tenant_id: Uuid,
@@ -74,6 +76,7 @@ impl TimeTrackingService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_work_type(
         &self,
         tenant_id: Uuid,
@@ -114,6 +117,7 @@ impl TimeTrackingService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_work_type(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let affected = sqlx::query("DELETE FROM work_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -150,6 +154,7 @@ impl TimeTrackingService {
         ))
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_time_entries(
         &self,
         tenant_id: Uuid,
@@ -227,6 +232,7 @@ impl TimeTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_entry(
         &self,
         tenant_id: Uuid,
@@ -283,6 +289,7 @@ impl TimeTrackingService {
         self.get_time_entry(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_time_entry(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TimeEntryResponse> {
         let row = sqlx::query_as::<_, TimeEntryRow>(
             r#"
@@ -302,6 +309,7 @@ impl TimeTrackingService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_time_entry(
         &self,
         tenant_id: Uuid,
@@ -367,6 +375,7 @@ impl TimeTrackingService {
         self.get_time_entry(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_time_entry(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let affected = sqlx::query("DELETE FROM time_entries WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -384,6 +393,7 @@ impl TimeTrackingService {
     // PMS-46 timesheets (aggregate over time_entries)
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_timesheets(
         &self,
         tenant_id: Uuid,
@@ -442,6 +452,7 @@ impl TimeTrackingService {
     /// `timesheet_id` is interpreted as a `(user_id, week_start)` pair
     /// composite via two query params; for the path-based endpoint the
     /// route handler unpacks `user_id_week-anchor` into the pair.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn submit_timesheet(
         &self,
         tenant_id: Uuid,
@@ -479,6 +490,7 @@ impl TimeTrackingService {
     /// Approve every pending entry in the user's week. Manager+ only
     /// (enforced at the route). Idempotent: re-approving an approved week is
     /// a no-op that returns the same summary.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn approve_timesheet(
         &self,
         tenant_id: Uuid,
@@ -514,6 +526,7 @@ impl TimeTrackingService {
 
     /// Reject every pending entry in the user's week with a reason. Manager+
     /// only (enforced at the route).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reject_timesheet(
         &self,
         tenant_id: Uuid,
@@ -585,6 +598,7 @@ impl TimeTrackingService {
     // PMS-48 active timers
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_active_timers(
         &self,
         tenant_id: Uuid,
@@ -611,6 +625,7 @@ impl TimeTrackingService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn start_timer(
         &self,
         tenant_id: Uuid,
@@ -693,6 +708,7 @@ impl TimeTrackingService {
 
     /// Stop a timer: removes the `active_timers` row and creates a
     /// `time_entries` row covering the elapsed window.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn stop_timer(
         &self,
         tenant_id: Uuid,
@@ -802,6 +818,7 @@ impl TimeTrackingService {
     // PMS-49 time rounding rules
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rounding_rules(
         &self,
         tenant_id: Uuid,
@@ -820,6 +837,7 @@ impl TimeTrackingService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rounding_rule(
         &self,
         tenant_id: Uuid,
@@ -861,6 +879,7 @@ impl TimeTrackingService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rounding_rule(
         &self,
         tenant_id: Uuid,
@@ -910,6 +929,7 @@ impl TimeTrackingService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rounding_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let affected =
             sqlx::query("DELETE FROM time_rounding_rules WHERE tenant_id = $1 AND id = $2")

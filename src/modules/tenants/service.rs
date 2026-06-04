@@ -21,6 +21,7 @@ impl TenantService {
     }
 
     /// Create a new tenant
+    #[tracing::instrument(skip_all)]
     pub async fn create_tenant(&self, request: &CreateTenantRequest) -> AppResult<Tenant> {
         let tenant_id = Uuid::new_v4();
         let slug = slugify(&request.slug);
@@ -92,6 +93,7 @@ impl TenantService {
     }
 
     /// Get tenant by ID
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_tenant(&self, tenant_id: Uuid) -> AppResult<Tenant> {
         let row = sqlx::query_as::<_, TenantRow>(
             r#"
@@ -111,6 +113,7 @@ impl TenantService {
     }
 
     /// Get tenant by slug
+    #[tracing::instrument(skip_all)]
     pub async fn get_tenant_by_slug(&self, slug: &str) -> AppResult<Tenant> {
         let row = sqlx::query_as::<_, TenantRow>(
             r#"
@@ -130,6 +133,7 @@ impl TenantService {
     }
 
     /// List all tenants
+    #[tracing::instrument(skip_all)]
     pub async fn list_tenants(&self, page: u32, per_page: u32) -> AppResult<(Vec<Tenant>, u64)> {
         let offset = (page.saturating_sub(1)) * per_page;
 
@@ -156,6 +160,7 @@ impl TenantService {
     }
 
     /// Update tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tenant(
         &self,
         tenant_id: Uuid,
@@ -211,6 +216,7 @@ impl TenantService {
     }
 
     /// Suspend tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn suspend_tenant(&self, tenant_id: Uuid) -> AppResult<()> {
         sqlx::query("UPDATE tenants SET status = 'suspended', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
@@ -221,6 +227,7 @@ impl TenantService {
     }
 
     /// Activate tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn activate_tenant(&self, tenant_id: Uuid) -> AppResult<()> {
         sqlx::query("UPDATE tenants SET status = 'active', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
@@ -231,6 +238,7 @@ impl TenantService {
     }
 
     /// Get tenant usage statistics
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_tenant_usage(&self, tenant_id: Uuid) -> AppResult<TenantUsage> {
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
             .bind(tenant_id)
@@ -280,6 +288,7 @@ impl TenantService {
     }
 
     /// Get module configuration for a tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_module_config(
         &self,
         tenant_id: Uuid,
@@ -312,6 +321,7 @@ impl TenantService {
     }
 
     /// Update module configuration
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_module_config(
         &self,
         tenant_id: Uuid,
