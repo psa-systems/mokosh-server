@@ -26,6 +26,12 @@ jobs:
     # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
     # fresh database per invocation against the URL in DATABASE_URL, so
     # this single instance fans out to all integration tests.
+    #
+    # The Forgejo Actions runner puts the job container and its service
+    # containers on a shared bridge network; services are reachable from
+    # the job container by their service name on the container-internal
+    # port. localhost would resolve to the job container itself, where
+    # nothing is listening on 5432.
     services:
       postgres:
         image: postgres:16-alpine
@@ -33,16 +39,14 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
           POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
+          --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 20
 
     env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
 
     steps:
       - name: Clone the repository
