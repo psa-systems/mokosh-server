@@ -197,6 +197,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Notifications dispatcher worker. Drains the `notifications`
+    // queue (status='pending' rows) and fires the right transport per
+    // row. One worker per replica; concurrent workers SKIP LOCKED
+    // their way past each other so it is safe to run several. The
+    // tick interval is intentionally low (5s) so transactional
+    // emails (password reset, welcome, ticket-note) feel synchronous
+    // from the operator's perspective.
+    let dispatcher = mokosh_server::modules::notifications::DispatcherWorker::new(
+        db.clone(),
+        mailer.clone(),
+    );
+    tokio::spawn(dispatcher.run_forever(std::time::Duration::from_secs(5), 25));
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,

@@ -12,6 +12,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::notifications::NotificationsService;
 use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::AppResult;
 
@@ -23,6 +24,11 @@ pub struct AutomationEngine {
     db: Database,
     mailer: Arc<dyn Mailer>,
     http: reqwest::Client,
+    /// When `Some`, the `send_notification` action dispatches through
+    /// the notifications queue (template + worker delivery) instead of
+    /// hitting the mailer directly. None preserves the legacy inline
+    /// send so older test fixtures still work.
+    notifications: Option<NotificationsService>,
 }
 
 impl AutomationEngine {
@@ -35,12 +41,36 @@ impl AutomationEngine {
     /// misbehaving endpoint should not stall the rest of the rule
     /// chain.
     pub fn with_deps(db: Database, mailer: Arc<dyn Mailer>) -> Self {
+        Self::build(db, mailer, None)
+    }
+
+    /// Like [`Self::with_deps`] but additionally wires the
+    /// notifications dispatcher so the `send_notification` action
+    /// enqueues an email rather than calling SMTP inline.
+    pub fn with_dispatcher(
+        db: Database,
+        mailer: Arc<dyn Mailer>,
+        notifications: NotificationsService,
+    ) -> Self {
+        Self::build(db, mailer, Some(notifications))
+    }
+
+    fn build(
+        db: Database,
+        mailer: Arc<dyn Mailer>,
+        notifications: Option<NotificationsService>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent("mokosh-server/automation")
             .build()
             .expect("reqwest client builds with default config");
-        Self { db, mailer, http }
+        Self {
+            db,
+            mailer,
+            http,
+            notifications,
+        }
     }
 
     /// Process automation rules for a trigger type
@@ -251,11 +281,12 @@ impl AutomationEngine {
                     }
                 }
                 "send_notification" => {
-                    // Today the rules engine speaks email only. When the
-                    // notifications module (PMS-85) lands, this branch
-                    // will hand off to its dispatcher so the rule author
-                    // gets channels + templates + watcher fan-out for
-                    // free. Until then, `params.to` is required.
+                    // Hand off to NotificationsService when wired so
+                    // the message gets templated + retried + recorded
+                    // in `notifications`. Fall back to a direct mailer
+                    // send for legacy fixtures that build the engine
+                    // without a dispatcher. `params.to` is still
+                    // required either way.
                     let to = action.params.get("to").and_then(|v| v.as_str());
                     let subject = action
                         .params
@@ -268,14 +299,33 @@ impl AutomationEngine {
                         .and_then(|v| v.as_str())
                         .unwrap_or("A ticket you watch has been updated.");
                     match to {
-                        Some(addr) if !addr.is_empty() => {
-                            if let Err(e) = self.mailer.send_text(addr, subject, body).await {
-                                tracing::warn!(
-                                    ?e, %ticket_id, rule = %rule.name,
-                                    "send_notification email failed",
-                                );
+                        Some(addr) if !addr.is_empty() => match &self.notifications {
+                            Some(notify) => {
+                                let context = serde_json::json!({
+                                    "recipient_email": addr,
+                                    "subject": subject,
+                                    "body": body,
+                                    "ticket_id": ticket_id.to_string(),
+                                });
+                                if let Err(e) = notify
+                                    .dispatch(tenant_id, "ticket.automation.notify", &context)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        ?e, %ticket_id, rule = %rule.name,
+                                        "send_notification dispatch failed",
+                                    );
+                                }
                             }
-                        }
+                            None => {
+                                if let Err(e) = self.mailer.send_text(addr, subject, body).await {
+                                    tracing::warn!(
+                                        ?e, %ticket_id, rule = %rule.name,
+                                        "send_notification email failed (legacy mailer path)",
+                                    );
+                                }
+                            }
+                        },
                         _ => tracing::warn!(
                             %ticket_id, rule = %rule.name,
                             "send_notification action missing 'to' param",
