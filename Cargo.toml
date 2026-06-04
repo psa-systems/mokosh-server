@@ -11,6 +11,8 @@ members = [
     "crates/mokosh-auth",
     # main added this crate for the Google OAuth popup flow.
     "crates/google-oauth-flow",
+    # Shared DTOs between mokosh-server and mokosh-clients (PMS-129).
+    "crates/mokosh-types",
 ]
 
 [workspace.package]
@@ -178,6 +180,12 @@ cookie = "0.18"
 
 # Reusable Google OAuth helper (workspace member)
 google-oauth-flow = { path = "crates/google-oauth-flow" }
+
+# Shared DTOs (workspace member). The `models.rs` for each shared
+# module (auth, contacts, tenants, tickets, time_tracking) re-exports
+# from `mokosh_types::<module>::*`; same crate is consumed by
+# mokosh-clients to keep the wire format in lock-step (PMS-129).
+mokosh-types = { path = "crates/mokosh-types" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
