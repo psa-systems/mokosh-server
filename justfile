@@ -63,14 +63,18 @@ ensure-oidc-keys:
 # Per-developer Traefik-routed instance for SSO testing.
 #   API:  https://{USER}-mokosh-api.a8n.run
 # Run `just dev-sso` here AND in mokosh-clients to get both ends up.
-# The dev-mokosh-private network is shared with whoever else may have
-# a stack running on this host. The dev-sso overlay marks it external,
-# so we create it defensively here (idempotent: skipped if it already
-# exists). Without this step a clean host would have nothing to attach
+# Each per-developer stack gets its OWN private network,
+# `dev-mokosh-private-${USER}`, matching the name compose.dev.yml
+# assigns. The dev-sso overlay marks that network external (it only
+# ATTACHES rather than owning it), so compose will not create it. We
+# create it defensively here (idempotent: skipped if it already
+# exists). The name MUST match the base/overlay name or the server
+# lands on a different network than Postgres and crash-loops on DB
+# connect. Without this step a clean host would have nothing to attach
 # to and `docker compose up` would error.
 [private]
 ensure-private-network:
-    @docker network inspect dev-mokosh-private >/dev/null 2>&1 || docker network create dev-mokosh-private >/dev/null
+    @docker network inspect dev-mokosh-private-${USER} >/dev/null 2>&1 || docker network create dev-mokosh-private-${USER} >/dev/null
 
 [doc("Start the SSO dev stack (Traefik-routed at *.a8n.run)")]
 [group: 'dev']
