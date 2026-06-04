@@ -13,7 +13,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::TimeTrackingService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireAuth, RequireManager};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -49,6 +49,14 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
         .route(
             "/timesheets/{user_id}/{week_start}/submit",
             post(submit_timesheet),
+        )
+        .route(
+            "/timesheets/{user_id}/{week_start}/approve",
+            post(approve_timesheet),
+        )
+        .route(
+            "/timesheets/{user_id}/{week_start}/reject",
+            post(reject_timesheet),
         )
         // PMS-48 active timers
         .route("/timers/active", get(list_active_timers))
@@ -223,6 +231,42 @@ async fn submit_timesheet(
         state
             .service
             .submit_timesheet(user.tenant_id, user_id, week_start)
+            .await?,
+    ))
+}
+
+async fn approve_timesheet(
+    State(state): State<TimeTrackingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _mgr: RequireManager,
+    Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
+) -> AppResult<Json<TimesheetSummaryResponse>> {
+    Ok(Json(
+        state
+            .service
+            .approve_timesheet(user.tenant_id, user.id, user_id, week_start)
+            .await?,
+    ))
+}
+
+async fn reject_timesheet(
+    State(state): State<TimeTrackingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _mgr: RequireManager,
+    Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
+    Json(request): Json<RejectTimesheetRequest>,
+) -> AppResult<Json<TimesheetSummaryResponse>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .service
+            .reject_timesheet(
+                user.tenant_id,
+                user.id,
+                user_id,
+                week_start,
+                &request.reason,
+            )
             .await?,
     ))
 }

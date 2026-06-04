@@ -121,12 +121,27 @@ pub struct TimesheetSummaryResponse {
     pub total_minutes: i64,
     pub billable_minutes: i64,
     pub entry_count: i64,
+    /// Week-level rollup of per-entry approval_status: "rejected" if any
+    /// entry is rejected, "approved" if all are, else "pending".
+    ///
+    /// DEBT: there is no real `submitted` state - the schema enum is
+    /// pending|approved|rejected only. The client renders `pending` with
+    /// `entry_count > 0` as "awaiting approval", so a submitted week is
+    /// visibly distinct from a never-touched one. Add a `submitted` state
+    /// post-M1 if approval needs a true draft/submitted boundary.
+    pub approval_status: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct TimesheetFilter {
     pub user_id: Option<Uuid>,
     pub week: Option<NaiveDate>,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct RejectTimesheetRequest {
+    #[validate(length(min = 1, max = 1000))]
+    pub reason: String,
 }
 
 // ============================================================================

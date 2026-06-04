@@ -4,6 +4,22 @@ A practical reference for what's actually implemented in this repo.
 Derived from a 2026-05-06 audit and intended to be kept current
 alongside source changes.
 
+> **Update 2026-06-03 (Service Desk slice).** The metrics and
+> per-module table below predate substantial work and are stale in
+> places. Confirmed changes since the audit: **F3 (ticket DTO joins)
+> is done** - `tickets/service.rs` builds `TicketResponse` from a
+> JOINed query (`TICKET_RESPONSE_SELECT`), no `String::new()`
+> placeholders remain. **F8 (time tracking) is done and then some** -
+> `time_tracking` is a real, router-mounted module (work types, time
+> entries, timesheets, timers, rounding rules) with rounding actually
+> applied, work-type rate derivation, a manager approve/reject state
+> machine, write-side tenant validation, and integration coverage in
+> `tests/time_tracking.rs`. Treat the `time_tracking` row in the
+> placeholder table and the F3/F8 entries under "Proposed fixes" as
+> closed. A broader re-audit of the other formerly-placeholder
+> modules (many are now `merge`d in `api/router.rs`) is still
+> outstanding.
+
 ## At a glance
 
 | Metric | Value |
@@ -257,7 +273,7 @@ against an existing schema.
 | `rmm` | `rmm_connections`, `rmm_device_mappings`, `rmm_alert_rules` | `/settings/integrations` |
 | `settings` | `tenant_settings`, `module_config` | `/settings/*` |
 | `sla` | `sla_policies`, `sla_targets`, `business_hours`, `holiday_calendars` | indirect (SLA fields on tickets) |
-| `time_tracking` | `work_types`, `time_entries`, `time_rounding_rules`, `active_timers` | `/time`, `/time/new`, `/timesheets` |
+| ~~`time_tracking`~~ **(now implemented, see Update 2026-06-03)** | `work_types`, `time_entries`, `time_rounding_rules`, `active_timers` | `/time`, `/time/new`, `/timesheets` |
 
 47 of the 71 schema tables are reachable only by future placeholder
 implementations.
@@ -348,7 +364,13 @@ Pattern already exists in
 `(ConnectInfo<SocketAddr>.ip(), email)` with a quota of ~5/minute,
 applied only to `/login` inside `auth_routes()`.
 
-### F3. Fill ticket DTOs from JOINed query
+### F3. Fill ticket DTOs from JOINed query - **DONE (2026-06-03)**
+
+Implemented: `tickets/service.rs` selects via `TICKET_RESPONSE_SELECT`
+(joins statuses, priorities, queues, types, categories, companies,
+contacts, and both user roles) and builds `TicketResponse` from the
+joined row. No `String::new()` placeholders remain. Original note kept
+below for history.
 
 Highest-impact fix. Patch
 [`tickets/service.rs::list_tickets`](../src/modules/tickets/service.rs#L194)
@@ -421,7 +443,38 @@ Tables already exist. Create
 
 Postpone POST/PUT.
 
-### F8. Stand up `/api/v1/time-entries` + `/api/v1/timesheets` read
+### F8. Stand up `/api/v1/time-entries` + `/api/v1/timesheets` - **DONE (2026-06-03)**
+
+Delivered well past the original read-only scope. `time_tracking` is a
+real module mounted in `api/router.rs`, with CRUD for work types, time
+entries, timers, and rounding rules, plus timesheet aggregation. The
+Service Desk slice added on top:
+
+- **Rounding actually applied.** `apply_rounding` (floor to
+  `minimum_minutes`, then round to `increment_minutes`; exact midpoint
+  rounds up) runs on both `create_time_entry` and `stop_timer`, loading
+  the tenant default rule. Billing-critical ordering is documented on
+  the function.
+- **Rate derived from work type.** `resolve_billing` precedence:
+  explicit request rate > `work_type.default_rate` > none. `stop_timer`
+  now prices the entry instead of inserting NULL rate/total with a
+  hardcoded `is_billable = TRUE`.
+- **Approval state machine.** `POST /timesheets/:user/:week/{approve,reject}`
+  (manager+), transitioning `approval_status`; `TimesheetSummaryResponse`
+  carries a week-level `approval_status` rollup. Submit on an empty week
+  returns a zeroed summary rather than 404.
+- **Write-side tenant validation.** `create_time_entry` / `start_timer`
+  verify work-type/ticket/company belong to the tenant (FKs check
+  existence, not ownership); `stop_timer`'s company-inference query is
+  tenant-scoped; the single-active-timer race maps to `Conflict`.
+- **Tests.** `tests/time_tracking.rs` drives the two-actor happy path
+  (technician times + submits, manager approves) plus a technician
+  cannot-approve guard; `apply_rounding` / `resolve_billing` have
+  pure-fn unit tests.
+
+DTOs were ported to `mokosh-clients`/`mokosh-apps` byte-identical (5th
+shared module; `rust_decimal` added to the client with `db-postgres`
+omitted). Original note kept below for history.
 
 Same shape as F7, against `time_entries`, `active_timers`,
 `time_rounding_rules`, `work_types`. Highest-leverage of the 14
