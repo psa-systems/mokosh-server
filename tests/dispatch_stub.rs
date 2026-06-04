@@ -22,38 +22,28 @@ async fn dispatch_stub_returns_self_documenting_501(pool: PgPool) {
         .send()
         .await
         .expect("send GET /api/v1/dispatch");
-    assert_eq!(
-        resp.status().as_u16(),
-        501,
-        "dispatch stub must return 501"
-    );
+    assert_eq!(resp.status().as_u16(), 501, "dispatch stub must return 501");
     let body: serde_json::Value = resp.json().await.expect("dispatch stub JSON body");
 
     assert_eq!(body["error"], "not_implemented");
     assert_eq!(body["module"], "dispatch");
     assert_eq!(body["tracking_issue"], "PMS-58");
     assert_eq!(body["path"], "/api/v1/dispatch");
+    let tracking_url = body["tracking_url"]
+        .as_str()
+        .expect("tracking_url must be a string");
     assert!(
-        body["tracking_url"]
-            .as_str()
-            .map(|s| s.contains("PMS-58"))
-            .unwrap_or(false),
-        "tracking_url must reference the YouTrack key: {body}"
+        tracking_url.contains("PMS-58"),
+        "tracking_url must reference the YouTrack key: {tracking_url}"
     );
     let endpoints = body["planned_endpoints"]
         .as_array()
         .expect("planned_endpoints must be an array");
-    assert!(
-        !endpoints.is_empty(),
-        "planned_endpoints must list at least one entry"
-    );
+    assert!(!endpoints.is_empty(), "planned_endpoints must list at least one entry");
     for ep in endpoints {
         assert!(ep["method"].is_string(), "endpoint missing method: {ep}");
         assert!(ep["path"].is_string(), "endpoint missing path: {ep}");
-        assert!(
-            ep["summary"].is_string(),
-            "endpoint missing summary: {ep}"
-        );
+        assert!(ep["summary"].is_string(), "endpoint missing summary: {ep}");
     }
 }
 

@@ -178,10 +178,14 @@ pub fn create_api_router(
             module_stub_routes(StubModule {
                 name: "dispatch",
                 tracking_issue: "PMS-58",
-                summary: "Technician dispatch board: appointments + availability + time off + on-call for a date range.",
-                planned_endpoints: &[
-                    ("GET", "/api/v1/dispatch", "Aggregated dispatch view for a date range and optional assignee filter."),
-                ],
+                summary: "Technician dispatch board: appointments + availability + \
+                          time off + on-call for a date range.",
+                planned_endpoints: &[(
+                    "GET",
+                    "/api/v1/dispatch",
+                    "Aggregated dispatch view for a date range and optional \
+                     assignee filter.",
+                )],
             }),
         )
         // Contracts: contracts + items + hour balances + rate cards. PMS-65.
