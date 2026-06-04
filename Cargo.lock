@@ -2044,6 +2044,7 @@ dependencies = [
  "moka",
  "mokosh-auth",
  "mokosh-auth-crypto",
+ "mokosh-types",
  "pulldown-cmark",
  "rand 0.9.4",
  "regex",
@@ -2063,6 +2064,18 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "uuid",
+ "validator",
+]
+
+[[package]]
+name = "mokosh-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
  "uuid",
  "validator",
 ]
