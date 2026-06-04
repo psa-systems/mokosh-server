@@ -167,7 +167,23 @@ pub fn create_api_router(
         // time-off, on-call. PMS-59. Mounted via merge so the routes
         // appear at their natural top-level paths.
         .merge(calendar_routes(calendar_service))
-        .nest("/dispatch", stub_routes())
+        // Dispatch view (technician scheduling board). Not yet
+        // implemented; the calendar story (PMS-58) owns the
+        // aggregating endpoint that combines appointments,
+        // availability, time off, and on-call coverage. Returns a
+        // self-documenting 501 listing the planned shape so an
+        // integrator hitting it early sees something useful.
+        .nest(
+            "/dispatch",
+            module_stub_routes(StubModule {
+                name: "dispatch",
+                tracking_issue: "PMS-58",
+                summary: "Technician dispatch board: appointments + availability + time off + on-call for a date range.",
+                planned_endpoints: &[
+                    ("GET", "/api/v1/dispatch", "Aggregated dispatch view for a date range and optional assignee filter."),
+                ],
+            }),
+        )
         // Contracts: contracts + items + hour balances + rate cards. PMS-65.
         .merge(contracts_routes(contracts_service))
         // SLA: policies, targets, business hours, holidays, evaluator. PMS-107.
@@ -294,34 +310,67 @@ async fn version_info() -> Json<VersionInfo> {
     Json(VersionInfo::current())
 }
 
-/// Stub routes for modules not yet implemented. Audit F12: previously
-/// returned a generic "Not implemented yet"; now responds with a JSON
-/// envelope that names the requested path and points at the audit
-/// findings, so an early integration attempt sees something useful in
-/// the response body instead of a hand-wave.
-fn stub_routes<S>() -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    Router::new()
-        .route("/", get(not_implemented))
-        .route("/{id}", get(not_implemented))
+/// Metadata describing a placeholder module surface. Used to render a
+/// self-documenting 501 body (F12 / PMS-125) so an integrator hitting
+/// an unimplemented endpoint learns the module name, the YouTrack
+/// issue tracking the implementation, and the planned endpoint shape
+/// without having to grep the source.
+#[derive(Clone, Copy)]
+struct StubModule {
+    /// Module slug as it appears in the URL (e.g. `dispatch`).
+    name: &'static str,
+    /// YouTrack key tracking the implementation (e.g. `PMS-58`).
+    tracking_issue: &'static str,
+    /// One-line description of the module's purpose.
+    summary: &'static str,
+    /// Planned endpoints as `(method, path, summary)`.
+    planned_endpoints: &'static [(&'static str, &'static str, &'static str)],
 }
 
-async fn not_implemented(
+/// Build a router that responds with a self-documenting 501 for every
+/// request under the module's mount point. Replaces the previous
+/// generic `Not implemented yet` body (audit F12 / PMS-125). The
+/// catch-all route uses Axum's `{*rest}` wildcard so sub-paths under
+/// the module also surface the same payload instead of falling
+/// through to a 404.
+fn module_stub_routes(meta: StubModule) -> Router {
+    Router::new()
+        .route("/", get(stub_handler))
+        .route("/{*rest}", get(stub_handler))
+        .with_state(meta)
+}
+
+async fn stub_handler(
+    axum::extract::State(meta): axum::extract::State<StubModule>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> (
-    axum::http::StatusCode,
-    [(axum::http::HeaderName, &'static str); 1],
-    String,
-) {
-    let body = format!(
-        r#"{{"error":"not_implemented","path":"{}","note":"This module is on the post-OAuth backlog. See dev-docs/codebase-state.md for the audit-tracked module list."}}"#,
-        uri.path()
-    );
+) -> impl IntoResponse {
+    let endpoints: Vec<serde_json::Value> = meta
+        .planned_endpoints
+        .iter()
+        .map(|(method, path, summary)| {
+            serde_json::json!({
+                "method": method,
+                "path": path,
+                "summary": summary,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "error": "not_implemented",
+        "module": meta.name,
+        "path": uri.path(),
+        "summary": meta.summary,
+        "tracking_issue": meta.tracking_issue,
+        "tracking_url": format!(
+            "https://niceguyit.myjetbrains.com/youtrack/issue/{}",
+            meta.tracking_issue
+        ),
+        "planned_endpoints": endpoints,
+        "docs": "dev-docs/codebase-state.md",
+    });
     (
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body,
+        StatusCode::NOT_IMPLEMENTED,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
     )
 }
