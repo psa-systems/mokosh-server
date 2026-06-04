@@ -72,11 +72,13 @@ async fn list_companies(
         .list_companies(user.tenant_id, &filter, &pagination)
         .await?;
 
-    let response = PaginatedResponse::from_params(
-        companies.into_iter().map(CompanyResponse::from).collect(),
-        &pagination,
-        total,
-    );
+    let responses: Vec<CompanyResponse> =
+        companies.into_iter().map(CompanyResponse::from).collect();
+    let enriched = state
+        .contact_service
+        .enrich_companies(user.tenant_id, responses)
+        .await?;
+    let response = PaginatedResponse::from_params(enriched, &pagination, total);
 
     Ok(Json(response))
 }
@@ -106,7 +108,14 @@ async fn get_company(
         .get_company(user.tenant_id, company_id)
         .await?;
 
-    Ok(Json(company.into()))
+    let enriched = state
+        .contact_service
+        .enrich_companies(user.tenant_id, vec![CompanyResponse::from(company)])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::utils::error::AppError::NotFound("Company".to_string()))?;
+    Ok(Json(enriched))
 }
 
 async fn update_company(
