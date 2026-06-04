@@ -57,6 +57,19 @@ impl TestApp {
 
 /// Bring up the API against `pool` on a random localhost port.
 pub async fn boot(pool: PgPool) -> TestApp {
+    // Route the server's tracing events to libtest's per-thread capture so
+    // a failing test surfaces the real cause in its panic output (e.g. the
+    // sqlx error swallowed by `AppError::Database("Database operation
+    // failed")` in `src/utils/error.rs`). `try_init` because concurrent
+    // tests in the same binary share the global subscriber.
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error,mokosh_server=info")),
+        )
+        .try_init();
+
     let db = Database::from_pool(pool.clone());
 
     // Stub Google OAuth client - tests never drive the Google flow.
