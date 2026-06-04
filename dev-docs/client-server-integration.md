@@ -29,14 +29,24 @@ hide.
 
 Both repos define types under `src/modules/<module>/models.rs`. As of
 2026-05-06 the four real-module trees are **byte-identical** between
-this repo and `mokosh-clients`:
+this repo and `mokosh-clients`; a fifth (`time_tracking`) was added
+byte-identical on 2026-06-03:
 
 ```
 src/modules/auth/{mod,models,routes,service,middleware,bootstrap}.rs
 src/modules/contacts/{mod,models,routes,service}.rs
 src/modules/tenants/{mod,models,routes,service}.rs
 src/modules/tickets/{mod,models,routes,service,automation}.rs
+src/modules/time_tracking/{mod,models,routes,service}.rs
 ```
+
+`time_tracking/mod.rs` was converted to the gated shared convention
+(`#[cfg(feature = "server")] mod routes; mod service;`) so the WASM
+client compiles only `models`. The client gained a `rust_decimal`
+dependency (`features = ["serde"]`, `db-postgres` omitted) for the
+money/rate fields. Per the recommendation below, a fifth shared module
+is the trigger to move from copy-paste to a shared crate - tracked as a
+follow-up; the 2026-06-03 port was a manual copy to ship the slice.
 
 Each `mod.rs` uses `#[cfg(feature = "server")]` so the WASM build
 omits the handler / service / middleware / bootstrap files and keeps
@@ -71,7 +81,7 @@ repo is on the hook for.
 | 1 | Auth (`/login`, `/forgot-password`, `/reset-password/:token`) | real `/api/v1/auth/*` (14 endpoints) | `users`, `user_sessions`, `password_reset_tokens` | yes | F2 (rate limit), email send | P0 |
 | 2 | Dashboard | no aggregate endpoint yet | covers many tables | n/a | future `/reports/dashboard` aggregate | P3 |
 | 3 | Tickets list / new / detail / notes | real `/api/v1/tickets/*` (11 endpoints) but DTOs return empty status / priority / company / contact / assignee names | `tickets`, `ticket_notes`, `ticket_statuses`, etc. | yes | **F3** (DTO joins), F11 (automation) | P1 |
-| 4 | Time tracking (`/time`, `/timesheets`) | 501 (placeholder) | `time_entries`, `active_timers`, `time_rounding_rules`, `work_types` | n/a | F8 (`time_tracking` module) | P1 |
+| 4 | Time tracking (`/time`, `/timesheets`) | **real** `/api/v1/{work-types,time-entries,timesheets,timers,time-rounding-rules}` (rounding applied, rate derived, manager approve/reject, tenant-scoped) | `time_entries`, `active_timers`, `time_rounding_rules`, `work_types` | yes (ported 2026-06-03) | F8 done | P1 |
 | 5 | Projects (`/projects`, `/projects/:id/tasks`) | 501 | `projects`, `project_phases`, `task_statuses`, `tasks`, `task_dependencies` | n/a | `projects` module | P1 |
 | 6 | Contacts + Companies | real `/api/v1/contacts/*` (16 endpoints) but `update_site` is a silent no-op | `companies`, `contacts`, `sites` | yes | **F4** (`update_site` fix) | P1 |
 | 7 | Calendar / Dispatch | 501 | `appointments`, `user_availability`, `time_off`, `on_call_schedules` | n/a | `calendar` module | P2 |

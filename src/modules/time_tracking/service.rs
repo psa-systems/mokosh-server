@@ -232,10 +232,27 @@ impl TimeTrackingService {
         tenant_id: Uuid,
         request: &CreateTimeEntryRequest,
     ) -> AppResult<TimeEntryResponse> {
-        let duration = Self::compute_minutes(request)?;
-        let total = request
-            .hourly_rate
-            .map(|r| r * Decimal::from(duration) / Decimal::from(60));
+        let pool = self.db.pool();
+        // Write-side tenant validation: FKs check existence, not ownership,
+        // so a request body could otherwise attach time to another tenant's
+        // work type / ticket / company.
+        let defaults = fetch_work_type_defaults(pool, tenant_id, request.work_type_id).await?;
+        assert_company_in_tenant(pool, tenant_id, request.company_id).await?;
+        if let Some(ticket_id) = request.ticket_id {
+            assert_ticket_in_tenant(pool, tenant_id, ticket_id).await?;
+        }
+
+        let raw = Self::compute_minutes(request)?;
+        let duration = match default_rounding_rule(pool, tenant_id).await? {
+            Some(rule) => apply_rounding(raw, &rule),
+            None => raw,
+        };
+        let (hourly_rate, total) = resolve_billing(
+            request.hourly_rate,
+            request.is_billable,
+            &defaults,
+            duration,
+        );
         let id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -259,9 +276,9 @@ impl TimeTrackingService {
         .bind(request.company_id)
         .bind(&request.notes)
         .bind(request.is_billable)
-        .bind(request.hourly_rate)
+        .bind(hourly_rate)
         .bind(total)
-        .execute(self.db.pool())
+        .execute(pool)
         .await?;
         self.get_time_entry(tenant_id, id).await
     }
@@ -395,7 +412,12 @@ impl TimeTrackingService {
                 SUM(duration_minutes)::bigint AS total_minutes,
                 SUM(CASE WHEN is_billable THEN duration_minutes ELSE 0 END)::bigint
                     AS billable_minutes,
-                COUNT(*)::bigint AS entry_count
+                COUNT(*)::bigint AS entry_count,
+                CASE
+                    WHEN BOOL_OR(approval_status = 'rejected') THEN 'rejected'
+                    WHEN BOOL_AND(approval_status = 'approved') THEN 'approved'
+                    ELSE 'pending'
+                END AS approval_status
             FROM time_entries
             WHERE {where_clause}
             GROUP BY user_id, DATE_TRUNC('week', date)
@@ -426,12 +448,13 @@ impl TimeTrackingService {
         user_id: Uuid,
         week_start: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
-        // Anchor to Monday (ISO week start).
-        let anchor =
-            week_start - chrono::Duration::days(week_start.weekday().num_days_from_monday() as i64);
+        let anchor = monday_anchor(week_start);
         let week_end = anchor + chrono::Duration::days(7);
 
-        let affected = sqlx::query(
+        // Move every non-approved entry in the week to 'pending'. An empty or
+        // already-approved week is not an error (decision: zeroed-summary
+        // everywhere); we just return the current week summary.
+        sqlx::query(
             r#"
             UPDATE time_entries
             SET approval_status = 'pending',
@@ -448,25 +471,114 @@ impl TimeTrackingService {
         .bind(anchor)
         .bind(week_end)
         .execute(self.db.pool())
-        .await?
-        .rows_affected();
+        .await?;
 
-        if affected == 0 {
-            return Err(AppError::NotFound(
-                "Timesheet (no editable entries in that week)".to_string(),
-            ));
-        }
+        self.week_summary(tenant_id, user_id, anchor).await
+    }
 
-        // Return the recomputed week summary.
+    /// Approve every pending entry in the user's week. Manager+ only
+    /// (enforced at the route). Idempotent: re-approving an approved week is
+    /// a no-op that returns the same summary.
+    pub async fn approve_timesheet(
+        &self,
+        tenant_id: Uuid,
+        approver_id: Uuid,
+        user_id: Uuid,
+        week_start: NaiveDate,
+    ) -> AppResult<TimesheetSummaryResponse> {
+        let anchor = monday_anchor(week_start);
+        let week_end = anchor + chrono::Duration::days(7);
+        sqlx::query(
+            r#"
+            UPDATE time_entries
+            SET approval_status = 'approved',
+                approved_by_id  = $5,
+                approved_at     = NOW(),
+                updated_at      = NOW()
+            WHERE tenant_id = $1
+              AND user_id   = $2
+              AND date     >= $3
+              AND date      < $4
+              AND approval_status = 'pending'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(anchor)
+        .bind(week_end)
+        .bind(approver_id)
+        .execute(self.db.pool())
+        .await?;
+        self.week_summary(tenant_id, user_id, anchor).await
+    }
+
+    /// Reject every pending entry in the user's week with a reason. Manager+
+    /// only (enforced at the route).
+    pub async fn reject_timesheet(
+        &self,
+        tenant_id: Uuid,
+        reviewer_id: Uuid,
+        user_id: Uuid,
+        week_start: NaiveDate,
+        reason: &str,
+    ) -> AppResult<TimesheetSummaryResponse> {
+        let anchor = monday_anchor(week_start);
+        let week_end = anchor + chrono::Duration::days(7);
+        // approved_by_id here records the LAST REVIEWER, not "the approver".
+        // No consumer reads time_entries.approved_by_id as an approval flag
+        // (verified: only calendar.time_off reads a column of that name), so
+        // setting it on a rejection is safe and captures who reviewed.
+        sqlx::query(
+            r#"
+            UPDATE time_entries
+            SET approval_status  = 'rejected',
+                rejection_reason = $5,
+                approved_by_id   = $6,
+                approved_at      = NOW(),
+                updated_at       = NOW()
+            WHERE tenant_id = $1
+              AND user_id   = $2
+              AND date     >= $3
+              AND date      < $4
+              AND approval_status = 'pending'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(anchor)
+        .bind(week_end)
+        .bind(reason)
+        .bind(reviewer_id)
+        .execute(self.db.pool())
+        .await?;
+        self.week_summary(tenant_id, user_id, anchor).await
+    }
+
+    /// Current week summary for a user, or a zeroed `pending` summary when the
+    /// week has no entries. Keeps submit/approve/reject responses consistent
+    /// on empty weeks (no 404s).
+    async fn week_summary(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        anchor: NaiveDate,
+    ) -> AppResult<TimesheetSummaryResponse> {
         let filter = TimesheetFilter {
             user_id: Some(user_id),
             week: Some(anchor),
         };
         let summaries = self.list_timesheets(tenant_id, &filter).await?;
-        summaries
+        Ok(summaries
             .into_iter()
             .find(|s| s.user_id == user_id && s.week_start == anchor)
-            .ok_or_else(|| AppError::NotFound("Timesheet".to_string()))
+            .unwrap_or_else(|| TimesheetSummaryResponse {
+                user_id,
+                week_start: anchor,
+                total_minutes: 0,
+                billable_minutes: 0,
+                entry_count: 0,
+                approval_status: "pending".to_string(),
+            }))
     }
 
     // ========================================================================
@@ -508,19 +620,34 @@ impl TimeTrackingService {
         // UNIQUE(user_id) on active_timers means we either upsert or
         // reject. We reject so the user explicitly stops + re-starts;
         // silent replacement loses the prior elapsed time.
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM active_timers WHERE user_id = $1)")
-                .bind(user_id)
-                .fetch_one(self.db.pool())
-                .await?;
+        let pool = self.db.pool();
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM active_timers WHERE tenant_id = $1 AND user_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
         if exists {
             return Err(AppError::Conflict(
                 "User already has an active timer; stop it first".to_string(),
             ));
         }
 
+        // Validate any supplied references belong to the tenant before we
+        // persist a timer that points at them.
+        if let Some(ticket_id) = request.ticket_id {
+            assert_ticket_in_tenant(pool, tenant_id, ticket_id).await?;
+        }
+        if let Some(company_id) = request.company_id {
+            assert_company_in_tenant(pool, tenant_id, company_id).await?;
+        }
+        if let Some(work_type_id) = request.work_type_id {
+            fetch_work_type_defaults(pool, tenant_id, work_type_id).await?;
+        }
+
         let id = Uuid::new_v4();
-        let started_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        let started_at: chrono::DateTime<Utc> = match sqlx::query_scalar(
             r#"
             INSERT INTO active_timers
                 (id, tenant_id, user_id, ticket_id, project_id, company_id,
@@ -537,8 +664,20 @@ impl TimeTrackingService {
         .bind(request.company_id)
         .bind(request.work_type_id)
         .bind(&request.notes)
-        .fetch_one(self.db.pool())
-        .await?;
+        .fetch_one(pool)
+        .await
+        {
+            Ok(ts) => ts,
+            // TOCTOU: another request may have inserted between the exists
+            // check above and here. UNIQUE(user_id) backs us; surface the
+            // race as a clean Conflict instead of a raw 500.
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                return Err(AppError::Conflict(
+                    "User already has an active timer; stop it first".to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         Ok(ActiveTimerResponse {
             id,
@@ -573,7 +712,7 @@ impl TimeTrackingService {
         };
 
         let now = Utc::now();
-        let duration = (now - timer.started_at).num_minutes().max(1) as i32;
+        let raw = (now - timer.started_at).num_minutes().max(1) as i32;
 
         // Active timer might not carry work_type_id / company_id; the
         // schema requires both on time_entries. Fall back to first
@@ -595,16 +734,30 @@ impl TimeTrackingService {
         };
         let company_id = match timer.company_id {
             Some(v) => v,
-            None => sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM tickets WHERE id = $1")
-                .bind(timer.ticket_id.unwrap_or(Uuid::nil()))
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| {
-                    AppError::BadRequest(
-                        "Cannot stop timer without an inferable company_id".to_string(),
-                    )
-                })?,
+            None => sqlx::query_scalar::<_, Uuid>(
+                "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(timer.ticket_id.unwrap_or(Uuid::nil()))
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Cannot stop timer without an inferable company_id".to_string(),
+                )
+            })?,
         };
+
+        // Derive billing from the resolved, tenant-scoped work type and apply
+        // the tenant default rounding rule to the elapsed minutes, so a
+        // stopped timer is priced consistently with a manual entry.
+        let defaults = fetch_work_type_defaults(&mut *tx, tenant_id, work_type_id).await?;
+        let duration = match default_rounding_rule(&mut *tx, tenant_id).await? {
+            Some(rule) => apply_rounding(raw, &rule),
+            None => raw,
+        };
+        let (hourly_rate, total) =
+            resolve_billing(None, defaults.default_billable, &defaults, duration);
 
         let entry_id = Uuid::new_v4();
         sqlx::query(
@@ -612,9 +765,9 @@ impl TimeTrackingService {
             INSERT INTO time_entries (
                 id, tenant_id, user_id, date, start_time, end_time,
                 duration_minutes, work_type_id, ticket_id, project_id,
-                company_id, notes, is_billable
+                company_id, notes, is_billable, hourly_rate, total_amount
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
             )
             "#,
         )
@@ -630,6 +783,9 @@ impl TimeTrackingService {
         .bind(timer.project_id)
         .bind(company_id)
         .bind(&timer.notes)
+        .bind(defaults.default_billable)
+        .bind(hourly_rate)
+        .bind(total)
         .execute(&mut *tx)
         .await?;
 
@@ -778,6 +934,182 @@ impl TimeTrackingService {
     }
 }
 
+// ============================================================================
+// Shared resolve helpers (tenant validation + billing derivation + rounding)
+// ============================================================================
+
+struct WorkTypeDefaults {
+    default_rate: Option<Decimal>,
+    default_billable: bool,
+}
+
+/// Tenant-scoped work-type fetch returning its billing defaults. `NotFound`
+/// when the work type does not belong to `tenant_id` - this doubles as
+/// write-side tenant validation, closing the cross-tenant attach vector
+/// (FKs check existence, not ownership).
+async fn fetch_work_type_defaults<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    work_type_id: Uuid,
+) -> AppResult<WorkTypeDefaults>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<(Option<Decimal>, bool)> = sqlx::query_as::<_, (Option<Decimal>, bool)>(
+        r#"
+        SELECT default_rate, COALESCE(default_billable, TRUE) AS default_billable
+        FROM work_types
+        WHERE tenant_id = $1 AND id = $2
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(work_type_id)
+    .fetch_optional(exec)
+    .await?;
+    let (default_rate, default_billable) =
+        row.ok_or_else(|| AppError::NotFound("WorkType".to_string()))?;
+    Ok(WorkTypeDefaults {
+        default_rate,
+        default_billable,
+    })
+}
+
+/// Assert a ticket belongs to the tenant; return its `company_id` so the
+/// caller can both validate and infer company. `NotFound` cross-tenant.
+async fn assert_ticket_in_tenant<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    ticket_id: Uuid,
+) -> AppResult<Uuid>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar::<_, Uuid>("SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(exec)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Ticket".to_string()))
+}
+
+/// Assert a company belongs to the tenant. `NotFound` cross-tenant.
+async fn assert_company_in_tenant<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    company_id: Uuid,
+) -> AppResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_optional(exec)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Company".to_string()))
+}
+
+/// Anchor a date to the Monday of its ISO week.
+fn monday_anchor(d: NaiveDate) -> NaiveDate {
+    d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64)
+}
+
+struct RoundingParams {
+    increment_minutes: i32,
+    minimum_minutes: i32,
+    method: String,
+}
+
+/// Apply a tenant rounding rule to a raw duration.
+///
+/// BILLING-CRITICAL: the order below is load-bearing. Once entries are billed
+/// against it, changing this re-prices every entry billed after the change.
+/// Do not reorder without a re-pricing migration.
+///
+/// 1. Floor to `minimum_minutes` first (a 3-min call on a 15-min floor
+///    bills 15).
+/// 2. Round the floored value to `increment_minutes` per `method`.
+///
+/// Tie-break: an exact midpoint rounds UP (bill-favorable, MSP convention).
+/// `increment_minutes <= 0` is treated as no increment rounding (floor only).
+fn apply_rounding(raw_minutes: i32, rule: &RoundingParams) -> i32 {
+    let floored = raw_minutes.max(rule.minimum_minutes);
+    let inc = rule.increment_minutes;
+    if inc <= 0 {
+        return floored;
+    }
+    let r = floored % inc;
+    if r == 0 {
+        return floored;
+    }
+    let down = floored - r;
+    match rule.method.as_str() {
+        "down" => down,
+        "up" => down + inc,
+        // `r * 2 >= inc` makes an exact midpoint round up.
+        "nearest" => {
+            if r * 2 >= inc {
+                down + inc
+            } else {
+                down
+            }
+        }
+        // Unreachable: method validated at rule-write (validate_rounding_method).
+        _ => floored,
+    }
+}
+
+/// Tenant default rounding rule, if one is configured. `None` => identity
+/// (raw minutes, no rounding). Missing-rule = identity is a deliberate M1
+/// choice; tracked as debt, not a silent gap.
+async fn default_rounding_rule<'e, E>(exec: E, tenant_id: Uuid) -> AppResult<Option<RoundingParams>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<(i32, i32, String)> = sqlx::query_as::<_, (i32, i32, String)>(
+        r#"
+        SELECT increment_minutes, COALESCE(minimum_minutes, 0), rounding_method
+        FROM time_rounding_rules
+        WHERE tenant_id = $1 AND is_default = TRUE
+        LIMIT 1
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(exec)
+    .await?;
+    Ok(row.map(
+        |(increment_minutes, minimum_minutes, method)| RoundingParams {
+            increment_minutes,
+            minimum_minutes,
+            method,
+        },
+    ))
+}
+
+/// Resolve the billable rate and total for an entry.
+///
+/// Rate precedence (locked, documented so an edited rate is never silently
+/// overwritten by the derive step):
+///   explicit request hourly_rate  >  work_type.default_rate  >  None
+/// `total_amount` is computed only when the entry is billable.
+fn resolve_billing(
+    explicit_rate: Option<Decimal>,
+    is_billable: bool,
+    defaults: &WorkTypeDefaults,
+    minutes: i32,
+) -> (Option<Decimal>, Option<Decimal>) {
+    let rate = explicit_rate.or(defaults.default_rate);
+    let total = if is_billable {
+        rate.map(|r| r * Decimal::from(minutes) / Decimal::from(60))
+    } else {
+        None
+    };
+    (rate, total)
+}
+
 #[derive(sqlx::FromRow)]
 struct WorkTypeRow {
     id: Uuid,
@@ -857,6 +1189,7 @@ struct TimesheetRow {
     total_minutes: i64,
     billable_minutes: i64,
     entry_count: i64,
+    approval_status: String,
 }
 
 impl From<TimesheetRow> for TimesheetSummaryResponse {
@@ -867,6 +1200,7 @@ impl From<TimesheetRow> for TimesheetSummaryResponse {
             total_minutes: r.total_minutes,
             billable_minutes: r.billable_minutes,
             entry_count: r.entry_count,
+            approval_status: r.approval_status,
         }
     }
 }
@@ -918,5 +1252,75 @@ impl From<RoundingRuleRow> for TimeRoundingRuleResponse {
             minimum_minutes: r.minimum_minutes.unwrap_or(0),
             is_default: r.is_default.unwrap_or(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(increment_minutes: i32, minimum_minutes: i32, method: &str) -> RoundingParams {
+        RoundingParams {
+            increment_minutes,
+            minimum_minutes,
+            method: method.to_string(),
+        }
+    }
+
+    #[test]
+    fn rounding_floor_applies_before_increment() {
+        // 3 raw minutes, 15-min floor, round up to 15-min increment -> 15.
+        assert_eq!(apply_rounding(3, &rule(15, 15, "up")), 15);
+        // Floor alone lifts a sub-minimum value even with method "down".
+        assert_eq!(apply_rounding(3, &rule(15, 15, "down")), 15);
+    }
+
+    #[test]
+    fn rounding_up_rounds_partial_increment_up() {
+        assert_eq!(apply_rounding(16, &rule(15, 0, "up")), 30);
+        // Exact multiples are untouched.
+        assert_eq!(apply_rounding(30, &rule(15, 0, "up")), 30);
+    }
+
+    #[test]
+    fn rounding_down_truncates_to_increment() {
+        assert_eq!(apply_rounding(29, &rule(15, 0, "down")), 15);
+        assert_eq!(apply_rounding(14, &rule(15, 0, "down")), 0);
+    }
+
+    #[test]
+    fn rounding_nearest_midpoint_rounds_up() {
+        // Exact midpoint (7.5 of 15) rounds UP per the locked tie-break.
+        assert_eq!(apply_rounding(8, &rule(15, 0, "nearest")), 15);
+        // Just below midpoint rounds down.
+        assert_eq!(apply_rounding(7, &rule(15, 0, "nearest")), 0);
+        // Just above midpoint rounds up.
+        assert_eq!(apply_rounding(23, &rule(15, 0, "nearest")), 30);
+    }
+
+    #[test]
+    fn rounding_zero_increment_is_floor_only() {
+        assert_eq!(apply_rounding(7, &rule(0, 15, "up")), 15);
+        assert_eq!(apply_rounding(40, &rule(0, 15, "up")), 40);
+    }
+
+    #[test]
+    fn resolve_billing_rate_precedence() {
+        let defaults = WorkTypeDefaults {
+            default_rate: Some(Decimal::from(100)),
+            default_billable: true,
+        };
+        // Explicit rate wins over the work-type default.
+        let (rate, total) = resolve_billing(Some(Decimal::from(150)), true, &defaults, 60);
+        assert_eq!(rate, Some(Decimal::from(150)));
+        assert_eq!(total, Some(Decimal::from(150)));
+        // Falls back to the work-type default when no explicit rate.
+        let (rate, total) = resolve_billing(None, true, &defaults, 30);
+        assert_eq!(rate, Some(Decimal::from(100)));
+        assert_eq!(total, Some(Decimal::from(50)));
+        // Non-billable never produces a total, even with a known rate.
+        let (rate, total) = resolve_billing(None, false, &defaults, 60);
+        assert_eq!(rate, Some(Decimal::from(100)));
+        assert_eq!(total, None);
     }
 }
