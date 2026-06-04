@@ -113,12 +113,13 @@ async fn dispatch_respects_preferences_and_worker_marks_sent(pool: PgPool) {
     // Exactly one row: the in_app fan-out. The email fan-out for this
     // user is suppressed by the preference; the rule has no standalone
     // emails so no recipient-only row gets written either.
-    let rows: Vec<(
+    type NotifRow = (
         Uuid,
         String,
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
-    )> = sqlx::query_as(
+    );
+    let rows: Vec<NotifRow> = sqlx::query_as(
         r#"
         SELECT id, channel_type, status, sent_at
         FROM notifications
