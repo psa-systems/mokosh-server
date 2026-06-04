@@ -15,8 +15,8 @@
 #
 # The project name is intentionally NOT redefined here. The base
 # compose.dev.yml already sets `name: dev-mokosh` and binds an explicit
-# non-prefixed network name (`dev-mokosh-private`); overriding the
-# project name would make compose see that network as foreign and
+# per-developer network name (`dev-mokosh-private-${USER}`); overriding
+# the project name would make compose see that network as foreign and
 # refuse to start. Per-developer isolation lives in container_name +
 # Traefik label keys, not in the project name.
 
@@ -81,16 +81,19 @@ services:
       MOKOSH_PUBLIC_SIGNUP_ENABLED: "true"
 
 networks:
-  # The base compose.dev.yml normally owns and creates this network.
-  # We mark it external here so the overlay only ATTACHES rather than
-  # re-claiming ownership. Without this, compose refuses if the network
-  # exists with labels it doesn't recognise (e.g. from a prior
-  # project-name churn, or because another developer's worktree owns
-  # the same shared `name: dev-mokosh-private`). The just recipe runs
-  # `docker network create` defensively so a fresh host also works.
+  # The base compose.dev.yml owns and creates this network as
+  # `dev-mokosh-private-${USER}` (per-developer). The name here MUST
+  # match that exactly: if it drifts (e.g. a non-suffixed
+  # `dev-mokosh-private`), the overlay attaches the server to a
+  # different network than the one Postgres + the other deps sit on, so
+  # the server can no longer resolve `postgres` and crash-loops on the
+  # DB connect. We mark it external here so the overlay only ATTACHES
+  # rather than re-claiming ownership; because external means compose
+  # will NOT create it, `just ensure-private-network` creates the same
+  # per-user name defensively so a fresh host also works.
   private:
     external: true
-    name: dev-mokosh-private
+    name: dev-mokosh-private-${USER}
   traefik-public:
     name: network-traefik-public
     external: true

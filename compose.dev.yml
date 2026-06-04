@@ -309,8 +309,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      infisical:
-        condition: service_healthy
+      # NB: no dependency on infisical. The mokosh-server binary never
+      # reads Infisical at startup (only the one-shot mokosh-bootstrap
+      # CLI does), and Infisical is now opt-in behind the `infisical`
+      # compose profile. A hard depends_on a profiled-out service makes
+      # compose reject the whole project ("depends on undefined service
+      # infisical") for every `just dev` / `just dev-sso` / `just down`.
       mailpit:
         # No healthcheck on mailpit; it accepts SMTP from cold start.
         # Wait for the container to be running, not healthy.
