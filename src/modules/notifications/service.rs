@@ -323,6 +323,7 @@ impl NotificationsService {
     /// addition to whatever the rule lists, with de-dup):
     ///   * `recipient_user_id`  - single UUID, fan-out as a user row
     ///   * `recipient_email`    - single string, fan-out as a recipient-only row
+    ///
     /// Transactional events (password reset, welcome, ticket note) keep
     /// their rule.recipients empty and pass the user via context, so the
     /// rule is reusable across tenants without rewriting recipient lists.
