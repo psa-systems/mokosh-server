@@ -127,6 +127,12 @@ pub async fn boot(pool: PgPool) -> TestApp {
 
 /// Seed a super_admin user under the default tenant. Returns
 /// `(user_id, email, plaintext_password)` so the test can drive `/login`.
+///
+/// `#[allow(dead_code)]` because each integration-test binary compiles
+/// its own copy of `common::` and clippy's per-binary dead-code analysis
+/// fires for binaries that exercise the API without authenticating
+/// (e.g. `tests/dispatch_stub.rs` hits an unauthenticated stub).
+#[allow(dead_code)]
 pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     let email = "test-admin@example.com".to_string();
     let password = "test-password-12345".to_string();
@@ -158,6 +164,10 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
 /// caller should attach as `Authorization: Bearer ...` on subsequent
 /// requests. Panics on a non-2xx login because tests that get this far
 /// already seeded a valid admin.
+///
+/// `#[allow(dead_code)]` for the same per-binary reason as
+/// [`seed_admin`]: not every integration-test binary authenticates.
+#[allow(dead_code)]
 pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
     let resp = app
         .client
