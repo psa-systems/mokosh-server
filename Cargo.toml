@@ -188,7 +188,9 @@ google-oauth-flow = { path = "crates/google-oauth-flow" }
 mokosh-types = { path = "crates/mokosh-types" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `test-util` exposes `tokio::time::{pause, advance, resume}` for
+# deterministic virtual-clock tests (used by tests/scheduler.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
 # Integration-test HTTP client. Tests pull the bearer token out of the
 # login JSON body and attach it via `.bearer_auth(&token)` on each call,
