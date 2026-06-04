@@ -45,9 +45,7 @@ struct StaticProvider {
 
 #[async_trait]
 impl RmmProvider for StaticProvider {
-    async fn list_devices(
-        &self,
-    ) -> mokosh_server::utils::error::AppResult<Vec<ProviderDevice>> {
+    async fn list_devices(&self) -> mokosh_server::utils::error::AppResult<Vec<ProviderDevice>> {
         Ok(self.devices.clone())
     }
     async fn list_alerts(
@@ -89,7 +87,10 @@ async fn sync_writes_mapping_asset_audit_and_status(pool: PgPool) {
         .expect("sync_one");
     assert_eq!(stats.devices_seen, 1);
     assert_eq!(stats.mappings_upserted, 1);
-    assert_eq!(stats.assets_created, 1, "asset should be auto-created when mapping has company_id");
+    assert_eq!(
+        stats.assets_created, 1,
+        "asset should be auto-created when mapping has company_id"
+    );
 
     // Mapping promoted to synced + linked to the new asset.
     let (asset_id, sync_status): (Option<Uuid>, Option<String>) = sqlx::query_as(
@@ -127,7 +128,9 @@ async fn sync_writes_mapping_asset_audit_and_status(pool: PgPool) {
     .await
     .expect("read audit");
     assert!(
-        audit_actions.iter().any(|(a,)| a == "created" || a == "synced"),
+        audit_actions
+            .iter()
+            .any(|(a,)| a == "created" || a == "synced"),
         "audit log should have a created/synced row, got {audit_actions:?}",
     );
 
@@ -173,9 +176,19 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
     .await;
 
     // 1. critical alert -> ticket should land via TicketService.
-    let critical = build_alert(conn_id, "device-A", "cpu_high", "High CPU", Some("critical"));
+    let critical = build_alert(
+        conn_id,
+        "device-A",
+        "cpu_high",
+        "High CPU",
+        Some("critical"),
+    );
     let resp = post_alert(&app, secret, &critical).await;
-    assert!(resp.status().is_success(), "first alert should ingest, got {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "first alert should ingest, got {}",
+        resp.status()
+    );
 
     let ticket_count_after_first: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND source = 'rmm'")
@@ -183,7 +196,10 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
             .fetch_one(&pool)
             .await
             .expect("count tickets");
-    assert_eq!(ticket_count_after_first, 1, "critical alert should create exactly one ticket");
+    assert_eq!(
+        ticket_count_after_first, 1,
+        "critical alert should create exactly one ticket"
+    );
 
     let (title, description, ticket_number): (String, Option<String>, String) = sqlx::query_as(
         "SELECT title, description, ticket_number FROM tickets WHERE tenant_id = $1 AND source = 'rmm'",
@@ -192,7 +208,10 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
     .fetch_one(&pool)
     .await
     .expect("read ticket");
-    assert_eq!(title, "CPU pressure on device-A", "ticket title should be rendered from template");
+    assert_eq!(
+        title, "CPU pressure on device-A",
+        "ticket title should be rendered from template"
+    );
     assert_eq!(
         description.as_deref(),
         Some("Alert: High CPU (critical)"),
@@ -206,14 +225,21 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
     // 2. low alert -> dropped by suppression.
     let low = build_alert(conn_id, "device-A", "cpu_high", "Mild CPU", Some("low"));
     let resp = post_alert(&app, secret, &low).await;
-    assert!(resp.status().is_success(), "low alert should ingest cleanly, got {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "low alert should ingest cleanly, got {}",
+        resp.status()
+    );
     let count_after_low: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND source = 'rmm'")
             .bind(tenant_id)
             .fetch_one(&pool)
             .await
             .expect("count tickets");
-    assert_eq!(count_after_low, 1, "low alert should be suppressed below min_severity");
+    assert_eq!(
+        count_after_low, 1,
+        "low alert should be suppressed below min_severity"
+    );
 
     // 3. second critical alert inside dedupe window -> no new ticket.
     let again = build_alert(
@@ -224,7 +250,10 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
         Some("critical"),
     );
     let resp = post_alert(&app, secret, &again).await;
-    assert!(resp.status().is_success(), "duplicate alert should ingest cleanly");
+    assert!(
+        resp.status().is_success(),
+        "duplicate alert should ingest cleanly"
+    );
     let count_after_dup: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND source = 'rmm'")
             .bind(tenant_id)
@@ -283,21 +312,18 @@ async fn channel_credentials_are_encrypted_at_rest(pool: PgPool) {
 
 async fn seed_company(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')",
-    )
-    .bind(id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("seed test company");
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
+        .bind(id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(pool)
+        .await
+        .expect("seed test company");
     id
 }
 
 async fn seed_connection(pool: &PgPool, api_key: &str, api_secret: Option<&str>) -> Uuid {
     let key_enc = crypto::encrypt(api_key, &TEST_KEY).expect("encrypt api_key");
-    let secret_enc = api_secret
-        .map(|s| crypto::encrypt(s, &TEST_KEY).expect("encrypt api_secret"));
+    let secret_enc = api_secret.map(|s| crypto::encrypt(s, &TEST_KEY).expect("encrypt api_secret"));
     let id = Uuid::new_v4();
     sqlx::query(
         r#"INSERT INTO rmm_connections

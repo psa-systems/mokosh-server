@@ -179,7 +179,11 @@ fn parse_tactical_agent(v: serde_json::Value) -> ProviderDevice {
         .map(str::to_string);
     let serial_number = v
         .get("serial_number")
-        .or_else(|| v.get("wmi_detail").and_then(|w| w.get("bios")).and_then(|b| b.get("SerialNumber")))
+        .or_else(|| {
+            v.get("wmi_detail")
+                .and_then(|w| w.get("bios"))
+                .and_then(|b| b.get("SerialNumber"))
+        })
         .and_then(|x| x.as_str())
         .map(str::to_string);
     let last_seen = v
@@ -212,15 +216,19 @@ fn parse_tactical_alert(v: serde_json::Value) -> ProviderAlert {
         .and_then(|x| x.as_str())
         .unwrap_or("RMM alert")
         .to_string();
-    let message = v.get("snmp_info").and_then(|x| x.as_str()).map(str::to_string);
+    let message = v
+        .get("snmp_info")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     let severity = v
         .get("severity")
         .and_then(|x| x.as_str())
         .map(str::to_string);
-    let source_id = v
-        .get("id")
-        .map(|x| x.to_string())
-        .or_else(|| v.get("alert_id").and_then(|x| x.as_str()).map(str::to_string));
+    let source_id = v.get("id").map(|x| x.to_string()).or_else(|| {
+        v.get("alert_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    });
     ProviderAlert {
         rmm_device_id,
         alert_type,

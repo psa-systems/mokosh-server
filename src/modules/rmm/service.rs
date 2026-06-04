@@ -578,14 +578,12 @@ impl RmmService {
         .await?;
         let queue_id: Option<Uuid> = match rule.queue_id {
             Some(q) => Some(q),
-            None => {
-                sqlx::query_scalar(
-                    "SELECT id FROM ticket_queues WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-                )
-                .bind(tenant_id)
-                .fetch_optional(self.db.pool())
-                .await?
-            }
+            None => sqlx::query_scalar(
+                "SELECT id FROM ticket_queues WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
+            )
+            .bind(tenant_id)
+            .fetch_optional(self.db.pool())
+            .await?,
         };
         let Some(default_creator) = self.default_creator(tenant_id).await? else {
             return Ok(());

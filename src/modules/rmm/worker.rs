@@ -104,7 +104,10 @@ impl RmmSyncWorker {
                 }
             };
             let provider: Arc<dyn RmmProvider> = build_provider(&row.provider, cfg).into();
-            if let Err(e) = self.sync_one(row.tenant_id, row.id, provider.as_ref()).await {
+            if let Err(e) = self
+                .sync_one(row.tenant_id, row.id, provider.as_ref())
+                .await
+            {
                 self.mark_failed(row.id, e.to_string()).await.ok();
             }
             count += 1;
@@ -301,12 +304,14 @@ impl RmmSyncWorker {
 
         if let Some(asset_id) = candidate {
             // Existing asset, link mapping + bump last_sync_at.
-            sqlx::query("UPDATE rmm_device_mappings SET asset_id = $1, updated_at = NOW() WHERE id = $2")
-                .bind(asset_id)
-                .bind(mapping_id)
-                .execute(self.db.pool())
-                .await
-                .map_err(|e| AppError::Database(format!("rmm link mapping: {e}")))?;
+            sqlx::query(
+                "UPDATE rmm_device_mappings SET asset_id = $1, updated_at = NOW() WHERE id = $2",
+            )
+            .bind(asset_id)
+            .bind(mapping_id)
+            .execute(self.db.pool())
+            .await
+            .map_err(|e| AppError::Database(format!("rmm link mapping: {e}")))?;
             sqlx::query(
                 r#"UPDATE assets
                    SET last_sync_at = NOW(), rmm_device_id = $1, updated_at = NOW()
@@ -363,12 +368,14 @@ impl RmmSyncWorker {
         .await
         .map_err(|e| AppError::Database(format!("rmm create asset: {e}")))?;
 
-        sqlx::query("UPDATE rmm_device_mappings SET asset_id = $1, updated_at = NOW() WHERE id = $2")
-            .bind(asset_id)
-            .bind(mapping_id)
-            .execute(self.db.pool())
-            .await
-            .map_err(|e| AppError::Database(format!("rmm link new mapping: {e}")))?;
+        sqlx::query(
+            "UPDATE rmm_device_mappings SET asset_id = $1, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(asset_id)
+        .bind(mapping_id)
+        .execute(self.db.pool())
+        .await
+        .map_err(|e| AppError::Database(format!("rmm link new mapping: {e}")))?;
         self.write_audit(tenant_id, asset_id, "created", d).await?;
         Ok(Some(LinkResult {
             created: true,
