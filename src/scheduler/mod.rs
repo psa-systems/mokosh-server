@@ -8,23 +8,36 @@
 //! semantics (e.g. the notifications dispatcher's backoff ladder)
 //! stay inside the `Job::run` implementation.
 //!
+//! Tokio's `interval(d)` fires its first tick IMMEDIATELY, then
+//! every `d`. That means every registered job runs once at process
+//! startup with no warmup delay; jobs that need a warmup should
+//! sleep inside `run` on first invocation.
+//!
 //! Usage from `main.rs`:
 //! ```ignore
 //! let mut scheduler = Scheduler::new();
 //! scheduler.register(notif_worker, Duration::from_secs(5));
 //! scheduler.register(rmm_worker, Duration::from_secs(60));
-//! scheduler.start();
+//! let _handles = scheduler.start();
 //! ```
+//!
+//! `start` returns the spawned task handles. They are usually
+//! dropped (fire-and-forget daemon semantics, same as the old
+//! ad-hoc spawn sites) but the caller MAY keep them for graceful
+//! shutdown / `abort()` on signal.
 //!
 //! Existing workers (`DispatcherWorker`, `RmmSyncWorker`) keep their
 //! current `run_forever(interval)` entry points; migration to the
 //! [`Job`] trait happens in follow-up PRs so each diff stays small.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use tracing::Instrument;
 
 use crate::utils::error::AppResult;
 
@@ -38,7 +51,10 @@ use crate::utils::error::AppResult;
 pub trait Job: Send + Sync + 'static {
     /// Stable identifier used in span fields and log lines, e.g.
     /// `notifications_dispatcher` or `rmm_sync`. Should match the
-    /// owning module's worker name for grep-ability.
+    /// owning module's worker name for grep-ability. Must be unique
+    /// across every job registered on the same [`Scheduler`];
+    /// [`Scheduler::register`] panics on duplicates so cross-job
+    /// trace fields stay unambiguous.
     fn name(&self) -> &'static str;
 
     /// One tick of work. Returning `Err` logs the error and skips the
@@ -49,7 +65,7 @@ pub trait Job: Send + Sync + 'static {
 }
 
 /// A single registered job + the interval at which the scheduler
-/// will tick it. Cheap to clone; `Arc<dyn Job>` is two pointers.
+/// will tick it.
 struct Entry {
     job: Arc<dyn Job>,
     interval: Duration,
@@ -59,6 +75,7 @@ struct Entry {
 /// jobs with [`Scheduler::register`], then call [`Scheduler::start`]
 /// to spawn one tokio task per job. The scheduler does not own a
 /// runtime handle; it relies on the surrounding `#[tokio::main]`.
+#[must_use = "a Scheduler does nothing until you call .start()"]
 pub struct Scheduler {
     entries: Vec<Entry>,
 }
@@ -68,10 +85,16 @@ impl Scheduler {
         Self { entries: vec![] }
     }
 
-    /// Queue a job to spawn at [`start`](Self::start) time. The job
-    /// is moved into an `Arc` so the spawn closure can carry it
-    /// without lifetimes.
+    /// Queue a job to spawn at [`start`](Self::start) time. Panics
+    /// if a job with the same [`Job::name`] was already registered
+    /// on this scheduler: identical span field values would make
+    /// per-job trace filtering ambiguous, and silently dropping the
+    /// second registration would mask a real misconfiguration.
     pub fn register<J: Job>(&mut self, job: J, interval: Duration) {
+        let name = job.name();
+        if self.entries.iter().any(|e| e.job.name() == name) {
+            panic!("scheduler: duplicate job name {name:?}");
+        }
         self.entries.push(Entry {
             job: Arc::new(job),
             interval,
@@ -79,18 +102,33 @@ impl Scheduler {
     }
 
     /// Consume the scheduler and spawn one tokio task per registered
-    /// job. Returns immediately; the spawned tasks run until the
-    /// surrounding runtime shuts down.
-    pub fn start(self) {
-        for Entry { job, interval } in self.entries {
-            let name = job.name();
-            tracing::info!(
-                job = name,
-                interval_secs = interval.as_secs(),
-                "scheduler: spawning job"
-            );
-            tokio::spawn(run_job_loop(job, interval));
+    /// job. Returns the `JoinHandle`s in registration order; the
+    /// caller may drop them for fire-and-forget daemon semantics or
+    /// keep them for graceful-shutdown coordination.
+    pub fn start(self) -> Vec<JoinHandle<()>> {
+        // Defence in depth: the registry already guards against
+        // duplicates at `register` time, but verify once more here
+        // so any future bypass (e.g. construction via Default +
+        // direct entries mutation in a refactor) still fails loud.
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        for e in &self.entries {
+            if !seen.insert(e.job.name()) {
+                panic!("scheduler: duplicate job name {:?} at start", e.job.name());
+            }
         }
+
+        self.entries
+            .into_iter()
+            .map(|Entry { job, interval }| {
+                let name = job.name();
+                tracing::info!(
+                    job = name,
+                    interval_secs = interval.as_secs(),
+                    "scheduler: spawning job"
+                );
+                tokio::spawn(run_job_loop(job, interval))
+            })
+            .collect()
     }
 }
 
@@ -110,8 +148,14 @@ async fn run_job_loop(job: Arc<dyn Job>, interval: Duration) {
     loop {
         ticker.tick().await;
         let span = tracing::info_span!("scheduler_tick", job = name);
-        let _enter = span.enter();
-        if let Err(e) = job.run().await {
+        // Use `Instrument` so the span stays attached to the future
+        // even if the tokio scheduler moves this task between
+        // threads mid-await. A bare `span.enter()` guard held across
+        // `.await` ties the span to the current OS thread and the
+        // log lines drift off the wrong context once the task
+        // resumes elsewhere.
+        let result = job.run().instrument(span).await;
+        if let Err(e) = result {
             tracing::warn!(
                 job = name,
                 error = ?e,
