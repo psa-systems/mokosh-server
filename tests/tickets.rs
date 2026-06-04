@@ -35,10 +35,16 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let token = common::login(&app, &email, &password).await;
 
     // CREATE
+    //
+    // `custom_fields` is sent as `{}` (not omitted) because
+    // `CreateTicketRequest.custom_fields` defaults to `serde_json::Value::Null`,
+    // and sqlx encodes `Value::Null` as SQL NULL, which trips the
+    // `custom_fields JSONB NOT NULL DEFAULT '{}'` constraint on `tickets`.
     let create_body = serde_json::json!({
         "title": "Server is on fire",
         "company_id": company_id,
         "description": "Smoke coming out of rack 3.",
+        "custom_fields": {},
     });
     let create_resp = app
         .client
@@ -48,12 +54,14 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
         .send()
         .await
         .expect("send create ticket");
+    let create_status = create_resp.status();
+    let create_text = create_resp.text().await.expect("create ticket body");
     assert!(
-        create_resp.status().is_success(),
-        "create ticket should 2xx, got {}",
-        create_resp.status()
+        create_status.is_success(),
+        "create ticket should 2xx, got {create_status} body={create_text}"
     );
-    let created: serde_json::Value = create_resp.json().await.expect("create ticket JSON");
+    let created: serde_json::Value =
+        serde_json::from_str(&create_text).expect("create ticket JSON");
     let ticket_id = created["id"]
         .as_str()
         .expect("created ticket has id")
