@@ -270,19 +270,14 @@ impl DispatcherWorker {
         }
     }
 
-    async fn lookup_user_email(
-        &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
-    ) -> AppResult<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT email FROM users WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|e| AppError::Database(format!("lookup_user_email: {e}")))?;
+    async fn lookup_user_email(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT email FROM users WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(user_id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(|e| AppError::Database(format!("lookup_user_email: {e}")))?;
         Ok(row.map(|(e,)| e))
     }
 }

@@ -138,7 +138,10 @@ async fn dispatch_respects_preferences_and_worker_marks_sent(pool: PgPool) {
         "expected exactly one notification row (in_app only), got {rows:?}",
     );
     let (notif_id, channel, status, sent_at) = rows.into_iter().next().unwrap();
-    assert_eq!(channel, "in_app", "preference enforcement let email through");
+    assert_eq!(
+        channel, "in_app",
+        "preference enforcement let email through"
+    );
     assert_eq!(
         status.as_deref(),
         Some("pending"),
@@ -193,7 +196,9 @@ async fn dispatch_respects_preferences_and_worker_marks_sent(pool: PgPool) {
     let inbox: serde_json::Value = inbox_resp.json().await.expect("inbox JSON");
     let items = inbox.as_array().expect("inbox returns an array");
     assert!(
-        items.iter().any(|i| i["id"].as_str() == Some(&notif_id.to_string())),
+        items
+            .iter()
+            .any(|i| i["id"].as_str() == Some(&notif_id.to_string())),
         "inbox should contain the dispatched notification",
     );
 
@@ -250,12 +255,13 @@ async fn channel_config_is_encrypted_at_rest(pool: PgPool) {
         create_resp.status(),
     );
 
-    let stored: String =
-        sqlx::query_scalar("SELECT config_encrypted FROM notification_channels WHERE tenant_id = $1")
-            .bind(tenant_id)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch ciphertext");
+    let stored: String = sqlx::query_scalar(
+        "SELECT config_encrypted FROM notification_channels WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch ciphertext");
 
     assert!(
         !stored.contains(secret_marker),

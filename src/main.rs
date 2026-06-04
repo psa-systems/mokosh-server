@@ -204,10 +204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tick interval is intentionally low (5s) so transactional
     // emails (password reset, welcome, ticket-note) feel synchronous
     // from the operator's perspective.
-    let dispatcher = mokosh_server::modules::notifications::DispatcherWorker::new(
-        db.clone(),
-        mailer.clone(),
-    );
+    let dispatcher =
+        mokosh_server::modules::notifications::DispatcherWorker::new(db.clone(), mailer.clone());
     tokio::spawn(dispatcher.run_forever(std::time::Duration::from_secs(5), 25));
 
     let psa_router = create_api_router(

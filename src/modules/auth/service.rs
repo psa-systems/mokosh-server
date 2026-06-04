@@ -12,9 +12,9 @@ use uuid::Uuid;
 #[cfg(feature = "server")]
 use crate::db::Database;
 #[cfg(feature = "server")]
-use crate::utils::crypto::{generate_token, hash_password, verify_password};
-#[cfg(feature = "server")]
 use crate::modules::notifications::NotificationsService;
+#[cfg(feature = "server")]
+use crate::utils::crypto::{generate_token, hash_password, verify_password};
 #[cfg(feature = "server")]
 use crate::utils::email::{LogMailer, Mailer};
 #[cfg(feature = "server")]
