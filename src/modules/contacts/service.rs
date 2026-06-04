@@ -130,6 +130,63 @@ impl ContactService {
     }
 
     /// Get company by ID
+    /// Populate the optional rollup fields on a `CompanyResponse`
+    /// (`account_manager_name`, `contact_count`, `site_count`,
+    /// `open_ticket_count`). The base list / get queries are kept on
+    /// the lean `Company` shape so internal callers that only need the
+    /// row keep working; this method runs ONE follow-up query per page
+    /// of results, regardless of page size, to fill in the counts the
+    /// list page renders.
+    pub async fn enrich_companies(
+        &self,
+        tenant_id: Uuid,
+        mut responses: Vec<CompanyResponse>,
+    ) -> AppResult<Vec<CompanyResponse>> {
+        if responses.is_empty() {
+            return Ok(responses);
+        }
+        let ids: Vec<Uuid> = responses.iter().map(|r| r.id).collect();
+        let rows = sqlx::query_as::<_, CompanyRollupRow>(
+            r#"
+            SELECT
+                c.id AS company_id,
+                CASE
+                    WHEN u.id IS NULL THEN NULL
+                    ELSE u.first_name || ' ' || u.last_name
+                END AS account_manager_name,
+                (SELECT COUNT(*) FROM contacts ct
+                    WHERE ct.tenant_id = c.tenant_id
+                      AND ct.company_id = c.id) AS contact_count,
+                (SELECT COUNT(*) FROM sites s
+                    WHERE s.tenant_id = c.tenant_id
+                      AND s.company_id = c.id) AS site_count,
+                (SELECT COUNT(*) FROM tickets t
+                    WHERE t.tenant_id = c.tenant_id
+                      AND t.company_id = c.id
+                      AND t.closed_at IS NULL) AS open_ticket_count
+            FROM companies c
+            LEFT JOIN users u ON u.id = c.account_manager_id
+            WHERE c.tenant_id = $1
+              AND c.id = ANY($2)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut by_id: std::collections::HashMap<Uuid, CompanyRollupRow> =
+            rows.into_iter().map(|r| (r.company_id, r)).collect();
+        for resp in responses.iter_mut() {
+            if let Some(row) = by_id.remove(&resp.id) {
+                resp.account_manager_name = row.account_manager_name;
+                resp.contact_count = Some(row.contact_count);
+                resp.site_count = Some(row.site_count);
+                resp.open_ticket_count = Some(row.open_ticket_count);
+            }
+        }
+        Ok(responses)
+    }
+
     pub async fn get_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<Company> {
         let row = sqlx::query_as::<_, CompanyRow>(
             r#"
@@ -920,6 +977,18 @@ impl From<CompanyRow> for Company {
             updated_at: row.updated_at,
         }
     }
+}
+
+/// Rollup row returned by `enrich_companies`. The four count columns
+/// are non-null because the subqueries always return a number (COUNT
+/// over an empty set is 0).
+#[derive(sqlx::FromRow)]
+struct CompanyRollupRow {
+    company_id: Uuid,
+    account_manager_name: Option<String>,
+    contact_count: i64,
+    site_count: i64,
+    open_ticket_count: i64,
 }
 
 #[derive(sqlx::FromRow)]
