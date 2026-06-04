@@ -119,6 +119,7 @@ impl TicketService {
     }
 
     /// Create a new ticket
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_ticket(
         &self,
         tenant_id: Uuid,
@@ -245,6 +246,7 @@ impl TicketService {
     }
 
     /// Get ticket by ID
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<Ticket> {
         let row = sqlx::query_as::<_, TicketRow>(
             r#"
@@ -271,6 +273,7 @@ impl TicketService {
     }
 
     /// Get ticket by number
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_by_number(
         &self,
         tenant_id: Uuid,
@@ -305,6 +308,7 @@ impl TicketService {
     // pattern: the trailing `param_idx += 1` keeps the next added
     // condition one line of diff away.
     #[allow(unused_assignments)]
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tickets(
         &self,
         tenant_id: Uuid,
@@ -425,6 +429,7 @@ impl TicketService {
     }
 
     /// Update ticket
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_ticket(
         &self,
         tenant_id: Uuid,
@@ -554,6 +559,7 @@ impl TicketService {
     }
 
     /// Assign ticket to user
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn assign_ticket(
         &self,
         tenant_id: Uuid,
@@ -575,6 +581,7 @@ impl TicketService {
     }
 
     /// Add note to ticket
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_note(
         &self,
         tenant_id: Uuid,
@@ -718,6 +725,7 @@ impl TicketService {
     }
 
     /// Get note by ID
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_note(&self, tenant_id: Uuid, note_id: Uuid) -> AppResult<TicketNote> {
         let row = sqlx::query_as::<_, TicketNoteRow>(
             r#"
@@ -739,6 +747,7 @@ impl TicketService {
     }
 
     /// Get notes for a ticket
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_notes(
         &self,
         tenant_id: Uuid,
@@ -828,6 +837,7 @@ impl TicketService {
     }
 
     /// Get ticket statuses for tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_statuses(&self, tenant_id: Uuid) -> AppResult<Vec<TicketStatus>> {
         let rows = sqlx::query_as::<_, TicketStatusRow>(
             r#"
@@ -845,6 +855,7 @@ impl TicketService {
     }
 
     /// Get ticket priorities for tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_priorities(&self, tenant_id: Uuid) -> AppResult<Vec<TicketPriority>> {
         let rows = sqlx::query_as::<_, TicketPriorityRow>(
             r#"
@@ -862,6 +873,7 @@ impl TicketService {
     }
 
     /// Get ticket queues for tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_queues(&self, tenant_id: Uuid) -> AppResult<Vec<TicketQueue>> {
         let rows = sqlx::query_as::<_, TicketQueueRow>(
             r#"
@@ -879,6 +891,7 @@ impl TicketService {
     }
 
     /// Get ticket types for tenant
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_types(&self, tenant_id: Uuid) -> AppResult<Vec<TicketType>> {
         let rows = sqlx::query_as::<_, TicketTypeRow>(
             r#"
@@ -902,6 +915,7 @@ impl TicketService {
     /// identity is captured by `contact_id`. Returns the fully-joined
     /// response so the portal client renders names not UUIDs.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_portal_ticket(
         &self,
         tenant_id: Uuid,
@@ -964,6 +978,7 @@ impl TicketService {
     /// opened, not just ones where `contact_id = self`. This matches
     /// the typical helpdesk model where employees of company X can
     /// follow each other's tickets.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_portal_tickets(
         &self,
         tenant_id: Uuid,
@@ -981,6 +996,7 @@ impl TicketService {
     /// Get a single ticket scoped to a portal contact's company. 404
     /// instead of 403 if the ticket exists in another company, so we
     /// don't leak the existence of a ticket the contact can't see.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_portal_ticket(
         &self,
         tenant_id: Uuid,
@@ -999,6 +1015,7 @@ impl TicketService {
     /// queue/company/contact/assigned/created-by names with empty
     /// strings; this method joins the lookup tables in one round-trip
     /// and produces a complete DTO ready for the wire.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_response(
         &self,
         tenant_id: Uuid,
@@ -1020,6 +1037,7 @@ impl TicketService {
     /// List fully-joined ticket responses + total. Mirrors the filter
     /// semantics of [`TicketService::list_tickets`] but produces
     /// response DTOs directly. Audit F3.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_ticket_responses(
         &self,
         tenant_id: Uuid,

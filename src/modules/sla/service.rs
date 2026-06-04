@@ -20,6 +20,7 @@ impl SlaService {
     }
 
     // PMS-108 policies --------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_policies(&self, tenant_id: Uuid) -> AppResult<Vec<SlaPolicyResponse>> {
         let rows = sqlx::query_as::<_, PolicyRow>(
             r#"SELECT id, name, description, business_hours_id, is_default
@@ -31,6 +32,7 @@ impl SlaService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_policy(
         &self,
         tenant_id: Uuid,
@@ -61,6 +63,7 @@ impl SlaService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_policy(&self, tenant_id: Uuid, id: Uuid) -> AppResult<SlaPolicyResponse> {
         let row = sqlx::query_as::<_, PolicyRow>(
             r#"SELECT id, name, description, business_hours_id, is_default
@@ -74,6 +77,7 @@ impl SlaService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_policy(
         &self,
         tenant_id: Uuid,
@@ -117,6 +121,7 @@ impl SlaService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_policy(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM sla_policies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -131,6 +136,7 @@ impl SlaService {
     }
 
     // PMS-109 targets ---------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_targets(
         &self,
         tenant_id: Uuid,
@@ -151,6 +157,7 @@ impl SlaService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_target(
         &self,
         tenant_id: Uuid,
@@ -192,6 +199,7 @@ impl SlaService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_target(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query(
             r#"DELETE FROM sla_targets t USING sla_policies p
@@ -209,6 +217,7 @@ impl SlaService {
     }
 
     // PMS-110 business hours --------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_business_hours(
         &self,
         tenant_id: Uuid,
@@ -223,6 +232,7 @@ impl SlaService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_business_hours(
         &self,
         tenant_id: Uuid,
@@ -258,6 +268,7 @@ impl SlaService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_business_hours(
         &self,
         tenant_id: Uuid,
@@ -290,6 +301,7 @@ impl SlaService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_business_hours(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM business_hours WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -304,6 +316,7 @@ impl SlaService {
     }
 
     // PMS-111 holiday calendars -----------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_holiday_calendars(
         &self,
         tenant_id: Uuid,
@@ -318,6 +331,7 @@ impl SlaService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_holiday_calendar(
         &self,
         tenant_id: Uuid,
@@ -341,6 +355,7 @@ impl SlaService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_holiday_calendar(
         &self,
         tenant_id: Uuid,
@@ -368,6 +383,7 @@ impl SlaService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_holiday_calendar(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM holiday_calendars WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -388,6 +404,7 @@ impl SlaService {
     /// 24x7 hours (ignores `business_hours` schedules); business-hours
     /// awareness lands as a follow-up once a Postgres function or
     /// in-process date arithmetic helper is bench-tested.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn evaluate_for_ticket(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<()> {
         let row: Option<(Option<Uuid>, Uuid, DateTime<Utc>)> = sqlx::query_as(
             r#"SELECT sla_id, priority_id, created_at FROM tickets

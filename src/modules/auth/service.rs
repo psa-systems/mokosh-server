@@ -117,6 +117,7 @@ impl AuthService {
     }
 
     /// Authenticate user with email and password
+    #[tracing::instrument(skip_all)]
     pub async fn login(
         &self,
         request: &LoginRequest,
@@ -214,6 +215,7 @@ impl AuthService {
     /// userinfo response. The caller is responsible for verifying the
     /// CSRF state and exchanging the authorization code via the
     /// `google-oauth-flow` crate before calling this.
+    #[tracing::instrument(skip_all)]
     pub async fn login_with_google(
         &self,
         google: google_oauth_flow::GoogleUserInfo,
@@ -373,6 +375,7 @@ impl AuthService {
     }
 
     /// Refresh access token
+    #[tracing::instrument(skip_all)]
     pub async fn refresh_token(&self, refresh_token: &str) -> AppResult<RefreshTokenResponse> {
         // Decode and validate refresh token
         let claims = self.decode_token(refresh_token)?;
@@ -413,6 +416,7 @@ impl AuthService {
     }
 
     /// Logout - invalidate session
+    #[tracing::instrument(skip_all)]
     pub async fn logout(&self, session_id: Uuid) -> AppResult<()> {
         sqlx::query("DELETE FROM user_sessions WHERE id = $1")
             .bind(session_id)
@@ -423,6 +427,7 @@ impl AuthService {
     }
 
     /// Logout all sessions for a user
+    #[tracing::instrument(skip_all)]
     pub async fn logout_all(&self, user_id: Uuid) -> AppResult<()> {
         sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
             .bind(user_id)
@@ -433,6 +438,7 @@ impl AuthService {
     }
 
     /// Request password reset
+    #[tracing::instrument(skip_all)]
     pub async fn request_password_reset(&self, email: &str) -> AppResult<()> {
         // Find user - don't reveal if user exists
         let user = match self.find_user_by_email(email).await {
@@ -504,6 +510,7 @@ impl AuthService {
     }
 
     /// Reset password with token
+    #[tracing::instrument(skip_all)]
     pub async fn reset_password(&self, request: &ResetPasswordRequest) -> AppResult<()> {
         if request.new_password != request.confirm_password {
             return Err(AppError::validation_field(
@@ -570,6 +577,7 @@ impl AuthService {
     }
 
     /// Change password (when logged in)
+    #[tracing::instrument(skip_all)]
     pub async fn change_password(
         &self,
         user_id: Uuid,
@@ -611,6 +619,7 @@ impl AuthService {
     }
 
     /// Create a new user
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_user(
         &self,
         tenant_id: Uuid,
@@ -729,6 +738,7 @@ impl AuthService {
     }
 
     /// Update user
+    #[tracing::instrument(skip_all)]
     pub async fn update_user(&self, user_id: Uuid, request: &UpdateUserRequest) -> AppResult<User> {
         // Build dynamic update query
         let mut updates = Vec::new();
@@ -821,6 +831,7 @@ impl AuthService {
     /// via [`AuthService::enable_mfa`]. Refusing partial enrollment
     /// guarantees that an authenticator that was misconfigured (wrong
     /// time, wrong algorithm) cannot lock the user out.
+    #[tracing::instrument(skip_all)]
     pub async fn start_mfa_enrollment(
         &self,
         user_id: Uuid,
@@ -852,6 +863,7 @@ impl AuthService {
     /// Finish MFA enrollment. Verifies one TOTP code against the secret
     /// staged by [`AuthService::start_mfa_enrollment`]; on success flips
     /// `mfa_enabled = true`.
+    #[tracing::instrument(skip_all)]
     pub async fn enable_mfa(&self, user_id: Uuid, code: &str) -> AppResult<()> {
         let user = self.get_user_by_id(user_id).await?;
         let secret_b32 = user.mfa_secret.as_ref().ok_or_else(|| {
@@ -873,6 +885,7 @@ impl AuthService {
 
     /// Disable MFA. Requires the user's current password (re-auth) so a
     /// stolen session cannot quietly weaken the account.
+    #[tracing::instrument(skip_all)]
     pub async fn disable_mfa(&self, user_id: Uuid, password: &str) -> AppResult<()> {
         let user = self.get_user_by_id(user_id).await?;
         let hash = user
@@ -898,6 +911,7 @@ impl AuthService {
     /// persisted. The first 10 chars of `psa_xxxx...` become the
     /// `key_prefix` lookup column so future bearer auth can find the
     /// row in O(log n) before doing the expensive hash compare.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_api_key(
         &self,
         tenant_id: Uuid,
@@ -952,6 +966,7 @@ impl AuthService {
     }
 
     /// List API keys owned by `user_id`. Never returns secret material.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_api_keys(
         &self,
         tenant_id: Uuid,
@@ -976,6 +991,7 @@ impl AuthService {
 
     /// Revoke (hard-delete) an API key. Scoped to the calling user +
     /// tenant so a stolen session for user A cannot kill user B's keys.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn revoke_api_key(
         &self,
         tenant_id: Uuid,
@@ -998,6 +1014,7 @@ impl AuthService {
     }
 
     /// List users in a tenant, paginated. Audit F1.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_users(
         &self,
         tenant_id: Uuid,
@@ -1048,6 +1065,7 @@ impl AuthService {
     }
 
     /// Get user by ID
+    #[tracing::instrument(skip_all)]
     pub async fn get_user_by_id(&self, user_id: Uuid) -> AppResult<User> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
@@ -1074,6 +1092,7 @@ impl AuthService {
     /// whose `sub` doesn't yet match a local row. The local `users.id` is set
     /// to `sub` so subsequent requests resolve via `get_user_by_id` without
     /// another userinfo round-trip. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md §3.3.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_user_from_oidc(
         &self,
         sub: Uuid,
@@ -1252,6 +1271,7 @@ impl AuthService {
     }
 
     /// Get all active sessions for a user
+    #[tracing::instrument(skip_all)]
     pub async fn get_user_sessions(
         &self,
         user_id: Uuid,
@@ -1283,6 +1303,7 @@ impl AuthService {
     }
 
     /// Delete a specific session
+    #[tracing::instrument(skip_all)]
     pub async fn delete_session(&self, user_id: Uuid, session_id: Uuid) -> AppResult<()> {
         sqlx::query("DELETE FROM user_sessions WHERE id = $1 AND user_id = $2")
             .bind(session_id)

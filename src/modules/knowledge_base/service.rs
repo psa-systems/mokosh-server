@@ -18,6 +18,7 @@ impl KbService {
     }
 
     // PMS-81 categories -------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_categories(&self, tenant_id: Uuid) -> AppResult<Vec<KbCategoryResponse>> {
         let rows = sqlx::query_as::<_, CatRow>(
             r#"SELECT id, name, description, parent_id, slug, visibility, sort_order
@@ -29,6 +30,7 @@ impl KbService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_category(
         &self,
         tenant_id: Uuid,
@@ -61,6 +63,7 @@ impl KbService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_category(
         &self,
         tenant_id: Uuid,
@@ -98,6 +101,7 @@ impl KbService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_category(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM kb_categories WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -112,6 +116,7 @@ impl KbService {
     }
 
     // PMS-82 / PMS-83 articles + versions -------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_articles(
         &self,
         tenant_id: Uuid,
@@ -157,6 +162,7 @@ impl KbService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_article(
         &self,
         tenant_id: Uuid,
@@ -200,6 +206,7 @@ impl KbService {
         self.get_article(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_article(&self, tenant_id: Uuid, id: Uuid) -> AppResult<KbArticleResponse> {
         let row = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
@@ -219,6 +226,7 @@ impl KbService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_article(
         &self,
         tenant_id: Uuid,
@@ -283,6 +291,7 @@ impl KbService {
         self.get_article(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_article(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM kb_articles WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -296,6 +305,7 @@ impl KbService {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_article_versions(
         &self,
         tenant_id: Uuid,
@@ -324,6 +334,7 @@ impl KbService {
     }
 
     // PMS-84 portal-visible helper -------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_portal_articles(&self, tenant_id: Uuid) -> AppResult<Vec<KbArticleResponse>> {
         let rows = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,

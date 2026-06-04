@@ -51,6 +51,7 @@ impl RmmSyncWorker {
 
     /// Long-running loop. Tick every `interval`. Log errors and keep
     /// going - one bad provider should not stall the rest.
+    #[tracing::instrument(skip_all)]
     pub async fn run_forever(self, interval: Duration) {
         tracing::info!(
             interval_secs = interval.as_secs(),
@@ -75,6 +76,7 @@ impl RmmSyncWorker {
     /// Pick up every active connection past its `sync_interval_minutes`
     /// window and sync each via its `RmmProvider`. Returns the number
     /// of connections processed.
+    #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self) -> AppResult<u64> {
         let due: Vec<DueConnection> = sqlx::query_as(
             r#"
@@ -118,6 +120,7 @@ impl RmmSyncWorker {
     /// Sync a single connection against the given provider. Public so
     /// the integration test can inject a mock provider directly,
     /// bypassing the `build_provider` factory.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn sync_one(
         &self,
         tenant_id: Uuid,

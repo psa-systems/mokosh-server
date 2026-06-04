@@ -41,6 +41,7 @@ impl BillingService {
     /// PMS-35: paginated + filterable invoice list. `lines` is left
     /// `None` on list rollups — the customer-facing UI fetches lines
     /// only when expanding a row.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_invoices(
         &self,
         tenant_id: Uuid,
@@ -124,6 +125,7 @@ impl BillingService {
     /// `subtotal = sum(line.total)` and `total = subtotal + tax -
     /// discount`. `balance_due` is initialised to `total`; payments
     /// move it down via PMS-39.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice(
         &self,
         tenant_id: Uuid,
@@ -237,6 +239,7 @@ impl BillingService {
 
     /// PMS-41: list all tax rates for the tenant. Includes inactive
     /// ones so admins can see history; filter client-side as needed.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tax_rates(&self, tenant_id: Uuid) -> AppResult<Vec<TaxRateResponse>> {
         let rows = sqlx::query_as::<_, TaxRateRow>(
             r#"
@@ -254,6 +257,7 @@ impl BillingService {
 
     /// PMS-41: create a tax rate. If `is_default = true`, demote any
     /// existing default first so only one rate is the tenant default.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_tax_rate(
         &self,
         tenant_id: Uuid,
@@ -291,6 +295,7 @@ impl BillingService {
     }
 
     /// PMS-41: update a tax rate. Same default-demote behaviour as create.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tax_rate(
         &self,
         tenant_id: Uuid,
@@ -341,6 +346,7 @@ impl BillingService {
     }
 
     /// PMS-41: delete a tax rate.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_tax_rate(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let affected = sqlx::query("DELETE FROM tax_rates WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -359,6 +365,7 @@ impl BillingService {
     /// jurisdiction key (e.g. "US-CA", "EU-DE"). Returns the active
     /// rate for the supplied name, or the tenant's default if no name
     /// matches.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn lookup_tax_rate(
         &self,
         tenant_id: Uuid,
@@ -398,6 +405,7 @@ impl BillingService {
     /// response carries the *decrypted* config so a finance admin can
     /// confirm what's wired without an extra round-trip to a "reveal"
     /// endpoint.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payment_gateways(
         &self,
         tenant_id: Uuid,
@@ -435,6 +443,7 @@ impl BillingService {
     /// PMS-40: upsert a payment gateway config. `(tenant_id, provider)`
     /// is unique in the schema, so the same call ends up insert-or-update.
     /// Encrypts the `config` blob at rest with the host encryption key.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_payment_gateway(
         &self,
         tenant_id: Uuid,
@@ -475,6 +484,7 @@ impl BillingService {
     }
 
     /// PMS-40: delete a payment gateway config. No-op if absent.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment_gateway(
         &self,
         tenant_id: Uuid,
@@ -490,6 +500,7 @@ impl BillingService {
 
     /// PMS-39: list payments. Optional filter on invoice_id and/or
     /// company_id.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payments(
         &self,
         tenant_id: Uuid,
@@ -546,6 +557,7 @@ impl BillingService {
     /// invoice's `amount_paid` is bumped and `balance_due` recomputed
     /// in the same transaction; the status moves to `paid` (or
     /// `partially_paid`) accordingly.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_payment(
         &self,
         tenant_id: Uuid,
@@ -644,6 +656,7 @@ impl BillingService {
     /// right call for unposted payments; once a payment has been
     /// posted to accounting it should be voided through a credit
     /// note instead - which is out of scope for this commit.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment(&self, tenant_id: Uuid, payment_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.pool().begin().await?;
 
@@ -708,6 +721,7 @@ impl BillingService {
     /// `InvoiceStatus::is_frozen` invoices (sent, paid, partially paid,
     /// void, written off) - correction goes through a credit note,
     /// which is out of scope for this commit.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_invoice(
         &self,
         tenant_id: Uuid,
@@ -820,6 +834,7 @@ impl BillingService {
 
     /// PMS-36: read a single invoice with `lines` populated. 404 when
     /// the id is outside the tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_invoice(
         &self,
         tenant_id: Uuid,

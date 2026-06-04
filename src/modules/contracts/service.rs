@@ -19,6 +19,7 @@ impl ContractsService {
     }
 
     // PMS-66 contracts CRUD ---------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contracts(
         &self,
         tenant_id: Uuid,
@@ -58,6 +59,7 @@ impl ContractsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contract(
         &self,
         tenant_id: Uuid,
@@ -92,6 +94,7 @@ impl ContractsService {
         self.get_contract(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_contract(&self, tenant_id: Uuid, id: Uuid) -> AppResult<ContractResponse> {
         let row = sqlx::query_as::<_, ContractRow>(
             r#"SELECT id, contract_number, name, company_id, contract_type, status,
@@ -107,6 +110,7 @@ impl ContractsService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contract(
         &self,
         tenant_id: Uuid,
@@ -151,6 +155,7 @@ impl ContractsService {
         self.get_contract(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contract(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM contracts WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -165,6 +170,7 @@ impl ContractsService {
     }
 
     // PMS-67 contract items ---------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contract_items(
         &self,
         tenant_id: Uuid,
@@ -184,6 +190,7 @@ impl ContractsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contract_item(
         &self,
         tenant_id: Uuid,
@@ -225,6 +232,7 @@ impl ContractsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contract_item(
         &self,
         tenant_id: Uuid,
@@ -279,6 +287,7 @@ impl ContractsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contract_item(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM contract_items WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -293,6 +302,7 @@ impl ContractsService {
     }
 
     // PMS-68 hour balances ----------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_hour_balance(
         &self,
         tenant_id: Uuid,
@@ -312,6 +322,7 @@ impl ContractsService {
     }
 
     // PMS-69 rate cards -------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rate_cards(&self, tenant_id: Uuid) -> AppResult<Vec<RateCardResponse>> {
         let rows = sqlx::query_as::<_, RateCardRow>(
             r#"SELECT id, name, description, is_default
@@ -323,6 +334,7 @@ impl ContractsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rate_card(
         &self,
         tenant_id: Uuid,
@@ -356,6 +368,7 @@ impl ContractsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rate_card(
         &self,
         tenant_id: Uuid,
@@ -390,6 +403,7 @@ impl ContractsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rate_card(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM rate_cards WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -404,6 +418,7 @@ impl ContractsService {
     }
 
     // PMS-70 rate card items --------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rate_card_items(
         &self,
         tenant_id: Uuid,
@@ -423,6 +438,7 @@ impl ContractsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_rate_card_item(
         &self,
         tenant_id: Uuid,
@@ -469,6 +485,7 @@ impl ContractsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rate_card_item(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query(
             r#"DELETE FROM rate_card_items rci USING rate_cards rc

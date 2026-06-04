@@ -37,6 +37,7 @@ impl PortalAuthService {
     /// and issue a portal JWT on success. Returns 401 on any failure
     /// path so the surface stays enumeration-resistant.
     #[allow(clippy::type_complexity)]
+    #[tracing::instrument(skip_all)]
     pub async fn login(&self, request: &PortalLoginRequest) -> AppResult<PortalLoginResponse> {
         let row: Option<(
             Uuid,
@@ -136,6 +137,7 @@ impl PortalAuthService {
     /// future `PUT /api/v1/portal/auth/password` endpoint that the
     /// customer hits after clicking their setup link.
     #[allow(dead_code)]
+    #[tracing::instrument(skip_all)]
     pub async fn set_password(&self, contact_id: Uuid, new_password: &str) -> AppResult<()> {
         if new_password.len() < 8 {
             return Err(AppError::BadRequest(

@@ -56,6 +56,7 @@ impl ContactService {
     // ========================================================================
 
     /// Create a new company
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_company(
         &self,
         tenant_id: Uuid,
@@ -137,6 +138,7 @@ impl ContactService {
     /// row keep working; this method runs ONE follow-up query per page
     /// of results, regardless of page size, to fill in the counts the
     /// list page renders.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn enrich_companies(
         &self,
         tenant_id: Uuid,
@@ -187,6 +189,7 @@ impl ContactService {
         Ok(responses)
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<Company> {
         let row = sqlx::query_as::<_, CompanyRow>(
             r#"
@@ -214,6 +217,7 @@ impl ContactService {
     }
 
     /// List companies with filters
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_companies(
         &self,
         tenant_id: Uuid,
@@ -307,6 +311,7 @@ impl ContactService {
     // reflowing the chain. The final `+= 1` looks dead today but keeps
     // the next added field one diff away.
     #[allow(unused_assignments)]
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_company(
         &self,
         tenant_id: Uuid,
@@ -366,6 +371,7 @@ impl ContactService {
     }
 
     /// Delete company
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<()> {
         // Check for related records
         let ticket_count: i64 = sqlx::query_scalar(
@@ -396,6 +402,7 @@ impl ContactService {
     // ========================================================================
 
     /// Create a new contact
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contact(
         &self,
         tenant_id: Uuid,
@@ -460,6 +467,7 @@ impl ContactService {
     }
 
     /// Get contact by ID
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_contact(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<Contact> {
         let row = sqlx::query_as::<_, ContactRow>(
             r#"
@@ -482,6 +490,7 @@ impl ContactService {
     }
 
     /// List contacts with filters
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contacts(
         &self,
         tenant_id: Uuid,
@@ -569,6 +578,7 @@ impl ContactService {
     }
 
     /// Get contacts for a company
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_contacts(
         &self,
         tenant_id: Uuid,
@@ -595,6 +605,7 @@ impl ContactService {
     }
 
     /// Update contact
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contact(
         &self,
         tenant_id: Uuid,
@@ -635,6 +646,7 @@ impl ContactService {
     }
 
     /// Delete contact
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contact(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<()> {
         sqlx::query("DELETE FROM contacts WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -650,6 +662,7 @@ impl ContactService {
     // ========================================================================
 
     /// Create a new site
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_site(
         &self,
         tenant_id: Uuid,
@@ -710,6 +723,7 @@ impl ContactService {
 
     /// Update a site. Audit F4: previously the route handler called
     /// `get_site` and silently returned the unchanged record.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_site(
         &self,
         tenant_id: Uuid,
@@ -827,6 +841,7 @@ impl ContactService {
     }
 
     /// Get site by ID
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<Site> {
         let row = sqlx::query_as::<_, SiteRow>(
             r#"
@@ -848,6 +863,7 @@ impl ContactService {
     }
 
     /// Get sites for a company
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_sites(
         &self,
         tenant_id: Uuid,
@@ -873,6 +889,7 @@ impl ContactService {
     }
 
     /// Delete site
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<()> {
         sqlx::query("DELETE FROM sites WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)

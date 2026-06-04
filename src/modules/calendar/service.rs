@@ -54,6 +54,7 @@ impl CalendarService {
     // PMS-60 appointments
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_appointments(
         &self,
         tenant_id: Uuid,
@@ -102,6 +103,7 @@ impl CalendarService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_appointment(
         &self,
         tenant_id: Uuid,
@@ -158,6 +160,7 @@ impl CalendarService {
         self.get_appointment(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_appointment(
         &self,
         tenant_id: Uuid,
@@ -178,6 +181,7 @@ impl CalendarService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_appointment(
         &self,
         tenant_id: Uuid,
@@ -224,6 +228,7 @@ impl CalendarService {
         self.get_appointment(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_appointment(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM appointments WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -241,6 +246,7 @@ impl CalendarService {
     // PMS-61 user availability
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_availability(
         &self,
         tenant_id: Uuid,
@@ -262,6 +268,7 @@ impl CalendarService {
     /// in one transaction. Partial updates are an explicit non-goal -
     /// the calendar UI typically presents the whole week as one form,
     /// so atomic replacement matches the user workflow.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn replace_user_availability(
         &self,
         tenant_id: Uuid,
@@ -303,6 +310,7 @@ impl CalendarService {
     // PMS-62 time off
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_time_off(
         &self,
         tenant_id: Uuid,
@@ -348,6 +356,7 @@ impl CalendarService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_off(
         &self,
         tenant_id: Uuid,
@@ -375,6 +384,7 @@ impl CalendarService {
         self.get_time_off(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_time_off(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TimeOffResponse> {
         let row = sqlx::query_as::<_, TimeOffRow>(
             r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
@@ -384,6 +394,7 @@ impl CalendarService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn approve_time_off(
         &self,
         tenant_id: Uuid,
@@ -413,6 +424,7 @@ impl CalendarService {
         self.get_time_off(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_time_off(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM time_off WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -430,6 +442,7 @@ impl CalendarService {
     // PMS-63 on-call schedules
     // ========================================================================
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_on_call_schedules(
         &self,
         tenant_id: Uuid,
@@ -445,6 +458,7 @@ impl CalendarService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_on_call_schedule(
         &self,
         tenant_id: Uuid,
@@ -475,6 +489,7 @@ impl CalendarService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_on_call_schedule(
         &self,
         tenant_id: Uuid,
@@ -510,6 +525,7 @@ impl CalendarService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_on_call_schedule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM on_call_schedules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -527,6 +543,7 @@ impl CalendarService {
     /// `rotation_config.user_ids[]` per active schedule; weekly /
     /// daily / custom rotation math arrives in a follow-up. Returns
     /// one entry per active schedule.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn on_call_now(&self, tenant_id: Uuid) -> AppResult<Vec<OnCallNowResponse>> {
         let rows = sqlx::query_as::<_, OnCallRow>(
             r#"SELECT id, name, team_id, rotation_type, rotation_config, is_active

@@ -27,6 +27,7 @@ impl AssetsService {
     }
 
     // PMS-73 asset types ------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_types(&self, tenant_id: Uuid) -> AppResult<Vec<AssetTypeResponse>> {
         let rows = sqlx::query_as::<_, AssetTypeRow>(
             r#"SELECT id, name, icon, parent_type_id, is_active
@@ -38,6 +39,7 @@ impl AssetsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_type(
         &self,
         tenant_id: Uuid,
@@ -65,6 +67,7 @@ impl AssetsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset_type(
         &self,
         tenant_id: Uuid,
@@ -97,6 +100,7 @@ impl AssetsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_asset_type(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM asset_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -111,6 +115,7 @@ impl AssetsService {
     }
 
     // PMS-74 assets CRUD ------------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_assets(
         &self,
         tenant_id: Uuid,
@@ -150,6 +155,7 @@ impl AssetsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset(
         &self,
         tenant_id: Uuid,
@@ -195,6 +201,7 @@ impl AssetsService {
         self.get_asset(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_asset(&self, tenant_id: Uuid, id: Uuid) -> AppResult<AssetResponse> {
         let row = sqlx::query_as::<_, AssetRow>(
             r#"SELECT id, asset_tag, name, asset_type_id, company_id, site_id, contact_id,
@@ -210,6 +217,7 @@ impl AssetsService {
         Ok(row.into())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset(
         &self,
         tenant_id: Uuid,
@@ -277,6 +285,7 @@ impl AssetsService {
         self.get_asset(tenant_id, id).await
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_asset(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM assets WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -291,6 +300,7 @@ impl AssetsService {
     }
 
     // PMS-75 relationships ----------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_relationships(
         &self,
         tenant_id: Uuid,
@@ -308,6 +318,7 @@ impl AssetsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_relationship(
         &self,
         tenant_id: Uuid,
@@ -335,6 +346,7 @@ impl AssetsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_asset_relationship(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM asset_relationships WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -349,6 +361,7 @@ impl AssetsService {
     }
 
     // PMS-76 configuration items ---------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_configuration_items(
         &self,
         tenant_id: Uuid,
@@ -380,6 +393,7 @@ impl AssetsService {
             .collect()
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_configuration_item(
         &self,
         tenant_id: Uuid,
@@ -413,6 +427,7 @@ impl AssetsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_configuration_item(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM configuration_items WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -427,6 +442,7 @@ impl AssetsService {
     }
 
     // PMS-77 credential vault ------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_credentials(
         &self,
         tenant_id: Uuid,
@@ -484,6 +500,7 @@ impl AssetsService {
             .collect()
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_credential(
         &self,
         tenant_id: Uuid,
@@ -551,6 +568,7 @@ impl AssetsService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_credential(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM credential_vault WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -565,6 +583,7 @@ impl AssetsService {
     }
 
     // PMS-78 audit log read --------------------------------------------------
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_audit_log(
         &self,
         tenant_id: Uuid,

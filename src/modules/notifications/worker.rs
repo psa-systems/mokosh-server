@@ -62,6 +62,7 @@ impl DispatcherWorker {
 
     /// Long-running loop: tick every `interval`. Logs errors and keeps
     /// going - one bad tick should not kill the worker.
+    #[tracing::instrument(skip_all)]
     pub async fn run_forever(self, interval: Duration, batch_size: i64) {
         tracing::info!(
             interval_secs = interval.as_secs(),
@@ -87,6 +88,7 @@ impl DispatcherWorker {
     /// Process up to `limit` pending notifications in a single
     /// transaction. Exposed publicly so the integration test can drive
     /// the worker deterministically (no sleep, no spawn).
+    #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self, limit: i64) -> AppResult<TickStats> {
         let mut tx = self.db.pool().begin().await?;
 
