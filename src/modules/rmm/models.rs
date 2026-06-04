@@ -39,6 +39,23 @@ fn default_60() -> i32 {
     60
 }
 
+/// PUT /api/v1/rmm/connections/{id}. Missing fields are left untouched
+/// so an admin can flip `is_active` or `sync_interval_minutes` without
+/// re-sending the credential (which would re-encrypt them under a
+/// fresh nonce for no reason). `api_key` / `api_secret` are only
+/// re-encrypted when explicitly supplied.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateRmmConnectionRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: Option<String>,
+    #[validate(url)]
+    pub api_url: Option<String>,
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+    pub is_active: Option<bool>,
+    pub sync_interval_minutes: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RmmDeviceMappingResponse {
     pub id: Uuid,

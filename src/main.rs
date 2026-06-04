@@ -208,6 +208,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::notifications::DispatcherWorker::new(db.clone(), mailer.clone());
     tokio::spawn(dispatcher.run_forever(std::time::Duration::from_secs(5), 25));
 
+    // RMM device-sync worker. Picks up every active `rmm_connections`
+    // row past its `sync_interval_minutes` window, pulls devices via
+    // the right `RmmProvider`, UPSERTs `rmm_device_mappings`, links /
+    // creates `assets`, and updates `sync_status` / `last_error`.
+    // Tick is 60s so the worker fires at minute granularity; per-
+    // connection cadence is enforced by the `sync_interval_minutes`
+    // gate in its query.
+    let rmm_worker = mokosh_server::modules::rmm::RmmSyncWorker::new(db.clone(), encryption_key);
+    tokio::spawn(rmm_worker.run_forever(std::time::Duration::from_secs(60)));
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,

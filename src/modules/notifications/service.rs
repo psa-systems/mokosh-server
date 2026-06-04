@@ -501,7 +501,7 @@ impl NotificationsService {
 /// untouched so an operator can see what was expected at delivery time.
 /// String values render verbatim; other JSON values render as their
 /// `Display` representation.
-fn render_template(input: &str, context: &serde_json::Value) -> String {
+pub fn render_template(input: &str, context: &serde_json::Value) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(open) = rest.find("{{") {

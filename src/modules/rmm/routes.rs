@@ -36,7 +36,9 @@ pub fn rmm_routes(service: RmmService) -> Router {
         )
         .route(
             "/rmm/connections/{id}",
-            axum::routing::delete(delete_connection),
+            get(get_connection)
+                .put(update_connection)
+                .delete(delete_connection),
         )
         .route("/rmm/connections/{id}/test", post(test_connection))
         // PMS-103 device mappings
@@ -78,10 +80,10 @@ async fn create_connection(
     req.validate()?;
     if !matches!(
         req.provider.as_str(),
-        "tactical_rmm" | "datto" | "connectwise" | "ninja_rmm"
+        "tactical_rmm" | "mesh_central" | "datto" | "connectwise" | "ninja_rmm"
     ) {
         return Err(AppError::BadRequest(format!(
-            "provider {:?} not supported; pick tactical_rmm | datto | connectwise | ninja_rmm",
+            "provider {:?} not supported; pick tactical_rmm | mesh_central | datto | connectwise | ninja_rmm",
             req.provider
         )));
     }
@@ -95,6 +97,28 @@ async fn delete_connection(
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_connection(u.tenant_id, id).await
+}
+
+async fn get_connection(
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<RmmConnectionResponse>> {
+    Ok(Json(s.service.get_connection(u.tenant_id, id).await?))
+}
+
+async fn update_connection(
+    State(s): State<RmmRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateRmmConnectionRequest>,
+) -> AppResult<Json<RmmConnectionResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.update_connection(u.tenant_id, id, &req).await?,
+    ))
 }
 
 async fn test_connection(
