@@ -126,8 +126,20 @@ pub fn create_api_router(
 
     // Build API v1 routes
     let api_v1 = Router::new()
-        // Health check
+        // Liveness probe: cheap, never touches downstream deps. Used by
+        // orchestrators to decide whether to restart the container.
         .route("/health", get(health_check))
+        // Readiness probe (PMS-130): also pings the DB, and best-effort
+        // pings Infisical when `INFISICAL_BASE_URL` is set. Returns 503
+        // with a JSON breakdown when a dependency is down so the
+        // orchestrator drains traffic until the probe goes green.
+        .route(
+            "/ready",
+            get({
+                let db = db.clone();
+                move || ready_check(db.clone())
+            }),
+        )
         // Build / version info (public, used for diagnostics)
         .route("/version", get(version_info))
         // Auth routes
@@ -304,6 +316,158 @@ async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
 /// Health check endpoint
 async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Readiness probe (PMS-130). Pings every external dependency the
+/// running server actually talks to:
+///
+/// - **Database** (always): `SELECT 1` against the pool. The legacy
+///   `health_check()` returns `"OK"` unconditionally; this is the
+///   first probe that distinguishes a process that booted from one
+///   that can actually serve a request.
+/// - **Infisical** (best-effort): if the operator set
+///   `INFISICAL_BASE_URL` at process start, a 1-second HTTP probe
+///   against `<base>/api/status`. Mokosh-server loads Infisical
+///   secrets at boot only, so a transient Infisical outage does
+///   not break in-flight requests; the probe still surfaces the
+///   outage because the next process restart would fail. Skipped
+///   when the env var was unset at boot (single-machine deployments
+///   without an Infisical sibling). The 1s timeout matches the
+///   Kubernetes `timeoutSeconds` default so the orchestrator gets
+///   our error body instead of timing out the whole probe.
+///
+/// Response shape on 200:
+/// ```json
+/// {"status":"ready","checks":{"db":"ok","infisical":"ok"|"skipped"}}
+/// ```
+///
+/// On 503 the same shape is returned with the failing dependency's
+/// value replaced by a short error string so the orchestrator log
+/// shows the root cause without a separate metrics scrape. The
+/// response sets `Cache-Control: no-store` so an intermediate
+/// proxy / CDN does not pin the failing state past the next probe.
+async fn ready_check(
+    db: crate::db::Database,
+) -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 2],
+    String,
+) {
+    let db_result = db.health_check().await;
+    let infisical_result = probe_infisical().await;
+
+    let db_value = match &db_result {
+        Ok(()) => serde_json::Value::String("ok".into()),
+        Err(e) => serde_json::Value::String(format!("error: {e}")),
+    };
+    let infisical_value = match &infisical_result {
+        Ok(true) => serde_json::Value::String("ok".into()),
+        Ok(false) => serde_json::Value::String("skipped".into()),
+        Err(e) => serde_json::Value::String(format!("error: {e}")),
+    };
+
+    let any_failed = db_result.is_err() || infisical_result.is_err();
+    let status_label = if any_failed { "not_ready" } else { "ready" };
+    let status_code = if any_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+
+    let body = serde_json::json!({
+        "status": status_label,
+        "checks": {
+            "db": db_value,
+            "infisical": infisical_value,
+        },
+    });
+    (
+        status_code,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body.to_string(),
+    )
+}
+
+/// Captured-at-boot Infisical probe state. The handler used to read
+/// `INFISICAL_BASE_URL` and build a fresh `reqwest::Client` on every
+/// request, which leaked file descriptors and re-resolved DNS under
+/// repeated orchestrator polling. Cache the parsed config + the HTTP
+/// client in a `OnceLock` so subsequent probes reuse the connection
+/// pool. The lock is initialised on the first /ready request, not at
+/// `create_api_router` time, because the env var is process-global
+/// and reading it lazily keeps the router signature unchanged.
+struct InfisicalProbe {
+    /// `<base>/api/status` URL with trailing-slash stripped from
+    /// `<base>`. Pre-built so the probe path is a const lookup.
+    url: String,
+    /// Sanitised display form of `<base>` (scheme + host[:port] only,
+    /// no userinfo or query string) used inside error strings so the
+    /// response body and access log do not echo credentials the
+    /// operator may have embedded in `INFISICAL_BASE_URL`.
+    display: String,
+    client: reqwest::Client,
+}
+
+static INFISICAL_PROBE: std::sync::OnceLock<Option<InfisicalProbe>> = std::sync::OnceLock::new();
+
+fn infisical_probe() -> Option<&'static InfisicalProbe> {
+    INFISICAL_PROBE
+        .get_or_init(|| {
+            let base = std::env::var("INFISICAL_BASE_URL").ok()?;
+            let trimmed = base.trim_end_matches('/').to_string();
+            // Best-effort credential scrub for error strings. If
+            // `INFISICAL_BASE_URL` does not parse as a URL, fall back
+            // to the literal trimmed string (no leak path exists for
+            // a value that does not parse anyway, but stay defensive).
+            let display = match url::Url::parse(&trimmed) {
+                Ok(mut u) => {
+                    let _ = u.set_username("");
+                    let _ = u.set_password(None);
+                    u.set_query(None);
+                    u.set_fragment(None);
+                    u.to_string().trim_end_matches('/').to_string()
+                }
+                Err(_) => trimmed.clone(),
+            };
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .ok()?;
+            Some(InfisicalProbe {
+                url: format!("{trimmed}/api/status"),
+                display,
+                client,
+            })
+        })
+        .as_ref()
+}
+
+/// Probe Infisical's `/api/status` endpoint when the operator opted
+/// in via `INFISICAL_BASE_URL`. Returns:
+///
+/// - `Ok(true)` - probe ran and got a 2xx response
+/// - `Ok(false)` - probe skipped (env var unset)
+/// - `Err(_)` - env var set, but the probe failed (DNS, TCP, non-2xx
+///   response, or 1s timeout). Error messages reference only the
+///   sanitised display URL so credentials in the env var stay out
+///   of the response body / access log.
+async fn probe_infisical() -> Result<bool, String> {
+    let Some(probe) = infisical_probe() else {
+        return Ok(false);
+    };
+    let resp = probe
+        .client
+        .get(&probe.url)
+        .send()
+        .await
+        .map_err(|e| format!("{}: {e}", probe.display))?;
+    if !resp.status().is_success() {
+        return Err(format!("{}: status {}", probe.display, resp.status()));
+    }
+    Ok(true)
 }
 
 /// Build / version info endpoint. Returns the package version, the
