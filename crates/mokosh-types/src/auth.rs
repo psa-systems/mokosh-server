@@ -120,6 +120,22 @@ impl UserStatus {
     }
 }
 
+/// Marker error returned by [`AuthState::require_user`] /
+/// [`AuthState::require_tenant`] when there is no authenticated
+/// principal. The shared crate cannot reach the server-side
+/// `AppError`, so callers map this to whatever they use locally
+/// (server side: `AppError::Unauthorized`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthRequired;
+
+impl std::fmt::Display for AuthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("authentication required")
+    }
+}
+
+impl std::error::Error for AuthRequired {}
+
 /// Current authenticated user state
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthState {
@@ -141,17 +157,16 @@ impl AuthState {
         }
     }
 
-    /// Get the current user or return an error
-    pub fn require_user(&self) -> Result<&CurrentUser, crate::utils::error::AppError> {
-        self.user
-            .as_ref()
-            .ok_or(crate::utils::error::AppError::Unauthorized)
+    /// Get the current user or return an [`AuthRequired`] marker.
+    /// Callers map `AuthRequired` to their own error type
+    /// (e.g. the server maps it to `AppError::Unauthorized`).
+    pub fn require_user(&self) -> Result<&CurrentUser, AuthRequired> {
+        self.user.as_ref().ok_or(AuthRequired)
     }
 
-    /// Get the current tenant ID or return an error
-    pub fn require_tenant(&self) -> Result<Uuid, crate::utils::error::AppError> {
-        self.tenant_id
-            .ok_or(crate::utils::error::AppError::Unauthorized)
+    /// Get the current tenant ID or return an [`AuthRequired`] marker.
+    pub fn require_tenant(&self) -> Result<Uuid, AuthRequired> {
+        self.tenant_id.ok_or(AuthRequired)
     }
 
     /// Check if the user has a specific role
