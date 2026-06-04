@@ -70,4 +70,4 @@ jobs:
         run: cargo test --lib
 
       - name: Integration tests
-        run: cargo test --test auth --test contacts --test tenants --test tickets --test notifications
+        run: cargo test --test auth --test contacts --test tenants --test tickets --test notifications --test rmm

@@ -107,7 +107,8 @@ pub fn create_api_router(
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());
     let reports_service = ReportsService::new(db.clone());
-    let rmm_service = RmmService::new(db.clone());
+    let rmm_service =
+        RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
     let sla_service = SlaService::new(db.clone());
     let settings_service = SettingsService::new(db.clone());
     let audit_service = AuditService::new(db.clone());

@@ -8,5 +8,5 @@ pub mod worker;
 
 pub use models::*;
 pub use routes::notifications_routes;
-pub use service::NotificationsService;
+pub use service::{render_template, NotificationsService};
 pub use worker::DispatcherWorker;
