@@ -507,11 +507,12 @@ impl TenantService {
         .execute(self.db.pool())
         .await?;
 
-        // Copy SLA notification templates (PMS-106 follow-up) so the
-        // sla_sweep worker has templates to render at-risk / breach
-        // alerts for tickets in the new tenant. Only the two SLA
-        // in-app events; other transactional defaults stay on the
-        // default tenant. Mirrors migration 027's default-tenant seed.
+        // Copy the in-app notification templates + rules the background
+        // workers need so a freshly created tenant fires SLA at-risk/breach
+        // alerts (PMS-106) and appointment reminders (PMS-58) out of the
+        // box, matching the default tenant's migration 027 / 028 seed.
+        // Other transactional templates (auth.*, ticket.*) stay on the
+        // migration seed / per-tenant CRUD.
         sqlx::query(
             r#"
             INSERT INTO notification_templates
@@ -519,8 +520,7 @@ impl TenantService {
             SELECT $1, name, event_type, channel_type, subject, body_text, body_html, is_active
             FROM notification_templates
             WHERE tenant_id = $2
-              AND event_type IN ('sla.at_risk', 'sla.breached')
-              AND channel_type = 'in_app'
+              AND event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached')
             "#,
         )
         .bind(new_tenant_id)
@@ -528,30 +528,28 @@ impl TenantService {
         .execute(self.db.pool())
         .await?;
 
-        // Active rule per SLA event, channel = in_app, recipients
-        // sourced from the dispatch context (the worker passes the
-        // assignee via context.recipient_user_id). template_id points
-        // at the NEW tenant's just-copied template rows, matched by
-        // event_type. Same shape as migration 027.
+        // Copy each default-tenant rule, re-linking template_id to the new
+        // tenant's just-copied template by (event_type, channel_type) since
+        // the copied template has a fresh id. Recipients ride the dispatch
+        // context (the workers pass the assignee via recipient_user_id).
         sqlx::query(
             r#"
             INSERT INTO notification_rules
                 (tenant_id, name, event_type, channels, recipients, template_id, is_active)
-            SELECT
-                $1,
-                'Default - ' || t.name,
-                t.event_type,
-                ARRAY['in_app']::VARCHAR(20)[],
-                '{"user_ids": [], "emails": []}'::jsonb,
-                t.id,
-                TRUE
-            FROM notification_templates t
-            WHERE t.tenant_id = $1
-              AND t.event_type IN ('sla.at_risk', 'sla.breached')
-              AND t.channel_type = 'in_app'
+            SELECT $1, r.name, r.event_type, r.channels, r.recipients, nt.id, r.is_active
+            FROM notification_rules r
+            JOIN notification_templates ot
+              ON ot.id = r.template_id AND ot.tenant_id = $2
+            JOIN notification_templates nt
+              ON nt.tenant_id = $1
+             AND nt.event_type = ot.event_type
+             AND nt.channel_type = ot.channel_type
+            WHERE r.tenant_id = $2
+              AND r.event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached')
             "#,
         )
         .bind(new_tenant_id)
+        .bind(default_tenant)
         .execute(self.db.pool())
         .await?;
 

@@ -247,6 +247,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
     scheduler.register(sla_worker, std::time::Duration::from_secs(60));
+
+    // Appointment-reminder worker (PMS-58 follow-up). Each 60s tick
+    // enumerates appointment occurrences whose reminder fire-time has
+    // arrived and dispatches `appointment.reminder` through the
+    // notifications queue, deduping per occurrence+offset via the
+    // `appointment_reminders` ledger. 60s matches the minute granularity
+    // of `reminder_minutes`. The CalendarService is built with its own
+    // NotificationsService clone so the worker can fan out.
+    let calendar_notifications =
+        mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
+            db.clone(),
+            encryption_key,
+        );
+    let calendar_reminder_worker = mokosh_server::modules::calendar::CalendarReminderWorker::new(
+        mokosh_server::modules::calendar::CalendarService::with_dispatcher(
+            db.clone(),
+            calendar_notifications,
+        ),
+    );
+    scheduler.register(calendar_reminder_worker, std::time::Duration::from_secs(60));
     let _scheduler_handles = scheduler.start();
 
     let psa_router = create_api_router(
