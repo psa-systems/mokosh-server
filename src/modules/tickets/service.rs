@@ -5,6 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
 use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
@@ -125,6 +126,7 @@ impl TicketService {
         tenant_id: Uuid,
         user_id: Uuid,
         request: &CreateTicketRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Ticket> {
         let ticket_id = Uuid::new_v4();
         let ticket_number = self.next_ticket_number(tenant_id).await?;
@@ -184,6 +186,10 @@ impl TicketService {
         self.validate_fk_opt(tenant_id, "assets", request.asset_id)
             .await?;
 
+        // Insert + audit row in one transaction: capture the new row
+        // with Postgres to_jsonb and write the audit entry on the same
+        // tx so a rollback drops both. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"
             INSERT INTO tickets (
@@ -225,8 +231,29 @@ impl TicketService {
         .bind(&request.custom_fields)
         .bind(&request.tags)
         .bind(user_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "tickets",
+            Some(ticket_id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         // Calculate and set SLA due dates
         self.calculate_sla_dates(tenant_id, ticket_id).await?;
@@ -436,6 +463,7 @@ impl TicketService {
         ticket_id: Uuid,
         user_id: Uuid,
         request: &UpdateTicketRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Ticket> {
         let ticket = self.get_ticket(tenant_id, ticket_id).await?;
         // Captured for a future "status changed" automation trigger;
@@ -460,6 +488,19 @@ impl TicketService {
         self.validate_fk_opt(tenant_id, "assets", request.asset_id)
             .await?;
 
+        // Mutation + audit row in one transaction: snapshot the row
+        // before and after (Postgres to_jsonb captures exact stored
+        // state) and write the audit entry on the same tx so a rollback
+        // drops both. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
         // Build update
         if let Some(ref title) = request.title {
             sqlx::query("UPDATE tickets SET title = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
@@ -467,7 +508,7 @@ impl TicketService {
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
         }
 
@@ -477,7 +518,7 @@ impl TicketService {
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
         }
 
@@ -486,7 +527,7 @@ impl TicketService {
             let is_closed: bool =
                 sqlx::query_scalar("SELECT is_closed FROM ticket_statuses WHERE id = $1")
                     .bind(status_id)
-                    .fetch_one(self.db.pool())
+                    .fetch_one(&mut *tx)
                     .await?;
 
             if is_closed && ticket.closed_at.is_none() {
@@ -497,7 +538,7 @@ impl TicketService {
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
             } else {
                 sqlx::query(
@@ -507,22 +548,23 @@ impl TicketService {
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
             }
         }
 
+        // Whether the priority changed; the SLA recalc that depends on it
+        // runs after the tx commits so it reads the committed priority
+        // (calculate_sla_dates goes through the pool, not this tx).
+        let priority_changed = request.priority_id.is_some();
         if let Some(priority_id) = request.priority_id {
             sqlx::query("UPDATE tickets SET priority_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
                 .bind(priority_id)
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
-
-            // Recalculate SLA when priority changes
-            self.calculate_sla_dates(tenant_id, ticket_id).await?;
         }
 
         if let Some(assigned_to_id) = request.assigned_to_id {
@@ -531,7 +573,7 @@ impl TicketService {
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
         }
 
@@ -541,8 +583,36 @@ impl TicketService {
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
+        }
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "tickets",
+            Some(ticket_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+
+        // Recalculate SLA when priority changes. Runs after commit so it
+        // reads the persisted priority (mirrors the post-commit follow-up
+        // pattern in contacts::update_company).
+        if priority_changed {
+            self.calculate_sla_dates(tenant_id, ticket_id).await?;
         }
 
         // Audit F11: run on_update automation rules. Same fail-soft
@@ -1034,7 +1104,11 @@ impl TicketService {
             custom_fields: serde_json::Value::Null,
             tags: vec![],
         };
-        let ticket = self.create_ticket(tenant_id, creator, &request).await?;
+        // Portal flow has no AuditCtx extractor (portal auth identity is a
+        // `contacts` row, not a `users` row); attribute to the system actor.
+        let ticket = self
+            .create_ticket(tenant_id, creator, &request, &AuditCtx::system(tenant_id))
+            .await?;
         self.get_ticket_response(tenant_id, ticket.id).await
     }
 

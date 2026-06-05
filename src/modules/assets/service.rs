@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -584,6 +585,7 @@ impl AssetsService {
         asset_id: Uuid,
         performer: Uuid,
         request: &CreateCredentialRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<CredentialResponse> {
         let username_enc = crate::utils::crypto::encrypt(&request.username, &self.encryption_key)?;
         let password_enc = crate::utils::crypto::encrypt(&request.password, &self.encryption_key)?;
@@ -628,6 +630,30 @@ impl AssetsService {
         .bind(performer)
         .execute(&mut *tx)
         .await?;
+
+        // PMS-117 audit: snapshot the new row WITHOUT the encrypted secret
+        // columns, so the audit trail records who created which credential
+        // but never the secret material itself.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            r#"SELECT to_jsonb(t) - 'username_encrypted' - 'password_encrypted'
+                      - 'notes_encrypted'
+               FROM credential_vault t WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "credential_vault",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
         tx.commit().await?;
 
         Ok(CredentialResponse {
@@ -646,16 +672,46 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_credential(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_credential(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // PMS-117 audit: snapshot before deleting, omitting the encrypted
+        // secret columns. Mutation + audit row share one transaction so a
+        // rollback drops both.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            r#"SELECT to_jsonb(t) - 'username_encrypted' - 'password_encrypted'
+                      - 'notes_encrypted'
+               FROM credential_vault t WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM credential_vault WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Credential".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "credential_vault",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
