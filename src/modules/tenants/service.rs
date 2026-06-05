@@ -507,6 +507,54 @@ impl TenantService {
         .execute(self.db.pool())
         .await?;
 
+        // Copy SLA notification templates (PMS-106 follow-up) so the
+        // sla_sweep worker has templates to render at-risk / breach
+        // alerts for tickets in the new tenant. Only the two SLA
+        // in-app events; other transactional defaults stay on the
+        // default tenant. Mirrors migration 027's default-tenant seed.
+        sqlx::query(
+            r#"
+            INSERT INTO notification_templates
+                (tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+            SELECT $1, name, event_type, channel_type, subject, body_text, body_html, is_active
+            FROM notification_templates
+            WHERE tenant_id = $2
+              AND event_type IN ('sla.at_risk', 'sla.breached')
+              AND channel_type = 'in_app'
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(self.db.pool())
+        .await?;
+
+        // Active rule per SLA event, channel = in_app, recipients
+        // sourced from the dispatch context (the worker passes the
+        // assignee via context.recipient_user_id). template_id points
+        // at the NEW tenant's just-copied template rows, matched by
+        // event_type. Same shape as migration 027.
+        sqlx::query(
+            r#"
+            INSERT INTO notification_rules
+                (tenant_id, name, event_type, channels, recipients, template_id, is_active)
+            SELECT
+                $1,
+                'Default - ' || t.name,
+                t.event_type,
+                ARRAY['in_app']::VARCHAR(20)[],
+                '{"user_ids": [], "emails": []}'::jsonb,
+                t.id,
+                TRUE
+            FROM notification_templates t
+            WHERE t.tenant_id = $1
+              AND t.event_type IN ('sla.at_risk', 'sla.breached')
+              AND t.channel_type = 'in_app'
+            "#,
+        )
+        .bind(new_tenant_id)
+        .execute(self.db.pool())
+        .await?;
+
         Ok(())
     }
 }
