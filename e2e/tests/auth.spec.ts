@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { expectAtLoginScreen, loginViaSpa } from '../lib/login';
+import { attachPageDiagnostics } from '../lib/page-diagnostics';
 
 // Browser-driven auth coverage (AC coverage area 1). DOM-level assertions:
 // the SPA stores its access token in WASM memory, so an external request
@@ -11,23 +12,42 @@ import { expectAtLoginScreen, loginViaSpa } from '../lib/login';
 // once on CI (2). Splitting login/logout into two tests would add another
 // 2-4 logins (test bodies + retries) and cross the cap, so keep auth-ui
 // down to one login attempt per project run.
-// PMS-140 phase-1 quarantine: the browser-driven login + logout round-trip
-// is flaky against the bunyip hub. Setup proves the underlying SPA login
-// works end-to-end (it captures a bearer from the post-login /api request),
-// so the suite has real auth coverage; this test fails non-deterministically
-// on the form-submit step or on the cross-origin logout redirect chain.
-// `test.fixme` keeps it discoverable as "to fix" without flagging CI red.
-// Revisit once the hub login surface stabilises - see PMS-140.
+//
+// PMS-142 took this out of `test.fixme` quarantine. Two observed failure
+// modes had previously made it flaky: (1) the bunyip hub form-submit not
+// progressing past /login (transient hub-side, sometimes a credentials race
+// with the WASM-hydrated SPA shim, sometimes legitimate user-error); (2)
+// the post-logout URL stalling on /dashboard because the User-menu click
+// reached the DOM before Dioxus had wired up the avatar's onclick
+// (WASM hydration race - the SPA was visually rendered but not yet
+// interactive). Mitigations:
+//   - `loginViaSpa` itself stays as-is for now (the hub form is HTMX, not
+//     WASM, so the hydration argument does not apply on its side; CI data
+//     will tell us if more is needed).
+//   - `logout` below clicks the avatar, then polls for the popup `role="menu"`
+//     to actually appear. If it doesn't within a short window, it clicks
+//     again (Dioxus toggles `open` per click, so the second click only fires
+//     when the first one no-op'd against an unhydrated button).
+//   - Both halves capture a diagnostic dump on failure via
+//     attachPageDiagnostics so the next iteration is precise.
 test.describe('auth login / session', () => {
-  test.fixme('login + logout round-trip', async ({ page }) => {
-    await loginViaSpa(page);
-    // loginViaSpa already polled "URL is no longer /login"; verify the SPA
-    // settled on a non-error landing page rather than 404 or transient
-    // error route.
+  test('login + logout round-trip', async ({ page }) => {
+    const diag = attachPageDiagnostics(page);
+
+    try {
+      await loginViaSpa(page);
+    } catch (err) {
+      throw new Error(`${String(err)}\n\n${diag.snapshot('login diagnostic', page)}`);
+    }
+
     expect(page.url(), 'post-login URL').not.toMatch(/\/(login|error|404)\/?$/);
 
-    await logout(page);
-    await expectAtLoginScreen(page);
+    try {
+      await logout(page);
+      await expectAtLoginScreen(page);
+    } catch (err) {
+      throw new Error(`${String(err)}\n\n${diag.snapshot('logout diagnostic', page)}`);
+    }
   });
 });
 
@@ -38,16 +58,43 @@ test.describe('auth login / session', () => {
 // before the SPA's logout handler can clear local state. The logout handler
 // then redirects to the bunyip hub's /logout which itself ends up on /login;
 // the surrounding test asserts on the final URL.
+//
+// The click-retry-if-menu-not-open loop defends against the Dioxus WASM
+// hydration race: a visible avatar button does not mean its onclick handler
+// has been wired up yet. If the first click no-op'd, the second one will
+// fire against the now-hydrated handler. Cap at 3 attempts so a genuinely
+// broken SPA fails clearly rather than spinning forever.
+const MENU_OPEN_ATTEMPTS = 3;
+const MENU_OPEN_WAIT_MS = 3_000;
+
 async function logout(page: Page): Promise<void> {
   // `.first()` defends against strict-mode violations if the SPA ever renders
   // a duplicate menu (e.g. parallel mobile/desktop nav copies of the same
   // button). The visible avatar in the top bar is the one we want either way.
   const userMenu = page.getByRole('button', { name: 'User menu' }).first();
   await userMenu.waitFor({ state: 'visible', timeout: 10_000 });
-  await userMenu.click();
 
-  // Same defence on the popup: a future drawer or context menu carrying
-  // role="menu" elsewhere on the page would otherwise trip strict mode.
   const menu = page.getByRole('menu').first();
+  let opened = false;
+  for (let attempt = 1; attempt <= MENU_OPEN_ATTEMPTS; attempt += 1) {
+    await userMenu.click();
+    try {
+      await menu.waitFor({ state: 'visible', timeout: MENU_OPEN_WAIT_MS });
+      opened = true;
+      break;
+    } catch {
+      // Menu didn't appear within the window. Most likely the Dioxus
+      // component had not finished hydrating; loop and try again. Each
+      // click toggles `open`, so an odd number of clicks lands on "open".
+    }
+  }
+  if (!opened) {
+    throw new Error(
+      `User menu did not open after ${MENU_OPEN_ATTEMPTS} clicks on the avatar ` +
+        `(${MENU_OPEN_WAIT_MS / 1000}s wait each). SPA likely still not interactive ` +
+        `or the markup has changed - check mokosh-clients/src/components/layout.rs.`,
+    );
+  }
+
   await menu.getByRole('button', { name: /^logout$/i }).click();
 }

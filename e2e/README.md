@@ -9,7 +9,7 @@ gate (that is PMS-141).
 
 | Area | File | How |
 | --- | --- | --- |
-| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form, logout invalidates the session (**quarantined - `test.fixme`**; flaky against the bunyip hub. Setup's bearer capture is the load-bearing proof that SPA login works end-to-end) |
+| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form (TOTP-aware), opens the avatar menu (click-retries through Dioxus WASM hydration), clicks Logout, asserts URL returns to the hub's `/login` |
 | OIDC token flow | `tests/oidc.spec.ts` | request context: `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE) (**quarantined - `test.fixme`**; bunyip's `/oauth2/authorize` needs an OP session cookie the request context does not carry, so it 302s to the hub login instead of the registered redirect. Mokosh-server's RS path is exercised indirectly by every other api test) |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
@@ -33,8 +33,9 @@ exist in mokosh's local `users` table):
 - **`auth-ui` project** (`tests/auth.spec.ts`) drives the SPA login form in
   a real browser and asserts on URL transitions (login leaves `/login`,
   logout returns to it). DOM-only, no API probe - the SPA's in-memory token
-  cannot be exfiltrated for an external request context to use. Currently
-  `test.fixme` (see "What it covers" above).
+  cannot be exfiltrated for an external request context to use. Captures a
+  URL trail + request log via `lib/page-diagnostics.ts` and folds them into
+  the thrown error on failure.
 
 ## Required configuration
 
