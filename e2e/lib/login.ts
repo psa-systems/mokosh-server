@@ -46,23 +46,6 @@ export async function loginViaSpa(page: Page): Promise<void> {
     .not.toMatch(/^\/login\/?$/);
 }
 
-// Bypass the SPA: call `POST /api/v1/auth/login` directly and return the
-// `access_token` from the JSON response. Used by `tests/global.setup.ts` to
-// seed the bearer token the API project tests reuse.
-export async function loginViaApi(request: APIRequestContext): Promise<string> {
-  const res = await request.post(routes.authLogin, {
-    data: { email: env.email, password: env.password },
-  });
-  if (!res.ok()) {
-    throw new Error(`POST ${routes.authLogin} -> ${res.status()}: ${await res.text()}`);
-  }
-  const body = (await res.json()) as { access_token?: string };
-  if (!body.access_token) {
-    throw new Error(`login response missing access_token: ${JSON.stringify(body)}`);
-  }
-  return body.access_token;
-}
-
 // An authenticated session can read the tenant-scoped tickets list (200); an
 // anonymous one is rejected (401/403). Cheapest universal session proof.
 export async function expectAuthenticated(request: APIRequestContext): Promise<void> {
@@ -80,12 +63,14 @@ export async function expectAnonymous(request: APIRequestContext): Promise<void>
 
 // Browser-driven "logged out" proof: the SPA bounces back to /login when the
 // session is gone. Used by the auth-ui project so it never touches a request
-// context (which would need its own bearer token).
+// context (which would need its own bearer token). Logout redirects through
+// the bunyip hub's /logout (cross-origin POST + Set-Cookie + redirect to the
+// hub's /login), so the wait budget covers that round-trip.
 export async function expectAtLoginScreen(page: Page): Promise<void> {
   await expect
     .poll(() => new URL(page.url()).pathname, {
-      timeout: 15_000,
-      message: 'expected SPA to navigate back to /login after logout',
+      timeout: 30_000,
+      message: 'expected SPA/hub to navigate to /login after logout',
     })
     .toMatch(/^\/login\/?$/);
 }
