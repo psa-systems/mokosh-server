@@ -112,7 +112,16 @@ npx playwright show-report     # after a run
 
 ## CI
 
-`.forgejo/workflows/e2e.yml` runs on push to `main`. It installs Node + the
-Chromium browser, waits for `GET /api/v1/version` to report the pushed commit's
-git hash (poll 15s, 10-min timeout - the **deploy-sync gate**), runs the suite,
-and uploads `playwright-report/` + `test-results/` as artifacts on failure.
+`.forgejo/workflows/e2e.yml` runs on three triggers, all serialised through a
+single concurrency group (the suite shares one E2E account and the per-email
+login rate limit is 5/min, so parallel runs would collide):
+
+| Trigger | Purpose | Pre-flight gate | Notes |
+| --- | --- | --- | --- |
+| `push` to `main` | Post-merge validation: assert the deployed commit is actually serving on staging | `scripts/wait-for-deploy.mjs` polls `GET /api/v1/version` until staging reports the pushed commit's git hash (poll 15s, 10-min timeout). Walks back to the last build-relevant commit when the merged commit is doc/CI-only | Originally PMS-140 |
+| `pull_request` targeting `main` (incl. `release/*` PRs) | Merge gate: every PR must pass the suite against staging before merge | `scripts/health-check.mjs` GETs `/api/v1/health` (one-shot, 30s timeout). A PR's SHA never deploys to staging so a version-SHA gate would always time out; this checks staging is up and the suite has something to talk to | PMS-141. Add `e2e` to required status checks on main branch protection to make the gate enforceable |
+| `workflow_dispatch` | Manual ad-hoc runs | Treated like `push` (runs the deploy-sync gate) | Use to force a re-run without pushing |
+
+Each run installs Node + Chromium, runs the suite against the configured
+staging deployment, and uploads `playwright-report/` + `test-results/` as
+artifacts on failure.
