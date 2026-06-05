@@ -172,6 +172,11 @@ regex = "1"
 # Cron
 cron = "0.15"
 
+# RFC 5545 recurrence-rule (RRULE) expansion for recurring appointments
+# (PMS-58). Expansion happens in-memory at read time, bounded by the
+# requested range; recurring rows are never materialised in the DB.
+rrule = "0.14"
+
 # URL
 url = "2"
 

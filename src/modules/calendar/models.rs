@@ -28,6 +28,16 @@ pub struct AppointmentResponse {
     pub timezone: String,
     pub status: String,
     pub location: Option<String>,
+    /// RFC 5545 RRULE string when this is a recurring series master
+    /// (e.g. `FREQ=DAILY;COUNT=3`). `None` for a one-off appointment or
+    /// for an expanded occurrence instance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurrence_rule: Option<String>,
+    /// Set on an expanded occurrence instance to the id of the series
+    /// master it was generated from. `None` on stored rows. Lets a
+    /// client tell a virtual instance apart from a persisted row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurrence_parent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -53,6 +63,11 @@ pub struct CreateAppointmentRequest {
     #[serde(default = "default_utc")]
     pub timezone: String,
     pub location: Option<String>,
+    /// Optional RFC 5545 RRULE (e.g. `FREQ=WEEKLY;BYDAY=MO`). Stored
+    /// verbatim; occurrences are expanded in-memory at read time, never
+    /// materialised as rows. A `DTSTART` line is NOT expected here - the
+    /// series is anchored on this appointment's `start_time`.
+    pub recurrence_rule: Option<String>,
 }
 
 fn default_other() -> String {
@@ -204,4 +219,38 @@ pub struct OnCallNowResponse {
     pub schedule_id: Uuid,
     pub schedule_name: String,
     pub on_call_user_id: Option<Uuid>,
+}
+
+// ============================================================================
+// Dispatch view (PMS-58)
+// ============================================================================
+
+/// Query for the dispatch board. `from`/`to` bound the window the
+/// aggregation covers; `assigned_to_id` optionally narrows appointments
+/// and availability to one technician.
+#[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
+pub struct DispatchFilter {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub assigned_to_id: Option<Uuid>,
+}
+
+/// Aggregated technician-dispatch view for a date range. Combines the
+/// four scheduling surfaces a dispatcher needs on one board:
+/// appointments (recurring series expanded in-memory), per-user weekly
+/// availability windows, approved time off, and current on-call
+/// coverage.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchResponse {
+    /// Appointments overlapping the range, with recurring series
+    /// expanded to concrete occurrence instances.
+    pub appointments: Vec<AppointmentResponse>,
+    /// Weekly availability windows. Scoped to `assigned_to_id` when the
+    /// filter sets it, otherwise every user in the tenant.
+    pub availability: Vec<UserAvailabilityResponse>,
+    /// Approved time off overlapping the range (pending / rejected
+    /// requests are excluded - they do not block dispatch).
+    pub time_off: Vec<TimeOffResponse>,
+    /// Who is on call right now, one entry per active schedule.
+    pub on_call: Vec<OnCallNowResponse>,
 }

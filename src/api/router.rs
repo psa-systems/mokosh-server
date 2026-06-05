@@ -20,7 +20,7 @@ use crate::modules::audit::{audit_log_middleware, audit_routes, AuditService};
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::billing::{billing_routes, BillingService};
-use crate::modules::calendar::{calendar_routes, CalendarService};
+use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
@@ -178,28 +178,13 @@ pub fn create_api_router(
         // Calendar / scheduling: events, appointments, availability,
         // time-off, on-call. PMS-59. Mounted via merge so the routes
         // appear at their natural top-level paths.
-        .merge(calendar_routes(calendar_service))
-        // Dispatch view (technician scheduling board). Not yet
-        // implemented; the calendar story (PMS-58) owns the
-        // aggregating endpoint that combines appointments,
-        // availability, time off, and on-call coverage. Returns a
-        // self-documenting 501 listing the planned shape so an
-        // integrator hitting it early sees something useful.
-        .nest(
-            "/dispatch",
-            module_stub_routes(StubModule {
-                name: "dispatch",
-                tracking_issue: "PMS-58",
-                summary: "Technician dispatch board: appointments + availability + \
-                          time off + on-call for a date range.",
-                planned_endpoints: &[(
-                    "GET",
-                    "/api/v1/dispatch",
-                    "Aggregated dispatch view for a date range and optional \
-                     assignee filter.",
-                )],
-            }),
-        )
+        .merge(calendar_routes(calendar_service.clone()))
+        // Dispatch view (technician scheduling board). PMS-58: the
+        // calendar story owns this aggregating endpoint that combines
+        // appointments (recurring series expanded), availability, time
+        // off, and on-call coverage for a date range. Backed by the
+        // same CalendarService as the calendar routes.
+        .nest("/dispatch", dispatch_routes(calendar_service))
         // Contracts: contracts + items + hour balances + rate cards. PMS-65.
         .merge(contracts_routes(contracts_service))
         // SLA: policies, targets, business hours, holidays, evaluator. PMS-107.
@@ -483,6 +468,13 @@ async fn version_info() -> Json<VersionInfo> {
 /// an unimplemented endpoint learns the module name, the YouTrack
 /// issue tracking the implementation, and the planned endpoint shape
 /// without having to grep the source.
+///
+/// `dispatch` (PMS-58) was the last live caller; it now has a real
+/// router. The helper is kept (not deleted) because the same
+/// self-documenting-501 pattern is the agreed shape for the remaining
+/// placeholder modules - the next module to graduate re-wires it the
+/// same way `dispatch` did. `#[allow(dead_code)]` until then.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct StubModule {
     /// Module slug as it appears in the URL (e.g. `dispatch`).
@@ -501,6 +493,9 @@ struct StubModule {
 /// catch-all route uses Axum's `{*rest}` wildcard so sub-paths under
 /// the module also surface the same payload instead of falling
 /// through to a 404.
+///
+/// Retained for the remaining placeholder modules; see [`StubModule`].
+#[allow(dead_code)]
 fn module_stub_routes(meta: StubModule) -> Router {
     Router::new()
         .route("/", get(stub_handler))
@@ -508,6 +503,7 @@ fn module_stub_routes(meta: StubModule) -> Router {
         .with_state(meta)
 }
 
+#[allow(dead_code)]
 async fn stub_handler(
     axum::extract::State(meta): axum::extract::State<StubModule>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,

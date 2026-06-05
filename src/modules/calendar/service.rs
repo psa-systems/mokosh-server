@@ -1,6 +1,6 @@
 //! Calendar / scheduling service. Stateless except for the DB handle.
 
-use chrono::{Datelike, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -8,6 +8,14 @@ use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+
+/// Hard ceiling on how many occurrences a single recurring series may
+/// expand to in one range query. RRULEs without `COUNT` / `UNTIL` are
+/// infinite; `rrule::RRuleSet::all` requires a `u16` limit, and we
+/// additionally clip to the requested `to` bound. This cap is the
+/// belt-and-braces guard so a pathological rule (e.g. `FREQ=SECONDLY`)
+/// over a wide range cannot blow up memory.
+const MAX_OCCURRENCES_PER_SERIES: u16 = 1000;
 
 #[derive(Clone)]
 pub struct CalendarService {
@@ -62,6 +70,28 @@ impl CalendarService {
         filter: &AppointmentFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AppointmentResponse>, u64)> {
+        // Bounded range query (both ends supplied) => expand recurring
+        // series in-memory and paginate the expanded set. Recurrence has
+        // no meaning without an upper bound, so the unbounded path below
+        // stays a plain SQL-paginated list of stored rows (master rows
+        // included, occurrences not expanded). `appointment_type` is not
+        // a dimension of the range/dispatch view, so it is honoured only
+        // on the unbounded path.
+        if let (Some(from), Some(to), None) =
+            (filter.from, filter.to, filter.appointment_type.as_ref())
+        {
+            let all = self
+                .appointments_in_range(tenant_id, from, to, filter.user_id)
+                .await?;
+            let total = all.len() as u64;
+            let start = pagination.offset() as usize;
+            let page: Vec<AppointmentResponse> = all
+                .into_iter()
+                .skip(start)
+                .take(pagination.limit() as usize)
+                .collect();
+            return Ok((page, total));
+        }
         let mut conditions = vec!["tenant_id = $1".to_string()];
         let mut idx = 2;
         if filter.user_id.is_some() {
@@ -87,6 +117,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
+                      recurrence_rule, recurrence_parent_id,
                       created_at, updated_at
                FROM appointments WHERE {where_clause}
                ORDER BY start_time
@@ -120,15 +151,103 @@ impl CalendarService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// Range query with in-memory recurrence expansion (PMS-58).
+    ///
+    /// Returns every appointment instance that overlaps `[from, to]`,
+    /// sorted by start. Non-recurring rows pass through unchanged; rows
+    /// carrying a `recurrence_rule` are expanded to concrete occurrence
+    /// instances bounded by the window (the master row itself is NOT
+    /// emitted - its occurrences are). Expansion happens here at read
+    /// time; no occurrence rows are ever written to the DB.
+    ///
+    /// `assigned_to_id` optionally narrows to one technician. The window
+    /// is required: an unbounded recurring series has no natural end, so
+    /// the caller must supply both bounds.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn appointments_in_range(
+        &self,
+        tenant_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        assigned_to_id: Option<Uuid>,
+    ) -> AppResult<Vec<AppointmentResponse>> {
+        // Non-recurring rows overlapping the window. The recurring
+        // masters are fetched separately (next query) WITHOUT a time
+        // filter, because a series that started before `from` can still
+        // produce occurrences inside the window.
+        let mut conditions = vec![
+            "tenant_id = $1".to_string(),
+            "recurrence_rule IS NULL".to_string(),
+        ];
+        let mut idx = 2;
+        if assigned_to_id.is_some() {
+            conditions.push(format!("assigned_to_id = ${idx}"));
+            idx += 1;
+        }
+        let from_ph = idx;
+        let to_ph = idx + 1;
+        // overlap: end >= from AND start <= to
+        conditions.push(format!("end_time >= ${from_ph}"));
+        conditions.push(format!("start_time <= ${to_ph}"));
+        let where_clause = conditions.join(" AND ");
+        let plain_query = format!(
+            r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
+                      task_id, company_id, contact_id, site_id, assigned_to_id,
+                      start_time, end_time, all_day, timezone, status, location,
+                      recurrence_rule, recurrence_parent_id,
+                      created_at, updated_at
+               FROM appointments WHERE {where_clause}
+               ORDER BY start_time"#
+        );
+        let mut q = sqlx::query_as::<_, AppointmentRow>(&plain_query).bind(tenant_id);
+        if let Some(v) = assigned_to_id {
+            q = q.bind(v);
+        }
+        let plain_rows = q.bind(from).bind(to).fetch_all(self.db.pool()).await?;
+
+        // Recurring masters: no time filter (the rule decides which
+        // occurrences land in the window).
+        let mut rconditions = vec![
+            "tenant_id = $1".to_string(),
+            "recurrence_rule IS NOT NULL".to_string(),
+        ];
+        if assigned_to_id.is_some() {
+            rconditions.push("assigned_to_id = $2".to_string());
+        }
+        let rwhere = rconditions.join(" AND ");
+        let recurring_query = format!(
+            r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
+                      task_id, company_id, contact_id, site_id, assigned_to_id,
+                      start_time, end_time, all_day, timezone, status, location,
+                      recurrence_rule, recurrence_parent_id,
+                      created_at, updated_at
+               FROM appointments WHERE {rwhere}
+               ORDER BY start_time"#
+        );
+        let mut rq = sqlx::query_as::<_, AppointmentRow>(&recurring_query).bind(tenant_id);
+        if let Some(v) = assigned_to_id {
+            rq = rq.bind(v);
+        }
+        let recurring_rows = rq.fetch_all(self.db.pool()).await?;
+
+        let mut out: Vec<AppointmentResponse> = plain_rows.into_iter().map(Into::into).collect();
+        for row in recurring_rows {
+            let base: AppointmentResponse = row.into();
+            out.extend(expand_recurrence(&base, from, to));
+        }
+        out.sort_by_key(|a| a.start_time);
+        Ok(out)
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_appointment(
         &self,
         tenant_id: Uuid,
         request: &CreateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
-        if request.end_time < request.start_time {
+        if request.end_time <= request.start_time {
             return Err(AppError::BadRequest(
-                "end_time must be >= start_time".to_string(),
+                "end_time must be after start_time".to_string(),
             ));
         }
         // PSA audit: every foreign id from the request body must belong to
@@ -152,8 +271,8 @@ impl CalendarService {
             r#"INSERT INTO appointments (
                 id, tenant_id, title, description, appointment_type, ticket_id, project_id,
                 task_id, company_id, contact_id, site_id, assigned_to_id,
-                start_time, end_time, all_day, timezone, location
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
+                start_time, end_time, all_day, timezone, location, recurrence_rule
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -172,6 +291,7 @@ impl CalendarService {
         .bind(request.all_day)
         .bind(&request.timezone)
         .bind(&request.location)
+        .bind(&request.recurrence_rule)
         .execute(self.db.pool())
         .await?;
         self.get_appointment(tenant_id, id).await
@@ -187,6 +307,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
+                      recurrence_rule, recurrence_parent_id,
                       created_at, updated_at
                FROM appointments WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -654,6 +775,201 @@ impl CalendarService {
         }
         Ok(out)
     }
+
+    // ========================================================================
+    // PMS-58 dispatch view
+    // ========================================================================
+
+    /// Aggregated dispatch board for `[from, to]`. Combines the four
+    /// scheduling surfaces a dispatcher needs:
+    ///   * appointments overlapping the window (recurring series expanded)
+    ///   * weekly availability windows (all users, or one when
+    ///     `assigned_to_id` is set)
+    ///   * approved time off overlapping the window
+    ///   * current on-call coverage
+    ///
+    /// Availability is week-relative (`day_of_week` + start/end TIME), so
+    /// it is returned as-is rather than projected onto the range; the UI
+    /// overlays it against each day in the window.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn dispatch_view(
+        &self,
+        tenant_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        assigned_to_id: Option<Uuid>,
+    ) -> AppResult<DispatchResponse> {
+        let appointments = self
+            .appointments_in_range(tenant_id, from, to, assigned_to_id)
+            .await?;
+
+        // Availability: optionally scoped to one technician.
+        let avail_rows = if let Some(uid) = assigned_to_id {
+            sqlx::query_as::<_, AvailRow>(
+                r#"SELECT id, user_id, day_of_week, start_time, end_time, is_available
+                   FROM user_availability WHERE tenant_id = $1 AND user_id = $2
+                   ORDER BY user_id, day_of_week, start_time"#,
+            )
+            .bind(tenant_id)
+            .bind(uid)
+            .fetch_all(self.db.pool())
+            .await?
+        } else {
+            sqlx::query_as::<_, AvailRow>(
+                r#"SELECT id, user_id, day_of_week, start_time, end_time, is_available
+                   FROM user_availability WHERE tenant_id = $1
+                   ORDER BY user_id, day_of_week, start_time"#,
+            )
+            .bind(tenant_id)
+            .fetch_all(self.db.pool())
+            .await?
+        };
+        let availability: Vec<UserAvailabilityResponse> =
+            avail_rows.into_iter().map(Into::into).collect();
+
+        // Approved time off overlapping the window. time_off is DATE
+        // granularity, so compare against the date components of the
+        // range bounds.
+        let from_date = from.date_naive();
+        let to_date = to.date_naive();
+        let time_off_rows = if let Some(uid) = assigned_to_id {
+            sqlx::query_as::<_, TimeOffRow>(
+                r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
+                   FROM time_off
+                   WHERE tenant_id = $1 AND status = 'approved'
+                     AND user_id = $4
+                     AND end_date >= $2 AND start_date <= $3
+                   ORDER BY start_date"#,
+            )
+            .bind(tenant_id)
+            .bind(from_date)
+            .bind(to_date)
+            .bind(uid)
+            .fetch_all(self.db.pool())
+            .await?
+        } else {
+            sqlx::query_as::<_, TimeOffRow>(
+                r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
+                   FROM time_off
+                   WHERE tenant_id = $1 AND status = 'approved'
+                     AND end_date >= $2 AND start_date <= $3
+                   ORDER BY start_date"#,
+            )
+            .bind(tenant_id)
+            .bind(from_date)
+            .bind(to_date)
+            .fetch_all(self.db.pool())
+            .await?
+        };
+        let time_off: Vec<TimeOffResponse> = time_off_rows.into_iter().map(Into::into).collect();
+
+        let on_call = self.on_call_now(tenant_id).await?;
+
+        Ok(DispatchResponse {
+            appointments,
+            availability,
+            time_off,
+            on_call,
+        })
+    }
+}
+
+/// Expand a recurring appointment master into concrete occurrence
+/// instances overlapping `[from, to]`.
+///
+/// The stored `recurrence_rule` is an RFC 5545 RRULE value (e.g.
+/// `FREQ=DAILY;COUNT=3`). The series is anchored on the master's
+/// `start_time` (a `DTSTART` is synthesised from it; any `DTSTART` /
+/// `RRULE:` prefix already present in the stored value is normalised
+/// away). Each occurrence keeps the master's duration; `start_time` /
+/// `end_time` are shifted to the occurrence and `recurrence_parent_id`
+/// is set to the master id so a client can tell a virtual instance from
+/// a stored row. The master row itself is NOT emitted - its first
+/// occurrence stands in for it.
+///
+/// Bounding is twofold: `rrule`'s `before`/`after` clip the walk to the
+/// window (widened by 1s so boundary occurrences are included, then
+/// re-filtered inclusively in Rust), and [`MAX_OCCURRENCES_PER_SERIES`]
+/// caps a pathological infinite rule. A rule that fails to parse yields
+/// no instances (logged at warn) rather than failing the whole query.
+fn expand_recurrence(
+    base: &AppointmentResponse,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<AppointmentResponse> {
+    use rrule::{RRuleSet, Tz};
+
+    let Some(rule_raw) = base.recurrence_rule.as_deref() else {
+        return Vec::new();
+    };
+    // Normalise: drop any DTSTART line the caller stored (we anchor on
+    // the appointment's start_time) and any leading `RRULE:` token, then
+    // rebuild a canonical `DTSTART:...\nRRULE:...` document.
+    let rule_body = rule_raw
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            let upper = l.to_uppercase();
+            !upper.starts_with("DTSTART") && !l.is_empty()
+        })
+        .map(|l| {
+            l.strip_prefix("RRULE:")
+                .or_else(|| l.strip_prefix("rrule:"))
+                .unwrap_or(l)
+        })
+        .unwrap_or(rule_raw);
+
+    let dtstart = base.start_time.format("%Y%m%dT%H%M%SZ");
+    let ical = format!("DTSTART:{dtstart}\nRRULE:{rule_body}");
+
+    let set: RRuleSet = match ical.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                appointment_id = %base.id,
+                rule = %rule_raw,
+                error = %e,
+                "skipping appointment with unparseable recurrence_rule",
+            );
+            return Vec::new();
+        }
+    };
+
+    let duration = base.end_time - base.start_time;
+    // Widen the rrule bounds by 1s so an occurrence landing exactly on a
+    // bound is not dropped by the exclusive before/after; re-filter
+    // inclusively below.
+    let epsilon = chrono::Duration::seconds(1);
+    let after = (from - epsilon).with_timezone(&Tz::UTC);
+    let before = (to + epsilon).with_timezone(&Tz::UTC);
+
+    let result = set
+        .after(after)
+        .before(before)
+        .all(MAX_OCCURRENCES_PER_SERIES);
+    if result.limited {
+        tracing::warn!(
+            appointment_id = %base.id,
+            cap = MAX_OCCURRENCES_PER_SERIES,
+            "recurrence expansion hit the per-series occurrence cap; results truncated",
+        );
+    }
+
+    result
+        .dates
+        .into_iter()
+        .map(|occ| occ.with_timezone(&Utc))
+        .filter(|start| *start >= from && *start <= to)
+        .map(|start| AppointmentResponse {
+            start_time: start,
+            end_time: start + duration,
+            recurrence_parent_id: Some(base.id),
+            // The instance carries no rule of its own; only the master
+            // does. Clearing it keeps the wire shape unambiguous.
+            recurrence_rule: None,
+            ..base.clone()
+        })
+        .collect()
 }
 
 #[derive(sqlx::FromRow)]
@@ -675,6 +991,8 @@ struct AppointmentRow {
     timezone: Option<String>,
     status: Option<String>,
     location: Option<String>,
+    recurrence_rule: Option<String>,
+    recurrence_parent_id: Option<Uuid>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -699,6 +1017,8 @@ impl From<AppointmentRow> for AppointmentResponse {
             timezone: r.timezone.unwrap_or_else(|| "UTC".into()),
             status: r.status.unwrap_or_else(|| "scheduled".into()),
             location: r.location,
+            recurrence_rule: r.recurrence_rule,
+            recurrence_parent_id: r.recurrence_parent_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
