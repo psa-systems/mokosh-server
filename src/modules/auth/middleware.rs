@@ -99,7 +99,7 @@ pub async fn auth_middleware(
                 match auth_middleware.auth_service.decode_token(token) {
                     Ok(claims) => match auth_middleware
                         .auth_service
-                        .get_user_by_id(claims.sub)
+                        .get_user_by_id(claims.tid, claims.sub)
                         .await
                     {
                         Ok(user) => AuthState::authenticated(user.to_current_user(), claims.tid),
@@ -333,8 +333,12 @@ async fn ensure_user_from_bunyip(
 ) -> Option<AuthState> {
     let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
 
-    // Happy path: row already exists.
-    if let Ok(user) = auth_service.get_user_by_id(sub).await {
+    // Happy path: row already exists. The bunyip-issued at+jwt does
+    // not (yet) carry a tenant claim, so we look up the user with
+    // the default bunyip tenant. If multi-tenant claim plumbing
+    // lands we revisit this. PMS-4 AC6 + docs §3.3.
+    let default_tenant = default_bunyip_tenant_id();
+    if let Ok(user) = auth_service.get_user_by_id(default_tenant, sub).await {
         let tenant_id = user.tenant_id;
         return Some(AuthState::authenticated(user.to_current_user(), tenant_id));
     }
@@ -345,14 +349,16 @@ async fn ensure_user_from_bunyip(
         .as_ref()
         .and_then(|i| i.email.clone())
         .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
-    let tenant_id = default_bunyip_tenant_id();
 
     let user = auth_service
-        .upsert_user_from_oidc(sub, tenant_id, &email, UserRole::default())
+        .upsert_user_from_oidc(sub, default_tenant, &email, UserRole::default())
         .await
         .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
         .ok()?;
-    Some(AuthState::authenticated(user.to_current_user(), tenant_id))
+    Some(AuthState::authenticated(
+        user.to_current_user(),
+        default_tenant,
+    ))
 }
 
 fn default_bunyip_tenant_id() -> uuid::Uuid {

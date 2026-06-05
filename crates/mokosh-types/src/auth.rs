@@ -262,8 +262,13 @@ pub struct LoginRequest {
     /// Remember me for longer session
     #[serde(default)]
     pub remember_me: bool,
-    /// MFA code if required
+    /// 6-8 digit TOTP code if MFA is enabled.
     pub mfa_code: Option<String>,
+    /// MFA recovery code (single-use). When supplied alongside a
+    /// valid password this bypasses `mfa_code`; on success the
+    /// matched hash is removed from
+    /// `users.mfa_recovery_codes_hashes`.
+    pub recovery_code: Option<String>,
 }
 
 /// Login response
@@ -329,6 +334,16 @@ pub struct MfaEnableRequest {
     pub code: String,
 }
 
+/// MFA enable response. Includes the freshly minted recovery codes,
+/// shown ONCE and never retrievable afterwards. The client is
+/// responsible for displaying them somewhere the user can save them.
+#[derive(Debug, Clone, Serialize)]
+pub struct MfaEnableResponse {
+    /// 10 single-use codes in `XXXXX-XXXXX` format. Each may be
+    /// submitted as `LoginRequest::recovery_code` exactly once.
+    pub recovery_codes: Vec<String>,
+}
+
 /// MFA disable. Requires the current password (re-auth) so a stolen
 /// session cannot disable MFA silently.
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -380,6 +395,19 @@ pub struct UpdateUserRequest {
     pub role: Option<UserRole>,
     pub status: Option<UserStatus>,
     pub timezone: Option<String>,
+}
+
+/// User list filter parameters. Parsed from the query string on
+/// `GET /api/v1/auth/users`. `q` matches `email`, `first_name`,
+/// and `last_name` via case-insensitive substring; capped at 200
+/// chars to keep the ILIKE plan bounded (F9 parity with
+/// `CompanyFilter::q` / `ContactFilter::q`).
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct ListUsersFilter {
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
+    pub role: Option<UserRole>,
+    pub status: Option<UserStatus>,
 }
 
 /// User list response (for API)

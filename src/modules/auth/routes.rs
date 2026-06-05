@@ -2,8 +2,7 @@
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header::SET_COOKIE, HeaderMap, HeaderValue},
-    middleware,
+    http::{header, header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -17,9 +16,9 @@ use validator::Validate;
 use super::{
     google_login, rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest,
     CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest,
-    LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest, MfaSetupResponse,
-    RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest, SessionInfo,
-    UpdateUserRequest, UserResponse,
+    ListUsersFilter, LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest,
+    MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse,
+    ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
@@ -39,6 +38,12 @@ pub struct AuthRouterState {
     /// Whether to set the `Secure` flag on the OAuth state cookie.
     /// `false` over plain HTTP localhost in dev; `true` in prod.
     pub cookie_secure: bool,
+    /// Layered (per-IP + per-email) login rate limiter (PMS-4 AC2 / F2).
+    /// Lives for the lifetime of the router so quota state survives
+    /// across requests. The check happens inline at the top of the
+    /// `login` handler so the limiter can see both source IP and the
+    /// email from the deserialized request body.
+    pub login_limiter: Arc<rate_limit::LoginLimiter>,
 }
 
 /// Create the auth router
@@ -55,22 +60,14 @@ pub fn auth_routes(
         client_origin,
         jwt_secret,
         cookie_secure,
+        login_limiter: rate_limit::LoginLimiter::new(),
     };
 
-    // Per-IP rate limiter shared across `/login` requests for the
-    // lifetime of the server (audit F2).
-    let login_limiter = rate_limit::login_limiter();
-
     Router::new()
-        // Public routes — `/login` is wrapped in a per-IP rate limiter
-        // (5/min) to harden against credential stuffing.
-        .route(
-            "/login",
-            post(login).layer(middleware::from_fn_with_state(
-                login_limiter,
-                rate_limit::login_rate_limit,
-            )),
-        )
+        // Public routes. Rate limit for `/login` runs inline at the top
+        // of the handler (see `login` below) so the limiter can key on
+        // `(ip, email)` not just `ip`.
+        .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
@@ -100,14 +97,35 @@ pub fn auth_routes(
         .with_state(state)
 }
 
-/// Login endpoint
+/// Login endpoint. Rate-limited per `(source IP, lowercased email)`
+/// at 20/min per IP + 5/min per email; over-quota returns 429 with
+/// a `Retry-After` header. The check has to run inline because tower
+/// middleware cannot read the JSON body without buffering it.
 async fn login(
     State(state): State<AuthRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
-) -> AppResult<Json<LoginResponse>> {
+) -> Result<Response, AppError> {
     request.validate()?;
+
+    if let Err(retry_after) = state.login_limiter.check(addr.ip(), &request.email) {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate_limited",
+                "message": "Too many login attempts, please try again later",
+                "retry_after_seconds": retry_after,
+            })),
+        )
+            .into_response();
+        let h = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+            h.insert(header::RETRY_AFTER, v);
+        }
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(resp);
+    }
 
     let ip_address = Some(addr.ip().to_string());
     let user_agent = headers
@@ -120,7 +138,7 @@ async fn login(
         .login(&request, ip_address, user_agent)
         .await?;
 
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 /// Logout endpoint
@@ -200,7 +218,10 @@ async fn get_current_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<UserResponse>> {
-    let full_user = state.auth_service.get_user_by_id(user.id).await?;
+    let full_user = state
+        .auth_service
+        .get_user_by_id(user.tenant_id, user.id)
+        .await?;
     Ok(Json(full_user.into()))
 }
 
@@ -222,7 +243,7 @@ async fn update_current_user(
 
     let updated = state
         .auth_service
-        .update_user(user.id, &sanitized_request, &ctx)
+        .update_user(user.tenant_id, user.id, &sanitized_request, &ctx)
         .await?;
 
     Ok(Json(updated.into()))
@@ -237,7 +258,7 @@ async fn change_password(
     request.validate()?;
     state
         .auth_service
-        .change_password(user.id, &request)
+        .change_password(user.tenant_id, user.id, &request)
         .await?;
     Ok(())
 }
@@ -300,26 +321,33 @@ async fn start_mfa_enrollment(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<MfaSetupResponse>> {
-    let resp = state.auth_service.start_mfa_enrollment(user.id).await?;
+    let resp = state
+        .auth_service
+        .start_mfa_enrollment(user.tenant_id, user.id)
+        .await?;
     Ok(Json(resp))
 }
 
-/// Confirm TOTP enrollment by verifying one code; flips `mfa_enabled`.
+/// Confirm TOTP enrollment by verifying one code; flips `mfa_enabled`
+/// and returns 10 single-use recovery codes shown ONCE to the user
+/// (PMS-4 AC3). The client is responsible for displaying them
+/// somewhere durable; the server only persists their hashes.
 async fn enable_mfa(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
     Json(request): Json<MfaEnableRequest>,
-) -> AppResult<()> {
+) -> AppResult<Json<MfaEnableResponse>> {
     request.validate()?;
-    state
+    let resp = state
         .auth_service
-        .enable_mfa(user.id, &request.code)
+        .enable_mfa(user.tenant_id, user.id, &request.code)
         .await?;
-    Ok(())
+    Ok(Json(resp))
 }
 
 /// Disable MFA. Requires re-auth with the current password so a stolen
-/// session cannot weaken the account quietly.
+/// session cannot weaken the account quietly. Zeroes the user's
+/// recovery-code set.
 async fn disable_mfa(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -328,7 +356,7 @@ async fn disable_mfa(
     request.validate()?;
     state
         .auth_service
-        .disable_mfa(user.id, &request.password)
+        .disable_mfa(user.tenant_id, user.id, &request.password)
         .await?;
     Ok(())
 }
@@ -378,20 +406,24 @@ async fn revoke_api_key(
     Ok(())
 }
 
-/// List users (admin only)
+/// List users (admin / manager only). Supports paginated browsing
+/// plus optional filters: `q` (substring across email + names),
+/// `role`, and `status`. Filter struct derives `Validate` (F9
+/// closeout for the auth module).
 async fn list_users(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
-    axum::extract::Query(pagination): axum::extract::Query<PaginationParams>,
+    Query(filter): Query<ListUsersFilter>,
+    Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<UserResponse>>> {
-    // Check admin permission
     if !user.role.is_admin() && !matches!(user.role, super::UserRole::Manager) {
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
+    filter.validate()?;
 
     let (users, total) = state
         .auth_service
-        .list_users(user.tenant_id, &pagination)
+        .list_users(user.tenant_id, &filter, &pagination)
         .await?;
 
     Ok(Json(PaginatedResponse::new(
@@ -424,18 +456,22 @@ async fn create_user(
     Ok(Json(new_user.into()))
 }
 
-/// Get user by ID (admin only)
+/// Get user by ID (admin or self). PMS-4 AC6: the service binds
+/// `tenant_id` so a cross-tenant `user_id` returns 404 here instead
+/// of leaking a row.
 async fn get_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
     Path(user_id): Path<Uuid>,
 ) -> AppResult<Json<UserResponse>> {
-    // Check admin permission or same user
     if !user.role.is_admin() && user.id != user_id {
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
 
-    let target_user = state.auth_service.get_user_by_id(user_id).await?;
+    let target_user = state
+        .auth_service
+        .get_user_by_id(user.tenant_id, user_id)
+        .await?;
 
     Ok(Json(target_user.into()))
 }
@@ -448,7 +484,6 @@ async fn update_user(
     Path(user_id): Path<Uuid>,
     Json(request): Json<UpdateUserRequest>,
 ) -> AppResult<Json<UserResponse>> {
-    // Check admin permission
     if !user.role.is_admin() {
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
@@ -457,7 +492,7 @@ async fn update_user(
 
     let updated = state
         .auth_service
-        .update_user(user_id, &request, &ctx)
+        .update_user(user.tenant_id, user_id, &request, &ctx)
         .await?;
 
     Ok(Json(updated.into()))
