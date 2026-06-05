@@ -126,7 +126,8 @@ async fn login(
 /// Logout endpoint
 async fn logout(
     State(state): State<AuthRouterState>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> AppResult<()> {
     // Extract session ID from token
@@ -139,6 +140,21 @@ async fn logout(
             }
         }
     }
+
+    // Record the logout (PMS-117 AC3).
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let _ = crate::modules::audit::audit_auth_event(
+        state.auth_service.pool(),
+        user.tenant_id,
+        Some(user.id),
+        crate::modules::audit::AuditAction::Logout,
+        Some(addr.ip().to_string()),
+        ua,
+    )
+    .await;
 
     Ok(())
 }
@@ -192,6 +208,7 @@ async fn get_current_user(
 async fn update_current_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpdateUserRequest>,
 ) -> AppResult<Json<UserResponse>> {
     request.validate()?;
@@ -205,7 +222,7 @@ async fn update_current_user(
 
     let updated = state
         .auth_service
-        .update_user(user.id, &sanitized_request)
+        .update_user(user.id, &sanitized_request, &ctx)
         .await?;
 
     Ok(Json(updated.into()))
@@ -389,6 +406,7 @@ async fn list_users(
 async fn create_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateUserRequest>,
 ) -> AppResult<Json<UserResponse>> {
     // Check admin permission
@@ -400,7 +418,7 @@ async fn create_user(
 
     let new_user = state
         .auth_service
-        .create_user(user.tenant_id, &request)
+        .create_user(user.tenant_id, &request, &ctx)
         .await?;
 
     Ok(Json(new_user.into()))
@@ -426,6 +444,7 @@ async fn get_user(
 async fn update_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(user_id): Path<Uuid>,
     Json(request): Json<UpdateUserRequest>,
 ) -> AppResult<Json<UserResponse>> {
@@ -436,7 +455,10 @@ async fn update_user(
 
     request.validate()?;
 
-    let updated = state.auth_service.update_user(user_id, &request).await?;
+    let updated = state
+        .auth_service
+        .update_user(user_id, &request, &ctx)
+        .await?;
 
     Ok(Json(updated.into()))
 }

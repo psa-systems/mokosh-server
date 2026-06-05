@@ -72,6 +72,7 @@ async fn list_tenants(
 async fn create_tenant(
     State(state): State<TenantRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
     if user.role != UserRole::SuperAdmin {
@@ -82,7 +83,7 @@ async fn create_tenant(
 
     request.validate()?;
 
-    let tenant = state.tenant_service.create_tenant(&request).await?;
+    let tenant = state.tenant_service.create_tenant(&request, &ctx).await?;
 
     Ok(Json(tenant.into()))
 }
@@ -107,6 +108,7 @@ async fn get_tenant(
 async fn update_tenant(
     State(state): State<TenantRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(tenant_id): Path<Uuid>,
     Json(request): Json<UpdateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
@@ -119,7 +121,7 @@ async fn update_tenant(
 
     let tenant = state
         .tenant_service
-        .update_tenant(tenant_id, &request)
+        .update_tenant(tenant_id, &request, &ctx)
         .await?;
 
     Ok(Json(tenant.into()))

@@ -111,6 +111,9 @@ uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
 
 # Date/Time
 chrono = { version = "0.4", features = ["serde"] }
+# IANA timezone database for chrono (business-hours-aware SLA clock,
+# PMS-106). 0.9 tracks chrono 0.4.
+chrono-tz = "0.9"
 
 # Password hashing
 argon2 = "0.5"
