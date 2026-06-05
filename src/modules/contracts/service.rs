@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -89,8 +90,12 @@ impl ContractsService {
         &self,
         tenant_id: Uuid,
         request: &CreateContractRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ContractResponse> {
         let id = Uuid::new_v4();
+        // Mutation + audit row in one transaction. CREATE: old = None,
+        // after captured by the new contract id. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"INSERT INTO contracts (
                 id, tenant_id, contract_number, name, company_id, contract_type, status,
@@ -114,8 +119,28 @@ impl ContractsService {
         .bind(request.signed_date)
         .bind(request.signed_by_contact_id)
         .bind(&request.notes)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contracts t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "contracts",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         self.get_contract(tenant_id, id).await
     }
 
@@ -141,7 +166,19 @@ impl ContractsService {
         tenant_id: Uuid,
         id: Uuid,
         request: &UpdateContractRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ContractResponse> {
+        // Mutation + audit row in one transaction: snapshot before and
+        // after, write the audit entry on the same tx. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contracts t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
         let n = sqlx::query(
             r#"UPDATE contracts SET
                 contract_number = COALESCE($3, contract_number),
@@ -171,26 +208,73 @@ impl ContractsService {
         .bind(request.signed_date)
         .bind(request.signed_by_contact_id)
         .bind(&request.notes)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Contract".to_string()));
         }
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contracts t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contracts",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         self.get_contract(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_contract(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_contract(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contracts t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM contracts WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Contract".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "contracts",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -233,9 +317,13 @@ impl ContractsService {
         tenant_id: Uuid,
         contract_id: Uuid,
         request: &UpsertContractItemRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
         let id = Uuid::new_v4();
+        // Mutation + audit row in one transaction. CREATE: old = None,
+        // after captured by the new item id. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"INSERT INTO contract_items (id, tenant_id, contract_id, name, description, item_type,
                                             quantity, unit_price, total_price, billing_frequency, work_type_id,
@@ -249,7 +337,27 @@ impl ContractsService {
         .bind(&request.billing_frequency).bind(request.work_type_id)
         .bind(request.included_hours).bind(request.overage_rate)
         .bind(request.rollover_enabled).bind(request.max_rollover_hours).bind(request.sort_order)
-        .execute(self.db.pool()).await?;
+        .execute(&mut *tx).await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "contract_items",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(ContractItemResponse {
             id,
             contract_id,
@@ -275,8 +383,19 @@ impl ContractsService {
         tenant_id: Uuid,
         id: Uuid,
         request: &UpsertContractItemRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
+        // Mutation + audit row in one transaction: snapshot before and
+        // after, write the audit entry on the same tx. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let contract_id: Option<Uuid> = sqlx::query_scalar(
             r#"UPDATE contract_items SET
                 name=$3, description=$4, item_type=$5, quantity=$6, unit_price=$7,
@@ -300,11 +419,31 @@ impl ContractsService {
         .bind(request.rollover_enabled)
         .bind(request.max_rollover_hours)
         .bind(request.sort_order)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(cid) = contract_id else {
             return Err(AppError::NotFound("ContractItem".to_string()));
         };
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contract_items",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(ContractItemResponse {
             id,
             contract_id: cid,
@@ -325,16 +464,43 @@ impl ContractsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_contract_item(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_contract_item(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM contract_items WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("ContractItem".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "contract_items",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -401,6 +567,7 @@ impl ContractsService {
         &self,
         tenant_id: Uuid,
         request: &UpsertRateCardRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<RateCardResponse> {
         let mut tx = self.db.pool().begin().await?;
         if request.is_default {
@@ -420,6 +587,27 @@ impl ContractsService {
         .bind(&request.description)
         .bind(request.is_default)
         .execute(&mut *tx)
+        .await?;
+
+        // Audit row in the same transaction. CREATE: old = None, after
+        // captured by the new rate-card id. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM rate_cards t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "rate_cards",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(RateCardResponse {
@@ -466,16 +654,43 @@ impl ContractsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_rate_card(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_rate_card(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM rate_cards t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM rate_cards WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("RateCard".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "rate_cards",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -521,6 +736,7 @@ impl ContractsService {
         tenant_id: Uuid,
         rate_card_id: Uuid,
         request: &UpsertRateCardItemRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<RateCardItemResponse> {
         // Verify rate card belongs to tenant first.
         let exists: bool = sqlx::query_scalar(
@@ -533,6 +749,29 @@ impl ContractsService {
         if !exists {
             return Err(AppError::NotFound("RateCard".to_string()));
         }
+
+        // Mutation + audit row in one transaction. PMS-117.
+        // `rate_card_items` has no `tenant_id` column (it is tenant-scoped
+        // through its parent `rate_cards` row, validated above), so the
+        // snapshot predicates key on the natural `(rate_card_id,
+        // work_type_id)` unique pair for `before` and on the returned `id`
+        // for `after`. This is an INSERT .. ON CONFLICT upsert, so the
+        // action is Update when a row already existed (the `before`
+        // snapshot doubles as the existence check) else Create.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM rate_card_items t \
+             WHERE t.rate_card_id = $1 AND t.work_type_id = $2",
+        )
+        .bind(rate_card_id)
+        .bind(request.work_type_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let action = if before.is_some() {
+            AuditAction::Update
+        } else {
+            AuditAction::Create
+        };
 
         let id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO rate_card_items
@@ -550,8 +789,26 @@ impl ContractsService {
         .bind(request.hourly_rate)
         .bind(request.after_hours_rate)
         .bind(request.emergency_rate)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM rate_card_items t WHERE t.id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            action,
+            "rate_card_items",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(RateCardItemResponse {
             id,
             rate_card_id,

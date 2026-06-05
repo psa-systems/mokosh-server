@@ -80,10 +80,13 @@ async fn create_contract(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateContractRequest>,
 ) -> AppResult<Json<ContractResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_contract(u.tenant_id, &req).await?))
+    Ok(Json(
+        s.service.create_contract(u.tenant_id, &req, &ctx).await?,
+    ))
 }
 
 async fn get_contract(
@@ -98,12 +101,15 @@ async fn update_contract(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateContractRequest>,
 ) -> AppResult<Json<ContractResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_contract(u.tenant_id, id, &req).await?,
+        s.service
+            .update_contract(u.tenant_id, id, &req, &ctx)
+            .await?,
     ))
 }
 
@@ -111,9 +117,10 @@ async fn delete_contract(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_contract(u.tenant_id, id).await
+    s.service.delete_contract(u.tenant_id, id, &ctx).await
 }
 
 async fn list_contract_items(
@@ -137,13 +144,14 @@ async fn create_contract_item(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertContractItemRequest>,
 ) -> AppResult<Json<ContractItemResponse>> {
     req.validate()?;
     Ok(Json(
         s.service
-            .create_contract_item(u.tenant_id, id, &req)
+            .create_contract_item(u.tenant_id, id, &req, &ctx)
             .await?,
     ))
 }
@@ -152,13 +160,14 @@ async fn update_contract_item(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertContractItemRequest>,
 ) -> AppResult<Json<ContractItemResponse>> {
     req.validate()?;
     Ok(Json(
         s.service
-            .update_contract_item(u.tenant_id, id, &req)
+            .update_contract_item(u.tenant_id, id, &req, &ctx)
             .await?,
     ))
 }
@@ -167,9 +176,10 @@ async fn delete_contract_item(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_contract_item(u.tenant_id, id).await
+    s.service.delete_contract_item(u.tenant_id, id, &ctx).await
 }
 
 async fn get_hour_balance(
@@ -206,10 +216,13 @@ async fn create_rate_card(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertRateCardRequest>,
 ) -> AppResult<Json<RateCardResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_rate_card(u.tenant_id, &req).await?))
+    Ok(Json(
+        s.service.create_rate_card(u.tenant_id, &req, &ctx).await?,
+    ))
 }
 
 async fn update_rate_card(
@@ -229,9 +242,10 @@ async fn delete_rate_card(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_rate_card(u.tenant_id, id).await
+    s.service.delete_rate_card(u.tenant_id, id, &ctx).await
 }
 
 async fn list_rate_card_items(
@@ -255,13 +269,14 @@ async fn upsert_rate_card_item(
     State(s): State<ContractsRouterState>,
     RequireAuth(u): RequireAuth,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertRateCardItemRequest>,
 ) -> AppResult<Json<RateCardItemResponse>> {
     req.validate()?;
     Ok(Json(
         s.service
-            .upsert_rate_card_item(u.tenant_id, id, &req)
+            .upsert_rate_card_item(u.tenant_id, id, &req, &ctx)
             .await?,
     ))
 }
