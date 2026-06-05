@@ -125,18 +125,12 @@ async fn monthly_contract_generates_one_invoice_for_due_period(pool: PgPool) {
     let invoice_id = created[0];
 
     // Invoice header: linked to the contract + company, draft, total 200.
-    let (linked_contract, linked_company, status, total): (
-        Option<Uuid>,
-        Uuid,
-        String,
-        Decimal,
-    ) = sqlx::query_as(
-        "SELECT contract_id, company_id, status, total FROM invoices WHERE id = $1",
-    )
-    .bind(invoice_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read invoice");
+    let (linked_contract, linked_company, status, total): (Option<Uuid>, Uuid, String, Decimal) =
+        sqlx::query_as("SELECT contract_id, company_id, status, total FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read invoice");
     assert_eq!(linked_contract, Some(contract));
     assert_eq!(linked_company, company);
     assert_eq!(status, "draft");
@@ -187,7 +181,10 @@ async fn second_run_same_period_is_idempotent(pool: PgPool) {
         .generate_due_recurring_invoices(tenant, now, &ctx)
         .await
         .expect("second run");
-    assert!(second.is_empty(), "second run creates nothing for the same period");
+    assert!(
+        second.is_empty(),
+        "second run creates nothing for the same period"
+    );
 
     // Exactly one invoice + one ledger row exist for the contract.
     let invoice_count: i64 =

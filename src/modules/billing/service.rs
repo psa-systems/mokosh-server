@@ -580,10 +580,7 @@ impl BillingService {
 
         let mut created = Vec::new();
         for contract in contracts {
-            let cycle = contract
-                .billing_cycle
-                .as_deref()
-                .unwrap_or("monthly");
+            let cycle = contract.billing_cycle.as_deref().unwrap_or("monthly");
             let Some((period_start, period_end)) =
                 current_billing_period(cycle, contract.start_date, today)
             else {
@@ -718,10 +715,7 @@ impl BillingService {
         let invoice_id = Uuid::new_v4();
 
         // --- 1. Insert the invoice header (draft, totals computed). ---
-        let subtotal: Decimal = items
-            .iter()
-            .map(|i| i.quantity * i.unit_price)
-            .sum();
+        let subtotal: Decimal = items.iter().map(|i| i.quantity * i.unit_price).sum();
         let tax = Decimal::ZERO;
         let discount = Decimal::ZERO;
         let total = subtotal + tax - discount;

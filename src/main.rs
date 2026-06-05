@@ -253,13 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // period no-ops, so the interval is not load-bearing. The encryption
     // key matches the router's BillingService so the construction is
     // uniform (recurring invoicing never touches gateway-config secrets).
-    let recurring_invoicing_worker =
-        mokosh_server::modules::billing::RecurringInvoicingWorker::new(
-            mokosh_server::modules::billing::BillingService::with_encryption_key(
-                db.clone(),
-                encryption_key,
-            ),
-        );
+    let recurring_invoicing_worker = mokosh_server::modules::billing::RecurringInvoicingWorker::new(
+        mokosh_server::modules::billing::BillingService::with_encryption_key(
+            db.clone(),
+            encryption_key,
+        ),
+    );
 
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
