@@ -52,27 +52,43 @@ impl BillingService {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
 
-        let mut conditions = vec!["tenant_id = $1".to_string()];
-        let mut param_idx = 4;
+        // Parallel WHERE clauses so the data and count queries each get
+        // correctly numbered placeholders. data has $1 tenant + $2 limit
+        // + $3 offset → filter binds at $4+; count has $1 tenant only →
+        // filter binds at $2+.
+        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        let mut count_conds = vec!["tenant_id = $1".to_string()];
+        let mut data_idx = 4;
+        let mut count_idx = 2;
         if filter.company_id.is_some() {
-            conditions.push(format!("company_id = ${param_idx}"));
-            param_idx += 1;
+            data_conds.push(format!("company_id = ${data_idx}"));
+            count_conds.push(format!("company_id = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.status.is_some() {
-            conditions.push(format!("status = ${param_idx}"));
-            param_idx += 1;
+            data_conds.push(format!("status = ${data_idx}"));
+            count_conds.push(format!("status = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.contract_id.is_some() {
-            conditions.push(format!("contract_id = ${param_idx}"));
-            param_idx += 1;
+            data_conds.push(format!("contract_id = ${data_idx}"));
+            count_conds.push(format!("contract_id = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.q.is_some() {
-            conditions.push(format!(
-                "(invoice_number ILIKE ${param_idx} OR po_number ILIKE ${param_idx})"
+            data_conds.push(format!(
+                "(invoice_number ILIKE ${data_idx} OR po_number ILIKE ${data_idx})"
+            ));
+            count_conds.push(format!(
+                "(invoice_number ILIKE ${count_idx} OR po_number ILIKE ${count_idx})"
             ));
         }
 
-        let where_clause = conditions.join(" AND ");
+        let data_where = data_conds.join(" AND ");
+        let count_where = count_conds.join(" AND ");
         let order_by = pagination.order_by(
             "invoice_date DESC",
             &["invoice_date", "due_date", "total", "created_at"],
@@ -85,12 +101,12 @@ impl BillingService {
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at
             FROM invoices
-            WHERE {where_clause}
+            WHERE {data_where}
             ORDER BY {order_by}
             LIMIT $2 OFFSET $3
             "#
         );
-        let count_query = format!("SELECT COUNT(*) FROM invoices WHERE {where_clause}");
+        let count_query = format!("SELECT COUNT(*) FROM invoices WHERE {count_where}");
 
         let mut q = sqlx::query_as::<_, InvoiceRow>(&query)
             .bind(tenant_id)
@@ -947,16 +963,26 @@ impl BillingService {
     ) -> AppResult<(Vec<PaymentResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
-        let mut conditions = vec!["tenant_id = $1".to_string()];
-        let mut param_idx = 4;
+        // Parallel WHERE clauses so the data and count queries each get
+        // correctly numbered placeholders. data has $1 tenant + $2 limit
+        // + $3 offset → filter binds at $4+; count has $1 tenant only →
+        // filter binds at $2+.
+        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        let mut count_conds = vec!["tenant_id = $1".to_string()];
+        let mut data_idx = 4;
+        let mut count_idx = 2;
         if filter.invoice_id.is_some() {
-            conditions.push(format!("invoice_id = ${param_idx}"));
-            param_idx += 1;
+            data_conds.push(format!("invoice_id = ${data_idx}"));
+            count_conds.push(format!("invoice_id = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.company_id.is_some() {
-            conditions.push(format!("company_id = ${param_idx}"));
+            data_conds.push(format!("company_id = ${data_idx}"));
+            count_conds.push(format!("company_id = ${count_idx}"));
         }
-        let where_clause = conditions.join(" AND ");
+        let data_where = data_conds.join(" AND ");
+        let count_where = count_conds.join(" AND ");
         let order_by = pagination.order_by(
             "payment_date DESC",
             &["payment_date", "amount", "created_at"],
@@ -967,12 +993,12 @@ impl BillingService {
                    payment_method, reference_number, gateway_transaction_id,
                    notes, created_at
             FROM payments
-            WHERE {where_clause}
+            WHERE {data_where}
             ORDER BY {order_by}
             LIMIT $2 OFFSET $3
             "#
         );
-        let count_query = format!("SELECT COUNT(*) FROM payments WHERE {where_clause}");
+        let count_query = format!("SELECT COUNT(*) FROM payments WHERE {count_where}");
         let mut q = sqlx::query_as::<_, PaymentRow>(&query)
             .bind(tenant_id)
             .bind(limit)

@@ -254,28 +254,42 @@ impl ContactService {
         let offset = pagination.offset() as i32;
         let limit = pagination.limit() as i32;
 
-        // Build dynamic query
-        let mut conditions = vec!["tenant_id = $1".to_string()];
-        let mut param_idx = 4;
+        // Parallel WHERE clauses so the data and count queries each get
+        // correctly numbered placeholders. data has $1 tenant + $2 limit
+        // + $3 offset → filter binds at $4+; count has $1 tenant only →
+        // filter binds at $2+. Sharing one WHERE string between them
+        // misaligns the count_query bind sequence and trips postgres
+        // 42P18 ("could not determine data type of parameter").
+        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        let mut count_conds = vec!["tenant_id = $1".to_string()];
+        let mut data_idx = 4;
+        let mut count_idx = 2;
 
         if filter.q.is_some() {
-            conditions.push(format!("name ILIKE ${}", param_idx));
-            param_idx += 1;
+            data_conds.push(format!("name ILIKE ${data_idx}"));
+            count_conds.push(format!("name ILIKE ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.company_type.is_some() {
-            conditions.push(format!("company_type = ${}", param_idx));
-            param_idx += 1;
+            data_conds.push(format!("company_type = ${data_idx}"));
+            count_conds.push(format!("company_type = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.status.is_some() {
-            conditions.push(format!("status = ${}", param_idx));
-            param_idx += 1;
+            data_conds.push(format!("status = ${data_idx}"));
+            count_conds.push(format!("status = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.account_manager_id.is_some() {
-            conditions.push(format!("account_manager_id = ${}", param_idx));
-            // param_idx += 1;
+            data_conds.push(format!("account_manager_id = ${data_idx}"));
+            count_conds.push(format!("account_manager_id = ${count_idx}"));
         }
 
-        let where_clause = conditions.join(" AND ");
+        let data_where = data_conds.join(" AND ");
+        let count_where = count_conds.join(" AND ");
         let order_by = pagination.order_by("name", &["name", "created_at", "updated_at"]);
 
         let query = format!(
@@ -291,14 +305,13 @@ impl ContactService {
                    custom_fields, tags, notes, logo_url, portal_enabled,
                    created_at, updated_at
             FROM companies
-            WHERE {}
-            ORDER BY {}
+            WHERE {data_where}
+            ORDER BY {order_by}
             LIMIT $2 OFFSET $3
-            "#,
-            where_clause, order_by
+            "#
         );
 
-        let count_query = format!("SELECT COUNT(*) FROM companies WHERE {}", where_clause);
+        let count_query = format!("SELECT COUNT(*) FROM companies WHERE {count_where}");
 
         // Execute queries
         let mut query_builder = sqlx::query_as::<_, CompanyRow>(&query)
@@ -794,30 +807,46 @@ impl ContactService {
         let offset = pagination.offset() as i32;
         let limit = pagination.limit() as i32;
 
-        let mut conditions = vec!["tenant_id = $1".to_string()];
-        let mut param_idx = 4;
+        // Parallel WHERE clauses so the data and count queries each get
+        // correctly numbered placeholders. data has $1 tenant + $2 limit
+        // + $3 offset → filter binds at $4+; count has $1 tenant only →
+        // filter binds at $2+.
+        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        let mut count_conds = vec!["tenant_id = $1".to_string()];
+        let mut data_idx = 4;
+        let mut count_idx = 2;
 
         if filter.q.is_some() {
-            conditions.push(format!(
-                "(first_name ILIKE ${} OR last_name ILIKE ${} OR email ILIKE ${})",
-                param_idx, param_idx, param_idx
+            data_conds.push(format!(
+                "(first_name ILIKE ${idx} OR last_name ILIKE ${idx} OR email ILIKE ${idx})",
+                idx = data_idx
             ));
-            param_idx += 1;
+            count_conds.push(format!(
+                "(first_name ILIKE ${idx} OR last_name ILIKE ${idx} OR email ILIKE ${idx})",
+                idx = count_idx
+            ));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.company_id.is_some() {
-            conditions.push(format!("company_id = ${}", param_idx));
-            param_idx += 1;
+            data_conds.push(format!("company_id = ${data_idx}"));
+            count_conds.push(format!("company_id = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.contact_type.is_some() {
-            conditions.push(format!("contact_type = ${}", param_idx));
-            param_idx += 1;
+            data_conds.push(format!("contact_type = ${data_idx}"));
+            count_conds.push(format!("contact_type = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.status.is_some() {
-            conditions.push(format!("status = ${}", param_idx));
-            // param_idx += 1;
+            data_conds.push(format!("status = ${data_idx}"));
+            count_conds.push(format!("status = ${count_idx}"));
         }
 
-        let where_clause = conditions.join(" AND ");
+        let data_where = data_conds.join(" AND ");
+        let count_where = count_conds.join(" AND ");
         let order_by = pagination.order_by(
             "last_name",
             &["first_name", "last_name", "email", "created_at"],
@@ -831,14 +860,13 @@ impl ContactService {
                    timezone, locale, custom_fields, tags, notes, avatar_url,
                    status, created_at, updated_at
             FROM contacts
-            WHERE {}
-            ORDER BY {}
+            WHERE {data_where}
+            ORDER BY {order_by}
             LIMIT $2 OFFSET $3
-            "#,
-            where_clause, order_by
+            "#
         );
 
-        let count_query = format!("SELECT COUNT(*) FROM contacts WHERE {}", where_clause);
+        let count_query = format!("SELECT COUNT(*) FROM contacts WHERE {count_where}");
 
         let mut query_builder = sqlx::query_as::<_, ContactRow>(&query)
             .bind(tenant_id)
