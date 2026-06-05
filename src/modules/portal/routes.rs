@@ -18,6 +18,7 @@ use validator::Validate;
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
 use super::{CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse};
+use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::tickets::{TicketResponse, TicketService};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -26,15 +27,17 @@ use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 pub struct PortalRouterState {
     pub service: Arc<PortalAuthService>,
     pub tickets: Arc<TicketService>,
+    pub kb: Arc<KbService>,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
 /// at the outermost layer so every handler sees either a valid
 /// `PortalAuthState` or the default (unauthenticated) one.
-pub fn portal_routes(service: PortalAuthService, tickets: TicketService) -> Router {
+pub fn portal_routes(service: PortalAuthService, tickets: TicketService, kb: KbService) -> Router {
     let state = PortalRouterState {
         service: Arc::new(service.clone()),
         tickets: Arc::new(tickets),
+        kb: Arc::new(kb),
     };
     let mw = PortalAuthMiddleware::new(service);
 
@@ -93,15 +96,25 @@ async fn get_invoice(
 }
 
 async fn list_kb(
-    RequirePortalAuth(_contact): RequirePortalAuth,
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
     Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<serde_json::Value>>> {
-    // Portal-visible KB articles. Will read against
-    // `knowledge_base.articles WHERE portal_visible = TRUE` (PMS-79
-    // story) once the KB module ships. Until then, an empty page lets
-    // the portal frontend render "no articles yet" without branching
-    // on 501.
-    Ok(Json(PaginatedResponse::from_params(vec![], &pagination, 0)))
+) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
+    // Portal-visible KB feed (PMS-79 / PMS-84). Returns only
+    // `status = 'published'` articles that are `visibility = 'public'`
+    // OR `client_specific` with the caller's company listed in
+    // `company_ids`. The company scope comes from the authenticated
+    // contact's JWT claim (`CurrentContact.company_id`), populated by
+    // `portal_auth_middleware`, so a client cannot widen it.
+    let (items, total) = state
+        .kb
+        .list_portal_articles_for_company(contact.tenant_id, contact.company_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn get_ticket(

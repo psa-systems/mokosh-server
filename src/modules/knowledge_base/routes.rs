@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use uuid::Uuid;
@@ -39,6 +39,15 @@ pub fn kb_routes(service: KbService) -> Router {
             get(get_article).put(update_article).delete(delete_article),
         )
         .route("/kb/articles/{id}/versions", get(list_article_versions))
+        // Restore a prior version as a new monotonic version (PMS-83).
+        .route(
+            "/kb/articles/{id}/versions/{version_number}/restore",
+            post(restore_article_version),
+        )
+        // Feedback counters (PMS-84). Tenant-scoped; bump and return the
+        // new tallies.
+        .route("/kb/articles/{id}/helpful", post(mark_helpful))
+        .route("/kb/articles/{id}/not_helpful", post(mark_not_helpful))
         // Portal-visible (PMS-84). Internal callers can still reach this;
         // the portal mounts its own thin reader in PMS-32.
         .route("/kb/articles/portal", get(list_portal_articles))
@@ -181,4 +190,34 @@ async fn list_portal_articles(
         &pagination,
         total,
     )))
+}
+
+async fn restore_article_version(
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path((id, version_number)): Path<(Uuid, i32)>,
+) -> AppResult<Json<KbArticleResponse>> {
+    Ok(Json(
+        s.service
+            .restore_article_version(u.tenant_id, id, version_number, u.id)
+            .await?,
+    ))
+}
+
+async fn mark_helpful(
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<KbArticleFeedbackResponse>> {
+    Ok(Json(s.service.increment_helpful(u.tenant_id, id).await?))
+}
+
+async fn mark_not_helpful(
+    State(s): State<KbRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<KbArticleFeedbackResponse>> {
+    Ok(Json(
+        s.service.increment_not_helpful(u.tenant_id, id).await?,
+    ))
 }

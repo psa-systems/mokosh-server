@@ -4,6 +4,7 @@ use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::slugify;
 
@@ -22,7 +23,11 @@ impl TenantService {
 
     /// Create a new tenant
     #[tracing::instrument(skip_all)]
-    pub async fn create_tenant(&self, request: &CreateTenantRequest) -> AppResult<Tenant> {
+    pub async fn create_tenant(
+        &self,
+        request: &CreateTenantRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<Tenant> {
         let tenant_id = Uuid::new_v4();
         let slug = slugify(&request.slug);
 
@@ -40,6 +45,12 @@ impl TenantService {
         // Create tenant
         let trial_ends_at = Utc::now() + Duration::days(14);
 
+        // Mutation + audit row in one transaction: insert the tenant and its
+        // seed rows, snapshot the new tenant with Postgres to_jsonb, and write
+        // the audit entry on the same tx so a rollback drops both. PMS-117 AC1.
+        // The tenant is its own audit scope, so tenant_id == entity_id here.
+        let mut tx = self.db.pool().begin().await?;
+
         sqlx::query(
             r#"
             INSERT INTO tenants (id, name, slug, status, billing_email, billing_contact_name,
@@ -54,20 +65,20 @@ impl TenantService {
         .bind(&request.billing_contact_name)
         .bind(&request.subscription_plan)
         .bind(trial_ends_at)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Initialize sequences
         sqlx::query("INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)")
             .bind(tenant_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
 
         sqlx::query(
             "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')",
         )
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Create admin user
@@ -83,8 +94,29 @@ impl TenantService {
         .bind(&request.admin_email)
         .bind(&request.admin_first_name)
         .bind(&request.admin_last_name)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+        // The `tenants` table is keyed by `id` alone (it has no `tenant_id`
+        // column), so the snapshot filters on `id`.
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tenants t WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "tenants",
+            Some(tenant_id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         // Copy default configuration from default tenant
         self.copy_default_config(tenant_id).await?;
@@ -166,6 +198,7 @@ impl TenantService {
         &self,
         tenant_id: Uuid,
         request: &UpdateTenantRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Tenant> {
         let mut query = String::from("UPDATE tenants SET updated_at = NOW()");
         let mut param_idx = 2;
@@ -211,7 +244,38 @@ impl TenantService {
             query_builder = query_builder.bind(serde_json::to_value(branding)?);
         }
 
-        query_builder.execute(self.db.pool()).await?;
+        // Mutation + audit row in one transaction: snapshot the row before and
+        // after (Postgres to_jsonb captures exact stored state) and write the
+        // audit entry on the same tx so a rollback drops both. PMS-117 AC1. The
+        // tenant is its own audit scope (tenant_id == entity_id) and the
+        // `tenants` table is keyed by `id` alone (no `tenant_id` column).
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tenants t WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        query_builder.execute(&mut *tx).await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tenants t WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "tenants",
+            Some(tenant_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_tenant(tenant_id).await
     }

@@ -51,6 +51,21 @@ impl KbService {
         tenant_id: Uuid,
         request: &UpsertKbCategoryRequest,
     ) -> AppResult<KbCategoryResponse> {
+        // Per-tenant unique slug (enforced at the app layer; the
+        // `uq_kb_categories_tenant_slug` constraint is the DB backstop).
+        let dup: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_categories WHERE tenant_id = $1 AND slug = $2)",
+        )
+        .bind(tenant_id)
+        .bind(&request.slug)
+        .fetch_one(self.db.pool())
+        .await?;
+        if dup {
+            return Err(AppError::Conflict(format!(
+                "KbCategory slug '{}' already exists",
+                request.slug
+            )));
+        }
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO kb_categories
@@ -152,18 +167,39 @@ impl KbService {
             conditions.push(format!("visibility = ${idx}"));
             idx += 1;
         }
-        if filter.q.is_some() {
-            conditions.push(format!("(title ILIKE ${idx} OR content ILIKE ${idx})"));
+        // Full-text search via pg_trgm word similarity. The `<%`
+        // operator (`query <% text`, true when
+        // `word_similarity(query, text) >= word_similarity_threshold`,
+        // default 0.6) is the right primitive for matching a short query
+        // term against the most similar word/extent inside a longer
+        // article body, and it is index-backed by
+        // `idx_kb_articles_content_trgm` (GIN over
+        // `(title || ' ' || content) gin_trgm_ops`). Results are ranked by
+        // `word_similarity(...)` DESC so the closest matches come first;
+        // falls back to `updated_at DESC` when no query term is given.
+        let q_placeholder = if filter.q.is_some() {
+            conditions.push(format!("${idx} <% (title || ' ' || content)"));
+            let p = idx;
             idx += 1;
-        }
+            Some(p)
+        } else {
+            None
+        };
         let where_clause = conditions.join(" AND ");
+        let order_by = match q_placeholder {
+            Some(p) => {
+                format!("word_similarity(${p}, title || ' ' || content) DESC, updated_at DESC")
+            }
+            None => "updated_at DESC".to_string(),
+        };
         let limit_placeholder = idx;
         let offset_placeholder = idx + 1;
         let query = format!(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, tags, created_at, updated_at
+                      author_id, view_count, helpful_count, not_helpful_count,
+                      published_at, tags, created_at, updated_at
                FROM kb_articles WHERE {where_clause}
-               ORDER BY updated_at DESC
+               ORDER BY {order_by}
                LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
         );
         let count_query = format!("SELECT COUNT(*) FROM kb_articles WHERE {where_clause}");
@@ -182,9 +218,10 @@ impl KbService {
             cq = cq.bind(v);
         }
         if let Some(v) = &filter.q {
-            let pat = format!("%{v}%");
-            q = q.bind(pat.clone());
-            cq = cq.bind(pat);
+            // pg_trgm compares the raw term against the indexed
+            // expression; no ILIKE wildcards.
+            q = q.bind(v.clone());
+            cq = cq.bind(v.clone());
         }
         let rows = q
             .bind(pagination.limit() as i64)
@@ -202,13 +239,33 @@ impl KbService {
         author_id: Uuid,
         request: &CreateKbArticleRequest,
     ) -> AppResult<KbArticleResponse> {
+        // Per-tenant unique slug (app-layer check; the
+        // `uq_kb_articles_tenant_slug` constraint is the DB backstop).
+        let dup: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE tenant_id = $1 AND slug = $2)",
+        )
+        .bind(tenant_id)
+        .bind(&request.slug)
+        .fetch_one(self.db.pool())
+        .await?;
+        if dup {
+            return Err(AppError::Conflict(format!(
+                "KbArticle slug '{}' already exists",
+                request.slug
+            )));
+        }
         let id = Uuid::new_v4();
         let mut tx = self.db.pool().begin().await?;
+        // Stamp published_at when the article is created already
+        // published; leave NULL for draft / archived. `NOW()` is applied
+        // in SQL only when status = 'published'.
+        let publish_now = request.status == "published";
         sqlx::query(
             r#"INSERT INTO kb_articles
                (id, tenant_id, title, slug, content, summary, category_id, visibility,
-                status, author_id, tags)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+                status, author_id, tags, published_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                       CASE WHEN $12 THEN NOW() ELSE NULL END)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -221,6 +278,7 @@ impl KbService {
         .bind(&request.status)
         .bind(author_id)
         .bind(&request.tags)
+        .bind(publish_now)
         .execute(&mut *tx)
         .await?;
         // Seed the first version.
@@ -243,7 +301,8 @@ impl KbService {
     pub async fn get_article(&self, tenant_id: Uuid, id: Uuid) -> AppResult<KbArticleResponse> {
         let row = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, tags, created_at, updated_at
+                      author_id, view_count, helpful_count, not_helpful_count,
+                      published_at, tags, created_at, updated_at
                FROM kb_articles WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
@@ -279,6 +338,14 @@ impl KbService {
                 visibility = COALESCE($8, visibility),
                 status = COALESCE($9, status),
                 tags = COALESCE($10, tags),
+                -- Stamp published_at on the first transition to
+                -- 'published'; leave it untouched once set and for
+                -- draft / archived transitions.
+                published_at = CASE
+                    WHEN COALESCE($9, status) = 'published' AND published_at IS NULL
+                        THEN NOW()
+                    ELSE published_at
+                END,
                 updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -304,24 +371,159 @@ impl KbService {
         let content_changed =
             request.content.is_some() && request.content.as_ref() != Some(&prior.content);
         if title_changed || content_changed {
-            let next: i32 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(version_number), 0) + 1 FROM kb_article_versions WHERE article_id = $1",
-            ).bind(id).fetch_one(&mut *tx).await?;
-            sqlx::query(
-                r#"INSERT INTO kb_article_versions
-                   (article_id, version_number, title, content, edited_by_id)
-                   VALUES ($1, $2, $3, $4, $5)"#,
+            Self::snapshot_version(
+                &mut tx,
+                id,
+                request.title.as_ref().unwrap_or(&prior.title),
+                request.content.as_ref().unwrap_or(&prior.content),
+                editor,
             )
-            .bind(id)
-            .bind(next)
-            .bind(request.title.as_ref().unwrap_or(&prior.title))
-            .bind(request.content.as_ref().unwrap_or(&prior.content))
-            .bind(editor)
-            .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
         self.get_article(tenant_id, id).await
+    }
+
+    /// Append a new monotonic version row for `article_id` inside an open
+    /// transaction. Shared by `update_article` (snapshot-on-edit) and
+    /// `restore_article_version` (snapshot-on-restore) so the
+    /// `MAX(version_number) + 1` numbering stays in one place.
+    async fn snapshot_version(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        article_id: Uuid,
+        title: &str,
+        content: &str,
+        editor: Uuid,
+    ) -> AppResult<i32> {
+        let next: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 FROM kb_article_versions WHERE article_id = $1",
+        )
+        .bind(article_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO kb_article_versions
+               (article_id, version_number, title, content, edited_by_id)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(article_id)
+        .bind(next)
+        .bind(title)
+        .bind(content)
+        .bind(editor)
+        .execute(&mut **tx)
+        .await?;
+        Ok(next)
+    }
+
+    /// Restore a prior version's `title`/`content` onto the live article
+    /// and record the restore as a NEW monotonic version (so the history
+    /// is append-only and the restore itself is auditable). Tenant-scoped:
+    /// the article must belong to `tenant_id` and the version must belong
+    /// to that article.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn restore_article_version(
+        &self,
+        tenant_id: Uuid,
+        article_id: Uuid,
+        version_number: i32,
+        editor: Uuid,
+    ) -> AppResult<KbArticleResponse> {
+        // Confirm the article is in this tenant before touching versions.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(article_id)
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("KbArticle".to_string()));
+        }
+
+        let snapshot: Option<(String, String)> = sqlx::query_as(
+            r#"SELECT title, content FROM kb_article_versions
+               WHERE article_id = $1 AND version_number = $2"#,
+        )
+        .bind(article_id)
+        .bind(version_number)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some((title, content)) = snapshot else {
+            return Err(AppError::NotFound("KbArticleVersion".to_string()));
+        };
+
+        let mut tx = self.db.pool().begin().await?;
+        sqlx::query(
+            r#"UPDATE kb_articles
+               SET title = $3, content = $4, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(&title)
+        .bind(&content)
+        .execute(&mut *tx)
+        .await?;
+        // The restore lands as a fresh version so editing still snapshots
+        // on top of it (monotonic numbering preserved).
+        Self::snapshot_version(&mut tx, article_id, &title, &content, editor).await?;
+        tx.commit().await?;
+        self.get_article(tenant_id, article_id).await
+    }
+
+    /// Increment `helpful_count` for a tenant-scoped article and return
+    /// the updated tallies.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn increment_helpful(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> AppResult<KbArticleFeedbackResponse> {
+        self.bump_feedback(tenant_id, id, "helpful_count").await
+    }
+
+    /// Increment `not_helpful_count` for a tenant-scoped article and
+    /// return the updated tallies.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn increment_not_helpful(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> AppResult<KbArticleFeedbackResponse> {
+        self.bump_feedback(tenant_id, id, "not_helpful_count").await
+    }
+
+    /// Shared body for the two feedback counters. `column` is a fixed
+    /// string literal (`helpful_count` / `not_helpful_count`) chosen by
+    /// the caller, never user input, so interpolating it into the SQL is
+    /// safe. RETURNING gives us the post-increment values for the
+    /// response.
+    async fn bump_feedback(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        column: &str,
+    ) -> AppResult<KbArticleFeedbackResponse> {
+        let sql = format!(
+            r#"UPDATE kb_articles
+               SET {column} = {column} + 1, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2
+               RETURNING id, helpful_count, not_helpful_count"#
+        );
+        let row: Option<(Uuid, Option<i32>, Option<i32>)> = sqlx::query_as(&sql)
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_optional(self.db.pool())
+            .await?;
+        let Some((id, helpful, not_helpful)) = row else {
+            return Err(AppError::NotFound("KbArticle".to_string()));
+        };
+        Ok(KbArticleFeedbackResponse {
+            id,
+            helpful_count: helpful.unwrap_or(0),
+            not_helpful_count: not_helpful.unwrap_or(0),
+        })
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -393,7 +595,8 @@ impl KbService {
 
         let rows = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, tags, created_at, updated_at
+                      author_id, view_count, helpful_count, not_helpful_count,
+                      published_at, tags, created_at, updated_at
                FROM kb_articles
                WHERE tenant_id = $1 AND status = 'published'
                  AND visibility IN ('public', 'client_specific')
@@ -401,6 +604,58 @@ impl KbService {
                LIMIT $2 OFFSET $3"#,
         )
         .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// Portal feed for a specific customer contact (PMS-84 / PMS-32).
+    ///
+    /// Unlike [`list_portal_articles`] (the staff-facing preview, which
+    /// returns every published portal-visible article in the tenant), this
+    /// is the contact-facing query: a `client_specific` article is only
+    /// returned when the caller's `company_id` is listed in the article's
+    /// `company_ids` array. `public` articles are always included. The
+    /// `company_id` is taken from the authenticated portal contact's JWT
+    /// claim (`CurrentContact.company_id`), so the scoping cannot be
+    /// widened by the client.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_portal_articles_for_company(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM kb_articles
+               WHERE tenant_id = $1 AND status = 'published'
+                 AND (
+                       visibility = 'public'
+                    OR (visibility = 'client_specific' AND $2 = ANY(company_ids))
+                 )"#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, ArticleRow>(
+            r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
+                      author_id, view_count, helpful_count, not_helpful_count,
+                      published_at, tags, created_at, updated_at
+               FROM kb_articles
+               WHERE tenant_id = $1 AND status = 'published'
+                 AND (
+                       visibility = 'public'
+                    OR (visibility = 'client_specific' AND $2 = ANY(company_ids))
+                 )
+               ORDER BY updated_at DESC
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
@@ -447,6 +702,8 @@ struct ArticleRow {
     author_id: Uuid,
     view_count: Option<i32>,
     helpful_count: Option<i32>,
+    not_helpful_count: Option<i32>,
+    published_at: Option<chrono::DateTime<chrono::Utc>>,
     tags: Option<Vec<String>>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -466,6 +723,8 @@ impl From<ArticleRow> for KbArticleResponse {
             author_id: r.author_id,
             view_count: r.view_count.unwrap_or(0),
             helpful_count: r.helpful_count.unwrap_or(0),
+            not_helpful_count: r.not_helpful_count.unwrap_or(0),
+            published_at: r.published_at,
             tags: r.tags.unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
