@@ -100,7 +100,7 @@ export default async function globalTeardown(): Promise<void> {
     return;
   }
   const api = await request.newContext({
-    baseURL: env.baseURL,
+    baseURL: env.apiBaseURL,
     extraHTTPHeaders: { Authorization: `Bearer ${token}` },
   });
   const now = Date.now();

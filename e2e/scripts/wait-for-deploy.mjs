@@ -2,11 +2,16 @@
 // Deploy-sync gate (PMS-140): block the E2E run until staging actually serves
 // the commit that triggered this workflow.
 //
-// Polls <E2E_BASE_URL>/api/v1/version every 15s for up to 10 minutes and
-// compares the reported git_hash (a 12-char short hash, see src/version.rs)
-// against the full GITHUB_SHA. On timeout it exits non-zero with a clear
-// "staging never picked up <sha>" message so the job fails loudly instead of
-// testing a stale deployment.
+// Polls <api>/api/v1/version every 15s for up to 10 minutes and compares the
+// reported git_hash (a 12-char short hash, see src/version.rs) against the
+// full GITHUB_SHA. On timeout it exits non-zero with a clear "staging never
+// picked up <sha>" message so the job fails loudly instead of testing a
+// stale deployment.
+//
+// The API lives at a separate host from the SPA on the canonical deploy
+// (`msp.<tld>` -> `msp-api.<tld>`), matching mokosh-clients/src/hooks/fetch.rs.
+// Prefer an explicit E2E_API_BASE_URL; otherwise derive from E2E_BASE_URL;
+// otherwise fall back to the canonical staging API host.
 //
 // When the separate deploy workflow lands, chain this workflow off its
 // completion and drop the polling.
@@ -21,12 +26,30 @@ function pick(...values) {
   return '';
 }
 
-const baseURL = pick(process.env.E2E_BASE_URL, 'https://msp.a8n.systems').replace(/\/+$/, '');
+function deriveApiBase(spaUrl) {
+  try {
+    const u = new URL(spaUrl);
+    if (u.hostname.startsWith('msp.')) {
+      const rest = u.hostname.slice('msp.'.length);
+      return `${u.protocol}//msp-api.${rest}`;
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+const spaBaseURL = pick(process.env.E2E_BASE_URL, 'https://msp.a8n.systems');
+const apiBaseURL = pick(
+  process.env.E2E_API_BASE_URL,
+  deriveApiBase(spaBaseURL),
+  spaBaseURL,
+).replace(/\/+$/, '');
 const expectedSha = pick(process.env.GITHUB_SHA, process.env.E2E_EXPECT_SHA);
 
 const INTERVAL_MS = 15_000;
 const TIMEOUT_MS = 10 * 60 * 1000;
-const versionUrl = `${baseURL}/api/v1/version`;
+const versionUrl = `${apiBaseURL}/api/v1/version`;
 
 if (!expectedSha) {
   console.error('GITHUB_SHA is unset; cannot verify the deployed commit. Aborting.');
