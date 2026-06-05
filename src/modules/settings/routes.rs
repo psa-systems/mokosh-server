@@ -7,7 +7,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use uuid::Uuid;
 use validator::Validate;
 
 use super::models::*;
@@ -24,9 +23,13 @@ pub struct SettingsRouterState {
 pub fn settings_routes(service: Arc<SettingsService>) -> Router {
     let state = SettingsRouterState { service };
     Router::new()
-        // PMS-115 tenant settings (legacy: list-all + delete-by-id)
+        // PMS-115 tenant settings list (paginated across categories).
+        // The PMS-113 PR added `/settings/{category}` for category
+        // scoping below; the legacy `DELETE /settings/{id}` route was
+        // dropped because axum's matchit treats `{id}` and `{category}`
+        // as the same path shape and refused to register both. Delete
+        // now lives at `DELETE /settings/{category}/{key}` per AC1.
         .route("/settings", get(list_settings).put(upsert_setting))
-        .route("/settings/{id}", axum::routing::delete(delete_setting))
         // PMS-116 module configs. PMS-113 AC2: the tenants-API
         // `/api/v1/tenants/:tenant_id/modules/:module` surface
         // delegates to the same SettingsService instance, so this is
@@ -77,15 +80,6 @@ async fn upsert_setting(
     Ok(Json(
         s.service.upsert_tenant_setting(u.tenant_id, &req).await?,
     ))
-}
-
-async fn delete_setting(
-    State(s): State<SettingsRouterState>,
-    RequireAuth(u): RequireAuth,
-    _a: RequireAdmin,
-    Path(id): Path<Uuid>,
-) -> AppResult<()> {
-    s.service.delete_tenant_setting(u.tenant_id, id).await
 }
 
 async fn list_module_configs(

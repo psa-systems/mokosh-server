@@ -72,20 +72,6 @@ impl SettingsService {
         })
     }
 
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_tenant_setting(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
-        let n = sqlx::query("DELETE FROM tenant_settings WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant_id)
-            .bind(id)
-            .execute(self.db.pool())
-            .await?
-            .rows_affected();
-        if n == 0 {
-            return Err(AppError::NotFound("TenantSetting".to_string()));
-        }
-        Ok(())
-    }
-
     // Category- and key-scoped tenant_settings access (PMS-113 AC1) ----------
 
     /// List every setting for `tenant_id` in `category`. The endpoint
