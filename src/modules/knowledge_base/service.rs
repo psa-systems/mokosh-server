@@ -577,45 +577,10 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
-    // PMS-84 portal-visible helper -------------------------------------------
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn list_portal_articles(
-        &self,
-        tenant_id: Uuid,
-        pagination: &PaginationParams,
-    ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
-        let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM kb_articles
-               WHERE tenant_id = $1 AND status = 'published'
-                 AND visibility IN ('public', 'client_specific')"#,
-        )
-        .bind(tenant_id)
-        .fetch_one(self.db.pool())
-        .await?;
-
-        let rows = sqlx::query_as::<_, ArticleRow>(
-            r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, created_at, updated_at
-               FROM kb_articles
-               WHERE tenant_id = $1 AND status = 'published'
-                 AND visibility IN ('public', 'client_specific')
-               ORDER BY updated_at DESC
-               LIMIT $2 OFFSET $3"#,
-        )
-        .bind(tenant_id)
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
-        .await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
-    }
-
     /// Portal feed for a specific customer contact (PMS-84 / PMS-32).
     ///
-    /// Unlike [`list_portal_articles`] (the staff-facing preview, which
-    /// returns every published portal-visible article in the tenant), this
-    /// is the contact-facing query: a `client_specific` article is only
+    /// This is the contact-facing query and the only portal-visible feed:
+    /// a `client_specific` article is only
     /// returned when the caller's `company_id` is listed in the article's
     /// `company_ids` array. `public` articles are always included. The
     /// `company_id` is taken from the authenticated portal contact's JWT
