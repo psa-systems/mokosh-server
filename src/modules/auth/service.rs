@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "server")]
 use crate::db::Database;
+use crate::modules::audit::{audit_auth_event, audit_write, AuditAction, AuditCtx};
 #[cfg(feature = "server")]
 use crate::modules::notifications::NotificationsService;
 #[cfg(feature = "server")]
@@ -64,6 +65,12 @@ impl AuthService {
             Arc::new(LogMailer),
             "http://localhost:4301".to_string(),
         )
+    }
+
+    /// Connection pool accessor, used by auth handlers to write audit
+    /// events (login / logout) via the shared `audit_write` helper.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        self.db.pool()
     }
 
     /// Create a new auth service with an explicit mailer + frontend
@@ -124,6 +131,11 @@ impl AuthService {
         ip_address: Option<String>,
         user_agent: Option<String>,
     ) -> AppResult<LoginResponse> {
+        // Captured for audit (PMS-117 AC3); the originals flow into
+        // create_session below.
+        let audit_ip = ip_address.clone();
+        let audit_ua = user_agent.clone();
+
         // Find user by email
         let user = self.find_user_by_email(&request.email).await?;
 
@@ -140,6 +152,24 @@ impl AuthService {
         let password_hash = user.password_hash.as_ref().ok_or(AppError::Unauthorized)?;
 
         if !verify_password(&request.password, password_hash)? {
+            // Record the failed attempt (PMS-117 AC3) before bailing.
+            let ctx = AuditCtx {
+                tenant_id: Some(user.tenant_id),
+                user_id: Some(user.id),
+                ip: audit_ip.clone(),
+                user_agent: audit_ua.clone(),
+            };
+            let _ = audit_write(
+                self.db.pool(),
+                user.tenant_id,
+                &ctx,
+                AuditAction::Login,
+                "auth",
+                Some(user.id),
+                None,
+                Some(serde_json::json!({ "outcome": "failed", "reason": "bad_password" })),
+            )
+            .await;
             return Err(AppError::Unauthorized);
         }
 
@@ -184,6 +214,18 @@ impl AuthService {
 
         // Update last login
         self.update_last_login(user.id).await?;
+
+        // Record the successful login (PMS-117 AC3). Out-of-band on the
+        // pool; a log-write failure must not fail the login itself.
+        let _ = audit_auth_event(
+            self.db.pool(),
+            user.tenant_id,
+            Some(user.id),
+            AuditAction::Login,
+            audit_ip,
+            audit_ua,
+        )
+        .await;
 
         Ok(LoginResponse {
             access_token,
@@ -624,6 +666,7 @@ impl AuthService {
         &self,
         tenant_id: Uuid,
         request: &CreateUserRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<User> {
         // Check if email already exists
         let exists: bool = sqlx::query_scalar(
@@ -644,6 +687,11 @@ impl AuthService {
             .clone()
             .unwrap_or_else(|| "UTC".to_string());
 
+        // Mutation + audit row in one transaction so a rollback drops
+        // both. CREATE: old = None, after captured by the new row id.
+        // Secret columns (password_hash, mfa_secret) are stripped from the
+        // snapshot. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"
             INSERT INTO users (
@@ -663,8 +711,28 @@ impl AuthService {
         .bind(&request.title)
         .bind(request.role.as_str())
         .bind(&timezone)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'password_hash' - 'mfa_secret' FROM users t WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "users",
+            Some(user_id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         if request.send_welcome_email {
             // Reuse the password_reset_tokens machinery so the recipient
@@ -739,7 +807,12 @@ impl AuthService {
 
     /// Update user
     #[tracing::instrument(skip_all)]
-    pub async fn update_user(&self, user_id: Uuid, request: &UpdateUserRequest) -> AppResult<User> {
+    pub async fn update_user(
+        &self,
+        user_id: Uuid,
+        request: &UpdateUserRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<User> {
         // Build dynamic update query
         let mut updates = Vec::new();
         let mut param_idx = 2;
@@ -819,7 +892,45 @@ impl AuthService {
             query_builder = query_builder.bind(timezone);
         }
 
-        query_builder.execute(self.db.pool()).await?;
+        // Mutation + audit row in one transaction: snapshot the row
+        // before and after (Postgres to_jsonb captures exact stored
+        // state, secret columns stripped) and write the audit entry on the
+        // same tx so a rollback drops both. The users table is keyed by id;
+        // tenant_id is read from the row to scope the audit entry. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let tenant_id: Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'password_hash' - 'mfa_secret' FROM users t WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        query_builder.execute(&mut *tx).await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'password_hash' - 'mfa_secret' FROM users t WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "users",
+            Some(user_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_user_by_id(user_id).await
     }
