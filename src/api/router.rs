@@ -31,6 +31,7 @@ use crate::modules::reports::{reports_routes, ReportsService};
 use crate::modules::rmm::{rmm_routes, RmmService};
 use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
+#[cfg(feature = "multi-tenant")]
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
@@ -94,8 +95,6 @@ pub fn create_api_router(
     );
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
-    #[cfg(not(feature = "multi-tenant"))]
-    let _ = TenantService::new(db.clone());
     let contact_service = ContactService::new(db.clone());
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer, notifications_service.clone());
