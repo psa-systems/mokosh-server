@@ -40,9 +40,11 @@ jobs:
       E2E_FOREIGN_COMPANY_ID: ${{ secrets.E2E_FOREIGN_COMPANY_ID }}
       # The opensuse-base runner does not grant write access to the default
       # /opt/hostedtoolcache, so actions/setup-node fails when it tries to
-      # cache the downloaded Node tarball. Point the tool cache at the
-      # per-job RUNNER_TEMP dir, which is always writable and ephemeral.
-      RUNNER_TOOL_CACHE: ${{ runner.temp }}/toolcache
+      # cache the downloaded Node tarball. Point the tool cache at a path the
+      # runner can write. ${{ runner.* }} cannot be referenced from job-env
+      # (Forgejo schema rejects it: the runner context is not yet bound),
+      # so use a fixed path under /tmp.
+      RUNNER_TOOL_CACHE: /tmp/toolcache
 
     steps:
       - name: Clone the repository
