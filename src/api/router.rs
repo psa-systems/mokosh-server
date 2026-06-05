@@ -109,7 +109,11 @@ pub fn create_api_router(
     let reports_service = ReportsService::new(db.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
-    let sla_service = SlaService::new(db.clone());
+    // SLA service shares the notifications dispatcher so the
+    // `sla_sweep` worker (spawned from main.rs with this same service)
+    // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
+    // do not use the dispatcher; only the worker does.
+    let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
     let settings_service = SettingsService::new(db.clone());
     let audit_service = AuditService::new(db.clone());
 
