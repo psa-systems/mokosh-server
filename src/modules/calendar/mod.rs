@@ -10,27 +10,28 @@
 //! - aggregated dispatch board (`/dispatch`) combining all of the above
 //!   for a date range
 //!
-//! DEFERRED - appointment reminders worker. `appointments.reminder_minutes`
-//! (INT[]) exists in the schema, but a reminder dispatcher needs two
-//! things this module does not yet have: (1) a handle to
-//! `NotificationsService` (the `CalendarService` is constructed with only
-//! a `Database` and threading a notifications handle would churn the
-//! constructor + its single call site), and (2) a per-occurrence
-//! "reminder already sent" marker so the worker does not re-dispatch on
-//! every tick (no such column / table exists - recurring occurrences are
-//! virtual, so there is no row to stamp). Adding the worker without (2)
-//! would spam recipients each tick. Tracked for a follow-up that adds a
-//! `sent_appointment_reminders(appointment_id, occurrence_start, channel)`
-//! ledger plus the notifications handle; at that point the worker fires
-//! `NotificationsService::dispatch(tenant_id, "appointment.reminder", &ctx)`.
+//! Appointment reminders worker (PMS-58 follow-up). The two blockers
+//! the original deferral noted are both resolved here:
+//! 1. [`CalendarService::with_dispatcher`] threads an optional
+//!    `NotificationsService` (same pattern as `AuthService`), wired in
+//!    `create_api_router`.
+//! 2. The `appointment_reminders` ledger (migration 028) stamps each
+//!    (appointment_id, occurrence_start, reminder_minutes) tuple so a
+//!    virtual recurring occurrence is reminded exactly once per offset.
+//!
+//! [`CalendarReminderWorker`] runs on the shared scheduler and fires
+//! `NotificationsService::dispatch(tenant_id, "appointment.reminder",
+//! &ctx)` with `recipient_user_id = assigned_to_id`.
 
 pub mod models;
 mod routes;
 pub mod service;
+pub mod worker;
 
 pub use models::*;
 pub use routes::{calendar_routes, dispatch_routes};
-pub use service::CalendarService;
+pub use service::{CalendarService, ReminderCandidate};
+pub use worker::CalendarReminderWorker;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

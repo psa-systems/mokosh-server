@@ -1,9 +1,12 @@
-//! Calendar / scheduling service. Stateless except for the DB handle.
+//! Calendar / scheduling service. Stateless except for the DB handle
+//! (plus an optional notifications dispatcher used by the reminder
+//! worker, mirroring `AuthService::with_dispatcher`).
 
 use chrono::{DateTime, Datelike, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::notifications::NotificationsService;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -20,11 +23,46 @@ const MAX_OCCURRENCES_PER_SERIES: u16 = 1000;
 #[derive(Clone)]
 pub struct CalendarService {
     db: Database,
+    /// When `Some`, the appointment-reminder worker
+    /// ([`CalendarReminderWorker`](super::worker::CalendarReminderWorker))
+    /// dispatches `appointment.reminder` events through the notifications
+    /// queue. `None` for the plain CRUD construction used by the API
+    /// router's calendar routes and by older test fixtures that never
+    /// run the reminder worker. Mirrors `AuthService::with_dispatcher`.
+    notifications: Option<NotificationsService>,
 }
 
 impl CalendarService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            notifications: None,
+        }
+    }
+
+    /// Like [`Self::new`] but additionally wires the notifications
+    /// dispatcher so the reminder worker can fan out
+    /// `appointment.reminder` events. The server uses this constructor in
+    /// `create_api_router` so the single `CalendarService` shared by the
+    /// calendar routes and the reminder worker carries the handle.
+    pub fn with_dispatcher(db: Database, notifications: NotificationsService) -> Self {
+        Self {
+            db,
+            notifications: Some(notifications),
+        }
+    }
+
+    /// Borrow the wired notifications dispatcher, if any. The reminder
+    /// worker uses this to fan out `appointment.reminder` events; absent
+    /// a dispatcher the worker tick is a no-op.
+    pub(crate) fn notifications(&self) -> Option<&NotificationsService> {
+        self.notifications.as_ref()
+    }
+
+    /// Connection-pool accessor for the reminder worker, which writes the
+    /// `appointment_reminders` dedupe ledger directly.
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        self.db.pool()
     }
 
     /// Reject a foreign id that does not belong to this tenant, so a request
@@ -236,6 +274,104 @@ impl CalendarService {
             out.extend(expand_recurrence(&base, from, to));
         }
         out.sort_by_key(|a| a.start_time);
+        Ok(out)
+    }
+
+    /// Enumerate concrete appointment occurrences (across all tenants)
+    /// whose reminder fire-time has arrived but whose start is still in
+    /// the future, for the reminder worker (PMS-58 follow-up).
+    ///
+    /// Only appointments carrying a non-empty `reminder_minutes` are
+    /// considered. The scan window is `[now, now + max_offset]` where
+    /// `max_offset` is the largest reminder offset present in the table:
+    /// any occurrence that could currently owe a reminder starts inside
+    /// that window (`now < occurrence_start <= now + offset <= now +
+    /// max_offset`), so a wider window would only add work. Recurring
+    /// masters are expanded in-memory via [`expand_recurrence`] exactly
+    /// like the dispatch/range view; non-recurring rows pass through.
+    ///
+    /// Returns one [`ReminderCandidate`] per (occurrence, offset) pair.
+    /// The worker is responsible for the per-pair dedupe against the
+    /// `appointment_reminders` ledger and for firing the actual
+    /// dispatch; this method only computes which reminders are due.
+    #[tracing::instrument(skip_all)]
+    pub async fn due_reminders(&self, now: DateTime<Utc>) -> AppResult<Vec<ReminderCandidate>> {
+        // Largest configured offset across the whole table bounds the
+        // expansion window. NULL (no appointment has reminders) => no work.
+        let max_offset_min: Option<i32> = sqlx::query_scalar(
+            r#"SELECT MAX(m) FROM appointments a, unnest(a.reminder_minutes) AS m
+               WHERE a.reminder_minutes IS NOT NULL"#,
+        )
+        .fetch_one(self.db.pool())
+        .await?;
+        let Some(max_offset_min) = max_offset_min else {
+            return Ok(Vec::new());
+        };
+        // Negative / zero offsets cannot produce a future-start reminder
+        // window; clamp at 0 so the window is never inverted.
+        let window_end = now + chrono::Duration::minutes(max_offset_min.max(0) as i64);
+
+        // Pull every appointment with reminders. Non-recurring rows are
+        // pre-filtered to those whose start can still fall in the window
+        // (start > now AND start <= window_end). Recurring masters carry
+        // no time filter - the rule decides which occurrences land in
+        // range, same as `appointments_in_range`.
+        let rows = sqlx::query_as::<_, ReminderRow>(
+            r#"SELECT id, tenant_id, assigned_to_id, start_time, end_time,
+                      recurrence_rule, reminder_minutes
+               FROM appointments
+               WHERE reminder_minutes IS NOT NULL
+                 AND array_length(reminder_minutes, 1) > 0
+                 AND (
+                   recurrence_rule IS NOT NULL
+                   OR (start_time > $1 AND start_time <= $2)
+                 )"#,
+        )
+        .bind(now)
+        .bind(window_end)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut out: Vec<ReminderCandidate> = Vec::new();
+        for row in rows {
+            // Occurrence starts this row contributes inside the window.
+            let occ_starts: Vec<DateTime<Utc>> = if row.recurrence_rule.is_some() {
+                // Reuse the proven expander. It needs an AppointmentResponse
+                // shape; only the recurrence-relevant fields matter here.
+                let base = row.to_response();
+                expand_recurrence(&base, now, window_end)
+                    .into_iter()
+                    .map(|occ| occ.start_time)
+                    .collect()
+            } else {
+                vec![row.start_time]
+            };
+
+            for occ_start in occ_starts {
+                // Past-start occurrences never owe a reminder (don't
+                // remind for events that already began).
+                if occ_start <= now {
+                    continue;
+                }
+                for &offset in &row.reminder_minutes {
+                    if offset < 0 {
+                        continue;
+                    }
+                    let fire_at = occ_start - chrono::Duration::minutes(offset as i64);
+                    // Due iff the fire-time has arrived. The start-future
+                    // check above already holds.
+                    if fire_at <= now {
+                        out.push(ReminderCandidate {
+                            tenant_id: row.tenant_id,
+                            appointment_id: row.id,
+                            assigned_to_id: row.assigned_to_id,
+                            occurrence_start: occ_start,
+                            reminder_minutes: offset,
+                        });
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -970,6 +1106,71 @@ fn expand_recurrence(
             ..base.clone()
         })
         .collect()
+}
+
+/// One due appointment reminder, as computed by
+/// [`CalendarService::due_reminders`]: a concrete occurrence start paired
+/// with one reminder offset whose fire-time has arrived. The worker
+/// dedupes each candidate against the `appointment_reminders` ledger
+/// before dispatching.
+#[derive(Clone, Debug)]
+pub struct ReminderCandidate {
+    pub tenant_id: Uuid,
+    pub appointment_id: Uuid,
+    pub assigned_to_id: Uuid,
+    /// Concrete occurrence start (the master start for a one-off, or an
+    /// expanded instance start for a recurring series).
+    pub occurrence_start: DateTime<Utc>,
+    /// Minutes-before offset that fired this candidate. Matches one
+    /// element of the appointment's `reminder_minutes[]` and is the
+    /// third component of the ledger's unique key.
+    pub reminder_minutes: i32,
+}
+
+/// Slim projection of `appointments` for the reminder scan: only the
+/// columns the offset/occurrence math needs. Avoids widening the public
+/// `AppointmentResponse` with `reminder_minutes`.
+#[derive(sqlx::FromRow)]
+struct ReminderRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    assigned_to_id: Uuid,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    recurrence_rule: Option<String>,
+    reminder_minutes: Vec<i32>,
+}
+
+impl ReminderRow {
+    /// Adapt to the `AppointmentResponse` shape `expand_recurrence`
+    /// consumes. Only the recurrence-relevant fields (id, start/end,
+    /// recurrence_rule) carry meaning for expansion; the rest are
+    /// placeholder values that the expander never reads.
+    fn to_response(&self) -> AppointmentResponse {
+        AppointmentResponse {
+            id: self.id,
+            title: String::new(),
+            description: None,
+            appointment_type: "other".into(),
+            ticket_id: None,
+            project_id: None,
+            task_id: None,
+            company_id: None,
+            contact_id: None,
+            site_id: None,
+            assigned_to_id: self.assigned_to_id,
+            start_time: self.start_time,
+            end_time: self.end_time,
+            all_day: false,
+            timezone: "UTC".into(),
+            status: "scheduled".into(),
+            location: None,
+            recurrence_rule: self.recurrence_rule.clone(),
+            recurrence_parent_id: None,
+            created_at: self.start_time,
+            updated_at: self.start_time,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]

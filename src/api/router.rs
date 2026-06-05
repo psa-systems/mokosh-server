@@ -102,7 +102,12 @@ pub fn create_api_router(
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
-    let calendar_service = CalendarService::new(db.clone());
+    // Wired with the notifications dispatcher so the appointment-reminder
+    // worker (registered in main.rs) fans out `appointment.reminder`
+    // events through the queue. The CRUD calendar/dispatch routes ignore
+    // the handle.
+    let calendar_service =
+        CalendarService::with_dispatcher(db.clone(), notifications_service.clone());
     let contracts_service = ContractsService::new(db.clone());
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());

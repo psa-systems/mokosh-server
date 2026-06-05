@@ -507,6 +507,50 @@ impl TenantService {
         .execute(self.db.pool())
         .await?;
 
+        // Copy the appointment.reminder notification template + rule
+        // (PMS-58 follow-up) so a freshly created tenant fires
+        // appointment reminders out of the box, the same way the default
+        // tenant does via migration 028. Other transactional templates
+        // (auth.*, ticket.*) are deliberately left to the migration seed
+        // / per-tenant CRUD; only the calendar reminder is copied here
+        // because the reminder worker has no per-tenant fallback.
+        sqlx::query(
+            r#"
+            INSERT INTO notification_templates
+                (tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+            SELECT $1, name, event_type, channel_type, subject, body_text, body_html, is_active
+            FROM notification_templates
+            WHERE tenant_id = $2 AND event_type = 'appointment.reminder'
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(self.db.pool())
+        .await?;
+
+        // Re-link the copied rule to the copied template by matching
+        // (event_type, channel_type) within the new tenant, since the
+        // copied template has a fresh id.
+        sqlx::query(
+            r#"
+            INSERT INTO notification_rules
+                (tenant_id, name, event_type, channels, recipients, template_id, is_active)
+            SELECT $1, r.name, r.event_type, r.channels, r.recipients, nt.id, r.is_active
+            FROM notification_rules r
+            JOIN notification_templates ot
+              ON ot.id = r.template_id AND ot.tenant_id = $2
+            JOIN notification_templates nt
+              ON nt.tenant_id = $1
+             AND nt.event_type = ot.event_type
+             AND nt.channel_type = ot.channel_type
+            WHERE r.tenant_id = $2 AND r.event_type = 'appointment.reminder'
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(self.db.pool())
+        .await?;
+
         Ok(())
     }
 }
