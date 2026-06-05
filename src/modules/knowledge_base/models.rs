@@ -48,6 +48,8 @@ pub struct KbArticleResponse {
     pub author_id: Uuid,
     pub view_count: i32,
     pub helpful_count: i32,
+    pub not_helpful_count: i32,
+    pub published_at: Option<DateTime<Utc>>,
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -94,7 +96,10 @@ pub struct KbArticleFilter {
     pub status: Option<String>,
     #[validate(length(max = 100))]
     pub visibility: Option<String>,
-    /// Free-text search; capped to 200 chars to keep ILIKE patterns sane.
+    /// Free-text search. Capped to 200 chars to keep the pg_trgm
+    /// similarity scan bounded; matched against the
+    /// `(title || ' ' || content) gin_trgm_ops` GIN index via the `%`
+    /// operator and ranked by `similarity()` DESC.
     #[validate(length(max = 200))]
     pub q: Option<String>,
 }
@@ -108,4 +113,13 @@ pub struct KbArticleVersionResponse {
     pub content: String,
     pub edited_by_id: Uuid,
     pub created_at: DateTime<Utc>,
+}
+
+/// Returned by the helpful / not_helpful feedback endpoints so the portal
+/// (or agent UI) can render the updated tallies without a follow-up GET.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbArticleFeedbackResponse {
+    pub id: Uuid,
+    pub helpful_count: i32,
+    pub not_helpful_count: i32,
 }
