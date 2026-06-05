@@ -269,13 +269,14 @@ async fn list_credentials(
 async fn create_credential(
     State(s): State<AssetsRouterState>,
     RequireAuth(u): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateCredentialRequest>,
 ) -> AppResult<Json<CredentialResponse>> {
     req.validate()?;
     Ok(Json(
         s.service
-            .create_credential(u.tenant_id, id, u.id, &req)
+            .create_credential(u.tenant_id, id, u.id, &req, &ctx)
             .await?,
     ))
 }
@@ -283,9 +284,10 @@ async fn create_credential(
 async fn delete_credential(
     State(s): State<AssetsRouterState>,
     RequireAuth(u): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_credential(u.tenant_id, id).await
+    s.service.delete_credential(u.tenant_id, id, &ctx).await
 }
 
 async fn list_asset_audit_log(

@@ -67,12 +67,13 @@ async fn list_tickets(
 async fn create_ticket(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
     request.validate()?;
     let ticket = state
         .ticket_service
-        .create_ticket(user.tenant_id, user.id, &request)
+        .create_ticket(user.tenant_id, user.id, &request, &ctx)
         .await?;
     let resp = state
         .ticket_service
@@ -96,13 +97,14 @@ async fn get_ticket(
 async fn update_ticket(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(ticket_id): Path<Uuid>,
     Json(request): Json<UpdateTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
     request.validate()?;
     state
         .ticket_service
-        .update_ticket(user.tenant_id, ticket_id, user.id, &request)
+        .update_ticket(user.tenant_id, ticket_id, user.id, &request, &ctx)
         .await?;
     let resp = state
         .ticket_service
