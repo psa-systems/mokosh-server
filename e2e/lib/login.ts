@@ -35,15 +35,21 @@ export async function loginViaSpa(page: Page): Promise<void> {
     .first()
     .click();
 
-  // The SPA navigates away from /login on a successful sign-in. Polling on
-  // the URL is DOM-agnostic, so it survives marketing-side redesigns better
-  // than asserting on any specific landing-page element.
+  // The SPA navigates fully away from the /login path family on a successful
+  // sign-in. Match anything that starts with /login (not just `/login` or
+  // `/login/`) so multi-step flows like `/login/2fa`, `/login/mfa`,
+  // `/login/recovery`, etc are still treated as IN the login flow rather
+  // than as "successful navigation". A previous CI run got past this check
+  // while sitting on `/login/2fa` and then thrashed for 30s trying to
+  // capture a bearer that no successful login had produced.
   await expect
     .poll(() => new URL(page.url()).pathname, {
       timeout: 30_000,
-      message: 'SPA login never navigated away from /login',
+      message:
+        'SPA login never navigated away from the /login flow ' +
+        '(still on /login, /login/2fa, /login/mfa, or similar)',
     })
-    .not.toMatch(/^\/login\/?$/);
+    .not.toMatch(/^\/login(\/|$)/);
 }
 
 // An authenticated session can read the tenant-scoped tickets list (200); an
