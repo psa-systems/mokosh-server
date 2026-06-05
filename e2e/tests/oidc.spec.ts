@@ -8,7 +8,7 @@ import { env } from '../lib/env';
 // The code is captured from the 302 Location WITHOUT following the redirect.
 test.describe('OIDC token flow', () => {
   test('authorize -> token -> userinfo -> refresh', async ({ request }) => {
-    const oidc = await discoverOidc(request, env.apiBaseURL);
+    const oidc = await discoverOidc(request, env.opBaseURL);
     const pkce = makePkce();
     const state = randomToken();
     const nonce = randomToken();
@@ -38,7 +38,7 @@ test.describe('OIDC token flow', () => {
 
     const location = authRes.headers()['location'];
     expect(location, 'authorize 3xx had no Location header').toBeTruthy();
-    const redirected = new URL(location, env.apiBaseURL);
+    const redirected = new URL(location, env.opBaseURL);
     expect(
       redirected.searchParams.get('error'),
       `authorize returned error=${redirected.searchParams.get('error')}`,

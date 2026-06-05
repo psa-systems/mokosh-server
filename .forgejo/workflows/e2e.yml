@@ -37,6 +37,7 @@ jobs:
       E2E_TENANT_ID: ${{ secrets.E2E_TENANT_ID }}
       E2E_OIDC_CLIENT_ID: ${{ secrets.E2E_OIDC_CLIENT_ID }}
       E2E_OIDC_REDIRECT_URI: ${{ secrets.E2E_OIDC_REDIRECT_URI }}
+      E2E_OP_BASE_URL: ${{ secrets.E2E_OP_BASE_URL }}
       E2E_TOTP_SECRET: ${{ secrets.E2E_TOTP_SECRET }}
       E2E_FOREIGN_COMPANY_ID: ${{ secrets.E2E_FOREIGN_COMPANY_ID }}
       # The opensuse-base runner does not grant write access to the default

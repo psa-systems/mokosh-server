@@ -9,24 +9,32 @@ gate (that is PMS-141).
 
 | Area | File | How |
 | --- | --- | --- |
-| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form, logout invalidates the session |
+| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form, logout invalidates the session (**quarantined - `test.fixme`**; flaky against the bunyip hub. Setup's bearer capture is the load-bearing proof that SPA login works end-to-end) |
 | OIDC token flow | `tests/oidc.spec.ts` | request context: `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE) |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
 
 **Harness shape.** Two independent auth paths because the mokosh-clients SPA
 keeps its bearer token in WASM memory (`mokosh-clients/src/hooks/fetch.rs`),
-which Playwright's `storageState` cannot replay:
+which Playwright's `storageState` cannot replay; and direct
+`POST /api/v1/auth/login` does not work either (the OP advertises only
+`authorization_code` + `refresh_token`, and SPA-signed-up accounts do not
+exist in mokosh's local `users` table):
 
-- **`setup` project** (`tests/global.setup.ts`) calls `POST /api/v1/auth/login`
-  directly against the deployment and writes the returned `access_token` to
-  `e2e/.auth/token.txt`. The `api` project (`oidc`, `tickets`, `contacts`)
-  uses a custom `test` fixture (`lib/fixtures.ts`) that injects the token as
-  `Authorization: Bearer ...` on every request. Teardown reads the same file.
-- **`auth-ui` project** (`tests/auth.spec.ts`) drives the SPA login form in a
-  real browser and asserts on URL transitions (login leaves `/login`, logout
-  returns to it). DOM-only, no API probe - the SPA's in-memory token cannot
-  be exfiltrated for an external request context to use.
+- **`setup` project** (`tests/global.setup.ts`) drives the SPA login in a
+  real browser (TOTP-aware), then listens for the first outbound request
+  carrying an `Authorization: Bearer` header (any host - the SPA's first
+  authenticated call lands on the bunyip hub's `/v1/auth/memberships`, and
+  the same bearer authenticates mokosh's RS-verified `/api/v1/*`). The
+  captured token is written to `e2e/.auth/token.txt`. The `api` project
+  (`oidc`, `tickets`, `contacts`) uses a custom `test` fixture
+  (`lib/fixtures.ts`) that injects the token as `Authorization: Bearer ...`
+  on every request. Teardown reads the same file.
+- **`auth-ui` project** (`tests/auth.spec.ts`) drives the SPA login form in
+  a real browser and asserts on URL transitions (login leaves `/login`,
+  logout returns to it). DOM-only, no API probe - the SPA's in-memory token
+  cannot be exfiltrated for an external request context to use. Currently
+  `test.fixme` (see "What it covers" above).
 
 ## Required configuration
 
@@ -36,7 +44,8 @@ in CI. Required unless noted:
 | Var | Purpose |
 | --- | --- |
 | `E2E_BASE_URL` | SPA host the auth-ui project navigates to (default `https://msp.a8n.systems`) |
-| `E2E_API_BASE_URL` | *optional* - API host for `/api/v1` + `/oauth2` + `/.well-known`. Defaults to prepending `api.` to `E2E_BASE_URL` (e.g. `msp.a8n.systems` -> `api.msp.a8n.systems`). Set when the deployment uses a different naming scheme |
+| `E2E_API_BASE_URL` | *optional* - API host for `/api/v1`. Defaults to prepending `api.` to `E2E_BASE_URL` (e.g. `msp.a8n.systems` -> `api.msp.a8n.systems`). Set when the deployment uses a different naming scheme |
+| `E2E_OP_BASE_URL` | *optional* - OIDC OP host for `/oauth2/*` + `/.well-known/openid-configuration`. Defaults to `E2E_API_BASE_URL`. On bunyip-as-OP deploys the OP runs on the apex `api.<tld>`, NOT the mokosh API host, so set this explicitly (e.g. `https://api.a8n.systems`) |
 | `E2E_EMAIL` | dedicated E2E account login |
 | `E2E_PASSWORD` | E2E account password |
 | `E2E_TENANT_ID` | UUID of the dedicated E2E tenant |
