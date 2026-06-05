@@ -66,6 +66,25 @@ jobs:
           let tags = (^nu oci-build/get-tags.nu --joined)
           $"tags=($tags)\n" | save --append $env.GITHUB_OUTPUT
 
+      # Resolve the version metadata that build.rs expects on its env. The
+      # .git tree is not copied into the Docker build context (see
+      # oci-build/Dockerfile), so without these args build.rs falls back to
+      # "unknown" / "v<crate-version>" and the deployed image cannot be
+      # identified per commit - the E2E deploy-sync gate ends up polling for
+      # a hash that never appears (PMS-140).
+      - name: Resolve build metadata
+        shell: nu {0}
+        run: |
+          let git_hash = (^git rev-parse --short=12 HEAD | str trim)
+          let git_describe = (^git describe --tags --always --dirty | str trim)
+          let source_date_epoch = (^git log -1 --pretty=%ct HEAD | str trim)
+          let build_date = (^date --utc --iso-8601=seconds | str trim)
+          $"MOKOSH_GIT_HASH=($git_hash)\n" | save --append $env.GITHUB_ENV
+          $"MOKOSH_GIT_DESCRIBE=($git_describe)\n" | save --append $env.GITHUB_ENV
+          $"MOKOSH_BUILD_DATE=($build_date)\n" | save --append $env.GITHUB_ENV
+          $"SOURCE_DATE_EPOCH=($source_date_epoch)\n" | save --append $env.GITHUB_ENV
+          print $"git_hash=($git_hash) git_describe=($git_describe) build_date=($build_date)"
+
       - name: Log in to container registry
         shell: nu {0}
         run: |
@@ -81,7 +100,17 @@ jobs:
           let tag_args = ($tags | each {|tag| [-t $"($registry)/($image):($tag)"]} | flatten)
           let cache_from = $"type=registry,ref=($registry)/($image):latest"
           print $"Building and pushing ($image) with tags: ($tags_str)"
-          ^docker buildx build --push --cache-from $cache_from --cache-to type=inline --build-arg $"GIT_SHA=($env.GITHUB_SHA)" ...$tag_args -f oci-build/Dockerfile .
+          # The unused GIT_SHA build-arg the previous step passed was a no-op:
+          # the Dockerfile reads MOKOSH_GIT_HASH / MOKOSH_GIT_DESCRIBE /
+          # MOKOSH_BUILD_DATE / SOURCE_DATE_EPOCH, which build.rs exports as
+          # rustc env vars (src/version.rs:21).
+          let build_args = [
+            "--build-arg" $"MOKOSH_GIT_HASH=($env.MOKOSH_GIT_HASH)"
+            "--build-arg" $"MOKOSH_GIT_DESCRIBE=($env.MOKOSH_GIT_DESCRIBE)"
+            "--build-arg" $"MOKOSH_BUILD_DATE=($env.MOKOSH_BUILD_DATE)"
+            "--build-arg" $"SOURCE_DATE_EPOCH=($env.SOURCE_DATE_EPOCH)"
+          ]
+          ^docker buildx build --push --cache-from $cache_from --cache-to type=inline ...$build_args ...$tag_args -f oci-build/Dockerfile .
 
       - name: Print image URLs
         shell: nu {0}
