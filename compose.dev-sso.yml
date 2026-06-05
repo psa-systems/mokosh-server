@@ -49,16 +49,36 @@ services:
       - traefik.http.routers.mokosh-api-${USER}.entrypoints=nebula-secure
       - traefik.http.routers.mokosh-api-${USER}.tls.certresolver=cert-cloudflare
       - traefik.http.services.mokosh-api-${USER}.loadbalancer.server.port=${MOKOSH_PORT}
+    # bunyip-as-OP cutover (runbook 3.8 / scaffold step 8): mokosh-server runs
+    # as a Resource Server. The auth middleware's BunyipVerifier (oidc_rs.rs)
+    # validates the at+jwt bunyip-api mints by fetching bunyip's discovery +
+    # JWKS over HTTPS and JIT-provisioning the user, activated purely by
+    # OIDC_ISSUER + OIDC_AUDIENCE below.
+    #
+    # The verifier fetches `${OIDC_ISSUER}/.well-known/openid-configuration`,
+    # but inside the container the issuer host resolves to dev-01's PUBLIC edge
+    # (self-signed cert + 404 on the OP path). This extra_hosts entry pins it to
+    # the LOCAL Traefik on the shared network, which serves the OP with a valid
+    # Let's Encrypt cert. Override BUNYIP_OP_TRAEFIK_IP in .env on a box whose
+    # Traefik publishes nebula-secure on a different IP.
+    extra_hosts:
+      - "${USER}-bunyip-api.a8n.run:${BUNYIP_OP_TRAEFIK_IP:-172.30.0.11}"
     environment:
-      # Public URL the OP advertises to relying parties. The issuer goes
-      # into every signed JWT, the discovery doc, and JWKS URLs.
+      # mokosh-server keeps its OWN issuer identity for its (now-unused) OP
+      # endpoints; token validation is done by the RS verifier below, NOT this.
       MOKOSH_AUTH_ISSUER: https://${USER}-mokosh-api.a8n.run
+      # RS verifier (the bunyip-as-OP path). OIDC_ISSUER must equal the token
+      # `iss` AND bunyip's advertised discovery issuer; OIDC_AUDIENCE must equal
+      # the `audience` on the mokosh-apps oauth_clients row in bunyip-api.
+      OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
+      OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
       # Cross-subdomain SSO: cookies span every *.a8n.run app this user
       # might add later. Mirrors saas / dmarc-reporter behaviour.
       MOKOSH_AUTH_COOKIE_DOMAIN: .a8n.run
-      # Keys live in ./secrets, mounted at /app/secrets:ro by
-      # compose.dev.yml. `just ensure-oidc-keys` generates them if
-      # missing (kid=dev-key by convention).
+      # Keys live in ./secrets, mounted at /app/secrets:ro by compose.dev.yml.
+      # `just ensure-oidc-keys` generates mokosh's own dev-key (for its own OP
+      # endpoints to boot); the RS path fetches bunyip's keys over JWKS, so no
+      # cross-service key copy is needed.
       MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: /app/secrets/dev-key.pem
       MOKOSH_AUTH_JWT_ACTIVE_KID: dev-key
       MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: /app/secrets
