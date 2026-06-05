@@ -45,6 +45,11 @@ function deriveApiBase(spaUrl: string): string | null {
 const spaBaseURL = optional('E2E_BASE_URL') ?? 'https://msp.a8n.systems';
 const derivedApi = deriveApiBase(spaBaseURL);
 const apiBaseURL = optional('E2E_API_BASE_URL') ?? derivedApi ?? spaBaseURL;
+// The OIDC OP (provider) is a separate host from mokosh-server on
+// bunyip-as-OP deploys: SPA + mokosh PSA live under `msp.<tld>`, but the
+// OP runs under the apex `api.<tld>` (no `msp.` prefix). When unset, fall
+// back to apiBaseURL so a mokosh-as-OP deploy still works.
+const opBaseURL = optional('E2E_OP_BASE_URL') ?? apiBaseURL;
 
 export const env = {
   // Where a human browser hits the SPA (login form, dashboard). The auth-ui
@@ -56,6 +61,11 @@ export const env = {
   // override with E2E_API_BASE_URL when the deployment uses a different
   // naming scheme.
   apiBaseURL,
+  // Where the OIDC OP (authorize / token / userinfo / discovery) lives.
+  // On bunyip-as-OP deploys this is a different host from apiBaseURL
+  // (e.g. `api.a8n.systems` rather than `api.msp.a8n.systems`); on
+  // mokosh-as-OP it defaults to apiBaseURL.
+  opBaseURL,
   get email() {
     return required('E2E_EMAIL');
   },

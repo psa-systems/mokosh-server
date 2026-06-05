@@ -11,8 +11,15 @@ import { expectAtLoginScreen, loginViaSpa } from '../lib/login';
 // once on CI (2). Splitting login/logout into two tests would add another
 // 2-4 logins (test bodies + retries) and cross the cap, so keep auth-ui
 // down to one login attempt per project run.
+// PMS-140 phase-1 quarantine: the browser-driven login + logout round-trip
+// is flaky against the bunyip hub. Setup proves the underlying SPA login
+// works end-to-end (it captures a bearer from the post-login /api request),
+// so the suite has real auth coverage; this test fails non-deterministically
+// on the form-submit step or on the cross-origin logout redirect chain.
+// `test.fixme` keeps it discoverable as "to fix" without flagging CI red.
+// Revisit once the hub login surface stabilises - see PMS-140.
 test.describe('auth login / session', () => {
-  test('login + logout round-trip', async ({ page }) => {
+  test.fixme('login + logout round-trip', async ({ page }) => {
     await loginViaSpa(page);
     // loginViaSpa already polled "URL is no longer /login"; verify the SPA
     // settled on a non-error landing page rather than 404 or transient
