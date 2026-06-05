@@ -198,7 +198,7 @@ async fn forgot_password(
     request.validate()?;
     state
         .auth_service
-        .request_password_reset(&request.email)
+        .request_password_reset(request.tenant_id, &request.email)
         .await?;
     Ok(())
 }

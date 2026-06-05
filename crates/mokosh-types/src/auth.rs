@@ -269,6 +269,14 @@ pub struct LoginRequest {
     /// matched hash is removed from
     /// `users.mfa_recovery_codes_hashes`.
     pub recovery_code: Option<String>,
+    /// Optional tenant hint sourced by the SPA from the request
+    /// hostname (e.g. `acme.mokosh.example` -> tenant slug lookup
+    /// -> tenant_id). Required to disambiguate multi-tenant
+    /// deployments where the same email exists under multiple
+    /// tenants; omitted clients fall back to
+    /// `00000000-0000-0000-0000-000000000001`. PMS-138.
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Login response
@@ -301,6 +309,9 @@ pub struct RefreshTokenResponse {
 pub struct ForgotPasswordRequest {
     #[validate(email(message = "Invalid email address"))]
     pub email: String,
+    /// Same shape + semantics as `LoginRequest::tenant_id`. PMS-138.
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Password reset completion

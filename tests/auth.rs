@@ -478,3 +478,251 @@ async fn tenant_isolation_get_user_by_id_returns_404(pool: PgPool) {
     // in the assertion above.
     let _: Uuid = user_b_id;
 }
+
+// ============================================================================
+// PMS-138: subdomain-driven `LoginRequest::tenant_id` hint
+// ============================================================================
+
+/// Insert a user under an arbitrary `(tenant_id, email)` with a known
+/// password. Used by the PMS-138 tests to set up the multi-tenant
+/// colliding-email scenario that the seeded helpers can't express on
+/// their own (they hard-code the default tenant or generate a unique
+/// per-tenant email).
+async fn insert_user_in_tenant(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    email: &str,
+    password: &str,
+    role: &str,
+) -> Uuid {
+    let password_hash = mokosh_server::utils::crypto::hash_password(password)
+        .expect("hash PMS-138 colliding user password");
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO users (
+            id, tenant_id, email, password_hash,
+            first_name, last_name, role, status, email_verified_at
+        )
+        VALUES ($1, $2, $3, $4, 'Colliding', 'User', $5, 'active', NOW())
+        "#,
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(email)
+    .bind(&password_hash)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("insert PMS-138 colliding user");
+    user_id
+}
+
+/// PMS-138 multi-tenant resolution: with the same email under two
+/// tenants the `tenant_id` hint must steer the lookup to the user in
+/// the named tenant. Pre-PMS-138 the email-only lookup returned the
+/// oldest-created row regardless of which tenant the caller intended.
+#[sqlx::test]
+async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
+    let colliding_email = "colliding@example.com";
+    let password_a = "password-tenant-a";
+    let password_b = "password-tenant-b";
+
+    let user_a_id = insert_user_in_tenant(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        colliding_email,
+        password_a,
+        "admin",
+    )
+    .await;
+    let (tenant_b_id, _admin_b_id, _admin_b_email, _admin_b_password) =
+        common::seed_tenant_with_admin(&pool, "pms138-tenant-b").await;
+    let user_b_id =
+        insert_user_in_tenant(&pool, tenant_b_id, colliding_email, password_b, "admin").await;
+
+    let app = common::boot(pool).await;
+
+    // Hint -> tenant B. Must authenticate as B's user.
+    let resp_b = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": colliding_email,
+            "password": password_b,
+            "tenant_id": tenant_b_id,
+        }))
+        .send()
+        .await
+        .expect("send login (tenant B hint)");
+    assert_eq!(
+        resp_b.status(),
+        reqwest::StatusCode::OK,
+        "tenant B login must succeed with the B-tenant hint"
+    );
+    let body_b: serde_json::Value = resp_b.json().await.expect("login B body");
+    assert_eq!(
+        body_b["user"]["id"].as_str(),
+        Some(user_b_id.to_string().as_str()),
+        "tenant-B hint must resolve to tenant B's user"
+    );
+    assert_eq!(
+        body_b["user"]["tenant_id"].as_str(),
+        Some(tenant_b_id.to_string().as_str()),
+        "tenant-B hint must return tenant B in user.tenant_id"
+    );
+
+    // Hint -> default tenant. Must authenticate as A's user.
+    let resp_a = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": colliding_email,
+            "password": password_a,
+            "tenant_id": common::DEFAULT_TENANT_ID,
+        }))
+        .send()
+        .await
+        .expect("send login (default-tenant hint)");
+    assert_eq!(
+        resp_a.status(),
+        reqwest::StatusCode::OK,
+        "tenant A login must succeed with the default-tenant hint"
+    );
+    let body_a: serde_json::Value = resp_a.json().await.expect("login A body");
+    assert_eq!(
+        body_a["user"]["id"].as_str(),
+        Some(user_a_id.to_string().as_str()),
+        "default-tenant hint must resolve to the default-tenant user"
+    );
+}
+
+/// PMS-138 backward compat: clients that omit `tenant_id` continue to
+/// land in the default tenant, so single-tenant deployments and any
+/// existing SPA that has not yet been updated keep working.
+#[sqlx::test]
+async fn login_omitting_tenant_id_falls_back_to_default(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+        }))
+        .send()
+        .await
+        .expect("send login (no tenant_id)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "login must succeed when tenant_id is omitted (default-tenant fallback)"
+    );
+    let body: serde_json::Value = resp.json().await.expect("login body");
+    assert_eq!(
+        body["user"]["tenant_id"].as_str(),
+        Some(common::DEFAULT_TENANT_ID.to_string().as_str()),
+        "omitted tenant_id must resolve to the default tenant"
+    );
+}
+
+/// PMS-138 wrong-hint pin: a hint that names a tenant where the email
+/// does not exist must return 401, never accidentally cross-
+/// authenticate against a different tenant's user.
+#[sqlx::test]
+async fn login_wrong_tenant_hint_returns_401(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let (tenant_c_id, _admin_c_id, _admin_c_email, _admin_c_password) =
+        common::seed_tenant_with_admin(&pool, "pms138-tenant-c").await;
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_id": tenant_c_id,
+        }))
+        .send()
+        .await
+        .expect("send login (wrong-tenant hint)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "wrong tenant_id hint must 401, never cross-authenticate"
+    );
+}
+
+/// PMS-138 forgot-password sibling fix: with the same email under two
+/// tenants the `tenant_id` hint on `/api/v1/auth/forgot-password` must
+/// route the reset token to the user in the named tenant.
+#[sqlx::test]
+async fn forgot_password_with_tenant_hint_targets_correct_user(pool: PgPool) {
+    let colliding_email = "colliding@example.com";
+    let _user_a_id = insert_user_in_tenant(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        colliding_email,
+        "password-tenant-a",
+        "admin",
+    )
+    .await;
+    let (tenant_b_id, _admin_b_id, _admin_b_email, _admin_b_password) =
+        common::seed_tenant_with_admin(&pool, "pms138-tenant-b-forgot").await;
+    let user_b_id = insert_user_in_tenant(
+        &pool,
+        tenant_b_id,
+        colliding_email,
+        "password-tenant-b",
+        "admin",
+    )
+    .await;
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/forgot-password"))
+        .json(&serde_json::json!({
+            "email": colliding_email,
+            "tenant_id": tenant_b_id,
+        }))
+        .send()
+        .await
+        .expect("send forgot-password (tenant B hint)");
+    assert!(
+        resp.status().is_success(),
+        "forgot-password with tenant hint must 2xx; got {}",
+        resp.status()
+    );
+
+    let (token_user_id, token_tenant_id): (Uuid, Uuid) =
+        sqlx::query_as("SELECT user_id, tenant_id FROM password_reset_tokens WHERE tenant_id = $1")
+            .bind(tenant_b_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read tenant B reset token");
+    assert_eq!(
+        token_user_id, user_b_id,
+        "reset token must target tenant B's user, not the default-tenant collider"
+    );
+    assert_eq!(
+        token_tenant_id, tenant_b_id,
+        "reset token row must be scoped to tenant B"
+    );
+
+    let default_tenant_token_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM password_reset_tokens WHERE tenant_id = $1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count default-tenant reset tokens");
+    assert_eq!(
+        default_tenant_token_count, 0,
+        "no reset token should have been issued for the default-tenant collider"
+    );
+}
