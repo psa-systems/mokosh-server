@@ -32,7 +32,10 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   const seenApiUrls: string[] = [];
   page.on('request', (req) => {
     const url = req.url();
-    if (!url.includes('/api/v1')) return;
+    // Trailing slash on purpose: prevents matches against unrelated paths
+    // that merely contain the substring `/api/v1` (e.g. `/api/v1foo` or a
+    // query string carrying the literal text).
+    if (!url.includes('/api/v1/')) return;
     seenApiUrls.push(url);
     if (token) return;
     const auth = req.headers()['authorization'];

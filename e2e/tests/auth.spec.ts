@@ -32,10 +32,15 @@ test.describe('auth login / session', () => {
 // then redirects to the bunyip hub's /logout which itself ends up on /login;
 // the surrounding test asserts on the final URL.
 async function logout(page: Page): Promise<void> {
-  const userMenu = page.getByRole('button', { name: 'User menu' });
+  // `.first()` defends against strict-mode violations if the SPA ever renders
+  // a duplicate menu (e.g. parallel mobile/desktop nav copies of the same
+  // button). The visible avatar in the top bar is the one we want either way.
+  const userMenu = page.getByRole('button', { name: 'User menu' }).first();
   await userMenu.waitFor({ state: 'visible', timeout: 10_000 });
   await userMenu.click();
 
-  const menu = page.getByRole('menu');
+  // Same defence on the popup: a future drawer or context menu carrying
+  // role="menu" elsewhere on the page would otherwise trip strict mode.
+  const menu = page.getByRole('menu').first();
   await menu.getByRole('button', { name: /^logout$/i }).click();
 }
