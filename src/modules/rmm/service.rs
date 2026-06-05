@@ -603,7 +603,15 @@ impl RmmService {
                         custom_fields: serde_json::json!({}),
                         tags: vec![],
                     };
-                    svc.create_ticket(tenant_id, default_creator, &req).await?;
+                    // RMM ingest is a background path (no AuditCtx extractor);
+                    // attribute the auto-created ticket to the system actor.
+                    svc.create_ticket(
+                        tenant_id,
+                        default_creator,
+                        &req,
+                        &crate::modules::audit::AuditCtx::system(tenant_id),
+                    )
+                    .await?;
                 }
                 None => {
                     self.legacy_insert_ticket(tenant_id, &rule, company_id, &title, &description)

@@ -1,6 +1,8 @@
 //! SLA service.
 
-use chrono::{DateTime, Duration, Utc};
+use std::collections::HashSet;
+
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -8,6 +10,7 @@ use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
+use super::clock::{self, BusinessSchedule, OperationalHours};
 use super::models::*;
 
 #[derive(Clone)]
@@ -448,13 +451,20 @@ impl SlaService {
         Ok(())
     }
 
-    // PMS-112 evaluator -------------------------------------------------------
+    // PMS-112 / PMS-106 evaluator ---------------------------------------------
     /// Compute and persist `tickets.first_response_due`, `resolution_due`,
     /// `sla_due_date` for the ticket based on its priority's targets in
-    /// its assigned SLA policy. v1 treats every target's window as
-    /// 24x7 hours (ignores `business_hours` schedules); business-hours
-    /// awareness lands as a follow-up once a Postgres function or
-    /// in-process date arithmetic helper is bench-tested.
+    /// its assigned SLA policy.
+    ///
+    /// The applicable policy is the ticket's `sla_id` when set, else the
+    /// tenant's default policy (`is_default = TRUE`). The policy's
+    /// `business_hours` row supplies the timezone + weekly schedule, and
+    /// the business-hours row's `holidays` (a `UUID[]` of
+    /// `holiday_calendars`) supply the non-working dates. Each target is
+    /// then evaluated through [`clock::due_at`] using the target's own
+    /// `operational_hours` (`24x7` -> wall-clock, `business_hours` ->
+    /// business-hours-aware, PMS-106). If the policy has no business
+    /// hours configured every target degrades to 24x7.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn evaluate_for_ticket(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<()> {
         let row: Option<(Option<Uuid>, Uuid, DateTime<Utc>)> = sqlx::query_as(
@@ -468,37 +478,58 @@ impl SlaService {
         let Some((sla_id, priority_id, created_at)) = row else {
             return Ok(());
         };
-        let policy_id = match sla_id {
-            Some(p) => p,
-            None => match sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM sla_policies WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
+
+        // Resolve the applicable policy and its business-hours id in one
+        // query so we do not round-trip twice.
+        let policy: Option<(Uuid, Option<Uuid>)> = match sla_id {
+            Some(p) => sqlx::query_as(
+                "SELECT id, business_hours_id FROM sla_policies WHERE tenant_id = $1 AND id = $2",
             )
             .bind(tenant_id)
+            .bind(p)
             .fetch_optional(self.db.pool())
-            .await?
-            {
-                Some(p) => p,
-                None => return Ok(()), // no policy configured; nothing to evaluate
-            },
+            .await?,
+            None => {
+                sqlx::query_as(
+                    r#"SELECT id, business_hours_id FROM sla_policies
+                   WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1"#,
+                )
+                .bind(tenant_id)
+                .fetch_optional(self.db.pool())
+                .await?
+            }
         };
-        let target: Option<(Option<Decimal>, Option<Decimal>)> = sqlx::query_as(
-            r#"SELECT first_response_hours, resolution_hours FROM sla_targets
+        let Some((policy_id, business_hours_id)) = policy else {
+            return Ok(()); // no policy configured; nothing to evaluate
+        };
+
+        let target: Option<(Option<Decimal>, Option<Decimal>, Option<String>)> = sqlx::query_as(
+            r#"SELECT first_response_hours, resolution_hours, operational_hours
+               FROM sla_targets
                WHERE sla_policy_id = $1 AND priority_id = $2"#,
         )
         .bind(policy_id)
         .bind(priority_id)
         .fetch_optional(self.db.pool())
         .await?;
-        let Some((fr, res)) = target else {
+        let Some((fr, res, op_hours)) = target else {
             return Ok(());
         };
 
-        let fr_due = fr
-            .and_then(|h| h.to_string().parse::<f64>().ok())
-            .map(|h| created_at + Duration::milliseconds((h * 3_600_000.0) as i64));
-        let res_due = res
-            .and_then(|h| h.to_string().parse::<f64>().ok())
-            .map(|h| created_at + Duration::milliseconds((h * 3_600_000.0) as i64));
+        // Load the policy's business hours (timezone + weekly schedule)
+        // and the holiday dates referenced by that row. Absent business
+        // hours => an all-closed schedule, which `clock::due_at` degrades
+        // to 24x7.
+        let (schedule, holidays) = self
+            .load_schedule_and_holidays(tenant_id, business_hours_id)
+            .await?;
+        let operational =
+            OperationalHours::from_db(op_hours.as_deref().unwrap_or("business_hours"));
+
+        let fr_due = decimal_to_hours(fr)
+            .map(|h| clock::due_at(created_at, h, &schedule, &holidays, operational));
+        let res_due = decimal_to_hours(res)
+            .map(|h| clock::due_at(created_at, h, &schedule, &holidays, operational));
 
         sqlx::query(
             r#"UPDATE tickets SET first_response_due = $3, resolution_due = $4,
@@ -513,6 +544,70 @@ impl SlaService {
         .await?;
         Ok(())
     }
+
+    /// Load and parse the [`BusinessSchedule`] for `business_hours_id`
+    /// plus the holiday dates referenced by that row's `holidays`
+    /// (`UUID[]` of `holiday_calendars`). A missing id or row yields an
+    /// empty (all-closed) schedule and an empty holiday set, which the
+    /// clock degrades to 24x7.
+    async fn load_schedule_and_holidays(
+        &self,
+        tenant_id: Uuid,
+        business_hours_id: Option<Uuid>,
+    ) -> AppResult<(BusinessSchedule, HashSet<NaiveDate>)> {
+        // No business hours on the policy: an empty (all-closed) schedule
+        // that `clock::due_at` degrades to 24x7, plus no holidays.
+        let empty = || {
+            (
+                BusinessSchedule::parse("UTC", &serde_json::json!({})),
+                HashSet::new(),
+            )
+        };
+
+        let Some(bh_id) = business_hours_id else {
+            return Ok(empty());
+        };
+
+        let bh: Option<(String, serde_json::Value, Option<Vec<Uuid>>)> = sqlx::query_as(
+            r#"SELECT timezone, schedule, holidays FROM business_hours
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(bh_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        let Some((timezone, schedule_json, holiday_calendar_ids)) = bh else {
+            return Ok(empty());
+        };
+
+        let schedule = BusinessSchedule::parse(&timezone, &schedule_json);
+
+        let mut holidays: HashSet<NaiveDate> = HashSet::new();
+        if let Some(ids) = holiday_calendar_ids {
+            if !ids.is_empty() {
+                let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+                    r#"SELECT holidays FROM holiday_calendars
+                       WHERE tenant_id = $1 AND id = ANY($2)"#,
+                )
+                .bind(tenant_id)
+                .bind(&ids)
+                .fetch_all(self.db.pool())
+                .await?;
+                for (json,) in rows {
+                    holidays.extend(clock::parse_holidays(&json));
+                }
+            }
+        }
+
+        Ok((schedule, holidays))
+    }
+}
+
+/// Convert a `DECIMAL` hours value (e.g. `1.50`) into `f64` hours for the
+/// clock. Returns `None` for NULL or unparseable values.
+fn decimal_to_hours(d: Option<Decimal>) -> Option<f64> {
+    d.and_then(|h| h.to_string().parse::<f64>().ok())
 }
 
 #[derive(sqlx::FromRow)]
