@@ -226,8 +226,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let contract_worker = mokosh_server::modules::contracts::ContractLifecycleWorker::new(
         mokosh_server::modules::contracts::ContractsService::new(db.clone()),
     );
+
+    // SLA sweep worker (PMS-106 follow-up). Scans open tickets with SLA
+    // due times set and enqueues an at-risk / breach notification the
+    // first time each milestone is crossed, deduped via the
+    // `sla_notifications` ledger. It needs the notifications dispatcher,
+    // so build a NotificationsService clone here (the router builds its
+    // own internally). A 60s tick gives minute-granular alerting; the
+    // `encryption_key` is `Copy`, so reusing it below for the router is
+    // fine.
+    let sla_notifications =
+        mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
+            db.clone(),
+            encryption_key,
+        );
+    let sla_worker = mokosh_server::modules::sla::SlaSweepWorker::new(
+        mokosh_server::modules::sla::SlaService::with_dispatcher(db.clone(), sla_notifications),
+    );
+
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
+    scheduler.register(sla_worker, std::time::Duration::from_secs(60));
 
     // Appointment-reminder worker (PMS-58 follow-up). Each 60s tick
     // enumerates appointment occurrences whose reminder fire-time has
@@ -248,7 +267,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     scheduler.register(calendar_reminder_worker, std::time::Duration::from_secs(60));
-
     let _scheduler_handles = scheduler.start();
 
     let psa_router = create_api_router(

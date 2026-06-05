@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::notifications::NotificationsService;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -16,11 +17,45 @@ use super::models::*;
 #[derive(Clone)]
 pub struct SlaService {
     db: Database,
+    /// When `Some`, the `sla_sweep` worker dispatches SLA at-risk /
+    /// breach alerts through the notifications queue (templates from
+    /// `notification_templates`, delivery driven by `DispatcherWorker`).
+    /// When `None` (the `new` constructor, used by older test fixtures
+    /// and the CRUD/evaluate paths that never sweep), no SLA alerts are
+    /// dispatched. Mirrors the `AuthService::with_dispatcher` pattern.
+    notifications: Option<NotificationsService>,
 }
 
 impl SlaService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            notifications: None,
+        }
+    }
+
+    /// Like [`Self::new`] but wires the notifications dispatcher so the
+    /// `sla_sweep` worker can enqueue at-risk / breach alerts. The
+    /// server uses this constructor in `create_api_router` so the
+    /// worker (spawned from `main.rs`) shares the same
+    /// `NotificationsService` clone as the rest of the app.
+    pub fn with_dispatcher(db: Database, notifications: NotificationsService) -> Self {
+        Self {
+            db,
+            notifications: Some(notifications),
+        }
+    }
+
+    /// Borrow the wired notifications dispatcher, if any. Used by the
+    /// `sla_sweep` worker to fan out at-risk / breach alerts.
+    pub(crate) fn notifications(&self) -> Option<&NotificationsService> {
+        self.notifications.as_ref()
+    }
+
+    /// Connection pool accessor for the `sla_sweep` worker's ledger
+    /// reads/writes.
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        self.db.pool()
     }
 
     // PMS-108 policies --------------------------------------------------------
