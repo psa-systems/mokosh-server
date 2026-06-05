@@ -27,16 +27,26 @@ import { loginViaSpa } from '../lib/login';
 // if the default landing route does not.
 const POST_LOGIN_PROBES = ['/dashboard', '/tickets'];
 
+// Cap on URL samples included in the timeout diagnostic. High enough to see
+// the actual SPA traffic pattern, low enough to keep the error readable.
+const URL_SAMPLE_CAP = 30;
+
 setup('capture bearer from the SPA login', async ({ page }) => {
   let token: string | null = null;
-  const seenApiUrls: string[] = [];
+  // Trace EVERYTHING the page does. Two prior CI runs reported `(none)` for
+  // /api/v1 traffic post-login, so the filter itself is suspect: capturing
+  // all hosts/paths here gives us the actual traffic to compare against
+  // what env.ts assumes.
+  const allRequestUrls: string[] = [];
+  const apiV1RequestUrls: string[] = [];
   page.on('request', (req) => {
     const url = req.url();
+    allRequestUrls.push(url);
     // Trailing slash on purpose: prevents matches against unrelated paths
     // that merely contain the substring `/api/v1` (e.g. `/api/v1foo` or a
     // query string carrying the literal text).
     if (!url.includes('/api/v1/')) return;
-    seenApiUrls.push(url);
+    apiV1RequestUrls.push(url);
     if (token) return;
     const auth = req.headers()['authorization'];
     if (auth && auth.toLowerCase().startsWith('bearer ')) {
@@ -44,7 +54,15 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     }
   });
 
+  // Track every URL the top frame lands on. On timeout we dump the trail so
+  // we can see whether the SPA bounced through the bunyip hub correctly.
+  const urlTrail: string[] = [];
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) urlTrail.push(frame.url());
+  });
+
   await loginViaSpa(page);
+  const postLoginUrl = page.url();
 
   // Force the SPA to hit a data-loading route so we are not at the mercy of
   // whichever landing page the post-login redirect happens to use. Either
@@ -64,15 +82,24 @@ setup('capture bearer from the SPA login', async ({ page }) => {
       })
       .not.toBeNull();
   } catch (err) {
-    // Re-throw with the captured URL list - expect.poll only accepts a static
-    // string message, but the URLs we DID see are the load-bearing diagnostic.
-    const observed =
-      seenApiUrls.length === 0 ? '(none)' : seenApiUrls.slice(0, 10).join(', ');
+    // expect.poll's `message` is a static string, so the dynamic diagnostic
+    // gets rebuilt here on the way out. The captured trail tells us whether
+    // (a) login actually completed on the SPA host, (b) the SPA fired ANY
+    // requests post-login, and (c) whether any of them hit /api/v1 at all.
+    const sample = (arr: string[]) =>
+      arr.length === 0 ? '(none)' : arr.slice(-URL_SAMPLE_CAP).join('\n    ');
+    const finalUrl = page.url();
     throw new Error(
-      `SPA login completed but no /api/v1 request carrying \`Authorization: Bearer\` ` +
-        `fired within 30s. /api/v1 requests observed (no Bearer header): ${observed}. ` +
-        `Either the SPA stopped using Bearer auth, or it hits a different API base ` +
-        `than e2e/lib/env.ts assumes. Underlying: ${String(err)}`,
+      [
+        'SPA login completed but no /api/v1 request carrying `Authorization: Bearer` ' +
+          `fired within 30s.`,
+        `  postLoginUrl=${postLoginUrl}`,
+        `  finalUrl=${finalUrl}`,
+        `  urlTrail (last ${URL_SAMPLE_CAP}):\n    ${sample(urlTrail)}`,
+        `  /api/v1 requests (last ${URL_SAMPLE_CAP}):\n    ${sample(apiV1RequestUrls)}`,
+        `  ALL requests (last ${URL_SAMPLE_CAP}):\n    ${sample(allRequestUrls)}`,
+        `  underlying: ${String(err)}`,
+      ].join('\n'),
     );
   }
 
