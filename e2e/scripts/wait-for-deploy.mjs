@@ -67,23 +67,60 @@ function deriveApiBase(spaUrl) {
   }
 }
 
-// Return the most recent commit at-or-before `headSha` that touched any
-// BUILD_TRIGGER_PATHS entry. Throws if git is unavailable or no match found.
-function resolveBuildSha(headSha) {
-  const out = execFileSync(
-    'git',
-    ['log', '-1', '--format=%H', headSha, '--', ...BUILD_TRIGGER_PATHS],
-    { encoding: 'utf8' },
-  );
-  const sha = out.trim();
-  if (!sha) {
-    throw new Error(
-      `No commit at-or-before ${headSha} touches any build-trigger path. ` +
-        `Check that BUILD_TRIGGER_PATHS in this script matches ` +
-        `.forgejo/workflows/build-oci-image.yml's on.push.paths.`,
-    );
+function git(args) {
+  return execFileSync('git', args, { encoding: 'utf8' }).trim();
+}
+
+function isShallow() {
+  try {
+    return git(['rev-parse', '--is-shallow-repository']) === 'true';
+  } catch {
+    return false;
   }
-  return sha;
+}
+
+function tryUnshallow() {
+  try {
+    console.log('  clone is shallow; running `git fetch --unshallow origin` ...');
+    execFileSync('git', ['fetch', '--unshallow', 'origin'], { stdio: 'inherit' });
+    return true;
+  } catch (err) {
+    console.warn(`  unshallow attempt failed: ${String(err)}`);
+    return false;
+  }
+}
+
+function buildShaQuery(headSha) {
+  return git(['log', '-1', '--format=%H', headSha, '--', ...BUILD_TRIGGER_PATHS]);
+}
+
+// Return the most recent commit at-or-before `headSha` that touched any
+// BUILD_TRIGGER_PATHS entry. The Forgejo runner's actions/checkout has
+// been observed to honour fetch-depth: 0 inconsistently, so if the first
+// query comes back empty AND the clone is shallow, self-heal via
+// `git fetch --unshallow origin` and retry once before failing.
+function resolveBuildSha(headSha) {
+  let sha = buildShaQuery(headSha);
+  if (sha) return sha;
+
+  if (isShallow() && tryUnshallow()) {
+    sha = buildShaQuery(headSha);
+    if (sha) return sha;
+  }
+
+  const depth = (() => {
+    try {
+      return git(['rev-list', '--count', headSha]);
+    } catch {
+      return '?';
+    }
+  })();
+  throw new Error(
+    `No commit at-or-before ${headSha} touches any build-trigger path ` +
+      `(clone depth=${depth}, shallow=${isShallow()}). Check that ` +
+      `BUILD_TRIGGER_PATHS in this script matches ` +
+      `.forgejo/workflows/build-oci-image.yml's on.push.paths.`,
+  );
 }
 
 const spaBaseURL = pick(process.env.E2E_BASE_URL, 'https://msp.a8n.systems');
