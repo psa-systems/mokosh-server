@@ -13,7 +13,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::service::*;
-use crate::modules::auth::{RequireAuth, RequireManager};
+use crate::modules::auth::{RequireManager, RequireReports};
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -42,14 +42,14 @@ struct DateRange {
 
 async fn dashboard(
     State(s): State<ReportsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireReports { user: u, .. }: RequireReports,
 ) -> AppResult<Json<DashboardResponse>> {
     Ok(Json(s.service.dashboard(u.tenant_id).await?))
 }
 
 async fn tickets_report(
     State(s): State<ReportsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireReports { user: u, .. }: RequireReports,
     Query(q): Query<DateRange>,
 ) -> AppResult<Json<TicketsReportResponse>> {
     Ok(Json(s.service.tickets(u.tenant_id, q.from, q.to).await?))
@@ -57,7 +57,7 @@ async fn tickets_report(
 
 async fn time_report(
     State(s): State<ReportsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireReports { user: u, .. }: RequireReports,
     Query(q): Query<DateRange>,
 ) -> AppResult<Json<TimeReportResponse>> {
     Ok(Json(s.service.time(u.tenant_id, q.from, q.to).await?))
@@ -70,7 +70,7 @@ struct BillingQ {
 
 async fn billing_report(
     State(s): State<ReportsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireReports { user: u, .. }: RequireReports,
     _m: RequireManager,
     Query(q): Query<BillingQ>,
 ) -> AppResult<Json<BillingReportResponse>> {
@@ -97,7 +97,7 @@ fn default_csv() -> String {
 /// coming.
 async fn export_report(
     State(s): State<ReportsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireReports { user: u, .. }: RequireReports,
     Path(report): Path<String>,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Response> {

@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::ProjectsService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireProjects};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -69,7 +69,7 @@ pub fn projects_routes(service: ProjectsService) -> Router {
 
 async fn list_projects(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Query(f): Query<ProjectFilter>,
     Query(p): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProjectResponse>>> {
@@ -80,7 +80,7 @@ async fn list_projects(
 
 async fn create_project(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Json(req): Json<CreateProjectRequest>,
 ) -> AppResult<Json<ProjectResponse>> {
     req.validate()?;
@@ -89,7 +89,7 @@ async fn create_project(
 
 async fn get_project(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ProjectResponse>> {
     Ok(Json(s.service.get_project(u.tenant_id, id).await?))
@@ -97,7 +97,7 @@ async fn get_project(
 
 async fn update_project(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateProjectRequest>,
 ) -> AppResult<Json<ProjectResponse>> {
@@ -107,7 +107,7 @@ async fn update_project(
 
 async fn delete_project(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -116,7 +116,7 @@ async fn delete_project(
 
 async fn list_project_phases(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProjectPhaseResponse>>> {
@@ -133,7 +133,7 @@ async fn list_project_phases(
 
 async fn create_project_phase(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertProjectPhaseRequest>,
 ) -> AppResult<Json<ProjectPhaseResponse>> {
@@ -147,7 +147,7 @@ async fn create_project_phase(
 
 async fn update_project_phase(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(phase_id): Path<Uuid>,
     Json(req): Json<UpsertProjectPhaseRequest>,
 ) -> AppResult<Json<ProjectPhaseResponse>> {
@@ -161,7 +161,7 @@ async fn update_project_phase(
 
 async fn delete_project_phase(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(phase_id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_project_phase(u.tenant_id, phase_id).await
@@ -169,7 +169,7 @@ async fn delete_project_phase(
 
 async fn list_task_statuses(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TaskStatusResponse>>> {
     let (items, total) = s
@@ -185,7 +185,7 @@ async fn list_task_statuses(
 
 async fn create_task_status(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     _a: RequireAdmin,
     Json(req): Json<UpsertTaskStatusRequest>,
 ) -> AppResult<Json<TaskStatusResponse>> {
@@ -195,7 +195,7 @@ async fn create_task_status(
 
 async fn update_task_status(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertTaskStatusRequest>,
@@ -208,7 +208,7 @@ async fn update_task_status(
 
 async fn delete_task_status(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -217,7 +217,7 @@ async fn delete_task_status(
 
 async fn list_project_tasks(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TaskResponse>>> {
@@ -234,7 +234,7 @@ async fn list_project_tasks(
 
 async fn create_task(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateTaskRequest>,
 ) -> AppResult<Json<TaskResponse>> {
@@ -244,7 +244,7 @@ async fn create_task(
 
 async fn get_task(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TaskResponse>> {
     Ok(Json(s.service.get_task(u.tenant_id, id).await?))
@@ -252,7 +252,7 @@ async fn get_task(
 
 async fn update_task(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> AppResult<Json<TaskResponse>> {
@@ -262,7 +262,7 @@ async fn update_task(
 
 async fn delete_task(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_task(u.tenant_id, id).await
@@ -270,7 +270,7 @@ async fn delete_task(
 
 async fn add_dep(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path((id, other)): Path<(Uuid, Uuid)>,
 ) -> AppResult<()> {
     s.service.add_task_dependency(u.tenant_id, id, other).await
@@ -278,7 +278,7 @@ async fn add_dep(
 
 async fn remove_dep(
     State(s): State<ProjectsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireProjects { user: u, .. }: RequireProjects,
     Path((id, other)): Path<(Uuid, Uuid)>,
 ) -> AppResult<()> {
     s.service

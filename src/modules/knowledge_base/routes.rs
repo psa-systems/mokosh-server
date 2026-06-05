@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::KbService;
-use crate::modules::auth::{RequireAuth, RequireManager};
+use crate::modules::auth::{RequireKnowledgeBase, RequireManager};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -56,7 +56,7 @@ pub fn kb_routes(service: KbService) -> Router {
 
 async fn list_categories(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbCategoryResponse>>> {
     let (items, total) = s.service.list_categories(u.tenant_id, &pagination).await?;
@@ -69,7 +69,7 @@ async fn list_categories(
 
 async fn create_category(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
     Json(req): Json<UpsertKbCategoryRequest>,
 ) -> AppResult<Json<KbCategoryResponse>> {
@@ -79,7 +79,7 @@ async fn create_category(
 
 async fn update_category(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertKbCategoryRequest>,
@@ -92,7 +92,7 @@ async fn update_category(
 
 async fn delete_category(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -101,7 +101,7 @@ async fn delete_category(
 
 async fn list_articles(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Query(f): Query<KbArticleFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
@@ -119,7 +119,7 @@ async fn list_articles(
 
 async fn create_article(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Json(req): Json<CreateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
@@ -130,7 +130,7 @@ async fn create_article(
 
 async fn get_article(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleResponse>> {
     Ok(Json(s.service.get_article(u.tenant_id, id).await?))
@@ -138,7 +138,7 @@ async fn get_article(
 
 async fn update_article(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
@@ -152,7 +152,7 @@ async fn update_article(
 
 async fn delete_article(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -161,7 +161,7 @@ async fn delete_article(
 
 async fn list_article_versions(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbArticleVersionResponse>>> {
@@ -178,7 +178,7 @@ async fn list_article_versions(
 
 async fn list_portal_articles(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
     let (items, total) = s
@@ -194,7 +194,7 @@ async fn list_portal_articles(
 
 async fn restore_article_version(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path((id, version_number)): Path<(Uuid, i32)>,
 ) -> AppResult<Json<KbArticleResponse>> {
     Ok(Json(
@@ -206,7 +206,7 @@ async fn restore_article_version(
 
 async fn mark_helpful(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
     Ok(Json(s.service.increment_helpful(u.tenant_id, id).await?))
@@ -214,7 +214,7 @@ async fn mark_helpful(
 
 async fn mark_not_helpful(
     State(s): State<KbRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
     Ok(Json(

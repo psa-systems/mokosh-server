@@ -294,6 +294,111 @@ pub type RequireAdmin = RequireRole<AdminRoles>;
 pub type RequireManager = RequireRole<ManagerRoles>;
 pub type RequireFinance = RequireRole<FinanceRoles>;
 
+// PMS-113 AC3: per-tenant module enable/disable runtime gate ----------------
+
+/// Trait carrying the static module name a `RequireModuleEnabled<G>`
+/// gate checks. One unit struct + one trait impl per gated module.
+/// The blanket `FromRequestParts` below does the DB lookup.
+pub trait ModuleGate: Send + Sync + 'static {
+    const NAME: &'static str;
+}
+
+/// Extractor that authenticates the caller AND verifies their tenant
+/// has the named module enabled via `module_config.is_enabled`. When
+/// the module is disabled (or has no row), returns `404 NotFound` so a
+/// probing client can't distinguish a disabled feature from an
+/// unmounted route. PMS-113 AC3.
+///
+/// Use the per-module type aliases below (`RequireBilling`, etc.) so
+/// the module name is compile-time bound to the extractor type, not a
+/// magic string in every handler signature.
+///
+/// **Core modules are NOT gated.** `ticketing`, `contacts`,
+/// `notifications`, and portal authentication keep working regardless
+/// of `module_config.is_enabled`. The gateable taxonomy is
+/// `billing`, `projects`, `calendar`, `contracts`, `assets`,
+/// `knowledge_base`, `rmm_integration`, `reports`, `time_tracking`.
+///
+/// The extractor reads an `Arc<SettingsService>` from the request's
+/// extensions; `create_api_router` adds it via `.layer(Extension(...))`.
+#[derive(Clone, Debug)]
+pub struct RequireModuleEnabled<G: ModuleGate> {
+    pub user: CurrentUser,
+    _gate: std::marker::PhantomData<G>,
+}
+
+impl<G: ModuleGate, S> axum::extract::FromRequestParts<S> for RequireModuleEnabled<G>
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // First require authentication; share the same AuthState path
+        // as RequireAuth so misconfigured handlers fail-closed on auth
+        // before ever touching the gate.
+        let auth_state = parts
+            .extensions
+            .get::<AuthState>()
+            .cloned()
+            .unwrap_or_default();
+        let user = match auth_state.user {
+            Some(u) => u,
+            None => return Err(AppError::Unauthorized),
+        };
+
+        // Read the SettingsService from request extensions. Wired in
+        // via `.layer(Extension(settings_service))` on the API v1
+        // router; if the layer is missing this fails to compile-link
+        // at runtime (which is acceptable - the router setup is one
+        // place, easy to spot).
+        let settings = parts
+            .extensions
+            .get::<std::sync::Arc<crate::modules::settings::SettingsService>>()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "SettingsService extension missing; routing wiring bug".to_string(),
+                )
+            })?;
+
+        let enabled = settings.is_module_enabled(user.tenant_id, G::NAME).await?;
+        if !enabled {
+            return Err(AppError::NotFound(format!("module {}", G::NAME)));
+        }
+        Ok(Self {
+            user,
+            _gate: std::marker::PhantomData,
+        })
+    }
+}
+
+/// Declare a gated module: defines a unit struct, implements
+/// `ModuleGate` on it, and exposes a `RequireFoo` type alias for the
+/// extractor.
+macro_rules! gated_module {
+    ($struct_name:ident, $module_name:expr, $alias:ident) => {
+        pub struct $struct_name;
+        impl ModuleGate for $struct_name {
+            const NAME: &'static str = $module_name;
+        }
+        pub type $alias = RequireModuleEnabled<$struct_name>;
+    };
+}
+
+gated_module!(BillingModule, "billing", RequireBilling);
+gated_module!(ProjectsModule, "projects", RequireProjects);
+gated_module!(CalendarModule, "calendar", RequireCalendar);
+gated_module!(ContractsModule, "contracts", RequireContracts);
+gated_module!(AssetsModule, "assets", RequireAssets);
+gated_module!(KnowledgeBaseModule, "knowledge_base", RequireKnowledgeBase);
+gated_module!(RmmModule, "rmm_integration", RequireRmm);
+gated_module!(ReportsModule, "reports", RequireReports);
+gated_module!(TimeTrackingModule, "time_tracking", RequireTimeTracking);
+
 /// Get the current user's tenant ID from the request
 pub fn get_tenant_id(request: &Request) -> Option<uuid::Uuid> {
     request

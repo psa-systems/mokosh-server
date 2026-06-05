@@ -16,7 +16,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::RmmService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireRmm};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -66,7 +66,7 @@ pub fn rmm_routes(service: RmmService) -> Router {
 
 async fn list_connections(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RmmConnectionResponse>>> {
@@ -80,7 +80,7 @@ async fn list_connections(
 
 async fn create_connection(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Json(req): Json<CreateRmmConnectionRequest>,
 ) -> AppResult<Json<RmmConnectionResponse>> {
@@ -99,7 +99,7 @@ async fn create_connection(
 
 async fn delete_connection(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -108,7 +108,7 @@ async fn delete_connection(
 
 async fn get_connection(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RmmConnectionResponse>> {
@@ -117,7 +117,7 @@ async fn get_connection(
 
 async fn update_connection(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateRmmConnectionRequest>,
@@ -130,7 +130,7 @@ async fn update_connection(
 
 async fn test_connection(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -144,7 +144,7 @@ struct ConnQuery {
 
 async fn list_device_mappings(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     Query(q): Query<ConnQuery>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RmmDeviceMappingResponse>>> {
@@ -161,7 +161,7 @@ async fn list_device_mappings(
 
 async fn create_device_mapping(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Json(req): Json<CreateRmmDeviceMappingRequest>,
 ) -> AppResult<Json<RmmDeviceMappingResponse>> {
@@ -173,7 +173,7 @@ async fn create_device_mapping(
 
 async fn delete_device_mapping(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -182,7 +182,7 @@ async fn delete_device_mapping(
 
 async fn list_alert_rules(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     Query(q): Query<ConnQuery>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RmmAlertRuleResponse>>> {
@@ -199,7 +199,7 @@ async fn list_alert_rules(
 
 async fn create_alert_rule(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Json(req): Json<UpsertRmmAlertRuleRequest>,
 ) -> AppResult<Json<RmmAlertRuleResponse>> {
@@ -209,7 +209,7 @@ async fn create_alert_rule(
 
 async fn delete_alert_rule(
     State(s): State<RmmRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {

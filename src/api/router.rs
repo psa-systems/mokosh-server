@@ -118,7 +118,10 @@ pub fn create_api_router(
     // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
     // do not use the dispatcher; only the worker does.
     let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
-    let settings_service = SettingsService::new(db.clone());
+    // PMS-113 AC2: Arc'd so both `settings_routes` and `tenant_routes`
+    // share the same instance. The tenants-side module-config handlers
+    // delegate to this; one canonical writer for `module_config`.
+    let settings_service = Arc::new(SettingsService::new(db.clone()));
     let audit_service = AuditService::new(db.clone());
 
     // Create auth middleware. The at+jwt verifier (when present) is
@@ -166,7 +169,10 @@ pub fn create_api_router(
         // CRUD endpoints would be a foot-gun. PMS-24.
         ;
     #[cfg(feature = "multi-tenant")]
-    let api_v1 = api_v1.nest("/tenants", tenant_routes(tenant_service));
+    let api_v1 = api_v1.nest(
+        "/tenants",
+        tenant_routes(tenant_service, settings_service.clone()),
+    );
     let api_v1 = api_v1
         // Contact management. The canonical company endpoints live
         // under `/api/v1/contacts/companies/...` (one router for
@@ -214,7 +220,7 @@ pub fn create_api_router(
         // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
         .merge(reports_routes(reports_service))
         // Settings: tenant settings + module configs. PMS-114.
-        .merge(settings_routes(settings_service))
+        .merge(settings_routes(settings_service.clone()))
         // Audit log read. PMS-118.
         .merge(audit_routes(audit_service.clone()))
         // Audit log middleware. PMS-119. Fires per-request after
@@ -230,7 +236,13 @@ pub fn create_api_router(
         .layer(middleware::from_fn_with_state(
             auth_middleware.clone(),
             crate::modules::auth::middleware::auth_middleware,
-        ));
+        ))
+        // PMS-113 AC3: make SettingsService reachable from
+        // `RequireModuleEnabled` extractors via the request's
+        // extensions. The extractor reads
+        // `parts.extensions.get::<Arc<SettingsService>>()` and short-
+        // circuits with 404 when the gated module is disabled.
+        .layer(axum::Extension(settings_service));
 
     // Build portal API routes. Portal identity is the contacts row,
     // so this surface runs its own auth middleware (mounted inside

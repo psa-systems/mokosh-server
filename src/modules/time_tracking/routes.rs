@@ -13,7 +13,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::TimeTrackingService;
-use crate::modules::auth::{RequireAdmin, RequireAuth, RequireManager};
+use crate::modules::auth::{RequireAdmin, RequireManager, RequireTimeTracking};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -80,7 +80,7 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
 
 async fn list_work_types(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<WorkTypeResponse>>> {
     let (items, total) = state
@@ -96,7 +96,7 @@ async fn list_work_types(
 
 async fn create_work_type(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Json(request): Json<UpsertWorkTypeRequest>,
 ) -> AppResult<Json<WorkTypeResponse>> {
@@ -111,7 +111,7 @@ async fn create_work_type(
 
 async fn update_work_type(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
     Json(request): Json<UpsertWorkTypeRequest>,
@@ -127,7 +127,7 @@ async fn update_work_type(
 
 async fn delete_work_type(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -140,7 +140,7 @@ async fn delete_work_type(
 
 async fn list_time_entries(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Query(filter): Query<TimeEntryFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimeEntryResponse>>> {
@@ -158,7 +158,7 @@ async fn list_time_entries(
 
 async fn create_time_entry(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Json(mut request): Json<CreateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
     // Non-admins can only log time for themselves.
@@ -176,7 +176,7 @@ async fn create_time_entry(
 
 async fn get_time_entry(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeEntryResponse>> {
     Ok(Json(
@@ -186,7 +186,7 @@ async fn get_time_entry(
 
 async fn update_time_entry(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
@@ -201,7 +201,7 @@ async fn update_time_entry(
 
 async fn delete_time_entry(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     state.service.delete_time_entry(user.tenant_id, id).await
@@ -213,7 +213,7 @@ async fn delete_time_entry(
 
 async fn list_timesheets(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Query(filter): Query<TimesheetFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimesheetSummaryResponse>>> {
@@ -231,7 +231,7 @@ async fn list_timesheets(
 
 async fn submit_timesheet(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
 ) -> AppResult<Json<TimesheetSummaryResponse>> {
     if !user.role.is_admin() && user_id != user.id {
@@ -249,7 +249,7 @@ async fn submit_timesheet(
 
 async fn approve_timesheet(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _mgr: RequireManager,
     Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
 ) -> AppResult<Json<TimesheetSummaryResponse>> {
@@ -263,7 +263,7 @@ async fn approve_timesheet(
 
 async fn reject_timesheet(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _mgr: RequireManager,
     Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
     Json(request): Json<RejectTimesheetRequest>,
@@ -294,7 +294,7 @@ struct ActiveTimersQuery {
 
 async fn list_active_timers(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Query(q): Query<ActiveTimersQuery>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ActiveTimerResponse>>> {
@@ -317,7 +317,7 @@ async fn list_active_timers(
 
 async fn start_timer(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Json(request): Json<StartTimerRequest>,
 ) -> AppResult<Json<ActiveTimerResponse>> {
     request.validate()?;
@@ -331,7 +331,7 @@ async fn start_timer(
 
 async fn stop_timer(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeEntryResponse>> {
     Ok(Json(state.service.stop_timer(user.tenant_id, id).await?))
@@ -343,7 +343,7 @@ async fn stop_timer(
 
 async fn list_rounding_rules(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimeRoundingRuleResponse>>> {
     let (items, total) = state
@@ -359,7 +359,7 @@ async fn list_rounding_rules(
 
 async fn create_rounding_rule(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Json(request): Json<UpsertTimeRoundingRuleRequest>,
 ) -> AppResult<Json<TimeRoundingRuleResponse>> {
@@ -374,7 +374,7 @@ async fn create_rounding_rule(
 
 async fn update_rounding_rule(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
     Json(request): Json<UpsertTimeRoundingRuleRequest>,
@@ -390,7 +390,7 @@ async fn update_rounding_rule(
 
 async fn delete_rounding_rule(
     State(state): State<TimeTrackingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {

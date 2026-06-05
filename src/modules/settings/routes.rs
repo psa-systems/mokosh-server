@@ -21,20 +21,32 @@ pub struct SettingsRouterState {
     pub service: Arc<SettingsService>,
 }
 
-pub fn settings_routes(service: SettingsService) -> Router {
-    let state = SettingsRouterState {
-        service: Arc::new(service),
-    };
+pub fn settings_routes(service: Arc<SettingsService>) -> Router {
+    let state = SettingsRouterState { service };
     Router::new()
-        // PMS-115 tenant settings
+        // PMS-115 tenant settings (legacy: list-all + delete-by-id)
         .route("/settings", get(list_settings).put(upsert_setting))
         .route("/settings/{id}", axum::routing::delete(delete_setting))
-        // PMS-116 module configs (parallel path; tenant module endpoint
-        // continues to live at /api/v1/tenants/:tenant_id/modules/:module)
+        // PMS-116 module configs. PMS-113 AC2: the tenants-API
+        // `/api/v1/tenants/:tenant_id/modules/:module` surface
+        // delegates to the same SettingsService instance, so this is
+        // the single canonical write path even though both URL shapes
+        // exist.
         .route("/settings/modules", get(list_module_configs))
         .route(
             "/settings/modules/{module}",
             get(get_module_config).put(upsert_module_config),
+        )
+        // PMS-113 AC1: category- and per-key tenant_settings endpoints.
+        // Placed AFTER /settings/modules so the literal "modules"
+        // segment matches the module routes first and only a non-
+        // "modules" category reaches `get_settings_by_category`.
+        .route("/settings/{category}", get(get_settings_by_category))
+        .route(
+            "/settings/{category}/{key}",
+            get(get_setting)
+                .put(put_setting)
+                .delete(delete_setting_by_key),
         )
         .with_state(state)
 }
@@ -115,4 +127,54 @@ async fn upsert_module_config(
             .upsert_module_config(u.tenant_id, &module, &req)
             .await?,
     ))
+}
+
+// PMS-113 AC1: category + per-key tenant_settings ---------------------------
+
+async fn get_settings_by_category(
+    State(s): State<SettingsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(category): Path<String>,
+) -> AppResult<Json<Vec<TenantSettingResponse>>> {
+    Ok(Json(
+        s.service
+            .list_settings_by_category(u.tenant_id, &category)
+            .await?,
+    ))
+}
+
+async fn get_setting(
+    State(s): State<SettingsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path((category, key)): Path<(String, String)>,
+) -> AppResult<Json<TenantSettingResponse>> {
+    Ok(Json(
+        s.service.get_setting(u.tenant_id, &category, &key).await?,
+    ))
+}
+
+async fn put_setting(
+    State(s): State<SettingsRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path((category, key)): Path<(String, String)>,
+    Json(req): Json<PutSettingValueRequest>,
+) -> AppResult<Json<TenantSettingResponse>> {
+    validate_setting_value(&category, &key, &req.value)?;
+    Ok(Json(
+        s.service
+            .put_setting(u.tenant_id, &category, &key, req.value)
+            .await?,
+    ))
+}
+
+async fn delete_setting_by_key(
+    State(s): State<SettingsRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    Path((category, key)): Path<(String, String)>,
+) -> AppResult<()> {
+    s.service
+        .delete_setting_by_key(u.tenant_id, &category, &key)
+        .await
 }
