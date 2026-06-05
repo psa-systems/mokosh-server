@@ -3,6 +3,7 @@
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -61,6 +62,7 @@ impl ContactService {
         &self,
         tenant_id: Uuid,
         request: &CreateCompanyRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Company> {
         let company_id = Uuid::new_v4();
         let address = request.address.clone().unwrap_or_default();
@@ -75,6 +77,10 @@ impl ContactService {
         self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
             .await?;
 
+        // Mutation + audit row in one transaction so a rollback drops
+        // both. CREATE: old = None, after captured by the new row id.
+        // PMS-117.
+        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"
             INSERT INTO companies (
@@ -124,8 +130,29 @@ impl ContactService {
         .bind(&request.tags)
         .bind(&request.notes)
         .bind(request.portal_enabled)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "companies",
+            Some(company_id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_company(tenant_id, company_id).await
     }
@@ -317,6 +344,7 @@ impl ContactService {
         tenant_id: Uuid,
         company_id: Uuid,
         request: &UpdateCompanyRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Company> {
         // Verify company exists
         self.get_company(tenant_id, company_id).await?;
@@ -542,14 +570,53 @@ impl ContactService {
             q = q.bind(portal_enabled);
         }
 
-        q.execute(self.db.pool()).await?;
+        // Mutation + audit row in one transaction: snapshot the row
+        // before and after (Postgres to_jsonb captures exact stored
+        // state) and write the audit entry on the same tx so a rollback
+        // drops both. PMS-117 AC1.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        q.execute(&mut *tx).await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "companies",
+            Some(company_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_company(tenant_id, company_id).await
     }
 
     /// Delete company
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<()> {
+    pub async fn delete_company(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         // Check for related records
         let ticket_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND company_id = $2",
@@ -565,11 +632,35 @@ impl ContactService {
             ));
         }
 
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
         sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(company_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "companies",
+            Some(company_id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -584,6 +675,7 @@ impl ContactService {
         &self,
         tenant_id: Uuid,
         request: &CreateContactRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Contact> {
         // Verify company exists
         self.get_company(tenant_id, request.company_id).await?;
@@ -594,6 +686,10 @@ impl ContactService {
             .clone()
             .unwrap_or_else(|| "UTC".to_string());
 
+        // Mutation + audit row in one transaction so a rollback drops
+        // both. CREATE: old = None, after captured by the new row id.
+        // PMS-117.
+        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"
             INSERT INTO contacts (
@@ -622,7 +718,7 @@ impl ContactService {
         .bind(&request.custom_fields)
         .bind(&request.tags)
         .bind(&request.notes)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // PMS-19: flip the contact's `is_portal_user` flag so the
@@ -636,9 +732,30 @@ impl ContactService {
                 "UPDATE contacts SET is_portal_user = TRUE, updated_at = NOW() WHERE id = $1",
             )
             .bind(contact_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
         }
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "contacts",
+            Some(contact_id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_contact(tenant_id, contact_id).await
     }
@@ -800,8 +917,20 @@ impl ContactService {
         tenant_id: Uuid,
         contact_id: Uuid,
         request: &UpdateContactRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Contact> {
         self.get_contact(tenant_id, contact_id).await?;
+
+        // Mutation + audit row in one transaction: snapshot before and
+        // after, write the audit entry on the same tx. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
 
         // Reject moving the contact to a foreign tenant's company. Same
         // shape as the create-time validate_fk path above.
@@ -945,19 +1074,69 @@ impl ContactService {
             q = q.bind(status.as_str());
         }
 
-        q.execute(self.db.pool()).await?;
+        q.execute(&mut *tx).await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contacts",
+            Some(contact_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_contact(tenant_id, contact_id).await
     }
 
     /// Delete contact
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_contact(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<()> {
+    pub async fn delete_contact(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
         sqlx::query("DELETE FROM contacts WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(contact_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "contacts",
+            Some(contact_id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -972,6 +1151,7 @@ impl ContactService {
         &self,
         tenant_id: Uuid,
         request: &CreateSiteRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Site> {
         self.get_company(tenant_id, request.company_id).await?;
 
@@ -982,6 +1162,11 @@ impl ContactService {
             .clone()
             .unwrap_or_else(|| "UTC".to_string());
 
+        // Mutation + audit row in one transaction so a rollback drops
+        // both. CREATE: old = None, after captured by the new row id.
+        // PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+
         // If this is marked as primary, unmark other sites
         if request.is_primary {
             sqlx::query(
@@ -989,7 +1174,7 @@ impl ContactService {
             )
             .bind(tenant_id)
             .bind(request.company_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
         }
 
@@ -1020,8 +1205,28 @@ impl ContactService {
         .bind(&request.notes)
         .bind(request.latitude)
         .bind(request.longitude)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(site_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "sites",
+            Some(site_id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_site(tenant_id, site_id).await
     }
@@ -1034,10 +1239,21 @@ impl ContactService {
         tenant_id: Uuid,
         site_id: Uuid,
         request: &UpdateSiteRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<Site> {
         // Verify site exists; also gives us the current company_id for
         // the is_primary unmark below.
         let current = self.get_site(tenant_id, site_id).await?;
+
+        // Mutation + audit row in one transaction: snapshot before and
+        // after, write the audit entry on the same tx. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(site_id)
+                .fetch_optional(&mut *tx)
+                .await?;
 
         // If this is being marked primary, demote the other sites under
         // the same company first (mirrors create_site).
@@ -1049,7 +1265,7 @@ impl ContactService {
             .bind(tenant_id)
             .bind(current.company_id)
             .bind(site_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
         }
 
@@ -1140,7 +1356,27 @@ impl ContactService {
             q = q.bind(longitude);
         }
 
-        q.execute(self.db.pool()).await?;
+        q.execute(&mut *tx).await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(site_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "sites",
+            Some(site_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_site(tenant_id, site_id).await
     }
@@ -1207,12 +1443,40 @@ impl ContactService {
 
     /// Delete site
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<()> {
+    pub async fn delete_site(
+        &self,
+        tenant_id: Uuid,
+        site_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(site_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
         sqlx::query("DELETE FROM sites WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(site_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "sites",
+            Some(site_id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
 
         Ok(())
     }

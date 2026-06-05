@@ -86,13 +86,14 @@ async fn list_companies(
 async fn create_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateCompanyRequest>,
 ) -> AppResult<Json<CompanyResponse>> {
     request.validate()?;
 
     let company = state
         .contact_service
-        .create_company(user.tenant_id, &request)
+        .create_company(user.tenant_id, &request, &ctx)
         .await?;
 
     Ok(Json(company.into()))
@@ -121,6 +122,7 @@ async fn get_company(
 async fn update_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(company_id): Path<Uuid>,
     Json(request): Json<UpdateCompanyRequest>,
 ) -> AppResult<Json<CompanyResponse>> {
@@ -128,7 +130,7 @@ async fn update_company(
 
     let company = state
         .contact_service
-        .update_company(user.tenant_id, company_id, &request)
+        .update_company(user.tenant_id, company_id, &request, &ctx)
         .await?;
 
     Ok(Json(company.into()))
@@ -137,11 +139,12 @@ async fn update_company(
 async fn delete_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(company_id): Path<Uuid>,
 ) -> AppResult<()> {
     state
         .contact_service
-        .delete_company(user.tenant_id, company_id)
+        .delete_company(user.tenant_id, company_id, &ctx)
         .await
 }
 
@@ -212,13 +215,14 @@ async fn list_contacts(
 async fn create_contact(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateContactRequest>,
 ) -> AppResult<Json<ContactResponse>> {
     request.validate()?;
 
     let contact = state
         .contact_service
-        .create_contact(user.tenant_id, &request)
+        .create_contact(user.tenant_id, &request, &ctx)
         .await?;
 
     Ok(Json(contact.into()))
@@ -240,6 +244,7 @@ async fn get_contact(
 async fn update_contact(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(contact_id): Path<Uuid>,
     Json(request): Json<UpdateContactRequest>,
 ) -> AppResult<Json<ContactResponse>> {
@@ -247,7 +252,7 @@ async fn update_contact(
 
     let contact = state
         .contact_service
-        .update_contact(user.tenant_id, contact_id, &request)
+        .update_contact(user.tenant_id, contact_id, &request, &ctx)
         .await?;
 
     Ok(Json(contact.into()))
@@ -256,11 +261,12 @@ async fn update_contact(
 async fn delete_contact(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(contact_id): Path<Uuid>,
 ) -> AppResult<()> {
     state
         .contact_service
-        .delete_contact(user.tenant_id, contact_id)
+        .delete_contact(user.tenant_id, contact_id, &ctx)
         .await
 }
 
@@ -271,13 +277,14 @@ async fn delete_contact(
 async fn create_site(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateSiteRequest>,
 ) -> AppResult<Json<SiteResponse>> {
     request.validate()?;
 
     let site = state
         .contact_service
-        .create_site(user.tenant_id, &request)
+        .create_site(user.tenant_id, &request, &ctx)
         .await?;
 
     Ok(Json(site.into()))
@@ -299,6 +306,7 @@ async fn get_site(
 async fn update_site(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(site_id): Path<Uuid>,
     Json(request): Json<UpdateSiteRequest>,
 ) -> AppResult<Json<SiteResponse>> {
@@ -306,7 +314,7 @@ async fn update_site(
 
     let site = state
         .contact_service
-        .update_site(user.tenant_id, site_id, &request)
+        .update_site(user.tenant_id, site_id, &request, &ctx)
         .await?;
 
     Ok(Json(site.into()))
@@ -315,10 +323,11 @@ async fn update_site(
 async fn delete_site(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(site_id): Path<Uuid>,
 ) -> AppResult<()> {
     state
         .contact_service
-        .delete_site(user.tenant_id, site_id)
+        .delete_site(user.tenant_id, site_id, &ctx)
         .await
 }
