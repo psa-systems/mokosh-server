@@ -90,20 +90,42 @@ function tryUnshallow() {
   }
 }
 
+// Forgejo's actions/checkout has been observed to clone with --filter=blob:none
+// or --filter=tree:0 even when fetch-depth: 0 is set, leaving the local clone
+// without the tree objects `git log -- <path>` needs to test path membership.
+// The query then silently returns zero matches even though the commits are
+// present. `git fetch --refetch origin` repopulates the missing objects.
+function tryRefetch() {
+  try {
+    console.log('  refetching objects without filter (`git fetch --refetch origin`) ...');
+    execFileSync('git', ['fetch', '--refetch', 'origin'], { stdio: 'inherit' });
+    return true;
+  } catch (err) {
+    console.warn(`  refetch attempt failed: ${String(err)}`);
+    return false;
+  }
+}
+
 function buildShaQuery(headSha) {
   return git(['log', '-1', '--format=%H', headSha, '--', ...BUILD_TRIGGER_PATHS]);
 }
 
 // Return the most recent commit at-or-before `headSha` that touched any
-// BUILD_TRIGGER_PATHS entry. The Forgejo runner's actions/checkout has
-// been observed to honour fetch-depth: 0 inconsistently, so if the first
-// query comes back empty AND the clone is shallow, self-heal via
-// `git fetch --unshallow origin` and retry once before failing.
+// BUILD_TRIGGER_PATHS entry. The Forgejo runner's actions/checkout has been
+// observed to honour fetch-depth: 0 inconsistently AND to apply object
+// filters that strip the trees `git log -- <path>` needs, so self-heal in
+// two stages: unshallow first if the clone is shallow, then refetch
+// without filter if the path query still finds nothing.
 function resolveBuildSha(headSha) {
   let sha = buildShaQuery(headSha);
   if (sha) return sha;
 
   if (isShallow() && tryUnshallow()) {
+    sha = buildShaQuery(headSha);
+    if (sha) return sha;
+  }
+
+  if (tryRefetch()) {
     sha = buildShaQuery(headSha);
     if (sha) return sha;
   }
@@ -144,8 +166,18 @@ let expectedSha;
 try {
   expectedSha = resolveBuildSha(headSha);
 } catch (err) {
-  console.error(`Could not resolve build-trigger SHA: ${String(err)}`);
-  process.exit(1);
+  // All self-heal attempts failed (probably a runner clone we cannot fix
+  // from inside the job). Falling back to GITHUB_SHA on a doc/test-only
+  // commit re-creates the very problem this gate is meant to avoid -
+  // polling for 10m on a SHA staging never serves. Phase 1 of PMS-140 is
+  // informational, not a merge gate, so skip the gate entirely with a
+  // loud warning and let the suite run against whatever staging is
+  // currently serving.
+  console.warn('============================================================');
+  console.warn(`SKIPPING deploy-sync gate: ${String(err)}`);
+  console.warn('Tests will run against whatever commit staging is currently serving.');
+  console.warn('============================================================');
+  process.exit(0);
 }
 
 if (expectedSha === headSha) {
