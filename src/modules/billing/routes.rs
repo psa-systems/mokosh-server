@@ -77,12 +77,13 @@ async fn create_tax_rate(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTaxRateRequest>,
 ) -> AppResult<Json<TaxRateResponse>> {
     request.validate()?;
     let r = state
         .service
-        .create_tax_rate(user.tenant_id, &request)
+        .create_tax_rate(user.tenant_id, &request, &ctx)
         .await?;
     Ok(Json(r))
 }
@@ -91,13 +92,14 @@ async fn update_tax_rate(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(request): Json<UpsertTaxRateRequest>,
 ) -> AppResult<Json<TaxRateResponse>> {
     request.validate()?;
     let r = state
         .service
-        .update_tax_rate(user.tenant_id, id, &request)
+        .update_tax_rate(user.tenant_id, id, &request, &ctx)
         .await?;
     Ok(Json(r))
 }
@@ -106,9 +108,13 @@ async fn delete_tax_rate(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    state.service.delete_tax_rate(user.tenant_id, id).await?;
+    state
+        .service
+        .delete_tax_rate(user.tenant_id, id, &ctx)
+        .await?;
     Ok(())
 }
 
@@ -150,12 +156,13 @@ async fn upsert_payment_gateway(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertPaymentGatewayConfigRequest>,
 ) -> AppResult<Json<PaymentGatewayConfigResponse>> {
     request.validate()?;
     let g = state
         .service
-        .upsert_payment_gateway(user.tenant_id, &request)
+        .upsert_payment_gateway(user.tenant_id, &request, &ctx)
         .await?;
     Ok(Json(g))
 }
@@ -164,6 +171,7 @@ async fn delete_payment_gateway(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(provider): Path<String>,
 ) -> AppResult<()> {
     let provider = GatewayProvider::from_str(&provider).ok_or_else(|| {
@@ -171,7 +179,7 @@ async fn delete_payment_gateway(
     })?;
     state
         .service
-        .delete_payment_gateway(user.tenant_id, provider)
+        .delete_payment_gateway(user.tenant_id, provider, &ctx)
         .await?;
     Ok(())
 }
@@ -199,12 +207,13 @@ async fn create_payment(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreatePaymentRequest>,
 ) -> AppResult<Json<PaymentResponse>> {
     request.validate()?;
     let p = state
         .service
-        .create_payment(user.tenant_id, &request)
+        .create_payment(user.tenant_id, &request, &ctx)
         .await?;
     Ok(Json(p))
 }
@@ -213,11 +222,12 @@ async fn delete_payment(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(payment_id): Path<Uuid>,
 ) -> AppResult<()> {
     state
         .service
-        .delete_payment(user.tenant_id, payment_id)
+        .delete_payment(user.tenant_id, payment_id, &ctx)
         .await?;
     Ok(())
 }
@@ -226,13 +236,14 @@ async fn update_invoice(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(invoice_id): Path<Uuid>,
     Json(request): Json<UpdateInvoiceRequest>,
 ) -> AppResult<Json<InvoiceResponse>> {
     request.validate()?;
     let inv = state
         .service
-        .update_invoice(user.tenant_id, invoice_id, &request)
+        .update_invoice(user.tenant_id, invoice_id, &request, &ctx)
         .await?;
     Ok(Json(inv))
 }
@@ -241,12 +252,13 @@ async fn create_invoice(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateInvoiceRequest>,
 ) -> AppResult<Json<InvoiceResponse>> {
     request.validate()?;
     let inv = state
         .service
-        .create_invoice(user.tenant_id, &request)
+        .create_invoice(user.tenant_id, &request, &ctx)
         .await?;
     Ok(Json(inv))
 }
@@ -259,12 +271,13 @@ async fn create_invoice_from_time_entries(
     State(state): State<BillingRouterState>,
     RequireAuth(user): RequireAuth,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateInvoiceFromTimeEntriesRequest>,
 ) -> AppResult<Json<InvoiceResponse>> {
     request.validate()?;
     let inv = state
         .service
-        .create_invoice_from_time_entries(user.tenant_id, &request)
+        .create_invoice_from_time_entries(user.tenant_id, &request, &ctx)
         .await?;
     Ok(Json(inv))
 }
