@@ -165,6 +165,87 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     (user_id, email, password)
 }
 
+/// Seed a non-admin user under the default tenant. Returns
+/// `(user_id, email, plaintext_password)`. Caller picks the email +
+/// role so a single test can stand up several distinct seeded users.
+/// Password is uniform across seeds; tests run against an ephemeral DB.
+#[allow(dead_code)]
+pub async fn seed_user(pool: &PgPool, email: &str, role: &str) -> (Uuid, String, String) {
+    let password = "test-password-12345".to_string();
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password(&password).expect("hash seeded user password");
+    let user_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (
+            id, tenant_id, email, password_hash,
+            first_name, last_name, role, status, email_verified_at
+        )
+        VALUES ($1, $2, $3, $4, 'Test', 'User', $5, 'active', NOW())
+        "#,
+    )
+    .bind(user_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(email)
+    .bind(&password_hash)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("insert seeded user");
+
+    (user_id, email.to_string(), password)
+}
+
+/// Seed a fresh tenant + admin so a test can prove tenant isolation.
+/// Returns `(tenant_id, user_id, email, password)`. The tenant uses
+/// the caller-supplied label both as its display name and as the
+/// unique `slug` column.
+#[allow(dead_code)]
+pub async fn seed_tenant_with_admin(
+    pool: &PgPool,
+    tenant_label: &str,
+) -> (Uuid, Uuid, String, String) {
+    let tenant_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO tenants (id, name, slug, status, kind)
+        VALUES ($1, $2, $3, 'active', 'org')
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(tenant_label)
+    .bind(tenant_label)
+    .execute(pool)
+    .await
+    .expect("insert tenant");
+
+    let email = format!("admin-{tenant_label}@example.com");
+    let password = "test-password-12345".to_string();
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant admin password");
+    let user_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (
+            id, tenant_id, email, password_hash,
+            first_name, last_name, role, status, email_verified_at
+        )
+        VALUES ($1, $2, $3, $4, 'Tenant', 'Admin', 'super_admin', 'active', NOW())
+        "#,
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(pool)
+    .await
+    .expect("insert tenant admin");
+
+    (tenant_id, user_id, email, password)
+}
+
 /// Drive `POST /api/v1/auth/login` and return the `access_token` the
 /// caller should attach as `Authorization: Bearer ...` on subsequent
 /// requests. Panics on a non-2xx login because tests that get this far
