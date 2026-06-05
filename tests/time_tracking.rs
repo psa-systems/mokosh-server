@@ -225,4 +225,23 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
         Some("approved"),
         "week reads as approved after the manager approves"
     );
+
+    // PMS-144: approval is the billing gate. The billable entry must flip
+    // from not_billed to ready_to_bill so PMS-33 invoicing can consume it.
+    let entry_id = entry["id"].as_str().expect("entry id");
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("get entry after approve")
+        .json()
+        .await
+        .expect("entry JSON after approve");
+    assert_eq!(
+        after["billing_status"].as_str(),
+        Some("ready_to_bill"),
+        "approving a billable entry must flip billing_status to ready_to_bill"
+    );
 }

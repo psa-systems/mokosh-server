@@ -280,8 +280,10 @@ impl BillingService {
     /// time entries in one transaction.
     ///
     /// Eligible entries are `is_billable = TRUE`, `invoice_id IS NULL`,
-    /// and `billing_status IN ('ready_to_bill', 'not_billed')`,
-    /// tenant-scoped and company-scoped. When `time_entry_ids` is
+    /// and `billing_status = 'ready_to_bill'` (PMS-144: approval is the
+    /// billing gate - timesheet approval flips billable entries from
+    /// `not_billed` to `ready_to_bill`, so pending/rejected time is never
+    /// invoiceable), tenant-scoped and company-scoped. When `time_entry_ids` is
     /// `Some`, the set is further restricted to those ids; `None` sweeps
     /// every eligible entry. The selected rows are `SELECT ... FOR
     /// UPDATE` so a concurrent generate cannot double-bill them.
@@ -322,7 +324,7 @@ impl BillingService {
               AND company_id = $2
               AND is_billable = TRUE
               AND invoice_id IS NULL
-              AND billing_status IN ('ready_to_bill', 'not_billed')
+              AND billing_status = 'ready_to_bill'
               AND ($3::uuid[] IS NULL OR id = ANY($3))
             ORDER BY date, created_at
             FOR UPDATE

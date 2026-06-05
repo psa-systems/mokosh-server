@@ -146,6 +146,30 @@ async fn generate_invoice_from_time_entries(pool: PgPool) {
     .await
     .expect("seed ignored non-billable entry");
 
+    // PMS-144: a BILLABLE but unapproved entry (billing_status='not_billed')
+    // must NOT be swept in - billing now consumes only 'ready_to_bill', which
+    // timesheet approval produces. This is the approval gate's negative control.
+    let unapproved_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO time_entries (
+            id, tenant_id, user_id, date, duration_minutes, work_type_id,
+            company_id, is_billable, billing_status, invoice_id,
+            hourly_rate, total_amount
+        )
+        VALUES ($1, $2, $3, CURRENT_DATE, 45, $4, $5,
+                TRUE, 'not_billed', NULL, 120.00, 90.00)
+        "#,
+    )
+    .bind(unapproved_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(admin_id)
+    .bind(work_type_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed billable-but-unapproved entry");
+
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 
@@ -243,6 +267,25 @@ async fn generate_invoice_from_time_entries(pool: PgPool) {
         "non-billable entry stays unbilled"
     );
     assert!(ignored_link.is_none(), "non-billable entry stays unlinked");
+
+    // PMS-144: the billable-but-unapproved entry must also be untouched -
+    // proof the approval gate holds (only ready_to_bill is invoiceable).
+    let unapproved =
+        sqlx::query("SELECT billing_status, invoice_id FROM time_entries WHERE id = $1")
+            .bind(unapproved_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read back unapproved entry");
+    let unapproved_status: String = unapproved.get("billing_status");
+    let unapproved_link: Option<Uuid> = unapproved.get("invoice_id");
+    assert_eq!(
+        unapproved_status, "not_billed",
+        "billable-but-unapproved entry must stay unbilled (approval gate)"
+    );
+    assert!(
+        unapproved_link.is_none(),
+        "billable-but-unapproved entry stays unlinked"
+    );
 }
 
 #[sqlx::test]
