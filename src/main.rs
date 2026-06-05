@@ -218,6 +218,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rmm_worker = mokosh_server::modules::rmm::RmmSyncWorker::new(db.clone(), encryption_key);
     tokio::spawn(rmm_worker.run_forever(std::time::Duration::from_secs(60)));
 
+    // Contract lifecycle worker (PMS-64). Sweeps `active` contracts past
+    // their `end_date` and renews (auto_renew) or expires them. Contract
+    // end_dates are day-granular, so an hourly tick is ample; running it
+    // on the shared Scheduler gives it the same per-job tracing span and
+    // missed-tick-skip semantics as future renewal/breach jobs.
+    let contract_worker = mokosh_server::modules::contracts::ContractLifecycleWorker::new(
+        mokosh_server::modules::contracts::ContractsService::new(db.clone()),
+    );
+    let mut scheduler = mokosh_server::scheduler::Scheduler::new();
+    scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
+    let _scheduler_handles = scheduler.start();
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,

@@ -1,5 +1,6 @@
 //! Contracts service.
 
+use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -577,6 +578,464 @@ impl ContractsService {
         }
         Ok(())
     }
+
+    // PMS-64 hour consumption -------------------------------------------------
+
+    /// Draw `hours` against a contract's block-hours allotment for the
+    /// period covering `when`, returning how much landed inside the
+    /// included allotment versus overage.
+    ///
+    /// Runs in a single transaction:
+    ///   1. Resolve the contract's `block_hours` `contract_item` to read
+    ///      `included_hours` / `overage_rate`.
+    ///   2. Find (or lazily create) the `contract_hour_balances` row whose
+    ///      `[period_start, period_end]` range contains `when`. The period
+    ///      is derived from the contract's `billing_cycle` and `start_date`
+    ///      (see [`Self::period_for`]); the lazily-created row seeds
+    ///      `hours_included` from the item (plus any prior rollover that a
+    ///      preceding [`Self::roll_to_next_period`] wrote) and
+    ///      `hours_remaining` to match.
+    ///   3. Split the request: the part that fits in `hours_remaining` is
+    ///      `hours_applied` and decrements the balance; the rest is
+    ///      `overage_hours`, billed at `overage_rate`.
+    ///
+    /// All queries are tenant-scoped. `hours` must be non-negative.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contract_id = %contract_id))]
+    pub async fn consume_hours(
+        &self,
+        tenant_id: Uuid,
+        contract_id: Uuid,
+        hours: Decimal,
+        when: DateTime<Utc>,
+    ) -> AppResult<ConsumeOutcome> {
+        if hours < Decimal::ZERO {
+            return Err(AppError::BadRequest(
+                "consume_hours: hours must be non-negative".to_string(),
+            ));
+        }
+
+        let mut tx = self.db.pool().begin().await?;
+
+        // 1. block-hours contract item + the contract's billing cycle / start.
+        let item = sqlx::query_as::<_, BlockItemRow>(
+            r#"SELECT ci.id, ci.included_hours, ci.overage_rate,
+                      ci.rollover_enabled, ci.max_rollover_hours,
+                      c.billing_cycle, c.start_date
+               FROM contract_items ci
+               INNER JOIN contracts c ON c.id = ci.contract_id
+               WHERE ci.tenant_id = $1 AND ci.contract_id = $2
+                 AND ci.item_type = 'block_hours'
+               ORDER BY ci.sort_order
+               LIMIT 1"#,
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("block_hours contract item".to_string()))?;
+
+        let included = item.included_hours.unwrap_or(Decimal::ZERO);
+        let overage_rate = item.overage_rate.unwrap_or(Decimal::ZERO);
+        let billing_cycle = item.billing_cycle.as_deref().unwrap_or("monthly");
+        let when_date = when.date_naive();
+        let (period_start, period_end) =
+            Self::period_for(item.start_date, billing_cycle, when_date);
+
+        // 2. find or create the balance row for this period.
+        let existing = sqlx::query_as::<_, BalanceMutRow>(
+            r#"SELECT id, hours_used, hours_remaining, rollover_hours
+               FROM contract_hour_balances
+               WHERE tenant_id = $1 AND contract_id = $2 AND contract_item_id = $3
+                 AND period_start = $4 AND period_end = $5
+               FOR UPDATE"#,
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .bind(item.id)
+        .bind(period_start)
+        .bind(period_end)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let balance = match existing {
+            Some(b) => b,
+            None => {
+                // Seed a fresh period. `hours_included` is the item's
+                // included hours (rollover from a closed prior period is
+                // applied separately by roll_to_next_period, which seeds
+                // the row up-front; if no such row exists we start clean).
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    r#"INSERT INTO contract_hour_balances
+                       (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
+                        hours_included, hours_used, hours_remaining, rollover_hours)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,0)"#,
+                )
+                .bind(id)
+                .bind(tenant_id)
+                .bind(contract_id)
+                .bind(item.id)
+                .bind(period_start)
+                .bind(period_end)
+                .bind(included)
+                .execute(&mut *tx)
+                .await?;
+                BalanceMutRow {
+                    id,
+                    hours_used: Some(Decimal::ZERO),
+                    hours_remaining: included,
+                    rollover_hours: Some(Decimal::ZERO),
+                }
+            }
+        };
+
+        // 3. split request into applied (against remaining) + overage.
+        let remaining = balance.hours_remaining.max(Decimal::ZERO);
+        let hours_applied = hours.min(remaining);
+        let overage_hours = hours - hours_applied;
+        let overage_amount = overage_hours * overage_rate;
+
+        let used = balance.hours_used.unwrap_or(Decimal::ZERO);
+        sqlx::query(
+            r#"UPDATE contract_hour_balances
+               SET hours_used = $2,
+                   hours_remaining = $3,
+                   updated_at = NOW()
+               WHERE id = $1"#,
+        )
+        .bind(balance.id)
+        .bind(used + hours_applied)
+        .bind(remaining - hours_applied)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(ConsumeOutcome {
+            hours_applied,
+            overage_hours,
+            overage_amount,
+            balance_id: balance.id,
+        })
+    }
+
+    /// Roll the unused hours of the period ending `closing_period_end`
+    /// into the next period's balance row, capped at the item's
+    /// `max_rollover_hours`. No-op (returns `Decimal::ZERO`) when the
+    /// item has `rollover_enabled = false`.
+    ///
+    /// Idempotency: the next-period row is UPSERTed. If it does not exist
+    /// it is created with `hours_included = included + rolled` and the
+    /// matching `hours_remaining`; if it already exists its
+    /// `rollover_hours` / `hours_included` / `hours_remaining` are bumped
+    /// by the rolled amount. Returns the number of hours actually rolled.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contract_id = %contract_id))]
+    pub async fn roll_to_next_period(
+        &self,
+        tenant_id: Uuid,
+        contract_id: Uuid,
+        closing_period_end: NaiveDate,
+    ) -> AppResult<Decimal> {
+        let mut tx = self.db.pool().begin().await?;
+
+        let item = sqlx::query_as::<_, BlockItemRow>(
+            r#"SELECT ci.id, ci.included_hours, ci.overage_rate,
+                      ci.rollover_enabled, ci.max_rollover_hours,
+                      c.billing_cycle, c.start_date
+               FROM contract_items ci
+               INNER JOIN contracts c ON c.id = ci.contract_id
+               WHERE ci.tenant_id = $1 AND ci.contract_id = $2
+                 AND ci.item_type = 'block_hours'
+               ORDER BY ci.sort_order
+               LIMIT 1"#,
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("block_hours contract item".to_string()))?;
+
+        if !item.rollover_enabled.unwrap_or(false) {
+            tx.commit().await?;
+            return Ok(Decimal::ZERO);
+        }
+
+        // Unused hours from the closing period.
+        let closing = sqlx::query_as::<_, BalanceMutRow>(
+            r#"SELECT id, hours_used, hours_remaining, rollover_hours
+               FROM contract_hour_balances
+               WHERE tenant_id = $1 AND contract_id = $2 AND contract_item_id = $3
+                 AND period_end = $4
+               FOR UPDATE"#,
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .bind(item.id)
+        .bind(closing_period_end)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("closing-period balance".to_string()))?;
+
+        let unused = closing.hours_remaining.max(Decimal::ZERO);
+        let cap = item.max_rollover_hours.unwrap_or(unused);
+        let rolled = unused.min(cap);
+        if rolled <= Decimal::ZERO {
+            tx.commit().await?;
+            return Ok(Decimal::ZERO);
+        }
+
+        let included = item.included_hours.unwrap_or(Decimal::ZERO);
+        let billing_cycle = item.billing_cycle.as_deref().unwrap_or("monthly");
+        // Next period starts the day after the closing period ends.
+        let next_start = closing_period_end.succ_opt().unwrap_or(closing_period_end);
+        let (period_start, period_end) =
+            Self::period_for(item.start_date, billing_cycle, next_start);
+
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO contract_hour_balances
+               (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
+                hours_included, hours_used, hours_remaining, rollover_hours)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,$8)
+               ON CONFLICT (tenant_id, contract_id, contract_item_id, period_start, period_end)
+               DO UPDATE SET
+                   hours_included = contract_hour_balances.hours_included + EXCLUDED.rollover_hours,
+                   hours_remaining = contract_hour_balances.hours_remaining + EXCLUDED.rollover_hours,
+                   rollover_hours = contract_hour_balances.rollover_hours + EXCLUDED.rollover_hours,
+                   updated_at = NOW()"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(contract_id)
+        .bind(item.id)
+        .bind(period_start)
+        .bind(period_end)
+        .bind(included + rolled)
+        .bind(rolled)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(rolled)
+    }
+
+    /// Derive the `[period_start, period_end]` inclusive date range that
+    /// contains `when`, anchored on the contract's `start_date` and
+    /// stepped by `billing_cycle`.
+    ///
+    /// Periods are contiguous, non-overlapping windows of the cycle
+    /// length starting at `anchor`:
+    ///   * `monthly`   -> 1-month windows
+    ///   * `quarterly` -> 3-month windows
+    ///   * `annually`  -> 12-month windows
+    ///   * `one_time` (and any unknown value) -> a single open window
+    ///     starting at `anchor` and ending far in the future, so a
+    ///     one-shot block draws from one balance row forever.
+    ///
+    /// `period_end` is the last day of the window (the day before the
+    /// next window's start), matching the DATE columns' inclusive
+    /// `period_start`/`period_end` semantics.
+    fn period_for(
+        anchor: NaiveDate,
+        billing_cycle: &str,
+        when: NaiveDate,
+    ) -> (NaiveDate, NaiveDate) {
+        let step_months: u32 = match billing_cycle {
+            "monthly" => 1,
+            "quarterly" => 3,
+            "annually" => 12,
+            // one_time / unknown: a single window from the anchor.
+            _ => {
+                let end = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap_or(anchor);
+                return (anchor, end);
+            }
+        };
+
+        // Walk windows forward from the anchor until one contains `when`.
+        // `when` before the anchor falls back to the first window so the
+        // caller still gets a deterministic, anchored range.
+        let mut start = anchor;
+        loop {
+            let next = start
+                .checked_add_months(Months::new(step_months))
+                .unwrap_or(start);
+            if next <= start {
+                // Overflow guard: stop walking, treat as open window.
+                let end = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap_or(start);
+                return (start, end);
+            }
+            if when < next {
+                let end = next.pred_opt().unwrap_or(next);
+                return (start, end);
+            }
+            start = next;
+        }
+    }
+
+    // PMS-64 rate resolution --------------------------------------------------
+
+    /// Resolve the effective hourly rate for a `work_type` on a rate card.
+    ///
+    /// Precedence: `emergency` wins, then `after_hours`, else the base
+    /// `hourly_rate`. When the chosen tier is NULL the method falls back
+    /// to `hourly_rate` (the only non-null column), so an
+    /// `after_hours`/`emergency` request still returns a usable rate.
+    /// Tenant-scoped through the parent `rate_cards` row.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, rate_card_id = %rate_card_id))]
+    pub async fn resolve_rate(
+        &self,
+        tenant_id: Uuid,
+        rate_card_id: Uuid,
+        work_type_id: Uuid,
+        after_hours: bool,
+        emergency: bool,
+    ) -> AppResult<Decimal> {
+        let row = sqlx::query_as::<_, RateTierRow>(
+            r#"SELECT rci.hourly_rate, rci.after_hours_rate, rci.emergency_rate
+               FROM rate_card_items rci
+               INNER JOIN rate_cards rc ON rci.rate_card_id = rc.id
+               WHERE rc.tenant_id = $1 AND rci.rate_card_id = $2 AND rci.work_type_id = $3"#,
+        )
+        .bind(tenant_id)
+        .bind(rate_card_id)
+        .bind(work_type_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("RateCardItem".to_string()))?;
+
+        let rate = if emergency {
+            row.emergency_rate.unwrap_or(row.hourly_rate)
+        } else if after_hours {
+            row.after_hours_rate.unwrap_or(row.hourly_rate)
+        } else {
+            row.hourly_rate
+        };
+        Ok(rate)
+    }
+
+    // PMS-64 lifecycle --------------------------------------------------------
+
+    /// Transition `active` contracts whose `end_date` has passed as of
+    /// `now`:
+    ///   * `auto_renew = true` with a non-empty `renewal_terms` (or a
+    ///     derivable term) -> status stays `active` conceptually but is
+    ///     stamped `renewed` for the closing term, and `start_date` /
+    ///     `end_date` are advanced by the renewal length. The renewal
+    ///     length is taken from `renewal_terms->>'term_months'` when
+    ///     present, else the span of the current term (end - start).
+    ///   * otherwise -> status set to `expired`.
+    ///
+    /// Returns `(renewed_count, expired_count)`. Tenant-scoped is not
+    /// applied here: lifecycle sweeps run across all tenants (the worker
+    /// owns the cadence), matching the notifications dispatcher's
+    /// cross-tenant drain. Pass a specific `now` for deterministic tests.
+    #[tracing::instrument(skip_all)]
+    pub async fn expire_due_contracts(&self, now: DateTime<Utc>) -> AppResult<(u64, u64)> {
+        let today = now.date_naive();
+        let mut tx = self.db.pool().begin().await?;
+
+        let due = sqlx::query_as::<_, DueContractRow>(
+            r#"SELECT id, start_date, end_date, auto_renew, renewal_terms
+               FROM contracts
+               WHERE status = 'active'
+                 AND end_date IS NOT NULL
+                 AND end_date < $1
+               FOR UPDATE"#,
+        )
+        .bind(today)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut renewed = 0u64;
+        let mut expired = 0u64;
+        for c in due {
+            let end_date = match c.end_date {
+                Some(d) => d,
+                None => continue,
+            };
+            if c.auto_renew.unwrap_or(false) {
+                // Renewal length: explicit term_months override, else the
+                // span of the closing term in whole months (>= 1).
+                let term_months = c
+                    .renewal_terms
+                    .as_ref()
+                    .and_then(|v| v.get("term_months"))
+                    .and_then(|v| v.as_u64())
+                    .map(|m| m as u32)
+                    .unwrap_or_else(|| months_between(c.start_date, end_date).max(1));
+
+                let new_start = end_date.succ_opt().unwrap_or(end_date);
+                let new_end = new_start
+                    .checked_add_months(Months::new(term_months))
+                    .and_then(|d| d.pred_opt())
+                    .unwrap_or(new_start);
+
+                sqlx::query(
+                    r#"UPDATE contracts
+                       SET status = 'renewed',
+                           start_date = $2,
+                           end_date = $3,
+                           updated_at = NOW()
+                       WHERE id = $1"#,
+                )
+                .bind(c.id)
+                .bind(new_start)
+                .bind(new_end)
+                .execute(&mut *tx)
+                .await?;
+                renewed += 1;
+            } else {
+                sqlx::query(
+                    r#"UPDATE contracts
+                       SET status = 'expired', updated_at = NOW()
+                       WHERE id = $1"#,
+                )
+                .bind(c.id)
+                .execute(&mut *tx)
+                .await?;
+                expired += 1;
+            }
+        }
+
+        tx.commit().await?;
+        Ok((renewed, expired))
+    }
+
+    // PMS-33 billing feed -----------------------------------------------------
+
+    /// Return a contract's recurring billing line items (the
+    /// `recurring_service` / `retainer` items that carry a billing
+    /// frequency) for the downstream billing engine (PMS-33) to turn
+    /// into invoice lines. Tenant-scoped.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contract_id = %contract_id))]
+    pub async fn list_recurring_items(
+        &self,
+        tenant_id: Uuid,
+        contract_id: Uuid,
+    ) -> AppResult<Vec<ContractItemResponse>> {
+        let rows = sqlx::query_as::<_, ContractItemRow>(
+            r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
+                      total_price, billing_frequency, work_type_id, included_hours,
+                      overage_rate, rollover_enabled, max_rollover_hours, sort_order
+               FROM contract_items
+               WHERE tenant_id = $1 AND contract_id = $2
+                 AND item_type IN ('recurring_service', 'retainer')
+               ORDER BY sort_order"#,
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+/// Whole-month span between two dates (used to derive a renewal term
+/// length when `renewal_terms` carries no explicit `term_months`).
+fn months_between(start: NaiveDate, end: NaiveDate) -> u32 {
+    let years = end.year() - start.year();
+    let months = end.month() as i32 - start.month() as i32;
+    (years * 12 + months).max(0) as u32
 }
 
 #[derive(sqlx::FromRow)]
@@ -734,4 +1193,46 @@ impl From<RateCardItemRow> for RateCardItemResponse {
             emergency_rate: r.emergency_rate,
         }
     }
+}
+
+/// Block-hours contract item + its parent contract's cycle anchor,
+/// joined for hour-consumption / rollover math.
+#[derive(sqlx::FromRow)]
+struct BlockItemRow {
+    id: Uuid,
+    included_hours: Option<Decimal>,
+    overage_rate: Option<Decimal>,
+    rollover_enabled: Option<bool>,
+    max_rollover_hours: Option<Decimal>,
+    billing_cycle: Option<String>,
+    start_date: chrono::NaiveDate,
+}
+
+/// Minimal mutable view of a `contract_hour_balances` row used when
+/// debiting / rolling hours.
+#[derive(sqlx::FromRow)]
+struct BalanceMutRow {
+    id: Uuid,
+    hours_used: Option<Decimal>,
+    hours_remaining: Decimal,
+    #[allow(dead_code)]
+    rollover_hours: Option<Decimal>,
+}
+
+/// The three rate tiers of a `rate_card_items` row for [`ContractsService::resolve_rate`].
+#[derive(sqlx::FromRow)]
+struct RateTierRow {
+    hourly_rate: Decimal,
+    after_hours_rate: Option<Decimal>,
+    emergency_rate: Option<Decimal>,
+}
+
+/// Contract fields needed by the lifecycle sweep.
+#[derive(sqlx::FromRow)]
+struct DueContractRow {
+    id: Uuid,
+    start_date: chrono::NaiveDate,
+    end_date: Option<chrono::NaiveDate>,
+    auto_renew: Option<bool>,
+    renewal_terms: Option<serde_json::Value>,
 }

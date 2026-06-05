@@ -56,6 +56,11 @@ impl TestApp {
 }
 
 /// Bring up the API against `pool` on a random localhost port.
+///
+/// `#[allow(dead_code)]` because each integration-test binary compiles its
+/// own copy of `common::`; binaries that exercise services directly (e.g.
+/// `tests/contracts.rs`) never boot the HTTP app.
+#[allow(dead_code)]
 pub async fn boot(pool: PgPool) -> TestApp {
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
