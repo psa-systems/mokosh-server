@@ -1,22 +1,40 @@
 ---
 
-# Playwright E2E suite against the deployed staging instance (PMS-140).
+# Playwright E2E suite against the deployed staging instance (PMS-140 phase 1;
+# PMS-141 promotion to merge gate).
 #
-# Runs after every merge to main (push to main). This phase is post-merge and
-# informational - it is NOT a merge gate (that is PMS-141). Before testing, the
-# job waits for staging to actually serve the pushed commit (deploy-sync gate),
-# so it never tests a stale deployment.
+# Triggers:
+#   - push to main: post-merge validation. Runs the deploy-sync gate
+#     (`wait-for-deploy.mjs`) so it asserts staging is actually serving the
+#     pushed commit before the suite runs.
+#   - pull_request targeting main (including release/* PRs): merge gate. PR
+#     SHAs never deploy to staging, so the version gate is replaced with a
+#     `/api/v1/health` reachability check; the suite still runs against
+#     whatever staging is currently serving. The intended semantics is
+#     "staging is healthy and the suite passes against it".
+#   - workflow_dispatch: manual ad-hoc runs (treated like post-merge).
+#
+# To make this a real gate, add `e2e` to the required status checks on the
+# main branch in Forgejo branch protection. PMS-141 sets a stability bar
+# (10 consecutive green post-merge runs) before flipping that switch.
 name: E2E (staging)
 
 on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
-# Back-to-back merges to main must not run two suites against the same shared
-# E2E tenant and single account at once (per-email login rate limit is 5/min,
-# see src/modules/auth/routes.rs). Serialise but do not cancel: every merged
-# commit must be exercised, not just the latest.
+# Back-to-back runs (post-merge + PR + multi-PR) must not collide on the
+# shared E2E tenant and single account (per-email login rate limit is 5/min,
+# see src/modules/auth/routes.rs). Serialise across ALL triggers via a
+# single group; do NOT cancel in progress, so post-merge runs always
+# complete and every PR commit gets exercised once it makes it through the
+# queue. Slow throughput is the trade-off; throughput beats correctness is
+# never the right answer for an auth-rate-limited gate.
 concurrency:
   group: e2e-staging
   cancel-in-progress: false
@@ -76,8 +94,13 @@ jobs:
         # install -y` step here for the missing sonames.
         run: npx playwright install chromium
 
-      - name: Wait for staging to serve this commit
+      - name: Wait for staging to serve this commit (push / dispatch)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: node scripts/wait-for-deploy.mjs
+
+      - name: Verify staging is reachable (pull_request)
+        if: github.event_name == 'pull_request'
+        run: node scripts/health-check.mjs
 
       - name: Run E2E suite
         run: npx playwright test
