@@ -39,6 +39,7 @@ async function fetchGitHash() {
 const deadline = Date.now() + TIMEOUT_MS;
 console.log(`Waiting for ${versionUrl} to report ${expectedSha} (timeout 10m)...`);
 
+let lastSeen = '';
 while (Date.now() < deadline) {
   const result = await fetchGitHash();
   if (result.ok && result.gitHash && expectedSha.startsWith(result.gitHash)) {
@@ -46,7 +47,10 @@ while (Date.now() < deadline) {
     process.exit(0);
   }
   const seen = result.ok ? `git_hash=${result.gitHash || '(empty)'}` : result.detail;
-  console.log(`  not yet (${seen}); retrying in ${INTERVAL_MS / 1000}s`);
+  if (seen !== lastSeen) {
+    console.log(`  not yet (${seen}); polling every ${INTERVAL_MS / 1000}s`);
+    lastSeen = seen;
+  }
   await sleep(INTERVAL_MS);
 }
 

@@ -2,8 +2,11 @@
 //
 // The PSA JSON API lives under /api/v1; the OIDC/SSO surface is mounted at the
 // deployment root (/oauth2/*, /.well-known/openid-configuration) - see
-// crates/mokosh-auth-http/src/router.rs. Request-context tests inherit the SPA
-// session cookie via storageState, so authenticated calls need no extra header.
+// crates/mokosh-auth-http/src/router.rs. The `api` Playwright project picks up
+// a Bearer token from the setup project (see e2e/lib/auth-state.ts) and the
+// custom `test` fixture in e2e/lib/fixtures.ts attaches it as the
+// `Authorization` header on every request, so handlers see the same auth path
+// the SPA uses (`src/modules/auth/middleware.rs:67,121-127`).
 
 import { createHash, randomBytes } from 'node:crypto';
 import type { APIRequestContext } from '@playwright/test';
@@ -21,6 +24,7 @@ export const routes = {
   contact: (id: string) => `${API_V1}/contacts/contacts/${id}`,
   tenants: `${API_V1}/tenants`,
   tenant: (id: string) => `${API_V1}/tenants/${id}`,
+  authLogin: `${API_V1}/auth/login`,
   authMe: `${API_V1}/auth/me`,
   authLogout: `${API_V1}/auth/logout`,
   oidcDiscovery: '/.well-known/openid-configuration',

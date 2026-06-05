@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from '../lib/fixtures';
 import { routes } from '../lib/api';
 import { createCompany } from '../lib/factories';
 import { runSuffix } from '../lib/run';

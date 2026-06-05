@@ -1,4 +1,5 @@
-import { expect, test } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
+import { expect, test } from '../lib/fixtures';
 import { routes } from '../lib/api';
 import { env } from '../lib/env';
 import { createCompany, createContact } from '../lib/factories';
@@ -52,7 +53,9 @@ test.describe('tenants smoke', () => {
 test.describe('cross-tenant isolation', () => {
   test('foreign tenant id is not readable', async ({ request }) => {
     // A well-formed but foreign/non-existent tenant id must never return 200.
-    const foreignTenant = '00000000-0000-0000-0000-000000000000';
+    // Random UUID avoids accidentally hitting a real tenant (a fixed nil UUID
+    // would alias whatever future seed migrations might insert there).
+    const foreignTenant = randomUUID();
     const res = await request.get(routes.tenant(foreignTenant));
     expect([403, 404], `foreign tenant read -> ${res.status()}`).toContain(res.status());
   });

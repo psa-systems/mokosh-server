@@ -33,7 +33,11 @@ export const env = {
     return required('E2E_OIDC_CLIENT_ID');
   },
   get oidcRedirectUri() {
-    return optional('E2E_OIDC_REDIRECT_URI') ?? this.baseURL;
+    // Required: OIDC clients are registered with specific callback paths.
+    // Defaulting to the bare deployment root produced invalid_redirect_uri
+    // either at /oauth2/authorize or at /oauth2/token. Force the operator
+    // to set a registered URI explicitly.
+    return required('E2E_OIDC_REDIRECT_URI');
   },
   foreignCompanyId: optional('E2E_FOREIGN_COMPANY_ID'),
 } as const;

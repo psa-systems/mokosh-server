@@ -14,11 +14,19 @@ gate (that is PMS-141).
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
 
-**Hybrid harness:** `tests/global.setup.ts` logs in through the SPA in a real
-browser and saves the session to `.auth/state.json` (`storageState`). The `api`
-Playwright project reuses that session for request-context API calls. The
-`auth-ui` project logs in fresh on its own so its logout assertion never
-invalidates the shared session.
+**Harness shape.** Two independent auth paths because the mokosh-clients SPA
+keeps its bearer token in WASM memory (`mokosh-clients/src/hooks/fetch.rs`),
+which Playwright's `storageState` cannot replay:
+
+- **`setup` project** (`tests/global.setup.ts`) calls `POST /api/v1/auth/login`
+  directly against the deployment and writes the returned `access_token` to
+  `e2e/.auth/token.txt`. The `api` project (`oidc`, `tickets`, `contacts`)
+  uses a custom `test` fixture (`lib/fixtures.ts`) that injects the token as
+  `Authorization: Bearer ...` on every request. Teardown reads the same file.
+- **`auth-ui` project** (`tests/auth.spec.ts`) drives the SPA login form in a
+  real browser and asserts on URL transitions (login leaves `/login`, logout
+  returns to it). DOM-only, no API probe - the SPA's in-memory token cannot
+  be exfiltrated for an external request context to use.
 
 ## Required configuration
 
@@ -32,7 +40,7 @@ in CI. Required unless noted:
 | `E2E_PASSWORD` | E2E account password |
 | `E2E_TENANT_ID` | UUID of the dedicated E2E tenant |
 | `E2E_OIDC_CLIENT_ID` | public OIDC client id for the token-flow test |
-| `E2E_OIDC_REDIRECT_URI` | redirect_uri registered for that client (default `E2E_BASE_URL`); only the `code` is captured, the URL is never loaded |
+| `E2E_OIDC_REDIRECT_URI` | redirect_uri registered for that client (no default; must match exactly or the OP returns `invalid_redirect_uri`). Only the `code` is captured, the URL is never loaded |
 | `E2E_FOREIGN_COMPANY_ID` | *optional* - a company id in **another** tenant; enables the cross-tenant company canary, otherwise that test is skipped |
 
 ## One-time staging provisioning (manual)

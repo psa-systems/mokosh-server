@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from '../lib/fixtures';
 import { discoverOidc, makePkce, randomToken } from '../lib/api';
 import { env } from '../lib/env';
 
@@ -19,7 +19,9 @@ test.describe('OIDC token flow', () => {
       response_type: 'code',
       client_id: env.oidcClientId,
       redirect_uri: env.oidcRedirectUri,
-      scope: 'openid profile email',
+      // offline_access is required by the OP to mint a refresh_token (the
+      // last leg of this test). See crates/mokosh-auth-oidc/.
+      scope: 'openid profile email offline_access',
       state,
       nonce,
       code_challenge: pkce.challenge,

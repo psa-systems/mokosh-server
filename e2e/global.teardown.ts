@@ -1,6 +1,7 @@
-import { request, type APIRequestContext, type FullConfig } from '@playwright/test';
+import { request, type APIRequestContext } from '@playwright/test';
 import { existsSync } from 'node:fs';
-import { STORAGE_STATE } from './playwright.config';
+import { TOKEN_FILE, readToken } from './lib/auth-state';
+import { env } from './lib/env';
 import { routes } from './lib/api';
 import { isOwnedByThisRun, isStale } from './lib/run';
 
@@ -8,6 +9,10 @@ import { isOwnedByThisRun, isStale } from './lib/run';
 // residue older than 24h left by earlier failed runs. Best-effort by design -
 // a teardown failure must not mask a green/red test result, so every deletion
 // is wrapped and we never throw.
+//
+// Auth: reuses the bearer token the setup project wrote to TOKEN_FILE; the
+// auth middleware reads Bearer only, so cookie-based reuse is not an option
+// (see e2e/lib/auth-state.ts and src/modules/auth/middleware.rs:67).
 //
 // Coverage note: the tickets module exposes no DELETE route
 // (src/modules/tickets/routes.rs), so test-created tickets cannot be hard
@@ -82,13 +87,22 @@ async function sweep(
   return { removed, failed };
 }
 
-export default async function globalTeardown(config: FullConfig): Promise<void> {
-  if (!existsSync(STORAGE_STATE)) {
-    console.warn('[teardown] no storageState; skipping cleanup (login likely failed)');
+export default async function globalTeardown(): Promise<void> {
+  if (!existsSync(TOKEN_FILE)) {
+    console.warn('[teardown] no bearer token on disk; skipping cleanup (setup likely failed)');
     return;
   }
-  const baseURL = config.projects[0]?.use?.baseURL ?? process.env.E2E_BASE_URL;
-  const api = await request.newContext({ baseURL, storageState: STORAGE_STATE });
+  let token: string;
+  try {
+    token = readToken();
+  } catch (err) {
+    console.warn(`[teardown] cannot read token: ${String(err)}`);
+    return;
+  }
+  const api = await request.newContext({
+    baseURL: env.baseURL,
+    extraHTTPHeaders: { Authorization: `Bearer ${token}` },
+  });
   const now = Date.now();
   try {
     // Contacts first: a company with contacts attached may refuse deletion.

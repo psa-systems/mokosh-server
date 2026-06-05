@@ -13,6 +13,14 @@ on:
     branches:
       - main
 
+# Back-to-back merges to main must not run two suites against the same shared
+# E2E tenant and single account at once (per-email login rate limit is 5/min,
+# see src/modules/auth/routes.rs). Serialise but do not cancel: every merged
+# commit must be exercised, not just the latest.
+concurrency:
+  group: e2e-staging
+  cancel-in-progress: false
+
 jobs:
   e2e:
     name: Playwright against staging
@@ -34,8 +42,6 @@ jobs:
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
-        with:
-          fetch-depth: 0
 
       - name: Set up Node.js
         uses: https://code.forgejo.org/actions/setup-node@v4

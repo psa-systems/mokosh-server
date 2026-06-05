@@ -16,8 +16,11 @@ export const STALE_MS = 24 * 60 * 60 * 1000; // 24h
 const RUN_STARTED_AT = Date.now();
 
 // Stable, filesystem/url-safe run id. Prefer the CI run id; fall back to the
-// run-start timestamp for local runs.
+// run-start timestamp for local runs. Forgejo Actions sets GITHUB_* for
+// compat, but GITEA_* is the native name - try it first so the logs read
+// naturally on Forgejo.
 export const RUN_ID = (
+  process.env.GITEA_RUN_ID ??
   process.env.GITHUB_RUN_ID ??
   process.env.E2E_RUN_ID ??
   String(RUN_STARTED_AT)
