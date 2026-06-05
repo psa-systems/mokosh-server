@@ -10,5 +10,11 @@
 -- the need to handle NULL on every read. Postgres 11+ adds a column
 -- with a constant default without rewriting the table; the
 -- `ACCESS EXCLUSIVE` lock is brief (catalog-only).
+--
+-- This migration shipped originally as `027_user_mfa_recovery_codes.sql`
+-- (PMS-4, PR #83) but collided with PMS-106's `027_sla_notify.sql`
+-- which merged first; sqlx rejected the duplicate version on fresh
+-- DBs. Renamed to 029 and `IF NOT EXISTS`-ified so any environment
+-- that already applied the old 027 form re-runs cleanly.
 ALTER TABLE users
-    ADD COLUMN mfa_recovery_codes_hashes TEXT[] NOT NULL DEFAULT '{}';
+    ADD COLUMN IF NOT EXISTS mfa_recovery_codes_hashes TEXT[] NOT NULL DEFAULT '{}';
