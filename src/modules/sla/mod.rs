@@ -1,6 +1,7 @@
 //! SLA module: policies, targets, business hours, holiday calendars,
 //! evaluator.
 
+pub mod clock;
 pub mod models;
 pub mod routes;
 pub mod service;
