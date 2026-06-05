@@ -75,6 +75,14 @@ export const env = {
     // to set a registered URI explicitly.
     return required('E2E_OIDC_REDIRECT_URI');
   },
+  get totpSecret() {
+    // Required: the E2E account is expected to have 2FA on, mirroring the
+    // production account hardening posture. Setup drives the second factor
+    // by generating a TOTP code from this base32 secret (the same string
+    // the user originally pasted into their authenticator app when
+    // enrolling). See e2e/lib/login.ts for the use.
+    return required('E2E_TOTP_SECRET');
+  },
   foreignCompanyId: optional('E2E_FOREIGN_COMPANY_ID'),
 } as const;
 
@@ -90,6 +98,11 @@ const REQUIRED: Array<{ name: string; purpose: string }> = [
   {
     name: 'E2E_OIDC_REDIRECT_URI',
     purpose: 'redirect_uri registered for E2E_OIDC_CLIENT_ID (must match exactly)',
+  },
+  {
+    name: 'E2E_TOTP_SECRET',
+    purpose:
+      'base32 TOTP secret for the E2E account, used to compute the second factor',
   },
 ];
 

@@ -13,6 +13,7 @@
     "@playwright/test": "1.60.0",
     "@types/node": "22.10.2",
     "dotenv": "16.4.7",
+    "otplib": "^12.0.1",
     "typescript": "5.7.2"
   }
 }

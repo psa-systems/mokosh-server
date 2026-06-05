@@ -42,6 +42,7 @@ in CI. Required unless noted:
 | `E2E_TENANT_ID` | UUID of the dedicated E2E tenant |
 | `E2E_OIDC_CLIENT_ID` | public OIDC client id for the token-flow test |
 | `E2E_OIDC_REDIRECT_URI` | redirect_uri registered for that client (no default; must match exactly or the OP returns `invalid_redirect_uri`). Only the `code` is captured, the URL is never loaded |
+| `E2E_TOTP_SECRET` | base32 TOTP secret for the E2E account. Setup generates the second-factor code at runtime; same string you pasted into your authenticator when enrolling 2FA on the account |
 | `E2E_FOREIGN_COMPANY_ID` | *optional* - a company id in **another** tenant; enables the cross-tenant company canary, otherwise that test is skipped |
 
 ## One-time staging provisioning (manual)
@@ -52,6 +53,9 @@ Done once by a human before the suite can pass against a deployment:
    `E2E_TENANT_ID`. All test records live here and are swept after each run.
 2. **E2E account** - create a user in that tenant with permission to manage
    tickets, companies, and contacts. Record `E2E_EMAIL` / `E2E_PASSWORD`.
+   Enable 2FA on the account and save the base32 secret (the string under
+   the QR code at enrollment) as `E2E_TOTP_SECRET` - the setup test
+   computes the second factor at runtime.
 3. **OIDC client** - reuse the staging SPA public client (PKCE) or register a
    dedicated E2E client. Record `E2E_OIDC_CLIENT_ID` and a registered
    `E2E_OIDC_REDIRECT_URI`. If `/oauth2/authorize` redirects the E2E session to
