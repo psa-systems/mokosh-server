@@ -1,0 +1,8 @@
+# Playwright / Node artifacts - never committed.
+node_modules/
+.auth/
+playwright-report/
+blob-report/
+test-results/
+playwright/.cache/
+.env

@@ -220,6 +220,12 @@ fmt:
 test:
     cargo test
 
+# Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
+# pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
+[group: 'test']
+test-e2e *args:
+    cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test {{args}}
+
 # Build release binaries
 [group: 'build']
 build:
