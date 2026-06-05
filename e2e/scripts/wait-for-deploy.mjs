@@ -9,9 +9,9 @@
 // stale deployment.
 //
 // The API lives at a separate host from the SPA on the canonical deploy
-// (`msp.<tld>` -> `msp-api.<tld>`), matching mokosh-clients/src/hooks/fetch.rs.
-// Prefer an explicit E2E_API_BASE_URL; otherwise derive from E2E_BASE_URL;
-// otherwise fall back to the canonical staging API host.
+// (`msp.a8n.systems` SPA -> `api.msp.a8n.systems` API). Prefer an explicit
+// E2E_API_BASE_URL; otherwise prepend `api.` to E2E_BASE_URL; otherwise fall
+// back to the SPA host (which only works for same-origin deployments).
 //
 // When the separate deploy workflow lands, chain this workflow off its
 // completion and drop the polling.
@@ -29,11 +29,8 @@ function pick(...values) {
 function deriveApiBase(spaUrl) {
   try {
     const u = new URL(spaUrl);
-    if (u.hostname.startsWith('msp.')) {
-      const rest = u.hostname.slice('msp.'.length);
-      return `${u.protocol}//msp-api.${rest}`;
-    }
-    return '';
+    if (u.hostname.startsWith('api.')) return '';
+    return `${u.protocol}//api.${u.hostname}`;
   } catch {
     return '';
   }

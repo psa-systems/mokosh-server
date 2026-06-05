@@ -36,7 +36,7 @@ in CI. Required unless noted:
 | Var | Purpose |
 | --- | --- |
 | `E2E_BASE_URL` | SPA host the auth-ui project navigates to (default `https://msp.a8n.systems`) |
-| `E2E_API_BASE_URL` | *optional* - API host for `/api/v1` + `/oauth2` + `/.well-known`. Defaults to deriving `msp-api.<rest>` from `E2E_BASE_URL`. Set when the deployment is not on a canonical `msp.*` host |
+| `E2E_API_BASE_URL` | *optional* - API host for `/api/v1` + `/oauth2` + `/.well-known`. Defaults to prepending `api.` to `E2E_BASE_URL` (e.g. `msp.a8n.systems` -> `api.msp.a8n.systems`). Set when the deployment uses a different naming scheme |
 | `E2E_EMAIL` | dedicated E2E account login |
 | `E2E_PASSWORD` | E2E account password |
 | `E2E_TENANT_ID` | UUID of the dedicated E2E tenant |

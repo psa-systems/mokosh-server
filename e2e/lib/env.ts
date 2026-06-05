@@ -28,17 +28,15 @@ function optional(name: string): string | undefined {
   return value === undefined || value.trim() === '' ? undefined : value.trim();
 }
 
-// Derive the API host from the SPA host the same way the SPA itself does
-// (`mokosh-clients/src/hooks/fetch.rs`): `msp.<rest>` -> `msp-api.<rest>`.
-// Returns null when no derivation applies (a custom hostname or localhost).
+// Derive the API host from the SPA host by prepending `api.`. The canonical
+// staging deploy serves the SPA at `msp.a8n.systems` and the API at
+// `api.msp.a8n.systems`. Returns null when the SPA host is already prefixed
+// or the URL cannot be parsed.
 function deriveApiBase(spaUrl: string): string | null {
   try {
     const u = new URL(spaUrl);
-    if (u.hostname.startsWith('msp.')) {
-      const rest = u.hostname.slice('msp.'.length);
-      return `${u.protocol}//msp-api.${rest}`;
-    }
-    return null;
+    if (u.hostname.startsWith('api.')) return null;
+    return `${u.protocol}//api.${u.hostname}`;
   } catch {
     return null;
   }
@@ -53,9 +51,10 @@ export const env = {
   // project navigates here.
   baseURL: spaBaseURL,
   // Where the JSON API and OIDC endpoints live. The api project, teardown,
-  // and the deploy-sync gate all hit this host. Defaults to the canonical
-  // `msp-api.<tld>` derivation; override with E2E_API_BASE_URL when the
-  // deployment is not on a `msp.*` SPA host.
+  // and the deploy-sync gate all hit this host. Defaults to prepending
+  // `api.` to E2E_BASE_URL (so `msp.a8n.systems` -> `api.msp.a8n.systems`);
+  // override with E2E_API_BASE_URL when the deployment uses a different
+  // naming scheme.
   apiBaseURL,
   get email() {
     return required('E2E_EMAIL');
