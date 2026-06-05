@@ -63,7 +63,11 @@ jobs:
         run: npm ci
 
       - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+        # --with-deps shells out to apt-get, which the OpenSUSE runner does
+        # not have. The runner image carries the X / GTK / NSS libs Chromium
+        # needs already; if a future image trims them down, add a `zypper
+        # install -y` step here for the missing sonames.
+        run: npx playwright install chromium
 
       - name: Wait for staging to serve this commit
         run: node scripts/wait-for-deploy.mjs
