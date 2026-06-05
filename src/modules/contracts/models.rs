@@ -166,3 +166,23 @@ pub struct UpsertRateCardItemRequest {
     pub after_hours_rate: Option<Decimal>,
     pub emergency_rate: Option<Decimal>,
 }
+
+/// Outcome of [`ContractsService::consume_hours`].
+///
+/// `hours_applied` is the portion of the requested hours drawn from the
+/// period's remaining included allotment. `overage_hours` is the
+/// remainder that fell past the included allotment; it is billed at the
+/// contract item's `overage_rate`, giving `overage_amount`. When the
+/// requested hours fit entirely within the allotment `overage_hours` and
+/// `overage_amount` are both zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConsumeOutcome {
+    /// Hours drawn from the included allotment for this period.
+    pub hours_applied: Decimal,
+    /// Hours past the included allotment, billed as overage.
+    pub overage_hours: Decimal,
+    /// `overage_hours * overage_rate` (zero when no overage / no rate).
+    pub overage_amount: Decimal,
+    /// The balance row id that was debited (current period).
+    pub balance_id: Uuid,
+}
