@@ -10,7 +10,7 @@ gate (that is PMS-141).
 | Area | File | How |
 | --- | --- | --- |
 | Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form, logout invalidates the session (**quarantined - `test.fixme`**; flaky against the bunyip hub. Setup's bearer capture is the load-bearing proof that SPA login works end-to-end) |
-| OIDC token flow | `tests/oidc.spec.ts` | request context: `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE) |
+| OIDC token flow | `tests/oidc.spec.ts` | request context: `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE) (**quarantined - `test.fixme`**; bunyip's `/oauth2/authorize` needs an OP session cookie the request context does not carry, so it 302s to the hub login instead of the registered redirect. Mokosh-server's RS path is exercised indirectly by every other api test) |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
 
