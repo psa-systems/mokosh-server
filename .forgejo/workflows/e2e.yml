@@ -49,6 +49,11 @@ jobs:
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          # wait-for-deploy.mjs walks `git log` from GITHUB_SHA back to the
+          # most recent commit that touched a build-trigger path. A shallow
+          # clone would stop at depth 1 and the walk would miss or fail.
+          fetch-depth: 0
 
       - name: Prepare tool cache directory
         # Absolute path; default working-directory (e2e/) is irrelevant.
