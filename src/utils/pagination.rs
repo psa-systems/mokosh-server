@@ -70,7 +70,18 @@ impl PaginationParams {
     }
 
     /// Get SQL ORDER BY clause
+    /// Build an `ORDER BY` body (`"<column> <ASC|DESC>"`) from the request's
+    /// `sort` (validated against `allowed_fields`) or `default_field`.
+    ///
+    /// `default_field` MUST be a bare column name: this appends the direction,
+    /// so `"created_at DESC"` would yield `"created_at DESC DESC"` and a SQL
+    /// syntax error. To keep that footgun non-fatal (it bit four call sites -
+    /// PMS-145) we defensively keep only the first whitespace token.
     pub fn order_by(&self, default_field: &str, allowed_fields: &[&str]) -> String {
+        let default_field = default_field
+            .split_whitespace()
+            .next()
+            .unwrap_or(default_field);
         let field = self
             .sort
             .as_ref()

@@ -175,32 +175,44 @@ impl TimeTrackingService {
     ) -> AppResult<(Vec<TimeEntryResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
-        let mut conditions = vec!["tenant_id = $1".to_string()];
-        let mut idx = 4;
+        // PMS-145: the data and count queries bind a different number of
+        // leading params (data: $1 tenant, $2 limit, $3 offset -> filters
+        // from $4; count: $1 tenant -> filters from $2), so each needs its
+        // OWN placeholder numbering. Sharing one where_clause made the count
+        // query reference an unbound $4 and 500 on any filter. Mirrors
+        // billing::list_invoices.
+        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        let mut count_conds = vec!["tenant_id = $1".to_string()];
+        let mut data_idx = 4;
+        let mut count_idx = 2;
+        let mut push_filter = |col: &str, op: &str| {
+            data_conds.push(format!("{col} {op} ${data_idx}"));
+            count_conds.push(format!("{col} {op} ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        };
         if filter.user_id.is_some() {
-            conditions.push(format!("user_id = ${idx}"));
-            idx += 1;
+            push_filter("user_id", "=");
         }
         if filter.ticket_id.is_some() {
-            conditions.push(format!("ticket_id = ${idx}"));
-            idx += 1;
+            push_filter("ticket_id", "=");
         }
         if filter.project_id.is_some() {
-            conditions.push(format!("project_id = ${idx}"));
-            idx += 1;
+            push_filter("project_id", "=");
         }
         if filter.date_from.is_some() {
-            conditions.push(format!("date >= ${idx}"));
-            idx += 1;
+            push_filter("date", ">=");
         }
         if filter.date_to.is_some() {
-            conditions.push(format!("date <= ${idx}"));
+            push_filter("date", "<=");
         }
-        let where_clause = conditions.join(" AND ");
-        let order_by = pagination.order_by(
-            "date DESC, start_time DESC",
-            &["date", "duration_minutes", "created_at"],
-        );
+        let data_where = data_conds.join(" AND ");
+        let count_where = count_conds.join(" AND ");
+        // order_by appends the sort direction to a single column name, so
+        // default_field must be a bare column - embedding "DESC" here yielded
+        // "ORDER BY date DESC, start_time DESC DESC" and 500'd every list call
+        // (PMS-145). Default direction is already DESC (newest first).
+        let order_by = pagination.order_by("date", &["date", "duration_minutes", "created_at"]);
         let query = format!(
             r#"
             SELECT id, user_id, date, start_time, end_time, duration_minutes,
@@ -208,12 +220,12 @@ impl TimeTrackingService {
                    is_billable, billing_status, hourly_rate, total_amount,
                    approval_status, created_at, updated_at
             FROM time_entries
-            WHERE {where_clause}
+            WHERE {data_where}
             ORDER BY {order_by}
             LIMIT $2 OFFSET $3
             "#
         );
-        let count_query = format!("SELECT COUNT(*) FROM time_entries WHERE {where_clause}");
+        let count_query = format!("SELECT COUNT(*) FROM time_entries WHERE {count_where}");
         let mut q = sqlx::query_as::<_, TimeEntryRow>(&query)
             .bind(tenant_id)
             .bind(limit)

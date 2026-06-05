@@ -169,6 +169,39 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
         "total should be priced from the derived rate"
     );
 
+    // PMS-145: listing time entries filtered by ticket_id must 200 (the
+    // count query previously referenced an unbound placeholder and 500'd on
+    // any filter) and return the entry we just logged.
+    let filtered = app
+        .client
+        .get(app.url(&format!("/api/v1/time-entries?ticket_id={ticket_id}")))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("list time entries by ticket");
+    let filtered_status = filtered.status();
+    let filtered_text = filtered.text().await.expect("filtered list body");
+    assert_eq!(
+        filtered_status,
+        reqwest::StatusCode::OK,
+        "filtered time-entries list should 200, got {filtered_status} body={filtered_text}"
+    );
+    let filtered: serde_json::Value =
+        serde_json::from_str(&filtered_text).expect("filtered list JSON");
+    let entry_id = entry["id"].as_str().expect("entry id");
+    assert!(
+        filtered["data"]
+            .as_array()
+            .expect("filtered list has data")
+            .iter()
+            .any(|e| e["id"].as_str() == Some(entry_id)),
+        "the ticket's time entry should appear in the ticket_id-filtered list"
+    );
+    assert!(
+        filtered["meta"]["total"].as_i64().unwrap_or(0) >= 1,
+        "filtered list total should count the entry"
+    );
+
     // SUBMIT the technician's week (any date in the week anchors to Monday).
     let entry_date = entry["date"].as_str().expect("entry date").to_string();
     let submit: serde_json::Value = app
