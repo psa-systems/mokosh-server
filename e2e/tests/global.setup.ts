@@ -21,11 +21,23 @@ import { loginViaSpa } from '../lib/login';
 // Intercepting the outbound request header is the only path that reuses the
 // real auth flow without registering a new OIDC client or maintaining a
 // parallel signup pipeline.
+
+// Routes the SPA almost certainly hits on landing. Visiting one of these
+// post-login forces the SPA to fire an authenticated `/api/v1` request even
+// if the default landing route does not.
+const POST_LOGIN_PROBES = ['/dashboard', '/tickets'];
+
 setup('capture bearer from the SPA login', async ({ page }) => {
   let token: string | null = null;
+  const seenApiUrls: string[] = [];
   page.on('request', (req) => {
+    const url = req.url();
+    // Trailing slash on purpose: prevents matches against unrelated paths
+    // that merely contain the substring `/api/v1` (e.g. `/api/v1foo` or a
+    // query string carrying the literal text).
+    if (!url.includes('/api/v1/')) return;
+    seenApiUrls.push(url);
     if (token) return;
-    if (!req.url().includes('/api/v1/')) return;
     const auth = req.headers()['authorization'];
     if (auth && auth.toLowerCase().startsWith('bearer ')) {
       token = auth.slice('bearer '.length).trim();
@@ -34,19 +46,35 @@ setup('capture bearer from the SPA login', async ({ page }) => {
 
   await loginViaSpa(page);
 
-  // After the SPA lands on its dashboard it fires an authenticated `/api/v1`
-  // call (typically /auth/me or a list endpoint) to hydrate the UI. Poll
-  // until that request is intercepted. 20s covers a slow staging hydrate
-  // without bumping the global test timeout.
-  await expect
-    .poll(() => token, {
-      timeout: 20_000,
-      message:
-        'SPA login completed but no /api/v1 request carrying `Authorization: Bearer` ' +
-        'fired within 20s. Either the SPA stopped using Bearer auth, or the post-login ' +
-        'route does not hit /api/v1 anymore.',
-    })
-    .not.toBeNull();
+  // Force the SPA to hit a data-loading route so we are not at the mercy of
+  // whichever landing page the post-login redirect happens to use. Either
+  // probe is fine - if one 404s the SPA still fires the auth'd API call
+  // backing its router-level data fetch. Tolerate nav errors; the listener
+  // captures whatever requests fly past, regardless of HTTP status.
+  for (const path of POST_LOGIN_PROBES) {
+    if (token) break;
+    await page.goto(path, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  }
+
+  try {
+    await expect
+      .poll(() => token, {
+        timeout: 30_000,
+        message: 'no /api/v1 request with `Authorization: Bearer` observed after SPA login',
+      })
+      .not.toBeNull();
+  } catch (err) {
+    // Re-throw with the captured URL list - expect.poll only accepts a static
+    // string message, but the URLs we DID see are the load-bearing diagnostic.
+    const observed =
+      seenApiUrls.length === 0 ? '(none)' : seenApiUrls.slice(0, 10).join(', ');
+    throw new Error(
+      `SPA login completed but no /api/v1 request carrying \`Authorization: Bearer\` ` +
+        `fired within 30s. /api/v1 requests observed (no Bearer header): ${observed}. ` +
+        `Either the SPA stopped using Bearer auth, or it hits a different API base ` +
+        `than e2e/lib/env.ts assumes. Underlying: ${String(err)}`,
+    );
+  }
 
   mkdirSync(dirname(TOKEN_FILE), { recursive: true });
   writeFileSync(TOKEN_FILE, token!);
