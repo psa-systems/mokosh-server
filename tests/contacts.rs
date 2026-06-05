@@ -143,6 +143,87 @@ async fn company_crud_happy_path(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-17 AC5: company-update F4-bis pin
+// ============================================================================
+
+/// Sibling of `site_update_persists_changes` for companies. Pins the
+/// PMS-17 expansion: the previous `update_company` only handled name /
+/// company_type / status, silently dropping every other field (industry,
+/// website, phone, address, etc.) on a 200 OK. Cover representative
+/// scalar + nested-object fields and re-GET to prove the writes hit
+/// Postgres.
+#[sqlx::test]
+async fn company_update_persists_all_fields(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Original Name").await;
+
+    let put_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Renamed",
+            "industry": "Healthcare",
+            "website": "https://example.com",
+            "phone": "+1 555 0300",
+            "address": {
+                "line1": "123 Business Ave",
+                "city": "Austin",
+                "state": "TX",
+                "postal_code": "78701",
+                "country": "USA",
+            },
+            "payment_terms": "net15",
+            "tax_exempt": true,
+            "notes": "VIP",
+        }))
+        .send()
+        .await
+        .expect("send update company");
+    assert!(
+        put_resp.status().is_success(),
+        "update company should 2xx, got {}",
+        put_resp.status()
+    );
+    let put_json: serde_json::Value = put_resp.json().await.expect("update JSON");
+    assert_eq!(put_json["name"].as_str(), Some("Renamed"));
+    assert_eq!(put_json["industry"].as_str(), Some("Healthcare"));
+    assert_eq!(put_json["website"].as_str(), Some("https://example.com"));
+    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0300"));
+    assert_eq!(
+        put_json["address"]["line1"].as_str(),
+        Some("123 Business Ave")
+    );
+    assert_eq!(put_json["address"]["city"].as_str(), Some("Austin"));
+    assert_eq!(put_json["address"]["state"].as_str(), Some("TX"));
+
+    // Independent GET - the F4-bis pin.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get company");
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let get_json: serde_json::Value = get_resp.json().await.expect("get JSON");
+    assert_eq!(get_json["name"].as_str(), Some("Renamed"));
+    assert_eq!(get_json["industry"].as_str(), Some("Healthcare"));
+    assert_eq!(get_json["website"].as_str(), Some("https://example.com"));
+    assert_eq!(get_json["phone"].as_str(), Some("+1 555 0300"));
+    assert_eq!(
+        get_json["address"]["line1"].as_str(),
+        Some("123 Business Ave")
+    );
+    assert_eq!(get_json["address"]["city"].as_str(), Some("Austin"));
+    assert_eq!(get_json["address"]["state"].as_str(), Some("TX"));
+    assert_eq!(get_json["address"]["postal_code"].as_str(), Some("78701"));
+}
+
+// ============================================================================
 // PMS-17 AC5: site CRUD + F4 regression pin
 // ============================================================================
 
@@ -228,7 +309,9 @@ async fn site_crud_happy_path(pool: PgPool) {
         .expect("send list company sites");
     assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
     let list: serde_json::Value = list_resp.json().await.expect("list response JSON");
-    let items = list.as_array().expect("sites response is a JSON array");
+    let items = list["data"]
+        .as_array()
+        .expect("sites response has a data array");
     assert_eq!(items.len(), 2, "should see both sites");
     let by_id = |id: &str| {
         items
@@ -260,7 +343,7 @@ async fn site_crud_happy_path(pool: PgPool) {
         .json()
         .await
         .expect("list2 JSON");
-    let items2 = list2.as_array().expect("list2 is array");
+    let items2 = list2["data"].as_array().expect("list2 has data array");
     let by_id2 = |id: &str| {
         items2
             .iter()
@@ -302,7 +385,7 @@ async fn site_crud_happy_path(pool: PgPool) {
         .json()
         .await
         .expect("list3 JSON");
-    let items3 = list3.as_array().expect("list3 is array");
+    let items3 = list3["data"].as_array().expect("list3 has data array");
     assert_eq!(items3.len(), 1, "only B should remain");
     assert_eq!(items3[0]["id"].as_str(), Some(site_b.as_str()));
 }
@@ -373,6 +456,10 @@ async fn contact_crud_happy_path(pool: PgPool) {
 
     // UPDATE - touch two fields and re-GET to verify persistence (same
     // pattern as the site_update test for symmetry).
+    // UPDATE many fields at once. The previous implementation only
+    // wrote first_name / last_name / email; title, department, phone,
+    // mobile, etc. were silently dropped on a 200 OK. Cover the full
+    // surface so a regression to partial-update behavior fails here.
     let put_resp = app
         .client
         .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
@@ -380,6 +467,8 @@ async fn contact_crud_happy_path(pool: PgPool) {
         .json(&serde_json::json!({
             "title": "CTO",
             "department": "Engineering",
+            "phone": "+1 555 0100",
+            "mobile": "+1 555 0200",
         }))
         .send()
         .await
@@ -392,6 +481,8 @@ async fn contact_crud_happy_path(pool: PgPool) {
     let put_json: serde_json::Value = put_resp.json().await.expect("update JSON");
     assert_eq!(put_json["title"].as_str(), Some("CTO"));
     assert_eq!(put_json["department"].as_str(), Some("Engineering"));
+    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0100"));
+    assert_eq!(put_json["mobile"].as_str(), Some("+1 555 0200"));
 
     let reget: serde_json::Value = app
         .client
@@ -405,6 +496,8 @@ async fn contact_crud_happy_path(pool: PgPool) {
         .expect("re-get JSON");
     assert_eq!(reget["title"].as_str(), Some("CTO"));
     assert_eq!(reget["department"].as_str(), Some("Engineering"));
+    assert_eq!(reget["phone"].as_str(), Some("+1 555 0100"));
+    assert_eq!(reget["mobile"].as_str(), Some("+1 555 0200"));
 
     // DELETE then confirm 404.
     let del_resp = app
