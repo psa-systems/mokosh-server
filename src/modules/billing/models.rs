@@ -182,6 +182,27 @@ pub struct CreateInvoiceRequest {
     pub lines: Vec<CreateInvoiceLineRequest>,
 }
 
+/// PMS-33 core: generate an invoice from a company's billable time
+/// entries. When `time_entry_ids` is `None`, every eligible entry for
+/// the company is swept in; when `Some`, only the listed ids (that are
+/// still eligible) are billed.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateInvoiceFromTimeEntriesRequest {
+    pub company_id: Uuid,
+    pub billing_contact_id: Option<Uuid>,
+    pub contract_id: Option<Uuid>,
+    pub invoice_date: Option<NaiveDate>,
+    pub due_date: Option<NaiveDate>,
+    #[validate(length(max = 20))]
+    pub payment_terms: Option<String>,
+    #[validate(length(max = 3))]
+    pub currency: Option<String>,
+    pub notes: Option<String>,
+    pub po_number: Option<String>,
+    /// Restrict to these entries. `None` bills every eligible entry.
+    pub time_entry_ids: Option<Vec<Uuid>>,
+}
+
 /// Header-only update. To replace line items, send `lines = Some(...)`.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateInvoiceRequest {

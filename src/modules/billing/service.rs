@@ -237,6 +237,221 @@ impl BillingService {
         self.get_invoice(tenant_id, invoice_id).await
     }
 
+    /// PMS-33 (core): generate an invoice from a company's billable
+    /// time entries in one transaction.
+    ///
+    /// Eligible entries are `is_billable = TRUE`, `invoice_id IS NULL`,
+    /// and `billing_status IN ('ready_to_bill', 'not_billed')`,
+    /// tenant-scoped and company-scoped. When `time_entry_ids` is
+    /// `Some`, the set is further restricted to those ids; `None` sweeps
+    /// every eligible entry. The selected rows are `SELECT ... FOR
+    /// UPDATE` so a concurrent generate cannot double-bill them.
+    ///
+    /// Each entry becomes one `invoice_line` with `line_type =
+    /// 'time_entry'`, `time_entry_ids = ARRAY[entry.id]`, `quantity =
+    /// duration_minutes / 60`, `unit_price = hourly_rate`, and `total =
+    /// total_amount` (falling back to `quantity * unit_price` when the
+    /// entry has no precomputed amount). Invoice number allocation
+    /// reuses the same gapless `invoice_sequences` row-lock as
+    /// [`create_invoice`]. After the lines are written, the source
+    /// entries are flipped to `billing_status = 'billed'` with their
+    /// `invoice_id` set, inside the SAME transaction.
+    ///
+    /// Tax is left at 0: the existing `create_invoice` does not apply a
+    /// tax rate automatically (callers pass `tax_amount` explicitly), so
+    /// this path mirrors that and leaves tax to a follow-up edit via
+    /// `update_invoice`. Recurring contract-item billing is out of scope
+    /// (depends on the unmerged PMS-64) and is a follow-up.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_invoice_from_time_entries(
+        &self,
+        tenant_id: Uuid,
+        request: &CreateInvoiceFromTimeEntriesRequest,
+    ) -> AppResult<InvoiceResponse> {
+        let mut tx = self.db.pool().begin().await?;
+
+        // 1. Lock the company's eligible billable entries. The `$3::uuid[]
+        //    IS NULL OR id = ANY($3)` guard makes the id filter optional:
+        //    a NULL array bills everything eligible. `FOR UPDATE`
+        //    serialises against a concurrent generate.
+        let entries: Vec<TimeEntryBillingRow> = sqlx::query_as(
+            r#"
+            SELECT id, duration_minutes, hourly_rate, total_amount, ticket_id
+            FROM time_entries
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND is_billable = TRUE
+              AND invoice_id IS NULL
+              AND billing_status IN ('ready_to_bill', 'not_billed')
+              AND ($3::uuid[] IS NULL OR id = ANY($3))
+            ORDER BY date, created_at
+            FOR UPDATE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(request.company_id)
+        .bind(request.time_entry_ids.as_deref())
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if entries.is_empty() {
+            return Err(AppError::BadRequest(
+                "no billable time entries found for this company".to_string(),
+            ));
+        }
+
+        // 2. Allocate a gapless invoice number (same row-lock as
+        //    `create_invoice`). Concurrent creates serialise on this row.
+        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
+            r#"
+            UPDATE invoice_sequences
+            SET last_number = last_number + 1
+            WHERE tenant_id = $1
+            RETURNING last_number, prefix
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (next_number, prefix) = match seq_row {
+            Some(v) => v,
+            None => {
+                sqlx::query(
+                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
+                )
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+                (1, Some("INV-".to_string()))
+            }
+        };
+        let invoice_number = format!(
+            "{}{:06}",
+            prefix.unwrap_or_else(|| "INV-".to_string()),
+            next_number
+        );
+
+        // 3. Build one line per entry, accumulating the subtotal. The
+        //    sixty-minute divisor is a Decimal so quantity keeps its
+        //    fractional hours (e.g. 90 min -> 1.5).
+        let sixty = Decimal::from(60);
+        let mut lines: Vec<(Uuid, String, Decimal, Decimal, Decimal, Option<Uuid>)> =
+            Vec::with_capacity(entries.len());
+        let mut subtotal = Decimal::ZERO;
+        for entry in &entries {
+            let quantity = Decimal::from(entry.duration_minutes) / sixty;
+            let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
+            let total = entry.total_amount.unwrap_or(quantity * unit_price);
+            subtotal += total;
+            let description = format!("Time entry {}", entry.id);
+            lines.push((
+                entry.id,
+                description,
+                quantity,
+                unit_price,
+                total,
+                entry.ticket_id,
+            ));
+        }
+
+        // Tax / discount left at 0 (see method doc); total == subtotal.
+        let tax = Decimal::ZERO;
+        let discount = Decimal::ZERO;
+        let total = subtotal + tax - discount;
+
+        // Default the invoice/due dates when the caller omits them:
+        // invoice today, due in 30 days (matches the `net30` term).
+        let invoice_date = request
+            .invoice_date
+            .unwrap_or_else(|| Utc::now().date_naive());
+        let due_date = request
+            .due_date
+            .unwrap_or_else(|| invoice_date + chrono::Duration::days(30));
+
+        // 4. Insert the invoice header. `balance_due` starts at `total`.
+        let invoice_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO invoices (
+                id, tenant_id, invoice_number, company_id, billing_contact_id,
+                contract_id, status, invoice_date, due_date, payment_terms,
+                subtotal, tax_amount, discount_amount, total, amount_paid,
+                balance_due, currency, notes, po_number
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
+                    $12, $13, 0, $13, $14, $15, $16)
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(&invoice_number)
+        .bind(request.company_id)
+        .bind(request.billing_contact_id)
+        .bind(request.contract_id)
+        .bind(invoice_date)
+        .bind(due_date)
+        .bind(&request.payment_terms)
+        .bind(subtotal)
+        .bind(tax)
+        .bind(discount)
+        .bind(total)
+        .bind(request.currency.as_deref().unwrap_or("USD"))
+        .bind(&request.notes)
+        .bind(&request.po_number)
+        .execute(&mut *tx)
+        .await?;
+
+        // 5. One line per time entry, carrying `time_entry_ids` so the
+        //    line traces back to its source. `sort_order` follows the
+        //    select order.
+        for (idx, (entry_id, description, quantity, unit_price, line_total, ticket_id)) in
+            lines.iter().enumerate()
+        {
+            sqlx::query(
+                r#"
+                INSERT INTO invoice_lines (
+                    id, invoice_id, line_type, description, quantity, unit_price,
+                    total, time_entry_ids, ticket_id, sort_order
+                )
+                VALUES ($1, $2, 'time_entry', $3, $4, $5, $6, ARRAY[$7]::uuid[], $8, $9)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(invoice_id)
+            .bind(description)
+            .bind(quantity)
+            .bind(unit_price)
+            .bind(line_total)
+            .bind(entry_id)
+            .bind(ticket_id)
+            .bind(idx as i32)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 6. Mark the source entries billed and link them to the invoice,
+        //    within the same transaction. Scoped to the locked id set so
+        //    a concurrently-inserted eligible entry is not swept in.
+        let billed_ids: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
+        sqlx::query(
+            r#"
+            UPDATE time_entries
+            SET billing_status = 'billed',
+                invoice_id     = $2,
+                updated_at     = NOW()
+            WHERE tenant_id = $1 AND id = ANY($3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .bind(&billed_ids)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        self.get_invoice(tenant_id, invoice_id).await
+    }
+
     /// PMS-41: list all tax rates for the tenant. Includes inactive
     /// ones so admins can see history; filter client-side as needed.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -899,6 +1114,18 @@ impl BillingService {
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         Ok(resp)
     }
+}
+
+/// Row shape for the billable-time-entry select in
+/// [`BillingService::create_invoice_from_time_entries`]. Only the
+/// columns the invoice line needs are pulled.
+#[derive(sqlx::FromRow)]
+struct TimeEntryBillingRow {
+    id: Uuid,
+    duration_minutes: i32,
+    hourly_rate: Option<Decimal>,
+    total_amount: Option<Decimal>,
+    ticket_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
