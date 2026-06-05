@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -130,6 +131,7 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
         request: &CreateInvoiceRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
         let mut tx = self.db.pool().begin().await?;
 
@@ -233,6 +235,27 @@ impl BillingService {
             .await?;
         }
 
+        // Audit row in the same transaction. CREATE: old = None, after
+        // captured by the new invoice id. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "invoices",
+            Some(invoice_id),
+            None,
+            after,
+        )
+        .await?;
+
         tx.commit().await?;
         self.get_invoice(tenant_id, invoice_id).await
     }
@@ -267,6 +290,7 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
         request: &CreateInvoiceFromTimeEntriesRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
         let mut tx = self.db.pool().begin().await?;
 
@@ -448,6 +472,27 @@ impl BillingService {
         .execute(&mut *tx)
         .await?;
 
+        // Audit row in the same transaction. CREATE: old = None, after
+        // captured by the new invoice id. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "invoices",
+            Some(invoice_id),
+            None,
+            after,
+        )
+        .await?;
+
         tx.commit().await?;
         self.get_invoice(tenant_id, invoice_id).await
     }
@@ -489,6 +534,7 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
         request: &UpsertTaxRateRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaxRateResponse> {
         let mut tx = self.db.pool().begin().await?;
         if request.is_default {
@@ -511,6 +557,27 @@ impl BillingService {
         .bind(request.is_active)
         .fetch_one(&mut *tx)
         .await?;
+
+        // Audit row in the same transaction. CREATE: old = None, after
+        // captured by the new tax-rate id. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "tax_rates",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(TaxRateResponse {
             id,
@@ -528,8 +595,17 @@ impl BillingService {
         tenant_id: Uuid,
         id: Uuid,
         request: &UpsertTaxRateRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaxRateResponse> {
         let mut tx = self.db.pool().begin().await?;
+        // Snapshot before any mutation (including the default-demote). PMS-117.
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         if request.is_default {
             sqlx::query(
                 "UPDATE tax_rates SET is_default = FALSE WHERE tenant_id = $1 AND id <> $2",
@@ -562,6 +638,26 @@ impl BillingService {
         if affected == 0 {
             return Err(AppError::NotFound("TaxRate".to_string()));
         }
+
+        // Audit row in the same transaction. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "tax_rates",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(TaxRateResponse {
             id,
@@ -574,16 +670,43 @@ impl BillingService {
 
     /// PMS-41: delete a tax rate.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_tax_rate(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_tax_rate(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let affected = sqlx::query("DELETE FROM tax_rates WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("TaxRate".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "tax_rates",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -688,10 +811,32 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
         request: &UpsertPaymentGatewayConfigRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<PaymentGatewayConfigResponse> {
         let plaintext = serde_json::to_string(&request.config)
             .map_err(|e| AppError::BadRequest(format!("config must serialise to JSON: {e}")))?;
         let encrypted = crate::utils::crypto::encrypt(&plaintext, &self.encryption_key)?;
+
+        // Mutation + audit row in one transaction. PMS-117. The secret
+        // `config_encrypted` column is subtracted from both snapshots so
+        // the audit trail never stores the encrypted blob. The action is
+        // Update when a row for `(tenant_id, provider)` already existed
+        // (this is an INSERT .. ON CONFLICT upsert), else Create; the
+        // `before` snapshot doubles as the existence check.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(request.provider.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let action = if before.is_some() {
+            AuditAction::Update
+        } else {
+            AuditAction::Create
+        };
 
         let id: Uuid = sqlx::query_scalar(
             r#"
@@ -711,8 +856,29 @@ impl BillingService {
         .bind(request.is_active)
         .bind(request.is_test_mode)
         .bind(&encrypted)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            action,
+            "payment_gateway_configs",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         Ok(PaymentGatewayConfigResponse {
             id,
@@ -729,12 +895,44 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
         provider: GatewayProvider,
+        ctx: &AuditCtx,
     ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before (minus the secret `config_encrypted` blob), old =
+        // before, after = None. PMS-117. The delete keys on `provider`
+        // (the unique `(tenant_id, provider)` pair), so read the row id
+        // for the audit `entity_id`. No-op when absent (no row -> no
+        // audit entry), preserving the original idempotent behaviour.
+        let mut tx = self.db.pool().begin().await?;
+        let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
+            "SELECT id, to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+
         sqlx::query("DELETE FROM payment_gateway_configs WHERE tenant_id = $1 AND provider = $2")
             .bind(tenant_id)
             .bind(provider.as_str())
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+
+        if let Some((id, before)) = row {
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Delete,
+                "payment_gateway_configs",
+                Some(id),
+                Some(before),
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -802,6 +1000,7 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
         request: &CreatePaymentRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<PaymentResponse> {
         let mut tx = self.db.pool().begin().await?;
 
@@ -875,6 +1074,29 @@ impl BillingService {
             .await?;
         }
 
+        // Audit row in the same transaction. CREATE: old = None, after
+        // captured by the new payment id, minus the secret
+        // `gateway_response` blob. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'gateway_response' FROM payments t \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(payment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "payments",
+            Some(payment_id),
+            None,
+            after,
+        )
+        .await?;
+
         tx.commit().await?;
         Ok(PaymentResponse {
             id: payment_id,
@@ -897,7 +1119,12 @@ impl BillingService {
     /// posted to accounting it should be voided through a credit
     /// note instead - which is out of scope for this commit.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_payment(&self, tenant_id: Uuid, payment_id: Uuid) -> AppResult<()> {
+    pub async fn delete_payment(
+        &self,
+        tenant_id: Uuid,
+        payment_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.pool().begin().await?;
 
         let row: Option<(Option<Uuid>, Decimal)> = sqlx::query_as(
@@ -910,6 +1137,17 @@ impl BillingService {
         let Some((invoice_id, amount)) = row else {
             return Err(AppError::NotFound("Payment".to_string()));
         };
+
+        // Snapshot before the delete, minus the secret `gateway_response`
+        // blob, for the audit `old_values`. PMS-117.
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'gateway_response' FROM payments t \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(payment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
 
         sqlx::query("DELETE FROM payments WHERE id = $1")
             .bind(payment_id)
@@ -952,6 +1190,20 @@ impl BillingService {
             }
         }
 
+        // Audit row in the same transaction. DELETE: old = before,
+        // after = None. PMS-117.
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "payments",
+            Some(payment_id),
+            before,
+            None,
+        )
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }
@@ -967,6 +1219,7 @@ impl BillingService {
         tenant_id: Uuid,
         invoice_id: Uuid,
         request: &UpdateInvoiceRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
         let current = self.get_invoice(tenant_id, invoice_id).await?;
         if current.status.is_frozen() {
@@ -977,6 +1230,15 @@ impl BillingService {
         }
 
         let mut tx = self.db.pool().begin().await?;
+
+        // Snapshot before any mutation (line replace + header update). PMS-117.
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
 
         // Replace lines first (if requested) so the recomputed
         // subtotal reflects the new set when we write the header.
@@ -1066,6 +1328,26 @@ impl BillingService {
         .bind(balance_due)
         .bind(sent_at)
         .execute(&mut *tx)
+        .await?;
+
+        // Audit row in the same transaction. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "invoices",
+            Some(invoice_id),
+            before,
+            after,
+        )
         .await?;
 
         tx.commit().await?;
