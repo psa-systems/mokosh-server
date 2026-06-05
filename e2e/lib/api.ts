@@ -24,7 +24,6 @@ export const routes = {
   contact: (id: string) => `${API_V1}/contacts/contacts/${id}`,
   tenants: `${API_V1}/tenants`,
   tenant: (id: string) => `${API_V1}/tenants/${id}`,
-  authLogin: `${API_V1}/auth/login`,
   authMe: `${API_V1}/auth/me`,
   authLogout: `${API_V1}/auth/logout`,
   oidcDiscovery: '/.well-known/openid-configuration',

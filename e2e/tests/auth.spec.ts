@@ -22,15 +22,18 @@ test.describe('auth login / session', () => {
   });
 });
 
-// Click the SPA's logout control. The control must clear the in-memory token
-// and navigate back to /login; if no control is found the SPA is broken and
-// the test fails loudly rather than papering over with a backend logout call.
+// Open the avatar-button user menu in the top bar, then click Logout in the
+// popup. Markup pinned in mokosh-clients/src/components/layout.rs:386 - the
+// button carries `aria-label="User menu"`, the dropdown is `role="menu"`,
+// and Logout is a `button` (not an `<a>`) so the menu does not navigate
+// before the SPA's logout handler can clear local state. The logout handler
+// then redirects to the bunyip hub's /logout which itself ends up on /login;
+// the surrounding test asserts on the final URL.
 async function logout(page: Page): Promise<void> {
-  const control = page
-    .getByRole('button', { name: /log ?out|sign ?out/i })
-    .or(page.getByRole('link', { name: /log ?out|sign ?out/i }))
-    .first();
+  const userMenu = page.getByRole('button', { name: 'User menu' });
+  await userMenu.waitFor({ state: 'visible', timeout: 10_000 });
+  await userMenu.click();
 
-  await control.waitFor({ state: 'visible', timeout: 10_000 });
-  await control.click();
+  const menu = page.getByRole('menu');
+  await menu.getByRole('button', { name: /^logout$/i }).click();
 }

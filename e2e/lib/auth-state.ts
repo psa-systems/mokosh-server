@@ -2,9 +2,14 @@
 // global teardown. We cannot reuse Playwright's `storageState` for auth
 // because the mokosh-clients SPA keeps the access token in WASM memory
 // (`mokosh-clients/src/hooks/fetch.rs:189`), not in cookies or localStorage,
-// so cookie replay does not authenticate the API context. Instead the setup
-// project does a direct `POST /api/v1/auth/login` and writes the
-// `access_token` here for the `api` project and teardown to pick up.
+// so cookie replay does not authenticate the API context. Direct
+// `POST /api/v1/auth/login` is also not an option: the OP advertises only
+// authorization_code + refresh_token grants, and SPA accounts created via
+// the bunyip hub do not exist in mokosh's local `users` table. Instead the
+// setup project drives the SPA login in a real browser and intercepts the
+// first `/api/v1` request's `Authorization: Bearer` header (see
+// e2e/tests/global.setup.ts), writing the captured token here for the
+// `api` project's request fixture and teardown to read.
 
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

@@ -32,16 +32,21 @@ export default defineConfig({
       name: 'preflight',
       testMatch: /preflight\.setup\.ts$/,
     },
-    // 1. Direct `POST /api/v1/auth/login` against the deployment; persists the
-    //    returned access_token to e2e/.auth/token.txt for the api project to
-    //    pick up. No browser - the SPA holds tokens in WASM memory so
-    //    storageState replay cannot authenticate the API context
-    //    (see e2e/lib/auth-state.ts).
+    // 1. Drive the SPA login in a real browser, sniff the first /api/v1
+    //    request, and persist its `Authorization: Bearer` header to
+    //    e2e/.auth/token.txt for the api project to pick up. Why intercept
+    //    rather than POSTing /api/v1/auth/login directly: the OP advertises
+    //    only authorization_code + refresh_token (no client_credentials, no
+    //    password grant), and SPA accounts created via the bunyip hub do
+    //    not exist in mokosh's local `users` table so legacy login 401s.
+    //    Reusing the real SPA flow is the only path that works without
+    //    registering a new OIDC client or maintaining a parallel signup
+    //    pipeline. baseURL targets the SPA host.
     {
       name: 'setup',
       testMatch: /global\.setup\.ts$/,
       dependencies: ['preflight'],
-      use: { baseURL: env.apiBaseURL },
+      use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
     },
     // 2. Browser-driven auth/session coverage. Does not depend on `setup`
     //    (it does its own SPA login so its logout assertion never
