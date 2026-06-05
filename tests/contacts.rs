@@ -1,11 +1,76 @@
-//! Integration test: contacts CRUD happy path.
+//! Integration tests for the contacts route group.
 //!
-//! Covers PMS-124 F10 acceptance for the contacts route group: a logged-in
-//! admin can create a company, list it back, fetch it by id, then delete it.
+//! Covers:
+//! - PMS-124 F10: company CRUD happy path.
+//! - PMS-17 AC5: site CRUD + the F4 regression pin (`update_site` actually
+//!   persists), contact CRUD, the `create_portal_access` flag-flip, and
+//!   the F9 filter-validation regression pin.
 
 mod common;
 
 use sqlx::PgPool;
+
+/// Helper: create a company through the API and return its id.
+///
+/// Every PMS-17 test starts from "I have a company"; this consolidates
+/// the bearer + POST boilerplate so each test body stays on the actual
+/// behaviour under test.
+#[allow(dead_code)]
+async fn create_company(app: &common::TestApp, token: &str, name: &str) -> String {
+    let body = serde_json::json!({ "name": name });
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send create company");
+    assert!(
+        resp.status().is_success(),
+        "create company should 2xx, got {}",
+        resp.status()
+    );
+    let v: serde_json::Value = resp.json().await.expect("create response JSON");
+    v["id"]
+        .as_str()
+        .expect("created company has an id")
+        .to_string()
+}
+
+/// Helper: create a site through the API and return its id.
+#[allow(dead_code)]
+async fn create_site(
+    app: &common::TestApp,
+    token: &str,
+    company_id: &str,
+    name: &str,
+    is_primary: bool,
+) -> String {
+    let body = serde_json::json!({
+        "company_id": company_id,
+        "name": name,
+        "is_primary": is_primary,
+    });
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contacts/sites"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send create site");
+    assert!(
+        resp.status().is_success(),
+        "create site {name} should 2xx, got {}",
+        resp.status()
+    );
+    let v: serde_json::Value = resp.json().await.expect("create site response JSON");
+    v["id"]
+        .as_str()
+        .expect("created site has an id")
+        .to_string()
+}
 
 #[sqlx::test]
 async fn company_crud_happy_path(pool: PgPool) {
@@ -74,5 +139,508 @@ async fn company_crud_happy_path(pool: PgPool) {
         delete_resp.status().is_success(),
         "delete company should 2xx, got {}",
         delete_resp.status()
+    );
+}
+
+// ============================================================================
+// PMS-17 AC5: company-update F4-bis pin
+// ============================================================================
+
+/// Sibling of `site_update_persists_changes` for companies. Pins the
+/// PMS-17 expansion: the previous `update_company` only handled name /
+/// company_type / status, silently dropping every other field (industry,
+/// website, phone, address, etc.) on a 200 OK. Cover representative
+/// scalar + nested-object fields and re-GET to prove the writes hit
+/// Postgres.
+#[sqlx::test]
+async fn company_update_persists_all_fields(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Original Name").await;
+
+    let put_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Renamed",
+            "industry": "Healthcare",
+            "website": "https://example.com",
+            "phone": "+1 555 0300",
+            "address": {
+                "line1": "123 Business Ave",
+                "city": "Austin",
+                "state": "TX",
+                "postal_code": "78701",
+                "country": "USA",
+            },
+            "payment_terms": "net15",
+            "tax_exempt": true,
+            "notes": "VIP",
+        }))
+        .send()
+        .await
+        .expect("send update company");
+    assert!(
+        put_resp.status().is_success(),
+        "update company should 2xx, got {}",
+        put_resp.status()
+    );
+    let put_json: serde_json::Value = put_resp.json().await.expect("update JSON");
+    assert_eq!(put_json["name"].as_str(), Some("Renamed"));
+    assert_eq!(put_json["industry"].as_str(), Some("Healthcare"));
+    assert_eq!(put_json["website"].as_str(), Some("https://example.com"));
+    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0300"));
+    assert_eq!(
+        put_json["address"]["line1"].as_str(),
+        Some("123 Business Ave")
+    );
+    assert_eq!(put_json["address"]["city"].as_str(), Some("Austin"));
+    assert_eq!(put_json["address"]["state"].as_str(), Some("TX"));
+
+    // Independent GET - the F4-bis pin.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get company");
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let get_json: serde_json::Value = get_resp.json().await.expect("get JSON");
+    assert_eq!(get_json["name"].as_str(), Some("Renamed"));
+    assert_eq!(get_json["industry"].as_str(), Some("Healthcare"));
+    assert_eq!(get_json["website"].as_str(), Some("https://example.com"));
+    assert_eq!(get_json["phone"].as_str(), Some("+1 555 0300"));
+    assert_eq!(
+        get_json["address"]["line1"].as_str(),
+        Some("123 Business Ave")
+    );
+    assert_eq!(get_json["address"]["city"].as_str(), Some("Austin"));
+    assert_eq!(get_json["address"]["state"].as_str(), Some("TX"));
+    assert_eq!(get_json["address"]["postal_code"].as_str(), Some("78701"));
+}
+
+// ============================================================================
+// PMS-17 AC5: site CRUD + F4 regression pin
+// ============================================================================
+
+/// Pin the PMS-18 fix for F4. The original defect was that `update_site`
+/// validated the body, then called `get_site` and returned the unmodified
+/// record - a 200 OK that hid a missed write. This test makes the
+/// regression cost a test failure: the PUT response is checked AND an
+/// independent GET re-fetches the row to prove the change actually
+/// landed in Postgres rather than only being reflected in the PUT's
+/// response body.
+#[sqlx::test]
+async fn site_update_persists_changes(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+    let site_id = create_site(&app, &token, &company_id, "Main Office", false).await;
+
+    let update_body = serde_json::json!({
+        "name": "Renamed HQ",
+        "is_primary": true,
+        "phone": "+1 555 0100",
+    });
+    let put_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/sites/{site_id}")))
+        .bearer_auth(&token)
+        .json(&update_body)
+        .send()
+        .await
+        .expect("send update site");
+    assert!(
+        put_resp.status().is_success(),
+        "update site should 2xx, got {}",
+        put_resp.status()
+    );
+    let put_json: serde_json::Value = put_resp.json().await.expect("update response JSON");
+    assert_eq!(put_json["name"].as_str(), Some("Renamed HQ"));
+    assert_eq!(put_json["is_primary"].as_bool(), Some(true));
+    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0100"));
+
+    // Independent GET to prove the write hit the database, not just the
+    // response builder. This is the actual F4 regression pin: a no-op
+    // implementation passes the assertions above (PUT echoes the request)
+    // but fails here.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/sites/{site_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get site");
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let get_json: serde_json::Value = get_resp.json().await.expect("get response JSON");
+    assert_eq!(get_json["name"].as_str(), Some("Renamed HQ"));
+    assert_eq!(get_json["is_primary"].as_bool(), Some(true));
+    assert_eq!(get_json["phone"].as_str(), Some("+1 555 0100"));
+}
+
+/// Site CRUD round-trip: covers create/list/get/update/delete plus the
+/// "demote the previous primary" side-effect on `is_primary` updates
+/// (mokosh-server/src/modules/contacts/service.rs::update_site, the
+/// pre-UPDATE that flips other sites' is_primary to FALSE when a new
+/// primary is set).
+#[sqlx::test]
+async fn site_crud_happy_path(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+    let site_a = create_site(&app, &token, &company_id, "Site A", false).await;
+    let site_b = create_site(&app, &token, &company_id, "Site B", true).await;
+
+    // LIST under the company.
+    let list_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}/sites")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list company sites");
+    assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
+    let list: serde_json::Value = list_resp.json().await.expect("list response JSON");
+    let items = list["data"]
+        .as_array()
+        .expect("sites response has a data array");
+    assert_eq!(items.len(), 2, "should see both sites");
+    let by_id = |id: &str| {
+        items
+            .iter()
+            .find(|s| s["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("site {id} present in list"))
+    };
+    assert_eq!(by_id(&site_a)["is_primary"].as_bool(), Some(false));
+    assert_eq!(by_id(&site_b)["is_primary"].as_bool(), Some(true));
+
+    // Flip A to primary; B should demote.
+    let put_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/sites/{site_a}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_primary": true }))
+        .send()
+        .await
+        .expect("send update site A primary");
+    assert!(put_resp.status().is_success());
+
+    let list2: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}/sites")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list company sites after demote")
+        .json()
+        .await
+        .expect("list2 JSON");
+    let items2 = list2["data"].as_array().expect("list2 has data array");
+    let by_id2 = |id: &str| {
+        items2
+            .iter()
+            .find(|s| s["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("site {id} present in list2"))
+    };
+    assert_eq!(
+        by_id2(&site_a)["is_primary"].as_bool(),
+        Some(true),
+        "A should now be primary"
+    );
+    assert_eq!(
+        by_id2(&site_b)["is_primary"].as_bool(),
+        Some(false),
+        "B should have been demoted when A flipped to primary"
+    );
+
+    // DELETE A.
+    let del_resp = app
+        .client
+        .delete(app.url(&format!("/api/v1/contacts/sites/{site_a}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete site A");
+    assert!(
+        del_resp.status().is_success(),
+        "delete site A should 2xx, got {}",
+        del_resp.status()
+    );
+
+    let list3: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}/sites")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list after delete")
+        .json()
+        .await
+        .expect("list3 JSON");
+    let items3 = list3["data"].as_array().expect("list3 has data array");
+    assert_eq!(items3.len(), 1, "only B should remain");
+    assert_eq!(items3[0]["id"].as_str(), Some(site_b.as_str()));
+}
+
+// ============================================================================
+// PMS-17 AC5: contact CRUD
+// ============================================================================
+
+#[sqlx::test]
+async fn contact_crud_happy_path(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    // CREATE
+    let create_body = serde_json::json!({
+        "company_id": company_id,
+        "first_name": "Bob",
+        "last_name": "Johnson",
+        "email": "bob@acme.example",
+    });
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&create_body)
+        .send()
+        .await
+        .expect("send create contact");
+    assert!(
+        create_resp.status().is_success(),
+        "create contact should 2xx, got {}",
+        create_resp.status()
+    );
+    let created: serde_json::Value = create_resp.json().await.expect("create JSON");
+    let contact_id = created["id"].as_str().expect("contact has id").to_string();
+
+    // LIST contains it.
+    let list_resp = app
+        .client
+        .get(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list contacts");
+    assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
+    let list: serde_json::Value = list_resp.json().await.expect("list JSON");
+    let items = list["data"].as_array().expect("list has data array");
+    assert!(
+        items.iter().any(|c| c["id"].as_str() == Some(&contact_id)),
+        "contact list should contain the new contact"
+    );
+
+    // GET single.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get contact");
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let got: serde_json::Value = get_resp.json().await.expect("get JSON");
+    assert_eq!(got["first_name"].as_str(), Some("Bob"));
+    assert_eq!(got["last_name"].as_str(), Some("Johnson"));
+
+    // UPDATE - touch two fields and re-GET to verify persistence (same
+    // pattern as the site_update test for symmetry).
+    // UPDATE many fields at once. The previous implementation only
+    // wrote first_name / last_name / email; title, department, phone,
+    // mobile, etc. were silently dropped on a 200 OK. Cover the full
+    // surface so a regression to partial-update behavior fails here.
+    let put_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "CTO",
+            "department": "Engineering",
+            "phone": "+1 555 0100",
+            "mobile": "+1 555 0200",
+        }))
+        .send()
+        .await
+        .expect("send update contact");
+    assert!(
+        put_resp.status().is_success(),
+        "update contact should 2xx, got {}",
+        put_resp.status()
+    );
+    let put_json: serde_json::Value = put_resp.json().await.expect("update JSON");
+    assert_eq!(put_json["title"].as_str(), Some("CTO"));
+    assert_eq!(put_json["department"].as_str(), Some("Engineering"));
+    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0100"));
+    assert_eq!(put_json["mobile"].as_str(), Some("+1 555 0200"));
+
+    let reget: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send re-get contact")
+        .json()
+        .await
+        .expect("re-get JSON");
+    assert_eq!(reget["title"].as_str(), Some("CTO"));
+    assert_eq!(reget["department"].as_str(), Some("Engineering"));
+    assert_eq!(reget["phone"].as_str(), Some("+1 555 0100"));
+    assert_eq!(reget["mobile"].as_str(), Some("+1 555 0200"));
+
+    // DELETE then confirm 404.
+    let del_resp = app
+        .client
+        .delete(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete contact");
+    assert!(
+        del_resp.status().is_success(),
+        "delete contact should 2xx, got {}",
+        del_resp.status()
+    );
+
+    let after_get = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send post-delete get");
+    assert_eq!(
+        after_get.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "GET after delete should 404"
+    );
+}
+
+// ============================================================================
+// PMS-17 AC2: create_portal_access flips is_portal_user
+// ============================================================================
+
+/// Pins the PMS-19 behaviour: the create_portal_access flag actually
+/// drives the contact's is_portal_user state. Includes a negative
+/// control (a second contact without the flag) so a future impl that
+/// silently always returns is_portal_user=true does NOT pass.
+#[sqlx::test]
+async fn create_contact_with_portal_access_flips_flag(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    // With the flag.
+    let with_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Portal",
+            "last_name": "User",
+            "email": "portal@acme.example",
+            "create_portal_access": true,
+        }))
+        .send()
+        .await
+        .expect("send create-portal contact");
+    assert!(with_resp.status().is_success());
+    let with_json: serde_json::Value = with_resp.json().await.expect("with JSON");
+    let with_id = with_json["id"].as_str().expect("with id").to_string();
+
+    // Without the flag (negative control).
+    let without_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Plain",
+            "last_name": "Contact",
+            "email": "plain@acme.example",
+        }))
+        .send()
+        .await
+        .expect("send no-portal contact");
+    assert!(without_resp.status().is_success());
+    let without_json: serde_json::Value = without_resp.json().await.expect("without JSON");
+    let without_id = without_json["id"].as_str().expect("without id").to_string();
+
+    // Verify each contact's persisted flag via an independent GET.
+    let with_get: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{with_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send re-get with")
+        .json()
+        .await
+        .expect("with re-get JSON");
+    assert_eq!(
+        with_get["is_portal_user"].as_bool(),
+        Some(true),
+        "create_portal_access=true should set is_portal_user=true"
+    );
+
+    let without_get: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{without_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send re-get without")
+        .json()
+        .await
+        .expect("without re-get JSON");
+    assert_eq!(
+        without_get["is_portal_user"].as_bool(),
+        Some(false),
+        "omitting create_portal_access should leave is_portal_user=false"
+    );
+}
+
+// ============================================================================
+// PMS-17 AC4 (F9 regression pin)
+// ============================================================================
+
+/// Pin the PMS-17 AC4 / F9 fix: CompanyFilter.q has #[validate(length(max
+/// = 200))], the route handler calls filter.validate()?, and an oversize
+/// q should be rejected with a 4xx rather than silently truncated or
+/// ILIKE'd into a slow scan. ContactFilter shares the same code path so
+/// covering one is sufficient.
+#[sqlx::test]
+async fn company_filter_rejects_oversize_q(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let huge = "a".repeat(1000);
+    let resp = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies?q={huge}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send oversize q list");
+    let status = resp.status();
+    assert!(
+        status == reqwest::StatusCode::BAD_REQUEST
+            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "oversize q should be rejected with 400 or 422, got {status}"
     );
 }

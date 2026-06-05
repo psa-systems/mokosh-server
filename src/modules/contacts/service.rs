@@ -358,39 +358,216 @@ impl ContactService {
         self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
             .await?;
 
-        // Build update query dynamically
+        // Build the dynamic UPDATE the same way update_site does. The
+        // previous implementation only handled name / company_type /
+        // status; everything else on UpdateCompanyRequest (industry,
+        // website, phone, address, billing_address, payment_terms,
+        // tax_exempt, custom_fields, tags, notes, portal_enabled) was
+        // silently dropped on a 200 OK. Same family of bug as F4 was
+        // for sites.
         let mut updates = vec!["updated_at = NOW()".to_string()];
         let mut param_idx = 3;
 
         if request.name.is_some() {
-            updates.push(format!("name = ${}", param_idx));
+            updates.push(format!("name = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.parent_company_id.is_some() {
+            updates.push(format!("parent_company_id = ${param_idx}"));
             param_idx += 1;
         }
         if request.company_type.is_some() {
-            updates.push(format!("company_type = ${}", param_idx));
+            updates.push(format!("company_type = ${param_idx}"));
             param_idx += 1;
         }
         if request.status.is_some() {
-            updates.push(format!("status = ${}", param_idx));
+            updates.push(format!("status = ${param_idx}"));
             param_idx += 1;
         }
-        // Add more fields as needed...
+        if request.industry.is_some() {
+            updates.push(format!("industry = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.website.is_some() {
+            updates.push(format!("website = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.phone.is_some() {
+            updates.push(format!("phone = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.fax.is_some() {
+            updates.push(format!("fax = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.address.is_some() {
+            updates.push(format!("address_line1 = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("address_line2 = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("city = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("state = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("postal_code = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("country = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.billing_address.is_some() {
+            updates.push(format!("billing_address_line1 = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("billing_address_line2 = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("billing_city = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("billing_state = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("billing_postal_code = ${param_idx}"));
+            param_idx += 1;
+            updates.push(format!("billing_country = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.tax_id.is_some() {
+            updates.push(format!("tax_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.account_number.is_some() {
+            updates.push(format!("account_number = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.default_billing_contact_id.is_some() {
+            updates.push(format!("default_billing_contact_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.default_technical_contact_id.is_some() {
+            updates.push(format!("default_technical_contact_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.account_manager_id.is_some() {
+            updates.push(format!("account_manager_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.sla_id.is_some() {
+            updates.push(format!("sla_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.default_contract_id.is_some() {
+            updates.push(format!("default_contract_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.payment_terms.is_some() {
+            updates.push(format!("payment_terms = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.tax_exempt.is_some() {
+            updates.push(format!("tax_exempt = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.custom_fields.is_some() {
+            updates.push(format!("custom_fields = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.tags.is_some() {
+            updates.push(format!("tags = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.notes.is_some() {
+            updates.push(format!("notes = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.portal_enabled.is_some() {
+            updates.push(format!("portal_enabled = ${param_idx}"));
+            // param_idx += 1;
+        }
 
         let query = format!(
             "UPDATE companies SET {} WHERE tenant_id = $1 AND id = $2",
             updates.join(", ")
         );
 
-        let mut query_builder = sqlx::query(&query).bind(tenant_id).bind(company_id);
+        let mut q = sqlx::query(&query).bind(tenant_id).bind(company_id);
 
         if let Some(ref name) = request.name {
-            query_builder = query_builder.bind(name);
+            q = q.bind(name);
         }
-        if let Some(ref ct) = request.company_type {
-            query_builder = query_builder.bind(ct.as_str());
+        if let Some(pcid) = request.parent_company_id {
+            q = q.bind(pcid);
         }
-        if let Some(ref status) = request.status {
-            query_builder = query_builder.bind(status.as_str());
+        if let Some(ct) = request.company_type {
+            q = q.bind(ct.as_str());
+        }
+        if let Some(status) = request.status {
+            q = q.bind(status.as_str());
+        }
+        if let Some(ref industry) = request.industry {
+            q = q.bind(industry);
+        }
+        if let Some(ref website) = request.website {
+            q = q.bind(website);
+        }
+        if let Some(ref phone) = request.phone {
+            q = q.bind(phone);
+        }
+        if let Some(ref fax) = request.fax {
+            q = q.bind(fax);
+        }
+        if let Some(ref addr) = request.address {
+            q = q
+                .bind(&addr.line1)
+                .bind(&addr.line2)
+                .bind(&addr.city)
+                .bind(&addr.state)
+                .bind(&addr.postal_code)
+                .bind(&addr.country);
+        }
+        if let Some(ref billing) = request.billing_address {
+            q = q
+                .bind(&billing.line1)
+                .bind(&billing.line2)
+                .bind(&billing.city)
+                .bind(&billing.state)
+                .bind(&billing.postal_code)
+                .bind(&billing.country);
+        }
+        if let Some(ref tax_id) = request.tax_id {
+            q = q.bind(tax_id);
+        }
+        if let Some(ref account_number) = request.account_number {
+            q = q.bind(account_number);
+        }
+        if let Some(billing_id) = request.default_billing_contact_id {
+            q = q.bind(billing_id);
+        }
+        if let Some(technical_id) = request.default_technical_contact_id {
+            q = q.bind(technical_id);
+        }
+        if let Some(am_id) = request.account_manager_id {
+            q = q.bind(am_id);
+        }
+        if let Some(sla_id) = request.sla_id {
+            q = q.bind(sla_id);
+        }
+        if let Some(contract_id) = request.default_contract_id {
+            q = q.bind(contract_id);
+        }
+        if let Some(ref payment_terms) = request.payment_terms {
+            q = q.bind(payment_terms);
+        }
+        if let Some(tax_exempt) = request.tax_exempt {
+            q = q.bind(tax_exempt);
+        }
+        if let Some(ref custom_fields) = request.custom_fields {
+            q = q.bind(custom_fields);
+        }
+        if let Some(ref tags) = request.tags {
+            q = q.bind(tags);
+        }
+        if let Some(ref notes) = request.notes {
+            q = q.bind(notes);
+        }
+        if let Some(portal_enabled) = request.portal_enabled {
+            q = q.bind(portal_enabled);
         }
 
         // Mutation + audit row in one transaction: snapshot the row
@@ -406,7 +583,7 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        query_builder.execute(&mut *tx).await?;
+        q.execute(&mut *tx).await?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
@@ -755,33 +932,149 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        // Simplified update - in production, use dynamic query building
+        // Reject moving the contact to a foreign tenant's company. Same
+        // shape as the create-time validate_fk path above.
+        self.validate_fk_opt(tenant_id, "companies", request.company_id)
+            .await?;
+
+        // Build the dynamic UPDATE the same way update_site does, so
+        // every field in UpdateContactRequest round-trips instead of
+        // being silently dropped. The previous implementation only
+        // handled first_name / last_name / email and 200-OK'd writes to
+        // title, department, phone, mobile, etc.; same family of bug as
+        // F4 was for sites.
+        let mut updates = vec!["updated_at = NOW()".to_string()];
+        let mut param_idx = 3;
+
+        if request.company_id.is_some() {
+            updates.push(format!("company_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.first_name.is_some() {
+            updates.push(format!("first_name = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.last_name.is_some() {
+            updates.push(format!("last_name = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.email.is_some() {
+            updates.push(format!("email = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.phone.is_some() {
+            updates.push(format!("phone = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.mobile.is_some() {
+            updates.push(format!("mobile = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.fax.is_some() {
+            updates.push(format!("fax = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.title.is_some() {
+            updates.push(format!("title = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.department.is_some() {
+            updates.push(format!("department = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.contact_type.is_some() {
+            updates.push(format!("contact_type = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.preferred_contact_method.is_some() {
+            updates.push(format!("preferred_contact_method = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.timezone.is_some() {
+            updates.push(format!("timezone = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.custom_fields.is_some() {
+            updates.push(format!("custom_fields = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.tags.is_some() {
+            updates.push(format!("tags = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.notes.is_some() {
+            updates.push(format!("notes = ${param_idx}"));
+            param_idx += 1;
+        }
+        if request.status.is_some() {
+            updates.push(format!("status = ${param_idx}"));
+            // param_idx += 1;
+        }
+
+        let query = format!(
+            "UPDATE contacts SET {} WHERE tenant_id = $1 AND id = $2",
+            updates.join(", ")
+        );
+        let mut q = sqlx::query(&query).bind(tenant_id).bind(contact_id);
+
+        if let Some(cid) = request.company_id {
+            q = q.bind(cid);
+        }
         if let Some(ref first_name) = request.first_name {
-            sqlx::query("UPDATE contacts SET first_name = $1, updated_at = NOW() WHERE tenant_id = $2 AND id = $3")
-                .bind(first_name)
-                .bind(tenant_id)
-                .bind(contact_id)
-                .execute(&mut *tx)
-                .await?;
+            q = q.bind(first_name);
         }
-
         if let Some(ref last_name) = request.last_name {
-            sqlx::query("UPDATE contacts SET last_name = $1, updated_at = NOW() WHERE tenant_id = $2 AND id = $3")
-                .bind(last_name)
-                .bind(tenant_id)
-                .bind(contact_id)
-                .execute(&mut *tx)
-                .await?;
+            q = q.bind(last_name);
+        }
+        if let Some(ref email) = request.email {
+            q = q.bind(email);
+        }
+        if let Some(ref phone) = request.phone {
+            q = q.bind(phone);
+        }
+        if let Some(ref mobile) = request.mobile {
+            q = q.bind(mobile);
+        }
+        if let Some(ref fax) = request.fax {
+            q = q.bind(fax);
+        }
+        if let Some(ref title) = request.title {
+            q = q.bind(title);
+        }
+        if let Some(ref department) = request.department {
+            q = q.bind(department);
+        }
+        if let Some(ct) = request.contact_type {
+            q = q.bind(ct.as_str());
+        }
+        if let Some(method) = request.preferred_contact_method {
+            // PreferredContactMethod has no as_str(); spell the mapping
+            // here to match the table's CHECK constraint ('email',
+            // 'phone', 'mobile').
+            let s = match method {
+                crate::modules::contacts::PreferredContactMethod::Email => "email",
+                crate::modules::contacts::PreferredContactMethod::Phone => "phone",
+                crate::modules::contacts::PreferredContactMethod::Mobile => "mobile",
+            };
+            q = q.bind(s);
+        }
+        if let Some(ref timezone) = request.timezone {
+            q = q.bind(timezone);
+        }
+        if let Some(ref custom_fields) = request.custom_fields {
+            q = q.bind(custom_fields);
+        }
+        if let Some(ref tags) = request.tags {
+            q = q.bind(tags);
+        }
+        if let Some(ref notes) = request.notes {
+            q = q.bind(notes);
+        }
+        if let Some(status) = request.status {
+            q = q.bind(status.as_str());
         }
 
-        if let Some(ref email) = request.email {
-            sqlx::query("UPDATE contacts SET email = $1, updated_at = NOW() WHERE tenant_id = $2 AND id = $3")
-                .bind(email)
-                .bind(tenant_id)
-                .bind(contact_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        q.execute(&mut *tx).await?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
