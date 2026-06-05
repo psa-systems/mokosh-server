@@ -136,8 +136,15 @@ impl AuthService {
         let audit_ip = ip_address.clone();
         let audit_ua = user_agent.clone();
 
-        // Find user by email
-        let user = self.find_user_by_email(&request.email).await?;
+        // PMS-138: bind the lookup to (tenant_id, email), falling
+        // back to the default tenant when the SPA didn't supply a
+        // hint. Replaces the prior email-only lookup with
+        // `ORDER BY created_at ASC LIMIT 1` tiebreaker that silently
+        // routed multi-tenant collisions to the wrong account.
+        let tenant_id = Self::resolve_tenant_for_login(request.tenant_id);
+        let user = self
+            .find_user_by_email_for_tenant(tenant_id, &request.email)
+            .await?;
 
         // Check if user is active
         if user.status != UserStatus::Active {
@@ -325,7 +332,17 @@ impl AuthService {
             self.get_user_by_id(tenant_id, user_id).await?
         } else {
             // 2. No identity row yet - find or create the user by email.
-            match self.find_user_by_email_optional(&google.email).await? {
+            // PMS-138: Google OAuth callback carries no SPA-provided
+            // tenant hint (the OAuth state cookie does not encode one),
+            // so the JIT-link lookup falls back to the default tenant.
+            // Multi-tenant Google login is a separate story; it would
+            // require baking tenant_id into the OAuth state at popup
+            // open time and verifying it in the callback.
+            let google_jit_tenant_id = Self::resolve_tenant_for_login(None);
+            match self
+                .find_user_by_email_for_tenant_optional(google_jit_tenant_id, &google.email)
+                .await?
+            {
                 Some(existing) => {
                     // Only auto-link to an existing local account whose own
                     // email is verified. Otherwise someone who registered a
@@ -430,9 +447,15 @@ impl AuthService {
         self.get_user_by_id(tenant_id, user_id).await
     }
 
-    /// Look up a user by email; returns `Ok(None)` instead of
-    /// `Err(Unauthorized)` when no user exists.
-    async fn find_user_by_email_optional(&self, email: &str) -> AppResult<Option<User>> {
+    /// Look up a user by `(tenant_id, email)`; returns `Ok(None)`
+    /// instead of `Err(Unauthorized)` when no row matches.
+    /// Tenant-bound sibling of `find_user_by_email_for_tenant` for
+    /// the Google JIT-link path. PMS-138.
+    async fn find_user_by_email_for_tenant_optional(
+        &self,
+        tenant_id: Uuid,
+        email: &str,
+    ) -> AppResult<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
@@ -441,9 +464,10 @@ impl AuthService {
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at
             FROM users
-            WHERE email = $1
+            WHERE tenant_id = $1 AND email = $2
             "#,
         )
+        .bind(tenant_id)
         .bind(email)
         .fetch_optional(self.db.pool())
         .await?;
@@ -515,11 +539,20 @@ impl AuthService {
         Ok(())
     }
 
-    /// Request password reset
+    /// Request password reset. PMS-138: the optional `tenant_hint`
+    /// flows in from `ForgotPasswordRequest::tenant_id` so a
+    /// multi-tenant deployment can target the correct user when
+    /// the same email exists under several tenants. `None` falls
+    /// back to the default tenant.
     #[tracing::instrument(skip_all)]
-    pub async fn request_password_reset(&self, email: &str) -> AppResult<()> {
+    pub async fn request_password_reset(
+        &self,
+        tenant_hint: Option<Uuid>,
+        email: &str,
+    ) -> AppResult<()> {
         // Find user - don't reveal if user exists
-        let user = match self.find_user_by_email(email).await {
+        let tenant_id = Self::resolve_tenant_for_login(tenant_hint);
+        let user = match self.find_user_by_email_for_tenant(tenant_id, email).await {
             Ok(user) => user,
             Err(_) => return Ok(()), // Silently succeed to not reveal user existence
         };
@@ -1421,18 +1454,14 @@ impl AuthService {
         self.get_user_by_id(tenant_id, sub).await
     }
 
-    /// Find user by email.
-    ///
-    /// PMS-4 AC6 residual: login does not yet know the tenant, so this
-    /// lookup is keyed only on email. The `users.UNIQUE(tenant_id,
-    /// email)` constraint does NOT prevent the same email from
-    /// existing across tenants; on a collision this returns the
-    /// oldest matching row (`ORDER BY created_at ASC LIMIT 1`).
-    /// Single-tenant deployments are unaffected. Multi-tenant
-    /// deployments need a subdomain-driven
-    /// `LoginRequest::tenant_id` hint to disambiguate; tracked as a
-    /// follow-up YT issue.
-    async fn find_user_by_email(&self, email: &str) -> AppResult<User> {
+    /// Find a user by `(tenant_id, email)`. PMS-138 closeout of
+    /// PMS-4 AC6's residual cross-cutting #8 leak: the previous
+    /// shape keyed on email alone and used `ORDER BY created_at
+    /// ASC LIMIT 1` as a deterministic-but-wrong tiebreaker for
+    /// multi-tenant deployments. Now the lookup binds both
+    /// columns; the `users.UNIQUE(tenant_id, email)` constraint
+    /// guarantees at most one row.
+    async fn find_user_by_email_for_tenant(&self, tenant_id: Uuid, email: &str) -> AppResult<User> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
@@ -1441,17 +1470,29 @@ impl AuthService {
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at
             FROM users
-            WHERE email = $1
-            ORDER BY created_at ASC
-            LIMIT 1
+            WHERE tenant_id = $1 AND email = $2
             "#,
         )
+        .bind(tenant_id)
         .bind(email)
         .fetch_optional(self.db.pool())
         .await?
         .ok_or(AppError::Unauthorized)?;
 
         Ok(row.into())
+    }
+
+    /// PMS-138 backward-compat fallback: when the caller does not
+    /// supply a tenant hint, resolve to the default tenant
+    /// `Uuid::from_u128(1)`. This matches both
+    /// `db::tenant::default_tenant_id()` (cfg-gated on
+    /// `single-tenant`) and `OIDC_DEFAULT_TENANT_ID` in
+    /// `auth::middleware`, so behaviour converges across the
+    /// legacy login path and the Bunyip-issued at+jwt path. Keep
+    /// the literal value in lockstep with those two sites if it
+    /// ever changes.
+    fn resolve_tenant_for_login(hint: Option<Uuid>) -> Uuid {
+        hint.unwrap_or_else(|| Uuid::from_u128(1))
     }
 
     /// Validate token and return claims
