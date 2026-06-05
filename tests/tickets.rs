@@ -1,10 +1,17 @@
-//! Integration test: tickets create / list / get / update / add note happy path.
+//! Integration test: tickets create / list / get / update / assign / add note happy path.
 //!
 //! The seed migration populates the default tenant with ticket statuses,
 //! priorities, and types, so `CreateTicketRequest` can omit those FKs and
 //! the service layer fills them from the defaults. We seed a company
 //! directly via SQL because the contacts CRUD path is covered in its own
 //! test file - this one keeps its assertions on the tickets surface.
+//!
+//! Beyond the happy path, this pins the PMS-11 / F3 fix: every ticket
+//! response must carry its JOINed name/color fields populated from the
+//! database, not the empty strings the route layer used to emit. Each
+//! returned DTO is run through `assert_joined_fields_populated`, and the
+//! assign step additionally asserts `assigned_to_name` resolves once an
+//! assignee is set.
 
 mod common;
 
@@ -27,9 +34,30 @@ async fn seed_company(pool: &PgPool) -> Uuid {
     id
 }
 
+/// Assert a ticket DTO carries its JOINed name/color fields populated from
+/// the database. This is the F3 regression guard: the route layer used to
+/// build `TicketResponse` with `String::new()` for these, returning `200`
+/// with blank names that any name-rendering client showed empty. `label`
+/// identifies which endpoint's response is under test in failure output.
+fn assert_joined_fields_populated(t: &serde_json::Value, label: &str) {
+    let non_empty = |path: &str, v: Option<&str>| {
+        assert!(
+            v.is_some_and(|s| !s.is_empty()),
+            "{label}: joined field {path} must be populated, got {v:?}"
+        );
+    };
+    non_empty("status.name", t["status"]["name"].as_str());
+    non_empty("status.color", t["status"]["color"].as_str());
+    non_empty("priority.name", t["priority"]["name"].as_str());
+    non_empty("priority.color", t["priority"]["color"].as_str());
+    non_empty("queue_name", t["queue_name"].as_str());
+    non_empty("company_name", t["company_name"].as_str());
+    non_empty("created_by_name", t["created_by_name"].as_str());
+}
+
 #[sqlx::test]
 async fn ticket_lifecycle_happy_path(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = seed_company(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
@@ -67,6 +95,12 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
         .expect("created ticket has id")
         .to_string();
     assert_eq!(created["title"].as_str(), Some("Server is on fire"));
+    assert_eq!(
+        created["company_name"].as_str(),
+        Some("Acme Co"),
+        "create response must resolve the company name from the JOIN"
+    );
+    assert_joined_fields_populated(&created, "create");
 
     // LIST
     let list_resp = app
@@ -79,10 +113,11 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
     let list: serde_json::Value = list_resp.json().await.expect("list tickets JSON");
     let items = list["data"].as_array().expect("tickets list has data");
-    assert!(
-        items.iter().any(|t| t["id"].as_str() == Some(&ticket_id)),
-        "list should contain the ticket we just created"
-    );
+    let listed = items
+        .iter()
+        .find(|t| t["id"].as_str() == Some(&ticket_id))
+        .expect("list should contain the ticket we just created");
+    assert_joined_fields_populated(listed, "list");
 
     // GET
     let get_resp = app
@@ -95,6 +130,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
     assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
     let got: serde_json::Value = get_resp.json().await.expect("get ticket JSON");
     assert_eq!(got["title"].as_str(), Some("Server is on fire"));
+    assert_joined_fields_populated(&got, "get");
 
     // UPDATE
     let update_resp = app
@@ -112,6 +148,37 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
         Some("Server is now smouldering"),
         "PUT must change the title"
     );
+    assert_joined_fields_populated(&updated, "update");
+
+    // ASSIGN
+    //
+    // Assign to the seeded admin (the only user in the tenant). The handler
+    // returns the freshly re-fetched DTO, so `assigned_to_id` must echo the
+    // assignee and `assigned_to_name` must resolve via the users JOIN that
+    // F3 left blank.
+    let assign_resp = app
+        .client
+        .post(app.url(&format!("/api/v1/tickets/{ticket_id}/assign")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "assigned_to_id": admin_id }))
+        .send()
+        .await
+        .expect("send assign ticket");
+    assert_eq!(assign_resp.status(), reqwest::StatusCode::OK);
+    let assigned: serde_json::Value = assign_resp.json().await.expect("assign ticket JSON");
+    assert_eq!(
+        assigned["assigned_to_id"].as_str(),
+        Some(admin_id.to_string().as_str()),
+        "assign must set assigned_to_id to the requested user"
+    );
+    assert!(
+        assigned["assigned_to_name"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "assign response must resolve assigned_to_name from the users JOIN, got {:?}",
+        assigned["assigned_to_name"]
+    );
+    assert_joined_fields_populated(&assigned, "assign");
 
     // ADD NOTE
     let note_resp = app
