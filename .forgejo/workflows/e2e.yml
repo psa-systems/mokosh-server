@@ -38,10 +38,19 @@ jobs:
       E2E_OIDC_CLIENT_ID: ${{ secrets.E2E_OIDC_CLIENT_ID }}
       E2E_OIDC_REDIRECT_URI: ${{ secrets.E2E_OIDC_REDIRECT_URI }}
       E2E_FOREIGN_COMPANY_ID: ${{ secrets.E2E_FOREIGN_COMPANY_ID }}
+      # The opensuse-base runner does not grant write access to the default
+      # /opt/hostedtoolcache, so actions/setup-node fails when it tries to
+      # cache the downloaded Node tarball. Point the tool cache at the
+      # per-job RUNNER_TEMP dir, which is always writable and ephemeral.
+      RUNNER_TOOL_CACHE: ${{ runner.temp }}/toolcache
 
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
+
+      - name: Prepare tool cache directory
+        # Absolute path; default working-directory (e2e/) is irrelevant.
+        run: mkdir -p "$RUNNER_TOOL_CACHE"
 
       - name: Set up Node.js
         uses: https://code.forgejo.org/actions/setup-node@v4
