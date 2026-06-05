@@ -10,13 +10,14 @@ import type { Page } from '@playwright/test';
 // actual SPA traffic pattern, low enough to keep the error readable.
 const URL_SAMPLE_CAP = 30;
 
-export interface PageDiagnostics {
-  /// Snapshot the current diagnostic as a multi-line string suitable for
-  /// folding into a thrown error message.
-  snapshot(label: string, page: Page): string;
-}
-
-export function attachPageDiagnostics(page: Page): PageDiagnostics {
+/// Attach request + framenavigated listeners to `page` and return a
+/// `snapshot(label)` that renders the accumulated trail as a multi-line
+/// string suitable for folding into a thrown error message. The page is
+/// captured at attach time so callers cannot accidentally hand in a stale
+/// or different one at snapshot time.
+export function attachPageDiagnostics(page: Page): {
+  snapshot(label: string): string;
+} {
   const urlTrail: string[] = [];
   const allRequestUrls: string[] = [];
   page.on('framenavigated', (frame) => {
@@ -27,7 +28,7 @@ export function attachPageDiagnostics(page: Page): PageDiagnostics {
   });
 
   return {
-    snapshot(label: string, page: Page): string {
+    snapshot(label: string): string {
       const sample = (arr: string[]) =>
         arr.length === 0 ? '(none)' : arr.slice(-URL_SAMPLE_CAP).join('\n    ');
       return [

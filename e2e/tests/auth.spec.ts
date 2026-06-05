@@ -37,7 +37,10 @@ test.describe('auth login / session', () => {
     try {
       await loginViaSpa(page);
     } catch (err) {
-      throw new Error(`${String(err)}\n\n${diag.snapshot('login diagnostic', page)}`);
+      // `cause` preserves the underlying assertion error so Playwright's
+      // reporter can still surface its stack and failed-matcher details
+      // below the diagnostic dump.
+      throw new Error(diag.snapshot('login diagnostic'), { cause: err });
     }
 
     expect(page.url(), 'post-login URL').not.toMatch(/\/(login|error|404)\/?$/);
@@ -46,7 +49,7 @@ test.describe('auth login / session', () => {
       await logout(page);
       await expectAtLoginScreen(page);
     } catch (err) {
-      throw new Error(`${String(err)}\n\n${diag.snapshot('logout diagnostic', page)}`);
+      throw new Error(diag.snapshot('logout diagnostic'), { cause: err });
     }
   });
 });
