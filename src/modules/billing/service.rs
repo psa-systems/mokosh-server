@@ -1,6 +1,6 @@
 //! Billing service. Endpoints land incrementally across PMS-33.
 
-use chrono::Utc;
+use chrono::{DateTime, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -515,6 +515,356 @@ impl BillingService {
 
         tx.commit().await?;
         self.get_invoice(tenant_id, invoice_id).await
+    }
+
+    /// PMS-64 AC5: generate recurring billing invoices from contracts'
+    /// recurring line items, idempotently per billing period.
+    ///
+    /// For each `active`, non-`one_time` contract in the tenant that is
+    /// due for its current billing period as of `now` and carries at
+    /// least one recurring item (`recurring_service` / `retainer`), this
+    /// creates one draft invoice whose lines mirror those items (name,
+    /// quantity, unit_price). Idempotency is enforced by the
+    /// `contract_invoice_runs` ledger: a row keyed UNIQUE on
+    /// `(tenant_id, contract_id, period_start)` is inserted in the SAME
+    /// transaction as the invoice via `INSERT ... ON CONFLICT DO
+    /// NOTHING`. If the period was already billed (a prior run, or a
+    /// concurrent run that committed first), the conflict short-circuits
+    /// and the would-be-duplicate invoice is rolled back, so a monthly
+    /// contract yields exactly one invoice per month even across
+    /// double-runs and process restarts.
+    ///
+    /// The due period is computed from `billing_cycle` + the contract's
+    /// `start_date` (see [`current_billing_period`]): the most recent
+    /// period boundary on or before `now`. Skipped: `one_time`,
+    /// non-`active` (draft/expired/cancelled/renewed) contracts,
+    /// contracts whose `start_date` is in the future, contracts past
+    /// their `end_date` for the computed period, and contracts with no
+    /// recurring items.
+    ///
+    /// Reuses the same gapless `invoice_sequences` row-lock and
+    /// invoice + invoice_lines write path as [`create_invoice`], plus
+    /// the in-transaction audit row. Tax / discount are left at 0,
+    /// matching the other invoice-creation paths.
+    ///
+    /// `now` is injected so tests (and the scheduler) drive periods
+    /// deterministically. Returns the ids of invoices actually created
+    /// this run (periods already billed contribute nothing). Tenant-scoped.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn generate_due_recurring_invoices(
+        &self,
+        tenant_id: Uuid,
+        now: DateTime<Utc>,
+        ctx: &AuditCtx,
+    ) -> AppResult<Vec<Uuid>> {
+        let today = now.date_naive();
+
+        // Candidate contracts: active, recurring (not one_time), already
+        // started. `end_date` is checked per-period below (a contract may
+        // still be due for a period that began before it expired).
+        let contracts = sqlx::query_as::<_, RecurringContractRow>(
+            r#"
+            SELECT id, company_id, billing_cycle, start_date, end_date
+            FROM contracts
+            WHERE tenant_id = $1
+              AND status = 'active'
+              AND billing_cycle IS DISTINCT FROM 'one_time'
+              AND start_date <= $2
+            ORDER BY id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(today)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut created = Vec::new();
+        for contract in contracts {
+            let cycle = contract
+                .billing_cycle
+                .as_deref()
+                .unwrap_or("monthly");
+            let Some((period_start, period_end)) =
+                current_billing_period(cycle, contract.start_date, today)
+            else {
+                // Unknown cycle or no period started yet: skip.
+                continue;
+            };
+
+            // Skip periods that begin after the contract's end_date: an
+            // expired contract should not be billed for a period that
+            // starts beyond its term. (A period that STARTED before the
+            // end_date is still billed even if it ends after, matching the
+            // "due for its current period" semantics.)
+            if let Some(end) = contract.end_date {
+                if period_start > end {
+                    continue;
+                }
+            }
+
+            if let Some(invoice_id) = self
+                .generate_one_recurring_invoice(
+                    tenant_id,
+                    contract.id,
+                    contract.company_id,
+                    period_start,
+                    period_end,
+                    today,
+                    ctx,
+                )
+                .await?
+            {
+                created.push(invoice_id);
+            }
+        }
+
+        if !created.is_empty() {
+            tracing::info!(
+                count = created.len(),
+                "recurring invoicing run generated invoices"
+            );
+        }
+        Ok(created)
+    }
+
+    /// Cross-tenant driver for the recurring-invoicing scheduler job.
+    /// Enumerates every tenant and runs
+    /// [`generate_due_recurring_invoices`](Self::generate_due_recurring_invoices)
+    /// for each, accumulating the total count of invoices created this
+    /// tick. A failure for one tenant is logged and skipped so a single
+    /// bad tenant cannot stall the whole run. `now` is injected (the
+    /// scheduler passes `Utc::now`).
+    #[tracing::instrument(skip_all)]
+    pub async fn generate_due_recurring_invoices_all_tenants(
+        &self,
+        now: DateTime<Utc>,
+    ) -> AppResult<u64> {
+        let tenant_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tenants")
+            .fetch_all(self.db.pool())
+            .await?;
+
+        let mut total = 0u64;
+        for tenant_id in tenant_ids {
+            let ctx = AuditCtx::system(tenant_id);
+            match self
+                .generate_due_recurring_invoices(tenant_id, now, &ctx)
+                .await
+            {
+                Ok(ids) => total += ids.len() as u64,
+                Err(e) => {
+                    tracing::warn!(
+                        %tenant_id,
+                        error = ?e,
+                        "recurring invoicing failed for tenant; skipping"
+                    );
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Create one recurring invoice for a single contract + period, in a
+    /// single transaction. Returns `Some(invoice_id)` when an invoice was
+    /// created, `None` when the period was already billed (ledger
+    /// conflict) or the contract has no recurring items.
+    ///
+    /// Split out of [`generate_due_recurring_invoices`] so each contract
+    /// gets its own transaction: one contract's conflict / empty-items
+    /// skip never rolls back another contract's invoice.
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_one_recurring_invoice(
+        &self,
+        tenant_id: Uuid,
+        contract_id: Uuid,
+        company_id: Uuid,
+        period_start: NaiveDate,
+        period_end: NaiveDate,
+        today: NaiveDate,
+        ctx: &AuditCtx,
+    ) -> AppResult<Option<Uuid>> {
+        let mut tx = self.db.pool().begin().await?;
+
+        // Pull this contract's recurring billing items. Mirrors
+        // `ContractsService::list_recurring_items` (recurring_service +
+        // retainer), but runs inside this transaction.
+        let items = sqlx::query_as::<_, RecurringItemRow>(
+            r#"
+            SELECT name, quantity, unit_price
+            FROM contract_items
+            WHERE tenant_id = $1 AND contract_id = $2
+              AND item_type IN ('recurring_service', 'retainer')
+            ORDER BY sort_order, name
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if items.is_empty() {
+            // Nothing recurring to bill; do not record a ledger row so a
+            // later-added item still gets picked up next run.
+            return Ok(None);
+        }
+
+        // Generate the invoice id up front so the ledger row can carry it
+        // as its (NOT NULL) `invoice_id` FK. The invoice header is
+        // inserted BEFORE the ledger row so the FK references an existing
+        // row at insert time (the FK is checked immediately, not
+        // deferred). The ledger insert's ON CONFLICT then dedupes the
+        // period; on conflict the whole transaction rolls back, discarding
+        // the just-inserted invoice header and the sequence bump, so a
+        // period is invoiced at most once.
+        let invoice_id = Uuid::new_v4();
+
+        // --- 1. Insert the invoice header (draft, totals computed). ---
+        let subtotal: Decimal = items
+            .iter()
+            .map(|i| i.quantity * i.unit_price)
+            .sum();
+        let tax = Decimal::ZERO;
+        let discount = Decimal::ZERO;
+        let total = subtotal + tax - discount;
+
+        // Invoice today, due in 30 days (matches the `net30` default term
+        // and the time-entry invoice path).
+        let invoice_date = today;
+        let due_date = invoice_date + chrono::Duration::days(30);
+
+        // Gapless invoice number: same per-tenant row-lock as
+        // `create_invoice`. NOTE: this increments the sequence even if the
+        // ledger insert below conflicts and we roll back; the rollback
+        // restores the sequence value too (the UPDATE is part of this tx),
+        // so numbers stay gapless.
+        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
+            r#"
+            UPDATE invoice_sequences
+            SET last_number = last_number + 1
+            WHERE tenant_id = $1
+            RETURNING last_number, prefix
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (next_number, prefix) = match seq_row {
+            Some(v) => v,
+            None => {
+                sqlx::query(
+                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
+                )
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+                (1, Some("INV-".to_string()))
+            }
+        };
+        let invoice_number = format!(
+            "{}{:06}",
+            prefix.unwrap_or_else(|| "INV-".to_string()),
+            next_number
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO invoices (
+                id, tenant_id, invoice_number, company_id, billing_contact_id,
+                contract_id, status, invoice_date, due_date, payment_terms,
+                subtotal, tax_amount, discount_amount, total, amount_paid,
+                balance_due, currency, notes, po_number
+            )
+            VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
+                    $10, $11, 0, $11, 'USD', $12, NULL)
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(&invoice_number)
+        .bind(company_id)
+        .bind(contract_id)
+        .bind(invoice_date)
+        .bind(due_date)
+        .bind(subtotal)
+        .bind(tax)
+        .bind(discount)
+        .bind(total)
+        .bind(format!(
+            "Recurring billing for {period_start} to {period_end}"
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        // --- 2. Reserve the period in the ledger. If the period was
+        // already billed, ON CONFLICT DO NOTHING returns no row: roll
+        // back the whole transaction (invoice header + sequence bump
+        // included) so the period is invoiced at most once. ---
+        let run_id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO contract_invoice_runs
+                (tenant_id, contract_id, invoice_id, period_start, period_end)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (tenant_id, contract_id, period_start) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contract_id)
+        .bind(invoice_id)
+        .bind(period_start)
+        .bind(period_end)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if run_id.is_none() {
+            // Period already billed: discard the in-progress invoice +
+            // sequence bump by NOT committing. Dropping `tx` rolls back.
+            return Ok(None);
+        }
+
+        // --- 3. One invoice line per recurring item (line_type 'service'). ---
+        for (idx, item) in items.iter().enumerate() {
+            sqlx::query(
+                r#"
+                INSERT INTO invoice_lines (
+                    id, invoice_id, line_type, description, quantity, unit_price,
+                    total, sort_order
+                )
+                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(invoice_id)
+            .bind(&item.name)
+            .bind(item.quantity)
+            .bind(item.unit_price)
+            .bind(item.quantity * item.unit_price)
+            .bind(idx as i32)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // --- 4. Audit row in the same transaction. CREATE: old = None. ---
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "invoices",
+            Some(invoice_id),
+            None,
+            after,
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(invoice_id))
     }
 
     /// PMS-41: list all tax rates for the tenant. Includes inactive
@@ -1424,6 +1774,92 @@ impl BillingService {
         let mut resp: InvoiceResponse = row.into();
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         Ok(resp)
+    }
+}
+
+/// Candidate-contract row for [`BillingService::generate_due_recurring_invoices`].
+#[derive(sqlx::FromRow)]
+struct RecurringContractRow {
+    id: Uuid,
+    company_id: Uuid,
+    billing_cycle: Option<String>,
+    start_date: NaiveDate,
+    end_date: Option<NaiveDate>,
+}
+
+/// Recurring contract-item row -> one invoice line.
+#[derive(sqlx::FromRow)]
+struct RecurringItemRow {
+    name: String,
+    quantity: Decimal,
+    unit_price: Decimal,
+}
+
+/// Number of whole months in one billing period for the given cycle.
+/// `None` for `one_time` / unknown cycles (the caller skips them).
+fn cycle_months(billing_cycle: &str) -> Option<u32> {
+    match billing_cycle {
+        "monthly" => Some(1),
+        "quarterly" => Some(3),
+        "annually" => Some(12),
+        // `one_time` is filtered out upstream; treat any other value as
+        // non-recurring so an unexpected cycle never bills.
+        _ => None,
+    }
+}
+
+/// Compute the current billing period `[period_start, period_end]` for a
+/// contract, anchored at `start_date` and stepped by the `billing_cycle`
+/// length, such that `period_start <= today` and `today <= period_end`.
+///
+/// Periods tile forward from `start_date` with no gaps:
+///   monthly  : start, start+1mo, start+2mo, ...
+///   quarterly: start, start+3mo, ...
+///   annually : start, start+12mo, ...
+/// `period_end` is the day before the next period's start.
+///
+/// Returns `None` when `today < start_date` (no period has begun yet) or
+/// the cycle is non-recurring / unknown.
+///
+/// Month arithmetic uses `chrono::Months`, which clamps end-of-month
+/// overflow (e.g. Jan 31 + 1 month -> Feb 28/29), so a contract that
+/// starts on the 31st still produces one period per cycle.
+fn current_billing_period(
+    billing_cycle: &str,
+    start_date: NaiveDate,
+    today: NaiveDate,
+) -> Option<(NaiveDate, NaiveDate)> {
+    if today < start_date {
+        return None;
+    }
+    let step = cycle_months(billing_cycle)?;
+    if step == 0 {
+        return None;
+    }
+
+    // Walk forward from start_date one cycle at a time until the next
+    // boundary would pass `today`. Bounded by the number of cycles
+    // between the two dates plus a small margin, so it always terminates
+    // even on clamped month math.
+    let mut period_start = start_date;
+    loop {
+        let next = period_start.checked_add_months(Months::new(step))?;
+        if next > today {
+            // `period_end` is the day before the next period starts.
+            let period_end = next.pred_opt().unwrap_or(next);
+            return Some((period_start, period_end));
+        }
+        period_start = next;
+        // Defensive guard against a pathological non-advancing step
+        // (cannot happen for step >= 1, but keeps the loop provably
+        // terminating).
+        if period_start > today {
+            let period_end = period_start
+                .checked_add_months(Months::new(step))
+                .and_then(|d| d.pred_opt())
+                .unwrap_or(period_start);
+            return Some((period_start, period_end));
+        }
     }
 }
 
