@@ -352,65 +352,13 @@ impl TenantService {
         })
     }
 
-    /// Get module configuration for a tenant
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_module_config(
-        &self,
-        tenant_id: Uuid,
-        module_name: &str,
-    ) -> AppResult<ModuleConfig> {
-        let row = sqlx::query_as::<_, (String, bool, serde_json::Value)>(
-            r#"
-            SELECT module_name, is_enabled, config
-            FROM module_config
-            WHERE tenant_id = $1 AND module_name = $2
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(module_name)
-        .fetch_optional(self.db.pool())
-        .await?;
-
-        match row {
-            Some((name, enabled, config)) => Ok(ModuleConfig {
-                module_name: name,
-                is_enabled: enabled,
-                config,
-            }),
-            None => Ok(ModuleConfig {
-                module_name: module_name.to_string(),
-                is_enabled: false,
-                config: serde_json::json!({}),
-            }),
-        }
-    }
-
-    /// Update module configuration
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn update_module_config(
-        &self,
-        tenant_id: Uuid,
-        module_name: &str,
-        is_enabled: bool,
-        config: serde_json::Value,
-    ) -> AppResult<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO module_config (tenant_id, module_name, is_enabled, config)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (tenant_id, module_name)
-            DO UPDATE SET is_enabled = $3, config = $4, updated_at = NOW()
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(module_name)
-        .bind(is_enabled)
-        .bind(&config)
-        .execute(self.db.pool())
-        .await?;
-
-        Ok(())
-    }
+    // PMS-113 AC2: TenantService::get_module_config and
+    // TenantService::update_module_config used to live here and ran
+    // their own SQL against `module_config`, parallel to the
+    // SettingsService implementation. The tenants-API handlers now
+    // delegate to SettingsService (see modules/tenants/routes.rs)
+    // so there is one canonical writer for `module_config`. The
+    // duplicate methods were removed.
 
     /// Copy default configuration from default tenant
     async fn copy_default_config(&self, new_tenant_id: Uuid) -> AppResult<()> {

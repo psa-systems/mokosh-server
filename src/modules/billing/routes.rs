@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::BillingService;
-use crate::modules::auth::{RequireAuth, RequireFinance};
+use crate::modules::auth::{RequireBilling, RequireFinance};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -58,7 +58,7 @@ pub fn billing_routes(service: BillingService) -> Router {
 
 async fn list_tax_rates(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TaxRateResponse>>> {
@@ -75,7 +75,7 @@ async fn list_tax_rates(
 
 async fn create_tax_rate(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTaxRateRequest>,
@@ -90,7 +90,7 @@ async fn create_tax_rate(
 
 async fn update_tax_rate(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -106,7 +106,7 @@ async fn update_tax_rate(
 
 async fn delete_tax_rate(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -125,7 +125,7 @@ struct LookupQuery {
 
 async fn lookup_tax_rate(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     Query(q): Query<LookupQuery>,
 ) -> AppResult<Json<TaxRateResponse>> {
     let r = state
@@ -137,7 +137,7 @@ async fn lookup_tax_rate(
 
 async fn list_payment_gateways(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<PaymentGatewayConfigResponse>>> {
@@ -154,7 +154,7 @@ async fn list_payment_gateways(
 
 async fn upsert_payment_gateway(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertPaymentGatewayConfigRequest>,
@@ -169,7 +169,7 @@ async fn upsert_payment_gateway(
 
 async fn delete_payment_gateway(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(provider): Path<String>,
@@ -186,7 +186,7 @@ async fn delete_payment_gateway(
 
 async fn list_payments(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     Query(filter): Query<PaymentFilter>,
     Query(pagination): Query<PaginationParams>,
@@ -205,7 +205,7 @@ async fn list_payments(
 
 async fn create_payment(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreatePaymentRequest>,
@@ -220,7 +220,7 @@ async fn create_payment(
 
 async fn delete_payment(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(payment_id): Path<Uuid>,
@@ -234,7 +234,7 @@ async fn delete_payment(
 
 async fn update_invoice(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(invoice_id): Path<Uuid>,
@@ -250,7 +250,7 @@ async fn update_invoice(
 
 async fn create_invoice(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateInvoiceRequest>,
@@ -269,7 +269,7 @@ async fn create_invoice(
 /// its own DTO, so existing invoice-create callers are untouched.
 async fn create_invoice_from_time_entries(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateInvoiceFromTimeEntriesRequest>,
@@ -284,7 +284,7 @@ async fn create_invoice_from_time_entries(
 
 async fn get_invoice(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
@@ -297,7 +297,7 @@ async fn get_invoice(
 
 async fn list_invoices(
     State(state): State<BillingRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     Query(filter): Query<InvoiceFilter>,
     Query(pagination): Query<PaginationParams>,

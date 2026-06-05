@@ -24,8 +24,10 @@ mod service;
 
 #[cfg(feature = "server")]
 pub use middleware::{
-    AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, RequireAdmin, RequireAuth,
-    RequireFinance, RequireManager, RequireRole, RoleRequirement, TenantScope,
+    AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,
+    RequireAssets, RequireAuth, RequireBilling, RequireCalendar, RequireContracts, RequireFinance,
+    RequireKnowledgeBase, RequireManager, RequireModuleEnabled, RequireProjects, RequireReports,
+    RequireRmm, RequireRole, RequireTimeTracking, RoleRequirement, TenantScope,
 };
 pub use models::*;
 #[cfg(feature = "server")]

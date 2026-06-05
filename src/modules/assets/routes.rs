@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::AssetsService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireAssets};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -75,7 +75,7 @@ pub fn assets_routes(service: AssetsService) -> Router {
 
 async fn list_asset_types(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetTypeResponse>>> {
     let (items, total) = s.service.list_asset_types(u.tenant_id, &pagination).await?;
@@ -88,7 +88,7 @@ async fn list_asset_types(
 
 async fn create_asset_type(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
     Json(req): Json<UpsertAssetTypeRequest>,
 ) -> AppResult<Json<AssetTypeResponse>> {
@@ -98,7 +98,7 @@ async fn create_asset_type(
 
 async fn update_asset_type(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertAssetTypeRequest>,
@@ -111,7 +111,7 @@ async fn update_asset_type(
 
 async fn delete_asset_type(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -120,7 +120,7 @@ async fn delete_asset_type(
 
 async fn list_assets(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Query(f): Query<AssetFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetResponse>>> {
@@ -135,7 +135,7 @@ async fn list_assets(
 
 async fn create_asset(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Json(req): Json<CreateAssetRequest>,
 ) -> AppResult<Json<AssetResponse>> {
     req.validate()?;
@@ -144,7 +144,7 @@ async fn create_asset(
 
 async fn get_asset(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<AssetResponse>> {
     Ok(Json(s.service.get_asset(u.tenant_id, id).await?))
@@ -152,7 +152,7 @@ async fn get_asset(
 
 async fn update_asset(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateAssetRequest>,
 ) -> AppResult<Json<AssetResponse>> {
@@ -164,7 +164,7 @@ async fn update_asset(
 
 async fn delete_asset(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -173,7 +173,7 @@ async fn delete_asset(
 
 async fn list_asset_relationships(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetRelationshipResponse>>> {
@@ -190,7 +190,7 @@ async fn list_asset_relationships(
 
 async fn create_asset_relationship(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateAssetRelationshipRequest>,
 ) -> AppResult<Json<AssetRelationshipResponse>> {
@@ -204,7 +204,7 @@ async fn create_asset_relationship(
 
 async fn delete_asset_relationship(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_asset_relationship(u.tenant_id, id).await
@@ -212,7 +212,7 @@ async fn delete_asset_relationship(
 
 async fn list_configuration_items(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ConfigurationItemResponse>>> {
@@ -229,7 +229,7 @@ async fn list_configuration_items(
 
 async fn create_configuration_item(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertConfigurationItemRequest>,
 ) -> AppResult<Json<ConfigurationItemResponse>> {
@@ -243,7 +243,7 @@ async fn create_configuration_item(
 
 async fn delete_configuration_item(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_configuration_item(u.tenant_id, id).await
@@ -251,7 +251,7 @@ async fn delete_configuration_item(
 
 async fn list_credentials(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CredentialResponse>>> {
@@ -268,7 +268,7 @@ async fn list_credentials(
 
 async fn create_credential(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateCredentialRequest>,
@@ -283,7 +283,7 @@ async fn create_credential(
 
 async fn delete_credential(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -292,7 +292,7 @@ async fn delete_credential(
 
 async fn list_asset_audit_log(
     State(s): State<AssetsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,

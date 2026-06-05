@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::ContractsService;
-use crate::modules::auth::{RequireAuth, RequireFinance};
+use crate::modules::auth::{RequireContracts, RequireFinance};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -60,7 +60,7 @@ pub fn contracts_routes(service: ContractsService) -> Router {
 
 async fn list_contracts(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     Query(f): Query<ContractFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractResponse>>> {
@@ -78,7 +78,7 @@ async fn list_contracts(
 
 async fn create_contract(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateContractRequest>,
@@ -91,7 +91,7 @@ async fn create_contract(
 
 async fn get_contract(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ContractResponse>> {
     Ok(Json(s.service.get_contract(u.tenant_id, id).await?))
@@ -99,7 +99,7 @@ async fn get_contract(
 
 async fn update_contract(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -115,7 +115,7 @@ async fn update_contract(
 
 async fn delete_contract(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -125,7 +125,7 @@ async fn delete_contract(
 
 async fn list_contract_items(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractItemResponse>>> {
@@ -142,7 +142,7 @@ async fn list_contract_items(
 
 async fn create_contract_item(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -158,7 +158,7 @@ async fn create_contract_item(
 
 async fn update_contract_item(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -174,7 +174,7 @@ async fn update_contract_item(
 
 async fn delete_contract_item(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -184,7 +184,7 @@ async fn delete_contract_item(
 
 async fn get_hour_balance(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractHourBalanceResponse>>> {
@@ -201,7 +201,7 @@ async fn get_hour_balance(
 
 async fn list_rate_cards(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RateCardResponse>>> {
     let (items, total) = s.service.list_rate_cards(u.tenant_id, &pagination).await?;
@@ -214,7 +214,7 @@ async fn list_rate_cards(
 
 async fn create_rate_card(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertRateCardRequest>,
@@ -227,7 +227,7 @@ async fn create_rate_card(
 
 async fn update_rate_card(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertRateCardRequest>,
@@ -240,7 +240,7 @@ async fn update_rate_card(
 
 async fn delete_rate_card(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -250,7 +250,7 @@ async fn delete_rate_card(
 
 async fn list_rate_card_items(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RateCardItemResponse>>> {
@@ -267,7 +267,7 @@ async fn list_rate_card_items(
 
 async fn upsert_rate_card_item(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
@@ -283,7 +283,7 @@ async fn upsert_rate_card_item(
 
 async fn delete_rate_card_item(
     State(s): State<ContractsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {

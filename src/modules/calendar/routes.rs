@@ -13,7 +13,7 @@ use validator::Validate;
 use super::models::*;
 use super::service::CalendarService;
 use super::{CalendarEvent, CalendarEventFilter};
-use crate::modules::auth::{RequireAuth, RequireManager};
+use crate::modules::auth::{RequireCalendar, RequireManager};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -89,7 +89,7 @@ pub fn dispatch_routes(service: CalendarService) -> Router {
 /// recurring appointments have no natural upper bound.
 async fn dispatch_view(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Query(f): Query<DispatchFilter>,
 ) -> AppResult<Json<DispatchResponse>> {
     f.validate()?;
@@ -115,7 +115,7 @@ async fn dispatch_view(
 
 /// `GET /api/v1/calendar/events?from=<rfc3339>&to=<rfc3339>`
 async fn list_events(
-    RequireAuth(_user): RequireAuth,
+    RequireCalendar { user: _user, .. }: RequireCalendar,
     Query(filter): Query<CalendarEventFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CalendarEvent>>> {
@@ -129,7 +129,7 @@ async fn list_events(
 
 async fn list_appointments(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Query(f): Query<AppointmentFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AppointmentResponse>>> {
@@ -147,7 +147,7 @@ async fn list_appointments(
 
 async fn create_appointment(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Json(req): Json<CreateAppointmentRequest>,
 ) -> AppResult<Json<AppointmentResponse>> {
     req.validate()?;
@@ -156,7 +156,7 @@ async fn create_appointment(
 
 async fn get_appointment(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<AppointmentResponse>> {
     Ok(Json(s.service.get_appointment(u.tenant_id, id).await?))
@@ -164,7 +164,7 @@ async fn get_appointment(
 
 async fn update_appointment(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateAppointmentRequest>,
 ) -> AppResult<Json<AppointmentResponse>> {
@@ -176,7 +176,7 @@ async fn update_appointment(
 
 async fn delete_appointment(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_appointment(u.tenant_id, id).await
@@ -184,7 +184,7 @@ async fn delete_appointment(
 
 async fn get_user_availability(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Path(user_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<UserAvailabilityResponse>>> {
@@ -201,7 +201,7 @@ async fn get_user_availability(
 
 async fn replace_user_availability(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Path(user_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
     Json(req): Json<ReplaceAvailabilityRequest>,
@@ -228,7 +228,7 @@ async fn replace_user_availability(
 
 async fn list_time_off(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Query(f): Query<TimeOffFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimeOffResponse>>> {
@@ -246,7 +246,7 @@ async fn list_time_off(
 
 async fn create_time_off(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Json(mut req): Json<CreateTimeOffRequest>,
 ) -> AppResult<Json<TimeOffResponse>> {
     if !u.role.is_admin() && req.user_id != u.id {
@@ -258,7 +258,7 @@ async fn create_time_off(
 
 async fn get_time_off(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeOffResponse>> {
     Ok(Json(s.service.get_time_off(u.tenant_id, id).await?))
@@ -266,7 +266,7 @@ async fn get_time_off(
 
 async fn approve_time_off(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     _m: RequireManager,
     Path(id): Path<Uuid>,
     Json(req): Json<ApproveTimeOffRequest>,
@@ -281,7 +281,7 @@ async fn approve_time_off(
 
 async fn delete_time_off(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_time_off(u.tenant_id, id).await
@@ -289,7 +289,7 @@ async fn delete_time_off(
 
 async fn list_on_call(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<OnCallScheduleResponse>>> {
     let (items, total) = s
@@ -305,7 +305,7 @@ async fn list_on_call(
 
 async fn create_on_call(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     _m: RequireManager,
     Json(req): Json<UpsertOnCallScheduleRequest>,
 ) -> AppResult<Json<OnCallScheduleResponse>> {
@@ -317,7 +317,7 @@ async fn create_on_call(
 
 async fn update_on_call(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     _m: RequireManager,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertOnCallScheduleRequest>,
@@ -332,7 +332,7 @@ async fn update_on_call(
 
 async fn delete_on_call(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
     _m: RequireManager,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -341,7 +341,7 @@ async fn delete_on_call(
 
 async fn on_call_now(
     State(s): State<CalendarRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCalendar { user: u, .. }: RequireCalendar,
 ) -> AppResult<Json<Vec<OnCallNowResponse>>> {
     Ok(Json(s.service.on_call_now(u.tenant_id).await?))
 }
