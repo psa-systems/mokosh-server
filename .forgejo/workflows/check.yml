@@ -70,4 +70,11 @@ jobs:
         run: cargo test --lib
 
       - name: Integration tests
-        run: cargo test --test auth --test contacts --test tenants --test tickets --test notifications --test rmm --test dispatch_stub --test readiness --test scheduler
+        # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
+        # Each test creates a per-test database AND holds the sqlx-test
+        # maintenance pool; at default per-cpu parallelism on a 16-core
+        # runner the maintenance pool was timing out with PoolTimedOut on
+        # tests/auth.rs (14 tests). 4 in-flight is well within the
+        # postgres default max_connections (100); slight wall-clock cost,
+        # full reliability.
+        run: cargo test --test auth --test contacts --test tenants --test tickets --test notifications --test rmm --test dispatch_stub --test readiness --test scheduler -- --test-threads=4
