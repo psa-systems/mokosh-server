@@ -7,7 +7,9 @@
 pub mod models;
 pub mod routes;
 pub mod service;
+pub mod worker;
 
 pub use models::*;
 pub use routes::billing_routes;
 pub use service::BillingService;
+pub use worker::RecurringInvoicingWorker;

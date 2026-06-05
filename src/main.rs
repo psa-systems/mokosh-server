@@ -244,8 +244,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::sla::SlaService::with_dispatcher(db.clone(), sla_notifications),
     );
 
+    // Recurring-invoicing worker (PMS-64 AC5). Each tick turns every
+    // active, recurring (non-one_time) contract that is due for its
+    // current billing period into a draft invoice built from the
+    // contract's recurring items, idempotently per period via the
+    // `contract_invoice_runs` ledger. Billing periods are day-granular, so
+    // an hourly tick is ample; the ledger makes extra ticks within a
+    // period no-ops, so the interval is not load-bearing. The encryption
+    // key matches the router's BillingService so the construction is
+    // uniform (recurring invoicing never touches gateway-config secrets).
+    let recurring_invoicing_worker = mokosh_server::modules::billing::RecurringInvoicingWorker::new(
+        mokosh_server::modules::billing::BillingService::with_encryption_key(
+            db.clone(),
+            encryption_key,
+        ),
+    );
+
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
+    scheduler.register(
+        recurring_invoicing_worker,
+        std::time::Duration::from_secs(3600),
+    );
     scheduler.register(sla_worker, std::time::Duration::from_secs(60));
 
     // Appointment-reminder worker (PMS-58 follow-up). Each 60s tick
