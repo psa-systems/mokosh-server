@@ -11,8 +11,18 @@
 // When the separate deploy workflow lands, chain this workflow off its
 // completion and drop the polling.
 
-const baseURL = (process.env.E2E_BASE_URL ?? 'https://msp.a8n.systems').replace(/\/+$/, '');
-const expectedSha = (process.env.GITHUB_SHA ?? process.env.E2E_EXPECT_SHA ?? '').trim();
+// Forgejo Actions passes the literal empty string for secrets that are not
+// configured, so `??` alone would not fall back. Treat empty/whitespace as
+// missing, matching e2e/lib/env.ts.
+function pick(...values) {
+  for (const v of values) {
+    if (typeof v === 'string' && v.trim() !== '') return v.trim();
+  }
+  return '';
+}
+
+const baseURL = pick(process.env.E2E_BASE_URL, 'https://msp.a8n.systems').replace(/\/+$/, '');
+const expectedSha = pick(process.env.GITHUB_SHA, process.env.E2E_EXPECT_SHA);
 
 const INTERVAL_MS = 15_000;
 const TIMEOUT_MS = 10 * 60 * 1000;
