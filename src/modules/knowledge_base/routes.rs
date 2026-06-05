@@ -48,9 +48,16 @@ pub fn kb_routes(service: KbService) -> Router {
         // new tallies.
         .route("/kb/articles/{id}/helpful", post(mark_helpful))
         .route("/kb/articles/{id}/not_helpful", post(mark_not_helpful))
-        // Portal-visible (PMS-84). Internal callers can still reach this;
-        // the portal mounts its own thin reader in PMS-32.
-        .route("/kb/articles/portal", get(list_portal_articles))
+        // The portal-visible feed lives on the portal tree at
+        // `GET /api/v1/portal/kb`, behind `PortalAuthMiddleware` /
+        // `RequirePortalAuth` and scoped to the authenticated contact's
+        // tenant + company (`KbService::list_portal_articles_for_company`).
+        // It is intentionally NOT mounted here: this agent tree carries
+        // only `RequireKnowledgeBase` (agent) auth, so a route named
+        // "portal" here would either be unreachable by portal tokens or,
+        // worse, expose the portal feed under agent auth that trusts the
+        // caller's own tenant rather than the portal contact's. See
+        // `modules/portal/routes.rs::list_kb`.
         .with_state(state)
 }
 
@@ -168,22 +175,6 @@ async fn list_article_versions(
     let (items, total) = s
         .service
         .list_article_versions(u.tenant_id, id, &pagination)
-        .await?;
-    Ok(Json(PaginatedResponse::from_params(
-        items,
-        &pagination,
-        total,
-    )))
-}
-
-async fn list_portal_articles(
-    State(s): State<KbRouterState>,
-    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
-    Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
-    let (items, total) = s
-        .service
-        .list_portal_articles(u.tenant_id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
