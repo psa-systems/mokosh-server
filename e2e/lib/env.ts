@@ -77,3 +77,36 @@ export const env = {
   },
   foreignCompanyId: optional('E2E_FOREIGN_COMPANY_ID'),
 } as const;
+
+// All env vars the suite cannot run without, in the order an operator
+// would reasonably fill them in. Each entry pairs the var name with a
+// one-line purpose so the aggregated error message names what each
+// missing value is for, not just which key is empty.
+const REQUIRED: Array<{ name: string; purpose: string }> = [
+  { name: 'E2E_EMAIL', purpose: 'login email of the dedicated E2E account' },
+  { name: 'E2E_PASSWORD', purpose: 'password for E2E_EMAIL' },
+  { name: 'E2E_TENANT_ID', purpose: 'UUID of the dedicated E2E tenant' },
+  { name: 'E2E_OIDC_CLIENT_ID', purpose: 'public OIDC client id for the token-flow test' },
+  {
+    name: 'E2E_OIDC_REDIRECT_URI',
+    purpose: 'redirect_uri registered for E2E_OIDC_CLIENT_ID (must match exactly)',
+  },
+];
+
+/// Verify every required env var is present and non-empty. Aggregates ALL
+/// missing names into a single error so the operator sees the full
+/// configuration gap in one round trip instead of fixing-and-rerunning
+/// once per missing key. Called from the `preflight` setup project so it
+/// runs before any other project's tests.
+export function preflightRequiredEnv(): void {
+  const missing = REQUIRED.filter(({ name }) => {
+    const value = process.env[name];
+    return value === undefined || value.trim() === '';
+  });
+  if (missing.length === 0) return;
+  const lines = missing.map(({ name, purpose }) => `  - ${name}: ${purpose}`);
+  throw new Error(
+    `Missing ${missing.length} required env var(s). Set in e2e/.env (local) or as ` +
+      `Forgejo Actions secrets (CI). See e2e/README.md.\n${lines.join('\n')}`,
+  );
+}

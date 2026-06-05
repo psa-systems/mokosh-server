@@ -17,7 +17,7 @@ export default defineConfig({
   expect: { timeout: 15_000 },
   reporter: [['list'], ['html', { open: 'never' }]],
   // No top-level baseURL: SPA vs API have different hosts on the canonical
-  // deployment (msp.a8n.systems vs msp-api.a8n.systems). Each project picks
+  // deployment (msp.a8n.systems vs api.msp.a8n.systems). Each project picks
   // the right one in its own `use:` block.
   use: {
     trace: 'retain-on-failure',
@@ -25,6 +25,13 @@ export default defineConfig({
     video: 'retain-on-failure',
   },
   projects: [
+    // 0. Aggregate-all-missing env-var check. Runs before everything else so
+    //    a misconfigured CI names every gap in one round trip instead of
+    //    dying at the first missing key and forcing a fix-rerun per var.
+    {
+      name: 'preflight',
+      testMatch: /preflight\.setup\.ts$/,
+    },
     // 1. Direct `POST /api/v1/auth/login` against the deployment; persists the
     //    returned access_token to e2e/.auth/token.txt for the api project to
     //    pick up. No browser - the SPA holds tokens in WASM memory so
@@ -33,21 +40,25 @@ export default defineConfig({
     {
       name: 'setup',
       testMatch: /global\.setup\.ts$/,
+      dependencies: ['preflight'],
       use: { baseURL: env.apiBaseURL },
     },
-    // 2. Browser-driven auth/session coverage. Independent of `setup` so its
-    //    logout assertion never invalidates the API token. Drives the SPA
-    //    form and asserts on URL transitions, not request-context API state.
-    //    Uses the SPA host the human-facing app is served on.
+    // 2. Browser-driven auth/session coverage. Does not depend on `setup`
+    //    (it does its own SPA login so its logout assertion never
+    //    invalidates the API token) but does depend on `preflight` so it
+    //    fails clean on a misconfigured CI. Drives the SPA form and asserts
+    //    on URL transitions, not request-context API state. Uses the SPA
+    //    host the human-facing app is served on.
     {
       name: 'auth-ui',
       testMatch: /auth\.spec\.ts$/,
+      dependencies: ['preflight'],
       use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
     },
     // 3. Request-context API coverage. The lib/fixtures.ts custom `test`
     //    fixture loads the bearer token written by `setup` and attaches it
     //    via extraHTTPHeaders on every request. Uses the API host, not the
-    //    SPA host.
+    //    SPA host. Transitively depends on `preflight` via `setup`.
     {
       name: 'api',
       testMatch: /(oidc|tickets|contacts)\.spec\.ts$/,
