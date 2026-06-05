@@ -10,7 +10,11 @@
 //! - restoring a prior version brings its content back as a NEW version
 //! - pg_trgm search finds an article by a fuzzy term
 //! - duplicate per-tenant slug is rejected (409)
-//! - helpful / not_helpful bump the counters
+//! - ratings are per-user, mutually exclusive, and toggleable: one vote
+//!   per account, switching helpful<->not_helpful flips in place, a repeat
+//!   click un-votes, a second user votes independently, and the GET vote
+//!   endpoint reports each caller's current vote (counts never exceed the
+//!   number of distinct voters)
 //!
 //! The portal-visible feed lives on the portal tree at
 //! `GET /api/v1/portal/kb` (behind `PortalAuthMiddleware` /
@@ -469,11 +473,60 @@ async fn duplicate_slug_is_rejected(pool: PgPool) {
     );
 }
 
+/// POST a vote and return the parsed feedback JSON.
+#[allow(dead_code)]
+async fn post_vote(
+    app: &common::TestApp,
+    token: &str,
+    article_id: &str,
+    kind: &str,
+) -> serde_json::Value {
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/kb/articles/{article_id}/{kind}")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send vote");
+    assert!(
+        resp.status().is_success(),
+        "vote {kind} should 2xx, got {}",
+        resp.status()
+    );
+    resp.json().await.expect("vote JSON")
+}
+
+/// GET the caller's current vote + counts.
+#[allow(dead_code)]
+async fn get_vote(app: &common::TestApp, token: &str, article_id: &str) -> serde_json::Value {
+    let resp = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}/vote")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send get vote");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    resp.json().await.expect("get vote JSON")
+}
+
+/// Per-user, mutually exclusive, toggleable rating: one vote per account.
+///
+/// Replaces the old global-counter behavior (clicking twice no longer
+/// inflates the tally). Covers: helpful sets helpful=1/my_vote=helpful;
+/// clicking helpful again un-votes (helpful=0/my_vote absent); switching
+/// helpful->not_helpful leaves helpful=0/not_helpful=1; a second user
+/// votes independently; counts never exceed distinct voters; and the GET
+/// vote endpoint reports each caller's current vote.
 #[sqlx::test]
-async fn helpful_and_not_helpful_increment_counters(pool: PgPool) {
+async fn vote_is_per_user_exclusive_and_toggleable(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    // A second user in the same tenant to prove votes are per-account.
+    let (_u2_id, email2, password2) =
+        common::seed_user(&pool, "voter-two@example.com", "technician").await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
+    let token2 = common::login(&app, &email2, &password2).await;
 
     let article = create_article(
         &app,
@@ -489,48 +542,74 @@ async fn helpful_and_not_helpful_increment_counters(pool: PgPool) {
     assert_eq!(article["helpful_count"].as_i64(), Some(0));
     assert_eq!(article["not_helpful_count"].as_i64(), Some(0));
 
-    // helpful twice -> 2
-    for _ in 0..2 {
-        let resp = app
-            .client
-            .post(app.url(&format!("/api/v1/kb/articles/{article_id}/helpful")))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("send helpful");
-        assert!(resp.status().is_success(), "helpful should 2xx");
-    }
-    // not_helpful once -> 1
-    let resp = app
-        .client
-        .post(app.url(&format!("/api/v1/kb/articles/{article_id}/not_helpful")))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("send not_helpful");
-    assert!(resp.status().is_success(), "not_helpful should 2xx");
-    let feedback: serde_json::Value = resp.json().await.expect("not_helpful JSON");
-    assert_eq!(feedback["not_helpful_count"].as_i64(), Some(1));
+    // GET before voting: no vote, zero counts.
+    let pre = get_vote(&app, &token, &article_id).await;
+    assert_eq!(pre["helpful_count"].as_i64(), Some(0));
+    assert_eq!(pre["not_helpful_count"].as_i64(), Some(0));
+    assert!(pre["my_vote"].is_null(), "no vote yet -> my_vote absent");
 
-    // Independent GET confirms both counters persisted.
+    // User 1 votes helpful -> helpful=1, my_vote=helpful.
+    let v = post_vote(&app, &token, &article_id, "helpful").await;
+    assert_eq!(v["helpful_count"].as_i64(), Some(1));
+    assert_eq!(v["not_helpful_count"].as_i64(), Some(0));
+    assert_eq!(v["my_vote"].as_str(), Some("helpful"));
+
+    // Same user clicks helpful again -> un-votes (helpful=0, my_vote gone).
+    let v = post_vote(&app, &token, &article_id, "helpful").await;
+    assert_eq!(
+        v["helpful_count"].as_i64(),
+        Some(0),
+        "clicking helpful twice should un-vote, not inflate"
+    );
+    assert!(v["my_vote"].is_null(), "un-vote clears my_vote");
+
+    // User 1 votes helpful again, then switches to not_helpful.
+    post_vote(&app, &token, &article_id, "helpful").await;
+    let v = post_vote(&app, &token, &article_id, "not_helpful").await;
+    assert_eq!(
+        v["helpful_count"].as_i64(),
+        Some(0),
+        "switching away from helpful clears the helpful tally"
+    );
+    assert_eq!(v["not_helpful_count"].as_i64(), Some(1));
+    assert_eq!(v["my_vote"].as_str(), Some("not_helpful"));
+
+    // User 2 votes helpful independently -> helpful=1, not_helpful=1.
+    let v = post_vote(&app, &token2, &article_id, "helpful").await;
+    assert_eq!(
+        v["helpful_count"].as_i64(),
+        Some(1),
+        "second user adds an independent helpful vote"
+    );
+    assert_eq!(v["not_helpful_count"].as_i64(), Some(1));
+    assert_eq!(v["my_vote"].as_str(), Some("helpful"));
+
+    // Each user's GET reports only their own vote; counts are stable.
+    let g1 = get_vote(&app, &token, &article_id).await;
+    assert_eq!(g1["my_vote"].as_str(), Some("not_helpful"));
+    assert_eq!(g1["helpful_count"].as_i64(), Some(1));
+    assert_eq!(g1["not_helpful_count"].as_i64(), Some(1));
+    let g2 = get_vote(&app, &token2, &article_id).await;
+    assert_eq!(g2["my_vote"].as_str(), Some("helpful"));
+
+    // Counts never exceed the number of distinct voters (two here).
+    assert!(
+        g1["helpful_count"].as_i64().unwrap() + g1["not_helpful_count"].as_i64().unwrap() <= 2,
+        "total votes must not exceed the two distinct voters"
+    );
+
+    // Independent GET on the article confirms the synced denormalized
+    // caches match the recomputed tallies.
     let get_resp = app
         .client
         .get(app.url(&format!("/api/v1/kb/articles/{article_id}")))
         .bearer_auth(&token)
         .send()
         .await
-        .expect("send get after feedback");
+        .expect("send get after voting");
     let got: serde_json::Value = get_resp.json().await.expect("get JSON");
-    assert_eq!(
-        got["helpful_count"].as_i64(),
-        Some(2),
-        "two helpful clicks should total 2"
-    );
-    assert_eq!(
-        got["not_helpful_count"].as_i64(),
-        Some(1),
-        "one not_helpful click should total 1"
-    );
+    assert_eq!(got["helpful_count"].as_i64(), Some(1));
+    assert_eq!(got["not_helpful_count"].as_i64(), Some(1));
 }
 
 /// Seed a portal-enabled contact under a company and return

@@ -44,10 +44,15 @@ pub fn kb_routes(service: KbService) -> Router {
             "/kb/articles/{id}/versions/{version_number}/restore",
             post(restore_article_version),
         )
-        // Feedback counters (PMS-84). Tenant-scoped; bump and return the
-        // new tallies.
+        // Feedback votes (PMS-84). Tenant-scoped, one vote per user
+        // account, mutually exclusive (helpful XOR not_helpful) and
+        // toggleable: POST records / toggles the caller's vote and
+        // returns the recomputed tallies plus the caller's resulting
+        // `my_vote`. GET reads the caller's current vote + counts without
+        // mutating, so the detail page can render the active thumb on load.
         .route("/kb/articles/{id}/helpful", post(mark_helpful))
         .route("/kb/articles/{id}/not_helpful", post(mark_not_helpful))
+        .route("/kb/articles/{id}/vote", get(get_article_vote))
         // The portal-visible feed lives on the portal tree at
         // `GET /api/v1/portal/kb`, behind `PortalAuthMiddleware` /
         // `RequirePortalAuth` and scoped to the authenticated contact's
@@ -200,7 +205,9 @@ async fn mark_helpful(
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
-    Ok(Json(s.service.increment_helpful(u.tenant_id, id).await?))
+    Ok(Json(
+        s.service.increment_helpful(u.tenant_id, id, u.id).await?,
+    ))
 }
 
 async fn mark_not_helpful(
@@ -209,6 +216,18 @@ async fn mark_not_helpful(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
     Ok(Json(
-        s.service.increment_not_helpful(u.tenant_id, id).await?,
+        s.service
+            .increment_not_helpful(u.tenant_id, id, u.id)
+            .await?,
+    ))
+}
+
+async fn get_article_vote(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<KbArticleFeedbackResponse>> {
+    Ok(Json(
+        s.service.get_article_vote(u.tenant_id, id, u.id).await?,
     ))
 }

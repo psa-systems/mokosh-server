@@ -117,9 +117,16 @@ pub struct KbArticleVersionResponse {
 
 /// Returned by the helpful / not_helpful feedback endpoints so the portal
 /// (or agent UI) can render the updated tallies without a follow-up GET.
+///
+/// `my_vote` is the calling user's current vote on the article AFTER the
+/// toggle (`Some("helpful")`, `Some("not_helpful")`, or `None` if they
+/// have no vote / just un-voted), so the staff KB detail page can render
+/// the active thumb state without a separate lookup.
 #[derive(Debug, Clone, Serialize)]
 pub struct KbArticleFeedbackResponse {
     pub id: Uuid,
     pub helpful_count: i32,
     pub not_helpful_count: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_vote: Option<String>,
 }
