@@ -496,7 +496,8 @@ impl KbService {
         id: Uuid,
         user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
-        self.record_vote(tenant_id, id, user_id, "not_helpful").await
+        self.record_vote(tenant_id, id, user_id, "not_helpful")
+            .await
     }
 
     /// Record (or toggle) one user's vote on a tenant-scoped article and
