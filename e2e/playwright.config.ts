@@ -1,18 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
-import { config as loadEnv } from 'dotenv';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const here = dirname(fileURLToPath(import.meta.url));
-
-// Local runs read e2e/.env; CI injects the same vars from Forgejo secrets, so a
-// missing file is fine (override:false keeps real env winning).
-loadEnv({ path: resolve(here, '.env'), override: false });
-
-// Forgejo Actions passes the empty string for unset secrets, so `??` alone
-// would not fall back. Treat empty/whitespace as missing.
-const rawBaseURL = process.env.E2E_BASE_URL?.trim();
-const baseURL = rawBaseURL && rawBaseURL.length > 0 ? rawBaseURL : 'https://msp.a8n.systems';
+// `lib/env` self-loads e2e/.env (dotenv) on first import so consumers see
+// the populated process.env, and exposes the SPA-vs-API split needed below.
+import { env } from './lib/env';
 
 export default defineConfig({
   testDir: './tests',
@@ -27,8 +16,10 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 15_000 },
   reporter: [['list'], ['html', { open: 'never' }]],
+  // No top-level baseURL: SPA vs API have different hosts on the canonical
+  // deployment (msp.a8n.systems vs msp-api.a8n.systems). Each project picks
+  // the right one in its own `use:` block.
   use: {
-    baseURL,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
@@ -42,22 +33,26 @@ export default defineConfig({
     {
       name: 'setup',
       testMatch: /global\.setup\.ts$/,
+      use: { baseURL: env.apiBaseURL },
     },
     // 2. Browser-driven auth/session coverage. Independent of `setup` so its
     //    logout assertion never invalidates the API token. Drives the SPA
     //    form and asserts on URL transitions, not request-context API state.
+    //    Uses the SPA host the human-facing app is served on.
     {
       name: 'auth-ui',
       testMatch: /auth\.spec\.ts$/,
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
     },
     // 3. Request-context API coverage. The lib/fixtures.ts custom `test`
     //    fixture loads the bearer token written by `setup` and attaches it
-    //    via extraHTTPHeaders on every request.
+    //    via extraHTTPHeaders on every request. Uses the API host, not the
+    //    SPA host.
     {
       name: 'api',
       testMatch: /(oidc|tickets|contacts)\.spec\.ts$/,
       dependencies: ['setup'],
+      use: { baseURL: env.apiBaseURL },
     },
   ],
 });
