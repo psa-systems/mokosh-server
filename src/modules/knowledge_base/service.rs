@@ -472,57 +472,186 @@ impl KbService {
         self.get_article(tenant_id, article_id).await
     }
 
-    /// Increment `helpful_count` for a tenant-scoped article and return
-    /// the updated tallies.
+    /// Record a `helpful` vote for `user_id` on a tenant-scoped article.
+    ///
+    /// Thin wrapper over [`record_vote`](Self::record_vote) so existing
+    /// callers keep a stable name; the toggle / mutual-exclusion semantics
+    /// live in `record_vote`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn increment_helpful(
         &self,
         tenant_id: Uuid,
         id: Uuid,
+        user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
-        self.bump_feedback(tenant_id, id, "helpful_count").await
+        self.record_vote(tenant_id, id, user_id, "helpful").await
     }
 
-    /// Increment `not_helpful_count` for a tenant-scoped article and
-    /// return the updated tallies.
+    /// Record a `not_helpful` vote for `user_id` on a tenant-scoped
+    /// article. Thin wrapper over [`record_vote`](Self::record_vote).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn increment_not_helpful(
         &self,
         tenant_id: Uuid,
         id: Uuid,
+        user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
-        self.bump_feedback(tenant_id, id, "not_helpful_count").await
+        self.record_vote(tenant_id, id, user_id, "not_helpful")
+            .await
     }
 
-    /// Shared body for the two feedback counters. `column` is a fixed
-    /// string literal (`helpful_count` / `not_helpful_count`) chosen by
-    /// the caller, never user input, so interpolating it into the SQL is
-    /// safe. RETURNING gives us the post-increment values for the
-    /// response.
-    async fn bump_feedback(
+    /// Record (or toggle) one user's vote on a tenant-scoped article and
+    /// return the recomputed tallies plus the caller's resulting vote.
+    ///
+    /// One vote per user account, mutually exclusive between `helpful` and
+    /// `not_helpful`, toggleable. In a single transaction:
+    ///
+    /// 1. Resolve the article (tenant-scoped) so a missing / wrong-tenant
+    ///    article is a clean 404 and FK targets are guaranteed to exist.
+    /// 2. Read the user's existing vote, if any.
+    /// 3. Toggle: if it equals `vote`, DELETE the row (un-vote); otherwise
+    ///    UPSERT to `vote` (insert, or flip an opposite vote in place).
+    /// 4. Recompute `helpful` / `not_helpful` as `COUNT(*)` over this
+    ///    table for the article (so counts can never exceed the number of
+    ///    distinct voters).
+    /// 5. Sync the denormalized `kb_articles` counter columns to those
+    ///    recomputed values so list / detail reads stay join-free and the
+    ///    cache cannot drift.
+    ///
+    /// `vote` is always one of the two literals the handlers pass; it is
+    /// bound as a parameter (never interpolated) and the CHECK constraint
+    /// rejects anything else.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn record_vote(
         &self,
         tenant_id: Uuid,
-        id: Uuid,
-        column: &str,
+        article_id: Uuid,
+        user_id: Uuid,
+        vote: &str,
     ) -> AppResult<KbArticleFeedbackResponse> {
-        let sql = format!(
-            r#"UPDATE kb_articles
-               SET {column} = {column} + 1, updated_at = NOW()
-               WHERE tenant_id = $1 AND id = $2
-               RETURNING id, helpful_count, not_helpful_count"#
-        );
-        let row: Option<(Uuid, Option<i32>, Option<i32>)> = sqlx::query_as(&sql)
+        let mut tx = self.db.pool().begin().await?;
+
+        // Tenant-scoped existence check: 404 if the article is missing or
+        // belongs to another tenant.
+        let exists: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM kb_articles WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(article_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Err(AppError::NotFound("KbArticle".to_string()));
+        }
+
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT vote FROM kb_article_votes WHERE article_id = $1 AND user_id = $2",
+        )
+        .bind(article_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let my_vote: Option<String> = if existing.as_deref() == Some(vote) {
+            // Same vote again -> un-vote (toggle off).
+            sqlx::query("DELETE FROM kb_article_votes WHERE article_id = $1 AND user_id = $2")
+                .bind(article_id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            None
+        } else {
+            // New vote, or switch from the opposite vote, in one statement.
+            sqlx::query(
+                r#"INSERT INTO kb_article_votes
+                       (tenant_id, article_id, user_id, vote)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (article_id, user_id)
+                   DO UPDATE SET vote = EXCLUDED.vote, updated_at = NOW()"#,
+            )
             .bind(tenant_id)
-            .bind(id)
-            .fetch_optional(self.db.pool())
+            .bind(article_id)
+            .bind(user_id)
+            .bind(vote)
+            .execute(&mut *tx)
             .await?;
+            Some(vote.to_string())
+        };
+
+        // Recompute both tallies from the votes table (source of truth).
+        let (helpful, not_helpful): (i64, i64) = sqlx::query_as(
+            r#"SELECT
+                   COUNT(*) FILTER (WHERE vote = 'helpful'),
+                   COUNT(*) FILTER (WHERE vote = 'not_helpful')
+               FROM kb_article_votes
+               WHERE article_id = $1"#,
+        )
+        .bind(article_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let helpful = helpful as i32;
+        let not_helpful = not_helpful as i32;
+
+        // Sync the denormalized caches on kb_articles so list / detail
+        // keep showing counts without a join.
+        sqlx::query(
+            r#"UPDATE kb_articles
+               SET helpful_count = $3, not_helpful_count = $4, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(helpful)
+        .bind(not_helpful)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(KbArticleFeedbackResponse {
+            id: article_id,
+            helpful_count: helpful,
+            not_helpful_count: not_helpful,
+            my_vote,
+        })
+    }
+
+    /// Read the current tallies for a tenant-scoped article plus the
+    /// caller's own vote, without mutating anything. Backs
+    /// `GET /kb/articles/{id}/vote` so the client can render the active
+    /// thumb state on load.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_article_vote(
+        &self,
+        tenant_id: Uuid,
+        article_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<KbArticleFeedbackResponse> {
+        let row: Option<(Uuid, Option<i32>, Option<i32>)> = sqlx::query_as(
+            r#"SELECT id, helpful_count, not_helpful_count
+               FROM kb_articles
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .fetch_optional(self.db.pool())
+        .await?;
         let Some((id, helpful, not_helpful)) = row else {
             return Err(AppError::NotFound("KbArticle".to_string()));
         };
+
+        let my_vote: Option<String> = sqlx::query_scalar(
+            "SELECT vote FROM kb_article_votes WHERE article_id = $1 AND user_id = $2",
+        )
+        .bind(article_id)
+        .bind(user_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+
         Ok(KbArticleFeedbackResponse {
             id,
             helpful_count: helpful.unwrap_or(0),
             not_helpful_count: not_helpful.unwrap_or(0),
+            my_vote,
         })
     }
 
