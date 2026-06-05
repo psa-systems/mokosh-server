@@ -169,7 +169,10 @@ async fn backfills_missing_rules_then_is_idempotent(pool: PgPool) {
     got.sort();
     let mut want: Vec<String> = WORKER_EVENTS.iter().map(|s| s.to_string()).collect();
     want.sort();
-    assert_eq!(got, want, "backfilled events must match the worker event set");
+    assert_eq!(
+        got, want,
+        "backfilled events must match the worker event set"
+    );
 
     // Every backfilled rule's template_id points at a template owned by
     // the SAME tenant with a matching (event_type, channel_type) - i.e.
