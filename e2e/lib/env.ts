@@ -55,11 +55,12 @@ export const env = {
   // Where a human browser hits the SPA (login form, dashboard). The auth-ui
   // project navigates here.
   baseURL: spaBaseURL,
-  // Where the JSON API and OIDC endpoints live. The api project, teardown,
-  // and the deploy-sync gate all hit this host. Defaults to prepending
-  // `api.` to E2E_BASE_URL (so `msp.a8n.systems` -> `api.msp.a8n.systems`);
-  // override with E2E_API_BASE_URL when the deployment uses a different
-  // naming scheme.
+  // Where the mokosh PSA JSON API lives. The api project and teardown hit
+  // this host for `/api/v1/*`. Defaults to prepending `api.` to
+  // E2E_BASE_URL (so `msp.a8n.systems` -> `api.msp.a8n.systems`); override
+  // with E2E_API_BASE_URL when the deployment uses a different naming
+  // scheme. OIDC traffic (`/oauth2/*`, `/.well-known/*`) goes to
+  // `opBaseURL` below, which can be a different host on bunyip-as-OP deploys.
   apiBaseURL,
   // Where the OIDC OP (authorize / token / userinfo / discovery) lives.
   // On bunyip-as-OP deploys this is a different host from apiBaseURL
