@@ -37,6 +37,12 @@ pub fn calendar_routes(service: CalendarService) -> Router {
             "/appointments",
             get(list_appointments).post(create_appointment),
         )
+        // PMS-58 range alias: the calendar view fetches the appointment
+        // range (recurring series expanded in-memory) from here. Same
+        // handler as `GET /appointments`; a bounded `from`+`to` triggers
+        // recurrence expansion. Read-only - mutations stay on
+        // `/appointments`.
+        .route("/calendar/appointments", get(list_appointments))
         .route(
             "/appointments/{id}",
             get(get_appointment)
@@ -60,6 +66,51 @@ pub fn calendar_routes(service: CalendarService) -> Router {
         )
         .route("/on-call/now", get(on_call_now))
         .with_state(state)
+}
+
+/// Mount the dispatch board under `/dispatch` (PMS-58). Shares the same
+/// `CalendarService` as the calendar routes; kept as its own router so
+/// `create_api_router` can `nest("/dispatch", ...)` exactly where the
+/// old self-documenting stub lived.
+pub fn dispatch_routes(service: CalendarService) -> Router {
+    let state = CalendarRouterState {
+        service: Arc::new(service),
+    };
+    Router::new()
+        .route("/", get(dispatch_view))
+        .with_state(state)
+}
+
+/// `GET /api/v1/dispatch?from=<rfc3339>&to=<rfc3339>&assigned_to_id=<uuid>`
+///
+/// Aggregated technician dispatch board for a date range: appointments
+/// (recurring series expanded), weekly availability, approved time off,
+/// and current on-call coverage. `from` and `to` are required because
+/// recurring appointments have no natural upper bound.
+async fn dispatch_view(
+    State(s): State<CalendarRouterState>,
+    RequireAuth(u): RequireAuth,
+    Query(f): Query<DispatchFilter>,
+) -> AppResult<Json<DispatchResponse>> {
+    f.validate()?;
+    let (from, to) = match (f.from, f.to) {
+        (Some(from), Some(to)) => (from, to),
+        _ => {
+            return Err(crate::utils::error::AppError::BadRequest(
+                "dispatch view requires both `from` and `to` query parameters".to_string(),
+            ))
+        }
+    };
+    if to < from {
+        return Err(crate::utils::error::AppError::BadRequest(
+            "`to` must be on or after `from`".to_string(),
+        ));
+    }
+    Ok(Json(
+        s.service
+            .dispatch_view(u.tenant_id, from, to, f.assigned_to_id)
+            .await?,
+    ))
 }
 
 /// `GET /api/v1/calendar/events?from=<rfc3339>&to=<rfc3339>`

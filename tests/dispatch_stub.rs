@@ -1,71 +1,69 @@
-//! Integration test for the placeholder-module stub body (F12 / PMS-125).
+//! Integration test for the dispatch board (PMS-58).
 //!
-//! `/api/v1/dispatch` is still a placeholder behind PMS-58. The router
-//! used to respond with a generic `Not implemented yet` envelope; this
-//! test pins the new per-module body so the contract does not silently
-//! regress to the old shape, and so an integrator can rely on the JSON
-//! fields (`module`, `tracking_issue`, `planned_endpoints`, ...) to
-//! find their way to the tracking issue.
+//! `/api/v1/dispatch` used to be a self-documenting 501 placeholder
+//! behind PMS-58. It is now a real aggregating endpoint that combines
+//! appointments (recurring series expanded), weekly availability,
+//! approved time off, and current on-call coverage for a date range.
+//! This test pins the new contract: the four top-level sections must be
+//! present, and the endpoint must no longer return 501.
 
 mod common;
 
-use common::boot;
+use common::{boot, login, seed_admin};
 use sqlx::PgPool;
 
 #[sqlx::test]
-async fn dispatch_stub_returns_self_documenting_501(pool: PgPool) {
+async fn dispatch_returns_aggregated_sections(pool: PgPool) {
+    let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
+
+    // Bounded window is mandatory: recurring appointments have no
+    // natural upper bound, so the handler requires both `from` and `to`.
+    let from = "2026-01-01T00:00:00Z";
+    let to = "2026-01-31T23:59:59Z";
 
     let resp = app
         .client
-        .get(app.url("/api/v1/dispatch"))
+        .get(app.url(&format!("/api/v1/dispatch?from={from}&to={to}")))
+        .bearer_auth(&token)
         .send()
         .await
         .expect("send GET /api/v1/dispatch");
-    assert_eq!(resp.status().as_u16(), 501, "dispatch stub must return 501");
-    let body: serde_json::Value = resp.json().await.expect("dispatch stub JSON body");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "dispatch must return 200, not the old 501 stub"
+    );
+    let body: serde_json::Value = resp.json().await.expect("dispatch JSON body");
 
-    assert_eq!(body["error"], "not_implemented");
-    assert_eq!(body["module"], "dispatch");
-    assert_eq!(body["tracking_issue"], "PMS-58");
-    assert_eq!(body["path"], "/api/v1/dispatch");
-    let tracking_url = body["tracking_url"]
-        .as_str()
-        .expect("tracking_url must be a string");
-    assert!(
-        tracking_url.contains("PMS-58"),
-        "tracking_url must reference the YouTrack key: {tracking_url}"
-    );
-    let endpoints = body["planned_endpoints"]
-        .as_array()
-        .expect("planned_endpoints must be an array");
-    assert!(
-        !endpoints.is_empty(),
-        "planned_endpoints must list at least one entry"
-    );
-    for ep in endpoints {
-        assert!(ep["method"].is_string(), "endpoint missing method: {ep}");
-        assert!(ep["path"].is_string(), "endpoint missing path: {ep}");
-        assert!(ep["summary"].is_string(), "endpoint missing summary: {ep}");
+    // The four aggregated sections must all be present and array-typed,
+    // even when empty (a freshly seeded tenant has no scheduling data).
+    for section in ["appointments", "availability", "time_off", "on_call"] {
+        assert!(
+            body[section].is_array(),
+            "dispatch response must carry an array `{section}`, got {body}"
+        );
     }
 }
 
 #[sqlx::test]
-async fn dispatch_stub_wildcard_subpath_returns_same_payload(pool: PgPool) {
+async fn dispatch_requires_a_bounded_range(pool: PgPool) {
+    let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
 
+    // Missing `to` => 400. Recurrence expansion needs an upper bound.
     let resp = app
         .client
-        .get(app.url("/api/v1/dispatch/board"))
+        .get(app.url("/api/v1/dispatch?from=2026-01-01T00:00:00Z"))
+        .bearer_auth(&token)
         .send()
         .await
-        .expect("send GET /api/v1/dispatch/board");
+        .expect("send GET /api/v1/dispatch without `to`");
     assert_eq!(
         resp.status().as_u16(),
-        501,
-        "dispatch sub-path must also return 501 instead of 404"
+        400,
+        "dispatch without a bounded range must 400"
     );
-    let body: serde_json::Value = resp.json().await.expect("subpath JSON body");
-    assert_eq!(body["module"], "dispatch");
-    assert_eq!(body["path"], "/api/v1/dispatch/board");
 }

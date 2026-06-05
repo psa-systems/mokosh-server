@@ -2,17 +2,34 @@
 //!
 //! Original v0.1.0 surface (`GET /api/v1/calendar/events`) stays; the
 //! PMS-58 story extends it with:
-//! - appointments CRUD (`/appointments`)
+//! - appointments CRUD (`/appointments`) with in-memory RFC 5545
+//!   recurrence expansion on the bounded range query
 //! - user availability windows (`/users/:id/availability`)
 //! - time off (`/time-off`)
 //! - on-call schedules + "who's on call now" (`/on-call-schedules`, `/on-call/now`)
+//! - aggregated dispatch board (`/dispatch`) combining all of the above
+//!   for a date range
+//!
+//! DEFERRED - appointment reminders worker. `appointments.reminder_minutes`
+//! (INT[]) exists in the schema, but a reminder dispatcher needs two
+//! things this module does not yet have: (1) a handle to
+//! `NotificationsService` (the `CalendarService` is constructed with only
+//! a `Database` and threading a notifications handle would churn the
+//! constructor + its single call site), and (2) a per-occurrence
+//! "reminder already sent" marker so the worker does not re-dispatch on
+//! every tick (no such column / table exists - recurring occurrences are
+//! virtual, so there is no row to stamp). Adding the worker without (2)
+//! would spam recipients each tick. Tracked for a follow-up that adds a
+//! `sent_appointment_reminders(appointment_id, occurrence_start, channel)`
+//! ledger plus the notifications handle; at that point the worker fires
+//! `NotificationsService::dispatch(tenant_id, "appointment.reminder", &ctx)`.
 
 pub mod models;
 mod routes;
 pub mod service;
 
 pub use models::*;
-pub use routes::calendar_routes;
+pub use routes::{calendar_routes, dispatch_routes};
 pub use service::CalendarService;
 
 use chrono::{DateTime, Utc};
