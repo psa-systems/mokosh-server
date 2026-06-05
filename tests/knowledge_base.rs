@@ -655,7 +655,16 @@ async fn portal_kb_feed_requires_portal_token_and_scopes_results(pool: PgPool) {
         .expect("seed other-tenant company");
 
     // Fixtures in the contact's tenant.
-    seed_kb_article(&pool, tenant_id, author_id, "pub-art", "public", "published", &[]).await;
+    seed_kb_article(
+        &pool,
+        tenant_id,
+        author_id,
+        "pub-art",
+        "public",
+        "published",
+        &[],
+    )
+    .await;
     seed_kb_article(
         &pool,
         tenant_id,
@@ -676,7 +685,16 @@ async fn portal_kb_feed_requires_portal_token_and_scopes_results(pool: PgPool) {
         &[company_b],
     )
     .await;
-    seed_kb_article(&pool, tenant_id, author_id, "draft-art", "public", "draft", &[]).await;
+    seed_kb_article(
+        &pool,
+        tenant_id,
+        author_id,
+        "draft-art",
+        "public",
+        "draft",
+        &[],
+    )
+    .await;
     // Same-tenant public article that should be visible.
     // A published public article in ANOTHER tenant must never appear.
     seed_kb_article(
@@ -748,7 +766,10 @@ async fn portal_kb_feed_requires_portal_token_and_scopes_results(pool: PgPool) {
         Some(2),
         "company A should see exactly 2 articles: {slugs:?}"
     );
-    assert!(slugs.contains(&"pub-art"), "public article visible: {slugs:?}");
+    assert!(
+        slugs.contains(&"pub-art"),
+        "public article visible: {slugs:?}"
+    );
     assert!(
         slugs.contains(&"a-art"),
         "A's client_specific article visible: {slugs:?}"
