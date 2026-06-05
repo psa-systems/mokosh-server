@@ -9,7 +9,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 // missing file is fine (override:false keeps real env winning).
 loadEnv({ path: resolve(here, '.env'), override: false });
 
-const baseURL = process.env.E2E_BASE_URL ?? 'https://msp.a8n.systems';
+// Forgejo Actions passes the empty string for unset secrets, so `??` alone
+// would not fall back. Treat empty/whitespace as missing.
+const rawBaseURL = process.env.E2E_BASE_URL?.trim();
+const baseURL = rawBaseURL && rawBaseURL.length > 0 ? rawBaseURL : 'https://msp.a8n.systems';
 
 export default defineConfig({
   testDir: './tests',
