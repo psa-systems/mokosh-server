@@ -30,6 +30,10 @@ pub fn billing_routes(service: BillingService) -> Router {
     Router::new()
         .route("/invoices", get(list_invoices).post(create_invoice))
         .route(
+            "/invoices/from-time-entries",
+            axum::routing::post(create_invoice_from_time_entries),
+        )
+        .route(
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
@@ -243,6 +247,24 @@ async fn create_invoice(
     let inv = state
         .service
         .create_invoice(user.tenant_id, &request)
+        .await?;
+    Ok(Json(inv))
+}
+
+/// PMS-33 core: generate an invoice from a company's billable time
+/// entries. Lower-risk than overloading `POST /invoices` (whose body is
+/// a fully-specified line set): this is a distinct, additive route with
+/// its own DTO, so existing invoice-create callers are untouched.
+async fn create_invoice_from_time_entries(
+    State(state): State<BillingRouterState>,
+    RequireAuth(user): RequireAuth,
+    _finance: RequireFinance,
+    Json(request): Json<CreateInvoiceFromTimeEntriesRequest>,
+) -> AppResult<Json<InvoiceResponse>> {
+    request.validate()?;
+    let inv = state
+        .service
+        .create_invoice_from_time_entries(user.tenant_id, &request)
         .await?;
     Ok(Json(inv))
 }
