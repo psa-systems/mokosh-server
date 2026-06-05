@@ -542,6 +542,14 @@ impl TimeTrackingService {
             SET approval_status = 'approved',
                 approved_by_id  = $5,
                 approved_at     = NOW(),
+                -- PMS-144: approval is the billing gate. Flip billable,
+                -- not-yet-billed entries to ready_to_bill so PMS-33's
+                -- create_invoice_from_time_entries (which now consumes only
+                -- ready_to_bill) can pick them up; leave non-billable and
+                -- already-invoiced rows untouched.
+                billing_status  = CASE
+                    WHEN is_billable AND billing_status = 'not_billed'
+                    THEN 'ready_to_bill' ELSE billing_status END,
                 updated_at      = NOW()
             WHERE tenant_id = $1
               AND user_id   = $2
