@@ -40,14 +40,28 @@ const POST_LOGIN_PROBES = ['/dashboard', '/tickets'];
 // the actual SPA traffic pattern, low enough to keep the error readable.
 const URL_SAMPLE_CAP = 30;
 
+// Regex matching the mokosh-apps SPA bundle URL. Each build embeds a content
+// hash in the filename (Vite/Dioxus convention) and the deployed asset is
+// served straight off the OCI image, so the hash uniquely identifies WHICH
+// build of mokosh-apps the browser actually ran. When the setup times out
+// we surface this in the diagnostic so "fix landed on main but staging
+// hasn't redeployed yet" failures are distinguishable from real regressions
+// in seconds rather than after digging into the trace zip.
+const SPA_BUNDLE_RE = /mokosh-apps[-_][a-zA-Z0-9_]+\.(?:js|wasm)$/;
+
 setup('capture bearer from the SPA login', async ({ page }) => {
   let token: string | null = null;
   let tokenSourceUrl: string | null = null;
   const allRequestUrls: string[] = [];
   const bearerRequestUrls: string[] = [];
+  // Asset URLs whose filenames match SPA_BUNDLE_RE, deduplicated. Usually
+  // 1-2 entries (the JS shell + WASM blob). Stored to surface in the
+  // timeout diagnostic.
+  const spaBundleUrls = new Set<string>();
   page.on('request', (req) => {
     const url = req.url();
     allRequestUrls.push(url);
+    if (SPA_BUNDLE_RE.test(url)) spaBundleUrls.add(url);
     const auth = req.headers()['authorization'];
     if (!auth || !auth.toLowerCase().startsWith('bearer ')) return;
     bearerRequestUrls.push(url);
@@ -91,12 +105,21 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     const sample = (arr: string[]) =>
       arr.length === 0 ? '(none)' : arr.slice(-URL_SAMPLE_CAP).join('\n    ');
     const finalUrl = page.url();
+    // SPA build identifier so "fix landed but staging hasn't redeployed"
+    // is obvious from the failure output. Compare the hash in the bundle
+    // URL against the mokosh-apps CI build artifact for the commit on
+    // main; mismatch means the deploy lags.
+    const bundles =
+      spaBundleUrls.size === 0
+        ? '(none observed)'
+        : [...spaBundleUrls].sort().join('\n    ');
     throw new Error(
       [
         'SPA login completed but no request carrying `Authorization: Bearer` ' +
           `fired within 30s.`,
         `  postLoginUrl=${postLoginUrl}`,
         `  finalUrl=${finalUrl}`,
+        `  spaBundles (identifies which mokosh-apps build staging served):\n    ${bundles}`,
         `  urlTrail (last ${URL_SAMPLE_CAP}):\n    ${sample(urlTrail)}`,
         `  Bearer-carrying requests (last ${URL_SAMPLE_CAP}):\n    ${sample(bearerRequestUrls)}`,
         `  ALL requests (last ${URL_SAMPLE_CAP}):\n    ${sample(allRequestUrls)}`,
