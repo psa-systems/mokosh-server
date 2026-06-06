@@ -1829,17 +1829,54 @@ fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
 /// `.`, `_`, or `-` and title-cases the first two segments; the user is
 /// expected to overwrite this later from Settings.
 ///
-/// `(first, last)` falls back to `("User", "")` when the email is
-/// shaped like `…@unresolved.invalid` or otherwise has no usable local
-/// part. Empty strings are still valid VARCHAR values for NOT NULL
-/// columns, so the insert always succeeds.
+/// `(first, last)` falls back to `("Mokosh", "User")` when the email
+/// is shaped like `…@unresolved.invalid` (mokosh-server's own JIT
+/// placeholder, see `ensure_user_from_bunyip`), when the local-part
+/// reads as a UUID (the placeholder is `{sub}@unresolved.invalid`, so
+/// `sub` lands in the local-part), or when the local-part has no
+/// usable segments. Empty strings are still valid VARCHAR values for
+/// NOT NULL columns, so the insert always succeeds.
+///
+/// The earlier version of this helper only checked the segment
+/// splitter; on a UUID local-part like `7fa2b249-6132-4abc-90de-...`
+/// it happily produced first_name = "7fa2b249", last_name = "6132",
+/// which then surfaced on the profile page as a UUID-fragment name.
+/// The fallback name is meant to be a clearly-placeholder string the
+/// user is expected to overwrite from the profile screen.
 #[cfg(feature = "server")]
 fn synthetic_name_from_email(email: &str) -> (String, String) {
-    let local = email.split_once('@').map(|(l, _)| l).unwrap_or(email);
+    const FALLBACK: (&str, &str) = ("Mokosh", "User");
+
+    let (local, domain) = email
+        .split_once('@')
+        .map(|(l, d)| (l, d.to_ascii_lowercase()))
+        .unwrap_or((email, String::new()));
+
+    // mokosh-server's own JIT placeholder: there is no real email here,
+    // so anything we synthesise from the local-part would just look
+    // like the user's bunyip sub. Land on the explicit placeholder.
+    if domain == "unresolved.invalid" {
+        return (FALLBACK.0.to_string(), FALLBACK.1.to_string());
+    }
+
     let parts: Vec<&str> = local
         .split(['.', '_', '-'])
         .filter(|p| !p.is_empty())
         .collect();
+
+    // UUIDs have five hex-only segments at canonical widths 8-4-4-4-12.
+    // If splitting the local-part produced any segment that's hex-only
+    // and at least 4 characters, treat the whole local-part as opaque
+    // (a stray UUID fragment, or some other machine-generated id) and
+    // fall back to the placeholder rather than name the user after a
+    // database id. Real first/last names contain non-hex letters.
+    let looks_like_uuid_fragment = parts
+        .iter()
+        .any(|p| p.len() >= 4 && p.chars().all(|c| c.is_ascii_hexdigit()));
+    if looks_like_uuid_fragment {
+        return (FALLBACK.0.to_string(), FALLBACK.1.to_string());
+    }
+
     let titlecase = |s: &str| {
         let mut chars = s.chars();
         match chars.next() {
@@ -1848,7 +1885,7 @@ fn synthetic_name_from_email(email: &str) -> (String, String) {
         }
     };
     match parts.as_slice() {
-        [] => ("User".to_string(), String::new()),
+        [] => (FALLBACK.0.to_string(), FALLBACK.1.to_string()),
         [one] => (titlecase(one), String::new()),
         [one, two, ..] => (titlecase(one), titlecase(two)),
     }
@@ -1896,5 +1933,48 @@ mod tests {
             !is_allowlisted_email(&[], "admin@niceguyit.biz"),
             "empty allowlist matches nothing"
         );
+    }
+
+    // ── synthetic_name_from_email ──────────────────────────────────────────
+
+    #[test]
+    fn synthetic_name_unresolved_invalid_returns_placeholder() {
+        // The JIT placeholder shape: `{sub}@unresolved.invalid`. The local-
+        // part is the bunyip user uuid and must not surface as a "name".
+        let (first, last) =
+            synthetic_name_from_email("7fa2b249-6132-4abc-90de-1234567890ab@unresolved.invalid");
+        assert_eq!(first, "Mokosh");
+        assert_eq!(last, "User");
+    }
+
+    #[test]
+    fn synthetic_name_uuid_fragment_local_part_returns_placeholder() {
+        // Even if the domain is real, a UUID-shaped local-part is a database
+        // id and must not be split into a "first / last name".
+        let (first, last) =
+            synthetic_name_from_email("7fa2b249-6132-4abc-90de-1234567890ab@example.com");
+        assert_eq!(first, "Mokosh");
+        assert_eq!(last, "User");
+    }
+
+    #[test]
+    fn synthetic_name_normal_first_last() {
+        let (first, last) = synthetic_name_from_email("a contributor.foo@a8n.run");
+        assert_eq!(first, "a contributor");
+        assert_eq!(last, "Foo");
+    }
+
+    #[test]
+    fn synthetic_name_first_only() {
+        let (first, last) = synthetic_name_from_email("a contributor@a8n.run");
+        assert_eq!(first, "a contributor");
+        assert_eq!(last, "");
+    }
+
+    #[test]
+    fn synthetic_name_underscore_separator() {
+        let (first, last) = synthetic_name_from_email("first_last@a8n.run");
+        assert_eq!(first, "First");
+        assert_eq!(last, "Last");
     }
 }
