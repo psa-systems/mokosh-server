@@ -1,21 +1,29 @@
-import { expect, test as setup } from '@playwright/test';
+import { expect, test as setup, type Response as PwResponse } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { TOKEN_FILE } from '../lib/auth-state';
 import { loginViaSpa } from '../lib/login';
 
 // Runs once before the `api` project. Drives the staging SPA login in a real
-// browser, sniffs the FIRST request that carries an `Authorization: Bearer`
-// header (any host, any path), and persists the token for the api project.
+// browser and persists the bunyip-issued at+jwt for the api project.
 //
-// Why "any host"? Post-login the SPA fires `/v1/auth/memberships` against
-// the bunyip hub (api.a8n.systems) FIRST, before any mokosh-server PSA
-// call. Both endpoints accept the same bunyip-issued at+jwt: mokosh-server
-// runs the bunyip-RS verifier (src/modules/auth/middleware.rs:69) and
-// JIT-mirrors the (sub, email) into its own users table on first use. So
-// the bearer attached to the membership request is the same token that
-// authenticates /api/v1/tickets later, and we can capture it on whichever
-// authenticated request fires first.
+// Two capture paths, with the OIDC token-endpoint response as the
+// PRIMARY: it is the source-of-truth for the access_token (the SPA only
+// receives the token via this response) and it fires as part of OIDC
+// itself, so it is observable even when the SPA's own data-fetching
+// layer is broken. The second path - sniffing the FIRST request that
+// carries an `Authorization: Bearer` header - is kept as a backstop
+// for whichever signal arrives first.
+//
+// Why two paths? A bug in the SPA's post-login navigation (mokosh-apps
+// #84) once put the SPA into an infinite-OIDC loop on staging: tokens
+// were exchanged successfully at `/oauth2/token` but the SPA never
+// reached a render where it could fire a Bearer-carrying API call.
+// The bearer-header-only capture timed out, the E2E suite failed, the
+// staging redeploy was gated on E2E, and the SPA fix could not deploy.
+// Reading the response body breaks that cycle: token capture survives
+// even a fully-broken SPA, the suite passes, the fix deploys, and the
+// next run captures via the bearer header normally.
 //
 // Why network sniff and not POST /api/v1/auth/login directly?
 //   - The OP (crates/mokosh-auth-oidc/src/discovery.rs:47) only advertises
@@ -27,8 +35,8 @@ import { loginViaSpa } from '../lib/login';
 //   - The SPA's bearer token lives in WASM thread-local memory
 //     (mokosh-clients/src/hooks/fetch.rs:189), so page.evaluate() cannot
 //     read it.
-// Intercepting the outbound request header is the only path that reuses the
-// real auth flow without registering a new OIDC client or maintaining a
+// Intercepting the OIDC handshake is the only path that reuses the real
+// auth flow without registering a new OIDC client or maintaining a
 // parallel signup pipeline.
 
 // Routes the SPA almost certainly hits on landing. Visiting one of these
@@ -49,6 +57,14 @@ const URL_SAMPLE_CAP = 30;
 // in seconds rather than after digging into the trace zip.
 const SPA_BUNDLE_RE = /mokosh-apps[-_][a-zA-Z0-9_]+\.(?:js|wasm)$/;
 
+// Bunyip's OIDC token endpoint. POST'd by the SPA at the end of the
+// authorization-code flow; the response body is the JSON document the
+// access_token comes out of. Matching by path-only on purpose, so a
+// future move of the OP to a different host does not silently break
+// the capture path - any host that exposes `/oauth2/token` over POST
+// counts.
+const TOKEN_ENDPOINT_RE = /\/oauth2\/token(?:\?|$)/;
+
 setup('capture bearer from the SPA login', async ({ page }) => {
   let token: string | null = null;
   let tokenSourceUrl: string | null = null;
@@ -58,6 +74,11 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   // 1-2 entries (the JS shell + WASM blob). Stored to surface in the
   // timeout diagnostic.
   const spaBundleUrls = new Set<string>();
+  // Token-endpoint responses observed (URL + HTTP status), for the
+  // timeout diagnostic. Empty when OIDC never completed; populated but
+  // non-OK when bunyip rejected the exchange.
+  const tokenEndpointResponses: Array<{ url: string; status: number }> = [];
+
   page.on('request', (req) => {
     const url = req.url();
     allRequestUrls.push(url);
@@ -68,6 +89,33 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     if (token) return;
     token = auth.slice('bearer '.length).trim();
     tokenSourceUrl = url;
+  });
+
+  // PRIMARY capture: read the access_token out of the first successful
+  // `/oauth2/token` response. Survives an SPA that gets the token but
+  // then loops in OIDC instead of firing data fetches. Ignores failed
+  // exchanges and non-JSON bodies; multiple successful exchanges are
+  // also fine - the first wins, which matches the bearer-header path.
+  const tryCaptureFromTokenResponse = async (resp: PwResponse) => {
+    const url = resp.url();
+    if (!TOKEN_ENDPOINT_RE.test(url)) return;
+    tokenEndpointResponses.push({ url, status: resp.status() });
+    if (token) return;
+    if (!resp.ok()) return;
+    let body: unknown;
+    try {
+      body = await resp.json();
+    } catch {
+      return;
+    }
+    if (typeof body !== 'object' || body === null) return;
+    const at = (body as Record<string, unknown>)['access_token'];
+    if (typeof at !== 'string' || at.length === 0) return;
+    token = at;
+    tokenSourceUrl = url;
+  };
+  page.on('response', (resp) => {
+    void tryCaptureFromTokenResponse(resp);
   });
 
   // Track every URL the top frame lands on. On timeout we dump the trail so
@@ -94,14 +142,15 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     await expect
       .poll(() => token, {
         timeout: 30_000,
-        message: 'no request with `Authorization: Bearer` observed after SPA login',
+        message: 'no access_token captured from either /oauth2/token or a Bearer header',
       })
       .not.toBeNull();
   } catch (err) {
     // expect.poll's `message` is a static string, so the dynamic diagnostic
     // gets rebuilt here on the way out. The captured trail tells us whether
     // (a) login actually completed, (b) the SPA fired ANY requests
-    // post-login, and (c) whether any of them carried a Bearer header.
+    // post-login, (c) whether any of them carried a Bearer header, and
+    // (d) whether the OIDC token exchange itself even happened.
     const sample = (arr: string[]) =>
       arr.length === 0 ? '(none)' : arr.slice(-URL_SAMPLE_CAP).join('\n    ');
     const finalUrl = page.url();
@@ -113,13 +162,20 @@ setup('capture bearer from the SPA login', async ({ page }) => {
       spaBundleUrls.size === 0
         ? '(none observed)'
         : [...spaBundleUrls].sort().join('\n    ');
+    const tokenExchanges =
+      tokenEndpointResponses.length === 0
+        ? '(none observed; OIDC token exchange never fired)'
+        : tokenEndpointResponses
+            .slice(-URL_SAMPLE_CAP)
+            .map((r) => `${r.status} ${r.url}`)
+            .join('\n    ');
     throw new Error(
       [
-        'SPA login completed but no request carrying `Authorization: Bearer` ' +
-          `fired within 30s.`,
+        'No access_token captured after SPA login completed (30s timeout).',
         `  postLoginUrl=${postLoginUrl}`,
         `  finalUrl=${finalUrl}`,
         `  spaBundles (identifies which mokosh-apps build staging served):\n    ${bundles}`,
+        `  /oauth2/token responses (status + url, last ${URL_SAMPLE_CAP}):\n    ${tokenExchanges}`,
         `  urlTrail (last ${URL_SAMPLE_CAP}):\n    ${sample(urlTrail)}`,
         `  Bearer-carrying requests (last ${URL_SAMPLE_CAP}):\n    ${sample(bearerRequestUrls)}`,
         `  ALL requests (last ${URL_SAMPLE_CAP}):\n    ${sample(allRequestUrls)}`,
