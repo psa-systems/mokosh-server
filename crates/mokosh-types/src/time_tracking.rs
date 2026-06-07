@@ -89,6 +89,9 @@ pub struct CreateTimeEntryRequest {
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+    /// Optional link to a project task (PMS-51). Approved time against a
+    /// task rolls up into the task's and project's actual hours.
+    pub task_id: Option<Uuid>,
     pub company_id: Uuid,
     pub notes: Option<String>,
     #[serde(default = "default_true")]
@@ -105,6 +108,7 @@ pub struct UpdateTimeEntryRequest {
     pub work_type_id: Option<Uuid>,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
     pub notes: Option<String>,
     pub is_billable: Option<bool>,
     pub hourly_rate: Option<Decimal>,

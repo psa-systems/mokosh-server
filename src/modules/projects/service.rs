@@ -33,20 +33,34 @@ impl ProjectsService {
     ) -> AppResult<(Vec<ProjectResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
-        let mut conditions = vec!["tenant_id = $1".to_string()];
-        let mut idx = 4;
+        // Parallel WHERE clauses so the data and count queries each get
+        // correctly numbered placeholders. The data query has $1 tenant +
+        // $2 limit + $3 offset, so filters bind at $4+; the count query has
+        // $1 tenant only, so filters bind at $2+. (Sharing one clause made
+        // the count query reference $4/$5 with only 3 binds -> 500. Same
+        // bug class as PMS-145.)
+        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        let mut count_conds = vec!["tenant_id = $1".to_string()];
+        let mut data_idx = 4;
+        let mut count_idx = 2;
         if filter.company_id.is_some() {
-            conditions.push(format!("company_id = ${idx}"));
-            idx += 1;
+            data_conds.push(format!("company_id = ${data_idx}"));
+            count_conds.push(format!("company_id = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.status.is_some() {
-            conditions.push(format!("status = ${idx}"));
-            idx += 1;
+            data_conds.push(format!("status = ${data_idx}"));
+            count_conds.push(format!("status = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.project_manager_id.is_some() {
-            conditions.push(format!("project_manager_id = ${idx}"));
+            data_conds.push(format!("project_manager_id = ${data_idx}"));
+            count_conds.push(format!("project_manager_id = ${count_idx}"));
         }
-        let where_clause = conditions.join(" AND ");
+        let where_clause = data_conds.join(" AND ");
+        let count_where = count_conds.join(" AND ");
         // Bare column only (order_by appends the direction); "created_at DESC"
         // produced "... DESC DESC" -> 500 (PMS-145).
         let order_by = pagination.order_by("created_at", &["name", "start_date", "created_at"]);
@@ -55,12 +69,19 @@ impl ProjectsService {
             SELECT id, name, description, project_number, company_id, contract_id,
                    project_type, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
+                   COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
+                             WHERE te.project_id = projects.id
+                               AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                       AS actual_hours,
+                   COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
+                             WHERE te.project_id = projects.id
+                               AND te.approval_status = 'approved'), 0) AS actual_amount,
                    billing_method, hourly_rate, is_billable, created_at, updated_at
             FROM projects WHERE {where_clause}
             ORDER BY {order_by} LIMIT $2 OFFSET $3
             "#
         );
-        let count_query = format!("SELECT COUNT(*) FROM projects WHERE {where_clause}");
+        let count_query = format!("SELECT COUNT(*) FROM projects WHERE {count_where}");
         let mut q = sqlx::query_as::<_, ProjectRow>(&query)
             .bind(tenant_id)
             .bind(limit)
@@ -129,6 +150,13 @@ impl ProjectsService {
             SELECT id, name, description, project_number, company_id, contract_id,
                    project_type, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
+                   COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
+                             WHERE te.project_id = projects.id
+                               AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                       AS actual_hours,
+                   COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
+                             WHERE te.project_id = projects.id
+                               AND te.approval_status = 'approved'), 0) AS actual_amount,
                    billing_method, hourly_rate, is_billable, created_at, updated_at
             FROM projects WHERE tenant_id = $1 AND id = $2
             "#,
@@ -441,7 +469,12 @@ impl ProjectsService {
 
         let rows = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
-                      priority, assigned_to_id, estimated_hours, actual_hours, start_date,
+                      priority, assigned_to_id, estimated_hours,
+                      COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
+                                WHERE te.task_id = tasks.id
+                                  AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                          AS actual_hours,
+                      start_date,
                       due_date, completed_at, sort_order
                FROM tasks WHERE tenant_id = $1 AND project_id = $2 ORDER BY sort_order, created_at
                LIMIT $3 OFFSET $4"#,
@@ -492,7 +525,12 @@ impl ProjectsService {
     pub async fn get_task(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TaskResponse> {
         let row = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
-                      priority, assigned_to_id, estimated_hours, actual_hours, start_date,
+                      priority, assigned_to_id, estimated_hours,
+                      COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
+                                WHERE te.task_id = tasks.id
+                                  AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                          AS actual_hours,
+                      start_date,
                       due_date, completed_at, sort_order
                FROM tasks WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -524,10 +562,9 @@ impl ProjectsService {
                   priority = COALESCE($7, priority),
                   assigned_to_id = COALESCE($8, assigned_to_id),
                   estimated_hours = COALESCE($9, estimated_hours),
-                  actual_hours = COALESCE($10, actual_hours),
-                  start_date = COALESCE($11, start_date),
-                  due_date = COALESCE($12, due_date),
-                  sort_order = COALESCE($13, sort_order),
+                  start_date = COALESCE($10, start_date),
+                  due_date = COALESCE($11, due_date),
+                  sort_order = COALESCE($12, sort_order),
                   completed_at = CASE
                       WHEN $5::uuid IS NOT NULL AND EXISTS (
                           SELECT 1 FROM task_statuses ts
@@ -548,7 +585,6 @@ impl ProjectsService {
         .bind(&request.priority)
         .bind(request.assigned_to_id)
         .bind(request.estimated_hours)
-        .bind(request.actual_hours)
         .bind(request.start_date)
         .bind(request.due_date)
         .bind(request.sort_order)
@@ -661,6 +697,8 @@ struct ProjectRow {
     actual_end_date: Option<chrono::NaiveDate>,
     budget_hours: Option<Decimal>,
     budget_amount: Option<Decimal>,
+    actual_hours: Decimal,
+    actual_amount: Decimal,
     billing_method: Option<String>,
     hourly_rate: Option<Decimal>,
     is_billable: Option<bool>,
@@ -685,6 +723,8 @@ impl From<ProjectRow> for ProjectResponse {
             actual_end_date: r.actual_end_date,
             budget_hours: r.budget_hours,
             budget_amount: r.budget_amount,
+            actual_hours: r.actual_hours,
+            actual_amount: r.actual_amount,
             billing_method: r
                 .billing_method
                 .unwrap_or_else(|| "time_and_materials".into()),
