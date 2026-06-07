@@ -22,6 +22,13 @@ pub struct ProjectResponse {
     pub actual_end_date: Option<NaiveDate>,
     pub budget_hours: Option<Decimal>,
     pub budget_amount: Option<Decimal>,
+    /// Actual hours rolled up from approved time entries on this project
+    /// (PMS-51 AC1). Derived on read; pair with `budget_hours` for
+    /// budget-vs-actual. Zero when no approved time is logged.
+    pub actual_hours: Decimal,
+    /// Actual billed/billable amount from approved time entries on this
+    /// project. Pair with `budget_amount`.
+    pub actual_amount: Decimal,
     pub billing_method: String,
     pub hourly_rate: Option<Decimal>,
     pub is_billable: bool,
@@ -153,6 +160,8 @@ pub struct TaskResponse {
     pub priority: String,
     pub assigned_to_id: Option<Uuid>,
     pub estimated_hours: Option<Decimal>,
+    /// Actual hours rolled up from approved time entries linked to this
+    /// task (PMS-51 AC5). Derived on read, not settable directly.
     pub actual_hours: Option<Decimal>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
@@ -192,7 +201,6 @@ pub struct UpdateTaskRequest {
     pub priority: Option<String>,
     pub assigned_to_id: Option<Uuid>,
     pub estimated_hours: Option<Decimal>,
-    pub actual_hours: Option<Decimal>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
     pub sort_order: Option<i32>,

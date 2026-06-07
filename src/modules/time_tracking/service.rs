@@ -289,8 +289,8 @@ impl TimeTrackingService {
             INSERT INTO time_entries (
                 id, tenant_id, user_id, date, start_time, end_time,
                 duration_minutes, work_type_id, ticket_id, project_id,
-                company_id, notes, is_billable, hourly_rate, total_amount
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                company_id, notes, is_billable, hourly_rate, total_amount, task_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             "#,
         )
         .bind(id)
@@ -308,6 +308,7 @@ impl TimeTrackingService {
         .bind(request.is_billable)
         .bind(hourly_rate)
         .bind(total)
+        .bind(request.task_id)
         .execute(pool)
         .await?;
         self.get_time_entry(tenant_id, id).await
@@ -373,6 +374,7 @@ impl TimeTrackingService {
                 is_billable       = COALESCE($11, is_billable),
                 hourly_rate       = $12,
                 total_amount      = $13,
+                task_id           = $14,
                 updated_at        = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -390,6 +392,7 @@ impl TimeTrackingService {
         .bind(request.is_billable)
         .bind(hourly_rate)
         .bind(total)
+        .bind(request.task_id)
         .execute(self.db.pool())
         .await?
         .rows_affected();
