@@ -18,6 +18,7 @@ use validator::Validate;
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
 use super::{CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse};
+use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::tickets::{TicketResponse, TicketService};
 use crate::utils::error::AppResult;
@@ -28,16 +29,23 @@ pub struct PortalRouterState {
     pub service: Arc<PortalAuthService>,
     pub tickets: Arc<TicketService>,
     pub kb: Arc<KbService>,
+    pub billing: Arc<BillingService>,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
 /// at the outermost layer so every handler sees either a valid
 /// `PortalAuthState` or the default (unauthenticated) one.
-pub fn portal_routes(service: PortalAuthService, tickets: TicketService, kb: KbService) -> Router {
+pub fn portal_routes(
+    service: PortalAuthService,
+    tickets: TicketService,
+    kb: KbService,
+    billing: BillingService,
+) -> Router {
     let state = PortalRouterState {
         service: Arc::new(service.clone()),
         tickets: Arc::new(tickets),
         kb: Arc::new(kb),
+        billing: Arc::new(billing),
     };
     let mw = PortalAuthMiddleware::new(service);
 
@@ -73,26 +81,48 @@ async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<Cur
 }
 
 async fn list_invoices(
-    RequirePortalAuth(_contact): RequirePortalAuth,
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
     Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<serde_json::Value>>> {
-    // Auth is enforced (RequirePortalAuth) so unauthenticated callers
-    // still get 401 instead of an empty 200, but the read itself is a
-    // stub until the billing module (PMS-33 story) lands. Returns an
-    // empty page so the portal frontend can render its "no invoices
-    // yet" empty state without a follow-up branch on 501.
-    Ok(Json(PaginatedResponse::from_params(vec![], &pagination, 0)))
+) -> AppResult<Json<PaginatedResponse<InvoiceResponse>>> {
+    // PMS-33 has landed: serve the contact's company invoices. The
+    // company scope is forced from the authenticated `CurrentContact`
+    // (never a query param), so a contact only ever sees its own
+    // company's invoices.
+    let filter = InvoiceFilter {
+        company_id: Some(contact.company_id),
+        ..Default::default()
+    };
+    let (items, total) = state
+        .billing
+        .list_invoices(contact.tenant_id, &filter, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 async fn get_invoice(
-    RequirePortalAuth(_contact): RequirePortalAuth,
-    Path(_invoice_id): Path<Uuid>,
-) -> AppResult<Json<serde_json::Value>> {
-    // Same shape as list_invoices: 401 for unauth callers, 404 for
-    // everyone else, until billing lands.
-    Err(crate::utils::error::AppError::NotFound(
-        "Invoice".to_string(),
-    ))
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<InvoiceResponse>> {
+    // Read within the contact's tenant, then enforce the company scope
+    // in code: an invoice belonging to another company in the same
+    // tenant returns 404 (not 403) so the portal never confirms the
+    // existence of another company's invoice.
+    let invoice = state
+        .billing
+        .get_invoice(contact.tenant_id, invoice_id)
+        .await?;
+    if invoice.company_id != contact.company_id {
+        return Err(crate::utils::error::AppError::NotFound(
+            "Invoice".to_string(),
+        ));
+    }
+    Ok(Json(invoice))
 }
 
 async fn list_kb(
