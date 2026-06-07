@@ -1,25 +1,23 @@
-import { expect, test } from '../lib/fixtures';
+import { expect, oidcTest as test } from '../lib/fixtures';
 import { discoverOidc, makePkce, randomToken } from '../lib/api';
 import { env } from '../lib/env';
 
-// OIDC authorization-code + PKCE flow (AC coverage area 2), driven entirely by
-// request context. /oauth2/authorize is supposed to issue a code for an
+// OIDC authorization-code + PKCE flow (AC coverage area 2), driven entirely
+// by request context. /oauth2/authorize is supposed to issue a code for an
 // already-authenticated OP session; the code is captured from the 302
 // Location WITHOUT following the redirect.
 //
-// PMS-140 phase-1 quarantine: the api project's request context only carries
-// a Bearer header, not the bunyip OP session cookie (PR #102 dropped
-// storageState because mokosh PSA auth is Bearer-only). With no OP session
-// cookie, bunyip 302s `/oauth2/authorize` to its OWN login screen instead
-// of to the registered redirect_uri, so `state` and `code` come back null.
-//
-// This test exercises bunyip-OP behaviour, not mokosh-server's RS path -
-// mokosh-server's bunyip-RS verifier is already covered indirectly by every
-// other api test (each one relies on it to accept the bunyip-issued bearer).
-// Fixme until we either capture+replay OP cookies in setup or drive the OIDC
-// flow through a real browser. Revisit alongside the auth-ui test.
+// PMS-143: uses the `oidcTest` fixture instead of the default `test`. The
+// fixture replays the OP session cookies that setup persists to
+// `e2e/.auth/op-state.json` via `request.newContext({ storageState })`
+// and deliberately omits the bearer header (bunyip's authorize handler
+// reads the OP session from the cookie; an inbound bearer with the wrong
+// audience would just be noise). Mokosh-server's bunyip-RS verifier is
+// covered indirectly by every other api test, so this test is here to
+// assert the full OP token-flow contract against staging, not to
+// exercise mokosh's RS path.
 test.describe('OIDC token flow', () => {
-  test.fixme('authorize -> token -> userinfo -> refresh', async ({ request }) => {
+  test('authorize -> token -> userinfo -> refresh', async ({ request }) => {
     const oidc = await discoverOidc(request, env.opBaseURL);
     const pkce = makePkce();
     const state = randomToken();
@@ -41,12 +39,33 @@ test.describe('OIDC token flow', () => {
     }).toString();
 
     const authRes = await request.get(authorizeUrl.toString(), { maxRedirects: 0 });
-    expect(
-      [301, 302, 303, 307, 308],
-      `authorize should 3xx-redirect with a code; got ${authRes.status()}. ` +
-        `If it redirected to a login screen the OP session was not accepted - ` +
-        `provision a dedicated E2E OIDC client (see e2e/README.md).`,
-    ).toContain(authRes.status());
+    const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+    if (!REDIRECT_STATUSES.includes(authRes.status())) {
+      // Surface bunyip's actual rejection so the failure names a root cause
+      // instead of just an unexpected status. Most likely causes on a 4xx:
+      //   - 400 invalid_request: redirect_uri does not match a value the
+      //     OIDC client registered, OR client_id is not a valid UUID, OR
+      //     scope omitted `openid`. Bunyip's body includes the specific
+      //     error code.
+      //   - 400 unknown client_id: the configured `E2E_OIDC_CLIENT_ID` is
+      //     not registered on this deploy.
+      //   - 302 to `/login?...`: OP session cookie not accepted (the cookie
+      //     captured by setup is wrong, expired, or scoped to the wrong
+      //     host). Verify setup logged the expected `bunyip_op_session`
+      //     cookie domain.
+      const body = await authRes.text().catch(() => '(unreadable body)');
+      const contentType = authRes.headers()['content-type'] ?? '(no content-type)';
+      throw new Error(
+        [
+          `authorize should 3xx-redirect with a code; got ${authRes.status()}.`,
+          `  client_id=${env.oidcClientId}`,
+          `  redirect_uri=${env.oidcRedirectUri}`,
+          `  content-type=${contentType}`,
+          `  body (first 2000 chars):`,
+          `    ${body.slice(0, 2000).replace(/\n/g, '\n    ')}`,
+        ].join('\n'),
+      );
+    }
 
     const location = authRes.headers()['location'];
     expect(location, 'authorize 3xx had no Location header').toBeTruthy();

@@ -10,7 +10,7 @@ gate (that is PMS-141).
 | Area | File | How |
 | --- | --- | --- |
 | Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form (TOTP-aware), opens the avatar menu, clicks Logout, asserts URL returns to the hub's `/login` (**quarantined - `test.fixme`**; PMS-148: after the PMS-142 v2 un-fixme merged, post-merge CI exposed a separate failure mode where the auth-ui project's login deterministically stalls when run after `setup` finishes - form submit click no-op's, URL stays on the hub `/login`. Bunyip's `/logout` fix from BUNYIP-53 IS deployed; this is a different problem) |
-| OIDC token flow | `tests/oidc.spec.ts` | request context: `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE) (**quarantined - `test.fixme`**; bunyip's `/oauth2/authorize` needs an OP session cookie the request context does not carry, so it 302s to the hub login instead of the registered redirect. Mokosh-server's RS path is exercised indirectly by every other api test) |
+| OIDC token flow | `tests/oidc.spec.ts` | request context with replayed OP session cookies (from `e2e/.auth/op-state.json`, written by setup): `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE). Asserts the full OP contract; mokosh-server's RS path is exercised indirectly by every other api test |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
 
@@ -22,14 +22,17 @@ which Playwright's `storageState` cannot replay; and direct
 exist in mokosh's local `users` table):
 
 - **`setup` project** (`tests/global.setup.ts`) drives the SPA login in a
-  real browser (TOTP-aware), then listens for the first outbound request
-  carrying an `Authorization: Bearer` header (any host - the SPA's first
-  authenticated call lands on the bunyip hub's `/v1/auth/memberships`, and
-  the same bearer authenticates mokosh's RS-verified `/api/v1/*`). The
-  captured token is written to `e2e/.auth/token.txt`. The `api` project
-  (`oidc`, `tickets`, `contacts`) uses a custom `test` fixture
-  (`lib/fixtures.ts`) that injects the token as `Authorization: Bearer ...`
-  on every request. Teardown reads the same file.
+  real browser (TOTP-aware), then writes two artifacts: (a) the
+  bunyip-issued bearer to `e2e/.auth/token.txt`, captured from the first
+  outbound `Authorization: Bearer` header (any host - the SPA's first
+  authenticated call lands on the bunyip hub's `/v1/auth/memberships`,
+  and the same bearer authenticates mokosh's RS-verified `/api/v1/*`);
+  and (b) the OP session cookies to `e2e/.auth/op-state.json`, filtered
+  to the OP host and its parent domain. The `api` project consumes both:
+  `lib/fixtures.ts` exports a default `test` (injects the bearer header
+  for PSA-API specs like `tickets`, `contacts`) and an `oidcTest`
+  (replays the OP cookies via `storageState`, no bearer header, used by
+  `tests/oidc.spec.ts`). Teardown reads `token.txt` only.
 - **`auth-ui` project** (`tests/auth.spec.ts`) drives the SPA login form in
   a real browser and asserts on URL transitions (login leaves `/login`,
   logout returns to it). DOM-only, no API probe - the SPA's in-memory token
