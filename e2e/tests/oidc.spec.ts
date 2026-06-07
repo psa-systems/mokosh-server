@@ -39,12 +39,33 @@ test.describe('OIDC token flow', () => {
     }).toString();
 
     const authRes = await request.get(authorizeUrl.toString(), { maxRedirects: 0 });
-    expect(
-      [301, 302, 303, 307, 308],
-      `authorize should 3xx-redirect with a code; got ${authRes.status()}. ` +
-        `If it redirected to a login screen the OP session was not accepted - ` +
-        `provision a dedicated E2E OIDC client (see e2e/README.md).`,
-    ).toContain(authRes.status());
+    const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+    if (!REDIRECT_STATUSES.includes(authRes.status())) {
+      // Surface bunyip's actual rejection so the failure names a root cause
+      // instead of just an unexpected status. Most likely causes on a 4xx:
+      //   - 400 invalid_request: redirect_uri does not match a value the
+      //     OIDC client registered, OR client_id is not a valid UUID, OR
+      //     scope omitted `openid`. Bunyip's body includes the specific
+      //     error code.
+      //   - 400 unknown client_id: the configured `E2E_OIDC_CLIENT_ID` is
+      //     not registered on this deploy.
+      //   - 302 to `/login?...`: OP session cookie not accepted (the cookie
+      //     captured by setup is wrong, expired, or scoped to the wrong
+      //     host). Verify setup logged the expected `bunyip_op_session`
+      //     cookie domain.
+      const body = await authRes.text().catch(() => '(unreadable body)');
+      const contentType = authRes.headers()['content-type'] ?? '(no content-type)';
+      throw new Error(
+        [
+          `authorize should 3xx-redirect with a code; got ${authRes.status()}.`,
+          `  client_id=${env.oidcClientId}`,
+          `  redirect_uri=${env.oidcRedirectUri}`,
+          `  content-type=${contentType}`,
+          `  body (first 2000 chars):`,
+          `    ${body.slice(0, 2000).replace(/\n/g, '\n    ')}`,
+        ].join('\n'),
+      );
+    }
 
     const location = authRes.headers()['location'];
     expect(location, 'authorize 3xx had no Location header').toBeTruthy();
