@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use chrono::NaiveDate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::service::*;
@@ -21,11 +21,30 @@ pub struct ReportsRouterState {
     pub service: Arc<ReportsService>,
 }
 
+/// One parameter a report accepts.
+#[derive(Serialize)]
+struct ParamSpec {
+    name: &'static str,
+    /// `date` | `uuid`
+    kind: &'static str,
+    required: bool,
+}
+
+/// A discoverable report type and its parameter schema (PMS-93 AC1).
+#[derive(Serialize)]
+struct ReportDescriptor {
+    key: &'static str,
+    name: &'static str,
+    description: &'static str,
+    parameters: Vec<ParamSpec>,
+}
+
 pub fn reports_routes(service: ReportsService) -> Router {
     let state = ReportsRouterState {
         service: Arc::new(service),
     };
     Router::new()
+        .route("/reports", get(list_reports))
         .route("/reports/dashboard", get(dashboard))
         .route("/reports/tickets", get(tickets_report))
         .route("/reports/time", get(time_report))
@@ -38,6 +57,51 @@ pub fn reports_routes(service: ReportsService) -> Router {
 struct DateRange {
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
+}
+
+/// Registry of available report types and their parameter schemas, so a
+/// client can discover what it can run (PMS-93 AC1).
+async fn list_reports(
+    RequireReports { .. }: RequireReports,
+) -> AppResult<Json<Vec<ReportDescriptor>>> {
+    let date = |name, required| ParamSpec {
+        name,
+        kind: "date",
+        required,
+    };
+    Ok(Json(vec![
+        ReportDescriptor {
+            key: "dashboard",
+            name: "Operations Dashboard",
+            description:
+                "Open tickets by priority, SLA at-risk / breached, and the 30-day ticket trend.",
+            parameters: vec![],
+        },
+        ReportDescriptor {
+            key: "tickets",
+            name: "Ticket Volume & SLA",
+            description:
+                "Tickets opened by status, total closed, and opened-by-assignee for a date range.",
+            parameters: vec![date("from", false), date("to", false)],
+        },
+        ReportDescriptor {
+            key: "time",
+            name: "Technician Utilization",
+            description: "Logged minutes by user and by work type for a date range.",
+            parameters: vec![date("from", false), date("to", false)],
+        },
+        ReportDescriptor {
+            key: "billing",
+            name: "Revenue & A/R Aging",
+            description:
+                "Invoiced / paid / outstanding totals and A/R aging buckets. Manager only.",
+            parameters: vec![ParamSpec {
+                name: "company_id",
+                kind: "uuid",
+                required: false,
+            }],
+        },
+    ]))
 }
 
 async fn dashboard(
