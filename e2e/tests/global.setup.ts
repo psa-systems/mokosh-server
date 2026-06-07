@@ -1,5 +1,6 @@
 import { expect, test as setup, type Response as PwResponse } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { dirname } from 'node:path';
 import { OP_STORAGE_STATE_FILE, TOKEN_FILE } from '../lib/auth-state';
 import { env } from '../lib/env';
@@ -229,13 +230,18 @@ setup('capture bearer from the SPA login', async ({ page }) => {
 // Compute the set of cookie-domain values the OIDC test cares about, given
 // the configured OP base URL. Includes the OP host itself plus the
 // immediate parent domain (so e.g. `api.a8n.systems` yields both
-// `api.a8n.systems` and `a8n.systems`). Single-label hosts return just
-// themselves; we deliberately do NOT walk up to a TLD because that would
-// admit cookies the OP and hub don't share with us.
+// `api.a8n.systems` and `a8n.systems`). Single-label hosts (`localhost`)
+// and IP literals return just themselves: stripping a leading label off
+// `127.0.0.1` produces the bogus `0.0.1`, which would match no real
+// cookie but would clutter the diagnostic line. We deliberately do NOT
+// walk up to a TLD because that would admit cookies the OP and hub do
+// not share with us.
 function computeOpCookieDomains(opUrl: string): Set<string> {
   const host = new URL(opUrl).hostname;
   const domains = new Set<string>([host]);
-  const parts = host.split('.');
-  if (parts.length > 2) domains.add(parts.slice(1).join('.'));
+  if (isIP(host) === 0) {
+    const parts = host.split('.');
+    if (parts.length > 2) domains.add(parts.slice(1).join('.'));
+  }
   return domains;
 }
