@@ -18,8 +18,16 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // `logout()` defend the Dioxus WASM hydration race (a visible avatar
 // button does not mean its onclick handler has been wired up yet). Do
 // not remove either without a replacement.
+//
+// PMS-148: re-fixme'd after the PMS-142 v2 un-fixme (PR #130) merged and
+// the post-merge CI run exposed a NEW failure mode unrelated to the
+// original BUNYIP-53 /logout bug (which is now fixed and deployed). The
+// auth-ui project's login deterministically stalls when run after the
+// `setup` project finishes: the form submit click no-op's (no POST in
+// the request log), URL stuck at the hub `/login`. Setup's login in the
+// same run succeeds. Tracking the diagnostic-first plan in PMS-148.
 test.describe('auth login / session', () => {
-  test('login + logout round-trip', async ({ page }) => {
+  test.fixme('login + logout round-trip', async ({ page }) => {
     const diag = attachPageDiagnostics(page);
 
     try {

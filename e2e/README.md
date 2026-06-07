@@ -9,7 +9,7 @@ gate (that is PMS-141).
 
 | Area | File | How |
 | --- | --- | --- |
-| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form (TOTP-aware), opens the avatar menu, clicks Logout, asserts URL returns to the hub's `/login` |
+| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form (TOTP-aware), opens the avatar menu, clicks Logout, asserts URL returns to the hub's `/login` (**quarantined - `test.fixme`**; PMS-148: after the PMS-142 v2 un-fixme merged, post-merge CI exposed a separate failure mode where the auth-ui project's login deterministically stalls when run after `setup` finishes - form submit click no-op's, URL stays on the hub `/login`. Bunyip's `/logout` fix from BUNYIP-53 IS deployed; this is a different problem) |
 | OIDC token flow | `tests/oidc.spec.ts` | request context: `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE) (**quarantined - `test.fixme`**; bunyip's `/oauth2/authorize` needs an OP session cookie the request context does not carry, so it 302s to the hub login instead of the registered redirect. Mokosh-server's RS path is exercised indirectly by every other api test) |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
@@ -35,7 +35,8 @@ exist in mokosh's local `users` table):
   logout returns to it). DOM-only, no API probe - the SPA's in-memory token
   cannot be exfiltrated for an external request context to use. Captures a
   URL trail + request log via `lib/page-diagnostics.ts` and folds them into
-  the thrown error on failure.
+  the thrown error on failure. Currently `test.fixme` pending PMS-148 (see
+  "What it covers" above).
 
 ## Required configuration
 
