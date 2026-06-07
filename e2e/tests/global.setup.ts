@@ -1,7 +1,8 @@
 import { expect, test as setup, type Response as PwResponse } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { TOKEN_FILE } from '../lib/auth-state';
+import { OP_STORAGE_STATE_FILE, TOKEN_FILE } from '../lib/auth-state';
+import { env } from '../lib/env';
 import { loginViaSpa } from '../lib/login';
 
 // Runs once before the `api` project. Drives the staging SPA login in a real
@@ -187,4 +188,54 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   console.log(`[setup] captured bearer from ${tokenSourceUrl}`);
   mkdirSync(dirname(TOKEN_FILE), { recursive: true });
   writeFileSync(TOKEN_FILE, token!);
+
+  // Persist the OP session cookies so the OIDC token-flow test
+  // (`tests/oidc.spec.ts`) can replay them via `request.newContext({
+  // storageState })`. Bunyip's `/oauth2/authorize` gates code minting on
+  // a server-validated OP session cookie (bunyip PR #67); without these
+  // cookies authorize 302s to the hub login screen instead of to the
+  // registered redirect_uri.
+  //
+  // Filter to the OP host and its parent domain. Cookies on bunyip-as-OP
+  // deploys are split: the OP-session cookie lives on the OP host
+  // (e.g. `api.a8n.systems`) while the hub access/refresh cookies live
+  // on the apex (`a8n.systems`). Including both covers the authorize
+  // path completely without sweeping in unrelated cookies (font CDNs,
+  // analytics, etc.) that would just bloat the file. Normalise
+  // leading-dot domains before comparing so `.a8n.systems` matches
+  // `a8n.systems` as expected.
+  const opCookieDomains = computeOpCookieDomains(env.opBaseURL);
+  const allCookies = await page.context().cookies();
+  const opCookies = allCookies.filter((c) => {
+    const d = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+    return opCookieDomains.has(d);
+  });
+  if (opCookies.length === 0) {
+    throw new Error(
+      `No OP cookies matched ${[...opCookieDomains].join(', ')} after login. ` +
+        `Browser had ${allCookies.length} cookie(s) total: ` +
+        `${allCookies.map((c) => `${c.domain}${c.path}#${c.name}`).join(', ') || '(none)'}.`,
+    );
+  }
+  writeFileSync(
+    OP_STORAGE_STATE_FILE,
+    JSON.stringify({ cookies: opCookies, origins: [] }, null, 2),
+  );
+  console.log(
+    `[setup] persisted ${opCookies.length} OP cookie(s) (${[...opCookieDomains].join(', ')}) to ${OP_STORAGE_STATE_FILE}`,
+  );
 });
+
+// Compute the set of cookie-domain values the OIDC test cares about, given
+// the configured OP base URL. Includes the OP host itself plus the
+// immediate parent domain (so e.g. `api.a8n.systems` yields both
+// `api.a8n.systems` and `a8n.systems`). Single-label hosts return just
+// themselves; we deliberately do NOT walk up to a TLD because that would
+// admit cookies the OP and hub don't share with us.
+function computeOpCookieDomains(opUrl: string): Set<string> {
+  const host = new URL(opUrl).hostname;
+  const domains = new Set<string>([host]);
+  const parts = host.split('.');
+  if (parts.length > 2) domains.add(parts.slice(1).join('.'));
+  return domains;
+}
