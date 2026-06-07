@@ -125,6 +125,19 @@ pub struct ConfigurationItemResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// List view of a configuration item. Deliberately omits the secret
+/// `value` so the encrypted payload is never leaked in a list; fetch the
+/// single-item reveal endpoint (audited) to decrypt it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigurationItemSummary {
+    pub id: Uuid,
+    pub asset_id: Uuid,
+    pub name: String,
+    pub category: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertConfigurationItemRequest {
     #[validate(length(min = 1, max = 100))]
@@ -145,6 +158,22 @@ pub struct CredentialResponse {
     pub password: String,
     pub url: Option<String>,
     pub notes: Option<String>,
+    pub last_rotated: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// List view of a vault credential. Deliberately omits `username`,
+/// `password`, and `notes` (all encrypted at rest) so secrets are never
+/// leaked in a list; fetch the single-credential reveal endpoint
+/// (audited) to decrypt them.
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub company_id: Option<Uuid>,
+    pub asset_id: Option<Uuid>,
+    pub credential_type: String,
+    pub url: Option<String>,
     pub last_rotated: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

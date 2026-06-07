@@ -412,12 +412,15 @@ impl AssetsService {
 
     // PMS-76 configuration items ---------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// List configuration items WITHOUT decrypting their values. The
+    /// encrypted secret never appears in a list; callers reveal a single
+    /// item via `reveal_configuration_item` (audited).
     pub async fn list_configuration_items(
         &self,
         tenant_id: Uuid,
         asset_id: Uuid,
         pagination: &PaginationParams,
-    ) -> AppResult<(Vec<ConfigurationItemResponse>, u64)> {
+    ) -> AppResult<(Vec<ConfigurationItemSummary>, u64)> {
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM configuration_items WHERE tenant_id = $1 AND asset_id = $2",
         )
@@ -438,23 +441,58 @@ impl AssetsService {
         .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())
         .await?;
-        let decrypted: Vec<ConfigurationItemResponse> = rows
+        let items: Vec<ConfigurationItemSummary> = rows
             .into_iter()
-            .map(|r| {
-                let value =
-                    crate::utils::crypto::decrypt(&r.value_encrypted, &self.encryption_key)?;
-                Ok(ConfigurationItemResponse {
-                    id: r.id,
-                    asset_id: r.asset_id,
-                    name: r.name,
-                    category: r.category,
-                    value,
-                    notes: r.notes,
-                    created_at: r.created_at,
-                })
+            .map(|r| ConfigurationItemSummary {
+                id: r.id,
+                asset_id: r.asset_id,
+                name: r.name,
+                category: r.category,
+                notes: r.notes,
+                created_at: r.created_at,
             })
-            .collect::<AppResult<Vec<_>>>()?;
-        Ok((decrypted, total as u64))
+            .collect();
+        Ok((items, total as u64))
+    }
+
+    /// Reveal a single configuration item's decrypted value. Authz is
+    /// enforced at the route (`RequireAssets`); the reveal is recorded in
+    /// `asset_audit_log` so every decryption is traceable.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn reveal_configuration_item(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        performer: Uuid,
+    ) -> AppResult<ConfigurationItemResponse> {
+        let r = sqlx::query_as::<_, ConfigItemRow>(
+            r#"SELECT id, asset_id, name, category, value_encrypted, notes, created_at
+               FROM configuration_items WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("ConfigurationItem".to_string()))?;
+        let value = crate::utils::crypto::decrypt(&r.value_encrypted, &self.encryption_key)?;
+        sqlx::query(
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
+               VALUES ($1, $2, 'synced', $3, '{"event":"config_item_revealed"}'::jsonb)"#,
+        )
+        .bind(tenant_id)
+        .bind(r.asset_id)
+        .bind(performer)
+        .execute(self.db.pool())
+        .await?;
+        Ok(ConfigurationItemResponse {
+            id: r.id,
+            asset_id: r.asset_id,
+            name: r.name,
+            category: r.category,
+            value,
+            notes: r.notes,
+            created_at: r.created_at,
+        })
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -507,13 +545,15 @@ impl AssetsService {
 
     // PMS-77 credential vault ------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// List vault credentials WITHOUT decrypting secrets. Username,
+    /// password, and notes never appear in a list; callers reveal a single
+    /// credential via `reveal_credential` (audited).
     pub async fn list_credentials(
         &self,
         tenant_id: Uuid,
         asset_id: Uuid,
-        performer: Uuid,
         pagination: &PaginationParams,
-    ) -> AppResult<(Vec<CredentialResponse>, u64)> {
+    ) -> AppResult<(Vec<CredentialSummary>, u64)> {
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM credential_vault WHERE tenant_id = $1 AND asset_id = $2",
         )
@@ -537,45 +577,73 @@ impl AssetsService {
         .fetch_all(self.db.pool())
         .await?;
 
-        // Audit every read.
+        let items: Vec<CredentialSummary> = rows
+            .into_iter()
+            .map(|r| CredentialSummary {
+                id: r.id,
+                name: r.name,
+                company_id: r.company_id,
+                asset_id: r.asset_id,
+                credential_type: r.credential_type,
+                url: r.url,
+                last_rotated: r.last_rotated,
+                created_at: r.created_at,
+            })
+            .collect();
+        Ok((items, total as u64))
+    }
+
+    /// Reveal a single credential's decrypted secrets. Authz is enforced
+    /// at the route (`RequireAssets`); the reveal is recorded in
+    /// `asset_audit_log` so every decryption is traceable.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn reveal_credential(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        performer: Uuid,
+    ) -> AppResult<CredentialResponse> {
+        let r = sqlx::query_as::<_, CredRow>(
+            r#"SELECT id, name, company_id, asset_id, credential_type,
+                      username_encrypted, password_encrypted, url, notes_encrypted,
+                      last_rotated, created_at
+               FROM credential_vault WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound("Credential".to_string()))?;
+
+        let username = crate::utils::crypto::decrypt(&r.username_encrypted, &self.encryption_key)?;
+        let password = crate::utils::crypto::decrypt(&r.password_encrypted, &self.encryption_key)?;
+        let notes = match r.notes_encrypted {
+            Some(enc) => Some(crate::utils::crypto::decrypt(&enc, &self.encryption_key)?),
+            None => None,
+        };
         sqlx::query(
-            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id,
-                                            changes)
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
                VALUES ($1, $2, 'synced', $3, '{"event":"credential_read"}'::jsonb)"#,
         )
         .bind(tenant_id)
-        .bind(asset_id)
+        .bind(r.asset_id)
         .bind(performer)
         .execute(self.db.pool())
         .await?;
 
-        let decrypted: Vec<CredentialResponse> = rows
-            .into_iter()
-            .map(|r| {
-                let username =
-                    crate::utils::crypto::decrypt(&r.username_encrypted, &self.encryption_key)?;
-                let password =
-                    crate::utils::crypto::decrypt(&r.password_encrypted, &self.encryption_key)?;
-                let notes = match r.notes_encrypted {
-                    Some(enc) => Some(crate::utils::crypto::decrypt(&enc, &self.encryption_key)?),
-                    None => None,
-                };
-                Ok(CredentialResponse {
-                    id: r.id,
-                    name: r.name,
-                    company_id: r.company_id,
-                    asset_id: r.asset_id,
-                    credential_type: r.credential_type,
-                    username,
-                    password,
-                    url: r.url,
-                    notes,
-                    last_rotated: r.last_rotated,
-                    created_at: r.created_at,
-                })
-            })
-            .collect::<AppResult<Vec<_>>>()?;
-        Ok((decrypted, total as u64))
+        Ok(CredentialResponse {
+            id: r.id,
+            name: r.name,
+            company_id: r.company_id,
+            asset_id: r.asset_id,
+            credential_type: r.credential_type,
+            username,
+            password,
+            url: r.url,
+            notes,
+            last_rotated: r.last_rotated,
+            created_at: r.created_at,
+        })
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
