@@ -13,40 +13,13 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // 2-4 logins (test bodies + retries) and cross the cap, so keep auth-ui
 // down to one login attempt per project run.
 //
-// PMS-142: this test stays `test.fixme` until an upstream bunyip bug is
-// fixed. The CI diagnostic dump from the first un-fixme attempt showed:
-//
-//   - Login worked end-to-end (TOTP, OIDC callback, lands on /dashboard).
-//   - The logout click reached `https://a8n.systems/logout` (visible in
-//     the request log).
-//   - Immediately after `/logout`, the SPA fired ANOTHER `/oauth2/authorize`
-//     and the OP returned a `code` (the OP session survived the supposed
-//     logout). The SPA exchanged the code, landed back on `/dashboard`, and
-//     `expectAtLoginScreen` timed out at `/dashboard`.
-//
-// Bunyip's GET `/logout` clears `access_token` and `refresh_token` cookies
-// (see `bunyip/crates/bunyip-domain/src/middleware/auth.rs:272` for
-// `AuthCookies::clear`), but `/oauth2/authorize` was still able to issue a
-// fresh code, meaning some persistence path (op_session, hub session
-// cookie, or browser-side refresh) keeps the user authenticated past the
-// logout. The SPA author actually predicted this in
-// `mokosh-clients/src/components/layout.rs:367-373`:
-//
-//   "Without that round-trip, the OP cookie would still be live and a
-//    subsequent visit here would silently sign the user back in via the
-//    SSO bridge."
-//
-// The intended round-trip is happening client-side, but the server-side
-// cookie clear isn't enough on staging. Needs an upstream bunyip fix
-// (file an issue against the BUNYIP project when this gets prioritised).
-// Re-fixme until bunyip's `/logout` fully terminates the OP session - at
-// that point this test should pass without further changes here.
-//
-// Kept in tree: the diagnostic capture (`attachPageDiagnostics`) and the
-// click-retry-if-menu-not-open loop in `logout()` (Dioxus WASM hydration
-// race defense). Both are load-bearing for the eventual un-fixme.
+// Load-bearing defenses still in tree: the diagnostic capture
+// (`attachPageDiagnostics`) and the click-retry-if-menu-not-open loop in
+// `logout()` defend the Dioxus WASM hydration race (a visible avatar
+// button does not mean its onclick handler has been wired up yet). Do
+// not remove either without a replacement.
 test.describe('auth login / session', () => {
-  test.fixme('login + logout round-trip', async ({ page }) => {
+  test('login + logout round-trip', async ({ page }) => {
     const diag = attachPageDiagnostics(page);
 
     try {
