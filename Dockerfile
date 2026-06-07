@@ -9,7 +9,7 @@
 # over /app/target, masking anything baked into the image. Each
 # developer's first `just dev` does the full compile into the named
 # volume; subsequent runs are incremental.
-FROM ghcr.io/niceguyit/rust-builder-glibc:v1.0.0-rust1.94-trixie
+FROM ghcr.io/niceguyit/rust-builder-glibc:v1.0.1-rust1.94-trixie
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
     pkg-config libssl-dev curl \
