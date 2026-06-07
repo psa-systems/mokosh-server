@@ -57,7 +57,7 @@ pub fn assets_routes(service: AssetsService) -> Router {
         )
         .route(
             "/configuration-items/{id}",
-            axum::routing::delete(delete_configuration_item),
+            get(reveal_configuration_item).delete(delete_configuration_item),
         )
         // PMS-77 credential vault
         .route(
@@ -66,7 +66,7 @@ pub fn assets_routes(service: AssetsService) -> Router {
         )
         .route(
             "/credentials/{id}",
-            axum::routing::delete(delete_credential),
+            get(reveal_credential).delete(delete_credential),
         )
         // PMS-78 audit log
         .route("/assets/{id}/audit-log", get(list_asset_audit_log))
@@ -215,7 +215,7 @@ async fn list_configuration_items(
     RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<ConfigurationItemResponse>>> {
+) -> AppResult<Json<PaginatedResponse<ConfigurationItemSummary>>> {
     let (items, total) = s
         .service
         .list_configuration_items(u.tenant_id, id, &pagination)
@@ -225,6 +225,19 @@ async fn list_configuration_items(
         &pagination,
         total,
     )))
+}
+
+/// Reveal a single configuration item's decrypted value (audited).
+async fn reveal_configuration_item(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<ConfigurationItemResponse>> {
+    Ok(Json(
+        s.service
+            .reveal_configuration_item(u.tenant_id, id, u.id)
+            .await?,
+    ))
 }
 
 async fn create_configuration_item(
@@ -254,16 +267,27 @@ async fn list_credentials(
     RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<CredentialResponse>>> {
+) -> AppResult<Json<PaginatedResponse<CredentialSummary>>> {
     let (items, total) = s
         .service
-        .list_credentials(u.tenant_id, id, u.id, &pagination)
+        .list_credentials(u.tenant_id, id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
         total,
     )))
+}
+
+/// Reveal a single credential's decrypted secrets (authz-gated + audited).
+async fn reveal_credential(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<CredentialResponse>> {
+    Ok(Json(
+        s.service.reveal_credential(u.tenant_id, id, u.id).await?,
+    ))
 }
 
 async fn create_credential(
