@@ -650,6 +650,80 @@ impl TicketService {
         self.get_ticket(tenant_id, ticket_id).await
     }
 
+    /// Hard-delete a ticket. Children that declare `ON DELETE CASCADE`
+    /// (`ticket_notes`, `ticket_status_history` in migrations/005_tickets.sql,
+    /// the sla tables in 027_sla_notify.sql) are removed by the row delete, and
+    /// `appointments.ticket_id` is `ON DELETE SET NULL`. Rows that reference the
+    /// ticket with the default RESTRICT - time entries (006_time_tracking.sql),
+    /// child tickets via `parent_ticket_id` (005_tickets.sql:119), billing rows
+    /// (010_billing.sql:68) - block the delete; that FK violation
+    /// (SQLSTATE 23503) is mapped to a clean `400` here instead of the generic
+    /// `500` the blanket `sqlx::Error -> AppError` conversion would produce,
+    /// mirroring `delete_company`'s explicit guard.
+    ///
+    /// Like `contacts::ContactService::delete_company`: 404 when the ticket is
+    /// absent in the tenant, then mutation + audit row in one transaction so a
+    /// rollback drops both. PMS-149 added this so the E2E teardown can remove
+    /// test-created tickets and, in turn, their parent company (which
+    /// `delete_company` refuses to drop while any ticket references it).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_ticket(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // 404 if the ticket is not in this tenant before doing any work.
+        self.get_ticket(tenant_id, ticket_id).await?;
+
+        // Mutation + audit row in one transaction. DELETE: snapshot before,
+        // old = before, after = None. PMS-117 audit convention.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Err(e) = sqlx::query("DELETE FROM tickets WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(ticket_id)
+            .execute(&mut *tx)
+            .await
+        {
+            // A referencing row with the default RESTRICT FK (time entries,
+            // child tickets, billing) raises SQLSTATE 23503. Surface it as a
+            // 400 with an actionable message instead of the generic 500 that
+            // `sqlx::Error -> AppError` would yield (it only special-cases the
+            // 23505 unique violation). The tx rolls back when dropped on return.
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
+                return Err(AppError::BadRequest(
+                    "Cannot delete ticket with related records (time entries, \
+                     sub-tickets, or billing); remove them first"
+                        .to_string(),
+                ));
+            }
+            return Err(e.into());
+        }
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "tickets",
+            Some(ticket_id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     /// Assign ticket to user
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn assign_ticket(

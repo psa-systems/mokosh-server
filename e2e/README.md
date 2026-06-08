@@ -84,17 +84,19 @@ Done once by a human before the suite can pass against a deployment:
 Every record a test creates carries an embedded tag `e2e-<epochMs>-<runId>-<n>`
 in its name and lives only in the E2E tenant. `global.teardown.ts`:
 
-- deletes companies and contacts created by **this** run, and
+- deletes tickets, contacts, and companies created by **this** run (in that
+  order, since `delete_company` refuses while a ticket or contact still
+  references the company), and
 - sweeps any `e2e-`-tagged residue older than **24h** left by earlier failed runs.
 
 On failure, this run's residue is intentionally left for debugging and the next
 run's sweep removes it once it ages past 24h. Teardown is best-effort and never
 throws, so it cannot mask a test result.
 
-**Tickets caveat:** the tickets module exposes no DELETE route
-(`src/modules/tickets/routes.rs`), so test-created tickets are not hard-deleted.
-They sit in the E2E tenant with run-tagged titles; their parent companies are
-deleted by teardown.
+Tickets are hard-deletable via `DELETE /api/v1/tickets/{id}`
+(`src/modules/tickets/routes.rs`, added in PMS-149); deleting a ticket cascades
+its notes/status-history. They carry run-tagged titles and are swept before
+their parent companies.
 
 ## Email
 

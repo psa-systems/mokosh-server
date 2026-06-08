@@ -14,16 +14,17 @@ import { isOwnedByThisRun, isStale } from './lib/run';
 // auth middleware reads Bearer only, so cookie-based reuse is not an option
 // (see e2e/lib/auth-state.ts and src/modules/auth/middleware.rs:67).
 //
-// Coverage note: the tickets module exposes no DELETE route
-// (src/modules/tickets/routes.rs), so test-created tickets cannot be hard
-// deleted via the API. They live in the dedicated E2E tenant with run-suffixed
-// titles; their parent companies ARE deleted here. See e2e/README.md.
+// Coverage note: tickets ARE hard-deletable via DELETE /tickets/{id}
+// (src/modules/tickets/routes.rs, added in PMS-149). They carry run-suffixed
+// titles and are swept before companies, since delete_company refuses while a
+// ticket still references the company. See e2e/README.md.
 
 const PER_PAGE = 200;
 
 interface Named {
   id: string;
   name?: string;
+  title?: string;
   full_name?: string;
   first_name?: string;
   last_name?: string;
@@ -45,6 +46,7 @@ async function listAll(api: APIRequestContext, path: string): Promise<Named[]> {
 function label(row: Named): string {
   return (
     row.name ??
+    row.title ??
     row.full_name ??
     [row.first_name, row.last_name].filter(Boolean).join(' ') ??
     ''
@@ -105,11 +107,15 @@ export default async function globalTeardown(): Promise<void> {
   });
   const now = Date.now();
   try {
-    // Contacts first: a company with contacts attached may refuse deletion.
+    // Order matters: delete_company refuses while any ticket OR contact still
+    // references the company. Tickets first (PMS-149 added DELETE
+    // /tickets/{id}), then contacts, then the now-unreferenced companies.
+    const tickets = await sweep(api, routes.tickets, routes.ticket, now);
     const contacts = await sweep(api, routes.contacts, routes.contact, now);
     const companies = await sweep(api, routes.companies, routes.company, now);
     console.log(
-      `[teardown] contacts removed=${contacts.removed} failed=${contacts.failed}; ` +
+      `[teardown] tickets removed=${tickets.removed} failed=${tickets.failed}; ` +
+        `contacts removed=${contacts.removed} failed=${contacts.failed}; ` +
         `companies removed=${companies.removed} failed=${companies.failed}`,
     );
   } finally {
