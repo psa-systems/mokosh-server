@@ -7,9 +7,9 @@ import { runSuffix } from '../lib/run';
 // the E2E tenant by the shared session. A ticket needs a company, so we create
 // one first (CreateTicketRequest.company_id is required).
 //
-// The tickets module has no DELETE route, so there is no hard-delete step; the
-// parent company is removed in global teardown, and the run-suffixed title lets
-// the stale sweep account for the residue. See e2e/README.md.
+// The ticket and its parent company are hard-deleted inline at the end (the
+// DELETE /tickets/{id} route landed in PMS-149); global teardown still backstops
+// failed runs via the run-suffixed title/name sweep. See e2e/README.md.
 test.describe('tickets CRUD', () => {
   test('create / read / update / list a ticket', async ({ request }) => {
     const company = await createCompany(request);
@@ -40,5 +40,12 @@ test.describe('tickets CRUD', () => {
     expect(listRes.status()).toBe(200);
     const list = (await listRes.json()) as { data: Array<{ id: string }> };
     expect(list.data.map((t) => t.id)).toContain(ticket.id);
+
+    // Delete ticket, then company (teardown also sweeps, but verify the path
+    // works: the company is undeletable until its ticket is gone).
+    const delTicket = await request.delete(routes.ticket(ticket.id));
+    expect(delTicket.ok(), `delete ticket -> ${delTicket.status()}`).toBeTruthy();
+    const delCompany = await request.delete(routes.company(company.id));
+    expect(delCompany.ok(), `delete company -> ${delCompany.status()}`).toBeTruthy();
   });
 });

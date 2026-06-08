@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use std::sync::Arc;
@@ -34,6 +34,7 @@ pub fn ticket_routes(ticket_service: TicketService) -> Router {
         .route("/", post(create_ticket))
         .route("/{ticket_id}", get(get_ticket))
         .route("/{ticket_id}", put(update_ticket))
+        .route("/{ticket_id}", delete(delete_ticket))
         .route("/{ticket_id}/assign", post(assign_ticket))
         .route("/{ticket_id}/notes", get(get_ticket_notes))
         .route("/{ticket_id}/notes", post(add_note))
@@ -111,6 +112,18 @@ async fn update_ticket(
         .get_ticket_response(user.tenant_id, ticket_id)
         .await?;
     Ok(Json(resp))
+}
+
+async fn delete_ticket(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(ticket_id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .ticket_service
+        .delete_ticket(user.tenant_id, ticket_id, &ctx)
+        .await
 }
 
 #[derive(serde::Deserialize)]

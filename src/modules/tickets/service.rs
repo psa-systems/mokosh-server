@@ -650,6 +650,58 @@ impl TicketService {
         self.get_ticket(tenant_id, ticket_id).await
     }
 
+    /// Hard-delete a ticket and its FK-cascaded children (ticket_notes,
+    /// ticket_status_history, sla_tracking all declare ON DELETE CASCADE in
+    /// migrations/005_tickets.sql, so the row delete removes them too).
+    ///
+    /// Mirrors `contacts::ContactService::delete_company`: 404 when the ticket
+    /// is absent in the tenant, then mutation + audit row in one transaction so
+    /// a rollback drops both. PMS-149 added this so the E2E teardown can remove
+    /// test-created tickets and, in turn, their parent company (which
+    /// `delete_company` refuses to drop while any ticket references it).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_ticket(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // 404 if the ticket is not in this tenant before doing any work.
+        self.get_ticket(tenant_id, ticket_id).await?;
+
+        // Mutation + audit row in one transaction. DELETE: snapshot before,
+        // old = before, after = None. PMS-117 audit convention.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM tickets WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(ticket_id)
+            .execute(&mut *tx)
+            .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "tickets",
+            Some(ticket_id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     /// Assign ticket to user
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn assign_ticket(
