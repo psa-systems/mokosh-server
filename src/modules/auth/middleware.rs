@@ -438,32 +438,76 @@ async fn ensure_user_from_bunyip(
 ) -> Option<AuthState> {
     let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
 
-    // Happy path: row already exists. The bunyip-issued at+jwt does
-    // not (yet) carry a tenant claim, so we look up the user with
-    // the default bunyip tenant. If multi-tenant claim plumbing
-    // lands we revisit this. PMS-4 AC6 + docs §3.3.
+    // Resolve the local shadow row, JIT-creating it on first sight. The
+    // bunyip-issued at+jwt does not (yet) carry a tenant claim, so we use the
+    // default bunyip tenant. If multi-tenant claim plumbing lands we revisit
+    // this. PMS-4 AC6 + docs §3.3.
     let default_tenant = default_bunyip_tenant_id();
-    if let Ok(user) = auth_service.get_user_by_id(default_tenant, sub).await {
-        let tenant_id = user.tenant_id;
-        return Some(AuthState::authenticated(user.to_current_user(), tenant_id));
+    let mut user = match auth_service.get_user_by_id(default_tenant, sub).await {
+        Ok(user) => user,
+        Err(_) => {
+            // JIT path: fetch email from /oauth2/userinfo and insert.
+            let info = verifier.userinfo(bearer).await;
+            let email = info
+                .as_ref()
+                .and_then(|i| i.email.clone())
+                .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
+            auth_service
+                .upsert_user_from_oidc(sub, default_tenant, &email, UserRole::default())
+                .await
+                .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
+                .ok()?
+        }
+    };
+
+    // PMS-172: Bunyip governs the top role. Translate the `bunyip_role` claim
+    // into mokosh's taxonomy and reconcile the shadow row when it drifts, so
+    // the DB stays accurate for joins/audit/reporting. When the claim is absent
+    // the effective role equals the local role, so this is a no-op for legacy /
+    // standalone tokens.
+    let effective = effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role);
+    if effective != user.role {
+        if let Err(e) = auth_service
+            .set_user_role(user.tenant_id, user.id, effective)
+            .await
+        {
+            tracing::warn!(error = %e, user = %user.id, "failed to sync bunyip-derived role");
+        }
+        user.role = effective;
     }
 
-    // JIT path: fetch email from /oauth2/userinfo and insert.
-    let info = verifier.userinfo(bearer).await;
-    let email = info
-        .as_ref()
-        .and_then(|i| i.email.clone())
-        .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
+    let tenant_id = user.tenant_id;
+    Some(AuthState::authenticated(user.to_current_user(), tenant_id))
+}
 
-    let user = auth_service
-        .upsert_user_from_oidc(sub, default_tenant, &email, UserRole::default())
-        .await
-        .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
-        .ok()?;
-    Some(AuthState::authenticated(
-        user.to_current_user(),
-        default_tenant,
-    ))
+/// Translate Bunyip's system role (the `bunyip_role` claim) into mokosh's
+/// effective role on the Bunyip RS path (PMS-172).
+///
+/// Bunyip is the SSO / identity manager and governs only the top role:
+/// - `admin`      -> mokosh `super_admin` (authoritative).
+/// - `subscriber` -> the user's locally-assigned mokosh role, EXCEPT that
+///   `super_admin` is Bunyip-exclusive, so a stale / locally-set `super_admin`
+///   is clamped down to `admin`.
+/// - any other / unknown value -> treated like `subscriber` (never elevates,
+///   still clamps a stale `super_admin`), so a future Bunyip role can't
+///   silently grant super_admin before mokosh learns to map it.
+/// - absent claim (`None`) -> keep the local role unchanged. Back-compatible:
+///   mokosh can ship before Bunyip emits the claim, and the legacy HS256 /
+///   standalone paths (which never carry the claim) are unaffected.
+fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> UserRole {
+    match bunyip_role {
+        None => local,
+        Some("admin") => UserRole::SuperAdmin,
+        Some(_) => {
+            // subscriber (or an unknown future value): super_admin is
+            // Bunyip-exclusive, everything below it is mokosh-internal.
+            if local == UserRole::SuperAdmin {
+                UserRole::Admin
+            } else {
+                local
+            }
+        }
+    }
 }
 
 fn default_bunyip_tenant_id() -> uuid::Uuid {
@@ -471,4 +515,77 @@ fn default_bunyip_tenant_id() -> uuid::Uuid {
         .ok()
         .and_then(|s| uuid::Uuid::parse_str(&s).ok())
         .unwrap_or_else(|| uuid::Uuid::from_u128(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_role_from_bunyip, UserRole};
+
+    #[test]
+    fn bunyip_admin_maps_to_super_admin() {
+        // A Bunyip admin is the top mokosh role regardless of the local row.
+        for local in [
+            UserRole::Technician,
+            UserRole::Manager,
+            UserRole::Admin,
+            UserRole::SuperAdmin,
+        ] {
+            assert_eq!(
+                effective_role_from_bunyip(Some("admin"), local),
+                UserRole::SuperAdmin
+            );
+        }
+    }
+
+    #[test]
+    fn subscriber_uses_local_role() {
+        for local in [
+            UserRole::Technician,
+            UserRole::Dispatcher,
+            UserRole::Sales,
+            UserRole::Finance,
+            UserRole::Manager,
+            UserRole::Admin,
+        ] {
+            assert_eq!(effective_role_from_bunyip(Some("subscriber"), local), local);
+        }
+    }
+
+    #[test]
+    fn subscriber_clamps_stale_super_admin_to_admin() {
+        // super_admin is Bunyip-exclusive: a subscriber can never carry it,
+        // even if the local row was left at super_admin.
+        assert_eq!(
+            effective_role_from_bunyip(Some("subscriber"), UserRole::SuperAdmin),
+            UserRole::Admin
+        );
+    }
+
+    #[test]
+    fn unknown_bunyip_role_does_not_elevate_and_clamps_super_admin() {
+        // A future / unrecognized Bunyip role must not silently grant
+        // super_admin, and must still strip a stale local super_admin.
+        assert_eq!(
+            effective_role_from_bunyip(Some("owner"), UserRole::Technician),
+            UserRole::Technician
+        );
+        assert_eq!(
+            effective_role_from_bunyip(Some("owner"), UserRole::SuperAdmin),
+            UserRole::Admin
+        );
+    }
+
+    #[test]
+    fn absent_claim_keeps_local_role_unchanged() {
+        // Back-compat: no claim (legacy / standalone / pre-BUNYIP-66) leaves
+        // the local role exactly as-is, including a local super_admin.
+        for local in [
+            UserRole::Technician,
+            UserRole::Manager,
+            UserRole::Admin,
+            UserRole::SuperAdmin,
+        ] {
+            assert_eq!(effective_role_from_bunyip(None, local), local);
+        }
+    }
 }
