@@ -38,6 +38,13 @@ pub struct AtClaims {
     pub scope: String,
     pub exp: i64,
     pub iat: i64,
+    /// Bunyip's system role for the user (`subscriber` | `admin`), emitted by
+    /// BUNYIP-66. Older tokens (and the legacy / standalone paths) do not carry
+    /// it, so it deserializes to `None`; the RS then keeps the local
+    /// `users.role` unchanged. When present, the middleware translates it into
+    /// mokosh's own role taxonomy (see `effective_role_from_bunyip`, PMS-172).
+    #[serde(default)]
+    pub bunyip_role: Option<String>,
 }
 
 /// Subset of bunyip-api's `/oauth2/userinfo` response. The RS calls this on

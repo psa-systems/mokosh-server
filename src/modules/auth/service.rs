@@ -1580,6 +1580,29 @@ impl AuthService {
         Ok(())
     }
 
+    /// Reconcile a user's role (PMS-172). The Bunyip RS auth path calls this
+    /// to keep the local `users.role` in sync with the role derived from the
+    /// Bunyip `bunyip_role` claim. Deliberately a plain UPDATE with no audit
+    /// row: this is a system reconciliation on login, not an operator action,
+    /// and the caller only invokes it when the role actually changed.
+    pub async fn set_user_role(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        role: UserRole,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(role.as_str())
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(self.db.pool())
+        .await?;
+
+        Ok(())
+    }
+
     /// Generate access and refresh tokens
     fn generate_tokens(
         &self,
