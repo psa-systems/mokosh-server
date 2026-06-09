@@ -185,10 +185,20 @@ impl SeedService {
             .create_contact(tenant_id, &demo_contact_secondary(company.id), &ctx)
             .await?;
 
+        // Tickets are best-effort per row. `create_ticket` requires the
+        // tenant's default status/priority/queue to exist; a tenant missing
+        // them (no `copy_default_config` / migration 023 seed) would error.
+        // That must not abort the whole seed and leave the account with NO
+        // demo data - the company + contacts are the core of the demo - so a
+        // failing ticket is logged and skipped rather than propagated.
         for ticket in demo_tickets(company.id, primary.id) {
-            self.tickets
+            if let Err(e) = self
+                .tickets
                 .create_ticket(tenant_id, user_id, &ticket, &ctx)
-                .await?;
+                .await
+            {
+                tracing::warn!(error = %e, %tenant_id, "demo ticket seeding skipped");
+            }
         }
         Ok(())
     }
