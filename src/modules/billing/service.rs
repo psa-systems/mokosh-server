@@ -52,6 +52,27 @@ impl BillingService {
         Ok(rows.into_iter().collect())
     }
 
+    /// Resolve a set of invoice ids to their human invoice numbers,
+    /// tenant-scoped (PMS-186). Used to label payments by invoice number
+    /// instead of the invoice UUID.
+    async fn invoice_number_map(
+        &self,
+        tenant_id: Uuid,
+        ids: &[Uuid],
+    ) -> AppResult<std::collections::HashMap<Uuid, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, invoice_number FROM invoices WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(tenant_id)
+        .bind(ids)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
@@ -66,16 +87,20 @@ impl BillingService {
         Ok(())
     }
 
-    /// Fill in `company_name` on a batch of payment responses (PMS-186).
+    /// Fill in `company_name` and `invoice_number` on a batch of payment
+    /// responses (PMS-186).
     async fn enrich_payments(
         &self,
         tenant_id: Uuid,
         resp: &mut [PaymentResponse],
     ) -> AppResult<()> {
-        let ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
-        let names = self.company_name_map(tenant_id, &ids).await?;
+        let company_ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
+        let names = self.company_name_map(tenant_id, &company_ids).await?;
+        let invoice_ids: Vec<Uuid> = resp.iter().filter_map(|r| r.invoice_id).collect();
+        let numbers = self.invoice_number_map(tenant_id, &invoice_ids).await?;
         for r in resp.iter_mut() {
             r.company_name = names.get(&r.company_id).cloned();
+            r.invoice_number = r.invoice_id.and_then(|id| numbers.get(&id).cloned());
         }
         Ok(())
     }
@@ -1528,10 +1553,15 @@ impl BillingService {
             .company_name_map(tenant_id, &[request.company_id])
             .await?
             .remove(&request.company_id);
+        let invoice_number = match request.invoice_id {
+            Some(id) => self.invoice_number_map(tenant_id, &[id]).await?.remove(&id),
+            None => None,
+        };
         Ok(PaymentResponse {
             id: payment_id,
             tenant_id,
             invoice_id: request.invoice_id,
+            invoice_number,
             company_id: request.company_id,
             company_name,
             payment_date: request.payment_date,
@@ -1980,6 +2010,7 @@ impl From<PaymentRow> for PaymentResponse {
             id: r.id,
             tenant_id: r.tenant_id,
             invoice_id: r.invoice_id,
+            invoice_number: None,
             company_id: r.company_id,
             company_name: None,
             payment_date: r.payment_date,

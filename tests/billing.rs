@@ -463,6 +463,11 @@ async fn billing_responses_carry_company_name(pool: PgPool) {
         Some("Acme Co"),
         "the create-payment response carries the company name"
     );
+    assert_eq!(
+        payment["invoice_number"].as_str(),
+        invoice["invoice_number"].as_str(),
+        "the create-payment response carries the linked invoice number"
+    );
 
     let payments: serde_json::Value = app
         .client
@@ -478,5 +483,10 @@ async fn billing_responses_carry_company_name(pool: PgPool) {
         payments["data"][0]["company_name"].as_str(),
         Some("Acme Co"),
         "payment list rows carry the company name"
+    );
+    assert_eq!(
+        payments["data"][0]["invoice_number"].as_str(),
+        invoice["invoice_number"].as_str(),
+        "payment list rows carry the linked invoice number"
     );
 }

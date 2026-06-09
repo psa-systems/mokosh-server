@@ -271,6 +271,10 @@ pub struct PaymentResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub invoice_id: Option<Uuid>,
+    /// Human invoice number of `invoice_id`, resolved on read (PMS-186), so
+    /// the client shows the number instead of the invoice UUID. `None` for
+    /// an unapplied payment or a missing invoice.
+    pub invoice_number: Option<String>,
     pub company_id: Uuid,
     /// Display name of `company_id`, resolved on read (PMS-186). `None`
     /// only if the company row is missing.
