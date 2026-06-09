@@ -81,10 +81,17 @@ test.describe('projects CRUD', () => {
       task.id,
     );
 
-    // Cleanup, reverse-dependency order: task, phase, task-status, project.
-    expect((await request.delete(routes.task(task.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.phase(phase.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.taskStatus(status.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.project(project.id))).ok()).toBeTruthy();
+    // Cleanup, reverse-dependency order: task, phase, task-status, project. Run
+    // every delete before asserting so one failure does not abort the rest and
+    // orphan the others (the task has no run-suffixed name teardown can sweep).
+    const cleanup = [
+      await request.delete(routes.task(task.id)),
+      await request.delete(routes.phase(phase.id)),
+      await request.delete(routes.taskStatus(status.id)),
+      await request.delete(routes.project(project.id)),
+    ];
+    for (const res of cleanup) {
+      expect(res.ok(), `cleanup delete -> ${res.status()}`).toBeTruthy();
+    }
   });
 });

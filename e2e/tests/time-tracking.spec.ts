@@ -83,11 +83,18 @@ test.describe('time-tracking CRUD', () => {
     });
     expect(updRr.status(), `update rounding-rule failed: ${await updRr.text()}`).toBe(200);
 
-    // Cleanup, reverse-dependency order. The time entry references the work
-    // type, so it must be deleted before the work type.
-    expect((await request.delete(routes.roundingRule(rule.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.timeEntry(entry.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.workType(workType.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.company(company.id))).ok()).toBeTruthy();
+    // Cleanup, reverse-dependency order (the time entry references the work
+    // type, so it goes first). Run every delete before asserting so one failure
+    // does not abort the rest and orphan the others - the time entry has no
+    // run-suffixed name, so teardown cannot sweep it as a backstop.
+    const cleanup = [
+      await request.delete(routes.roundingRule(rule.id)),
+      await request.delete(routes.timeEntry(entry.id)),
+      await request.delete(routes.workType(workType.id)),
+      await request.delete(routes.company(company.id)),
+    ];
+    for (const res of cleanup) {
+      expect(res.ok(), `cleanup delete -> ${res.status()}`).toBeTruthy();
+    }
   });
 });

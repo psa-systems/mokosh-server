@@ -89,10 +89,17 @@ test.describe('contracts CRUD', () => {
     expect(updRc.status(), `update rate-card failed: ${await updRc.text()}`).toBe(200);
 
     // Cleanup, reverse-dependency order: item before contract; rate card and
-    // company are independent.
-    expect((await request.delete(routes.contractItem(item.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.rateCard(rateCard.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.contract(contract.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.company(company.id))).ok()).toBeTruthy();
+    // company are independent. Run every delete before asserting so one failure
+    // does not abort the rest and orphan the others (the contract item has no
+    // run-suffixed name teardown can sweep).
+    const cleanup = [
+      await request.delete(routes.contractItem(item.id)),
+      await request.delete(routes.rateCard(rateCard.id)),
+      await request.delete(routes.contract(contract.id)),
+      await request.delete(routes.company(company.id)),
+    ];
+    for (const res of cleanup) {
+      expect(res.ok(), `cleanup delete -> ${res.status()}`).toBeTruthy();
+    }
   });
 });

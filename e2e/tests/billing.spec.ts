@@ -65,8 +65,15 @@ test.describe('billing CRUD', () => {
     expect(listInv.status(), `list invoices -> ${listInv.status()}`).toBe(200);
 
     // Cleanup, reverse-dependency order: the payment references the company.
-    expect((await request.delete(routes.payment(payment.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.taxRate(taxRate.id))).ok()).toBeTruthy();
-    expect((await request.delete(routes.company(company.id))).ok()).toBeTruthy();
+    // Run every delete before asserting so one failure does not abort the rest
+    // and orphan the others (the payment has no run-suffixed name to sweep).
+    const cleanup = [
+      await request.delete(routes.payment(payment.id)),
+      await request.delete(routes.taxRate(taxRate.id)),
+      await request.delete(routes.company(company.id)),
+    ];
+    for (const res of cleanup) {
+      expect(res.ok(), `cleanup delete -> ${res.status()}`).toBeTruthy();
+    }
   });
 });
