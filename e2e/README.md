@@ -93,6 +93,44 @@ Done once by a human before the suite can pass against a deployment:
    secret (the string under the QR code at enrollment) as `E2E_TOTP_SECRET` -
    the setup test
    computes the second factor at runtime.
+
+   **Where the role lives, and how to set it.** The E2E account signs in
+   through the bunyip SSO, so it reaches mokosh on the bunyip Resource-Server
+   path (`ensure_user_from_bunyip`, `src/modules/auth/middleware.rs`). That path
+   resolves the request's role from the mokosh `users` table row
+   (`get_user_by_id(...).role`), NOT from the access token - the bunyip token
+   only carries `sub` + email. On first login the row is auto-created by
+   `upsert_user_from_oidc(...)` with the schema default `role = 'technician'`
+   (`migrations/003_auth.sql`), which is non-admin. So "make the account admin"
+   means flipping that row's `role` to `admin`. Valid values:
+   `super_admin, admin, manager, technician, dispatcher, sales, finance`.
+
+   The role is re-read from the row on every request, so the change takes effect
+   on the next call (no re-login needed). Two ways to set it:
+
+   - **Direct DB on the staging mokosh Postgres** (simplest, avoids the
+     chicken-and-egg below):
+
+     ```sql
+     -- confirm the row first
+     SELECT id, email, role, tenant_id FROM users WHERE email = '<E2E_EMAIL>';
+     -- elevate
+     UPDATE users SET role = 'admin' WHERE email = '<E2E_EMAIL>';
+     ```
+
+   - **Admin API**, if an admin/super_admin already exists: as that admin,
+     `PUT /api/v1/users/{e2e_user_id}` with body `{"role":"admin"}`
+     (`update_user`; rejects non-admin callers). `e2e_user_id` is the bunyip
+     `sub` UUID, which is the mokosh `users.id`; list it via
+     `GET /api/v1/users` as the admin.
+
+   **Bootstrapping the first admin.** If no admin exists yet, an account whose
+   email is in the `OAUTH_SUPER_ADMIN_EMAILS` env and that signs in via the
+   **Google** path is auto-provisioned as `super_admin`
+   (`provision_user_from_google`). That account can then elevate others via the
+   Admin API above. This allowlist only applies to the Google login path, not
+   the bunyip SSO path the E2E account uses, so it cannot elevate the E2E
+   account directly - use the DB update for that.
 3. **OIDC client** - reuse the staging SPA public client (PKCE) or register a
    dedicated E2E client. Record `E2E_OIDC_CLIENT_ID` and a registered
    `E2E_OIDC_REDIRECT_URI`. If `/oauth2/authorize` redirects the E2E session to
