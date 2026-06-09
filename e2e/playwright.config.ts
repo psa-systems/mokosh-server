@@ -66,7 +66,8 @@ export default defineConfig({
     //    SPA host. Transitively depends on `preflight` via `setup`.
     {
       name: 'api',
-      testMatch: /(oidc|tickets|contacts)\.spec\.ts$/,
+      testMatch:
+        /(oidc|tickets|contacts|time-tracking|projects|billing|contracts|calendar|sla|assets|knowledge-base|notifications|settings|audit|reports|rmm|dispatch)\.spec\.ts$/,
       dependencies: ['setup'],
       use: { baseURL: env.apiBaseURL },
     },

@@ -13,6 +13,24 @@ gate (that is PMS-141).
 | OIDC token flow | `tests/oidc.spec.ts` | request context with replayed OP session cookies (from `e2e/.auth/op-state.json`, written by setup): `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE). Asserts the full OP contract; mokosh-server's RS path is exercised indirectly by every other api test |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
+| Time-tracking CRUD | `tests/time-tracking.spec.ts` | work types + time entries + rounding rules (PMS-155); enables the `time_tracking` module first |
+| Projects CRUD | `tests/projects.spec.ts` | project + phase + task + task-status (PMS-155); enables the `projects` module first |
+| Billing CRUD | `tests/billing.spec.ts` | tax-rate + payment full lifecycle, invoices read-only (no DELETE route) (PMS-155); enables the `billing` module first |
+| Contracts CRUD | `tests/contracts.spec.ts` | contract + item + rate card + hour-balance (PMS-155); enables the `contracts` module first |
+| Calendar CRUD | `tests/calendar.spec.ts` | appointment + time-off + on-call schedule (PMS-155); enables the `calendar` module first |
+| SLA CRUD | `tests/sla.spec.ts` | policy + business hours + holiday calendar (PMS-155); SLA is not module-gated, writes are admin-only |
+| Assets CRUD | `tests/assets.spec.ts` | asset type + asset + encrypted configuration item (PMS-155); enables the `assets` module first |
+| Knowledge-base CRUD | `tests/knowledge-base.spec.ts` | category + article + version history (PMS-155); enables the `knowledge_base` module first |
+| Notifications CRUD | `tests/notifications.spec.ts` | template + channel create/list/delete (PMS-155); not module-gated, writes admin-only |
+| Settings CRUD | `tests/settings.spec.ts` | tenant setting upsert/read/update/delete keyed by category+key (PMS-155); throwaway `e2e` category |
+| Audit log | `tests/audit.spec.ts` | read-only; creates a company and asserts the audit log surfaces its `create` entry (PMS-155) |
+| Reports read smoke | `tests/reports.spec.ts` | dashboard/tickets/time/billing + CSV export return 200 (PMS-155); enables the `reports` module first |
+| RMM CRUD | `tests/rmm.spec.ts` | connection (fake credentials) + alert rule + device mapping (PMS-155); enables the `rmm_integration` module first |
+| Dispatch board | `tests/dispatch.spec.ts` | aggregated board read smoke for a date range (PMS-155); enables the `calendar` module first, requires `from`+`to` |
+
+**Module gating.** Most feature modules (time_tracking, projects, billing, contracts, calendar, assets, knowledge_base, reports, rmm_integration) are tenant-gated and default to DISABLED (`is_module_enabled` treats a missing `module_config` row as `false`). Each spec for a gated module enables it up front via `PUT /api/v1/settings/modules/{module}` (admin-only, idempotent) so it runs regardless of the staging tenant's current config; see `lib/factories.ts::enableModule`. The enable persists on the E2E tenant - this is configuration, not swept residue. SLA is NOT gated; its writes are simply admin-only.
+
+**Invoices.** Billing has no `DELETE /api/v1/invoices/{id}` route, so an invoice created by the suite would be permanent residue (the leak PMS-149/PMS-155 set out to avoid). The billing spec therefore smoke-reads the invoice list only; a follow-up should add a delete/void-and-purge route and the matching invoice lifecycle.
 
 **Harness shape.** Two independent auth paths because the mokosh-clients SPA
 keeps its bearer token in WASM memory (`mokosh-clients/src/hooks/fetch.rs`),
@@ -84,10 +102,23 @@ Done once by a human before the suite can pass against a deployment:
 Every record a test creates carries an embedded tag `e2e-<epochMs>-<runId>-<n>`
 in its name and lives only in the E2E tenant. `global.teardown.ts`:
 
-- deletes tickets, contacts, and companies created by **this** run (in that
-  order, since `delete_company` refuses while a ticket or contact still
-  references the company), and
+- deletes the top-level named records created by **this** run - across
+  tickets, projects, contracts, assets/asset-types, appointments, on-call
+  schedules, SLA policies/business-hours/holiday-calendars, KB
+  articles/categories, work types, rounding rules, task statuses, rate cards,
+  tax rates, contacts, and companies - sweeping children before parents (the
+  company is referenced by almost everything, so it goes last). The sweep list
+  lives in `global.teardown.ts`; add a row when a new named resource is
+  covered. Gated-module sweeps no-op when the module is disabled (their list
+  route 404s); and
 - sweeps any `e2e-`-tagged residue older than **24h** left by earlier failed runs.
+
+Records without a run-suffixed name (time entries, tasks, contract items,
+payments, invoices, time-off, configuration items) are not name-matchable;
+specs delete those inline in reverse-dependency order, and the name sweep is
+only a backstop for the
+top-level residue a failed run leaves behind. Sweeps for gated-module resources
+no-op when the module is disabled (their list route 404s).
 
 On failure, this run's residue is intentionally left for debugging and the next
 run's sweep removes it once it ages past 24h. Teardown is best-effort and never
