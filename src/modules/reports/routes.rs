@@ -49,6 +49,8 @@ pub fn reports_routes(service: ReportsService) -> Router {
         .route("/reports/tickets", get(tickets_report))
         .route("/reports/time", get(time_report))
         .route("/reports/billing", get(billing_report))
+        .route("/reports/projects", get(projects_report))
+        .route("/reports/clients", get(clients_report))
         .route("/reports/{report}/export", get(export_report))
         .with_state(state)
 }
@@ -101,6 +103,20 @@ async fn list_reports(
                 required: false,
             }],
         },
+        ReportDescriptor {
+            key: "projects",
+            name: "Project Delivery",
+            description:
+                "Projects by status, budget vs actual hours / amount, task completion, and overdue projects.",
+            parameters: vec![],
+        },
+        ReportDescriptor {
+            key: "clients",
+            name: "Clients & Assets",
+            description:
+                "Company counts, asset inventory by type and status, warranties expiring soon, and contract renewals.",
+            parameters: vec![],
+        },
     ]))
 }
 
@@ -141,6 +157,20 @@ async fn billing_report(
     Ok(Json(s.service.billing(u.tenant_id, q.company_id).await?))
 }
 
+async fn projects_report(
+    State(s): State<ReportsRouterState>,
+    RequireReports { user: u, .. }: RequireReports,
+) -> AppResult<Json<ProjectsReportResponse>> {
+    Ok(Json(s.service.projects(u.tenant_id).await?))
+}
+
+async fn clients_report(
+    State(s): State<ReportsRouterState>,
+    RequireReports { user: u, .. }: RequireReports,
+) -> AppResult<Json<ClientsReportResponse>> {
+    Ok(Json(s.service.clients(u.tenant_id).await?))
+}
+
 #[derive(Deserialize)]
 struct ExportQ {
     #[serde(default = "default_csv")]
@@ -176,6 +206,8 @@ async fn export_report(
         "tickets" => csv_for_tickets(&s.service.tickets(u.tenant_id, q.from, q.to).await?),
         "time" => csv_for_time(&s.service.time(u.tenant_id, q.from, q.to).await?),
         "billing" => csv_for_billing(&s.service.billing(u.tenant_id, q.company_id).await?),
+        "projects" => csv_for_projects(&s.service.projects(u.tenant_id).await?),
+        "clients" => csv_for_clients(&s.service.clients(u.tenant_id).await?),
         other => return Err(AppError::NotFound(format!("report {other:?}"))),
     };
     Ok((
@@ -240,6 +272,47 @@ fn csv_for_billing(r: &BillingReportResponse) -> String {
     s.push_str("\nbucket,total\n");
     for b in &r.aging {
         s.push_str(&format!("{},{}\n", b.bucket, b.total));
+    }
+    s
+}
+
+fn csv_for_projects(r: &ProjectsReportResponse) -> String {
+    let mut s = String::from("status,count\n");
+    for b in &r.by_status {
+        s.push_str(&format!("{},{}\n", b.label, b.count));
+    }
+    s.push_str("\nmetric,value\n");
+    s.push_str(&format!("budget_hours,{}\n", r.budget_hours));
+    s.push_str(&format!("budget_amount,{}\n", r.budget_amount));
+    s.push_str(&format!("actual_hours,{}\n", r.actual_hours));
+    s.push_str(&format!("actual_amount,{}\n", r.actual_amount));
+    s.push_str(&format!("tasks_total,{}\n", r.tasks_total));
+    s.push_str(&format!("tasks_completed,{}\n", r.tasks_completed));
+    s.push_str(&format!("overdue,{}\n", r.overdue));
+    s
+}
+
+fn csv_for_clients(r: &ClientsReportResponse) -> String {
+    let mut s = String::from("metric,value\n");
+    s.push_str(&format!("companies_total,{}\n", r.companies_total));
+    s.push_str(&format!("companies_active,{}\n", r.companies_active));
+    s.push_str(&format!("assets_total,{}\n", r.assets_total));
+    s.push_str(&format!(
+        "warranty_expiring_90d,{}\n",
+        r.warranty_expiring_90d
+    ));
+    s.push_str(&format!("contracts_active,{}\n", r.contracts_active));
+    s.push_str(&format!(
+        "contracts_renewing_90d,{}\n",
+        r.contracts_renewing_90d
+    ));
+    s.push_str("\nasset_type,count\n");
+    for b in &r.assets_by_type {
+        s.push_str(&format!("{},{}\n", b.label, b.count));
+    }
+    s.push_str("\nasset_status,count\n");
+    for b in &r.assets_by_status {
+        s.push_str(&format!("{},{}\n", b.label, b.count));
     }
     s
 }

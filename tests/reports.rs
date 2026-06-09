@@ -270,3 +270,453 @@ fn dec(v: &serde_json::Value) -> f64 {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(f64::NAN)
 }
+
+// --- PMS-179 project + client report seed helpers ---------------------------
+
+/// Seed a project. Numeric/date columns are inlined (not bound) so we don't
+/// pull in a Decimal bind; `target_end_sql` is a raw SQL date expression
+/// (e.g. `CURRENT_DATE - INTERVAL '1 day'` or `NULL`).
+async fn seed_project(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    name: &str,
+    status: &str,
+    budget_hours: i64,
+    budget_amount: i64,
+    target_end_sql: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let q = format!(
+        r#"INSERT INTO projects
+           (id, tenant_id, name, status, budget_hours, budget_amount, target_end_date)
+           VALUES ($1, $2, $3, $4, {budget_hours}, {budget_amount}, {target_end_sql})"#
+    );
+    sqlx::query(&q)
+        .bind(id)
+        .bind(tenant_id)
+        .bind(name)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed project");
+    id
+}
+
+/// First seeded task status matching the wanted completion flag (the seed
+/// migration provisions a "Done"-style completed status and several open
+/// ones for the default tenant).
+async fn task_status_id(pool: &PgPool, tenant_id: Uuid, completed: bool) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM task_statuses WHERE tenant_id = $1 AND is_completed = $2 LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(completed)
+    .fetch_one(pool)
+    .await
+    .expect("a seeded task status")
+}
+
+async fn seed_task(pool: &PgPool, tenant_id: Uuid, project_id: Uuid, status_id: Uuid, title: &str) {
+    sqlx::query(
+        "INSERT INTO tasks (id, tenant_id, project_id, title, status_id) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(project_id)
+    .bind(title)
+    .bind(status_id)
+    .execute(pool)
+    .await
+    .expect("seed task");
+}
+
+/// Seed a project-linked time entry. `minutes` and `amount` are inlined to
+/// avoid a Decimal bind; `work_type_id` is fetched from the seeded set.
+async fn seed_project_time_entry(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    company_id: Uuid,
+    project_id: Uuid,
+    minutes: i64,
+    amount: i64,
+) {
+    let work_type_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM work_types WHERE tenant_id = $1 LIMIT 1")
+            .bind(tenant_id)
+            .fetch_one(pool)
+            .await
+            .expect("a seeded work type");
+    let q = format!(
+        r#"INSERT INTO time_entries
+           (id, tenant_id, user_id, date, duration_minutes, work_type_id,
+            company_id, project_id, total_amount)
+           VALUES ($1, $2, $3, CURRENT_DATE, {minutes}, $4, $5, $6, {amount})"#
+    );
+    sqlx::query(&q)
+        .bind(Uuid::new_v4())
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(work_type_id)
+        .bind(company_id)
+        .bind(project_id)
+        .execute(pool)
+        .await
+        .expect("seed project time entry");
+}
+
+async fn asset_type_id(pool: &PgPool, tenant_id: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM asset_types WHERE tenant_id = $1 LIMIT 1")
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await
+        .expect("a seeded asset type")
+}
+
+/// Create an asset type for a tenant that has none (the seed migration only
+/// provisions lookup rows for the default tenant).
+async fn seed_asset_type(pool: &PgPool, tenant_id: Uuid, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO asset_types (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(tenant_id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed asset type");
+    id
+}
+
+/// Seed an asset. `warranty_sql` is a raw SQL date expression
+/// (e.g. `CURRENT_DATE + INTERVAL '30 days'` or `NULL`).
+async fn seed_asset(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    type_id: Uuid,
+    name: &str,
+    status: &str,
+    warranty_sql: &str,
+) {
+    let q = format!(
+        r#"INSERT INTO assets
+           (id, tenant_id, name, asset_type_id, company_id, status, warranty_expiry)
+           VALUES ($1, $2, $3, $4, $5, $6, {warranty_sql})"#
+    );
+    sqlx::query(&q)
+        .bind(Uuid::new_v4())
+        .bind(tenant_id)
+        .bind(name)
+        .bind(type_id)
+        .bind(company_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed asset");
+}
+
+/// Seed a contract. `end_sql` is a raw SQL date expression (or `NULL`).
+async fn seed_contract(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    name: &str,
+    status: &str,
+    end_sql: &str,
+) {
+    let q = format!(
+        r#"INSERT INTO contracts
+           (id, tenant_id, name, company_id, contract_type, status, start_date, end_date)
+           VALUES ($1, $2, $3, $4, 'managed_services', $5, '2026-01-01', {end_sql})"#
+    );
+    sqlx::query(&q)
+        .bind(Uuid::new_v4())
+        .bind(tenant_id)
+        .bind(name)
+        .bind(company_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed contract");
+}
+
+/// Set a company's status (seed_company defaults to 'active').
+async fn set_company_status(pool: &PgPool, company_id: Uuid, status: &str) {
+    sqlx::query("UPDATE companies SET status = $1 WHERE id = $2")
+        .bind(status)
+        .bind(company_id)
+        .execute(pool)
+        .await
+        .expect("set company status");
+}
+
+// PMS-179: projects report reflects seeded delivery data; appears in the
+// registry; CSV export works.
+#[sqlx::test]
+async fn projects_report_aggregates(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, tenant, "Acme Co").await;
+
+    // One active, overdue project: budget 10h / $1000.
+    let project = seed_project(
+        &pool,
+        tenant,
+        "Migration",
+        "active",
+        10,
+        1000,
+        "CURRENT_DATE - INTERVAL '1 day'",
+    )
+    .await;
+    // A second, on-track planning project so by_status has two buckets.
+    seed_project(
+        &pool,
+        tenant,
+        "Onboarding",
+        "planning",
+        5,
+        500,
+        "CURRENT_DATE + INTERVAL '30 days'",
+    )
+    .await;
+
+    // Two tasks: one completed, one open.
+    let done = task_status_id(&pool, tenant, true).await;
+    let open = task_status_id(&pool, tenant, false).await;
+    seed_task(&pool, tenant, project, done, "Cutover").await;
+    seed_task(&pool, tenant, project, open, "Validation").await;
+
+    // 90 minutes / $150 of project-linked time -> 1.5 actual hours.
+    seed_project_time_entry(&pool, tenant, admin_id, company, project, 90, 150).await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // Registry advertises the projects report.
+    let registry: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/reports"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list reports")
+        .json()
+        .await
+        .expect("registry JSON");
+    let keys: Vec<&str> = registry
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["key"].as_str())
+        .collect();
+    assert!(keys.contains(&"projects"), "registry lists 'projects'");
+    assert!(keys.contains(&"clients"), "registry lists 'clients'");
+
+    let rep: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/reports/projects"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("projects report")
+        .json()
+        .await
+        .expect("projects JSON");
+
+    let active = rep["by_status"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["label"] == "active")
+        .and_then(|b| b["count"].as_i64())
+        .unwrap_or(0);
+    assert_eq!(active, 1, "one active project");
+    assert!(
+        (dec(&rep["budget_hours"]) - 15.0).abs() < 0.01,
+        "budget hours sum 10 + 5"
+    );
+    assert!(
+        (dec(&rep["budget_amount"]) - 1500.0).abs() < 0.01,
+        "budget amount sum 1000 + 500"
+    );
+    assert!(
+        (dec(&rep["actual_hours"]) - 1.5).abs() < 0.01,
+        "90 logged minutes -> 1.5 hours"
+    );
+    assert!(
+        (dec(&rep["actual_amount"]) - 150.0).abs() < 0.01,
+        "actual amount 150"
+    );
+    assert_eq!(rep["tasks_total"].as_i64().unwrap(), 2, "two tasks");
+    assert_eq!(
+        rep["tasks_completed"].as_i64().unwrap(),
+        1,
+        "one completed task"
+    );
+    assert_eq!(rep["overdue"].as_i64().unwrap(), 1, "one overdue project");
+
+    // CSV export.
+    let export = app
+        .client
+        .get(app.url("/api/v1/reports/projects/export?format=csv"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("csv export");
+    assert!(export.status().is_success(), "projects csv export 2xx");
+    assert!(
+        !export.text().await.unwrap().trim().is_empty(),
+        "projects csv has content"
+    );
+}
+
+// PMS-179: clients report reflects seeded CMDB / contract data; CSV works.
+#[sqlx::test]
+async fn clients_report_aggregates(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+
+    let company_a = seed_company(&pool, tenant, "Active Co").await;
+    let company_b = seed_company(&pool, tenant, "Inactive Co").await;
+    set_company_status(&pool, company_b, "inactive").await;
+
+    let at = asset_type_id(&pool, tenant).await;
+    // One asset with a warranty expiring inside 90 days, one with none.
+    seed_asset(
+        &pool,
+        tenant,
+        company_a,
+        at,
+        "Server-1",
+        "active",
+        "CURRENT_DATE + INTERVAL '30 days'",
+    )
+    .await;
+    seed_asset(&pool, tenant, company_a, at, "Laptop-1", "active", "NULL").await;
+
+    // One contract renewing inside 90 days, one well beyond.
+    seed_contract(
+        &pool,
+        tenant,
+        company_a,
+        "MSP Agreement",
+        "active",
+        "CURRENT_DATE + INTERVAL '30 days'",
+    )
+    .await;
+    seed_contract(
+        &pool,
+        tenant,
+        company_a,
+        "Long Term",
+        "active",
+        "CURRENT_DATE + INTERVAL '300 days'",
+    )
+    .await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let rep: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/reports/clients"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("clients report")
+        .json()
+        .await
+        .expect("clients JSON");
+
+    assert_eq!(rep["companies_total"].as_i64().unwrap(), 2, "two companies");
+    assert_eq!(
+        rep["companies_active"].as_i64().unwrap(),
+        1,
+        "one active company"
+    );
+    assert_eq!(rep["assets_total"].as_i64().unwrap(), 2, "two assets");
+    let by_type: i64 = rep["assets_by_type"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["count"].as_i64())
+        .sum();
+    assert_eq!(by_type, 2, "assets_by_type sums to all assets");
+    assert_eq!(
+        rep["warranty_expiring_90d"].as_i64().unwrap(),
+        1,
+        "one warranty expiring within 90 days"
+    );
+    assert_eq!(
+        rep["contracts_active"].as_i64().unwrap(),
+        2,
+        "two active contracts"
+    );
+    assert_eq!(
+        rep["contracts_renewing_90d"].as_i64().unwrap(),
+        1,
+        "one contract renewing within 90 days"
+    );
+
+    let export = app
+        .client
+        .get(app.url("/api/v1/reports/clients/export?format=csv"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("csv export");
+    assert!(export.status().is_success(), "clients csv export 2xx");
+    assert!(
+        !export.text().await.unwrap().trim().is_empty(),
+        "clients csv has content"
+    );
+}
+
+// PMS-179 (AC5): the clients report is tenant-scoped - a second tenant's
+// assets never leak into this tenant's counts.
+#[sqlx::test]
+async fn clients_report_is_tenant_scoped(pool: PgPool) {
+    let tenant_a = common::DEFAULT_TENANT_ID;
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company_a = seed_company(&pool, tenant_a, "Tenant A Co").await;
+    let at_a = asset_type_id(&pool, tenant_a).await;
+    seed_asset(&pool, tenant_a, company_a, at_a, "A-1", "active", "NULL").await;
+
+    // Tenant B with three assets of its own.
+    let (tenant_b, _b_uid, _b_email, _b_pw) =
+        common::seed_tenant_with_admin(&pool, "tenant-b").await;
+    let company_b = seed_company(&pool, tenant_b, "Tenant B Co").await;
+    let at_b = seed_asset_type(&pool, tenant_b, "Workstation").await;
+    for n in 0..3 {
+        seed_asset(
+            &pool,
+            tenant_b,
+            company_b,
+            at_b,
+            &format!("B-{n}"),
+            "active",
+            "NULL",
+        )
+        .await;
+    }
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let rep: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/reports/clients"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("clients report")
+        .json()
+        .await
+        .expect("clients JSON");
+    assert_eq!(
+        rep["assets_total"].as_i64().unwrap(),
+        1,
+        "tenant A sees only its own asset, not tenant B's three"
+    );
+}

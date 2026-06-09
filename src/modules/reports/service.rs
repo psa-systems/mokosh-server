@@ -244,6 +244,159 @@ impl ReportsService {
                 .collect(),
         })
     }
+
+    // PMS-179 projects --------------------------------------------------------
+    /// Project delivery: counts by status, budget vs actual (actuals come
+    /// from `time_entries` linked to a project), task completion, and
+    /// overdue projects. Powers the SPA project-status / budget-tracking /
+    /// milestone-tracking report types.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn projects(&self, tenant_id: Uuid) -> AppResult<ProjectsReportResponse> {
+        let by_status: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT status, COUNT(*)::bigint
+               FROM projects WHERE tenant_id = $1
+               GROUP BY status ORDER BY status"#,
+        )
+        .bind(tenant_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let (budget_hours, budget_amount): (Decimal, Decimal) = sqlx::query_as(
+            r#"SELECT COALESCE(SUM(budget_hours), 0), COALESCE(SUM(budget_amount), 0)
+               FROM projects WHERE tenant_id = $1"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        // Actuals: only time entries that belong to a project count toward a
+        // project's spend. Minutes are summed in SQL; hours are derived once
+        // here so callers and CSV share the same rounding.
+        let (actual_minutes, actual_amount): (i64, Decimal) = sqlx::query_as(
+            r#"SELECT COALESCE(SUM(duration_minutes), 0)::bigint,
+                      COALESCE(SUM(total_amount), 0)
+               FROM time_entries
+               WHERE tenant_id = $1 AND project_id IS NOT NULL"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        let actual_hours = Decimal::from(actual_minutes) / Decimal::from(60);
+
+        let (tasks_total, tasks_completed): (i64, i64) = sqlx::query_as(
+            r#"SELECT COUNT(*)::bigint,
+                      COUNT(*) FILTER (WHERE tst.is_completed)::bigint
+               FROM tasks t
+               INNER JOIN task_statuses tst ON t.status_id = tst.id
+               WHERE t.tenant_id = $1"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let overdue: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)::bigint FROM projects
+               WHERE tenant_id = $1 AND target_end_date < CURRENT_DATE
+                 AND status NOT IN ('completed', 'cancelled')"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(ProjectsReportResponse {
+            by_status: by_status
+                .into_iter()
+                .map(|(label, count)| Bucket { label, count })
+                .collect(),
+            budget_hours,
+            budget_amount,
+            actual_hours,
+            actual_amount,
+            tasks_total,
+            tasks_completed,
+            overdue,
+        })
+    }
+
+    // PMS-179 clients ---------------------------------------------------------
+    /// Client / CMDB summary: company counts, asset inventory by type and
+    /// status, warranties expiring soon, and contract renewals. Powers the
+    /// SPA client-summary / asset-inventory / contract-renewals report types.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn clients(&self, tenant_id: Uuid) -> AppResult<ClientsReportResponse> {
+        let (companies_total, companies_active): (i64, i64) = sqlx::query_as(
+            r#"SELECT COUNT(*)::bigint,
+                      COUNT(*) FILTER (WHERE status = 'active')::bigint
+               FROM companies WHERE tenant_id = $1"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let assets_total: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*)::bigint FROM assets WHERE tenant_id = $1"#)
+                .bind(tenant_id)
+                .fetch_one(self.db.pool())
+                .await?;
+
+        let by_type: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT at.name, COUNT(*)::bigint
+               FROM assets a INNER JOIN asset_types at ON a.asset_type_id = at.id
+               WHERE a.tenant_id = $1
+               GROUP BY at.name ORDER BY at.name"#,
+        )
+        .bind(tenant_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let by_status: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT status, COUNT(*)::bigint
+               FROM assets WHERE tenant_id = $1
+               GROUP BY status ORDER BY status"#,
+        )
+        .bind(tenant_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let warranty_expiring_90d: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)::bigint FROM assets
+               WHERE tenant_id = $1
+                 AND warranty_expiry BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let (contracts_active, contracts_renewing_90d): (i64, i64) = sqlx::query_as(
+            r#"SELECT
+                  COUNT(*) FILTER (WHERE status = 'active')::bigint,
+                  COUNT(*) FILTER (
+                      WHERE status = 'active' AND end_date IS NOT NULL
+                        AND end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
+                  )::bigint
+               FROM contracts WHERE tenant_id = $1"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        Ok(ClientsReportResponse {
+            companies_total,
+            companies_active,
+            assets_total,
+            assets_by_type: by_type
+                .into_iter()
+                .map(|(label, count)| Bucket { label, count })
+                .collect(),
+            assets_by_status: by_status
+                .into_iter()
+                .map(|(label, count)| Bucket { label, count })
+                .collect(),
+            warranty_expiring_90d,
+            contracts_active,
+            contracts_renewing_90d,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -307,4 +460,28 @@ pub struct BillingReportResponse {
     pub paid: Decimal,
     pub outstanding: Decimal,
     pub aging: Vec<AgingBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectsReportResponse {
+    pub by_status: Vec<Bucket>,
+    pub budget_hours: Decimal,
+    pub budget_amount: Decimal,
+    pub actual_hours: Decimal,
+    pub actual_amount: Decimal,
+    pub tasks_total: i64,
+    pub tasks_completed: i64,
+    pub overdue: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientsReportResponse {
+    pub companies_total: i64,
+    pub companies_active: i64,
+    pub assets_total: i64,
+    pub assets_by_type: Vec<Bucket>,
+    pub assets_by_status: Vec<Bucket>,
+    pub warranty_expiring_90d: i64,
+    pub contracts_active: i64,
+    pub contracts_renewing_90d: i64,
 }
