@@ -62,10 +62,21 @@ impl AuditService {
     ) -> AppResult<(Vec<AuditLogEntryResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
+
+        // Build the WHERE clause with sequential positional placeholders.
+        // The same `where_clause` string is reused by the data and count
+        // queries, so the tenant + filter placeholders MUST be numbered
+        // identically for both. We number them starting at $1, then the data
+        // query appends LIMIT/OFFSET as the LAST two placeholders (bound last);
+        // the count query has neither. A previous version started filters at
+        // $3, colliding with `OFFSET $3` and binding more values than the
+        // statement declared, which 500'd whenever a filter was present
+        // (PMS-178).
         let mut conditions: Vec<String> = vec![];
-        let mut idx = 3;
+        let mut idx = 1;
         if tenant_id.is_some() {
-            conditions.push("tenant_id = $1".to_string());
+            conditions.push(format!("tenant_id = ${idx}"));
+            idx += 1;
         }
         if filter.user_id.is_some() {
             conditions.push(format!("user_id = ${idx}"));
@@ -85,32 +96,31 @@ impl AuditService {
         }
         if filter.to.is_some() {
             conditions.push(format!("timestamp <= ${idx}"));
+            idx += 1;
         }
         let where_clause = if conditions.is_empty() {
             "TRUE".to_string()
         } else {
             conditions.join(" AND ")
         };
+        let limit_ph = idx;
+        let offset_ph = idx + 1;
         let query = format!(
             r#"SELECT id, tenant_id, user_id, action, entity_type, entity_id,
                       old_values, new_values, ip_address, user_agent, timestamp
                FROM audit_log WHERE {where_clause}
-               ORDER BY timestamp DESC LIMIT $2 OFFSET $3"#
+               ORDER BY timestamp DESC LIMIT ${limit_ph} OFFSET ${offset_ph}"#
         );
         let count_query = format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}");
 
-        // Bindings: $1 is tenant_id (always present in the placeholder
-        // sequence because the WHERE clause references it conditionally;
-        // we still bind a UUID even for cross-tenant queries by using
-        // the nil UUID with a no-op "true" predicate). Simpler approach:
-        // build different queries.
         let mut q = sqlx::query_as::<_, AuditRow>(&query);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query);
+        // Bind tenant + filters in the SAME order for both queries so the
+        // shared `where_clause` placeholders line up.
         if let Some(tid) = tenant_id {
             q = q.bind(tid);
             cq = cq.bind(tid);
         }
-        q = q.bind(limit).bind(offset);
         if let Some(v) = filter.user_id {
             q = q.bind(v);
             cq = cq.bind(v);
@@ -131,6 +141,9 @@ impl AuditService {
             q = q.bind(v);
             cq = cq.bind(v);
         }
+        // Data query binds LIMIT/OFFSET last, matching the appended
+        // $limit_ph / $offset_ph; the count query binds neither.
+        q = q.bind(limit).bind(offset);
 
         let rows = q.fetch_all(self.db.pool()).await?;
         let total = cq.fetch_one(self.db.pool()).await?;
