@@ -19,6 +19,12 @@ impl ReportsService {
         Self { db }
     }
 
+    /// Connection pool, for the custom-report builder which constructs its
+    /// own dynamic (but fully whitelisted) query. See `super::custom`.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        self.db.pool()
+    }
+
     // PMS-95 dashboard --------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dashboard(&self, tenant_id: Uuid) -> AppResult<DashboardResponse> {
