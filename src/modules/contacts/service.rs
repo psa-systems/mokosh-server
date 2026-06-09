@@ -656,11 +656,29 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
+        // The explicit ticket guard above only covers one of the many tables
+        // that foreign-key `companies` (contracts, invoices, payments,
+        // projects, assets, time entries, appointments, sub-companies, ...).
+        // Those references are `ON DELETE RESTRICT`, so the DELETE raises
+        // Postgres `23503`; map it to a 400 instead of letting the generic
+        // `From<sqlx::Error>` turn it into a 500 (PMS-170, same shape as the
+        // PMS-149 ticket-delete fix).
+        if let Err(e) = sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(company_id)
             .execute(&mut *tx)
-            .await?;
+            .await
+        {
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
+                return Err(AppError::BadRequest(
+                    "Cannot delete company with related records (contracts, invoices, \
+                     payments, projects, assets, time entries, appointments, or \
+                     sub-companies); remove them first"
+                        .to_string(),
+                ));
+            }
+            return Err(e.into());
+        }
 
         audit_write(
             &mut *tx,
