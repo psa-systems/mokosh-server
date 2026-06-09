@@ -461,17 +461,44 @@ async fn ensure_user_from_bunyip(
     };
 
     // PMS-172: Bunyip governs the top role. Translate the `bunyip_role` claim
-    // into mokosh's taxonomy and reconcile the shadow row when it drifts, so
-    // the DB stays accurate for joins/audit/reporting. When the claim is absent
+    // into mokosh's taxonomy. The translated `effective` role is the
+    // AUTHORITATIVE authorization for this request (it is derived from the
+    // already-verified at+jwt, so it is exactly the caller's entitlement); the
+    // `set_user_role` write below is best-effort PERSISTENCE only, kept so the
+    // DB stays accurate for joins/audit/reporting. A failed write therefore
+    // does NOT under- or over-grant: the request still runs with `effective`,
+    // and the next request re-derives and re-syncs. When the claim is absent
     // the effective role equals the local role, so this is a no-op for legacy /
     // standalone tokens.
+    if let Some(raw) = claims.bunyip_role.as_deref() {
+        if raw != "admin" && raw != "subscriber" {
+            tracing::debug!(
+                user = %user.id,
+                bunyip_role = %raw,
+                "unrecognized bunyip_role claim value; treating as non-admin"
+            );
+        }
+    }
     let effective = effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role);
     if effective != user.role {
+        // Role transitions are security-relevant; log every one (fires only on
+        // change, so low volume) so an elevation/demotion is observable even
+        // though this reconciliation writes no audit-table row (the actor is
+        // the login itself, not an operator request carrying an AuditCtx). A
+        // first-class audit row would need request-context plumbing; tracked as
+        // a follow-up.
+        tracing::info!(
+            user = %user.id,
+            from = %user.role.as_str(),
+            to = %effective.as_str(),
+            bunyip_role = ?claims.bunyip_role.as_deref(),
+            "reconciling user role from Bunyip claim"
+        );
         if let Err(e) = auth_service
             .set_user_role(user.tenant_id, user.id, effective)
             .await
         {
-            tracing::warn!(error = %e, user = %user.id, "failed to sync bunyip-derived role");
+            tracing::warn!(error = %e, user = %user.id, "failed to persist bunyip-derived role (request still uses it)");
         }
         user.role = effective;
     }
