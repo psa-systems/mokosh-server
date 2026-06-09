@@ -7,6 +7,7 @@
 
 mod common;
 
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -718,5 +719,223 @@ async fn clients_report_is_tenant_scoped(pool: PgPool) {
         rep["assets_total"].as_i64().unwrap(),
         1,
         "tenant A sees only its own asset, not tenant B's three"
+    );
+}
+
+// --- PMS-180 custom report builder ------------------------------------------
+
+/// POST a custom-report spec and return the HTTP status code.
+async fn custom_post_status(app: &common::TestApp, token: &str, body: serde_json::Value) -> u16 {
+    app.client
+        .post(app.url("/api/v1/reports/custom"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("custom post")
+        .status()
+        .as_u16()
+}
+
+// The builder runs a whitelisted aggregate, advertises its catalog, and
+// exports CSV.
+#[sqlx::test]
+async fn custom_report_runs_and_exports(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, tenant, "Acme Co").await;
+    let at = asset_type_id(&pool, tenant).await;
+    seed_asset(&pool, tenant, company, at, "Srv-1", "active", "NULL").await;
+    seed_asset(&pool, tenant, company, at, "Srv-2", "active", "NULL").await;
+    seed_asset(&pool, tenant, company, at, "Old-1", "retired", "NULL").await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // --- Schema advertises the assets source with status / count ---
+    let schema: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/reports/custom/schema"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("schema")
+        .json()
+        .await
+        .expect("schema JSON");
+    let assets_src = schema
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "assets")
+        .expect("assets source in schema");
+    assert!(
+        assets_src["dimensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["key"] == "status"),
+        "assets source advertises a status dimension"
+    );
+    assert!(
+        assets_src["measures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["key"] == "count"),
+        "assets source advertises a count measure"
+    );
+
+    // --- Run: assets grouped by status, counted ---
+    let res = app
+        .client
+        .post(app.url("/api/v1/reports/custom"))
+        .bearer_auth(&token)
+        .json(&json!({ "source": "assets", "dimensions": ["status"], "measures": ["count"] }))
+        .send()
+        .await
+        .expect("custom run");
+    assert!(res.status().is_success(), "custom run should 2xx");
+    let body: serde_json::Value = res.json().await.expect("custom JSON");
+    assert_eq!(body["columns"], json!(["Status", "Count"]));
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "two status groups (active, retired)");
+    let active = rows
+        .iter()
+        .find(|r| r[0] == "active")
+        .expect("an active row");
+    assert_eq!(active[1], "2", "two active assets");
+    assert_eq!(body["totals"]["Count"], "3", "totals sum across groups");
+
+    // --- CSV export ---
+    let csv = app
+        .client
+        .post(app.url("/api/v1/reports/custom"))
+        .bearer_auth(&token)
+        .json(&json!({ "source": "assets", "measures": ["count"], "format": "csv" }))
+        .send()
+        .await
+        .expect("csv run");
+    assert!(csv.status().is_success(), "csv run should 2xx");
+    let ct = csv
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.contains("text/csv"), "csv content type (got {ct})");
+    assert!(
+        !csv.text().await.unwrap().trim().is_empty(),
+        "csv body has content"
+    );
+}
+
+// Unknown / malicious source, dimension, measure, or an empty measure list
+// are rejected with 400 before any SQL is built.
+#[sqlx::test]
+async fn custom_report_rejects_unknown_fields(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    assert_eq!(
+        custom_post_status(
+            &app,
+            &token,
+            json!({ "source": "bogus", "measures": ["count"] })
+        )
+        .await,
+        400,
+        "unknown source rejected"
+    );
+    // An injection-style dimension name is just an unknown key -> 400, never
+    // interpolated into SQL.
+    assert_eq!(
+        custom_post_status(
+            &app,
+            &token,
+            json!({ "source": "tickets", "dimensions": ["status; DROP TABLE tickets"], "measures": ["count"] })
+        )
+        .await,
+        400,
+        "unknown / malicious dimension rejected"
+    );
+    assert_eq!(
+        custom_post_status(
+            &app,
+            &token,
+            json!({ "source": "tickets", "measures": ["evil"] })
+        )
+        .await,
+        400,
+        "unknown measure rejected"
+    );
+    assert_eq!(
+        custom_post_status(
+            &app,
+            &token,
+            json!({ "source": "tickets", "dimensions": ["status"], "measures": [] })
+        )
+        .await,
+        400,
+        "a report with no measure is rejected"
+    );
+    // A fully valid request still succeeds.
+    assert_eq!(
+        custom_post_status(
+            &app,
+            &token,
+            json!({ "source": "tickets", "measures": ["count"] })
+        )
+        .await,
+        200,
+        "a valid spec succeeds"
+    );
+}
+
+// A custom report is tenant-scoped: a second tenant's assets never reach
+// this tenant's counts.
+#[sqlx::test]
+async fn custom_report_is_tenant_scoped(pool: PgPool) {
+    let tenant_a = common::DEFAULT_TENANT_ID;
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company_a = seed_company(&pool, tenant_a, "Tenant A Co").await;
+    let at_a = asset_type_id(&pool, tenant_a).await;
+    seed_asset(&pool, tenant_a, company_a, at_a, "A-1", "active", "NULL").await;
+
+    let (tenant_b, _b_uid, _b_email, _b_pw) =
+        common::seed_tenant_with_admin(&pool, "tenant-b").await;
+    let company_b = seed_company(&pool, tenant_b, "Tenant B Co").await;
+    let at_b = seed_asset_type(&pool, tenant_b, "Workstation").await;
+    for n in 0..3 {
+        seed_asset(
+            &pool,
+            tenant_b,
+            company_b,
+            at_b,
+            &format!("B-{n}"),
+            "active",
+            "NULL",
+        )
+        .await;
+    }
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let body: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/reports/custom"))
+        .bearer_auth(&token)
+        .json(&json!({ "source": "assets", "measures": ["count"] }))
+        .send()
+        .await
+        .expect("custom run")
+        .json()
+        .await
+        .expect("custom JSON");
+    assert_eq!(
+        body["totals"]["Count"], "1",
+        "tenant A counts only its own asset, not tenant B's three"
     );
 }

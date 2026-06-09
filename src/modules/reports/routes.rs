@@ -5,13 +5,14 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::custom;
 use super::service::*;
 use crate::modules::auth::{RequireManager, RequireReports};
 use crate::utils::error::{AppError, AppResult};
@@ -51,6 +52,8 @@ pub fn reports_routes(service: ReportsService) -> Router {
         .route("/reports/billing", get(billing_report))
         .route("/reports/projects", get(projects_report))
         .route("/reports/clients", get(clients_report))
+        .route("/reports/custom/schema", get(custom_schema))
+        .route("/reports/custom", post(custom_run))
         .route("/reports/{report}/export", get(export_report))
         .with_state(state)
 }
@@ -102,6 +105,13 @@ async fn list_reports(
                 kind: "uuid",
                 required: false,
             }],
+        },
+        ReportDescriptor {
+            key: "custom",
+            name: "Custom Report Builder",
+            description:
+                "Build a report from a whitelisted catalog of sources, dimensions, and measures. Discover the catalog at GET /reports/custom/schema and run via POST /reports/custom.",
+            parameters: vec![],
         },
         ReportDescriptor {
             key: "projects",
@@ -169,6 +179,33 @@ async fn clients_report(
     RequireReports { user: u, .. }: RequireReports,
 ) -> AppResult<Json<ClientsReportResponse>> {
     Ok(Json(s.service.clients(u.tenant_id).await?))
+}
+
+/// Catalog the custom-report builder draws from (PMS-180): sources and
+/// their whitelisted dimensions / measures / filters.
+async fn custom_schema(
+    RequireReports { .. }: RequireReports,
+) -> AppResult<Json<Vec<custom::SourceSchema>>> {
+    Ok(Json(custom::schema()))
+}
+
+/// Run a whitelisted custom report. Returns the generic columns / rows /
+/// totals envelope as JSON, or CSV when the spec sets `"format": "csv"`.
+async fn custom_run(
+    State(s): State<ReportsRouterState>,
+    RequireReports { user: u, .. }: RequireReports,
+    Json(spec): Json<custom::CustomSpec>,
+) -> AppResult<Response> {
+    let report = custom::run(s.service.pool(), u.tenant_id, &spec).await?;
+    if spec.format.as_deref() == Some("csv") {
+        let csv = custom::to_csv(&report);
+        return Ok((
+            [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+            csv,
+        )
+            .into_response());
+    }
+    Ok(Json(report).into_response())
 }
 
 #[derive(Deserialize)]
