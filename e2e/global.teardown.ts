@@ -123,6 +123,16 @@ export default async function globalTeardown(): Promise<void> {
       { name: 'appointments', list: routes.appointments, del: routes.appointment },
       { name: 'kbArticles', list: routes.kbArticles, del: routes.kbArticle },
       { name: 'kbCategories', list: routes.kbCategories, del: routes.kbCategory },
+      {
+        name: 'notificationTemplates',
+        list: routes.notificationTemplates,
+        del: routes.notificationTemplate,
+      },
+      {
+        name: 'notificationChannels',
+        list: routes.notificationChannels,
+        del: routes.notificationChannel,
+      },
       { name: 'tickets', list: routes.tickets, del: routes.ticket },
       { name: 'projects', list: routes.projects, del: routes.project },
       { name: 'contracts', list: routes.contracts, del: routes.contract },

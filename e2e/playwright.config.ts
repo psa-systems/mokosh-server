@@ -67,7 +67,7 @@ export default defineConfig({
     {
       name: 'api',
       testMatch:
-        /(oidc|tickets|contacts|time-tracking|projects|billing|contracts|calendar|sla|assets|knowledge-base)\.spec\.ts$/,
+        /(oidc|tickets|contacts|time-tracking|projects|billing|contracts|calendar|sla|assets|knowledge-base|notifications|settings|audit|reports)\.spec\.ts$/,
       dependencies: ['setup'],
       use: { baseURL: env.apiBaseURL },
     },

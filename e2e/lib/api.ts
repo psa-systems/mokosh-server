@@ -98,6 +98,29 @@ export const routes = {
   kbArticles: `${API_V1}/kb/articles`,
   kbArticle: (id: string) => `${API_V1}/kb/articles/${id}`,
   kbArticleVersions: (id: string) => `${API_V1}/kb/articles/${id}/versions`,
+
+  // Notifications (PMS-86; not module-gated, writes admin-only). Templates,
+  // channels, and rules are create/list/delete only (no update or get-by-id).
+  notificationTemplates: `${API_V1}/notification-templates`,
+  notificationTemplate: (id: string) => `${API_V1}/notification-templates/${id}`,
+  notificationChannels: `${API_V1}/notification-channels`,
+  notificationChannel: (id: string) => `${API_V1}/notification-channels/${id}`,
+
+  // Settings (PMS-114; tenant settings keyed by category + key, admin writes).
+  settings: `${API_V1}/settings`,
+  settingsCategory: (category: string) => `${API_V1}/settings/${category}`,
+  setting: (category: string, key: string) => `${API_V1}/settings/${category}/${key}`,
+
+  // Audit log (PMS-118; read-only, admin).
+  auditLog: `${API_V1}/audit-log`,
+
+  // Reports (PMS-94; module-gated, read-only aggregations).
+  reports: `${API_V1}/reports`,
+  reportDashboard: `${API_V1}/reports/dashboard`,
+  reportTickets: `${API_V1}/reports/tickets`,
+  reportTime: `${API_V1}/reports/time`,
+  reportBilling: `${API_V1}/reports/billing`,
+  reportExport: (report: string) => `${API_V1}/reports/${report}/export`,
 } as const;
 
 function base64url(buf: Buffer): string {
