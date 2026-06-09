@@ -83,10 +83,15 @@ Done once by a human before the suite can pass against a deployment:
 
 1. **E2E tenant** - create a dedicated tenant for E2E. Record its UUID as
    `E2E_TENANT_ID`. All test records live here and are swept after each run.
-2. **E2E account** - create a user in that tenant with permission to manage
-   tickets, companies, and contacts. Record `E2E_EMAIL` / `E2E_PASSWORD`.
-   Enable 2FA on the account and save the base32 secret (the string under
-   the QR code at enrollment) as `E2E_TOTP_SECRET` - the setup test
+2. **E2E account** - create a user in that tenant with the **`admin`** role
+   (or `super_admin`). Admin is REQUIRED, not optional: the suite enables
+   tenant-gated modules via the admin-only `PUT /api/v1/settings/modules/{module}`
+   route, and many writes are gated by `RequireAdmin` / `RequireManager` /
+   `RequireFinance` (admin satisfies all three). A non-admin account passes only
+   the tickets / contacts / OIDC specs and 403s on everything else. Record
+   `E2E_EMAIL` / `E2E_PASSWORD`. Enable 2FA on the account and save the base32
+   secret (the string under the QR code at enrollment) as `E2E_TOTP_SECRET` -
+   the setup test
    computes the second factor at runtime.
 3. **OIDC client** - reuse the staging SPA public client (PKCE) or register a
    dedicated E2E client. Record `E2E_OIDC_CLIENT_ID` and a registered
