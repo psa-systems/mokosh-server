@@ -107,14 +107,36 @@ export default async function globalTeardown(): Promise<void> {
   });
   const now = Date.now();
   try {
-    // Order matters: delete_company refuses while any ticket OR contact still
-    // references the company. Tickets first (PMS-149 added DELETE
-    // /tickets/{id}), then contacts, then the now-unreferenced companies.
+    // Order matters: a parent refuses deletion while a child still references
+    // it. Sweep children before parents, and the company (referenced by almost
+    // everything) dead last.
+    //
+    // PMS-155 modules (time_tracking, projects, billing, contracts) are
+    // tenant-gated: when a module is disabled its list route 404s, `listAll`
+    // returns [], and that sweep is a silent no-op - which is fine, a disabled
+    // module created no records. Records without a run-suffixed name (time
+    // entries, tasks, contract items, invoices, payments) cannot be matched by
+    // the name sweep; specs delete those inline, and this backstop only mops up
+    // the top-level named residue a failed run leaves behind.
     const tickets = await sweep(api, routes.tickets, routes.ticket, now);
+    const projects = await sweep(api, routes.projects, routes.project, now);
+    const contracts = await sweep(api, routes.contracts, routes.contract, now);
+    const workTypes = await sweep(api, routes.workTypes, routes.workType, now);
+    const roundingRules = await sweep(api, routes.roundingRules, routes.roundingRule, now);
+    const taskStatuses = await sweep(api, routes.taskStatuses, routes.taskStatus, now);
+    const rateCards = await sweep(api, routes.rateCards, routes.rateCard, now);
+    const taxRates = await sweep(api, routes.taxRates, routes.taxRate, now);
     const contacts = await sweep(api, routes.contacts, routes.contact, now);
     const companies = await sweep(api, routes.companies, routes.company, now);
     console.log(
       `[teardown] tickets removed=${tickets.removed} failed=${tickets.failed}; ` +
+        `projects removed=${projects.removed} failed=${projects.failed}; ` +
+        `contracts removed=${contracts.removed} failed=${contracts.failed}; ` +
+        `workTypes removed=${workTypes.removed} failed=${workTypes.failed}; ` +
+        `roundingRules removed=${roundingRules.removed} failed=${roundingRules.failed}; ` +
+        `taskStatuses removed=${taskStatuses.removed} failed=${taskStatuses.failed}; ` +
+        `rateCards removed=${rateCards.removed} failed=${rateCards.failed}; ` +
+        `taxRates removed=${taxRates.removed} failed=${taxRates.failed}; ` +
         `contacts removed=${contacts.removed} failed=${contacts.failed}; ` +
         `companies removed=${companies.removed} failed=${companies.failed}`,
     );

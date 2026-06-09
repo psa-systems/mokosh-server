@@ -27,6 +27,46 @@ export const routes = {
   authMe: `${API_V1}/auth/me`,
   authLogout: `${API_V1}/auth/logout`,
   oidcDiscovery: '/.well-known/openid-configuration',
+
+  // Per-tenant module enable/disable. Modules are gated and default to
+  // DISABLED (is_module_enabled COALESCEs a missing row to FALSE), so a spec
+  // for a gated module must enable it first - see lib/factories.enableModule.
+  settingsModule: (name: string) => `${API_V1}/settings/modules/${name}`,
+
+  // Time tracking (PMS-43; routes merged at the /api/v1 top level).
+  workTypes: `${API_V1}/work-types`,
+  workType: (id: string) => `${API_V1}/work-types/${id}`,
+  timeEntries: `${API_V1}/time-entries`,
+  timeEntry: (id: string) => `${API_V1}/time-entries/${id}`,
+  roundingRules: `${API_V1}/time-rounding-rules`,
+  roundingRule: (id: string) => `${API_V1}/time-rounding-rules/${id}`,
+
+  // Projects (PMS-52).
+  projects: `${API_V1}/projects`,
+  project: (id: string) => `${API_V1}/projects/${id}`,
+  projectPhases: (id: string) => `${API_V1}/projects/${id}/phases`,
+  phase: (id: string) => `${API_V1}/phases/${id}`,
+  taskStatuses: `${API_V1}/task-statuses`,
+  taskStatus: (id: string) => `${API_V1}/task-statuses/${id}`,
+  projectTasks: (id: string) => `${API_V1}/projects/${id}/tasks`,
+  task: (id: string) => `${API_V1}/tasks/${id}`,
+
+  // Billing (PMS-34).
+  invoices: `${API_V1}/invoices`,
+  invoice: (id: string) => `${API_V1}/invoices/${id}`,
+  payments: `${API_V1}/payments`,
+  payment: (id: string) => `${API_V1}/payments/${id}`,
+  taxRates: `${API_V1}/tax-rates`,
+  taxRate: (id: string) => `${API_V1}/tax-rates/${id}`,
+
+  // Contracts (PMS-65).
+  contracts: `${API_V1}/contracts`,
+  contract: (id: string) => `${API_V1}/contracts/${id}`,
+  contractItems: (id: string) => `${API_V1}/contracts/${id}/items`,
+  contractItem: (id: string) => `${API_V1}/contract-items/${id}`,
+  hourBalance: (id: string) => `${API_V1}/contracts/${id}/hour-balance`,
+  rateCards: `${API_V1}/rate-cards`,
+  rateCard: (id: string) => `${API_V1}/rate-cards/${id}`,
 } as const;
 
 function base64url(buf: Buffer): string {

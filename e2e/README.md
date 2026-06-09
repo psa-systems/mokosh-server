@@ -13,6 +13,14 @@ gate (that is PMS-141).
 | OIDC token flow | `tests/oidc.spec.ts` | request context with replayed OP session cookies (from `e2e/.auth/op-state.json`, written by setup): `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE). Asserts the full OP contract; mokosh-server's RS path is exercised indirectly by every other api test |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
+| Time-tracking CRUD | `tests/time-tracking.spec.ts` | work types + time entries + rounding rules (PMS-155); enables the `time_tracking` module first |
+| Projects CRUD | `tests/projects.spec.ts` | project + phase + task + task-status (PMS-155); enables the `projects` module first |
+| Billing CRUD | `tests/billing.spec.ts` | tax-rate + payment full lifecycle, invoices read-only (no DELETE route) (PMS-155); enables the `billing` module first |
+| Contracts CRUD | `tests/contracts.spec.ts` | contract + item + rate card + hour-balance (PMS-155); enables the `contracts` module first |
+
+**Module gating.** The time-tracking, projects, billing, and contracts modules are tenant-gated and default to DISABLED (`is_module_enabled` treats a missing `module_config` row as `false`). Each spec enables its module up front via `PUT /api/v1/settings/modules/{module}` (admin-only, idempotent) so it runs regardless of the staging tenant's current config; see `lib/factories.ts::enableModule`. The enable persists on the E2E tenant - this is configuration, not swept residue.
+
+**Invoices.** Billing has no `DELETE /api/v1/invoices/{id}` route, so an invoice created by the suite would be permanent residue (the leak PMS-149/PMS-155 set out to avoid). The billing spec therefore smoke-reads the invoice list only; a follow-up should add a delete/void-and-purge route and the matching invoice lifecycle.
 
 **Harness shape.** Two independent auth paths because the mokosh-clients SPA
 keeps its bearer token in WASM memory (`mokosh-clients/src/hooks/fetch.rs`),
@@ -84,10 +92,17 @@ Done once by a human before the suite can pass against a deployment:
 Every record a test creates carries an embedded tag `e2e-<epochMs>-<runId>-<n>`
 in its name and lives only in the E2E tenant. `global.teardown.ts`:
 
-- deletes tickets, contacts, and companies created by **this** run (in that
-  order, since `delete_company` refuses while a ticket or contact still
-  references the company), and
+- deletes the top-level named records created by **this** run - tickets,
+  projects, contracts, work types, rounding rules, task statuses, rate cards,
+  tax rates, contacts, and companies - sweeping children before parents (the
+  company is referenced by almost everything, so it goes last), and
 - sweeps any `e2e-`-tagged residue older than **24h** left by earlier failed runs.
+
+Records without a run-suffixed name (time entries, tasks, contract items,
+payments, invoices) are not name-matchable; specs delete those inline in
+reverse-dependency order, and the name sweep is only a backstop for the
+top-level residue a failed run leaves behind. Sweeps for gated-module resources
+no-op when the module is disabled (their list route 404s).
 
 On failure, this run's residue is intentionally left for debugging and the next
 run's sweep removes it once it ages past 24h. Teardown is best-effort and never
