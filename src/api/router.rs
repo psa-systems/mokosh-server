@@ -98,6 +98,14 @@ pub fn create_api_router(
     let contact_service = ContactService::new(db.clone());
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer, notifications_service.clone());
+    // PMS-157: first-visit demo seeding. Holds its own clones of the
+    // contacts + tickets services so it can drive the real create paths;
+    // wired below as a middleware that runs after auth populates AuthState.
+    let seed_service = Arc::new(crate::modules::seed::SeedService::new(
+        db.clone(),
+        contact_service.clone(),
+        ticket_service.clone(),
+    ));
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
@@ -231,6 +239,16 @@ pub fn create_api_router(
                 service: std::sync::Arc::new(audit_service),
             },
             audit_log_middleware,
+        ))
+        // First-visit demo seeding (PMS-157). Added before the auth layer
+        // so it runs *inner* of it: auth populates AuthState, then this
+        // reads the resolved tenant/user and seeds a new account's demo
+        // data once (detached, best-effort). No-op for already-seen tenants.
+        .layer(middleware::from_fn_with_state(
+            crate::modules::seed::SeedMiddlewareState {
+                service: seed_service,
+            },
+            crate::modules::seed::seed_middleware,
         ))
         // Apply auth middleware
         .layer(middleware::from_fn_with_state(

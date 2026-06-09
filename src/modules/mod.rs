@@ -16,6 +16,7 @@ pub mod portal;
 pub mod projects;
 pub mod reports;
 pub mod rmm;
+pub mod seed;
 pub mod settings;
 pub mod sla;
 pub mod tenants;

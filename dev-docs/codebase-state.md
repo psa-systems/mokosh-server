@@ -250,6 +250,28 @@ them. Tracked as **F5**.
 **Schema touched:** `tenants`, `tenant_settings`, `module_config`,
 plus reads across `users`, `tickets`, etc. for usage.
 
+#### `seed` (PMS-157, no routes)
+
+Files: [`service.rs`](../src/modules/seed/service.rs),
+[`middleware.rs`](../src/modules/seed/middleware.rs),
+[`data.rs`](../src/modules/seed/data.rs).
+
+First-visit demo-data seeding. A middleware (`seed_middleware`) runs
+inner of the auth middleware so `AuthState` is populated, and on the
+first authenticated visit by a tenant it spawns `SeedService::ensure_demo_seeded`
+detached (never adds latency, all errors logged and swallowed). The
+seed inserts one demo company, two contacts, and three tickets through
+the real `ContactService` / `TicketService` create paths. Idempotency:
+an in-process seen-set, an atomic compare-and-set on
+`tenants.settings->>'demo_seeded'`, and an emptiness check that skips
+tenants that already have companies (so established tenants are never
+polluted on the first visit after a deploy). Disable with
+`MOKOSH_DEMO_SEED=false` (e.g. E2E/staging on the shared default
+tenant).
+
+**Schema touched:** `tenants` (the `demo_seeded` settings flag), plus
+inserts into `companies`, `contacts`, `tickets`.
+
 ### Placeholder modules (14)
 
 Each is a single-line `mod.rs` (`//! <name> module placeholder`) and

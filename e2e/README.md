@@ -167,6 +167,8 @@ On failure, this run's residue is intentionally left for debugging and the next
 run's sweep removes it once it ages past 24h. Teardown is best-effort and never
 throws, so it cannot mask a test result.
 
+**Demo seeding (PMS-157):** the server seeds a demo company + contacts + tickets into a tenant on its first authenticated visit. Those rows are NOT `e2e-`-tagged, so the teardown sweep will not remove them, and they would otherwise appear in list assertions against the shared E2E tenant. The staging/E2E deployment must set `MOKOSH_DEMO_SEED=false` to disable first-visit seeding. (The server also skips seeding any tenant that already has companies, so an E2E tenant with residual data is protected even if the flag is left on, but set it explicitly to be safe.)
+
 Tickets are hard-deletable via `DELETE /api/v1/tickets/{id}`
 (`src/modules/tickets/routes.rs`, added in PMS-149); deleting a ticket cascades
 its notes/status-history. They carry run-tagged titles and are swept before
