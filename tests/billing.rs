@@ -371,3 +371,112 @@ async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
         "balance_due should be zero, got {balance}"
     );
 }
+
+// PMS-186: invoice and payment responses carry the company's display name
+// so the client never has to surface a raw company_id UUID.
+#[sqlx::test]
+async fn billing_responses_carry_company_name(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = seed_company(&pool).await; // seeded as "Acme Co"
+    let work_type_id = seed_work_type(&pool).await;
+    seed_time_entry(
+        &pool,
+        admin_id,
+        company_id,
+        work_type_id,
+        60,
+        "150.00",
+        "150.00",
+    )
+    .await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices/from-time-entries"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company_id }))
+        .send()
+        .await
+        .expect("generate invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
+
+    // --- Invoice list carries company_name ---
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list invoices")
+        .json()
+        .await
+        .expect("invoices JSON");
+    assert_eq!(
+        list["data"][0]["company_name"].as_str(),
+        Some("Acme Co"),
+        "invoice list rows carry the company name"
+    );
+
+    // --- Invoice detail carries company_name ---
+    let detail: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get invoice")
+        .json()
+        .await
+        .expect("invoice detail JSON");
+    assert_eq!(
+        detail["company_name"].as_str(),
+        Some("Acme Co"),
+        "invoice detail carries the company name"
+    );
+
+    // --- Payment create + list carry company_name ---
+    let payment: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "payment_date": chrono::Utc::now().date_naive().to_string(),
+            "amount": "150.00",
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("record payment")
+        .json()
+        .await
+        .expect("payment JSON");
+    assert_eq!(
+        payment["company_name"].as_str(),
+        Some("Acme Co"),
+        "the create-payment response carries the company name"
+    );
+
+    let payments: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list payments")
+        .json()
+        .await
+        .expect("payments JSON");
+    assert_eq!(
+        payments["data"][0]["company_name"].as_str(),
+        Some("Acme Co"),
+        "payment list rows carry the company name"
+    );
+}

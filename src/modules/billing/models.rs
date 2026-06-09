@@ -118,6 +118,10 @@ pub struct InvoiceResponse {
     pub tenant_id: Uuid,
     pub invoice_number: String,
     pub company_id: Uuid,
+    /// Display name of `company_id`, resolved on read so the client never
+    /// has to show a raw UUID (PMS-186). `None` only if the company row is
+    /// missing (e.g. deleted).
+    pub company_name: Option<String>,
     pub billing_contact_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
     pub status: InvoiceStatus,
@@ -268,6 +272,9 @@ pub struct PaymentResponse {
     pub tenant_id: Uuid,
     pub invoice_id: Option<Uuid>,
     pub company_id: Uuid,
+    /// Display name of `company_id`, resolved on read (PMS-186). `None`
+    /// only if the company row is missing.
+    pub company_name: Option<String>,
     pub payment_date: NaiveDate,
     pub amount: Decimal,
     pub payment_method: PaymentMethod,
