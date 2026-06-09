@@ -31,6 +31,55 @@ impl BillingService {
         }
     }
 
+    /// Resolve a set of company ids to their display names, tenant-scoped
+    /// (PMS-186). Returns a map so callers can attach `company_name` to
+    /// invoice / payment responses without a per-row round-trip. Empty
+    /// input short-circuits to an empty map.
+    async fn company_name_map(
+        &self,
+        tenant_id: Uuid,
+        ids: &[Uuid],
+    ) -> AppResult<std::collections::HashMap<Uuid, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT id, name FROM companies WHERE tenant_id = $1 AND id = ANY($2)")
+                .bind(tenant_id)
+                .bind(ids)
+                .fetch_all(self.db.pool())
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Fill in `company_name` on a batch of invoice responses (PMS-186).
+    async fn enrich_invoices(
+        &self,
+        tenant_id: Uuid,
+        resp: &mut [InvoiceResponse],
+    ) -> AppResult<()> {
+        let ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
+        let names = self.company_name_map(tenant_id, &ids).await?;
+        for r in resp.iter_mut() {
+            r.company_name = names.get(&r.company_id).cloned();
+        }
+        Ok(())
+    }
+
+    /// Fill in `company_name` on a batch of payment responses (PMS-186).
+    async fn enrich_payments(
+        &self,
+        tenant_id: Uuid,
+        resp: &mut [PaymentResponse],
+    ) -> AppResult<()> {
+        let ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
+        let names = self.company_name_map(tenant_id, &ids).await?;
+        for r in resp.iter_mut() {
+            r.company_name = names.get(&r.company_id).cloned();
+        }
+        Ok(())
+    }
+
     /// Production constructor: takes the same `ENCRYPTION_KEY` env that
     /// auth uses for token encryption. Hands the key down to the
     /// payment-gateway-config write path so secrets never hit the DB
@@ -135,7 +184,9 @@ impl BillingService {
 
         let rows = q.fetch_all(self.db.pool()).await?;
         let total = cq.fetch_one(self.db.pool()).await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        let mut resp: Vec<InvoiceResponse> = rows.into_iter().map(Into::into).collect();
+        self.enrich_invoices(tenant_id, &mut resp).await?;
+        Ok((resp, total as u64))
     }
 
     /// PMS-37: create an invoice with its line items in one
@@ -1361,7 +1412,9 @@ impl BillingService {
         }
         let rows = q.fetch_all(self.db.pool()).await?;
         let total = cq.fetch_one(self.db.pool()).await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        let mut resp: Vec<PaymentResponse> = rows.into_iter().map(Into::into).collect();
+        self.enrich_payments(tenant_id, &mut resp).await?;
+        Ok((resp, total as u64))
     }
 
     /// PMS-39: record a payment. When `invoice_id` is set, the linked
@@ -1471,11 +1524,16 @@ impl BillingService {
         .await?;
 
         tx.commit().await?;
+        let company_name = self
+            .company_name_map(tenant_id, &[request.company_id])
+            .await?
+            .remove(&request.company_id);
         Ok(PaymentResponse {
             id: payment_id,
             tenant_id,
             invoice_id: request.invoice_id,
             company_id: request.company_id,
+            company_name,
             payment_date: request.payment_date,
             amount: request.amount,
             payment_method: request.payment_method,
@@ -1767,6 +1825,8 @@ impl BillingService {
 
         let mut resp: InvoiceResponse = row.into();
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
+        self.enrich_invoices(tenant_id, std::slice::from_mut(&mut resp))
+            .await?;
         Ok(resp)
     }
 }
@@ -1921,6 +1981,7 @@ impl From<PaymentRow> for PaymentResponse {
             tenant_id: r.tenant_id,
             invoice_id: r.invoice_id,
             company_id: r.company_id,
+            company_name: None,
             payment_date: r.payment_date,
             amount: r.amount,
             payment_method: PaymentMethod::from_str(&r.payment_method)
@@ -1996,6 +2057,7 @@ impl From<InvoiceRow> for InvoiceResponse {
             tenant_id: r.tenant_id,
             invoice_number: r.invoice_number,
             company_id: r.company_id,
+            company_name: None,
             billing_contact_id: r.billing_contact_id,
             contract_id: r.contract_id,
             status: InvoiceStatus::from_str(&r.status).unwrap_or(InvoiceStatus::Draft),
