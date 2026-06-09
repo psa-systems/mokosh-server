@@ -25,6 +25,8 @@ gate (that is PMS-141).
 | Settings CRUD | `tests/settings.spec.ts` | tenant setting upsert/read/update/delete keyed by category+key (PMS-155); throwaway `e2e` category |
 | Audit log | `tests/audit.spec.ts` | read-only; creates a company and asserts the audit log surfaces its `create` entry (PMS-155) |
 | Reports read smoke | `tests/reports.spec.ts` | dashboard/tickets/time/billing + CSV export return 200 (PMS-155); enables the `reports` module first |
+| RMM CRUD | `tests/rmm.spec.ts` | connection (fake credentials) + alert rule + device mapping (PMS-155); enables the `rmm_integration` module first |
+| Dispatch board | `tests/dispatch.spec.ts` | aggregated board read smoke for a date range (PMS-155); enables the `calendar` module first, requires `from`+`to` |
 
 **Module gating.** Most feature modules (time_tracking, projects, billing, contracts, calendar, assets, knowledge_base, reports, rmm_integration) are tenant-gated and default to DISABLED (`is_module_enabled` treats a missing `module_config` row as `false`). Each spec for a gated module enables it up front via `PUT /api/v1/settings/modules/{module}` (admin-only, idempotent) so it runs regardless of the staging tenant's current config; see `lib/factories.ts::enableModule`. The enable persists on the E2E tenant - this is configuration, not swept residue. SLA is NOT gated; its writes are simply admin-only.
 

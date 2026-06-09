@@ -121,6 +121,17 @@ export const routes = {
   reportTime: `${API_V1}/reports/time`,
   reportBilling: `${API_V1}/reports/billing`,
   reportExport: (report: string) => `${API_V1}/reports/${report}/export`,
+
+  // RMM (PMS-101; module-gated 'rmm_integration', admin-only).
+  rmmConnections: `${API_V1}/rmm/connections`,
+  rmmConnection: (id: string) => `${API_V1}/rmm/connections/${id}`,
+  rmmAlertRules: `${API_V1}/rmm/alert-rules`,
+  rmmAlertRule: (id: string) => `${API_V1}/rmm/alert-rules/${id}`,
+  rmmDeviceMappings: `${API_V1}/rmm/device-mappings`,
+  rmmDeviceMapping: (id: string) => `${API_V1}/rmm/device-mappings/${id}`,
+
+  // Dispatch board (PMS-58; RequireCalendar; requires from+to query params).
+  dispatch: `${API_V1}/dispatch`,
 } as const;
 
 function base64url(buf: Buffer): string {
