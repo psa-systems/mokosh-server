@@ -67,6 +67,37 @@ export const routes = {
   hourBalance: (id: string) => `${API_V1}/contracts/${id}/hour-balance`,
   rateCards: `${API_V1}/rate-cards`,
   rateCard: (id: string) => `${API_V1}/rate-cards/${id}`,
+
+  // Calendar / scheduling (PMS-59; merged at the /api/v1 top level).
+  appointments: `${API_V1}/appointments`,
+  appointment: (id: string) => `${API_V1}/appointments/${id}`,
+  timeOff: `${API_V1}/time-off`,
+  timeOffItem: (id: string) => `${API_V1}/time-off/${id}`,
+  onCallSchedules: `${API_V1}/on-call-schedules`,
+  onCallSchedule: (id: string) => `${API_V1}/on-call-schedules/${id}`,
+
+  // SLA (PMS-107; not module-gated, writes are admin-only).
+  slaPolicies: `${API_V1}/sla/policies`,
+  slaPolicy: (id: string) => `${API_V1}/sla/policies/${id}`,
+  slaBusinessHours: `${API_V1}/sla/business-hours`,
+  slaBusinessHour: (id: string) => `${API_V1}/sla/business-hours/${id}`,
+  slaHolidayCalendars: `${API_V1}/sla/holiday-calendars`,
+  slaHolidayCalendar: (id: string) => `${API_V1}/sla/holiday-calendars/${id}`,
+
+  // Assets / CMDB (PMS-72).
+  assetTypes: `${API_V1}/asset-types`,
+  assetType: (id: string) => `${API_V1}/asset-types/${id}`,
+  assets: `${API_V1}/assets`,
+  asset: (id: string) => `${API_V1}/assets/${id}`,
+  assetConfigItems: (assetId: string) => `${API_V1}/assets/${assetId}/configuration-items`,
+  configItem: (id: string) => `${API_V1}/configuration-items/${id}`,
+
+  // Knowledge base (PMS-80). Category + article slugs are unique per tenant.
+  kbCategories: `${API_V1}/kb/categories`,
+  kbCategory: (id: string) => `${API_V1}/kb/categories/${id}`,
+  kbArticles: `${API_V1}/kb/articles`,
+  kbArticle: (id: string) => `${API_V1}/kb/articles/${id}`,
+  kbArticleVersions: (id: string) => `${API_V1}/kb/articles/${id}/versions`,
 } as const;
 
 function base64url(buf: Buffer): string {

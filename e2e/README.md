@@ -17,8 +17,12 @@ gate (that is PMS-141).
 | Projects CRUD | `tests/projects.spec.ts` | project + phase + task + task-status (PMS-155); enables the `projects` module first |
 | Billing CRUD | `tests/billing.spec.ts` | tax-rate + payment full lifecycle, invoices read-only (no DELETE route) (PMS-155); enables the `billing` module first |
 | Contracts CRUD | `tests/contracts.spec.ts` | contract + item + rate card + hour-balance (PMS-155); enables the `contracts` module first |
+| Calendar CRUD | `tests/calendar.spec.ts` | appointment + time-off + on-call schedule (PMS-155); enables the `calendar` module first |
+| SLA CRUD | `tests/sla.spec.ts` | policy + business hours + holiday calendar (PMS-155); SLA is not module-gated, writes are admin-only |
+| Assets CRUD | `tests/assets.spec.ts` | asset type + asset + encrypted configuration item (PMS-155); enables the `assets` module first |
+| Knowledge-base CRUD | `tests/knowledge-base.spec.ts` | category + article + version history (PMS-155); enables the `knowledge_base` module first |
 
-**Module gating.** The time-tracking, projects, billing, and contracts modules are tenant-gated and default to DISABLED (`is_module_enabled` treats a missing `module_config` row as `false`). Each spec enables its module up front via `PUT /api/v1/settings/modules/{module}` (admin-only, idempotent) so it runs regardless of the staging tenant's current config; see `lib/factories.ts::enableModule`. The enable persists on the E2E tenant - this is configuration, not swept residue.
+**Module gating.** Most feature modules (time_tracking, projects, billing, contracts, calendar, assets, knowledge_base, reports, rmm_integration) are tenant-gated and default to DISABLED (`is_module_enabled` treats a missing `module_config` row as `false`). Each spec for a gated module enables it up front via `PUT /api/v1/settings/modules/{module}` (admin-only, idempotent) so it runs regardless of the staging tenant's current config; see `lib/factories.ts::enableModule`. The enable persists on the E2E tenant - this is configuration, not swept residue. SLA is NOT gated; its writes are simply admin-only.
 
 **Invoices.** Billing has no `DELETE /api/v1/invoices/{id}` route, so an invoice created by the suite would be permanent residue (the leak PMS-149/PMS-155 set out to avoid). The billing spec therefore smoke-reads the invoice list only; a follow-up should add a delete/void-and-purge route and the matching invoice lifecycle.
 
@@ -92,15 +96,21 @@ Done once by a human before the suite can pass against a deployment:
 Every record a test creates carries an embedded tag `e2e-<epochMs>-<runId>-<n>`
 in its name and lives only in the E2E tenant. `global.teardown.ts`:
 
-- deletes the top-level named records created by **this** run - tickets,
-  projects, contracts, work types, rounding rules, task statuses, rate cards,
+- deletes the top-level named records created by **this** run - across
+  tickets, projects, contracts, assets/asset-types, appointments, on-call
+  schedules, SLA policies/business-hours/holiday-calendars, KB
+  articles/categories, work types, rounding rules, task statuses, rate cards,
   tax rates, contacts, and companies - sweeping children before parents (the
-  company is referenced by almost everything, so it goes last), and
+  company is referenced by almost everything, so it goes last). The sweep list
+  lives in `global.teardown.ts`; add a row when a new named resource is
+  covered. Gated-module sweeps no-op when the module is disabled (their list
+  route 404s); and
 - sweeps any `e2e-`-tagged residue older than **24h** left by earlier failed runs.
 
 Records without a run-suffixed name (time entries, tasks, contract items,
-payments, invoices) are not name-matchable; specs delete those inline in
-reverse-dependency order, and the name sweep is only a backstop for the
+payments, invoices, time-off, configuration items) are not name-matchable;
+specs delete those inline in reverse-dependency order, and the name sweep is
+only a backstop for the
 top-level residue a failed run leaves behind. Sweeps for gated-module resources
 no-op when the module is disabled (their list route 404s).
 
