@@ -191,6 +191,14 @@ pub struct CurrentUser {
     pub role: UserRole,
     pub timezone: String,
     pub avatar_url: Option<String>,
+    /// `true` once the user has confirmed first + last name through the
+    /// onboarding screen. `false` for freshly JIT-created Bunyip users
+    /// whose names are still placeholder values derived from email.
+    /// Default `true` so deserialising an old response (or test fixtures
+    /// that omit the field) does not unexpectedly trap users in
+    /// onboarding.
+    #[serde(default = "default_true")]
+    pub profile_completed: bool,
 }
 
 impl CurrentUser {
@@ -234,6 +242,12 @@ pub struct User {
     pub settings: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Timestamp at which the user confirmed first + last name via the
+    /// onboarding screen. NULL = needs onboarding; set on first
+    /// successful `PUT /api/v1/auth/me` whose body includes non-empty
+    /// `first_name` and `last_name`. See migration
+    /// `033_users_profile_completed_at.sql`.
+    pub profile_completed_at: Option<DateTime<Utc>>,
 }
 
 impl User {
@@ -248,6 +262,7 @@ impl User {
             role: self.role,
             timezone: self.timezone.clone(),
             avatar_url: self.avatar_url.clone(),
+            profile_completed: self.profile_completed_at.is_some(),
         }
     }
 }
@@ -439,6 +454,9 @@ pub struct UserResponse {
     pub mfa_enabled: bool,
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// `true` once first + last name were confirmed via onboarding.
+    /// SPAs gate their non-onboarding routes on this.
+    pub profile_completed: bool,
 }
 
 impl From<User> for UserResponse {
@@ -459,6 +477,7 @@ impl From<User> for UserResponse {
             mfa_enabled: user.mfa_enabled,
             last_login_at: user.last_login_at,
             created_at: user.created_at,
+            profile_completed: user.profile_completed_at.is_some(),
         }
     }
 }
@@ -631,6 +650,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            profile_completed: true,
         };
         let tenant_id = user.tenant_id;
 
@@ -651,6 +671,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            profile_completed: true,
         };
         let tenant_id = user.tenant_id;
         let state = AuthState::authenticated(user, tenant_id);
@@ -671,6 +692,7 @@ mod tests {
             role: UserRole::Technician,
             timezone: "America/New_York".to_string(),
             avatar_url: None,
+            profile_completed: true,
         };
 
         assert_eq!(user.full_name(), "John Doe");
@@ -687,6 +709,7 @@ mod tests {
             role: UserRole::Technician,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            profile_completed: true,
         };
 
         assert_eq!(user.initials(), "JD");
@@ -706,6 +729,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            profile_completed: true,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
@@ -726,6 +750,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            profile_completed: true,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
