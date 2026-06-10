@@ -72,30 +72,36 @@ impl AuditService {
         // $3, colliding with `OFFSET $3` and binding more values than the
         // statement declared, which 500'd whenever a filter was present
         // (PMS-178).
+        // Columns are referenced with the `al.` table alias to disambiguate
+        // them from the `users u` JOIN added below; bare `user_id` etc.
+        // would be ambiguous on the data query (users has its own `id`).
+        // The same `where_clause` is reused by the count query, which has
+        // no JOIN, but `al.<col>` resolves fine there too because the count
+        // query also aliases `audit_log` as `al`.
         let mut conditions: Vec<String> = vec![];
         let mut idx = 1;
         if tenant_id.is_some() {
-            conditions.push(format!("tenant_id = ${idx}"));
+            conditions.push(format!("al.tenant_id = ${idx}"));
             idx += 1;
         }
         if filter.user_id.is_some() {
-            conditions.push(format!("user_id = ${idx}"));
+            conditions.push(format!("al.user_id = ${idx}"));
             idx += 1;
         }
         if filter.entity_type.is_some() {
-            conditions.push(format!("entity_type = ${idx}"));
+            conditions.push(format!("al.entity_type = ${idx}"));
             idx += 1;
         }
         if filter.action.is_some() {
-            conditions.push(format!("action = ${idx}"));
+            conditions.push(format!("al.action = ${idx}"));
             idx += 1;
         }
         if filter.from.is_some() {
-            conditions.push(format!("timestamp >= ${idx}"));
+            conditions.push(format!("al.timestamp >= ${idx}"));
             idx += 1;
         }
         if filter.to.is_some() {
-            conditions.push(format!("timestamp <= ${idx}"));
+            conditions.push(format!("al.timestamp <= ${idx}"));
             idx += 1;
         }
         let where_clause = if conditions.is_empty() {
@@ -105,13 +111,61 @@ impl AuditService {
         };
         let limit_ph = idx;
         let offset_ph = idx + 1;
+        // Resolved labels (user_name + entity_name) are computed in SQL so
+        // the SPA gets a single response per page without N+1 lookups.
+        //
+        // user_name: LEFT JOIN users; NULL collapses to "System" client-side.
+        //
+        // entity_name: CASE WHEN per entity_type with single-row PK
+        // subselects. Each subselect costs one index hit; for a 20-row page
+        // that's 20 trivial lookups. New entity_types added in the future
+        // fall through ELSE NULL and the SPA renders the short UUID as
+        // before, so the join is forward-compatible.
+        //
+        // The `auth` entity_type stores user_id as entity_id (see
+        // `audit_auth_event`), so it resolves against `users` too. Contacts
+        // compose `first_name || ' ' || last_name` with NULLIF on the
+        // trimmed result so empty/whitespace-only rows surface as NULL
+        // rather than a lone separator string.
         let query = format!(
-            r#"SELECT id, tenant_id, user_id, action, entity_type, entity_id,
-                      old_values, new_values, ip_address, user_agent, timestamp
-               FROM audit_log WHERE {where_clause}
-               ORDER BY timestamp DESC LIMIT ${limit_ph} OFFSET ${offset_ph}"#
+            r#"SELECT al.id, al.tenant_id, al.user_id, al.action, al.entity_type, al.entity_id,
+                      al.old_values, al.new_values, al.ip_address, al.user_agent, al.timestamp,
+                      NULLIF(TRIM(BOTH ' ' FROM
+                          COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')
+                      ), '') AS user_name,
+                      CASE al.entity_type
+                          WHEN 'auth' THEN (
+                              SELECT NULLIF(TRIM(BOTH ' ' FROM
+                                  COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')
+                              ), '')
+                              FROM users WHERE id = al.entity_id
+                          )
+                          WHEN 'companies' THEN (SELECT name FROM companies WHERE id = al.entity_id)
+                          WHEN 'contacts' THEN (
+                              SELECT NULLIF(TRIM(BOTH ' ' FROM
+                                  COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')
+                              ), '')
+                              FROM contacts WHERE id = al.entity_id
+                          )
+                          WHEN 'sites' THEN (SELECT name FROM sites WHERE id = al.entity_id)
+                          WHEN 'contracts' THEN (SELECT name FROM contracts WHERE id = al.entity_id)
+                          WHEN 'contract_items' THEN (SELECT name FROM contract_items WHERE id = al.entity_id)
+                          WHEN 'rate_cards' THEN (SELECT name FROM rate_cards WHERE id = al.entity_id)
+                          WHEN 'invoices' THEN (SELECT invoice_number FROM invoices WHERE id = al.entity_id)
+                          WHEN 'tickets' THEN (SELECT 'T' || ticket_number FROM tickets WHERE id = al.entity_id)
+                          WHEN 'projects' THEN (SELECT name FROM projects WHERE id = al.entity_id)
+                          WHEN 'assets' THEN (SELECT name FROM assets WHERE id = al.entity_id)
+                          WHEN 'credential_vault' THEN (SELECT name FROM credential_vault WHERE id = al.entity_id)
+                          WHEN 'payment_gateway_configs' THEN (SELECT provider FROM payment_gateway_configs WHERE id = al.entity_id)
+                          WHEN 'tax_rates' THEN (SELECT name FROM tax_rates WHERE id = al.entity_id)
+                          ELSE NULL
+                      END AS entity_name
+               FROM audit_log al
+               LEFT JOIN users u ON u.id = al.user_id
+               WHERE {where_clause}
+               ORDER BY al.timestamp DESC LIMIT ${limit_ph} OFFSET ${offset_ph}"#
         );
-        let count_query = format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}");
+        let count_query = format!("SELECT COUNT(*) FROM audit_log al WHERE {where_clause}");
 
         let mut q = sqlx::query_as::<_, AuditRow>(&query);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query);
@@ -156,9 +210,11 @@ struct AuditRow {
     id: Uuid,
     tenant_id: Uuid,
     user_id: Option<Uuid>,
+    user_name: Option<String>,
     action: String,
     entity_type: String,
     entity_id: Option<Uuid>,
+    entity_name: Option<String>,
     old_values: Option<serde_json::Value>,
     new_values: Option<serde_json::Value>,
     ip_address: Option<String>,
@@ -172,9 +228,11 @@ impl From<AuditRow> for AuditLogEntryResponse {
             id: r.id,
             tenant_id: r.tenant_id,
             user_id: r.user_id,
+            user_name: r.user_name,
             action: r.action,
             entity_type: r.entity_type,
             entity_id: r.entity_id,
+            entity_name: r.entity_name,
             old_values: r.old_values,
             new_values: r.new_values,
             ip_address: r.ip_address,
