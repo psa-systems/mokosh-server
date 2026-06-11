@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use mokosh_server::modules::sla::clock::{self, BusinessSchedule, OperationalHours};
 use mokosh_server::modules::sla::SlaService;
+use mokosh_server::modules::auth::TenantId;
 use mokosh_server::Database;
 
 fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
@@ -213,7 +214,7 @@ async fn evaluate_for_ticket_uses_business_hours(pool: PgPool) {
     // Evaluate through the wired service path.
     let service = SlaService::new(Database::from_pool(pool.clone()));
     service
-        .evaluate_for_ticket(tenant_id, ticket_id)
+        .evaluate_for_ticket(TenantId::from_trusted(tenant_id), ticket_id)
         .await
         .expect("evaluate_for_ticket");
 

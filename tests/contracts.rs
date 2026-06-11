@@ -22,6 +22,7 @@ mod common;
 
 use chrono::{NaiveDate, TimeZone, Utc};
 use mokosh_server::modules::contracts::ContractsService;
+use mokosh_server::modules::auth::TenantId;
 use mokosh_server::Database;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -104,7 +105,7 @@ async fn consume_within_allotment_debits_balance(pool: PgPool) {
     let when = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
 
     let out = svc
-        .consume_hours(tenant, contract, dec("4"), when)
+        .consume_hours(TenantId::from_trusted(tenant), contract, dec("4"), when)
         .await
         .expect("consume 4h");
     assert_eq!(out.hours_applied, dec("4"));
@@ -136,7 +137,7 @@ async fn consume_past_allotment_computes_overage(pool: PgPool) {
 
     // included 10, request 13 -> 10 applied, 3 overage at 150/h = 450.
     let out = svc
-        .consume_hours(tenant, contract, dec("13"), when)
+        .consume_hours(TenantId::from_trusted(tenant), contract, dec("13"), when)
         .await
         .expect("consume 13h");
     assert_eq!(out.hours_applied, dec("10"));
@@ -165,14 +166,14 @@ async fn rollover_carries_capped_unused_hours(pool: PgPool) {
 
     // January: use 4 of 10 -> 6 unused, but cap rollover at 3.
     let jan = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
-    svc.consume_hours(tenant, contract, dec("4"), jan)
+    svc.consume_hours(TenantId::from_trusted(tenant), contract, dec("4"), jan)
         .await
         .expect("consume jan");
 
     // Close January (period_end = 2026-01-31) and roll into February.
     let jan_end = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
     let rolled = svc
-        .roll_to_next_period(tenant, contract, jan_end)
+        .roll_to_next_period(TenantId::from_trusted(tenant), contract, jan_end)
         .await
         .expect("roll");
     assert_eq!(rolled, dec("3"), "6 unused capped at max_rollover 3");
@@ -196,7 +197,7 @@ async fn rollover_carries_capped_unused_hours(pool: PgPool) {
     // Consuming 13 in February now fits exactly (rollover included).
     let feb = Utc.with_ymd_and_hms(2026, 2, 15, 0, 0, 0).unwrap();
     let out = svc
-        .consume_hours(tenant, contract, dec("13"), feb)
+        .consume_hours(TenantId::from_trusted(tenant), contract, dec("13"), feb)
         .await
         .expect("consume feb");
     assert_eq!(out.hours_applied, dec("13"));
@@ -225,15 +226,15 @@ async fn resolve_rate_honours_tier_precedence(pool: PgPool) {
     .expect("work type");
 
     let base = svc
-        .resolve_rate(tenant, rate_card_id, work_type_id, false, false)
+        .resolve_rate(TenantId::from_trusted(tenant), rate_card_id, work_type_id, false, false)
         .await
         .expect("base rate");
     let after = svc
-        .resolve_rate(tenant, rate_card_id, work_type_id, true, false)
+        .resolve_rate(TenantId::from_trusted(tenant), rate_card_id, work_type_id, true, false)
         .await
         .expect("after-hours rate");
     let emergency = svc
-        .resolve_rate(tenant, rate_card_id, work_type_id, true, true)
+        .resolve_rate(TenantId::from_trusted(tenant), rate_card_id, work_type_id, true, true)
         .await
         .expect("emergency rate");
 
@@ -335,7 +336,7 @@ async fn list_recurring_items_returns_recurring_and_retainer(pool: PgPool) {
 
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
     let items = svc
-        .list_recurring_items(tenant, contract)
+        .list_recurring_items(TenantId::from_trusted(tenant), contract)
         .await
         .expect("list recurring");
     assert_eq!(items.len(), 2, "only recurring_service + retainer");

@@ -333,12 +333,16 @@ the infrastructure or shared-helper layer.
    `tenant_id: TenantId` can no longer be called with a bare `Uuid` (pinned by
    a `compile_fail` doctest on `TenantId`). **Migrated so far:** `reports` (the
    reference pattern - handlers use `u.tenant()`, service + `custom::run` take
-   `TenantId`), `rmm`, `time_tracking`, `assets`, and `projects`. The RMM ingest webhook is
+   `TenantId`), `rmm`, `time_tracking`, `assets`, `projects`, `calendar`, `sla`,
+   and `contracts`. The RMM ingest webhook is
    unauthenticated (machine HMAC), so it uses the `from_trusted` escape hatch
    with a `// SAFETY:` comment. Where a migrated module calls a not-yet-swept
    hub (`audit_write`, `notifications::dispatch`, `TicketService`) it unwraps
-   with `tenant_id.get()` transitionally; those hubs migrate last.
-   **Remaining:** sweep the other ~12 modules' `routes.rs` + `service.rs` the
+   with `tenant_id.get()` transitionally; those hubs migrate last. Cross-tenant
+   workers (calendar reminder, sla sweep, contract lifecycle) read tenant ids
+   straight off DB-projected rows as `Uuid` and dispatch through the hubs, so
+   they are untouched by the sweep.
+   **Remaining:** sweep the other ~9 modules' `routes.rs` + `service.rs` the
    same way (PMS-139 follow-ups). Until the sweep completes this item stays
    open.
 9. **`validator::Validate` coverage is uneven.** `Create*Request`
