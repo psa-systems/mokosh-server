@@ -45,6 +45,13 @@ pub struct AtClaims {
     /// mokosh's own role taxonomy (see `effective_role_from_bunyip`, PMS-172).
     #[serde(default)]
     pub bunyip_role: Option<String>,
+    /// Bunyip's opaque org identifier (PMS-240). When present, the middleware
+    /// resolves it to a mokosh tenant - auto-provisioning one on first sight -
+    /// instead of funnelling every SSO user into the default tenant. Older
+    /// tokens do not carry it, so it deserializes to `None` and the default
+    /// tenant is used (unchanged behaviour) until Bunyip starts emitting it.
+    #[serde(default)]
+    pub bunyip_org_id: Option<String>,
 }
 
 /// Subset of bunyip-api's `/oauth2/userinfo` response. The RS calls this on

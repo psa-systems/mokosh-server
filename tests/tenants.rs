@@ -10,6 +10,62 @@ mod common;
 
 use sqlx::PgPool;
 
+use mokosh_server::modules::tenants::TenantService;
+use mokosh_server::Database;
+
+#[sqlx::test]
+async fn ensure_tenant_for_bunyip_org_provisions_then_is_idempotent(pool: PgPool) {
+    // PMS-240: first login for an org provisions a dedicated tenant; subsequent
+    // logins resolve the same one (no duplicate, no funnel into the default).
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+
+    let first = svc
+        .ensure_tenant_for_bunyip_org("bunyip-org-abc")
+        .await
+        .expect("provision tenant");
+
+    // A real, distinct tenant - not the shared default.
+    assert_ne!(first, common::DEFAULT_TENANT_ID);
+
+    let mapped: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE bunyip_org_id = $1")
+            .bind("bunyip-org-abc")
+            .fetch_optional(&pool)
+            .await
+            .expect("read mapping");
+    assert_eq!(mapped, Some(first), "org id maps to the provisioned tenant");
+
+    // Default config copied so the tenant works out of the box (statuses are a
+    // representative slice of `copy_default_config`).
+    let status_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
+            .bind(first)
+            .fetch_one(&pool)
+            .await
+            .expect("count statuses");
+    assert!(status_count > 0, "default ticket statuses copied");
+
+    // Second call resolves the same tenant; a different org gets a different one.
+    let again = svc
+        .ensure_tenant_for_bunyip_org("bunyip-org-abc")
+        .await
+        .expect("resolve tenant");
+    assert_eq!(again, first, "idempotent for the same org");
+
+    let other = svc
+        .ensure_tenant_for_bunyip_org("bunyip-org-xyz")
+        .await
+        .expect("provision second org");
+    assert_ne!(other, first, "distinct org gets a distinct tenant");
+
+    let tenant_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+        .fetch_one(&pool)
+        .await
+        .expect("count tenants");
+    // default + two provisioned orgs.
+    assert_eq!(tenant_total, 3, "no duplicate tenants provisioned");
+}
+
 #[sqlx::test]
 async fn list_tenants_returns_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
