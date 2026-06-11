@@ -16,11 +16,23 @@ const INVITE_TTL_DAYS: i64 = 14;
 #[derive(Clone)]
 pub struct InvitationsService {
     db: Database,
+    /// Base URL the invitee follows to accept (the SPA origin). When set, a
+    /// `POST /invitations` enqueues an email notification with this link
+    /// (PMS-246); when `None` (tests / no SPA configured) no email is sent.
+    app_url: Option<String>,
 }
 
 impl InvitationsService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self { db, app_url: None }
+    }
+
+    /// Set the accept-link base (the SPA origin) so created invites email the
+    /// invitee. Acceptance is login-driven: the link points at the Mokosh login,
+    /// and the PMS-244 resolution places the invitee on their next sign-in.
+    pub fn with_app_url(mut self, app_url: String) -> Self {
+        self.app_url = Some(app_url);
+        self
     }
 
     /// Create (or refresh) a pending invite for `email` into `tenant_id`.
@@ -69,6 +81,37 @@ impl InvitationsService {
             .bind(tenant_id)
             .execute(&mut *tx)
             .await?;
+
+        // PMS-246: email the invitee. Enqueue a `notifications` email row in the
+        // same transaction; the dispatcher worker (with the SMTP mailer) drains
+        // it - same path used for password-reset / welcome mail. Acceptance is
+        // login-driven, so the link is just the Mokosh login (PMS-244). Skipped
+        // when no SPA URL is configured (tests).
+        if let Some(app_url) = self.app_url.as_deref() {
+            let tenant_name: String =
+                sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+                    .bind(tenant_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let subject = format!("You have been invited to {tenant_name} on Mokosh");
+            let body = format!(
+                "You have been invited to join {tenant_name} on Mokosh as a {role}.\n\n\
+                 Sign in to accept the invitation:\n{app_url}\n\n\
+                 The invitation expires in {ttl} days. If you did not expect this, you can ignore this email.",
+                role = request.role,
+                ttl = INVITE_TTL_DAYS,
+            );
+            sqlx::query(
+                "INSERT INTO notifications (tenant_id, channel_type, recipient, subject, body)
+                 VALUES ($1, 'email', $2, $3, $4)",
+            )
+            .bind(tenant_id)
+            .bind(&email)
+            .bind(&subject)
+            .bind(&body)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(invite)
