@@ -98,11 +98,16 @@ async fn get_project(
 async fn update_project(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateProjectRequest>,
 ) -> AppResult<Json<ProjectResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_project(u.tenant_id, id, &req).await?))
+    Ok(Json(
+        s.service
+            .update_project(u.tenant_id, id, &req, &ctx)
+            .await?,
+    ))
 }
 
 async fn delete_project(
@@ -253,11 +258,14 @@ async fn get_task(
 async fn update_task(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> AppResult<Json<TaskResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_task(u.tenant_id, id, &req).await?))
+    Ok(Json(
+        s.service.update_task(u.tenant_id, id, &req, &ctx).await?,
+    ))
 }
 
 async fn delete_task(
