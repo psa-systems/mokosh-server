@@ -334,13 +334,18 @@ the infrastructure or shared-helper layer.
    a `compile_fail` doctest on `TenantId`). **Migrated so far:** `reports` (the
    reference pattern - handlers use `u.tenant()`, service + `custom::run` take
    `TenantId`), `rmm`, `time_tracking`, `assets`, `projects`, `calendar`, `sla`,
-   `contracts`, `knowledge_base`, `tenants`, and `settings`. The RMM ingest
+   `contracts`, `knowledge_base`, `tenants`, `settings`, `contacts`, and
+   `billing`. The RMM ingest
    webhook is unauthenticated (machine HMAC), so it uses the `from_trusted`
    escape hatch with a `// SAFETY:` comment; the `tenants` super-admin handlers
    address an arbitrary path tenant (not the caller's claim) so they
-   `from_trusted` the path id after the role guard, and the portal KB feed
-   bridges its verified contact-JWT tenant the same way (portal runs on contact
-   sessions, not `CurrentUser`, so it gets its own scoping pass later). The
+   `from_trusted` the path id after the role guard, and the portal KB + invoice
+   feeds bridge their verified contact-JWT tenant the same way (portal runs on
+   contact sessions, not `CurrentUser`, so it gets its own scoping pass later).
+   The demo seeder (`seed`) is a trusted system actor that bridges its claimed
+   tenant id into the contacts service via `from_trusted`, and the billing
+   recurring-invoice sweep does likewise for the tenant ids it reads off the
+   `tenants` table. The
    `settings` module-enablement gate in `auth/middleware.rs` now derives the
    tenant via `TenantScoped::tenant(&user)`. Where a migrated module calls a
    not-yet-swept hub (`audit_write`, `notifications::dispatch`, `TicketService`)
@@ -350,9 +355,10 @@ the infrastructure or shared-helper layer.
    hubs, so they are untouched by the sweep. The `tenants::copy_default_config`
    seed helper keeps its `Uuid` (it copies from a hardcoded default tenant into
    a freshly minted one - neither is a claim).
-   **Remaining:** sweep the remaining ~6 modules' `routes.rs` + `service.rs` the
-   same way (PMS-139 follow-ups), ending with the `audit_write` /
-   `notifications::dispatch` / `TicketService` hubs. Until the sweep completes
+   **Remaining:** the final batch sweeps the `audit` / `notifications` /
+   `tickets` modules, which own the `audit_write` / `notifications::dispatch` /
+   `TicketService` hubs; flipping those removes every transitional
+   `tenant_id.get()` across batches 1-5. Until the sweep completes
    this item stays open.
 9. **`validator::Validate` coverage is uneven.** `Create*Request`
    and `Update*Request` types are validated. `*Filter` query types

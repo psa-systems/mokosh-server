@@ -14,7 +14,7 @@ use super::{
     CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
     UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
 };
-use crate::modules::auth::RequireAuth;
+use crate::modules::auth::{RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -69,14 +69,14 @@ async fn list_companies(
     filter.validate()?;
     let (companies, total) = state
         .contact_service
-        .list_companies(user.tenant_id, &filter, &pagination)
+        .list_companies(user.tenant(), &filter, &pagination)
         .await?;
 
     let responses: Vec<CompanyResponse> =
         companies.into_iter().map(CompanyResponse::from).collect();
     let enriched = state
         .contact_service
-        .enrich_companies(user.tenant_id, responses)
+        .enrich_companies(user.tenant(), responses)
         .await?;
     let response = PaginatedResponse::from_params(enriched, &pagination, total);
 
@@ -93,7 +93,7 @@ async fn create_company(
 
     let company = state
         .contact_service
-        .create_company(user.tenant_id, &request, &ctx)
+        .create_company(user.tenant(), &request, &ctx)
         .await?;
 
     Ok(Json(company.into()))
@@ -106,12 +106,12 @@ async fn get_company(
 ) -> AppResult<Json<CompanyResponse>> {
     let company = state
         .contact_service
-        .get_company(user.tenant_id, company_id)
+        .get_company(user.tenant(), company_id)
         .await?;
 
     let enriched = state
         .contact_service
-        .enrich_companies(user.tenant_id, vec![CompanyResponse::from(company)])
+        .enrich_companies(user.tenant(), vec![CompanyResponse::from(company)])
         .await?
         .into_iter()
         .next()
@@ -130,7 +130,7 @@ async fn update_company(
 
     let company = state
         .contact_service
-        .update_company(user.tenant_id, company_id, &request, &ctx)
+        .update_company(user.tenant(), company_id, &request, &ctx)
         .await?;
 
     Ok(Json(company.into()))
@@ -144,7 +144,7 @@ async fn delete_company(
 ) -> AppResult<()> {
     state
         .contact_service
-        .delete_company(user.tenant_id, company_id, &ctx)
+        .delete_company(user.tenant(), company_id, &ctx)
         .await
 }
 
@@ -156,7 +156,7 @@ async fn get_company_contacts(
 ) -> AppResult<Json<PaginatedResponse<ContactResponse>>> {
     let (contacts, total) = state
         .contact_service
-        .get_company_contacts(user.tenant_id, company_id, &pagination)
+        .get_company_contacts(user.tenant(), company_id, &pagination)
         .await?;
 
     let items: Vec<ContactResponse> = contacts.into_iter().map(ContactResponse::from).collect();
@@ -175,7 +175,7 @@ async fn get_company_sites(
 ) -> AppResult<Json<PaginatedResponse<SiteResponse>>> {
     let (sites, total) = state
         .contact_service
-        .get_company_sites(user.tenant_id, company_id, &pagination)
+        .get_company_sites(user.tenant(), company_id, &pagination)
         .await?;
 
     let items: Vec<SiteResponse> = sites.into_iter().map(SiteResponse::from).collect();
@@ -200,7 +200,7 @@ async fn list_contacts(
     filter.validate()?;
     let (contacts, total) = state
         .contact_service
-        .list_contacts(user.tenant_id, &filter, &pagination)
+        .list_contacts(user.tenant(), &filter, &pagination)
         .await?;
 
     let response = PaginatedResponse::from_params(
@@ -222,7 +222,7 @@ async fn create_contact(
 
     let contact = state
         .contact_service
-        .create_contact(user.tenant_id, &request, &ctx)
+        .create_contact(user.tenant(), &request, &ctx)
         .await?;
 
     Ok(Json(contact.into()))
@@ -235,7 +235,7 @@ async fn get_contact(
 ) -> AppResult<Json<ContactResponse>> {
     let contact = state
         .contact_service
-        .get_contact(user.tenant_id, contact_id)
+        .get_contact(user.tenant(), contact_id)
         .await?;
 
     Ok(Json(contact.into()))
@@ -252,7 +252,7 @@ async fn update_contact(
 
     let contact = state
         .contact_service
-        .update_contact(user.tenant_id, contact_id, &request, &ctx)
+        .update_contact(user.tenant(), contact_id, &request, &ctx)
         .await?;
 
     Ok(Json(contact.into()))
@@ -266,7 +266,7 @@ async fn delete_contact(
 ) -> AppResult<()> {
     state
         .contact_service
-        .delete_contact(user.tenant_id, contact_id, &ctx)
+        .delete_contact(user.tenant(), contact_id, &ctx)
         .await
 }
 
@@ -284,7 +284,7 @@ async fn create_site(
 
     let site = state
         .contact_service
-        .create_site(user.tenant_id, &request, &ctx)
+        .create_site(user.tenant(), &request, &ctx)
         .await?;
 
     Ok(Json(site.into()))
@@ -297,7 +297,7 @@ async fn get_site(
 ) -> AppResult<Json<SiteResponse>> {
     let site = state
         .contact_service
-        .get_site(user.tenant_id, site_id)
+        .get_site(user.tenant(), site_id)
         .await?;
 
     Ok(Json(site.into()))
@@ -314,7 +314,7 @@ async fn update_site(
 
     let site = state
         .contact_service
-        .update_site(user.tenant_id, site_id, &request, &ctx)
+        .update_site(user.tenant(), site_id, &request, &ctx)
         .await?;
 
     Ok(Json(site.into()))
@@ -328,6 +328,6 @@ async fn delete_site(
 ) -> AppResult<()> {
     state
         .contact_service
-        .delete_site(user.tenant_id, site_id, &ctx)
+        .delete_site(user.tenant(), site_id, &ctx)
         .await
 }

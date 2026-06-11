@@ -24,6 +24,7 @@ mod common;
 use chrono::{NaiveDate, TimeZone, Utc};
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::billing::BillingService;
+use mokosh_server::modules::auth::TenantId;
 use mokosh_server::Database;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -118,7 +119,7 @@ async fn monthly_contract_generates_one_invoice_for_due_period(pool: PgPool) {
     let now = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
 
     let created = svc
-        .generate_due_recurring_invoices(tenant, now, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), now, &ctx)
         .await
         .expect("generate recurring invoices");
     assert_eq!(created.len(), 1, "exactly one invoice for the due period");
@@ -170,7 +171,7 @@ async fn second_run_same_period_is_idempotent(pool: PgPool) {
     let now = Utc.with_ymd_and_hms(2026, 1, 20, 8, 0, 0).unwrap();
 
     let first = svc
-        .generate_due_recurring_invoices(tenant, now, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), now, &ctx)
         .await
         .expect("first run");
     assert_eq!(first.len(), 1, "first run creates the invoice");
@@ -178,7 +179,7 @@ async fn second_run_same_period_is_idempotent(pool: PgPool) {
     // Second run with the same `now`: the period is already billed, so no
     // new invoice (ledger dedupe), even though the process "restarted".
     let second = svc
-        .generate_due_recurring_invoices(tenant, now, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), now, &ctx)
         .await
         .expect("second run");
     assert!(
@@ -238,7 +239,7 @@ async fn one_time_and_expired_contracts_generate_nothing(pool: PgPool) {
     let ctx = AuditCtx::system(tenant);
 
     let created = svc
-        .generate_due_recurring_invoices(tenant, now, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), now, &ctx)
         .await
         .expect("generate");
     assert!(
@@ -278,7 +279,7 @@ async fn contract_with_no_recurring_items_generates_nothing(pool: PgPool) {
     let now = Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap();
 
     let created = svc
-        .generate_due_recurring_invoices(tenant, now, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), now, &ctx)
         .await
         .expect("generate");
     assert!(created.is_empty(), "no recurring items -> no invoice");
@@ -309,7 +310,7 @@ async fn next_period_generates_a_new_invoice(pool: PgPool) {
     // January period.
     let jan = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
     let jan_created = svc
-        .generate_due_recurring_invoices(tenant, jan, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), jan, &ctx)
         .await
         .expect("january run");
     assert_eq!(jan_created.len(), 1, "january invoice");
@@ -317,7 +318,7 @@ async fn next_period_generates_a_new_invoice(pool: PgPool) {
     // February period: a new, distinct invoice.
     let feb = Utc.with_ymd_and_hms(2026, 2, 10, 0, 0, 0).unwrap();
     let feb_created = svc
-        .generate_due_recurring_invoices(tenant, feb, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), feb, &ctx)
         .await
         .expect("february run");
     assert_eq!(feb_created.len(), 1, "february invoice (new period)");
@@ -328,7 +329,7 @@ async fn next_period_generates_a_new_invoice(pool: PgPool) {
 
     // Re-running February is still idempotent.
     let feb_again = svc
-        .generate_due_recurring_invoices(tenant, feb, &ctx)
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), feb, &ctx)
         .await
         .expect("february rerun");
     assert!(feb_again.is_empty(), "february rerun creates nothing");

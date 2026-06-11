@@ -93,9 +93,16 @@ async fn list_invoices(
         company_id: Some(contact.company_id),
         ..Default::default()
     };
+    // PMS-139: bridge the verified contact-JWT tenant through `from_trusted`
+    // (portal runs on contact sessions, not `CurrentUser`; see the KB feed
+    // note below for the full rationale).
     let (items, total) = state
         .billing
-        .list_invoices(contact.tenant_id, &filter, &pagination)
+        .list_invoices(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            &filter,
+            &pagination,
+        )
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -113,9 +120,13 @@ async fn get_invoice(
     // in code: an invoice belonging to another company in the same
     // tenant returns 404 (not 403) so the portal never confirms the
     // existence of another company's invoice.
+    // PMS-139: bridge the verified contact-JWT tenant (see KB feed note below).
     let invoice = state
         .billing
-        .get_invoice(contact.tenant_id, invoice_id)
+        .get_invoice(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            invoice_id,
+        )
         .await?;
     if invoice.company_id != contact.company_id {
         return Err(crate::utils::error::AppError::NotFound(
