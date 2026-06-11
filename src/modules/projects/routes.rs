@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::ProjectsService;
-use crate::modules::auth::{RequireAdmin, RequireProjects};
+use crate::modules::auth::{RequireAdmin, RequireProjects, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -74,7 +74,7 @@ async fn list_projects(
     Query(p): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProjectResponse>>> {
     f.validate()?;
-    let (items, total) = s.service.list_projects(u.tenant_id, &f, &p).await?;
+    let (items, total) = s.service.list_projects(u.tenant(), &f, &p).await?;
     Ok(Json(PaginatedResponse::from_params(items, &p, total)))
 }
 
@@ -84,7 +84,7 @@ async fn create_project(
     Json(req): Json<CreateProjectRequest>,
 ) -> AppResult<Json<ProjectResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_project(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_project(u.tenant(), &req).await?))
 }
 
 async fn get_project(
@@ -92,7 +92,7 @@ async fn get_project(
     RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ProjectResponse>> {
-    Ok(Json(s.service.get_project(u.tenant_id, id).await?))
+    Ok(Json(s.service.get_project(u.tenant(), id).await?))
 }
 
 async fn update_project(
@@ -104,9 +104,7 @@ async fn update_project(
 ) -> AppResult<Json<ProjectResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service
-            .update_project(u.tenant_id, id, &req, &ctx)
-            .await?,
+        s.service.update_project(u.tenant(), id, &req, &ctx).await?,
     ))
 }
 
@@ -116,7 +114,7 @@ async fn delete_project(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_project(u.tenant_id, id).await
+    s.service.delete_project(u.tenant(), id).await
 }
 
 async fn list_project_phases(
@@ -127,7 +125,7 @@ async fn list_project_phases(
 ) -> AppResult<Json<PaginatedResponse<ProjectPhaseResponse>>> {
     let (items, total) = s
         .service
-        .list_project_phases(u.tenant_id, id, &pagination)
+        .list_project_phases(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -144,9 +142,7 @@ async fn create_project_phase(
 ) -> AppResult<Json<ProjectPhaseResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service
-            .create_project_phase(u.tenant_id, id, &req)
-            .await?,
+        s.service.create_project_phase(u.tenant(), id, &req).await?,
     ))
 }
 
@@ -159,7 +155,7 @@ async fn update_project_phase(
     req.validate()?;
     Ok(Json(
         s.service
-            .update_project_phase(u.tenant_id, phase_id, &req)
+            .update_project_phase(u.tenant(), phase_id, &req)
             .await?,
     ))
 }
@@ -169,7 +165,7 @@ async fn delete_project_phase(
     RequireProjects { user: u, .. }: RequireProjects,
     Path(phase_id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_project_phase(u.tenant_id, phase_id).await
+    s.service.delete_project_phase(u.tenant(), phase_id).await
 }
 
 async fn list_task_statuses(
@@ -179,7 +175,7 @@ async fn list_task_statuses(
 ) -> AppResult<Json<PaginatedResponse<TaskStatusResponse>>> {
     let (items, total) = s
         .service
-        .list_task_statuses(u.tenant_id, &pagination)
+        .list_task_statuses(u.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -195,7 +191,7 @@ async fn create_task_status(
     Json(req): Json<UpsertTaskStatusRequest>,
 ) -> AppResult<Json<TaskStatusResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_task_status(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_task_status(u.tenant(), &req).await?))
 }
 
 async fn update_task_status(
@@ -207,7 +203,7 @@ async fn update_task_status(
 ) -> AppResult<Json<TaskStatusResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_task_status(u.tenant_id, id, &req).await?,
+        s.service.update_task_status(u.tenant(), id, &req).await?,
     ))
 }
 
@@ -217,7 +213,7 @@ async fn delete_task_status(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_task_status(u.tenant_id, id).await
+    s.service.delete_task_status(u.tenant(), id).await
 }
 
 async fn list_project_tasks(
@@ -228,7 +224,7 @@ async fn list_project_tasks(
 ) -> AppResult<Json<PaginatedResponse<TaskResponse>>> {
     let (items, total) = s
         .service
-        .list_project_tasks(u.tenant_id, id, &pagination)
+        .list_project_tasks(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -244,7 +240,7 @@ async fn create_task(
     Json(req): Json<CreateTaskRequest>,
 ) -> AppResult<Json<TaskResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_task(u.tenant_id, id, &req).await?))
+    Ok(Json(s.service.create_task(u.tenant(), id, &req).await?))
 }
 
 async fn get_task(
@@ -252,7 +248,7 @@ async fn get_task(
     RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TaskResponse>> {
-    Ok(Json(s.service.get_task(u.tenant_id, id).await?))
+    Ok(Json(s.service.get_task(u.tenant(), id).await?))
 }
 
 async fn update_task(
@@ -264,7 +260,7 @@ async fn update_task(
 ) -> AppResult<Json<TaskResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_task(u.tenant_id, id, &req, &ctx).await?,
+        s.service.update_task(u.tenant(), id, &req, &ctx).await?,
     ))
 }
 
@@ -273,7 +269,7 @@ async fn delete_task(
     RequireProjects { user: u, .. }: RequireProjects,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_task(u.tenant_id, id).await
+    s.service.delete_task(u.tenant(), id).await
 }
 
 async fn add_dep(
@@ -281,7 +277,7 @@ async fn add_dep(
     RequireProjects { user: u, .. }: RequireProjects,
     Path((id, other)): Path<(Uuid, Uuid)>,
 ) -> AppResult<()> {
-    s.service.add_task_dependency(u.tenant_id, id, other).await
+    s.service.add_task_dependency(u.tenant(), id, other).await
 }
 
 async fn remove_dep(
@@ -290,6 +286,6 @@ async fn remove_dep(
     Path((id, other)): Path<(Uuid, Uuid)>,
 ) -> AppResult<()> {
     s.service
-        .remove_task_dependency(u.tenant_id, id, other)
+        .remove_task_dependency(u.tenant(), id, other)
         .await
 }

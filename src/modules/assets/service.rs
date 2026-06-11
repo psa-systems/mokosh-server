@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -32,7 +33,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_types(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetTypeResponse>, u64)> {
         let total: i64 =
@@ -57,7 +58,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertAssetTypeRequest,
     ) -> AppResult<AssetTypeResponse> {
         let id = Uuid::new_v4();
@@ -85,7 +86,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertAssetTypeRequest,
     ) -> AppResult<AssetTypeResponse> {
@@ -116,7 +117,7 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset_type(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM asset_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -133,7 +134,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_assets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &AssetFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetResponse>, u64)> {
@@ -195,7 +196,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         performer: Uuid,
         request: &CreateAssetRequest,
     ) -> AppResult<AssetResponse> {
@@ -239,7 +240,7 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_asset(&self, tenant_id: Uuid, id: Uuid) -> AppResult<AssetResponse> {
+    pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
         let row = sqlx::query_as::<_, AssetRow>(
             r#"SELECT id, asset_tag, name, asset_type_id, company_id, site_id, contact_id,
                       status, manufacturer, model, serial_number, purchase_date,
@@ -257,7 +258,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         performer: Uuid,
         request: &UpdateAssetRequest,
@@ -342,7 +343,7 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM assets WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -359,7 +360,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_relationships(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetRelationshipResponse>, u64)> {
@@ -390,7 +391,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_relationship(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         parent_id: Uuid,
         request: &CreateAssetRelationshipRequest,
     ) -> AppResult<AssetRelationshipResponse> {
@@ -416,7 +417,7 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset_relationship(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset_relationship(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM asset_relationships WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -436,7 +437,7 @@ impl AssetsService {
     /// item via `reveal_configuration_item` (audited).
     pub async fn list_configuration_items(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ConfigurationItemSummary>, u64)> {
@@ -480,7 +481,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reveal_configuration_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         performer: Uuid,
     ) -> AppResult<ConfigurationItemResponse> {
@@ -517,7 +518,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_configuration_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         request: &UpsertConfigurationItemRequest,
     ) -> AppResult<ConfigurationItemResponse> {
@@ -549,7 +550,7 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_configuration_item(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_configuration_item(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM configuration_items WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -569,7 +570,7 @@ impl AssetsService {
     /// credential via `reveal_credential` (audited).
     pub async fn list_credentials(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<CredentialSummary>, u64)> {
@@ -618,7 +619,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reveal_credential(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         performer: Uuid,
     ) -> AppResult<CredentialResponse> {
@@ -668,7 +669,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_credential(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         performer: Uuid,
         request: &CreateCredentialRequest,
@@ -730,9 +731,11 @@ impl AssetsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
+        // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "credential_vault",
@@ -761,7 +764,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_credential(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -787,9 +790,11 @@ impl AssetsService {
         if n == 0 {
             return Err(AppError::NotFound("Credential".to_string()));
         }
+        // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
+        // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "credential_vault",
@@ -814,7 +819,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_audit_log(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetAuditLogResponse>, u64)> {
