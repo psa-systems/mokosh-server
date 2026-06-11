@@ -2,6 +2,7 @@
 
 use chrono::{Duration, Utc};
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -121,12 +122,12 @@ impl TenantService {
         // Copy default configuration from default tenant
         self.copy_default_config(tenant_id).await?;
 
-        self.get_tenant(tenant_id).await
+        self.get_tenant(TenantId::from_trusted(tenant_id)).await
     }
 
     /// Get tenant by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_tenant(&self, tenant_id: Uuid) -> AppResult<Tenant> {
+    pub async fn get_tenant(&self, tenant_id: TenantId) -> AppResult<Tenant> {
         let row = sqlx::query_as::<_, TenantRow>(
             r#"
             SELECT id, name, slug, status, settings, branding, billing_email,
@@ -196,7 +197,7 @@ impl TenantService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tenant(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpdateTenantRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Tenant> {
@@ -266,11 +267,11 @@ impl TenantService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "tenants",
-            Some(tenant_id),
+            Some(tenant_id.get()),
             before,
             after,
         )
@@ -282,7 +283,7 @@ impl TenantService {
 
     /// Suspend tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn suspend_tenant(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub async fn suspend_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
         sqlx::query("UPDATE tenants SET status = 'suspended', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
             .execute(self.db.pool())
@@ -293,7 +294,7 @@ impl TenantService {
 
     /// Activate tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn activate_tenant(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub async fn activate_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
         sqlx::query("UPDATE tenants SET status = 'active', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
             .execute(self.db.pool())
@@ -304,7 +305,7 @@ impl TenantService {
 
     /// Get tenant usage statistics
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_tenant_usage(&self, tenant_id: Uuid) -> AppResult<TenantUsage> {
+    pub async fn get_tenant_usage(&self, tenant_id: TenantId) -> AppResult<TenantUsage> {
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
             .bind(tenant_id)
             .fetch_one(self.db.pool())
@@ -342,7 +343,7 @@ impl TenantService {
         .await?;
 
         Ok(TenantUsage {
-            tenant_id,
+            tenant_id: tenant_id.get(),
             user_count,
             company_count,
             contact_count,

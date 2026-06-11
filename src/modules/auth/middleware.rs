@@ -365,7 +365,7 @@ where
                 )
             })?;
 
-        let enabled = settings.is_module_enabled(user.tenant_id, G::NAME).await?;
+        let enabled = settings.is_module_enabled(super::tenant::TenantScoped::tenant(&user), G::NAME).await?;
         if !enabled {
             return Err(AppError::NotFound(format!("module {}", G::NAME)));
         }

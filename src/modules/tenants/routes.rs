@@ -10,7 +10,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
-use crate::modules::auth::{RequireAuth, UserRole};
+use crate::modules::auth::{RequireAuth, TenantId, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -109,7 +109,7 @@ async fn get_tenant(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
-    let tenant = state.tenant_service.get_tenant(tenant_id).await?;
+    let tenant = state.tenant_service.get_tenant(TenantId::from_trusted(tenant_id)).await?;
 
     Ok(Json(tenant.into()))
 }
@@ -131,7 +131,7 @@ async fn update_tenant(
 
     let tenant = state
         .tenant_service
-        .update_tenant(tenant_id, &request, &ctx)
+        .update_tenant(TenantId::from_trusted(tenant_id), &request, &ctx)
         .await?;
 
     Ok(Json(tenant.into()))
@@ -149,7 +149,7 @@ async fn suspend_tenant(
         ));
     }
 
-    state.tenant_service.suspend_tenant(tenant_id).await?;
+    state.tenant_service.suspend_tenant(TenantId::from_trusted(tenant_id)).await?;
 
     Ok(())
 }
@@ -166,7 +166,7 @@ async fn activate_tenant(
         ));
     }
 
-    state.tenant_service.activate_tenant(tenant_id).await?;
+    state.tenant_service.activate_tenant(TenantId::from_trusted(tenant_id)).await?;
 
     Ok(())
 }
@@ -182,7 +182,7 @@ async fn get_tenant_usage(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
-    let usage = state.tenant_service.get_tenant_usage(tenant_id).await?;
+    let usage = state.tenant_service.get_tenant_usage(TenantId::from_trusted(tenant_id)).await?;
 
     Ok(Json(usage))
 }
@@ -205,7 +205,7 @@ async fn get_module_config(
 
     let config = state
         .settings_service
-        .get_module_config(tenant_id, &module)
+        .get_module_config(TenantId::from_trusted(tenant_id), &module)
         .await?;
 
     Ok(Json(config))
@@ -225,7 +225,7 @@ async fn update_module_config(
 
     let config = state
         .settings_service
-        .upsert_module_config(tenant_id, &module, &request)
+        .upsert_module_config(TenantId::from_trusted(tenant_id), &module, &request)
         .await?;
 
     Ok(Json(config))

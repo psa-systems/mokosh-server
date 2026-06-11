@@ -1,6 +1,7 @@
 //! Knowledge base service.
 
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
@@ -22,7 +23,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_categories(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbCategoryResponse>, u64)> {
         let total: i64 =
@@ -48,7 +49,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_category(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertKbCategoryRequest,
     ) -> AppResult<KbCategoryResponse> {
         // Per-tenant unique slug (enforced at the app layer; the
@@ -96,7 +97,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_category(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertKbCategoryRequest,
     ) -> AppResult<KbCategoryResponse> {
@@ -132,7 +133,7 @@ impl KbService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_category(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_category(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM kb_categories WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -149,7 +150,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_articles(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &KbArticleFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
@@ -235,7 +236,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_article(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         author_id: Uuid,
         request: &CreateKbArticleRequest,
     ) -> AppResult<KbArticleResponse> {
@@ -298,7 +299,7 @@ impl KbService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_article(&self, tenant_id: Uuid, id: Uuid) -> AppResult<KbArticleResponse> {
+    pub async fn get_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<KbArticleResponse> {
         let row = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
                       author_id, view_count, helpful_count, not_helpful_count,
@@ -321,7 +322,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_article(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         editor: Uuid,
         request: &UpdateKbArticleRequest,
@@ -424,7 +425,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn restore_article_version(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         version_number: i32,
         editor: Uuid,
@@ -480,7 +481,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn increment_helpful(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
@@ -492,7 +493,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn increment_not_helpful(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
@@ -524,7 +525,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn record_vote(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         user_id: Uuid,
         vote: &str,
@@ -622,7 +623,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_article_vote(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
@@ -656,7 +657,7 @@ impl KbService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_article(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM kb_articles WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -672,7 +673,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_article_versions(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleVersionResponse>, u64)> {
@@ -718,7 +719,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
     pub async fn list_portal_articles_for_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleResponse>, u64)> {

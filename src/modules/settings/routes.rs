@@ -11,7 +11,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::SettingsService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -61,7 +61,7 @@ async fn list_settings(
 ) -> AppResult<Json<PaginatedResponse<TenantSettingResponse>>> {
     let (items, total) = s
         .service
-        .list_tenant_settings(u.tenant_id, &pagination)
+        .list_tenant_settings(u.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -78,7 +78,7 @@ async fn upsert_setting(
 ) -> AppResult<Json<TenantSettingResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.upsert_tenant_setting(u.tenant_id, &req).await?,
+        s.service.upsert_tenant_setting(u.tenant(), &req).await?,
     ))
 }
 
@@ -89,7 +89,7 @@ async fn list_module_configs(
 ) -> AppResult<Json<PaginatedResponse<ModuleConfigResponse>>> {
     let (items, total) = s
         .service
-        .list_module_configs(u.tenant_id, &pagination)
+        .list_module_configs(u.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -104,7 +104,7 @@ async fn get_module_config(
     Path(module): Path<String>,
 ) -> AppResult<Json<ModuleConfigResponse>> {
     Ok(Json(
-        s.service.get_module_config(u.tenant_id, &module).await?,
+        s.service.get_module_config(u.tenant(), &module).await?,
     ))
 }
 
@@ -118,7 +118,7 @@ async fn upsert_module_config(
     req.validate()?;
     Ok(Json(
         s.service
-            .upsert_module_config(u.tenant_id, &module, &req)
+            .upsert_module_config(u.tenant(), &module, &req)
             .await?,
     ))
 }
@@ -132,7 +132,7 @@ async fn get_settings_by_category(
 ) -> AppResult<Json<Vec<TenantSettingResponse>>> {
     Ok(Json(
         s.service
-            .list_settings_by_category(u.tenant_id, &category)
+            .list_settings_by_category(u.tenant(), &category)
             .await?,
     ))
 }
@@ -143,7 +143,7 @@ async fn get_setting(
     Path((category, key)): Path<(String, String)>,
 ) -> AppResult<Json<TenantSettingResponse>> {
     Ok(Json(
-        s.service.get_setting(u.tenant_id, &category, &key).await?,
+        s.service.get_setting(u.tenant(), &category, &key).await?,
     ))
 }
 
@@ -157,7 +157,7 @@ async fn put_setting(
     validate_setting_value(&category, &key, &req.value)?;
     Ok(Json(
         s.service
-            .put_setting(u.tenant_id, &category, &key, req.value)
+            .put_setting(u.tenant(), &category, &key, req.value)
             .await?,
     ))
 }
@@ -169,6 +169,6 @@ async fn delete_setting_by_key(
     Path((category, key)): Path<(String, String)>,
 ) -> AppResult<()> {
     s.service
-        .delete_setting_by_key(u.tenant_id, &category, &key)
+        .delete_setting_by_key(u.tenant(), &category, &key)
         .await
 }
