@@ -480,7 +480,8 @@ async fn ensure_user_from_bunyip(
     let email = info.as_ref().and_then(|i| i.email.clone());
     let email_verified = info.as_ref().and_then(|i| i.email_verified).unwrap_or(false);
 
-    let current = auth_service.find_user_tenant(sub).await.ok().flatten();
+    let placement = auth_service.find_user_placement(sub).await.ok().flatten();
+    let current = placement.as_ref().map(|(t, _)| *t);
 
     // An invite to address X is consumed only by a Bunyip user with verified X.
     let invite = match (invitations, email.as_deref()) {
@@ -488,12 +489,23 @@ async fn ensure_user_from_bunyip(
         _ => None,
     };
 
+    // PMS-245: a non-admin user still parked in the shared default tenant (dumped
+    // there by the pre-PMS-244 funnel) is treated like a fresh user - moved to
+    // their own personal tenant - so nobody stays stuck sharing it.
+    let stuck_in_default = is_stuck_in_default(
+        current,
+        default_bunyip_tenant_id(),
+        placement.as_ref().map(|(_, r)| r.as_str()).unwrap_or(""),
+        invite.is_some(),
+    );
+
     let target = if let Some(inv) = invite.as_ref() {
         inv.tenant_id
-    } else if let Some(t) = current {
+    } else if let Some(t) = current.filter(|_| !stuck_in_default) {
         t
     } else {
-        // Brand-new user, no invite: provision their own personal tenant.
+        // Brand-new user (or one being backfilled off the default tenant), no
+        // invite: provision their own personal tenant.
         match tenants {
             Some(svc) => match svc.ensure_personal_tenant(sub).await {
                 Ok(t) => t,
@@ -630,9 +642,49 @@ fn default_bunyip_tenant_id() -> uuid::Uuid {
         .unwrap_or_else(|| uuid::Uuid::from_u128(1))
 }
 
+/// PMS-245: whether an already-placed user should be backfilled off the shared
+/// default landing tenant into their own personal tenant. True only for a user
+/// currently in `default_tenant`, with no pending invite, who is not a platform
+/// `super_admin` (those legitimately belong to the infra/default tenant).
+fn is_stuck_in_default(
+    current: Option<uuid::Uuid>,
+    default_tenant: uuid::Uuid,
+    role: &str,
+    has_invite: bool,
+) -> bool {
+    current == Some(default_tenant) && !has_invite && role != "super_admin"
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{effective_role_from_bunyip, UserRole};
+    use super::{default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default, UserRole};
+    use uuid::Uuid;
+
+    #[test]
+    fn backfill_only_non_admin_default_tenant_users_without_invite() {
+        let default = default_bunyip_tenant_id();
+        let other = Uuid::from_u128(99);
+
+        // The target case: a technician parked in the default tenant, no invite.
+        assert!(is_stuck_in_default(Some(default), default, "technician", false));
+        // Exemptions:
+        assert!(
+            !is_stuck_in_default(Some(default), default, "super_admin", false),
+            "super_admins stay in the infra tenant"
+        );
+        assert!(
+            !is_stuck_in_default(Some(default), default, "technician", true),
+            "an invite takes precedence - it decides the tenant"
+        );
+        assert!(
+            !is_stuck_in_default(Some(other), default, "technician", false),
+            "a user already in a real tenant is left alone"
+        );
+        assert!(
+            !is_stuck_in_default(None, default, "", false),
+            "a brand-new user has no current placement to back-fill"
+        );
+    }
 
     #[test]
     fn bunyip_admin_maps_to_super_admin() {
