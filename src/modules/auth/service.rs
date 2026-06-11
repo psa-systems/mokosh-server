@@ -1395,12 +1395,14 @@ impl AuthService {
     /// Cross-tenant lookups return `NotFound` so the response shape
     /// stays opaque to a probing client.
     ///
-    /// The tenant a user currently lives in, by global user id (`sub`).
-    /// `None` if the user has no row yet (PMS-244: the bunyip path uses this to
-    /// decide between joining an invited tenant, staying put, or self-signup).
-    pub async fn find_user_tenant(&self, user_id: Uuid) -> AppResult<Option<Uuid>> {
+    /// Where a user currently lives, by global user id (`sub`): `(tenant_id,
+    /// role)`. `None` if the user has no row yet. The bunyip path uses this
+    /// (PMS-244) to decide between joining an invited tenant, staying put, or
+    /// self-signup, and (PMS-245) to back-fill non-admin users out of the shared
+    /// default tenant - the `role` lets it exempt platform `super_admin`s.
+    pub async fn find_user_placement(&self, user_id: Uuid) -> AppResult<Option<(Uuid, String)>> {
         Ok(
-            sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+            sqlx::query_as::<_, (Uuid, String)>("SELECT tenant_id, role FROM users WHERE id = $1")
                 .bind(user_id)
                 .fetch_optional(self.db.pool())
                 .await?,
