@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -175,7 +176,20 @@ impl ProjectsService {
         tenant_id: Uuid,
         id: Uuid,
         request: &UpdateProjectRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectResponse> {
+        // Mutation + audit row in one transaction (PMS-184), so the project
+        // Overview's edits are captured in the change-history feed just like
+        // tasks and tickets.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(p) FROM projects p WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
         let affected = sqlx::query(
             r#"
             UPDATE projects SET
@@ -209,12 +223,33 @@ impl ProjectsService {
         .bind(&request.billing_method)
         .bind(request.hourly_rate)
         .bind(request.is_billable)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("Project".to_string()));
         }
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(p) FROM projects p WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "projects",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         self.get_project(tenant_id, id).await
     }
 
@@ -548,7 +583,20 @@ impl ProjectsService {
         tenant_id: Uuid,
         id: Uuid,
         request: &UpdateTaskRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
+        // Mutation + audit row in one transaction (PMS-184, mirrors the
+        // tickets path): snapshot the row before and after with `to_jsonb`
+        // so the change-history feed can diff which columns moved, and write
+        // the audit entry on the same tx so a rollback drops both.
+        let mut tx = self.db.pool().begin().await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tasks t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
         // When the new status is completed, stamp completed_at; clearing
         // back to non-completed clears it. Two reads (status flag check)
         // would be more correct but require a join; we instead infer
@@ -588,12 +636,32 @@ impl ProjectsService {
         .bind(request.start_date)
         .bind(request.due_date)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Task".to_string()));
         }
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tasks t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "tasks",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         self.get_task(tenant_id, id).await
     }
 

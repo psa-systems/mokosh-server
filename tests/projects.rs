@@ -418,3 +418,98 @@ async fn projects_routes_require_auth_and_never_501(pool: PgPool) {
         );
     }
 }
+
+/// PMS-184: editing a task and a project each write an in-transaction audit
+/// row (entity_type + entity_id + the changed columns), which the per-record
+/// history endpoint then surfaces. Asserted directly against `audit_log` so
+/// this stays independent of the history-read endpoint (delivered separately).
+#[sqlx::test]
+async fn task_and_project_edits_write_audit_rows(pool: PgPool) {
+    let probe = pool.clone();
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "History Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Rollout", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = project["id"].as_str().expect("project id").to_string();
+
+    let status_id = first_task_status(&app, &token).await;
+    let task: serde_json::Value = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        serde_json::json!({ "title": "Initial", "status_id": status_id, "priority": "low" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("task JSON");
+    let task_id = task["id"].as_str().expect("task id").to_string();
+    let task_uuid = Uuid::parse_str(&task_id).unwrap();
+    let project_uuid = Uuid::parse_str(&project_id).unwrap();
+
+    // Edit the task title, then the project name.
+    let t_upd = app
+        .client
+        .put(app.url(&format!("/api/v1/tasks/{task_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "title": "Renamed" }))
+        .send()
+        .await
+        .expect("update task");
+    assert!(t_upd.status().is_success(), "PUT task should 2xx");
+
+    let p_upd = app
+        .client
+        .put(app.url(&format!("/api/v1/projects/{project_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Rollout v2" }))
+        .send()
+        .await
+        .expect("update project");
+    assert!(p_upd.status().is_success(), "PUT project should 2xx");
+
+    // An entity-scoped audit row (entity_id set) must exist for each edit,
+    // with the changed column captured between the old/new snapshots.
+    let task_changed: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM audit_log
+             WHERE entity_type = 'tasks' AND entity_id = $1 AND action = 'update'
+               AND old_values->>'title' = 'Initial' AND new_values->>'title' = 'Renamed'
+           )"#,
+    )
+    .bind(task_uuid)
+    .fetch_one(&probe)
+    .await
+    .expect("query task audit");
+    assert!(
+        task_changed,
+        "task edit must write an entity-scoped audit row"
+    );
+
+    let project_changed: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM audit_log
+             WHERE entity_type = 'projects' AND entity_id = $1 AND action = 'update'
+               AND old_values->>'name' = 'Rollout' AND new_values->>'name' = 'Rollout v2'
+           )"#,
+    )
+    .bind(project_uuid)
+    .fetch_one(&probe)
+    .await
+    .expect("query project audit");
+    assert!(
+        project_changed,
+        "project edit must write an entity-scoped audit row"
+    );
+}
