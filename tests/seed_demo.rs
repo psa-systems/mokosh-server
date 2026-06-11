@@ -101,6 +101,33 @@ async fn seeds_demo_data_once_for_a_fresh_tenant(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn skips_seeding_the_shared_landing_tenant(pool: PgPool) {
+    // PMS-239: when the deployment funnels every user into one shared tenant
+    // (Bunyip JIT with no tenant claim), that tenant must never be auto-seeded
+    // - otherwise all users share, and can edit, the same demo rows.
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = common::DEFAULT_TENANT_ID;
+
+    seed_service(&pool)
+        .with_shared_tenant(Some(tenant))
+        .ensure_demo_seeded(tenant, admin_id)
+        .await;
+
+    assert_eq!(
+        company_count(&pool, tenant).await,
+        0,
+        "shared landing tenant is not seeded"
+    );
+    assert_eq!(contact_count(&pool, tenant).await, 0, "no demo contacts");
+    assert_eq!(ticket_count(&pool, tenant).await, 0, "no demo tickets");
+    assert_eq!(
+        demo_seeded_flag(&pool, tenant).await,
+        None,
+        "skip leaves the flag untouched (no DB write)"
+    );
+}
+
+#[sqlx::test]
 async fn skips_seeding_a_tenant_that_already_has_companies(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = common::DEFAULT_TENANT_ID;
