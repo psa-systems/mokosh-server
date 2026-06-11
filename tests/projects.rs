@@ -352,6 +352,21 @@ async fn approved_time_rolls_into_actuals(pool: PgPool) {
         "pending (unapproved) time does not roll into actual hours"
     );
 
+    // Submit the week first (PMS-183: entries start as draft and must be
+    // submitted before a manager can approve them).
+    let submit = post(
+        &app,
+        &token,
+        &format!("/api/v1/timesheets/{admin_id}/{date}/submit"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        submit.status().is_success(),
+        "submit timesheet should 2xx, got {}",
+        submit.status()
+    );
+
     // Approve the week.
     let approve = post(
         &app,

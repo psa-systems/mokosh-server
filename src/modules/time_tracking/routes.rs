@@ -51,6 +51,10 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
             post(submit_timesheet),
         )
         .route(
+            "/timesheets/{user_id}/{week_start}/withdraw",
+            post(withdraw_timesheet),
+        )
+        .route(
             "/timesheets/{user_id}/{week_start}/approve",
             post(approve_timesheet),
         )
@@ -243,6 +247,24 @@ async fn submit_timesheet(
         state
             .service
             .submit_timesheet(user.tenant_id, user_id, week_start)
+            .await?,
+    ))
+}
+
+async fn withdraw_timesheet(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
+) -> AppResult<Json<TimesheetSummaryResponse>> {
+    if !user.role.is_admin() && user_id != user.id {
+        return Err(crate::utils::error::AppError::Forbidden(
+            "Cannot withdraw another user's timesheet".to_string(),
+        ));
+    }
+    Ok(Json(
+        state
+            .service
+            .withdraw_timesheet(user.tenant_id, user_id, week_start)
             .await?,
     ))
 }

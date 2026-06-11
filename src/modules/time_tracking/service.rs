@@ -457,7 +457,8 @@ impl TimeTrackingService {
                 CASE
                     WHEN BOOL_OR(approval_status = 'rejected') THEN 'rejected'
                     WHEN BOOL_AND(approval_status = 'approved') THEN 'approved'
-                    ELSE 'pending'
+                    WHEN BOOL_OR(approval_status = 'pending') THEN 'pending'
+                    ELSE 'draft'
                 END AS approval_status
             FROM time_entries
             WHERE {where_clause}
@@ -526,6 +527,63 @@ impl TimeTrackingService {
               AND date     >= $3
               AND date      < $4
               AND approval_status NOT IN ('approved')
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(anchor)
+        .bind(week_end)
+        .execute(self.db.pool())
+        .await?;
+
+        self.week_summary(tenant_id, user_id, anchor).await
+    }
+
+    /// Withdraw a submitted timesheet: move every still-pending entry in the
+    /// week back to 'draft' so the owner can edit and resubmit. Refuses once
+    /// any entry in the week has been approved (PMS-183) - an approved week is
+    /// past the point of withdrawal (it has flipped billable entries to
+    /// ready_to_bill). Owner-only is enforced at the route.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn withdraw_timesheet(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        week_start: NaiveDate,
+    ) -> AppResult<TimesheetSummaryResponse> {
+        let anchor = monday_anchor(week_start);
+        let week_end = anchor + chrono::Duration::days(7);
+
+        let approved_exists: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM time_entries
+                 WHERE tenant_id = $1 AND user_id = $2
+                   AND date >= $3 AND date < $4
+                   AND approval_status = 'approved'
+               )"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(anchor)
+        .bind(week_end)
+        .fetch_one(self.db.pool())
+        .await?;
+        if approved_exists {
+            return Err(AppError::Conflict(
+                "Cannot withdraw an approved timesheet".to_string(),
+            ));
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE time_entries
+            SET approval_status = 'draft',
+                updated_at      = NOW()
+            WHERE tenant_id = $1
+              AND user_id   = $2
+              AND date     >= $3
+              AND date      < $4
+              AND approval_status = 'pending'
             "#,
         )
         .bind(tenant_id)
@@ -654,7 +712,7 @@ impl TimeTrackingService {
                 total_minutes: 0,
                 billable_minutes: 0,
                 entry_count: 0,
-                approval_status: "pending".to_string(),
+                approval_status: "draft".to_string(),
             }))
     }
 
