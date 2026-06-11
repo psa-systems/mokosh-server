@@ -10,8 +10,50 @@ mod common;
 
 use sqlx::PgPool;
 
+use mokosh_server::modules::auth::AuthService;
 use mokosh_server::modules::tenants::TenantService;
 use mokosh_server::Database;
+
+async fn user_tenant(pool: &PgPool, user_id: uuid::Uuid) -> uuid::Uuid {
+    sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("read user tenant")
+}
+
+#[sqlx::test]
+async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
+    // PMS-243: a user mirrored into the default tenant is re-homed to their org
+    // tenant on first org-claimed login; scoped to the default tenant and
+    // idempotent.
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    assert_eq!(user_tenant(&pool, admin_id).await, common::DEFAULT_TENANT_ID);
+
+    let tenants = TenantService::new(Database::from_pool(pool.clone()));
+    let org_tenant = tenants
+        .ensure_tenant_for_bunyip_org("bunyip-org-rehome")
+        .await
+        .expect("provision org tenant");
+
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into(), vec![]);
+
+    // First org-claimed login: the user moves out of the default tenant.
+    let moved = auth
+        .rehome_user_between_tenants(admin_id, common::DEFAULT_TENANT_ID, org_tenant)
+        .await
+        .expect("rehome");
+    assert!(moved, "user re-homed on first sight");
+    assert_eq!(user_tenant(&pool, admin_id).await, org_tenant);
+
+    // Idempotent: already out of the default tenant, so nothing to move.
+    let again = auth
+        .rehome_user_between_tenants(admin_id, common::DEFAULT_TENANT_ID, org_tenant)
+        .await
+        .expect("rehome idempotent");
+    assert!(!again, "no-op once re-homed");
+    assert_eq!(user_tenant(&pool, admin_id).await, org_tenant);
+}
 
 #[sqlx::test]
 async fn ensure_tenant_for_bunyip_org_provisions_then_is_idempotent(pool: PgPool) {

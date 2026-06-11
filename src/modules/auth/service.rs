@@ -1462,6 +1462,38 @@ impl AuthService {
         self.get_user_by_id(tenant_id, sub).await
     }
 
+    /// Lazy backfill (PMS-243): re-home a user row from `from_tenant` to
+    /// `to_tenant`, but ONLY if it is currently in `from_tenant`. Used by the
+    /// bunyip path to migrate users who were JIT-mirrored into the shared
+    /// default tenant before per-org tenants existed (PMS-240): on the first
+    /// login whose token resolves to a real org tenant, the user's row moves
+    /// there. Scoped to `from_tenant` so a user already correctly placed in
+    /// another tenant is never moved, and idempotent (a no-op once moved).
+    ///
+    /// Only the `users` row moves. Data created while many orgs shared the
+    /// default tenant is co-mingled and cannot be auto-attributed to one org,
+    /// so it stays put for separate triage (see PMS-243). Returns whether a row
+    /// was actually moved.
+    pub async fn rehome_user_between_tenants(
+        &self,
+        user_id: Uuid,
+        from_tenant: Uuid,
+        to_tenant: Uuid,
+    ) -> AppResult<bool> {
+        if from_tenant == to_tenant {
+            return Ok(false);
+        }
+        let res = sqlx::query(
+            "UPDATE users SET tenant_id = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(to_tenant)
+        .bind(user_id)
+        .bind(from_tenant)
+        .execute(self.db.pool())
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Find a user by `(tenant_id, email)`. PMS-138 closeout of
     /// PMS-4 AC6's residual cross-cutting #8 leak: the previous
     /// shape keyed on email alone and used `ORDER BY created_at
