@@ -3,6 +3,7 @@
 use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -244,7 +245,7 @@ impl TicketService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            TenantId::from_trusted(tenant_id),
             ctx,
             AuditAction::Create,
             "tickets",
@@ -619,7 +620,7 @@ impl TicketService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            TenantId::from_trusted(tenant_id),
             ctx,
             AuditAction::Update,
             "tickets",
@@ -710,7 +711,7 @@ impl TicketService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            TenantId::from_trusted(tenant_id),
             ctx,
             AuditAction::Delete,
             "tickets",

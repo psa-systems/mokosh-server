@@ -341,7 +341,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "invoices",
@@ -580,7 +580,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "invoices",
@@ -928,7 +928,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "invoices",
@@ -1014,7 +1014,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "tax_rates",
@@ -1094,7 +1094,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "tax_rates",
@@ -1142,7 +1142,7 @@ impl BillingService {
         }
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "tax_rates",
@@ -1314,7 +1314,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             action,
             "payment_gateway_configs",
@@ -1367,7 +1367,7 @@ impl BillingService {
         if let Some((id, before)) = row {
             audit_write(
                 &mut *tx,
-                tenant_id.get(),
+                tenant_id,
                 ctx,
                 AuditAction::Delete,
                 "payment_gateway_configs",
@@ -1543,7 +1543,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "payments",
@@ -1660,7 +1660,7 @@ impl BillingService {
         // after = None. PMS-117.
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "payments",
@@ -1806,7 +1806,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "invoices",
