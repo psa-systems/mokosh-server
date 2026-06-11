@@ -149,6 +149,105 @@ impl AuditService {
         let total = cq.fetch_one(self.db.pool()).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
+
+    /// Change history for a single record, newest first. Tenant-scoped and
+    /// reads only `audit_log` rows whose `entity_id` matches, so it is safe
+    /// to expose to non-admins for the whitelisted entity types
+    /// (`HISTORY_ENTITY_TYPES`). Powers the detail-page change-history feeds
+    /// in PMS-182 (tickets), PMS-184 (tasks) and projects.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_entity_history(
+        &self,
+        tenant_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<EntityHistoryEntry>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE tenant_id = $1 AND entity_type = $2 AND entity_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(entity_type)
+        .bind(entity_id)
+        .fetch_one(self.db.pool())
+        .await?;
+
+        let rows = sqlx::query_as::<_, HistoryRow>(
+            r#"SELECT id, action, user_id, old_values, new_values, timestamp
+               FROM audit_log
+               WHERE tenant_id = $1 AND entity_type = $2 AND entity_id = $3
+               ORDER BY timestamp DESC LIMIT $4 OFFSET $5"#,
+        )
+        .bind(tenant_id)
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+}
+
+/// Entity types whose change history may be read through the non-admin
+/// per-record endpoint. Restricting the set keeps that endpoint from exposing
+/// audit trails for sensitive entities (billing, auth) that a technician
+/// should not browse, while covering the record types whose detail pages
+/// surface a change history (PMS-182/184/185).
+pub const HISTORY_ENTITY_TYPES: &[&str] = &["tickets", "tasks", "projects", "assets"];
+
+/// Columns excluded from a record's `changed_fields` diff: bookkeeping that
+/// changes on every write and would otherwise drown the meaningful edits.
+const HISTORY_NOISE_FIELDS: &[&str] = &[
+    "updated_at",
+    "created_at",
+    "id",
+    "tenant_id",
+    "last_updated_by_id",
+];
+
+/// Names of object keys whose values differ between the before/after
+/// snapshots, with noise columns removed and the result sorted for a stable
+/// display order. An empty result (e.g. a create with no `old_values`) means
+/// the action label alone carries the information.
+fn changed_fields(old: &Option<serde_json::Value>, new: &Option<serde_json::Value>) -> Vec<String> {
+    match (old, new) {
+        (Some(serde_json::Value::Object(o)), Some(serde_json::Value::Object(n))) => {
+            let mut keys: Vec<String> = n
+                .iter()
+                .filter(|(k, v)| o.get(k.as_str()) != Some(*v))
+                .map(|(k, _)| k.clone())
+                .filter(|k| !HISTORY_NOISE_FIELDS.contains(&k.as_str()))
+                .collect();
+            keys.sort();
+            keys
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct HistoryRow {
+    id: Uuid,
+    action: String,
+    user_id: Option<Uuid>,
+    old_values: Option<serde_json::Value>,
+    new_values: Option<serde_json::Value>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<HistoryRow> for EntityHistoryEntry {
+    fn from(r: HistoryRow) -> Self {
+        let changed_fields = changed_fields(&r.old_values, &r.new_values);
+        Self {
+            id: r.id,
+            action: r.action,
+            user_id: r.user_id,
+            changed_fields,
+            timestamp: r.timestamp,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]

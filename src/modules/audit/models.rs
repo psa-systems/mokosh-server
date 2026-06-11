@@ -19,6 +19,20 @@ pub struct AuditLogEntryResponse {
     pub timestamp: DateTime<Utc>,
 }
 
+/// One change-history entry for a single record, derived from `audit_log`.
+/// `changed_fields` is the set of columns that differ between the before and
+/// after snapshots (noise columns like `updated_at` are dropped), so a detail
+/// page can render "Updated (description, status)" without parsing raw JSON.
+/// Surfaced by the per-record history endpoint (PMS-182/184/185).
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityHistoryEntry {
+    pub id: Uuid,
+    pub action: String,
+    pub user_id: Option<Uuid>,
+    pub changed_fields: Vec<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct AuditLogFilter {
     pub user_id: Option<Uuid>,
