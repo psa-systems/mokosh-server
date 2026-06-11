@@ -1,6 +1,7 @@
 //! Audit service.
 
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::utils::error::AppResult;
@@ -25,7 +26,7 @@ impl AuditService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn append(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Option<Uuid>,
         action: &str,
         entity_type: &str,
@@ -56,7 +57,7 @@ impl AuditService {
     #[tracing::instrument(skip_all, fields(tenant_id = ?tenant_id))]
     pub async fn list(
         &self,
-        tenant_id: Option<Uuid>,
+        tenant_id: Option<TenantId>,
         filter: &AuditLogFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AuditLogEntryResponse>, u64)> {
@@ -158,7 +159,7 @@ impl AuditService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_entity_history(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         entity_type: &str,
         entity_id: Uuid,
         pagination: &PaginationParams,

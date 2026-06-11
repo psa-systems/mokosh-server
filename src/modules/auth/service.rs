@@ -8,6 +8,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use std::sync::Arc;
 #[cfg(feature = "server")]
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 #[cfg(feature = "server")]
 use crate::db::Database;
@@ -168,7 +169,7 @@ impl AuthService {
             };
             let _ = audit_write(
                 self.db.pool(),
-                user.tenant_id,
+                TenantId::from_trusted(user.tenant_id),
                 &ctx,
                 AuditAction::Login,
                 "auth",
@@ -812,7 +813,7 @@ impl AuthService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            TenantId::from_trusted(tenant_id),
             ctx,
             AuditAction::Create,
             "users",
@@ -1018,7 +1019,7 @@ impl AuthService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            TenantId::from_trusted(tenant_id),
             ctx,
             AuditAction::Update,
             "users",

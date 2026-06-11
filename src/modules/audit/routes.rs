@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::{AuditService, HISTORY_ENTITY_TYPES};
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -50,7 +50,7 @@ async fn list_entity_history(
     }
     let (items, total) = s
         .service
-        .list_entity_history(u.tenant_id, &entity_type, entity_id, &pagination)
+        .list_entity_history(u.tenant(), &entity_type, entity_id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -70,7 +70,7 @@ async fn list_audit_log(
     // Super-admins can cross tenants by setting the special X-Tenant-Id
     // header (read by a future middleware); for now everyone reads
     // their own tenant.
-    let scope = Some(u.tenant_id);
+    let scope = Some(u.tenant());
     let (items, total) = s.service.list(scope, &filter, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,

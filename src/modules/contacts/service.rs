@@ -144,7 +144,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "companies",
@@ -609,7 +609,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "companies",
@@ -683,7 +683,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "companies",
@@ -778,7 +778,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "contacts",
@@ -1133,7 +1133,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "contacts",
@@ -1174,7 +1174,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "contacts",
@@ -1264,7 +1264,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "sites",
@@ -1414,7 +1414,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "sites",
@@ -1514,7 +1514,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "sites",

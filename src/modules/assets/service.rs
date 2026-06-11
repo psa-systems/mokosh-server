@@ -735,7 +735,7 @@ impl AssetsService {
         // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "credential_vault",
@@ -794,7 +794,7 @@ impl AssetsService {
         // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "credential_vault",

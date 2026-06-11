@@ -108,7 +108,7 @@ impl TenantService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            TenantId::from_trusted(tenant_id),
             ctx,
             AuditAction::Create,
             "tenants",
@@ -267,7 +267,7 @@ impl TenantService {
 
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "tenants",

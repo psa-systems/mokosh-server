@@ -132,7 +132,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "contracts",
@@ -225,7 +225,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "contracts",
@@ -266,7 +266,7 @@ impl ContractsService {
         }
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "contracts",
@@ -349,7 +349,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "contract_items",
@@ -435,7 +435,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "contract_items",
@@ -492,7 +492,7 @@ impl ContractsService {
         }
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "contract_items",
@@ -601,7 +601,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "rate_cards",
@@ -682,7 +682,7 @@ impl ContractsService {
         }
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "rate_cards",
@@ -800,7 +800,7 @@ impl ContractsService {
                 .await?;
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             action,
             "rate_card_items",

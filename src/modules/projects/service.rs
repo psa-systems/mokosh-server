@@ -243,7 +243,7 @@ impl ProjectsService {
         // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "projects",
@@ -657,7 +657,7 @@ impl ProjectsService {
         // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
-            tenant_id.get(),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "tasks",
