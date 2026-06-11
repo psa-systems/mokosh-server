@@ -97,9 +97,7 @@ async fn update_category(
     Json(req): Json<UpsertKbCategoryRequest>,
 ) -> AppResult<Json<KbCategoryResponse>> {
     req.validate()?;
-    Ok(Json(
-        s.service.update_category(u.tenant(), id, &req).await?,
-    ))
+    Ok(Json(s.service.update_category(u.tenant(), id, &req).await?))
 }
 
 async fn delete_category(
@@ -118,10 +116,7 @@ async fn list_articles(
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
     f.validate()?;
-    let (items, total) = s
-        .service
-        .list_articles(u.tenant(), &f, &pagination)
-        .await?;
+    let (items, total) = s.service.list_articles(u.tenant(), &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -156,9 +151,7 @@ async fn update_article(
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service
-            .update_article(u.tenant(), id, u.id, &req)
-            .await?,
+        s.service.update_article(u.tenant(), id, u.id, &req).await?,
     ))
 }
 

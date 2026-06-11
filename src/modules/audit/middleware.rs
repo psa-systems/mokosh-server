@@ -58,8 +58,7 @@ pub async fn audit_log_middleware(
     // Only audit successful mutating requests.
     if let Some(action) = action {
         if response.status().is_success() {
-            if let (Some(_), Some(user)) = (auth_state.tenant_id, auth_state.user.as_ref())
-            {
+            if let (Some(_), Some(user)) = (auth_state.tenant_id, auth_state.user.as_ref()) {
                 let _ = state
                     .service
                     .append(

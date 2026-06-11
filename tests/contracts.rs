@@ -21,8 +21,8 @@
 mod common;
 
 use chrono::{NaiveDate, TimeZone, Utc};
-use mokosh_server::modules::contracts::ContractsService;
 use mokosh_server::modules::auth::TenantId;
+use mokosh_server::modules::contracts::ContractsService;
 use mokosh_server::Database;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -226,15 +226,33 @@ async fn resolve_rate_honours_tier_precedence(pool: PgPool) {
     .expect("work type");
 
     let base = svc
-        .resolve_rate(TenantId::from_trusted(tenant), rate_card_id, work_type_id, false, false)
+        .resolve_rate(
+            TenantId::from_trusted(tenant),
+            rate_card_id,
+            work_type_id,
+            false,
+            false,
+        )
         .await
         .expect("base rate");
     let after = svc
-        .resolve_rate(TenantId::from_trusted(tenant), rate_card_id, work_type_id, true, false)
+        .resolve_rate(
+            TenantId::from_trusted(tenant),
+            rate_card_id,
+            work_type_id,
+            true,
+            false,
+        )
         .await
         .expect("after-hours rate");
     let emergency = svc
-        .resolve_rate(TenantId::from_trusted(tenant), rate_card_id, work_type_id, true, true)
+        .resolve_rate(
+            TenantId::from_trusted(tenant),
+            rate_card_id,
+            work_type_id,
+            true,
+            true,
+        )
         .await
         .expect("emergency rate");
 

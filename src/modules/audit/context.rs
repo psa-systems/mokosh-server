@@ -10,11 +10,11 @@
 
 use std::net::SocketAddr;
 
+use crate::modules::auth::TenantId;
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use serde_json::Value;
 use uuid::Uuid;
-use crate::modules::auth::TenantId;
 
 use crate::modules::auth::AuthState;
 use crate::utils::error::AppResult;
@@ -188,5 +188,15 @@ where
         ip,
         user_agent,
     };
-    audit_write(exec, TenantId::from_trusted(tenant_id), &ctx, action, "auth", user_id, None, None).await
+    audit_write(
+        exec,
+        TenantId::from_trusted(tenant_id),
+        &ctx,
+        action,
+        "auth",
+        user_id,
+        None,
+        None,
+    )
+    .await
 }

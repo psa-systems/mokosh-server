@@ -1,9 +1,9 @@
 //! Ticket service implementation
 
+use crate::modules::auth::TenantId;
 use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
-use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -74,7 +74,12 @@ impl TicketService {
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: TenantId, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(
+        &self,
+        tenant_id: TenantId,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
@@ -1204,7 +1209,12 @@ impl TicketService {
         // Portal flow has no AuditCtx extractor (portal auth identity is a
         // `contacts` row, not a `users` row); attribute to the system actor.
         let ticket = self
-            .create_ticket(tenant_id, creator, &request, &AuditCtx::system(tenant_id.get()))
+            .create_ticket(
+                tenant_id,
+                creator,
+                &request,
+                &AuditCtx::system(tenant_id.get()),
+            )
             .await?;
         self.get_ticket_response(tenant_id, ticket.id).await
     }

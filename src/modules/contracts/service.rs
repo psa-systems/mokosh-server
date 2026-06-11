@@ -1,9 +1,9 @@
 //! Contracts service.
 
+use crate::modules::auth::TenantId;
 use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
-use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};

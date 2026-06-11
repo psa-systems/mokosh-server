@@ -288,10 +288,7 @@ async fn get_invoice(
     _finance: RequireFinance,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
-    let inv = state
-        .service
-        .get_invoice(user.tenant(), invoice_id)
-        .await?;
+    let inv = state.service.get_invoice(user.tenant(), invoice_id).await?;
     Ok(Json(inv))
 }
 

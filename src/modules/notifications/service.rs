@@ -8,8 +8,8 @@
 //! are wired by the `notification_dispatcher` worker once it lands; the
 //! row's `status = pending` is the queue marker.
 
-use uuid::Uuid;
 use crate::modules::auth::TenantId;
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};

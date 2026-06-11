@@ -1,7 +1,7 @@
 //! Contact service implementation
 
-use uuid::Uuid;
 use crate::modules::auth::TenantId;
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -24,7 +24,12 @@ impl ContactService {
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: TenantId, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(
+        &self,
+        tenant_id: TenantId,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
