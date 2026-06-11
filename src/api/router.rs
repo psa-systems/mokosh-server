@@ -119,7 +119,10 @@ pub fn create_api_router(
     let contracts_service = ContractsService::new(db.clone());
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());
-    let invitations_service = Arc::new(InvitationsService::new(db.clone()));
+    // PMS-246: the SPA origin is the invite accept-link base (login-driven
+    // acceptance), so created invites email the invitee.
+    let invitations_service =
+        Arc::new(InvitationsService::new(db.clone()).with_app_url(client_origin.clone()));
     let reports_service = ReportsService::new(db.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());

@@ -89,6 +89,51 @@ async fn rejects_non_invitable_role(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
+    // PMS-246: with a SPA URL configured, creating an invite enqueues an email
+    // notification (channel=email, recipient=invitee) for the worker to deliver.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let s = InvitationsService::new(Database::from_pool(pool.clone()))
+        .with_app_url("https://app.example.test".to_string());
+
+    s.create(tenant, admin_id, &req("Invitee@Example.com", "technician"))
+        .await
+        .expect("create invite");
+
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT channel_type, recipient, body FROM notifications
+         WHERE tenant_id = $1 AND channel_type = 'email' AND recipient = $2",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("invitee@example.com")
+    .fetch_optional(&pool)
+    .await
+    .expect("query notification");
+
+    let (channel, recipient, body) = row.expect("an invite email was enqueued");
+    assert_eq!(channel, "email");
+    assert_eq!(recipient.as_deref(), Some("invitee@example.com"));
+    assert!(
+        body.contains("https://app.example.test"),
+        "body carries the accept link"
+    );
+
+    // Without a SPA URL, no email is enqueued (tests / unconfigured deploys).
+    let s2 = InvitationsService::new(Database::from_pool(pool.clone()));
+    s2.create(tenant, admin_id, &req("noemail@example.com", "technician"))
+        .await
+        .expect("create invite without email");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE recipient = 'noemail@example.com'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 0, "no email enqueued when app_url is unset");
+}
+
+#[sqlx::test]
 async fn newest_pending_lookup_then_accept(pool: PgPool) {
     // The login path's building blocks (PMS-244 phase 2): resolve the newest
     // live invite for an email, then mark it accepted so it stops resolving.
