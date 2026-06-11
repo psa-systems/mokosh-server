@@ -2,10 +2,10 @@
 
 use std::collections::HashSet;
 
+use crate::modules::auth::TenantId;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
-use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::notifications::NotificationsService;

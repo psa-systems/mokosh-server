@@ -23,8 +23,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use uuid::Uuid;
 use crate::modules::auth::TenantId;
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::AuditCtx;
@@ -184,10 +184,18 @@ impl SeedService {
             .await?;
         let primary = self
             .contacts
-            .create_contact(TenantId::from_trusted(tenant_id), &demo_contact_primary(company.id), &ctx)
+            .create_contact(
+                TenantId::from_trusted(tenant_id),
+                &demo_contact_primary(company.id),
+                &ctx,
+            )
             .await?;
         self.contacts
-            .create_contact(TenantId::from_trusted(tenant_id), &demo_contact_secondary(company.id), &ctx)
+            .create_contact(
+                TenantId::from_trusted(tenant_id),
+                &demo_contact_secondary(company.id),
+                &ctx,
+            )
             .await?;
 
         // Tickets are best-effort per row. `create_ticket` requires the

@@ -109,7 +109,10 @@ async fn get_tenant(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
-    let tenant = state.tenant_service.get_tenant(TenantId::from_trusted(tenant_id)).await?;
+    let tenant = state
+        .tenant_service
+        .get_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(Json(tenant.into()))
 }
@@ -149,7 +152,10 @@ async fn suspend_tenant(
         ));
     }
 
-    state.tenant_service.suspend_tenant(TenantId::from_trusted(tenant_id)).await?;
+    state
+        .tenant_service
+        .suspend_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(())
 }
@@ -166,7 +172,10 @@ async fn activate_tenant(
         ));
     }
 
-    state.tenant_service.activate_tenant(TenantId::from_trusted(tenant_id)).await?;
+    state
+        .tenant_service
+        .activate_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(())
 }
@@ -182,7 +191,10 @@ async fn get_tenant_usage(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
-    let usage = state.tenant_service.get_tenant_usage(TenantId::from_trusted(tenant_id)).await?;
+    let usage = state
+        .tenant_service
+        .get_tenant_usage(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(Json(usage))
 }

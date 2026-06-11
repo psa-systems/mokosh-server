@@ -1,8 +1,8 @@
 //! Tenant service implementation
 
+use crate::modules::auth::TenantId;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
-use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};

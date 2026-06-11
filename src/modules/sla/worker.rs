@@ -34,11 +34,11 @@
 //! tickets with no assignee are skipped (nobody to notify). The spawn
 //! site is `src/main.rs`.
 
+use crate::modules::auth::TenantId;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use uuid::Uuid;
-use crate::modules::auth::TenantId;
 
 use crate::scheduler::Job;
 use crate::utils::error::AppResult;

@@ -1,5 +1,6 @@
 //! Authentication service implementation
 
+use crate::modules::auth::TenantId;
 #[cfg(feature = "server")]
 use chrono::{Duration, Utc};
 #[cfg(feature = "server")]
@@ -8,7 +9,6 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use std::sync::Arc;
 #[cfg(feature = "server")]
 use uuid::Uuid;
-use crate::modules::auth::TenantId;
 
 #[cfg(feature = "server")]
 use crate::db::Database;
@@ -589,7 +589,11 @@ impl AuthService {
                     "reset_link": reset_link,
                 });
                 if let Err(e) = notify
-                    .dispatch(TenantId::from_trusted(user.tenant_id), "auth.password_reset", &context)
+                    .dispatch(
+                        TenantId::from_trusted(user.tenant_id),
+                        "auth.password_reset",
+                        &context,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -864,7 +868,10 @@ impl AuthService {
                         "display_name": display_name,
                         "setup_link": setup_link,
                     });
-                    if let Err(e) = notify.dispatch(TenantId::from_trusted(tenant_id), "auth.welcome", &context).await {
+                    if let Err(e) = notify
+                        .dispatch(TenantId::from_trusted(tenant_id), "auth.welcome", &context)
+                        .await
+                    {
                         tracing::warn!(
                             user_id = %user_id,
                             error = ?e,

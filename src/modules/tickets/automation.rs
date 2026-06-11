@@ -9,8 +9,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use uuid::Uuid;
 use crate::modules::auth::TenantId;
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::notifications::NotificationsService;

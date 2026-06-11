@@ -233,10 +233,7 @@ async fn list_time_off(
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimeOffResponse>>> {
     f.validate()?;
-    let (items, total) = s
-        .service
-        .list_time_off(u.tenant(), &f, &pagination)
-        .await?;
+    let (items, total) = s.service.list_time_off(u.tenant(), &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
