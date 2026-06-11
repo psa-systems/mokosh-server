@@ -480,6 +480,35 @@ async fn ensure_user_from_bunyip(
     let email = info.as_ref().and_then(|i| i.email.clone());
     let email_verified = info.as_ref().and_then(|i| i.email_verified).unwrap_or(false);
 
+    place_bunyip_user(
+        auth_service,
+        tenants,
+        invitations,
+        sub,
+        email,
+        email_verified,
+        claims,
+    )
+    .await
+}
+
+/// PMS-249: the testable core of the bunyip login path. Given the verified
+/// `sub` plus the `email` / `email_verified` resolved from userinfo, resolve
+/// which Mokosh tenant the user belongs to (invite > existing placement >
+/// personal self-signup, with the PMS-245 default-tenant backfill), JIT-mirror
+/// the user, accept any consumed invite, reconcile the Bunyip role, and return
+/// the `AuthState`. Split out of [`ensure_user_from_bunyip`] (which owns the
+/// verifier / userinfo call) so this placement logic is integration-testable
+/// without a live OIDC verifier.
+pub async fn place_bunyip_user(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    email: Option<String>,
+    email_verified: bool,
+    claims: &super::oidc_rs::AtClaims,
+) -> Option<AuthState> {
     let placement = auth_service.find_user_placement(sub).await.ok().flatten();
     let current = placement.as_ref().map(|(t, _)| *t);
 
