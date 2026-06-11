@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -27,7 +28,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_work_types(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<WorkTypeResponse>, u64)> {
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_types WHERE tenant_id = $1")
@@ -56,7 +57,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_work_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertWorkTypeRequest,
     ) -> AppResult<WorkTypeResponse> {
         let id: Uuid = sqlx::query_scalar(
@@ -91,7 +92,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_work_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertWorkTypeRequest,
     ) -> AppResult<WorkTypeResponse> {
@@ -130,7 +131,7 @@ impl TimeTrackingService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_work_type(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_work_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let affected = sqlx::query("DELETE FROM work_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -169,7 +170,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_time_entries(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TimeEntryFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimeEntryResponse>, u64)> {
@@ -259,7 +260,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_entry(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateTimeEntryRequest,
     ) -> AppResult<TimeEntryResponse> {
         let pool = self.db.pool();
@@ -315,7 +316,11 @@ impl TimeTrackingService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_time_entry(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TimeEntryResponse> {
+    pub async fn get_time_entry(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<TimeEntryResponse> {
         let row = sqlx::query_as::<_, TimeEntryRow>(
             r#"
             SELECT id, user_id, date, start_time, end_time, duration_minutes,
@@ -337,7 +342,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_time_entry(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateTimeEntryRequest,
     ) -> AppResult<TimeEntryResponse> {
@@ -403,7 +408,7 @@ impl TimeTrackingService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_time_entry(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_time_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let affected = sqlx::query("DELETE FROM time_entries WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -423,7 +428,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_timesheets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TimesheetFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimesheetSummaryResponse>, u64)> {
@@ -507,7 +512,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn submit_timesheet(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         week_start: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
@@ -547,7 +552,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn withdraw_timesheet(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         week_start: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
@@ -602,7 +607,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn approve_timesheet(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         approver_id: Uuid,
         user_id: Uuid,
         week_start: NaiveDate,
@@ -646,7 +651,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reject_timesheet(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         reviewer_id: Uuid,
         user_id: Uuid,
         week_start: NaiveDate,
@@ -689,7 +694,7 @@ impl TimeTrackingService {
     /// on empty weeks (no 404s).
     async fn week_summary(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         anchor: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
@@ -723,7 +728,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_active_timers(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ActiveTimerResponse>, u64)> {
@@ -762,7 +767,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn start_timer(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &StartTimerRequest,
     ) -> AppResult<ActiveTimerResponse> {
@@ -845,7 +850,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn stop_timer(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         timer_id: Uuid,
     ) -> AppResult<TimeEntryResponse> {
         let mut tx = self.db.pool().begin().await?;
@@ -955,7 +960,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rounding_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimeRoundingRuleResponse>, u64)> {
         let total: i64 =
@@ -984,7 +989,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rounding_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertTimeRoundingRuleRequest,
     ) -> AppResult<TimeRoundingRuleResponse> {
         Self::validate_rounding_method(&request.rounding_method)?;
@@ -1026,7 +1031,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rounding_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertTimeRoundingRuleRequest,
     ) -> AppResult<TimeRoundingRuleResponse> {
@@ -1074,7 +1079,7 @@ impl TimeTrackingService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_rounding_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_rounding_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let affected =
             sqlx::query("DELETE FROM time_rounding_rules WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -1113,7 +1118,7 @@ struct WorkTypeDefaults {
 /// (FKs check existence, not ownership).
 async fn fetch_work_type_defaults<'e, E>(
     exec: E,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     work_type_id: Uuid,
 ) -> AppResult<WorkTypeDefaults>
 where
@@ -1142,7 +1147,7 @@ where
 /// caller can both validate and infer company. `NotFound` cross-tenant.
 async fn assert_ticket_in_tenant<'e, E>(
     exec: E,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     ticket_id: Uuid,
 ) -> AppResult<Uuid>
 where
@@ -1159,7 +1164,7 @@ where
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
 async fn assert_company_in_tenant<'e, E>(
     exec: E,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     company_id: Uuid,
 ) -> AppResult<()>
 where
@@ -1229,7 +1234,10 @@ fn apply_rounding(raw_minutes: i32, rule: &RoundingParams) -> i32 {
 /// Tenant default rounding rule, if one is configured. `None` => identity
 /// (raw minutes, no rounding). Missing-rule = identity is a deliberate M1
 /// choice; tracked as debt, not a silent gap.
-async fn default_rounding_rule<'e, E>(exec: E, tenant_id: Uuid) -> AppResult<Option<RoundingParams>>
+async fn default_rounding_rule<'e, E>(
+    exec: E,
+    tenant_id: TenantId,
+) -> AppResult<Option<RoundingParams>>
 where
     E: sqlx::PgExecutor<'e>,
 {
