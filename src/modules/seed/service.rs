@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::AuditCtx;
@@ -173,16 +174,20 @@ impl SeedService {
             user_agent: None,
         };
 
+        // SAFETY (PMS-139): the demo seeder is a trusted system actor that
+        // seeds a known tenant id (claimed via `try_claim` above), not user
+        // input, so it bridges into the tenant-scoped contacts service through
+        // `from_trusted`.
         let company = self
             .contacts
-            .create_company(tenant_id, &demo_company(), &ctx)
+            .create_company(TenantId::from_trusted(tenant_id), &demo_company(), &ctx)
             .await?;
         let primary = self
             .contacts
-            .create_contact(tenant_id, &demo_contact_primary(company.id), &ctx)
+            .create_contact(TenantId::from_trusted(tenant_id), &demo_contact_primary(company.id), &ctx)
             .await?;
         self.contacts
-            .create_contact(tenant_id, &demo_contact_secondary(company.id), &ctx)
+            .create_contact(TenantId::from_trusted(tenant_id), &demo_contact_secondary(company.id), &ctx)
             .await?;
 
         // Tickets are best-effort per row. `create_ticket` requires the

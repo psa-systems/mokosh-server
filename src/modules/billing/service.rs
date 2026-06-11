@@ -3,6 +3,7 @@
 use chrono::{DateTime, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -37,7 +38,7 @@ impl BillingService {
     /// input short-circuits to an empty map.
     async fn company_name_map(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ids: &[Uuid],
     ) -> AppResult<std::collections::HashMap<Uuid, String>> {
         if ids.is_empty() {
@@ -57,7 +58,7 @@ impl BillingService {
     /// instead of the invoice UUID.
     async fn invoice_number_map(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ids: &[Uuid],
     ) -> AppResult<std::collections::HashMap<Uuid, String>> {
         if ids.is_empty() {
@@ -76,7 +77,7 @@ impl BillingService {
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         resp: &mut [InvoiceResponse],
     ) -> AppResult<()> {
         let ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
@@ -91,7 +92,7 @@ impl BillingService {
     /// responses (PMS-186).
     async fn enrich_payments(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         resp: &mut [PaymentResponse],
     ) -> AppResult<()> {
         let company_ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
@@ -119,7 +120,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_invoices(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &InvoiceFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<InvoiceResponse>, u64)> {
@@ -223,7 +224,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
@@ -340,7 +341,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "invoices",
@@ -384,7 +385,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice_from_time_entries(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateInvoiceFromTimeEntriesRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
@@ -579,7 +580,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "invoices",
@@ -629,7 +630,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn generate_due_recurring_invoices(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         now: DateTime<Utc>,
         ctx: &AuditCtx,
     ) -> AppResult<Vec<Uuid>> {
@@ -718,9 +719,13 @@ impl BillingService {
 
         let mut total = 0u64;
         for tenant_id in tenant_ids {
+            // SAFETY (PMS-139): cross-tenant sweep driven by the billing worker.
+            // `tenant_id` is read straight off the `tenants` table (a real
+            // tenant id, not user input), so it bridges into the tenant-scoped
+            // path through `from_trusted`.
             let ctx = AuditCtx::system(tenant_id);
             match self
-                .generate_due_recurring_invoices(tenant_id, now, &ctx)
+                .generate_due_recurring_invoices(TenantId::from_trusted(tenant_id), now, &ctx)
                 .await
             {
                 Ok(ids) => total += ids.len() as u64,
@@ -747,7 +752,7 @@ impl BillingService {
     #[allow(clippy::too_many_arguments)]
     async fn generate_one_recurring_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
         company_id: Uuid,
         period_start: NaiveDate,
@@ -923,7 +928,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "invoices",
@@ -942,7 +947,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tax_rates(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TaxRateResponse>, u64)> {
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tax_rates WHERE tenant_id = $1")
@@ -972,7 +977,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertTaxRateRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TaxRateResponse> {
@@ -1009,7 +1014,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "tax_rates",
@@ -1032,7 +1037,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertTaxRateRequest,
         ctx: &AuditCtx,
@@ -1089,7 +1094,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "tax_rates",
@@ -1112,7 +1117,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -1137,7 +1142,7 @@ impl BillingService {
         }
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "tax_rates",
@@ -1158,7 +1163,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn lookup_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         jurisdiction: &str,
     ) -> AppResult<TaxRateResponse> {
         let row = sqlx::query_as::<_, TaxRateRow>(
@@ -1198,7 +1203,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payment_gateways(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<PaymentGatewayConfigResponse>, u64)> {
         let total: i64 =
@@ -1249,7 +1254,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_payment_gateway(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertPaymentGatewayConfigRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentGatewayConfigResponse> {
@@ -1309,7 +1314,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             action,
             "payment_gateway_configs",
@@ -1333,7 +1338,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment_gateway(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         provider: GatewayProvider,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -1362,7 +1367,7 @@ impl BillingService {
         if let Some((id, before)) = row {
             audit_write(
                 &mut *tx,
-                tenant_id,
+                tenant_id.get(),
                 ctx,
                 AuditAction::Delete,
                 "payment_gateway_configs",
@@ -1381,7 +1386,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payments(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &PaymentFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<PaymentResponse>, u64)> {
@@ -1449,7 +1454,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_payment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreatePaymentRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentResponse> {
@@ -1538,7 +1543,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "payments",
@@ -1559,7 +1564,7 @@ impl BillingService {
         };
         Ok(PaymentResponse {
             id: payment_id,
-            tenant_id,
+            tenant_id: tenant_id.get(),
             invoice_id: request.invoice_id,
             invoice_number,
             company_id: request.company_id,
@@ -1582,7 +1587,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         payment_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -1655,7 +1660,7 @@ impl BillingService {
         // after = None. PMS-117.
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "payments",
@@ -1677,7 +1682,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         invoice_id: Uuid,
         request: &UpdateInvoiceRequest,
         ctx: &AuditCtx,
@@ -1801,7 +1806,7 @@ impl BillingService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "invoices",
@@ -1820,7 +1825,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         invoice_id: Uuid,
     ) -> AppResult<InvoiceResponse> {
         let row = sqlx::query_as::<_, InvoiceRow>(

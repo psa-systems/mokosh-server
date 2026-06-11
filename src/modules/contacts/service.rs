@@ -1,6 +1,7 @@
 //! Contact service implementation
 
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -23,7 +24,7 @@ impl ContactService {
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: Uuid, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(&self, tenant_id: TenantId, table: &'static str, id: Uuid) -> AppResult<()> {
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
@@ -42,7 +43,7 @@ impl ContactService {
 
     async fn validate_fk_opt(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         table: &'static str,
         id: Option<Uuid>,
     ) -> AppResult<()> {
@@ -60,7 +61,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateCompanyRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Company> {
@@ -143,7 +144,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "companies",
@@ -168,7 +169,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn enrich_companies(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         mut responses: Vec<CompanyResponse>,
     ) -> AppResult<Vec<CompanyResponse>> {
         if responses.is_empty() {
@@ -217,7 +218,7 @@ impl ContactService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<Company> {
+    pub async fn get_company(&self, tenant_id: TenantId, company_id: Uuid) -> AppResult<Company> {
         let row = sqlx::query_as::<_, CompanyRow>(
             r#"
             SELECT id, tenant_id, name, parent_company_id, company_type, status,
@@ -247,7 +248,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_companies(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &CompanyFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Company>, u64)> {
@@ -354,7 +355,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         request: &UpdateCompanyRequest,
         ctx: &AuditCtx,
@@ -608,7 +609,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "companies",
@@ -626,7 +627,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -682,7 +683,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "companies",
@@ -704,7 +705,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contact(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateContactRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Contact> {
@@ -777,7 +778,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "contacts",
@@ -793,7 +794,7 @@ impl ContactService {
 
     /// Get contact by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_contact(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<Contact> {
+    pub async fn get_contact(&self, tenant_id: TenantId, contact_id: Uuid) -> AppResult<Contact> {
         let row = sqlx::query_as::<_, ContactRow>(
             r#"
             SELECT id, tenant_id, company_id, first_name, last_name, email,
@@ -818,7 +819,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contacts(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &ContactFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Contact>, u64)> {
@@ -921,7 +922,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_contacts(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Contact>, u64)> {
@@ -960,7 +961,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contact(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contact_id: Uuid,
         request: &UpdateContactRequest,
         ctx: &AuditCtx,
@@ -1132,7 +1133,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "contacts",
@@ -1150,7 +1151,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contact(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contact_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -1173,7 +1174,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "contacts",
@@ -1195,7 +1196,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_site(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateSiteRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Site> {
@@ -1263,7 +1264,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "sites",
@@ -1282,7 +1283,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_site(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         site_id: Uuid,
         request: &UpdateSiteRequest,
         ctx: &AuditCtx,
@@ -1413,7 +1414,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "sites",
@@ -1429,7 +1430,7 @@ impl ContactService {
 
     /// Get site by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<Site> {
+    pub async fn get_site(&self, tenant_id: TenantId, site_id: Uuid) -> AppResult<Site> {
         let row = sqlx::query_as::<_, SiteRow>(
             r#"
             SELECT id, tenant_id, company_id, name,
@@ -1453,7 +1454,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_sites(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Site>, u64)> {
@@ -1491,7 +1492,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_site(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         site_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -1513,7 +1514,7 @@ impl ContactService {
 
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "sites",
