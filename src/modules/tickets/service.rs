@@ -74,7 +74,7 @@ impl TicketService {
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: Uuid, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(&self, tenant_id: TenantId, table: &'static str, id: Uuid) -> AppResult<()> {
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
@@ -93,7 +93,7 @@ impl TicketService {
 
     async fn validate_fk_opt(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         table: &'static str,
         id: Option<Uuid>,
     ) -> AppResult<()> {
@@ -104,7 +104,7 @@ impl TicketService {
     }
 
     /// Generate next ticket number for tenant
-    async fn next_ticket_number(&self, tenant_id: Uuid) -> AppResult<String> {
+    async fn next_ticket_number(&self, tenant_id: TenantId) -> AppResult<String> {
         let row = sqlx::query_as::<_, (i32,)>(
             r#"
             UPDATE ticket_sequences
@@ -124,7 +124,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &CreateTicketRequest,
         ctx: &AuditCtx,
@@ -245,7 +245,7 @@ impl TicketService {
 
         audit_write(
             &mut *tx,
-            TenantId::from_trusted(tenant_id),
+            tenant_id,
             ctx,
             AuditAction::Create,
             "tickets",
@@ -275,7 +275,7 @@ impl TicketService {
 
     /// Get ticket by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_ticket(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<Ticket> {
+    pub async fn get_ticket(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<Ticket> {
         let row = sqlx::query_as::<_, TicketRow>(
             r#"
             SELECT id, tenant_id, ticket_number, title, description,
@@ -304,7 +304,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_by_number(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_number: &str,
     ) -> AppResult<Ticket> {
         let row = sqlx::query_as::<_, TicketRow>(
@@ -339,7 +339,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tickets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Ticket>, u64)> {
@@ -482,7 +482,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         user_id: Uuid,
         request: &UpdateTicketRequest,
@@ -620,7 +620,7 @@ impl TicketService {
 
         audit_write(
             &mut *tx,
-            TenantId::from_trusted(tenant_id),
+            tenant_id,
             ctx,
             AuditAction::Update,
             "tickets",
@@ -670,7 +670,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -711,7 +711,7 @@ impl TicketService {
 
         audit_write(
             &mut *tx,
-            TenantId::from_trusted(tenant_id),
+            tenant_id,
             ctx,
             AuditAction::Delete,
             "tickets",
@@ -729,7 +729,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn assign_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         assigned_to_id: Uuid,
         user_id: Uuid,
@@ -751,7 +751,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_note(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         user_id: Uuid,
         request: &CreateNoteRequest,
@@ -810,7 +810,7 @@ impl TicketService {
     /// and visible to the agent.
     async fn send_note_email(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         note_id: Uuid,
         content: &str,
@@ -861,7 +861,7 @@ impl TicketService {
                     "content": content,
                 });
                 notify
-                    .dispatch(TenantId::from_trusted(tenant_id), "ticket.note_added", &context)
+                    .dispatch(tenant_id, "ticket.note_added", &context)
                     .await
                     .map(|_| ())
                     .map_err(|e| format!("notify dispatch: {e}"))
@@ -893,7 +893,7 @@ impl TicketService {
 
     /// Get note by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_note(&self, tenant_id: Uuid, note_id: Uuid) -> AppResult<TicketNote> {
+    pub async fn get_note(&self, tenant_id: TenantId, note_id: Uuid) -> AppResult<TicketNote> {
         let row = sqlx::query_as::<_, TicketNoteRow>(
             r#"
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
@@ -917,7 +917,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_notes(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketNote>, u64)> {
@@ -952,7 +952,7 @@ impl TicketService {
     }
 
     /// Calculate SLA due dates for a ticket
-    async fn calculate_sla_dates(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<()> {
+    async fn calculate_sla_dates(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<()> {
         // Get ticket details
         let ticket = self.get_ticket(tenant_id, ticket_id).await?;
 
@@ -1019,7 +1019,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_statuses(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketStatus>, u64)> {
         let total: i64 =
@@ -1050,7 +1050,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_priorities(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketPriority>, u64)> {
         let total: i64 =
@@ -1081,7 +1081,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_queues(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketQueue>, u64)> {
         let total: i64 =
@@ -1112,7 +1112,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_types(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketType>, u64)> {
         let total: i64 = sqlx::query_scalar(
@@ -1150,7 +1150,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_portal_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         contact_id: Uuid,
         title: String,
@@ -1204,7 +1204,7 @@ impl TicketService {
         // Portal flow has no AuditCtx extractor (portal auth identity is a
         // `contacts` row, not a `users` row); attribute to the system actor.
         let ticket = self
-            .create_ticket(tenant_id, creator, &request, &AuditCtx::system(tenant_id))
+            .create_ticket(tenant_id, creator, &request, &AuditCtx::system(tenant_id.get()))
             .await?;
         self.get_ticket_response(tenant_id, ticket.id).await
     }
@@ -1217,7 +1217,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_portal_tickets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketResponse>, u64)> {
@@ -1235,7 +1235,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_portal_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         ticket_id: Uuid,
     ) -> AppResult<TicketResponse> {
@@ -1254,7 +1254,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_response(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
     ) -> AppResult<TicketResponse> {
         let sql = format!(
@@ -1276,7 +1276,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_ticket_responses(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketResponse>, u64)> {
