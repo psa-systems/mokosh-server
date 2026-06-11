@@ -34,10 +34,13 @@ use crate::utils::error::AppResult;
 
 use super::data::{demo_company, demo_contact_primary, demo_contact_secondary, demo_tickets};
 
-/// Whether demo seeding is enabled. Reads `MOKOSH_DEMO_SEED` once;
-/// defaults to enabled. Set it to `0`/`false`/`no`/`off` to disable in
-/// environments where automatic demo rows are unwanted (e.g. E2E/staging
-/// against the shared default tenant).
+/// Whether demo seeding is enabled at all. Reads `MOKOSH_DEMO_SEED` once;
+/// defaults to enabled. Set it to `0`/`false`/`no`/`off` to disable entirely
+/// (e.g. E2E). Note this is the global kill-switch; the shared multi-user
+/// landing tenant is excluded separately and unconditionally by
+/// [`shared_landing_tenant`] (PMS-239), so you do NOT need this flag just to
+/// keep demo rows out of a Bunyip deployment's shared tenant. To remove demo
+/// rows that were seeded before that fix, run `scripts/wipe_demo_seed.sql`.
 fn demo_seed_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -52,6 +55,22 @@ fn demo_seed_enabled() -> bool {
     })
 }
 
+/// The shared multi-user landing tenant, if this deployment funnels users
+/// into one (PMS-239). Bunyip-issued tokens carry no tenant claim yet, so
+/// every OIDC user JIT-lands in `OIDC_DEFAULT_TENANT_ID` (see
+/// `auth::middleware::ensure_user_from_bunyip` / docs §3.3). That tenant is a
+/// shared zone, NOT a fresh single-owner account, so it must never be
+/// auto-seeded with per-account demo data - otherwise every user sees (and can
+/// edit) the same demo rows, which is exactly the bug reported in PMS-239.
+///
+/// Returns `None` when the env var is unset (single-tenant / test / legacy
+/// deployments), in which case there is no shared tenant to exclude.
+fn shared_landing_tenant() -> Option<Uuid> {
+    std::env::var("OIDC_DEFAULT_TENANT_ID")
+        .ok()
+        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+}
+
 /// Seeds first-visit demo data for new accounts. Cheap to clone (holds
 /// `Arc`/`Clone` services and a shared seen-set).
 #[derive(Clone)]
@@ -63,6 +82,9 @@ pub struct SeedService {
     /// confirmed-claimed-elsewhere). Bounds DB work to once per tenant per
     /// process lifetime.
     seen: Arc<Mutex<HashSet<Uuid>>>,
+    /// The shared multi-user landing tenant to never auto-seed (PMS-239).
+    /// Captured at construction from `OIDC_DEFAULT_TENANT_ID`.
+    shared_tenant: Option<Uuid>,
 }
 
 impl SeedService {
@@ -72,7 +94,15 @@ impl SeedService {
             contacts,
             tickets,
             seen: Arc::new(Mutex::new(HashSet::new())),
+            shared_tenant: shared_landing_tenant(),
         }
+    }
+
+    /// Override the shared landing tenant explicitly. Lets callers (and tests)
+    /// pin the tenant to exclude without depending on process-global env state.
+    pub fn with_shared_tenant(mut self, tenant_id: Option<Uuid>) -> Self {
+        self.shared_tenant = tenant_id;
+        self
     }
 
     /// True once this process has settled `tenant_id` (no further DB work
@@ -95,6 +125,16 @@ impl SeedService {
     /// problem can never break the request that triggered it.
     pub async fn ensure_demo_seeded(&self, tenant_id: Uuid, user_id: Uuid) {
         if !demo_seed_enabled() || self.is_seen(tenant_id) {
+            return;
+        }
+        // PMS-239: never auto-seed the shared multi-user landing tenant. It is
+        // not a fresh single-owner account - every Bunyip user lands there - so
+        // demo rows would be shared by, and editable across, all of them. Mark
+        // it seen so we skip the check on every future request this process
+        // serves.
+        if self.shared_tenant == Some(tenant_id) {
+            self.mark_seen(tenant_id);
+            tracing::debug!(%tenant_id, "skipping demo seed for shared landing tenant");
             return;
         }
         match self.run(tenant_id, user_id).await {
