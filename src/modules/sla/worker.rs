@@ -38,6 +38,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::scheduler::Job;
 use crate::utils::error::AppResult;
@@ -180,7 +181,7 @@ impl SlaSweepWorker {
                     "due": due.to_rfc3339(),
                 });
                 match notifications
-                    .dispatch(t.tenant_id, event_type, &context)
+                    .dispatch(TenantId::from_trusted(t.tenant_id), event_type, &context)
                     .await
                 {
                     Ok(n) => {

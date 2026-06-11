@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::notifications::NotificationsService;
@@ -308,7 +309,7 @@ impl AutomationEngine {
                                     "ticket_id": ticket_id.to_string(),
                                 });
                                 if let Err(e) = notify
-                                    .dispatch(tenant_id, "ticket.automation.notify", &context)
+                                    .dispatch(TenantId::from_trusted(tenant_id), "ticket.automation.notify", &context)
                                     .await
                                 {
                                     tracing::warn!(

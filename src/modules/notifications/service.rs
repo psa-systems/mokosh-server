@@ -9,6 +9,7 @@
 //! row's `status = pending` is the queue marker.
 
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
@@ -42,7 +43,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_channels(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationChannelResponse>, u64)> {
         let total: i64 =
@@ -85,7 +86,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_channel(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertNotificationChannelRequest,
     ) -> AppResult<NotificationChannelResponse> {
         let plain = serde_json::to_string(&request.config)
@@ -117,7 +118,7 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_channel(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_channel(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM notification_channels WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -134,7 +135,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_templates(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationTemplateResponse>, u64)> {
         let total: i64 =
@@ -160,7 +161,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_template(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertNotificationTemplateRequest,
     ) -> AppResult<NotificationTemplateResponse> {
         let id = Uuid::new_v4();
@@ -186,7 +187,7 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_template(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_template(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM notification_templates WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -203,7 +204,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_user_preferences(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<UserNotificationPreferenceResponse>, u64)> {
@@ -234,7 +235,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_user_preference(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &UpsertUserNotificationPreferenceRequest,
     ) -> AppResult<UserNotificationPreferenceResponse> {
@@ -268,7 +269,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_inbox(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationInboxItemResponse>, u64)> {
@@ -298,7 +299,7 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn mark_read(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn mark_read(&self, tenant_id: TenantId, user_id: Uuid, id: Uuid) -> AppResult<()> {
         sqlx::query(
             r#"UPDATE notifications SET read_at = NOW()
                WHERE tenant_id = $1 AND user_id = $2 AND id = $3"#,
@@ -315,7 +316,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationRuleResponse>, u64)> {
         let total: i64 =
@@ -341,7 +342,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertNotificationRuleRequest,
     ) -> AppResult<NotificationRuleResponse> {
         let id = Uuid::new_v4();
@@ -375,7 +376,7 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM notification_rules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -413,7 +414,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<u64> {
@@ -546,7 +547,7 @@ impl NotificationsService {
     /// = accept only if `channel_types` contains the channel.
     async fn user_accepts_channel(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         event_type: &str,
         channel: &str,

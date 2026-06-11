@@ -22,6 +22,7 @@
 use async_trait::async_trait;
 
 use crate::scheduler::Job;
+use crate::modules::auth::TenantId;
 use crate::utils::error::AppResult;
 
 use super::service::CalendarService;
@@ -86,7 +87,7 @@ impl CalendarReminderWorker {
                 "reminder_minutes": c.reminder_minutes,
             });
             if let Err(e) = notifications
-                .dispatch(c.tenant_id, "appointment.reminder", &context)
+                .dispatch(TenantId::from_trusted(c.tenant_id), "appointment.reminder", &context)
                 .await
             {
                 // Ledger row already committed above, so this reminder is
