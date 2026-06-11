@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use uuid::Uuid;
 
+use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 
 // --- Catalog (server-side constants; never user input) ----------------------
@@ -321,7 +321,7 @@ enum Bind {
 /// envelope. Every unknown key is a 400 before any SQL is built.
 pub async fn run(
     pool: &PgPool,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     spec: &CustomSpec,
 ) -> AppResult<CustomReportResponse> {
     let src = SOURCES

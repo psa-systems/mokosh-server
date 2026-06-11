@@ -7,6 +7,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::TenantId;
 use crate::utils::error::AppResult;
 
 #[derive(Clone)]
@@ -27,7 +28,7 @@ impl ReportsService {
 
     // PMS-95 dashboard --------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn dashboard(&self, tenant_id: Uuid) -> AppResult<DashboardResponse> {
+    pub async fn dashboard(&self, tenant_id: TenantId) -> AppResult<DashboardResponse> {
         let open_by_priority: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT tp.name, COUNT(*)::bigint
                FROM tickets t
@@ -85,7 +86,7 @@ impl ReportsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn tickets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: Option<NaiveDate>,
         to: Option<NaiveDate>,
     ) -> AppResult<TicketsReportResponse> {
@@ -148,7 +149,7 @@ impl ReportsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn time(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: Option<NaiveDate>,
         to: Option<NaiveDate>,
     ) -> AppResult<TimeReportResponse> {
@@ -194,7 +195,7 @@ impl ReportsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn billing(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Option<Uuid>,
     ) -> AppResult<BillingReportResponse> {
         let totals: Option<(Decimal, Decimal, Decimal)> = if let Some(c) = company_id {
@@ -257,7 +258,7 @@ impl ReportsService {
     /// overdue projects. Powers the SPA project-status / budget-tracking /
     /// milestone-tracking report types.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn projects(&self, tenant_id: Uuid) -> AppResult<ProjectsReportResponse> {
+    pub async fn projects(&self, tenant_id: TenantId) -> AppResult<ProjectsReportResponse> {
         let by_status: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT status, COUNT(*)::bigint
                FROM projects WHERE tenant_id = $1
@@ -329,7 +330,7 @@ impl ReportsService {
     /// status, warranties expiring soon, and contract renewals. Powers the
     /// SPA client-summary / asset-inventory / contract-renewals report types.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn clients(&self, tenant_id: Uuid) -> AppResult<ClientsReportResponse> {
+    pub async fn clients(&self, tenant_id: TenantId) -> AppResult<ClientsReportResponse> {
         let (companies_total, companies_active): (i64, i64) = sqlx::query_as(
             r#"SELECT COUNT(*)::bigint,
                       COUNT(*) FILTER (WHERE status = 'active')::bigint
