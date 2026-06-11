@@ -861,7 +861,7 @@ impl TicketService {
                     "content": content,
                 });
                 notify
-                    .dispatch(tenant_id, "ticket.note_added", &context)
+                    .dispatch(TenantId::from_trusted(tenant_id), "ticket.note_added", &context)
                     .await
                     .map(|_| ())
                     .map_err(|e| format!("notify dispatch: {e}"))

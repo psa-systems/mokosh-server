@@ -335,10 +335,12 @@ the infrastructure or shared-helper layer.
    reference pattern - handlers use `u.tenant()`, service + `custom::run` take
    `TenantId`), `rmm`, `time_tracking`, `assets`, `projects`, `calendar`, `sla`,
    `contracts`, `knowledge_base`, `tenants`, `settings`, `contacts`,
-   `billing`, and `audit` (the first hub - its `audit_write` writer and the
+   `billing`, `audit` (the first hub - its `audit_write` writer and the
    `AuditService` read/append methods now take `TenantId`, which let every
    swept module drop its transitional `tenant_id.get()` at the audit call
-   site). The RMM ingest
+   site), and `notifications` (the second hub - `dispatch` and the service
+   methods now take `TenantId`; its cross-tenant dispatcher worker stays a
+   `Uuid`-internal struct like the calendar/sla workers). The RMM ingest
    webhook is unauthenticated (machine HMAC), so it uses the `from_trusted`
    escape hatch with a `// SAFETY:` comment; the `tenants` super-admin handlers
    address an arbitrary path tenant (not the caller's claim) so they
@@ -350,22 +352,24 @@ the infrastructure or shared-helper layer.
    recurring-invoice sweep does likewise for the tenant ids it reads off the
    `tenants` table. The
    `settings` module-enablement gate in `auth/middleware.rs` now derives the
-   tenant via `TenantScoped::tenant(&user)`. Where a migrated module calls a
-   still-not-swept hub (`notifications::dispatch`, `TicketService`) it unwraps
-   with `tenant_id.get()` transitionally; those two hubs migrate last. The
-   `audit_write` hub now takes `TenantId`, so its callers in the two
-   not-yet-swept modules (`auth`, `tickets`) and the `tenants` create path (a
-   minted id) plus the `audit_auth_event` helper bridge through `from_trusted`
-   until each is swept; `AuditCtx` itself stays a `Uuid` context bag (it is the
-   request-extractor DTO, tolerant of unauthenticated/system callers).
+   tenant via `TenantScoped::tenant(&user)`. One hub remains: a migrated module
+   calling `TicketService` still unwraps with `tenant_id.get()` transitionally
+   (the sole surviving such site is rmm's alert path). The `audit_write` and
+   `notifications::dispatch` hubs now take `TenantId`, so their callers in the
+   not-yet-swept modules (`auth`, `tickets`), the `tenants` create path (a
+   minted id), the `audit_auth_event` helper, and the cross-tenant
+   calendar/sla workers bridge through `from_trusted` until each is swept;
+   `AuditCtx` itself stays a `Uuid` context bag (it is the request-extractor
+   DTO, tolerant of unauthenticated/system callers).
    Cross-tenant workers (calendar reminder, sla sweep, contract lifecycle) read
    tenant ids straight off DB-projected rows as `Uuid` and dispatch through the
    hubs, so they are untouched by the sweep. The `tenants::copy_default_config`
    seed helper keeps its `Uuid` (it copies from a hardcoded default tenant into
    a freshly minted one - neither is a claim).
-   **Remaining:** sweep `notifications` (the `dispatch` hub) and `tickets` (the
-   `TicketService` hub); flipping those removes the last transitional
-   `tenant_id.get()` sites. Until the sweep completes this item stays open.
+   **Remaining:** sweep `tickets` (the `TicketService` hub - the last hub);
+   flipping it removes the final transitional `tenant_id.get()` (rmm's alert
+   path) and lets `auth`/`tickets` shed their `from_trusted` audit/dispatch
+   bridges. Until the sweep completes this item stays open.
 9. **`validator::Validate` coverage is uneven.** `Create*Request`
    and `Update*Request` types are validated. `*Filter` query types
    (`TicketFilter`, `CompanyFilter`, `ContactFilter`) are not.
