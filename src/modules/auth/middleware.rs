@@ -476,6 +476,27 @@ async fn ensure_user_from_bunyip(
         _ => default_bunyip_tenant_id(),
     };
 
+    // PMS-243 lazy backfill: a user mirrored into the shared default tenant
+    // before per-org tenants existed is re-homed to their resolved org tenant
+    // on this login. Scoped to the default tenant (so a correctly-placed user
+    // is never moved) and idempotent. Without this, an existing default-tenant
+    // user presenting an org claim would miss the org-tenant lookup below and
+    // the bunyip path would drop them. Co-mingled default-tenant data stays put
+    // for separate triage (PMS-243).
+    let default_tenant = default_bunyip_tenant_id();
+    if tenant != default_tenant {
+        match auth_service
+            .rehome_user_between_tenants(sub, default_tenant, tenant)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(sub = %sub, tenant_id = %tenant, "re-homed user from default tenant to org tenant")
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, sub = %sub, "user re-home to org tenant failed"),
+        }
+    }
+
     // Resolve the local shadow row, JIT-creating it on first sight.
     let mut user = match auth_service.get_user_by_id(tenant, sub).await {
         Ok(user) => user,
