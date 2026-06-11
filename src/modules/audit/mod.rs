@@ -27,4 +27,4 @@ pub use context::{audit_auth_event, audit_write, AuditAction, AuditCtx};
 pub use middleware::audit_log_middleware;
 pub use models::*;
 pub use routes::audit_routes;
-pub use service::AuditService;
+pub use service::{field_changes, AuditService};

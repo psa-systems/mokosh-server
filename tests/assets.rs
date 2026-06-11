@@ -143,6 +143,18 @@ async fn asset_crud_and_filtering(pool: PgPool) {
         !audit["data"].as_array().unwrap().is_empty(),
         "asset mutations write asset_audit_log rows"
     );
+    // PMS-204: the status edit's audit row carries the before/after diff so
+    // the detail page can show the actual content, not just "status_changed".
+    let status_change = audit["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["changes"].as_array())
+        .flatten()
+        .find(|c| c["field"].as_str() == Some("status"))
+        .expect("an audit row must carry the status field change");
+    assert_eq!(status_change["old"].as_str(), Some("active"));
+    assert_eq!(status_change["new"].as_str(), Some("in_repair"));
 }
 
 // AC3: asset relationships with the four relationship types.

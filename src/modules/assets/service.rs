@@ -264,6 +264,14 @@ impl AssetsService {
     ) -> AppResult<AssetResponse> {
         let prior = self.get_asset(tenant_id, id).await?;
         let mut tx = self.db.pool().begin().await?;
+        // Snapshot before/after so the audit row records the field-level
+        // before -> after diff, not just the action (PMS-204).
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let n = sqlx::query(
             r#"UPDATE assets SET
                 asset_tag = COALESCE($3, asset_tag),
@@ -303,19 +311,30 @@ impl AssetsService {
         if n == 0 {
             return Err(AppError::NotFound("Asset".to_string()));
         }
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let action = if request.status.is_some() && request.status.as_ref() != Some(&prior.status) {
             "status_changed"
         } else {
             "updated"
         };
+        // Persist the before -> after diff as a JSON array of {field, old, new}
+        // so the asset detail page can show the actual content of the edit.
+        let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
+            .unwrap_or(serde_json::Value::Null);
         sqlx::query(
-            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id)
-               VALUES ($1, $2, $3, $4)"#,
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
+               VALUES ($1, $2, $3, $4, $5)"#,
         )
         .bind(tenant_id)
         .bind(id)
         .bind(action)
         .bind(performer)
+        .bind(changes)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
