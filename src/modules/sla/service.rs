@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::notifications::NotificationsService;
@@ -62,7 +63,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_policies(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<SlaPolicyResponse>, u64)> {
         let total: i64 =
@@ -88,7 +89,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_policy(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertSlaPolicyRequest,
     ) -> AppResult<SlaPolicyResponse> {
         let mut tx = self.db.pool().begin().await?;
@@ -117,7 +118,7 @@ impl SlaService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_policy(&self, tenant_id: Uuid, id: Uuid) -> AppResult<SlaPolicyResponse> {
+    pub async fn get_policy(&self, tenant_id: TenantId, id: Uuid) -> AppResult<SlaPolicyResponse> {
         let row = sqlx::query_as::<_, PolicyRow>(
             r#"SELECT id, name, description, business_hours_id, is_default
                FROM sla_policies WHERE tenant_id = $1 AND id = $2"#,
@@ -133,7 +134,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_policy(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertSlaPolicyRequest,
     ) -> AppResult<SlaPolicyResponse> {
@@ -175,7 +176,7 @@ impl SlaService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_policy(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_policy(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM sla_policies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -192,7 +193,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_targets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         policy_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<SlaTargetResponse>, u64)> {
@@ -227,7 +228,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_target(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         policy_id: Uuid,
         request: &UpsertSlaTargetRequest,
     ) -> AppResult<SlaTargetResponse> {
@@ -267,7 +268,7 @@ impl SlaService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_target(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_target(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query(
             r#"DELETE FROM sla_targets t USING sla_policies p
                WHERE t.sla_policy_id = p.id AND p.tenant_id = $1 AND t.id = $2"#,
@@ -287,7 +288,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_business_hours(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<BusinessHoursResponse>, u64)> {
         let total: i64 =
@@ -313,7 +314,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_business_hours(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertBusinessHoursRequest,
     ) -> AppResult<BusinessHoursResponse> {
         let mut tx = self.db.pool().begin().await?;
@@ -349,7 +350,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_business_hours(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertBusinessHoursRequest,
     ) -> AppResult<BusinessHoursResponse> {
@@ -380,7 +381,7 @@ impl SlaService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_business_hours(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_business_hours(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM business_hours WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -397,7 +398,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_holiday_calendars(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<HolidayCalendarResponse>, u64)> {
         let total: i64 =
@@ -423,7 +424,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_holiday_calendar(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertHolidayCalendarRequest,
     ) -> AppResult<HolidayCalendarResponse> {
         let id = Uuid::new_v4();
@@ -447,7 +448,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_holiday_calendar(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertHolidayCalendarRequest,
     ) -> AppResult<HolidayCalendarResponse> {
@@ -473,7 +474,7 @@ impl SlaService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_holiday_calendar(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_holiday_calendar(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM holiday_calendars WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -501,7 +502,7 @@ impl SlaService {
     /// business-hours-aware, PMS-106). If the policy has no business
     /// hours configured every target degrades to 24x7.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn evaluate_for_ticket(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<()> {
+    pub async fn evaluate_for_ticket(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<()> {
         let row: Option<(Option<Uuid>, Uuid, DateTime<Utc>)> = sqlx::query_as(
             r#"SELECT sla_id, priority_id, created_at FROM tickets
                WHERE tenant_id = $1 AND id = $2"#,
@@ -587,7 +588,7 @@ impl SlaService {
     /// clock degrades to 24x7.
     async fn load_schedule_and_holidays(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         business_hours_id: Option<Uuid>,
     ) -> AppResult<(BusinessSchedule, HashSet<NaiveDate>)> {
         // No business hours on the policy: an empty (all-closed) schedule

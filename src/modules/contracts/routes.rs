@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::ContractsService;
-use crate::modules::auth::{RequireContracts, RequireFinance};
+use crate::modules::auth::{RequireContracts, RequireFinance, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -67,7 +67,7 @@ async fn list_contracts(
     f.validate()?;
     let (items, total) = s
         .service
-        .list_contracts(u.tenant_id, &f, &pagination)
+        .list_contracts(u.tenant(), &f, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -85,7 +85,7 @@ async fn create_contract(
 ) -> AppResult<Json<ContractResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_contract(u.tenant_id, &req, &ctx).await?,
+        s.service.create_contract(u.tenant(), &req, &ctx).await?,
     ))
 }
 
@@ -94,7 +94,7 @@ async fn get_contract(
     RequireContracts { user: u, .. }: RequireContracts,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ContractResponse>> {
-    Ok(Json(s.service.get_contract(u.tenant_id, id).await?))
+    Ok(Json(s.service.get_contract(u.tenant(), id).await?))
 }
 
 async fn update_contract(
@@ -108,7 +108,7 @@ async fn update_contract(
     req.validate()?;
     Ok(Json(
         s.service
-            .update_contract(u.tenant_id, id, &req, &ctx)
+            .update_contract(u.tenant(), id, &req, &ctx)
             .await?,
     ))
 }
@@ -120,7 +120,7 @@ async fn delete_contract(
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_contract(u.tenant_id, id, &ctx).await
+    s.service.delete_contract(u.tenant(), id, &ctx).await
 }
 
 async fn list_contract_items(
@@ -131,7 +131,7 @@ async fn list_contract_items(
 ) -> AppResult<Json<PaginatedResponse<ContractItemResponse>>> {
     let (items, total) = s
         .service
-        .list_contract_items(u.tenant_id, id, &pagination)
+        .list_contract_items(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -151,7 +151,7 @@ async fn create_contract_item(
     req.validate()?;
     Ok(Json(
         s.service
-            .create_contract_item(u.tenant_id, id, &req, &ctx)
+            .create_contract_item(u.tenant(), id, &req, &ctx)
             .await?,
     ))
 }
@@ -167,7 +167,7 @@ async fn update_contract_item(
     req.validate()?;
     Ok(Json(
         s.service
-            .update_contract_item(u.tenant_id, id, &req, &ctx)
+            .update_contract_item(u.tenant(), id, &req, &ctx)
             .await?,
     ))
 }
@@ -179,7 +179,7 @@ async fn delete_contract_item(
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_contract_item(u.tenant_id, id, &ctx).await
+    s.service.delete_contract_item(u.tenant(), id, &ctx).await
 }
 
 async fn get_hour_balance(
@@ -190,7 +190,7 @@ async fn get_hour_balance(
 ) -> AppResult<Json<PaginatedResponse<ContractHourBalanceResponse>>> {
     let (items, total) = s
         .service
-        .get_hour_balance(u.tenant_id, id, &pagination)
+        .get_hour_balance(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -204,7 +204,7 @@ async fn list_rate_cards(
     RequireContracts { user: u, .. }: RequireContracts,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RateCardResponse>>> {
-    let (items, total) = s.service.list_rate_cards(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_rate_cards(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -221,7 +221,7 @@ async fn create_rate_card(
 ) -> AppResult<Json<RateCardResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_rate_card(u.tenant_id, &req, &ctx).await?,
+        s.service.create_rate_card(u.tenant(), &req, &ctx).await?,
     ))
 }
 
@@ -234,7 +234,7 @@ async fn update_rate_card(
 ) -> AppResult<Json<RateCardResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_rate_card(u.tenant_id, id, &req).await?,
+        s.service.update_rate_card(u.tenant(), id, &req).await?,
     ))
 }
 
@@ -245,7 +245,7 @@ async fn delete_rate_card(
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_rate_card(u.tenant_id, id, &ctx).await
+    s.service.delete_rate_card(u.tenant(), id, &ctx).await
 }
 
 async fn list_rate_card_items(
@@ -256,7 +256,7 @@ async fn list_rate_card_items(
 ) -> AppResult<Json<PaginatedResponse<RateCardItemResponse>>> {
     let (items, total) = s
         .service
-        .list_rate_card_items(u.tenant_id, id, &pagination)
+        .list_rate_card_items(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -276,7 +276,7 @@ async fn upsert_rate_card_item(
     req.validate()?;
     Ok(Json(
         s.service
-            .upsert_rate_card_item(u.tenant_id, id, &req, &ctx)
+            .upsert_rate_card_item(u.tenant(), id, &req, &ctx)
             .await?,
     ))
 }
@@ -287,5 +287,5 @@ async fn delete_rate_card_item(
     _f: RequireFinance,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_rate_card_item(u.tenant_id, id).await
+    s.service.delete_rate_card_item(u.tenant(), id).await
 }

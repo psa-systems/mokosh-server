@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Datelike, Utc};
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::notifications::NotificationsService;
@@ -68,7 +69,7 @@ impl CalendarService {
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: Uuid, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(&self, tenant_id: TenantId, table: &'static str, id: Uuid) -> AppResult<()> {
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
@@ -87,7 +88,7 @@ impl CalendarService {
 
     async fn validate_fk_opt(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         table: &'static str,
         id: Option<Uuid>,
     ) -> AppResult<()> {
@@ -104,7 +105,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_appointments(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &AppointmentFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AppointmentResponse>, u64)> {
@@ -204,7 +205,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn appointments_in_range(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         assigned_to_id: Option<Uuid>,
@@ -378,7 +379,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_appointment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
         if request.end_time <= request.start_time {
@@ -436,7 +437,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_appointment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
     ) -> AppResult<AppointmentResponse> {
         let row = sqlx::query_as::<_, AppointmentRow>(
@@ -458,7 +459,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_appointment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
@@ -503,7 +504,7 @@ impl CalendarService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_appointment(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_appointment(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM appointments WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -523,7 +524,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_availability(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<UserAvailabilityResponse>, u64)> {
@@ -557,7 +558,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn replace_user_availability(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &ReplaceAvailabilityRequest,
         pagination: &PaginationParams,
@@ -601,7 +602,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_time_off(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TimeOffFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimeOffResponse>, u64)> {
@@ -663,7 +664,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_off(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateTimeOffRequest,
     ) -> AppResult<TimeOffResponse> {
         if request.end_date < request.start_date {
@@ -689,7 +690,7 @@ impl CalendarService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_time_off(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TimeOffResponse> {
+    pub async fn get_time_off(&self, tenant_id: TenantId, id: Uuid) -> AppResult<TimeOffResponse> {
         let row = sqlx::query_as::<_, TimeOffRow>(
             r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
                FROM time_off WHERE tenant_id = $1 AND id = $2"#,
@@ -701,7 +702,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn approve_time_off(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         approver_id: Uuid,
         status: &str,
@@ -729,7 +730,7 @@ impl CalendarService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_time_off(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_time_off(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM time_off WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -749,7 +750,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_on_call_schedules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<OnCallScheduleResponse>, u64)> {
         let total: i64 =
@@ -775,7 +776,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_on_call_schedule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertOnCallScheduleRequest,
     ) -> AppResult<OnCallScheduleResponse> {
         let id = Uuid::new_v4();
@@ -806,7 +807,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_on_call_schedule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertOnCallScheduleRequest,
     ) -> AppResult<OnCallScheduleResponse> {
@@ -840,7 +841,7 @@ impl CalendarService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_on_call_schedule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_on_call_schedule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM on_call_schedules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -858,7 +859,7 @@ impl CalendarService {
     /// daily / custom rotation math arrives in a follow-up. Returns
     /// one entry per active schedule.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn on_call_now(&self, tenant_id: Uuid) -> AppResult<Vec<OnCallNowResponse>> {
+    pub async fn on_call_now(&self, tenant_id: TenantId) -> AppResult<Vec<OnCallNowResponse>> {
         let rows = sqlx::query_as::<_, OnCallRow>(
             r#"SELECT id, name, team_id, rotation_type, rotation_config, is_active
                FROM on_call_schedules WHERE tenant_id = $1 AND is_active = TRUE"#,
@@ -930,7 +931,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch_view(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         assigned_to_id: Option<Uuid>,

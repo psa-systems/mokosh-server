@@ -3,6 +3,7 @@
 use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -25,7 +26,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contracts(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &ContractFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ContractResponse>, u64)> {
@@ -88,7 +89,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contract(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateContractRequest,
         ctx: &AuditCtx,
     ) -> AppResult<ContractResponse> {
@@ -131,7 +132,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "contracts",
@@ -145,7 +146,7 @@ impl ContractsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_contract(&self, tenant_id: Uuid, id: Uuid) -> AppResult<ContractResponse> {
+    pub async fn get_contract(&self, tenant_id: TenantId, id: Uuid) -> AppResult<ContractResponse> {
         let row = sqlx::query_as::<_, ContractRow>(
             r#"SELECT id, contract_number, name, company_id, contract_type, status,
                       start_date, end_date, auto_renew, billing_cycle, billing_amount,
@@ -163,7 +164,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contract(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateContractRequest,
         ctx: &AuditCtx,
@@ -224,7 +225,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "contracts",
@@ -240,7 +241,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contract(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -265,7 +266,7 @@ impl ContractsService {
         }
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "contracts",
@@ -282,7 +283,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contract_items(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ContractItemResponse>, u64)> {
@@ -314,7 +315,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contract_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
         request: &UpsertContractItemRequest,
         ctx: &AuditCtx,
@@ -348,7 +349,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "contract_items",
@@ -380,7 +381,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contract_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertContractItemRequest,
         ctx: &AuditCtx,
@@ -434,7 +435,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Update,
             "contract_items",
@@ -466,7 +467,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contract_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -491,7 +492,7 @@ impl ContractsService {
         }
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "contract_items",
@@ -508,7 +509,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_hour_balance(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ContractHourBalanceResponse>, u64)> {
@@ -540,7 +541,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rate_cards(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RateCardResponse>, u64)> {
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rate_cards WHERE tenant_id = $1")
@@ -565,7 +566,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rate_card(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertRateCardRequest,
         ctx: &AuditCtx,
     ) -> AppResult<RateCardResponse> {
@@ -600,7 +601,7 @@ impl ContractsService {
         .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Create,
             "rate_cards",
@@ -621,7 +622,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rate_card(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertRateCardRequest,
     ) -> AppResult<RateCardResponse> {
@@ -656,7 +657,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rate_card(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -681,7 +682,7 @@ impl ContractsService {
         }
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             AuditAction::Delete,
             "rate_cards",
@@ -698,7 +699,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rate_card_items(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         rate_card_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RateCardItemResponse>, u64)> {
@@ -733,7 +734,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_rate_card_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         rate_card_id: Uuid,
         request: &UpsertRateCardItemRequest,
         ctx: &AuditCtx,
@@ -799,7 +800,7 @@ impl ContractsService {
                 .await?;
         audit_write(
             &mut *tx,
-            tenant_id,
+            tenant_id.get(),
             ctx,
             action,
             "rate_card_items",
@@ -820,7 +821,7 @@ impl ContractsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_rate_card_item(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_rate_card_item(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query(
             r#"DELETE FROM rate_card_items rci USING rate_cards rc
                WHERE rci.rate_card_id = rc.id AND rc.tenant_id = $1 AND rci.id = $2"#,
@@ -860,7 +861,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contract_id = %contract_id))]
     pub async fn consume_hours(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
         hours: Decimal,
         when: DateTime<Utc>,
@@ -989,7 +990,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contract_id = %contract_id))]
     pub async fn roll_to_next_period(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
         closing_period_end: NaiveDate,
     ) -> AppResult<Decimal> {
@@ -1141,7 +1142,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, rate_card_id = %rate_card_id))]
     pub async fn resolve_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         rate_card_id: Uuid,
         work_type_id: Uuid,
         after_hours: bool,
@@ -1267,7 +1268,7 @@ impl ContractsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contract_id = %contract_id))]
     pub async fn list_recurring_items(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
     ) -> AppResult<Vec<ContractItemResponse>> {
         let rows = sqlx::query_as::<_, ContractItemRow>(
