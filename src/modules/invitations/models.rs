@@ -27,6 +27,14 @@ pub struct InvitationResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// Slim projection the login path consumes to place an invited user (PMS-244).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PendingInvite {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub role: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateInvitationRequest {
     #[validate(email)]

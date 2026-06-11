@@ -104,6 +104,38 @@ impl InvitationsService {
         Ok((rows, total as u64))
     }
 
+    /// The newest live (pending, unexpired) invite for `email`, across tenants.
+    /// The login path uses this to place an invited user (PMS-244). Most-recent
+    /// wins if an email has several pending invites.
+    pub async fn newest_pending_for(&self, email: &str) -> AppResult<Option<PendingInvite>> {
+        let email = email.trim().to_ascii_lowercase();
+        Ok(sqlx::query_as::<_, PendingInvite>(
+            r#"SELECT id, tenant_id, role
+               FROM tenant_invitations
+               WHERE lower(email) = $1 AND status = 'pending' AND expires_at > NOW()
+               ORDER BY created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(&email)
+        .fetch_optional(self.db.pool())
+        .await?)
+    }
+
+    /// Mark an invite accepted by `accepted_by`. Best-effort: a no-op if it is
+    /// no longer pending (it was revoked or accepted in a concurrent login).
+    pub async fn accept(&self, id: Uuid, accepted_by: Uuid) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE tenant_invitations
+             SET status = 'accepted', accepted_at = NOW(), accepted_by = $2, updated_at = NOW()
+             WHERE id = $1 AND status = 'pending'",
+        )
+        .bind(id)
+        .bind(accepted_by)
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
     /// Revoke a pending invite. 404 if it does not exist in this tenant or is
     /// no longer pending.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]

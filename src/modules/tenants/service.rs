@@ -125,40 +125,36 @@ impl TenantService {
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
     }
 
-    /// Resolve the mokosh tenant for a Bunyip org id, auto-provisioning one on
-    /// first sight (PMS-240). This is the seam that replaces the
-    /// "everyone lands in the default tenant" stopgap: a Bunyip-issued token
-    /// carries an opaque `bunyip_org_id`, and each distinct org maps to its own
-    /// tenant here.
+    /// Find-or-provision the `personal` tenant owned by `owner_id` (PMS-244).
+    /// A brand-new SSO user with no invite lands here: their own one-person org.
     ///
     /// Idempotent and race-safe: the partial unique index on
-    /// `tenants.bunyip_org_id` makes concurrent first-logins for the same org
-    /// converge on a single tenant (the loser of the `ON CONFLICT` race re-reads
-    /// the winner's row). A freshly provisioned tenant gets the same sequences +
-    /// default config (`copy_default_config`) a normally-created tenant does, so
-    /// tickets/SLA/notifications work out of the box - it just has no admin user
-    /// row, because the SSO user is JIT-mirrored separately.
-    #[tracing::instrument(skip_all, fields(bunyip_org_id = %org_id))]
-    pub async fn ensure_tenant_for_bunyip_org(&self, org_id: &str) -> AppResult<Uuid> {
-        if let Some(id) = self.tenant_id_for_bunyip_org(org_id).await? {
+    /// `tenants.personal_owner_id` makes concurrent first-logins converge on one
+    /// tenant (the `ON CONFLICT` loser re-reads the winner). The tenant gets the
+    /// same sequences + default config (`copy_default_config`) a normally
+    /// created tenant does, so it works out of the box; the owning user is
+    /// JIT-mirrored separately.
+    #[tracing::instrument(skip_all, fields(owner_id = %owner_id))]
+    pub async fn ensure_personal_tenant(&self, owner_id: Uuid) -> AppResult<Uuid> {
+        if let Some(id) = self.personal_tenant_for_owner(owner_id).await? {
             return Ok(id);
         }
 
         let tenant_id = Uuid::new_v4();
         // A uuid-derived slug guarantees uniqueness without a human display name
-        // (orgs are auto-provisioned; the operator can rename later).
-        let slug = slugify(&format!("org-{}", &tenant_id.simple().to_string()[..12]));
+        // (personal tenants are auto-provisioned; the owner can rename later).
+        let slug = slugify(&format!("personal-{}", &tenant_id.simple().to_string()[..12]));
 
         let inserted: Option<Uuid> = sqlx::query_scalar(
-            r#"INSERT INTO tenants (id, name, slug, kind, status, subscription_status, bunyip_org_id)
-               VALUES ($1, $2, $3, 'org', 'active', 'active', $4)
-               ON CONFLICT (bunyip_org_id) WHERE bunyip_org_id IS NOT NULL DO NOTHING
+            r#"INSERT INTO tenants (id, name, slug, kind, status, subscription_status, personal_owner_id)
+               VALUES ($1, $2, $3, 'personal', 'active', 'active', $4)
+               ON CONFLICT (personal_owner_id) WHERE personal_owner_id IS NOT NULL DO NOTHING
                RETURNING id"#,
         )
         .bind(tenant_id)
-        .bind(format!("Org {org_id}"))
+        .bind("My workspace")
         .bind(&slug)
-        .bind(org_id)
+        .bind(owner_id)
         .fetch_optional(self.db.pool())
         .await?;
 
@@ -175,21 +171,26 @@ impl TenantService {
                 .execute(self.db.pool())
                 .await?;
                 self.copy_default_config(id).await?;
-                tracing::info!(tenant_id = %id, bunyip_org_id = %org_id, "provisioned tenant for bunyip org");
+                tracing::info!(tenant_id = %id, owner_id = %owner_id, "provisioned personal tenant");
                 Ok(id)
             }
             // Lost the insert race: another request provisioned it concurrently.
-            None => self.tenant_id_for_bunyip_org(org_id).await?.ok_or_else(|| {
-                AppError::Internal("bunyip org tenant missing after insert conflict".to_string())
-            }),
+            None => self
+                .personal_tenant_for_owner(owner_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "personal tenant missing after insert conflict".to_string(),
+                    )
+                }),
         }
     }
 
-    /// The mokosh tenant id mapped to `org_id`, if one exists yet.
-    async fn tenant_id_for_bunyip_org(&self, org_id: &str) -> AppResult<Option<Uuid>> {
+    /// The `personal` tenant id owned by `owner_id`, if one exists yet.
+    async fn personal_tenant_for_owner(&self, owner_id: Uuid) -> AppResult<Option<Uuid>> {
         Ok(
-            sqlx::query_scalar("SELECT id FROM tenants WHERE bunyip_org_id = $1")
-                .bind(org_id)
+            sqlx::query_scalar("SELECT id FROM tenants WHERE personal_owner_id = $1")
+                .bind(owner_id)
                 .fetch_optional(self.db.pool())
                 .await?,
         )

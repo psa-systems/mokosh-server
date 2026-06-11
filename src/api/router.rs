@@ -143,12 +143,14 @@ pub fn create_api_router(
     }
     if let Some(v) = bunyip_verifier {
         auth_middleware = auth_middleware.with_bunyip(v);
-        // PMS-240: let the bunyip path resolve / provision a tenant per
-        // `bunyip_org_id` claim instead of funnelling everyone into the default
-        // tenant. Its own cheap pool-backed handle (tenant_service is moved into
-        // tenant_routes below).
-        auth_middleware =
-            auth_middleware.with_tenants(std::sync::Arc::new(TenantService::new(db.clone())));
+        // PMS-244: the bunyip path resolves the user's tenant from Mokosh's own
+        // membership - a pending invite, else existing placement, else a
+        // provisioned personal tenant. Its own cheap pool-backed tenant handle
+        // (the router's `tenant_service` is moved into `tenant_routes`); the
+        // invitations Arc is shared with `invitations_routes`.
+        auth_middleware = auth_middleware
+            .with_tenants(std::sync::Arc::new(TenantService::new(db.clone())))
+            .with_invitations(invitations_service.clone());
     }
 
     // Build API v1 routes

@@ -89,6 +89,45 @@ async fn rejects_non_invitable_role(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn newest_pending_lookup_then_accept(pool: PgPool) {
+    // The login path's building blocks (PMS-244 phase 2): resolve the newest
+    // live invite for an email, then mark it accepted so it stops resolving.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let s = svc(&pool);
+
+    let inv = s
+        .create(tenant, admin_id, &req("Joiner@Example.com", "manager"))
+        .await
+        .expect("invite");
+
+    let found = s
+        .newest_pending_for("joiner@example.com")
+        .await
+        .expect("lookup")
+        .expect("a pending invite");
+    assert_eq!(found.id, inv.id);
+    assert_eq!(found.tenant_id, common::DEFAULT_TENANT_ID);
+    assert_eq!(found.role, "manager");
+
+    s.accept(inv.id, admin_id).await.expect("accept");
+
+    assert!(
+        s.newest_pending_for("joiner@example.com")
+            .await
+            .expect("lookup after accept")
+            .is_none(),
+        "accepted invite no longer resolves"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM tenant_invitations WHERE id = $1")
+        .bind(inv.id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "accepted");
+}
+
+#[sqlx::test]
 async fn first_invite_promotes_personal_tenant_to_org(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
