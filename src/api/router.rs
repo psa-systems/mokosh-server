@@ -23,6 +23,7 @@ use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
+use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
@@ -118,6 +119,7 @@ pub fn create_api_router(
     let contracts_service = ContractsService::new(db.clone());
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());
+    let invitations_service = Arc::new(InvitationsService::new(db.clone()));
     let reports_service = ReportsService::new(db.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
@@ -226,6 +228,8 @@ pub fn create_api_router(
         .merge(assets_routes(assets_service))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // Org membership invitations (PMS-244): admin-only, tenant-scoped.
+        .merge(invitations_routes(invitations_service))
         // Notifications: channels + templates + prefs + inbox + rules
         // + dispatcher. PMS-86.
         .merge(notifications_routes(notifications_service))
