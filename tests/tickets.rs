@@ -262,6 +262,24 @@ async fn ticket_history_records_description_edit(pool: PgPool) {
         edit["timestamp"].as_str().is_some(),
         "history entry must carry a timestamp"
     );
+    // PMS-204: the entry must carry the before/after content of the change,
+    // not just the field name.
+    let desc_change = edit["changes"]
+        .as_array()
+        .expect("entry has a changes array")
+        .iter()
+        .find(|c| c["field"].as_str() == Some("description"))
+        .expect("changes must include the description field");
+    assert_eq!(
+        desc_change["old"].as_str(),
+        Some("Paper stuck in tray 2."),
+        "change must carry the old description"
+    );
+    assert_eq!(
+        desc_change["new"].as_str(),
+        Some("Paper stuck in tray 2 and toner low."),
+        "change must carry the new description"
+    );
 
     // Unknown entity type is rejected by the whitelist, not silently emptied.
     let bad = app

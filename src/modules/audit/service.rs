@@ -207,21 +207,29 @@ const HISTORY_NOISE_FIELDS: &[&str] = &[
     "last_updated_by_id",
 ];
 
-/// Names of object keys whose values differ between the before/after
-/// snapshots, with noise columns removed and the result sorted for a stable
+/// The before/after value of every column that differs between the two
+/// snapshots, noise columns removed and sorted by field name for a stable
 /// display order. An empty result (e.g. a create with no `old_values`) means
-/// the action label alone carries the information.
-fn changed_fields(old: &Option<serde_json::Value>, new: &Option<serde_json::Value>) -> Vec<String> {
+/// the action label alone carries the information. Shared by the history read
+/// path and the asset audit writer (PMS-204).
+pub fn field_changes(
+    old: &Option<serde_json::Value>,
+    new: &Option<serde_json::Value>,
+) -> Vec<FieldChange> {
     match (old, new) {
         (Some(serde_json::Value::Object(o)), Some(serde_json::Value::Object(n))) => {
-            let mut keys: Vec<String> = n
+            let mut changes: Vec<FieldChange> = n
                 .iter()
                 .filter(|(k, v)| o.get(k.as_str()) != Some(*v))
-                .map(|(k, _)| k.clone())
-                .filter(|k| !HISTORY_NOISE_FIELDS.contains(&k.as_str()))
+                .filter(|(k, _)| !HISTORY_NOISE_FIELDS.contains(&k.as_str()))
+                .map(|(k, v)| FieldChange {
+                    field: k.clone(),
+                    old: o.get(k).cloned(),
+                    new: Some(v.clone()),
+                })
                 .collect();
-            keys.sort();
-            keys
+            changes.sort_by(|a, b| a.field.cmp(&b.field));
+            changes
         }
         _ => Vec::new(),
     }
@@ -239,12 +247,14 @@ struct HistoryRow {
 
 impl From<HistoryRow> for EntityHistoryEntry {
     fn from(r: HistoryRow) -> Self {
-        let changed_fields = changed_fields(&r.old_values, &r.new_values);
+        let changes = field_changes(&r.old_values, &r.new_values);
+        let changed_fields = changes.iter().map(|c| c.field.clone()).collect();
         Self {
             id: r.id,
             action: r.action,
             user_id: r.user_id,
             changed_fields,
+            changes,
             timestamp: r.timestamp,
         }
     }
