@@ -28,10 +28,13 @@ pub struct AuthMiddleware {
     /// JWKS first; on success it JIT-mirrors the (sub, email) into the local
     /// users table. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
     pub bunyip: Option<Arc<BunyipVerifier>>,
-    /// Optional tenant service used by the bunyip path to resolve / provision
-    /// the tenant for a `bunyip_org_id` claim (PMS-240). When unset, the bunyip
-    /// path falls back to the single default tenant.
+    /// Optional tenant service used by the bunyip path to provision a user's
+    /// personal tenant on self-signup (PMS-244). When unset, the bunyip path
+    /// falls back to the single default tenant.
     pub tenants: Option<Arc<crate::modules::tenants::TenantService>>,
+    /// Optional invitations service: the bunyip path resolves a pending invite
+    /// for the user's email and places/re-homes them into that tenant (PMS-244).
+    pub invitations: Option<Arc<crate::modules::invitations::InvitationsService>>,
 }
 
 impl AuthMiddleware {
@@ -41,6 +44,7 @@ impl AuthMiddleware {
             at_jwt: None,
             bunyip: None,
             tenants: None,
+            invitations: None,
         }
     }
 
@@ -58,13 +62,20 @@ impl AuthMiddleware {
         self
     }
 
-    /// Wire the tenant service so the bunyip path can resolve / provision a
-    /// tenant per `bunyip_org_id` claim (PMS-240).
-    pub fn with_tenants(
-        mut self,
-        tenants: Arc<crate::modules::tenants::TenantService>,
-    ) -> Self {
+    /// Wire the tenant service so the bunyip path can provision a user's
+    /// personal tenant on self-signup (PMS-244).
+    pub fn with_tenants(mut self, tenants: Arc<crate::modules::tenants::TenantService>) -> Self {
         self.tenants = Some(tenants);
+        self
+    }
+
+    /// Wire the invitations service so the bunyip path resolves a pending invite
+    /// into a tenant placement on login (PMS-244).
+    pub fn with_invitations(
+        mut self,
+        invitations: Arc<crate::modules::invitations::InvitationsService>,
+    ) -> Self {
+        self.invitations = Some(invitations);
         self
     }
 }
@@ -89,6 +100,7 @@ pub async fn auth_middleware(
                         ensure_user_from_bunyip(
                             &auth_middleware.auth_service,
                             auth_middleware.tenants.as_ref(),
+                            auth_middleware.invitations.as_ref(),
                             v.as_ref(),
                             token,
                             &claims,
@@ -451,69 +463,88 @@ pub fn get_current_user(request: &Request) -> Option<CurrentUser> {
 async fn ensure_user_from_bunyip(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
     verifier: &BunyipVerifier,
     bearer: &str,
     claims: &super::oidc_rs::AtClaims,
 ) -> Option<AuthState> {
     let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
 
-    // PMS-240: resolve the tenant from the `bunyip_org_id` claim, provisioning a
-    // tenant for the org on first sight. When the claim is absent (older tokens)
-    // or the tenant service is not wired, fall back to the single default bunyip
-    // tenant - the pre-PMS-240 behaviour (PMS-4 AC6 / docs §3.3).
-    let tenant = match (claims.bunyip_org_id.as_deref(), tenants) {
-        (Some(org), Some(svc)) if !org.is_empty() => {
-            match svc.ensure_tenant_for_bunyip_org(org).await {
-                Ok(t) => t,
-                Err(e) => {
-                    // Can't resolve the org's tenant: drop the bunyip path
-                    // rather than silently landing the user in the wrong tenant.
-                    tracing::warn!(error = %e, %org, sub = %sub, "bunyip org tenant resolution failed");
-                    return None;
-                }
-            }
-        }
-        _ => default_bunyip_tenant_id(),
+    // PMS-244: orgs live in Mokosh (Bunyip is a personal-subscription IdP with
+    // no org concept), so the tenant is resolved from Mokosh's own membership
+    // state, NOT a token claim. Priority: a pending invite for the user's
+    // verified email wins; else their existing placement; else a brand-new user
+    // gets their own `personal` tenant (self-signup). Email comes from
+    // /oauth2/userinfo (the at+jwt carries no email claim).
+    let info = verifier.userinfo(bearer).await;
+    let email = info.as_ref().and_then(|i| i.email.clone());
+    let email_verified = info.as_ref().and_then(|i| i.email_verified).unwrap_or(false);
+
+    let current = auth_service.find_user_tenant(sub).await.ok().flatten();
+
+    // An invite to address X is consumed only by a Bunyip user with verified X.
+    let invite = match (invitations, email.as_deref()) {
+        (Some(invs), Some(em)) if email_verified => invs.newest_pending_for(em).await.ok().flatten(),
+        _ => None,
     };
 
-    // PMS-243 lazy backfill: a user mirrored into the shared default tenant
-    // before per-org tenants existed is re-homed to their resolved org tenant
-    // on this login. Scoped to the default tenant (so a correctly-placed user
-    // is never moved) and idempotent. Without this, an existing default-tenant
-    // user presenting an org claim would miss the org-tenant lookup below and
-    // the bunyip path would drop them. Co-mingled default-tenant data stays put
-    // for separate triage (PMS-243).
-    let default_tenant = default_bunyip_tenant_id();
-    if tenant != default_tenant {
-        match auth_service
-            .rehome_user_between_tenants(sub, default_tenant, tenant)
-            .await
-        {
-            Ok(true) => {
-                tracing::info!(sub = %sub, tenant_id = %tenant, "re-homed user from default tenant to org tenant")
+    let target = if let Some(inv) = invite.as_ref() {
+        inv.tenant_id
+    } else if let Some(t) = current {
+        t
+    } else {
+        // Brand-new user, no invite: provision their own personal tenant.
+        match tenants {
+            Some(svc) => match svc.ensure_personal_tenant(sub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, sub = %sub, "personal tenant provisioning failed");
+                    return None;
+                }
+            },
+            None => default_bunyip_tenant_id(),
+        }
+    };
+
+    // Re-home an already-placed user into the target tenant - invite acceptance,
+    // or the PMS-243 backfill out of the legacy default tenant. Idempotent (a
+    // no-op when they are already there); co-mingled data stays put (PMS-243).
+    if let Some(cur) = current {
+        if cur != target {
+            match auth_service.rehome_user_between_tenants(sub, cur, target).await {
+                Ok(true) => {
+                    tracing::info!(sub = %sub, tenant_id = %target, "re-homed user into tenant")
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, sub = %sub, "user re-home failed"),
             }
-            Ok(false) => {}
-            Err(e) => tracing::warn!(error = %e, sub = %sub, "user re-home to org tenant failed"),
         }
     }
 
-    // Resolve the local shadow row, JIT-creating it on first sight.
-    let mut user = match auth_service.get_user_by_id(tenant, sub).await {
+    // Resolve the local shadow row, JIT-creating it on first sight. A brand-new
+    // invited user is seeded with the invite's role.
+    let initial_role = invite
+        .as_ref()
+        .and_then(|i| UserRole::from_str(&i.role))
+        .unwrap_or_default();
+    let mut user = match auth_service.get_user_by_id(target, sub).await {
         Ok(user) => user,
         Err(_) => {
-            // JIT path: fetch email from /oauth2/userinfo and insert.
-            let info = verifier.userinfo(bearer).await;
-            let email = info
-                .as_ref()
-                .and_then(|i| i.email.clone())
+            let email_for_insert = email
+                .clone()
                 .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
             auth_service
-                .upsert_user_from_oidc(sub, tenant, &email, UserRole::default())
+                .upsert_user_from_oidc(sub, target, &email_for_insert, initial_role)
                 .await
                 .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
                 .ok()?
         }
     };
+
+    // Mark the invite accepted now the user is placed (best-effort).
+    if let (Some(invs), Some(inv)) = (invitations, invite.as_ref()) {
+        let _ = invs.accept(inv.id, sub).await;
+    }
 
     // PMS-172: Bunyip governs the top role. Translate the `bunyip_role` claim
     // into mokosh's taxonomy. The translated `effective` role is the

@@ -1394,6 +1394,19 @@ impl AuthService {
     /// to thread the boundary cannot leak rows across tenants.
     /// Cross-tenant lookups return `NotFound` so the response shape
     /// stays opaque to a probing client.
+    ///
+    /// The tenant a user currently lives in, by global user id (`sub`).
+    /// `None` if the user has no row yet (PMS-244: the bunyip path uses this to
+    /// decide between joining an invited tenant, staying put, or self-signup).
+    pub async fn find_user_tenant(&self, user_id: Uuid) -> AppResult<Option<Uuid>> {
+        Ok(
+            sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(self.db.pool())
+                .await?,
+        )
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_by_id(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<User> {
         let row = sqlx::query_as::<_, UserRow>(

@@ -1,0 +1,152 @@
+//! Integration tests for the `invitations` module (PMS-244).
+
+mod common;
+
+use sqlx::PgPool;
+
+use mokosh_server::modules::auth::TenantId;
+use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
+use mokosh_server::Database;
+use mokosh_server::utils::pagination::PaginationParams;
+
+fn svc(pool: &PgPool) -> InvitationsService {
+    InvitationsService::new(Database::from_pool(pool.clone()))
+}
+
+fn page() -> PaginationParams {
+    PaginationParams {
+        page: 1,
+        per_page: 25,
+        sort: None,
+        sort_dir: "desc".to_string(),
+    }
+}
+
+fn req(email: &str, role: &str) -> CreateInvitationRequest {
+    CreateInvitationRequest {
+        email: email.to_string(),
+        role: role.to_string(),
+    }
+}
+
+#[sqlx::test]
+async fn create_list_revoke_roundtrip(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let s = svc(&pool);
+
+    let inv = s
+        .create(tenant, admin_id, &req("Tech@Example.com", "technician"))
+        .await
+        .expect("create invite");
+    assert_eq!(inv.email, "tech@example.com", "email is lowercased");
+    assert_eq!(inv.role, "technician");
+    assert_eq!(inv.status, "pending");
+
+    let (items, total) = s.list_pending(tenant, &page()).await.expect("list");
+    assert_eq!(total, 1);
+    assert_eq!(items.len(), 1);
+
+    s.revoke(tenant, inv.id).await.expect("revoke");
+    let (_items, total) = s.list_pending(tenant, &page()).await.expect("list after revoke");
+    assert_eq!(total, 0, "revoked invite no longer pending");
+
+    // Revoking again 404s (no live invite).
+    assert!(s.revoke(tenant, inv.id).await.is_err());
+}
+
+#[sqlx::test]
+async fn reinvite_same_email_upserts(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let s = svc(&pool);
+
+    let first = s
+        .create(tenant, admin_id, &req("dup@example.com", "technician"))
+        .await
+        .expect("first");
+    let second = s
+        .create(tenant, admin_id, &req("dup@example.com", "manager"))
+        .await
+        .expect("re-invite");
+
+    assert_eq!(first.id, second.id, "same live invite, refreshed");
+    assert_eq!(second.role, "manager", "role updated on re-invite");
+
+    let (_items, total) = s.list_pending(tenant, &page()).await.expect("list");
+    assert_eq!(total, 1, "no duplicate pending invite");
+}
+
+#[sqlx::test]
+async fn rejects_non_invitable_role(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let err = svc(&pool)
+        .create(tenant, admin_id, &req("x@example.com", "super_admin"))
+        .await;
+    assert!(err.is_err(), "super_admin is not invitable");
+}
+
+#[sqlx::test]
+async fn newest_pending_lookup_then_accept(pool: PgPool) {
+    // The login path's building blocks (PMS-244 phase 2): resolve the newest
+    // live invite for an email, then mark it accepted so it stops resolving.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let s = svc(&pool);
+
+    let inv = s
+        .create(tenant, admin_id, &req("Joiner@Example.com", "manager"))
+        .await
+        .expect("invite");
+
+    let found = s
+        .newest_pending_for("joiner@example.com")
+        .await
+        .expect("lookup")
+        .expect("a pending invite");
+    assert_eq!(found.id, inv.id);
+    assert_eq!(found.tenant_id, common::DEFAULT_TENANT_ID);
+    assert_eq!(found.role, "manager");
+
+    s.accept(inv.id, admin_id).await.expect("accept");
+
+    assert!(
+        s.newest_pending_for("joiner@example.com")
+            .await
+            .expect("lookup after accept")
+            .is_none(),
+        "accepted invite no longer resolves"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM tenant_invitations WHERE id = $1")
+        .bind(inv.id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "accepted");
+}
+
+#[sqlx::test]
+async fn first_invite_promotes_personal_tenant_to_org(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    sqlx::query("UPDATE tenants SET kind = 'personal' WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(&pool)
+        .await
+        .expect("make tenant personal");
+
+    svc(&pool)
+        .create(tenant, admin_id, &req("colleague@example.com", "technician"))
+        .await
+        .expect("invite");
+
+    let kind: String = sqlx::query_scalar("SELECT kind FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("read kind");
+    assert_eq!(kind, "org", "inviting promotes a personal tenant to org");
+}

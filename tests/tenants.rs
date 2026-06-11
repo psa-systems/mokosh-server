@@ -32,9 +32,9 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
 
     let tenants = TenantService::new(Database::from_pool(pool.clone()));
     let org_tenant = tenants
-        .ensure_tenant_for_bunyip_org("bunyip-org-rehome")
+        .ensure_personal_tenant(uuid::Uuid::new_v4())
         .await
-        .expect("provision org tenant");
+        .expect("provision target tenant");
 
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into(), vec![]);
 
@@ -56,13 +56,15 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn ensure_tenant_for_bunyip_org_provisions_then_is_idempotent(pool: PgPool) {
-    // PMS-240: first login for an org provisions a dedicated tenant; subsequent
-    // logins resolve the same one (no duplicate, no funnel into the default).
+async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
+    // PMS-244: a brand-new SSO user with no invite gets their own personal
+    // tenant; subsequent logins resolve the same one (no duplicate).
     let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let owner_a = uuid::Uuid::new_v4();
+    let owner_b = uuid::Uuid::new_v4();
 
     let first = svc
-        .ensure_tenant_for_bunyip_org("bunyip-org-abc")
+        .ensure_personal_tenant(owner_a)
         .await
         .expect("provision tenant");
 
@@ -70,12 +72,19 @@ async fn ensure_tenant_for_bunyip_org_provisions_then_is_idempotent(pool: PgPool
     assert_ne!(first, common::DEFAULT_TENANT_ID);
 
     let mapped: Option<uuid::Uuid> =
-        sqlx::query_scalar("SELECT id FROM tenants WHERE bunyip_org_id = $1")
-            .bind("bunyip-org-abc")
+        sqlx::query_scalar("SELECT id FROM tenants WHERE personal_owner_id = $1")
+            .bind(owner_a)
             .fetch_optional(&pool)
             .await
             .expect("read mapping");
-    assert_eq!(mapped, Some(first), "org id maps to the provisioned tenant");
+    assert_eq!(mapped, Some(first), "owner maps to the provisioned tenant");
+
+    let kind: String = sqlx::query_scalar("SELECT kind FROM tenants WHERE id = $1")
+        .bind(first)
+        .fetch_one(&pool)
+        .await
+        .expect("read kind");
+    assert_eq!(kind, "personal");
 
     // Default config copied so the tenant works out of the box (statuses are a
     // representative slice of `copy_default_config`).
@@ -87,24 +96,24 @@ async fn ensure_tenant_for_bunyip_org_provisions_then_is_idempotent(pool: PgPool
             .expect("count statuses");
     assert!(status_count > 0, "default ticket statuses copied");
 
-    // Second call resolves the same tenant; a different org gets a different one.
+    // Second call resolves the same tenant; a different owner gets a different one.
     let again = svc
-        .ensure_tenant_for_bunyip_org("bunyip-org-abc")
+        .ensure_personal_tenant(owner_a)
         .await
         .expect("resolve tenant");
-    assert_eq!(again, first, "idempotent for the same org");
+    assert_eq!(again, first, "idempotent for the same owner");
 
     let other = svc
-        .ensure_tenant_for_bunyip_org("bunyip-org-xyz")
+        .ensure_personal_tenant(owner_b)
         .await
-        .expect("provision second org");
-    assert_ne!(other, first, "distinct org gets a distinct tenant");
+        .expect("provision second owner");
+    assert_ne!(other, first, "distinct owner gets a distinct tenant");
 
     let tenant_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
         .fetch_one(&pool)
         .await
         .expect("count tenants");
-    // default + two provisioned orgs.
+    // default + two provisioned personal tenants.
     assert_eq!(tenant_total, 3, "no duplicate tenants provisioned");
 }
 

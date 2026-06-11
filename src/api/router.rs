@@ -23,6 +23,7 @@ use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
+use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
@@ -118,6 +119,7 @@ pub fn create_api_router(
     let contracts_service = ContractsService::new(db.clone());
     let assets_service = AssetsService::new(db.clone());
     let kb_service = KbService::new(db.clone());
+    let invitations_service = Arc::new(InvitationsService::new(db.clone()));
     let reports_service = ReportsService::new(db.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
@@ -141,12 +143,14 @@ pub fn create_api_router(
     }
     if let Some(v) = bunyip_verifier {
         auth_middleware = auth_middleware.with_bunyip(v);
-        // PMS-240: let the bunyip path resolve / provision a tenant per
-        // `bunyip_org_id` claim instead of funnelling everyone into the default
-        // tenant. Its own cheap pool-backed handle (tenant_service is moved into
-        // tenant_routes below).
-        auth_middleware =
-            auth_middleware.with_tenants(std::sync::Arc::new(TenantService::new(db.clone())));
+        // PMS-244: the bunyip path resolves the user's tenant from Mokosh's own
+        // membership - a pending invite, else existing placement, else a
+        // provisioned personal tenant. Its own cheap pool-backed tenant handle
+        // (the router's `tenant_service` is moved into `tenant_routes`); the
+        // invitations Arc is shared with `invitations_routes`.
+        auth_middleware = auth_middleware
+            .with_tenants(std::sync::Arc::new(TenantService::new(db.clone())))
+            .with_invitations(invitations_service.clone());
     }
 
     // Build API v1 routes
@@ -226,6 +230,8 @@ pub fn create_api_router(
         .merge(assets_routes(assets_service))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // Org membership invitations (PMS-244): admin-only, tenant-scoped.
+        .merge(invitations_routes(invitations_service))
         // Notifications: channels + templates + prefs + inbox + rules
         // + dispatcher. PMS-86.
         .merge(notifications_routes(notifications_service))
