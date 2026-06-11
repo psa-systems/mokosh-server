@@ -69,6 +69,12 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
+      - name: Doc tests
+        # Runs the doctests, including the PMS-139 `compile_fail` guard that
+        # pins "a raw Uuid cannot be passed where a TenantId is required".
+        # `--lib` above does not execute doctests.
+        run: cargo test --doc
+
       - name: Integration tests
         # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
         # Each test creates a per-test database AND holds the sqlx-test

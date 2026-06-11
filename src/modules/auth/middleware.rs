@@ -195,7 +195,7 @@ where
 /// take an additional path / query parameter and gate it on role.
 #[derive(Clone, Debug)]
 pub struct TenantScope {
-    pub tenant_id: uuid::Uuid,
+    pub tenant_id: super::tenant::TenantId,
     pub user: CurrentUser,
 }
 
@@ -217,7 +217,7 @@ where
 
         match auth_state.user {
             Some(user) => Ok(TenantScope {
-                tenant_id: user.tenant_id,
+                tenant_id: super::tenant::TenantScoped::tenant(&user),
                 user,
             }),
             None => Err(AppError::Unauthorized),

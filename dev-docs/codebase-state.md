@@ -324,10 +324,19 @@ the infrastructure or shared-helper layer.
 7. **`utils/pagination.rs` exists but is bypassed.** `auth::list_users`
    constructs a `PaginatedResponse` of `vec![]`; `tenants` and
    `contacts` build inline pagination SQL.
-8. **Multi-tenancy enforced ad-hoc.** Every service method takes a
-   `tenant_id: Uuid`. No middleware-level tenant scoping. A future
-   handler that forgets to pass `user.tenant_id` becomes a
-   cross-tenant data leak.
+8. **Multi-tenancy: typed scoping rollout in progress (PMS-139).** The
+   foundation has landed: a `TenantId` newtype
+   ([`auth/tenant.rs`](../src/modules/auth/tenant.rs)) whose only in-crate
+   constructor is `pub(crate)` and is reached solely via
+   `CurrentUser::tenant()` (the `TenantScoped` trait), so a `TenantId` always
+   traces back to an authenticated claim. Service methods that take
+   `tenant_id: TenantId` can no longer be called with a bare `Uuid` (pinned by
+   a `compile_fail` doctest on `TenantId`). The **`reports`** module is fully
+   migrated as the reference pattern (handlers use `u.tenant()`, service +
+   `custom::run` take `TenantId`). **Remaining:** sweep the other ~17 modules'
+   `routes.rs` + `service.rs` the same way (tracked as PMS-139 follow-ups); the
+   `from_trusted` escape hatch is the named seam for super-admin cross-tenant
+   ops and tests. Until the sweep completes this item stays open.
 9. **`validator::Validate` coverage is uneven.** `Create*Request`
    and `Update*Request` types are validated. `*Filter` query types
    (`TicketFilter`, `CompanyFilter`, `ContactFilter`) are not.

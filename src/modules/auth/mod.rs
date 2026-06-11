@@ -21,6 +21,7 @@ pub mod rate_limit;
 #[cfg(feature = "server")]
 mod routes;
 mod service;
+pub mod tenant;
 
 #[cfg(feature = "server")]
 pub use middleware::{
@@ -34,3 +35,4 @@ pub use models::*;
 pub use routes::auth_routes;
 #[cfg(feature = "server")]
 pub use service::AuthService;
+pub use tenant::{TenantId, TenantScoped};
