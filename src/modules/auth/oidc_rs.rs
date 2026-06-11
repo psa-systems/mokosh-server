@@ -54,6 +54,14 @@ pub struct AtClaims {
 pub struct UserInfo {
     pub sub: String,
     pub email: Option<String>,
+    /// Whether bunyip has verified this email. The PMS-244 invite flow consumes
+    /// a pending invite only when this is `true`, so the field is load-bearing.
+    /// Verified (PMS-248): bunyip-api's `/oauth2/userinfo` handler emits
+    /// `email_verified` from the `users.email_verified` column (set `TRUE` on
+    /// email verification); see `bunyip/crates/bunyip-oidc/src/handlers/oidc.rs`.
+    /// `Option` so a response that ever omits it deserializes to `None` (treated
+    /// as unverified) instead of failing; `userinfo_email_verified_contract`
+    /// below pins the expected shape.
     pub email_verified: Option<bool>,
 }
 
@@ -407,6 +415,46 @@ mod tests {
         let pem = ed25519_spki_pem_from_x(&x_b64).unwrap();
         assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----"));
         assert!(pem.trim_end().ends_with("-----END PUBLIC KEY-----"));
+    }
+
+    /// PMS-248: pin the consuming side of the bunyip `/oauth2/userinfo`
+    /// contract. The PMS-244 invite flow gates on `email_verified`, so a real
+    /// verified login must deserialize to `Some(true)`. The exact JSON mirrors
+    /// bunyip-api's userinfo handler.
+    #[test]
+    fn userinfo_email_verified_contract() {
+        let body = serde_json::json!({
+            "sub": "11111111-1111-1111-1111-111111111111",
+            "email": "user@example.com",
+            "email_verified": true,
+            "membership_status": "active",
+            "has_member_access": true,
+        });
+        let info: UserInfo = serde_json::from_value(body).expect("deserialize userinfo");
+        assert_eq!(info.email.as_deref(), Some("user@example.com"));
+        assert_eq!(
+            info.email_verified,
+            Some(true),
+            "a verified bunyip login must carry email_verified=true to the invite gate"
+        );
+
+        // An unverified account: the invite gate must NOT fire.
+        let unverified: UserInfo = serde_json::from_value(serde_json::json!({
+            "sub": "22222222-2222-2222-2222-222222222222",
+            "email": "u2@example.com",
+            "email_verified": false,
+        }))
+        .expect("deserialize unverified userinfo");
+        assert_eq!(unverified.email_verified, Some(false));
+
+        // A response that omits the field deserializes to None (unverified),
+        // never a parse error - so the gate fails closed, not the request.
+        let missing: UserInfo = serde_json::from_value(serde_json::json!({
+            "sub": "33333333-3333-3333-3333-333333333333",
+            "email": "u3@example.com",
+        }))
+        .expect("deserialize userinfo without email_verified");
+        assert_eq!(missing.email_verified, None);
     }
 
     #[test]
