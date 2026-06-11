@@ -1,6 +1,7 @@
 //! Settings service.
 
 use uuid::Uuid;
+use crate::modules::auth::TenantId;
 
 use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
@@ -22,7 +23,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tenant_settings(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TenantSettingResponse>, u64)> {
         let total: i64 =
@@ -48,7 +49,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_tenant_setting(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertTenantSettingRequest,
     ) -> AppResult<TenantSettingResponse> {
         let id: Uuid = sqlx::query_scalar(
@@ -81,7 +82,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_settings_by_category(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
     ) -> AppResult<Vec<TenantSettingResponse>> {
         let rows = sqlx::query_as::<_, SettingRow>(
@@ -99,7 +100,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_setting(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
         key: &str,
     ) -> AppResult<TenantSettingResponse> {
@@ -121,7 +122,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn put_setting(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
         key: &str,
         value: serde_json::Value,
@@ -150,7 +151,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_setting_by_key(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
         key: &str,
     ) -> AppResult<()> {
@@ -177,7 +178,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_module_configs(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ModuleConfigResponse>, u64)> {
         let total: i64 =
@@ -208,7 +209,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_module_config(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         module: &str,
     ) -> AppResult<ModuleConfigResponse> {
         let row = sqlx::query_as::<_, ModCfgRow>(
@@ -227,7 +228,7 @@ impl SettingsService {
     /// Read just the `is_enabled` flag, fast path used by
     /// `RequireModuleEnabled` (PMS-113 AC3). Missing row -> `false`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn is_module_enabled(&self, tenant_id: Uuid, module: &str) -> AppResult<bool> {
+    pub async fn is_module_enabled(&self, tenant_id: TenantId, module: &str) -> AppResult<bool> {
         let enabled: Option<bool> = sqlx::query_scalar(
             r#"SELECT COALESCE(is_enabled, FALSE) FROM module_config
                WHERE tenant_id = $1 AND module_name = $2"#,
@@ -242,7 +243,7 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_module_config(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         module: &str,
         request: &UpsertModuleConfigRequest,
     ) -> AppResult<ModuleConfigResponse> {

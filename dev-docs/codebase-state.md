@@ -334,17 +334,26 @@ the infrastructure or shared-helper layer.
    a `compile_fail` doctest on `TenantId`). **Migrated so far:** `reports` (the
    reference pattern - handlers use `u.tenant()`, service + `custom::run` take
    `TenantId`), `rmm`, `time_tracking`, `assets`, `projects`, `calendar`, `sla`,
-   and `contracts`. The RMM ingest webhook is
-   unauthenticated (machine HMAC), so it uses the `from_trusted` escape hatch
-   with a `// SAFETY:` comment. Where a migrated module calls a not-yet-swept
-   hub (`audit_write`, `notifications::dispatch`, `TicketService`) it unwraps
-   with `tenant_id.get()` transitionally; those hubs migrate last. Cross-tenant
-   workers (calendar reminder, sla sweep, contract lifecycle) read tenant ids
-   straight off DB-projected rows as `Uuid` and dispatch through the hubs, so
-   they are untouched by the sweep.
-   **Remaining:** sweep the other ~9 modules' `routes.rs` + `service.rs` the
-   same way (PMS-139 follow-ups). Until the sweep completes this item stays
-   open.
+   `contracts`, `knowledge_base`, `tenants`, and `settings`. The RMM ingest
+   webhook is unauthenticated (machine HMAC), so it uses the `from_trusted`
+   escape hatch with a `// SAFETY:` comment; the `tenants` super-admin handlers
+   address an arbitrary path tenant (not the caller's claim) so they
+   `from_trusted` the path id after the role guard, and the portal KB feed
+   bridges its verified contact-JWT tenant the same way (portal runs on contact
+   sessions, not `CurrentUser`, so it gets its own scoping pass later). The
+   `settings` module-enablement gate in `auth/middleware.rs` now derives the
+   tenant via `TenantScoped::tenant(&user)`. Where a migrated module calls a
+   not-yet-swept hub (`audit_write`, `notifications::dispatch`, `TicketService`)
+   it unwraps with `tenant_id.get()` transitionally; those hubs migrate last.
+   Cross-tenant workers (calendar reminder, sla sweep, contract lifecycle) read
+   tenant ids straight off DB-projected rows as `Uuid` and dispatch through the
+   hubs, so they are untouched by the sweep. The `tenants::copy_default_config`
+   seed helper keeps its `Uuid` (it copies from a hardcoded default tenant into
+   a freshly minted one - neither is a claim).
+   **Remaining:** sweep the remaining ~6 modules' `routes.rs` + `service.rs` the
+   same way (PMS-139 follow-ups), ending with the `audit_write` /
+   `notifications::dispatch` / `TicketService` hubs. Until the sweep completes
+   this item stays open.
 9. **`validator::Validate` coverage is uneven.** `Create*Request`
    and `Update*Request` types are validated. `*Filter` query types
    (`TicketFilter`, `CompanyFilter`, `ContactFilter`) are not.

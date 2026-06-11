@@ -136,9 +136,18 @@ async fn list_kb(
     // `company_ids`. The company scope comes from the authenticated
     // contact's JWT claim (`CurrentContact.company_id`), populated by
     // `portal_auth_middleware`, so a client cannot widen it.
+    // SAFETY (PMS-139): `contact.tenant_id` is a verified claim from the
+    // portal JWT (`RequirePortalAuth`), not user input. Portal runs on
+    // contact sessions rather than `CurrentUser`, so it cannot use the
+    // `TenantScoped` extractor; `from_trusted` is the sanctioned bridge
+    // until the portal surface gets its own scoping pass.
     let (items, total) = state
         .kb
-        .list_portal_articles_for_company(contact.tenant_id, contact.company_id, &pagination)
+        .list_portal_articles_for_company(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.company_id,
+            &pagination,
+        )
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,

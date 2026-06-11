@@ -958,7 +958,7 @@ async fn portal_feed_company_scoping(pool: PgPool) {
         sort_dir: "desc".to_string(),
     };
     let (items, total) = kb
-        .list_portal_articles_for_company(tenant_id, company_a, &pagination)
+        .list_portal_articles_for_company(mokosh_server::modules::auth::TenantId::from_trusted(tenant_id), company_a, &pagination)
         .await
         .expect("portal feed query");
 
