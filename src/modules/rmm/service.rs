@@ -5,6 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::TenantId;
 use crate::modules::notifications::render_template;
 use crate::modules::tickets::{CreateTicketRequest, TicketService, TicketSource};
 use crate::utils::error::{AppError, AppResult};
@@ -66,7 +67,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_connections(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RmmConnectionResponse>, u64)> {
         let total: i64 =
@@ -93,7 +94,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_connection(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateRmmConnectionRequest,
     ) -> AppResult<RmmConnectionResponse> {
         let key_enc = crate::utils::crypto::encrypt(&request.api_key, &self.encryption_key)?;
@@ -138,7 +139,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_connection(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
     ) -> AppResult<RmmConnectionResponse> {
         let row: Option<ConnRow> = sqlx::query_as(
@@ -163,7 +164,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_connection(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateRmmConnectionRequest,
     ) -> AppResult<RmmConnectionResponse> {
@@ -204,7 +205,7 @@ impl RmmService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_connection(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_connection(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM rmm_connections WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -221,7 +222,11 @@ impl RmmService {
     /// v1 just decrypts the credentials and HEADs the api_url to confirm
     /// reachability; per-provider auth check is the next commit.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn test_connection(&self, tenant_id: Uuid, id: Uuid) -> AppResult<serde_json::Value> {
+    pub async fn test_connection(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<serde_json::Value> {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT api_url, api_key_encrypted FROM rmm_connections WHERE tenant_id = $1 AND id = $2",
         ).bind(tenant_id).bind(id).fetch_optional(self.db.pool()).await?;
@@ -264,7 +269,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_device_mappings(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         connection_id: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RmmDeviceMappingResponse>, u64)> {
@@ -318,7 +323,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_device_mapping(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateRmmDeviceMappingRequest,
     ) -> AppResult<RmmDeviceMappingResponse> {
         let id = Uuid::new_v4();
@@ -349,7 +354,7 @@ impl RmmService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_device_mapping(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_device_mapping(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM rmm_device_mappings WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -366,7 +371,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_alert_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         connection_id: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RmmAlertRuleResponse>, u64)> {
@@ -420,7 +425,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_alert_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertRmmAlertRuleRequest,
     ) -> AppResult<RmmAlertRuleResponse> {
         let id = Uuid::new_v4();
@@ -455,7 +460,7 @@ impl RmmService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_alert_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_alert_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let n = sqlx::query("DELETE FROM rmm_alert_rules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -485,7 +490,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn ingest_alert(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &IngestAlertRequest,
     ) -> AppResult<u64> {
         let rules: Vec<AlertRuleRow> = sqlx::query_as(
@@ -605,11 +610,13 @@ impl RmmService {
                     };
                     // RMM ingest is a background path (no AuditCtx extractor);
                     // attribute the auto-created ticket to the system actor.
+                    // PMS-139: tickets/audit not yet on TenantId; unwrap at the
+                    // boundary until those modules are swept.
                     svc.create_ticket(
-                        tenant_id,
+                        tenant_id.get(),
                         default_creator,
                         &req,
-                        &crate::modules::audit::AuditCtx::system(tenant_id),
+                        &crate::modules::audit::AuditCtx::system(tenant_id.get()),
                     )
                     .await?;
                 }
@@ -630,7 +637,7 @@ impl RmmService {
     /// path; new call sites should not extend this.
     async fn legacy_insert_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         rule: &AlertRuleRow,
         company_id: Uuid,
         title: &str,
@@ -696,7 +703,7 @@ impl RmmService {
         Ok(())
     }
 
-    async fn default_creator(&self, tenant_id: Uuid) -> AppResult<Option<Uuid>> {
+    async fn default_creator(&self, tenant_id: TenantId) -> AppResult<Option<Uuid>> {
         Ok(sqlx::query_scalar(
             r#"SELECT id FROM users WHERE tenant_id = $1 AND status = 'active'
                  AND role IN ('super_admin', 'admin', 'manager')
@@ -713,7 +720,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn connection_api_secret(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         connection_id: Uuid,
     ) -> AppResult<Option<String>> {
         let row: Option<Option<String>> = sqlx::query_scalar(
