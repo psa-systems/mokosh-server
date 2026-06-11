@@ -224,6 +224,42 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
         "submitted week has the stopped entry"
     );
 
+    // PMS-183 WITHDRAW: the owner can pull a submitted (not-yet-approved)
+    // timesheet back to draft, then resubmit.
+    let withdraw: serde_json::Value = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/timesheets/{tech_id}/{entry_date}/withdraw"
+        )))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("withdraw timesheet")
+        .json()
+        .await
+        .expect("withdraw JSON");
+    assert_eq!(
+        withdraw["approval_status"].as_str(),
+        Some("draft"),
+        "a withdrawn week returns to draft (unsubmitted)"
+    );
+    // Resubmit so the rest of the flow (approve) proceeds.
+    let resubmit: serde_json::Value = app
+        .client
+        .post(app.url(&format!("/api/v1/timesheets/{tech_id}/{entry_date}/submit")))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("resubmit timesheet")
+        .json()
+        .await
+        .expect("resubmit JSON");
+    assert_eq!(
+        resubmit["approval_status"].as_str(),
+        Some("pending"),
+        "resubmitting a draft week returns it to pending"
+    );
+
     // GUARD: a technician cannot approve a timesheet (manager+ only).
     let tech_approve = app
         .client
@@ -276,5 +312,21 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
         after["billing_status"].as_str(),
         Some("ready_to_bill"),
         "approving a billable entry must flip billing_status to ready_to_bill"
+    );
+
+    // PMS-183 GUARD: an approved timesheet can no longer be withdrawn.
+    let withdraw_approved = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/timesheets/{tech_id}/{entry_date}/withdraw"
+        )))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("withdraw-after-approve attempt");
+    assert_eq!(
+        withdraw_approved.status(),
+        reqwest::StatusCode::CONFLICT,
+        "withdrawing an approved timesheet must be rejected"
     );
 }
