@@ -141,6 +141,12 @@ pub fn create_api_router(
     }
     if let Some(v) = bunyip_verifier {
         auth_middleware = auth_middleware.with_bunyip(v);
+        // PMS-240: let the bunyip path resolve / provision a tenant per
+        // `bunyip_org_id` claim instead of funnelling everyone into the default
+        // tenant. Its own cheap pool-backed handle (tenant_service is moved into
+        // tenant_routes below).
+        auth_middleware =
+            auth_middleware.with_tenants(std::sync::Arc::new(TenantService::new(db.clone())));
     }
 
     // Build API v1 routes

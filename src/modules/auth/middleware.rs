@@ -28,6 +28,10 @@ pub struct AuthMiddleware {
     /// JWKS first; on success it JIT-mirrors the (sub, email) into the local
     /// users table. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
     pub bunyip: Option<Arc<BunyipVerifier>>,
+    /// Optional tenant service used by the bunyip path to resolve / provision
+    /// the tenant for a `bunyip_org_id` claim (PMS-240). When unset, the bunyip
+    /// path falls back to the single default tenant.
+    pub tenants: Option<Arc<crate::modules::tenants::TenantService>>,
 }
 
 impl AuthMiddleware {
@@ -36,6 +40,7 @@ impl AuthMiddleware {
             auth_service: Arc::new(auth_service),
             at_jwt: None,
             bunyip: None,
+            tenants: None,
         }
     }
 
@@ -50,6 +55,16 @@ impl AuthMiddleware {
     /// once `OIDC_ISSUER` + `OIDC_AUDIENCE` are set; see `oidc_rs::VerifierConfig`.
     pub fn with_bunyip(mut self, verifier: BunyipVerifier) -> Self {
         self.bunyip = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Wire the tenant service so the bunyip path can resolve / provision a
+    /// tenant per `bunyip_org_id` claim (PMS-240).
+    pub fn with_tenants(
+        mut self,
+        tenants: Arc<crate::modules::tenants::TenantService>,
+    ) -> Self {
+        self.tenants = Some(tenants);
         self
     }
 }
@@ -73,6 +88,7 @@ pub async fn auth_middleware(
                     Ok(claims) => {
                         ensure_user_from_bunyip(
                             &auth_middleware.auth_service,
+                            auth_middleware.tenants.as_ref(),
                             v.as_ref(),
                             token,
                             &claims,
@@ -434,18 +450,34 @@ pub fn get_current_user(request: &Request) -> Option<CurrentUser> {
 /// The caller treats `None` as "drop the bunyip path" and falls back to legacy.
 async fn ensure_user_from_bunyip(
     auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
     verifier: &BunyipVerifier,
     bearer: &str,
     claims: &super::oidc_rs::AtClaims,
 ) -> Option<AuthState> {
     let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
 
-    // Resolve the local shadow row, JIT-creating it on first sight. The
-    // bunyip-issued at+jwt does not (yet) carry a tenant claim, so we use the
-    // default bunyip tenant. If multi-tenant claim plumbing lands we revisit
-    // this. PMS-4 AC6 + docs §3.3.
-    let default_tenant = default_bunyip_tenant_id();
-    let mut user = match auth_service.get_user_by_id(default_tenant, sub).await {
+    // PMS-240: resolve the tenant from the `bunyip_org_id` claim, provisioning a
+    // tenant for the org on first sight. When the claim is absent (older tokens)
+    // or the tenant service is not wired, fall back to the single default bunyip
+    // tenant - the pre-PMS-240 behaviour (PMS-4 AC6 / docs §3.3).
+    let tenant = match (claims.bunyip_org_id.as_deref(), tenants) {
+        (Some(org), Some(svc)) if !org.is_empty() => {
+            match svc.ensure_tenant_for_bunyip_org(org).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // Can't resolve the org's tenant: drop the bunyip path
+                    // rather than silently landing the user in the wrong tenant.
+                    tracing::warn!(error = %e, %org, sub = %sub, "bunyip org tenant resolution failed");
+                    return None;
+                }
+            }
+        }
+        _ => default_bunyip_tenant_id(),
+    };
+
+    // Resolve the local shadow row, JIT-creating it on first sight.
+    let mut user = match auth_service.get_user_by_id(tenant, sub).await {
         Ok(user) => user,
         Err(_) => {
             // JIT path: fetch email from /oauth2/userinfo and insert.
@@ -455,7 +487,7 @@ async fn ensure_user_from_bunyip(
                 .and_then(|i| i.email.clone())
                 .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
             auth_service
-                .upsert_user_from_oidc(sub, default_tenant, &email, UserRole::default())
+                .upsert_user_from_oidc(sub, tenant, &email, UserRole::default())
                 .await
                 .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
                 .ok()?
