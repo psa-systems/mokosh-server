@@ -77,7 +77,7 @@ impl AutomationEngine {
     /// Process automation rules for a trigger type
     pub async fn process_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         trigger: AutomationTrigger,
     ) -> AppResult<()> {
@@ -99,7 +99,7 @@ impl AutomationEngine {
     /// Get active automation rules for a trigger type
     async fn get_active_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         trigger: AutomationTrigger,
     ) -> AppResult<Vec<AutomationRule>> {
         let rows = sqlx::query_as::<_, AutomationRuleRow>(
@@ -123,7 +123,7 @@ impl AutomationEngine {
     /// Evaluate if rule conditions match the ticket
     async fn evaluate_conditions(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         rule: &AutomationRule,
     ) -> AppResult<bool> {
@@ -197,7 +197,7 @@ impl AutomationEngine {
     /// Execute automation rule actions
     async fn execute_actions(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         rule: &AutomationRule,
     ) -> AppResult<()> {
@@ -309,7 +309,7 @@ impl AutomationEngine {
                                     "ticket_id": ticket_id.to_string(),
                                 });
                                 if let Err(e) = notify
-                                    .dispatch(TenantId::from_trusted(tenant_id), "ticket.automation.notify", &context)
+                                    .dispatch(tenant_id, "ticket.automation.notify", &context)
                                     .await
                                 {
                                     tracing::warn!(
@@ -354,7 +354,7 @@ impl AutomationEngine {
                         .to_ascii_uppercase();
                     let payload = action.params.get("payload").cloned().unwrap_or_else(|| {
                         serde_json::json!({
-                            "tenant_id": tenant_id,
+                            "tenant_id": tenant_id.get(),
                             "ticket_id": ticket_id,
                             "rule_id": rule.id,
                             "rule_name": rule.name,

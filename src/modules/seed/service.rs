@@ -199,7 +199,7 @@ impl SeedService {
         for ticket in demo_tickets(company.id, primary.id) {
             if let Err(e) = self
                 .tickets
-                .create_ticket(tenant_id, user_id, &ticket, &ctx)
+                .create_ticket(TenantId::from_trusted(tenant_id), user_id, &ticket, &ctx)
                 .await
             {
                 tracing::warn!(error = %e, %tenant_id, "demo ticket seeding skipped");

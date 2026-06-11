@@ -174,7 +174,7 @@ async fn get_ticket(
 ) -> AppResult<Json<TicketResponse>> {
     let resp = state
         .tickets
-        .get_portal_ticket(contact.tenant_id, contact.company_id, ticket_id)
+        .get_portal_ticket(crate::modules::auth::TenantId::from_trusted(contact.tenant_id), contact.company_id, ticket_id)
         .await?;
     Ok(Json(resp))
 }
@@ -186,7 +186,7 @@ async fn list_tickets(
 ) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
     let (tickets, total) = state
         .tickets
-        .list_portal_tickets(contact.tenant_id, contact.company_id, &pagination)
+        .list_portal_tickets(crate::modules::auth::TenantId::from_trusted(contact.tenant_id), contact.company_id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         tickets,
@@ -204,7 +204,7 @@ async fn create_ticket(
     let resp = state
         .tickets
         .create_portal_ticket(
-            contact.tenant_id,
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
             contact.company_id,
             contact.id,
             request.title,

@@ -13,7 +13,7 @@ use super::{
     CreateNoteRequest, CreateTicketRequest, TicketFilter, TicketNoteResponse, TicketPriority,
     TicketQueue, TicketResponse, TicketService, TicketStatus, TicketType, UpdateTicketRequest,
 };
-use crate::modules::auth::RequireAuth;
+use crate::modules::auth::{RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -56,7 +56,7 @@ async fn list_tickets(
     filter.validate()?;
     let (responses, total) = state
         .ticket_service
-        .list_ticket_responses(user.tenant_id, &filter, &pagination)
+        .list_ticket_responses(user.tenant(), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         responses,
@@ -74,11 +74,11 @@ async fn create_ticket(
     request.validate()?;
     let ticket = state
         .ticket_service
-        .create_ticket(user.tenant_id, user.id, &request, &ctx)
+        .create_ticket(user.tenant(), user.id, &request, &ctx)
         .await?;
     let resp = state
         .ticket_service
-        .get_ticket_response(user.tenant_id, ticket.id)
+        .get_ticket_response(user.tenant(), ticket.id)
         .await?;
     Ok(Json(resp))
 }
@@ -90,7 +90,7 @@ async fn get_ticket(
 ) -> AppResult<Json<TicketResponse>> {
     let resp = state
         .ticket_service
-        .get_ticket_response(user.tenant_id, ticket_id)
+        .get_ticket_response(user.tenant(), ticket_id)
         .await?;
     Ok(Json(resp))
 }
@@ -105,11 +105,11 @@ async fn update_ticket(
     request.validate()?;
     state
         .ticket_service
-        .update_ticket(user.tenant_id, ticket_id, user.id, &request, &ctx)
+        .update_ticket(user.tenant(), ticket_id, user.id, &request, &ctx)
         .await?;
     let resp = state
         .ticket_service
-        .get_ticket_response(user.tenant_id, ticket_id)
+        .get_ticket_response(user.tenant(), ticket_id)
         .await?;
     Ok(Json(resp))
 }
@@ -122,7 +122,7 @@ async fn delete_ticket(
 ) -> AppResult<()> {
     state
         .ticket_service
-        .delete_ticket(user.tenant_id, ticket_id, &ctx)
+        .delete_ticket(user.tenant(), ticket_id, &ctx)
         .await
 }
 
@@ -139,11 +139,11 @@ async fn assign_ticket(
 ) -> AppResult<Json<TicketResponse>> {
     state
         .ticket_service
-        .assign_ticket(user.tenant_id, ticket_id, request.assigned_to_id, user.id)
+        .assign_ticket(user.tenant(), ticket_id, request.assigned_to_id, user.id)
         .await?;
     let resp = state
         .ticket_service
-        .get_ticket_response(user.tenant_id, ticket_id)
+        .get_ticket_response(user.tenant(), ticket_id)
         .await?;
     Ok(Json(resp))
 }
@@ -156,7 +156,7 @@ async fn get_ticket_notes(
 ) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
     let (notes, total) = state
         .ticket_service
-        .get_ticket_notes(user.tenant_id, ticket_id, &pagination)
+        .get_ticket_notes(user.tenant(), ticket_id, &pagination)
         .await?;
 
     let responses: Vec<TicketNoteResponse> = notes
@@ -189,7 +189,7 @@ async fn add_note(
 
     let note = state
         .ticket_service
-        .add_note(user.tenant_id, ticket_id, user.id, &request)
+        .add_note(user.tenant(), ticket_id, user.id, &request)
         .await?;
 
     Ok(Json(TicketNoteResponse {
@@ -210,7 +210,7 @@ async fn get_statuses(
 ) -> AppResult<Json<PaginatedResponse<TicketStatus>>> {
     let (statuses, total) = state
         .ticket_service
-        .get_statuses(user.tenant_id, &pagination)
+        .get_statuses(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         statuses,
@@ -226,7 +226,7 @@ async fn get_priorities(
 ) -> AppResult<Json<PaginatedResponse<TicketPriority>>> {
     let (priorities, total) = state
         .ticket_service
-        .get_priorities(user.tenant_id, &pagination)
+        .get_priorities(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         priorities,
@@ -242,7 +242,7 @@ async fn get_queues(
 ) -> AppResult<Json<PaginatedResponse<TicketQueue>>> {
     let (queues, total) = state
         .ticket_service
-        .get_queues(user.tenant_id, &pagination)
+        .get_queues(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         queues,
@@ -258,7 +258,7 @@ async fn get_types(
 ) -> AppResult<Json<PaginatedResponse<TicketType>>> {
     let (types, total) = state
         .ticket_service
-        .get_types(user.tenant_id, &pagination)
+        .get_types(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         types,

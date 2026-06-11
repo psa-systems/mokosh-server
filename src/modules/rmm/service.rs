@@ -610,10 +610,11 @@ impl RmmService {
                     };
                     // RMM ingest is a background path (no AuditCtx extractor);
                     // attribute the auto-created ticket to the system actor.
-                    // PMS-139: tickets/audit not yet on TenantId; unwrap at the
-                    // boundary until those modules are swept.
+                    // `TicketService` is on `TenantId`, so the scope flows
+                    // straight through; `AuditCtx::system` is still a `Uuid`
+                    // context bag, so unwrap only there.
                     svc.create_ticket(
-                        tenant_id.get(),
+                        tenant_id,
                         default_creator,
                         &req,
                         &crate::modules::audit::AuditCtx::system(tenant_id.get()),
