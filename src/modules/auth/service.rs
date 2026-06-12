@@ -460,7 +460,8 @@ impl AuthService {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
-                   phone, mobile, title, avatar_url, timezone, locale, role,
+                   phone, mobile, title, avatar_url, timezone, locale,
+                   date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at
@@ -790,9 +791,9 @@ impl AuthService {
             r#"
             INSERT INTO users (
                 id, tenant_id, email, first_name, last_name, phone, mobile,
-                title, role, timezone, status
+                title, role, timezone, date_format_string, status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
             "#,
         )
         .bind(user_id)
@@ -805,6 +806,7 @@ impl AuthService {
         .bind(&request.title)
         .bind(request.role.as_str())
         .bind(&timezone)
+        .bind(&request.date_format_string)
         .execute(&mut *tx)
         .await?;
 
@@ -950,6 +952,10 @@ impl AuthService {
         }
         if request.timezone.is_some() {
             updates.push(format!("timezone = ${}", param_idx));
+            param_idx += 1;
+        }
+        if request.date_format_string.is_some() {
+            updates.push(format!("date_format_string = ${}", param_idx));
             // param_idx += 1;
         }
 
@@ -993,6 +999,9 @@ impl AuthService {
         }
         if let Some(ref timezone) = request.timezone {
             query_builder = query_builder.bind(timezone);
+        }
+        if let Some(ref date_format_string) = request.date_format_string {
+            query_builder = query_builder.bind(date_format_string);
         }
 
         // Mutation + audit row in one transaction: snapshot the row
@@ -1350,7 +1359,8 @@ impl AuthService {
         let data_query = format!(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
-                   phone, mobile, title, avatar_url, timezone, locale, role,
+                   phone, mobile, title, avatar_url, timezone, locale,
+                   date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at
@@ -1414,7 +1424,8 @@ impl AuthService {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
-                   phone, mobile, title, avatar_url, timezone, locale, role,
+                   phone, mobile, title, avatar_url, timezone, locale,
+                   date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at
@@ -1520,7 +1531,8 @@ impl AuthService {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
-                   phone, mobile, title, avatar_url, timezone, locale, role,
+                   phone, mobile, title, avatar_url, timezone, locale,
+                   date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at
@@ -1771,6 +1783,7 @@ struct UserRow {
     avatar_url: Option<String>,
     timezone: String,
     locale: String,
+    date_format_string: Option<String>,
     role: String,
     status: String,
     email_verified_at: Option<chrono::DateTime<Utc>>,
@@ -1799,6 +1812,7 @@ impl From<UserRow> for User {
             avatar_url: row.avatar_url,
             timezone: row.timezone,
             locale: row.locale,
+            date_format_string: row.date_format_string,
             role: UserRole::from_str(&row.role).unwrap_or_default(),
             status: UserStatus::from_str(&row.status).unwrap_or_default(),
             email_verified_at: row.email_verified_at,

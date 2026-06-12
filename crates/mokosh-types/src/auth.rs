@@ -191,6 +191,11 @@ pub struct CurrentUser {
     pub role: UserRole,
     pub timezone: String,
     pub avatar_url: Option<String>,
+    /// PMS-253: per-user date/time format string (mokosh-apps token
+    /// grammar). `None` means "use browser locale" - the legacy
+    /// rendering behaviour. Capped server-side at 64 chars.
+    #[serde(default)]
+    pub date_format_string: Option<String>,
 }
 
 impl CurrentUser {
@@ -223,6 +228,9 @@ pub struct User {
     pub avatar_url: Option<String>,
     pub timezone: String,
     pub locale: String,
+    /// PMS-253: per-user date/time format string. See [`CurrentUser::date_format_string`].
+    #[serde(default)]
+    pub date_format_string: Option<String>,
     pub role: UserRole,
     pub status: UserStatus,
     pub email_verified_at: Option<DateTime<Utc>>,
@@ -248,6 +256,7 @@ impl User {
             role: self.role,
             timezone: self.timezone.clone(),
             avatar_url: self.avatar_url.clone(),
+            date_format_string: self.date_format_string.clone(),
         }
     }
 }
@@ -384,6 +393,13 @@ pub struct CreateUserRequest {
     pub title: Option<String>,
     pub role: UserRole,
     pub timezone: Option<String>,
+    /// PMS-253: optional date/time format pref. Capped at 64 chars to
+    /// match the users.date_format_string check constraint.
+    #[validate(length(
+        max = 64,
+        message = "Date format string must be 64 characters or fewer"
+    ))]
+    pub date_format_string: Option<String>,
     /// If true, send welcome email with password setup link
     #[serde(default = "default_true")]
     pub send_welcome_email: bool,
@@ -406,6 +422,13 @@ pub struct UpdateUserRequest {
     pub role: Option<UserRole>,
     pub status: Option<UserStatus>,
     pub timezone: Option<String>,
+    /// PMS-253: optional date/time format pref. Capped at 64 chars to
+    /// match the users.date_format_string check constraint.
+    #[validate(length(
+        max = 64,
+        message = "Date format string must be 64 characters or fewer"
+    ))]
+    pub date_format_string: Option<String>,
 }
 
 /// User list filter parameters. Parsed from the query string on
@@ -434,6 +457,9 @@ pub struct UserResponse {
     pub title: Option<String>,
     pub avatar_url: Option<String>,
     pub timezone: String,
+    /// PMS-253: per-user date/time format. See [`CurrentUser::date_format_string`].
+    #[serde(default)]
+    pub date_format_string: Option<String>,
     pub role: UserRole,
     pub status: UserStatus,
     pub mfa_enabled: bool,
@@ -454,6 +480,7 @@ impl From<User> for UserResponse {
             title: user.title,
             avatar_url: user.avatar_url,
             timezone: user.timezone,
+            date_format_string: user.date_format_string,
             role: user.role,
             status: user.status,
             mfa_enabled: user.mfa_enabled,
@@ -631,6 +658,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            date_format_string: None,
         };
         let tenant_id = user.tenant_id;
 
@@ -651,6 +679,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            date_format_string: None,
         };
         let tenant_id = user.tenant_id;
         let state = AuthState::authenticated(user, tenant_id);
@@ -671,6 +700,7 @@ mod tests {
             role: UserRole::Technician,
             timezone: "America/New_York".to_string(),
             avatar_url: None,
+            date_format_string: None,
         };
 
         assert_eq!(user.full_name(), "John Doe");
@@ -687,6 +717,7 @@ mod tests {
             role: UserRole::Technician,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            date_format_string: None,
         };
 
         assert_eq!(user.initials(), "JD");
@@ -706,6 +737,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            date_format_string: None,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
@@ -726,6 +758,7 @@ mod tests {
             role: UserRole::Admin,
             timezone: "UTC".to_string(),
             avatar_url: None,
+            date_format_string: None,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
