@@ -6,8 +6,8 @@ use sqlx::PgPool;
 
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
-use mokosh_server::Database;
 use mokosh_server::utils::pagination::PaginationParams;
+use mokosh_server::Database;
 
 fn svc(pool: &PgPool) -> InvitationsService {
     InvitationsService::new(Database::from_pool(pool.clone()))
@@ -48,7 +48,10 @@ async fn create_list_revoke_roundtrip(pool: PgPool) {
     assert_eq!(items.len(), 1);
 
     s.revoke(tenant, inv.id).await.expect("revoke");
-    let (_items, total) = s.list_pending(tenant, &page()).await.expect("list after revoke");
+    let (_items, total) = s
+        .list_pending(tenant, &page())
+        .await
+        .expect("list after revoke");
     assert_eq!(total, 0, "revoked invite no longer pending");
 
     // Revoking again 404s (no live invite).
@@ -184,7 +187,11 @@ async fn first_invite_promotes_personal_tenant_to_org(pool: PgPool) {
         .expect("make tenant personal");
 
     svc(&pool)
-        .create(tenant, admin_id, &req("colleague@example.com", "technician"))
+        .create(
+            tenant,
+            admin_id,
+            &req("colleague@example.com", "technician"),
+        )
         .await
         .expect("invite");
 

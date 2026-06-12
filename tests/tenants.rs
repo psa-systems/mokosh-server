@@ -28,7 +28,10 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
     // tenant on first org-claimed login; scoped to the default tenant and
     // idempotent.
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
-    assert_eq!(user_tenant(&pool, admin_id).await, common::DEFAULT_TENANT_ID);
+    assert_eq!(
+        user_tenant(&pool, admin_id).await,
+        common::DEFAULT_TENANT_ID
+    );
 
     let tenants = TenantService::new(Database::from_pool(pool.clone()));
     let org_tenant = tenants
@@ -36,7 +39,11 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
         .await
         .expect("provision target tenant");
 
-    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into(), vec![]);
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
 
     // First org-claimed login: the user moves out of the default tenant.
     let moved = auth
