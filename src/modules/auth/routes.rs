@@ -291,7 +291,7 @@ async fn get_sessions(
 
     let (sessions, total) = state
         .auth_service
-        .get_user_sessions(user.id, current_session_id, &pagination)
+        .get_user_sessions(user.tenant_id, user.id, current_session_id, &pagination)
         .await?;
 
     Ok(Json(PaginatedResponse::from_params(

@@ -11,6 +11,64 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use mokosh_server::modules::auth::TenantId;
+use mokosh_server::modules::reports::ReportsService;
+use mokosh_server::Database;
+
+/// Seed an open ticket under `tenant_id`. The classification lookups
+/// (status/priority/queue) are pulled from the default tenant - the only
+/// tenant the seed migration provisions them for - and referenced by id;
+/// the ticket FKs do not enforce same-tenant lookups, so this lets a test
+/// plant tickets in a second tenant without duplicating the whole lookup set.
+/// The chosen status is open (`is_closed = false`) so the dashboard's
+/// open-ticket aggregates count it.
+async fn seed_open_ticket(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    created_by: Uuid,
+    number: &str,
+) {
+    let status_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_closed = FALSE LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(pool)
+    .await
+    .expect("an open ticket status");
+    let priority_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("a ticket priority");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("a ticket queue");
+
+    sqlx::query(
+        r#"INSERT INTO tickets
+           (id, tenant_id, ticket_number, title, status_id, priority_id,
+            queue_id, company_id, created_by_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(number)
+    .bind("Seed ticket")
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .expect("seed open ticket");
+}
+
 async fn seed_company(pool: &PgPool, tenant_id: Uuid, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
@@ -262,6 +320,45 @@ async fn billing_report_is_tenant_scoped(pool: PgPool) {
     assert!(
         (invoiced - 1000.0).abs() < 0.01,
         "tenant A sees only its own $1000 invoice, not tenant B's $5000 (got {invoiced})"
+    );
+}
+
+// PMS-260: the dashboard aggregates (open-by-priority, ticket trend) are
+// tenant-scoped - a second tenant's tickets never inflate this tenant's
+// counts. Aggregates leak counts even when rows are hidden, so this pins
+// the COUNT(*) scoping directly at the service layer.
+#[sqlx::test]
+async fn dashboard_is_tenant_scoped(pool: PgPool) {
+    let tenant_a = common::DEFAULT_TENANT_ID;
+    let (admin_a, _email, _pw) = common::seed_admin(&pool).await;
+    let company_a = seed_company(&pool, tenant_a, "Tenant A Co").await;
+    // Two open tickets in the caller's tenant.
+    seed_open_ticket(&pool, tenant_a, company_a, admin_a, "A-1").await;
+    seed_open_ticket(&pool, tenant_a, company_a, admin_a, "A-2").await;
+
+    // A second tenant with three open tickets of its own.
+    let (tenant_b, user_b, _b_email, _b_pw) =
+        common::seed_tenant_with_admin(&pool, "pms260-dash-b").await;
+    let company_b = seed_company(&pool, tenant_b, "Tenant B Co").await;
+    for n in 0..3 {
+        seed_open_ticket(&pool, tenant_b, company_b, user_b, &format!("B-{n}")).await;
+    }
+
+    let reports = ReportsService::new(Database::from_pool(pool.clone()));
+    let dash = reports
+        .dashboard(TenantId::from_trusted(tenant_a))
+        .await
+        .expect("dashboard");
+
+    let open: i64 = dash.open_by_priority.iter().map(|b| b.count).sum();
+    assert_eq!(
+        open, 2,
+        "open_by_priority counts only the caller's two tickets, not tenant B's three"
+    );
+    let trend: i64 = dash.ticket_trend_30d.iter().map(|d| d.count).sum();
+    assert_eq!(
+        trend, 2,
+        "ticket_trend_30d counts only the caller's two tickets, not tenant B's three"
     );
 }
 
