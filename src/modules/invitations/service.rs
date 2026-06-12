@@ -88,11 +88,10 @@ impl InvitationsService {
         // login-driven, so the link is just the Mokosh login (PMS-244). Skipped
         // when no SPA URL is configured (tests).
         if let Some(app_url) = self.app_url.as_deref() {
-            let tenant_name: String =
-                sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
-                    .bind(tenant_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
             let subject = format!("You have been invited to {tenant_name} on Mokosh");
             let body = format!(
                 "You have been invited to join {tenant_name} on Mokosh as a {role}.\n\n\

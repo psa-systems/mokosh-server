@@ -24,7 +24,10 @@ pub struct InvitationsRouterState {
 pub fn invitations_routes(service: Arc<InvitationsService>) -> Router {
     let state = InvitationsRouterState { service };
     Router::new()
-        .route("/invitations", get(list_invitations).post(create_invitation))
+        .route(
+            "/invitations",
+            get(list_invitations).post(create_invitation),
+        )
         .route("/invitations/{id}", delete(revoke_invitation))
         .with_state(state)
 }

@@ -478,7 +478,10 @@ async fn ensure_user_from_bunyip(
     // /oauth2/userinfo (the at+jwt carries no email claim).
     let info = verifier.userinfo(bearer).await;
     let email = info.as_ref().and_then(|i| i.email.clone());
-    let email_verified = info.as_ref().and_then(|i| i.email_verified).unwrap_or(false);
+    let email_verified = info
+        .as_ref()
+        .and_then(|i| i.email_verified)
+        .unwrap_or(false);
 
     place_bunyip_user(
         auth_service,
@@ -514,7 +517,9 @@ pub async fn place_bunyip_user(
 
     // An invite to address X is consumed only by a Bunyip user with verified X.
     let invite = match (invitations, email.as_deref()) {
-        (Some(invs), Some(em)) if email_verified => invs.newest_pending_for(em).await.ok().flatten(),
+        (Some(invs), Some(em)) if email_verified => {
+            invs.newest_pending_for(em).await.ok().flatten()
+        }
         _ => None,
     };
 
@@ -552,7 +557,10 @@ pub async fn place_bunyip_user(
     // no-op when they are already there); co-mingled data stays put (PMS-243).
     if let Some(cur) = current {
         if cur != target {
-            match auth_service.rehome_user_between_tenants(sub, cur, target).await {
+            match auth_service
+                .rehome_user_between_tenants(sub, cur, target)
+                .await
+            {
                 Ok(true) => {
                     tracing::info!(sub = %sub, tenant_id = %target, "re-homed user into tenant")
                 }
@@ -686,7 +694,9 @@ fn is_stuck_in_default(
 
 #[cfg(test)]
 mod tests {
-    use super::{default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default, UserRole};
+    use super::{
+        default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default, UserRole,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -695,7 +705,12 @@ mod tests {
         let other = Uuid::from_u128(99);
 
         // The target case: a technician parked in the default tenant, no invite.
-        assert!(is_stuck_in_default(Some(default), default, "technician", false));
+        assert!(is_stuck_in_default(
+            Some(default),
+            default,
+            "technician",
+            false
+        ));
         // Exemptions:
         assert!(
             !is_stuck_in_default(Some(default), default, "super_admin", false),

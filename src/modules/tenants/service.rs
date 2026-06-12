@@ -143,7 +143,10 @@ impl TenantService {
         let tenant_id = Uuid::new_v4();
         // A uuid-derived slug guarantees uniqueness without a human display name
         // (personal tenants are auto-provisioned; the owner can rename later).
-        let slug = slugify(&format!("personal-{}", &tenant_id.simple().to_string()[..12]));
+        let slug = slugify(&format!(
+            "personal-{}",
+            &tenant_id.simple().to_string()[..12]
+        ));
 
         let inserted: Option<Uuid> = sqlx::query_scalar(
             r#"INSERT INTO tenants (id, name, slug, kind, status, subscription_status, personal_owner_id)
@@ -179,9 +182,7 @@ impl TenantService {
                 .personal_tenant_for_owner(owner_id)
                 .await?
                 .ok_or_else(|| {
-                    AppError::Internal(
-                        "personal tenant missing after insert conflict".to_string(),
-                    )
+                    AppError::Internal("personal tenant missing after insert conflict".to_string())
                 }),
         }
     }

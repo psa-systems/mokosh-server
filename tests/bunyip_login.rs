@@ -19,7 +19,13 @@ use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsSe
 use mokosh_server::modules::tenants::TenantService;
 use mokosh_server::Database;
 
-fn services(pool: &PgPool) -> (Arc<AuthService>, Arc<TenantService>, Arc<InvitationsService>) {
+fn services(
+    pool: &PgPool,
+) -> (
+    Arc<AuthService>,
+    Arc<TenantService>,
+    Arc<InvitationsService>,
+) {
     let db = Database::from_pool(pool.clone());
     (
         Arc::new(AuthService::new(db.clone(), "test-secret".into(), vec![])),
@@ -204,7 +210,10 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
     .expect("placed");
 
     let (tenant, _role) = user_tenant_role(&pool, sub).await;
-    assert_ne!(tenant, org, "unverified email must not join the inviting tenant");
+    assert_ne!(
+        tenant, org,
+        "unverified email must not join the inviting tenant"
+    );
 
     let still_pending: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM tenant_invitations WHERE tenant_id = $1 AND status = 'pending'",
