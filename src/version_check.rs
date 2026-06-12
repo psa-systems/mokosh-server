@@ -161,7 +161,7 @@ async fn run_update_check() -> UpdateCheck {
         }
     }
 
-    let result = fetch_update_check(probe).await;
+    let result = fetch_update_check(&probe.client, &probe.url, &probe.display).await;
 
     if let Ok(mut guard) = result_cache().lock() {
         *guard = Some(CachedResult {
@@ -175,28 +175,35 @@ async fn run_update_check() -> UpdateCheck {
 /// Perform the manifest fetch + version comparison with no caching. Split out
 /// so `run_update_check` owns the cache policy and this stays a straight-line
 /// network path that is easy to unit-test.
-async fn fetch_update_check(probe: &UpdateCheckProbe) -> UpdateCheck {
-    let resp = match probe.client.get(&probe.url).send().await {
+async fn fetch_update_check(client: &reqwest::Client, url: &str, display: &str) -> UpdateCheck {
+    let resp = match client.get(url).send().await {
         Ok(resp) => resp,
         Err(e) => {
+            // The raw reqwest error can embed the request URL, and thus any
+            // credentials carried in `MOKOSH_UPDATE_CHECK_URL`. Keep the detail
+            // in the server log only; the response body references just the
+            // pre-sanitised display URL so credentials never reach a caller.
+            tracing::warn!(error = %e, "update check request failed");
             return UpdateCheck::Error {
                 current_version: PACKAGE_VERSION,
-                message: format!("{}: request failed: {e}", probe.display),
+                message: format!("{display}: request failed"),
             };
         }
     };
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
         return UpdateCheck::Error {
             current_version: PACKAGE_VERSION,
-            message: format!("{}: status {}", probe.display, resp.status()),
+            message: format!("{display}: status {status}"),
         };
     }
     let manifest: Manifest = match resp.json().await {
         Ok(m) => m,
         Err(e) => {
+            tracing::warn!(error = %e, "update check manifest parse failed");
             return UpdateCheck::Error {
                 current_version: PACKAGE_VERSION,
-                message: format!("{}: invalid manifest: {e}", probe.display),
+                message: format!("{display}: invalid manifest"),
             };
         }
     };
@@ -241,12 +248,28 @@ fn parse_version(v: &str) -> Vec<u64> {
     let core = v.trim().trim_start_matches('v');
     let core = core.split(['-', '+']).next().unwrap_or(core);
     core.split('.')
-        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .map(|p| {
+            p.parse::<u64>().unwrap_or_else(|_| {
+                // A manifest version we cannot parse (typo, calendar scheme,
+                // etc.) degrades to 0 so the check still answers, but warn so a
+                // misconfigured publishing side is visible instead of silently
+                // never advertising an update.
+                tracing::warn!(component = %p, version = %v, "unparseable version component treated as 0");
+                0
+            })
+        })
         .collect()
 }
 
 /// True when `latest` is a strictly higher release than `current`. Missing
 /// trailing components compare as `0`, so `0.2` ranks equal to `0.2.0`.
+///
+/// Comparison is on release cores only: pre-release and build metadata are
+/// stripped (see [`parse_version`]). A consequence is that a pre-release build
+/// (e.g. running `0.2.0-rc1`) compares equal to its final release `0.2.0`, so
+/// an operator on a pre-release is not told the matching stable release is
+/// "newer". This is acceptable for self-host update nudges, which target
+/// published releases, not rc-to-stable transitions.
 fn is_newer(latest: &str, current: &str) -> bool {
     let l = parse_version(latest);
     let c = parse_version(current);
@@ -293,6 +316,87 @@ mod tests {
     fn missing_trailing_components_default_to_zero() {
         assert!(!is_newer("0.2", "0.2.0"));
         assert!(is_newer("0.2.1", "0.2"));
+    }
+
+    /// Bind an ephemeral loopback port and answer exactly one HTTP request
+    /// with the given status line and body, then close. Returns the URL to
+    /// GET. Lets the network path be tested without a mock-server dependency.
+    async fn oneshot_http(status_line: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the request line/headers; we do not inspect them.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}/manifest")
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_update_available_with_release_url() {
+        let url = oneshot_http(
+            "200 OK",
+            r#"{"version":"99.0.0","release_url":"https://example.com/99.0.0"}"#,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        match fetch_update_check(&client, &url, "http://display").await {
+            UpdateCheck::UpdateAvailable {
+                latest_version,
+                release_url,
+                ..
+            } => {
+                assert_eq!(latest_version, "99.0.0");
+                assert_eq!(release_url.as_deref(), Some("https://example.com/99.0.0"));
+            }
+            other => panic!("expected UpdateAvailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_up_to_date_for_an_older_manifest() {
+        let url = oneshot_http("200 OK", r#"{"version":"0.0.1"}"#).await;
+        let client = reqwest::Client::new();
+        assert!(matches!(
+            fetch_update_check(&client, &url, "http://display").await,
+            UpdateCheck::UpToDate { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_error_on_non_success_status() {
+        let url = oneshot_http("503 Service Unavailable", "nope").await;
+        let client = reqwest::Client::new();
+        match fetch_update_check(&client, &url, "http://display").await {
+            UpdateCheck::Error { message, .. } => {
+                assert!(message.contains("http://display"));
+                assert!(message.contains("503"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_error_body_excludes_raw_url_credentials() {
+        let url = oneshot_http("200 OK", "{ not json").await;
+        let client = reqwest::Client::new();
+        match fetch_update_check(&client, &url, "http://display").await {
+            UpdateCheck::Error { message, .. } => {
+                assert_eq!(message, "http://display: invalid manifest");
+                // The raw upstream URL must never reach the body.
+                assert!(!message.contains(&url));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
