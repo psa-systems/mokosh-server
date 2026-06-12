@@ -91,6 +91,7 @@ pub fn current_user_from_at_jwt(v: &VerifiedAtJwt) -> CurrentUser {
         role: v.role,
         timezone: "UTC".to_string(),
         avatar_url: None,
+        date_format_string: None,
     }
 }
 
