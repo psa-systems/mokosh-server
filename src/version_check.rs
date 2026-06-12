@@ -111,8 +111,39 @@ fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
         .as_ref()
 }
 
-/// Run the update check. Pure async logic split out from the handler so it can
-/// be unit-tested without spinning up the Axum stack.
+/// Last check result plus the instant it was fetched. The `/version/check`
+/// endpoint is unauthenticated and triggers an outbound request, so without a
+/// cache each caller amplifies one hit into one upstream fetch. Results are
+/// served from here while within their TTL.
+struct CachedResult {
+    result: UpdateCheck,
+    fetched_at: std::time::Instant,
+}
+
+static RESULT_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedResult>>> =
+    std::sync::OnceLock::new();
+
+/// Reuse window for a successful check. Update info changes rarely, so a
+/// generous window collapses dashboard polling (and abuse) to one upstream
+/// request per window.
+const SUCCESS_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Shorter reuse window for a failed check, so a transient upstream outage
+/// recovers on the next poll instead of being pinned for the success window.
+const ERROR_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn result_cache() -> &'static std::sync::Mutex<Option<CachedResult>> {
+    RESULT_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn ttl_for(result: &UpdateCheck) -> std::time::Duration {
+    match result {
+        UpdateCheck::Error { .. } => ERROR_TTL,
+        _ => SUCCESS_TTL,
+    }
+}
+
+/// Run the update check, serving a cached result while it is within its TTL.
+/// The `disabled` branch makes no request and needs no cache (already trivial).
 async fn run_update_check() -> UpdateCheck {
     let Some(probe) = update_check_probe() else {
         return UpdateCheck::Disabled {
@@ -120,6 +151,31 @@ async fn run_update_check() -> UpdateCheck {
         };
     };
 
+    // Serve a fresh cached result without touching the network. The lock is
+    // held only for the lookup, never across the await below.
+    if let Ok(guard) = result_cache().lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.fetched_at.elapsed() < ttl_for(&cached.result) {
+                return cached.result.clone();
+            }
+        }
+    }
+
+    let result = fetch_update_check(probe).await;
+
+    if let Ok(mut guard) = result_cache().lock() {
+        *guard = Some(CachedResult {
+            result: result.clone(),
+            fetched_at: std::time::Instant::now(),
+        });
+    }
+    result
+}
+
+/// Perform the manifest fetch + version comparison with no caching. Split out
+/// so `run_update_check` owns the cache policy and this stays a straight-line
+/// network path that is easy to unit-test.
+async fn fetch_update_check(probe: &UpdateCheckProbe) -> UpdateCheck {
     let resp = match probe.client.get(&probe.url).send().await {
         Ok(resp) => resp,
         Err(e) => {
@@ -237,5 +293,20 @@ mod tests {
     fn missing_trailing_components_default_to_zero() {
         assert!(!is_newer("0.2", "0.2.0"));
         assert!(is_newer("0.2.1", "0.2"));
+    }
+
+    #[test]
+    fn errors_cache_for_a_shorter_window_than_successes() {
+        let ok = UpdateCheck::UpToDate {
+            current_version: PACKAGE_VERSION,
+            latest_version: "0.1.0".to_string(),
+        };
+        let err = UpdateCheck::Error {
+            current_version: PACKAGE_VERSION,
+            message: "boom".to_string(),
+        };
+        assert_eq!(ttl_for(&ok), SUCCESS_TTL);
+        assert_eq!(ttl_for(&err), ERROR_TTL);
+        assert!(ERROR_TTL < SUCCESS_TTL);
     }
 }
