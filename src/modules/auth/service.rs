@@ -1551,13 +1551,13 @@ impl AuthService {
 
     /// PMS-138 backward-compat fallback: when the caller does not
     /// supply a tenant hint, resolve to the default tenant
-    /// `Uuid::from_u128(1)`. This matches both
-    /// `db::tenant::default_tenant_id()` (cfg-gated on
-    /// `single-tenant`) and `OIDC_DEFAULT_TENANT_ID` in
-    /// `auth::middleware`, so behaviour converges across the
-    /// legacy login path and the Bunyip-issued at+jwt path. Keep
-    /// the literal value in lockstep with those two sites if it
-    /// ever changes.
+    /// `Uuid::from_u128(1)`. This matches `OIDC_DEFAULT_TENANT_ID` in
+    /// `auth::middleware` (`default_bunyip_tenant_id`), so behaviour
+    /// converges across the legacy login path and the Bunyip-issued
+    /// at+jwt path. Keep the literal value in lockstep with that site
+    /// if it ever changes. PMS-262: the `single-tenant` feature's
+    /// `db::tenant::default_tenant_id()` that this used to mirror has
+    /// been removed; the default tenant is now infra-only.
     fn resolve_tenant_for_login(hint: Option<Uuid>) -> Uuid {
         hint.unwrap_or_else(|| Uuid::from_u128(1))
     }
