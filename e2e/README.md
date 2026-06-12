@@ -66,9 +66,9 @@ in CI. Required unless noted:
 
 | Var | Purpose |
 | --- | --- |
-| `E2E_BASE_URL` | SPA host the auth-ui project navigates to (default `https://msp.a8n.systems`) |
-| `E2E_API_BASE_URL` | *optional* - API host for `/api/v1`. Defaults to prepending `api.` to `E2E_BASE_URL` (e.g. `msp.a8n.systems` -> `api.msp.a8n.systems`). Set when the deployment uses a different naming scheme |
-| `E2E_OP_BASE_URL` | *optional* - OIDC OP host for `/oauth2/*` + `/.well-known/openid-configuration`. Defaults to `E2E_API_BASE_URL`. On bunyip-as-OP deploys the OP runs on the apex `api.<tld>`, NOT the mokosh API host, so set this explicitly (e.g. `https://api.a8n.systems`) |
+| `E2E_BASE_URL` | SPA host the auth-ui project navigates to (default `https://mokosh.systems`) |
+| `E2E_API_BASE_URL` | *optional* - API host for `/api/v1`. Defaults to prepending `api.` to `E2E_BASE_URL` (e.g. `mokosh.systems` -> `api.mokosh.systems`). Set when the deployment uses a different naming scheme |
+| `E2E_OP_BASE_URL` | *optional* - OIDC OP host for `/oauth2/*` + `/.well-known/openid-configuration`. Defaults to `E2E_API_BASE_URL`. On bunyip-as-OP deploys the OP runs on the apex `api.<tld>`, NOT the mokosh API host, so set this explicitly (e.g. `https://api.mokosh.systems`) |
 | `E2E_EMAIL` | dedicated E2E account login |
 | `E2E_PASSWORD` | E2E account password |
 | `E2E_TENANT_ID` | UUID of the dedicated E2E tenant |

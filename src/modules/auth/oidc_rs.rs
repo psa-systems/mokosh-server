@@ -97,7 +97,7 @@ pub struct VerifierConfig {
     /// Expected `iss` claim and the host the discovery doc lives on.
     pub issuer: String,
     /// Expected `aud` claim (the RS's own canonical URL, e.g.
-    /// `https://api.msp.a8n.systems`). Must match the `audience` column of the
+    /// `https://api.mokosh.systems`). Must match the `audience` column of the
     /// bunyip oauth_clients row that issued the token.
     pub audience: String,
     /// JWKS refresh interval. The cache is also force-refreshed on `kid` miss.
@@ -111,11 +111,11 @@ impl VerifierConfig {
     /// misconfigured RS never silently accepts tokens from the wrong issuer.
     pub fn from_env() -> Result<Self, String> {
         let issuer = std::env::var("OIDC_ISSUER")
-            .map_err(|_| "OIDC_ISSUER must be set (e.g. https://api.a8n.systems)".to_string())?
+            .map_err(|_| "OIDC_ISSUER must be set (e.g. https://api.mokosh.systems)".to_string())?
             .trim_end_matches('/')
             .to_string();
         let audience = std::env::var("OIDC_AUDIENCE").map_err(|_| {
-            "OIDC_AUDIENCE must be set (e.g. https://api.msp.a8n.systems)".to_string()
+            "OIDC_AUDIENCE must be set (e.g. https://api.mokosh.systems)".to_string()
         })?;
         let jwks_cache_ttl_secs = std::env::var("OIDC_JWKS_CACHE_TTL_SECS")
             .ok()

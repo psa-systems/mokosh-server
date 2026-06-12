@@ -29,8 +29,8 @@ function optional(name: string): string | undefined {
 }
 
 // Derive the API host from the SPA host by prepending `api.`. The canonical
-// staging deploy serves the SPA at `msp.a8n.systems` and the API at
-// `api.msp.a8n.systems`. Returns null when the SPA host is already prefixed
+// deploy serves the SPA at `mokosh.systems` and the API at
+// `api.mokosh.systems`. Returns null when the SPA host is already prefixed
 // or the URL cannot be parsed.
 function deriveApiBase(spaUrl: string): string | null {
   try {
@@ -42,7 +42,7 @@ function deriveApiBase(spaUrl: string): string | null {
   }
 }
 
-const spaBaseURL = optional('E2E_BASE_URL') ?? 'https://msp.a8n.systems';
+const spaBaseURL = optional('E2E_BASE_URL') ?? 'https://mokosh.systems';
 const derivedApi = deriveApiBase(spaBaseURL);
 const apiBaseURL = optional('E2E_API_BASE_URL') ?? derivedApi ?? spaBaseURL;
 // The OIDC OP (provider) is a separate host from mokosh-server on
@@ -57,14 +57,14 @@ export const env = {
   baseURL: spaBaseURL,
   // Where the mokosh PSA JSON API lives. The api project and teardown hit
   // this host for `/api/v1/*`. Defaults to prepending `api.` to
-  // E2E_BASE_URL (so `msp.a8n.systems` -> `api.msp.a8n.systems`); override
+  // E2E_BASE_URL (so `mokosh.systems` -> `api.mokosh.systems`); override
   // with E2E_API_BASE_URL when the deployment uses a different naming
   // scheme. OIDC traffic (`/oauth2/*`, `/.well-known/*`) goes to
   // `opBaseURL` below, which can be a different host on bunyip-as-OP deploys.
   apiBaseURL,
   // Where the OIDC OP (authorize / token / userinfo / discovery) lives.
   // On bunyip-as-OP deploys this is a different host from apiBaseURL
-  // (e.g. `api.a8n.systems` rather than `api.msp.a8n.systems`); on
+  // (e.g. `api.<tld>` rather than `api.msp.<tld>`); on
   // mokosh-as-OP it defaults to apiBaseURL.
   opBaseURL,
   get email() {

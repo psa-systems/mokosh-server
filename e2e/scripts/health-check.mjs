@@ -22,7 +22,7 @@ function deriveApiBase(spaUrl) {
   }
 }
 
-const spaBaseURL = pick(process.env.E2E_BASE_URL, 'https://msp.a8n.systems');
+const spaBaseURL = pick(process.env.E2E_BASE_URL, 'https://mokosh.systems');
 const apiBaseURL = pick(
   process.env.E2E_API_BASE_URL,
   deriveApiBase(spaBaseURL),
