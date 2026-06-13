@@ -394,6 +394,18 @@ impl SlaService {
         request: &UpsertBusinessHoursRequest,
     ) -> AppResult<BusinessHoursResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-195: enforce a single default. Clear every other row's
+        // `is_default` before promoting this one, mirroring
+        // `create_business_hours`.
+        if request.is_default {
+            sqlx::query(
+                "UPDATE business_hours SET is_default = FALSE WHERE tenant_id = $1 AND id <> $2",
+            )
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
         let n = sqlx::query(
             r#"UPDATE business_hours SET name = $3, timezone = $4, schedule = $5,
                    is_default = $6, updated_at = NOW()

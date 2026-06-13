@@ -1839,7 +1839,14 @@ impl From<ContactRow> for Contact {
             contact_type: ContactType::from_str(&row.contact_type).unwrap_or_default(),
             is_portal_user: row.is_portal_user,
             portal_user_id: row.portal_user_id,
-            preferred_contact_method: PreferredContactMethod::Email,
+            // PMS-195: honor the stored value instead of hardcoding Email.
+            // Unknown values fall back to the enum default (Email), matching
+            // the `contact_type` / `status` `unwrap_or_default()` pattern.
+            preferred_contact_method: match row.preferred_contact_method.as_str() {
+                "phone" => PreferredContactMethod::Phone,
+                "mobile" => PreferredContactMethod::Mobile,
+                _ => PreferredContactMethod::Email,
+            },
             timezone: row.timezone,
             locale: row.locale,
             custom_fields: row.custom_fields,
