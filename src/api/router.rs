@@ -186,7 +186,7 @@ pub fn create_api_router(
             auth_routes(
                 auth_service,
                 google_oauth,
-                client_origin,
+                client_origin.clone(),
                 jwt_secret.clone(),
                 cookie_secure,
             ),
@@ -324,7 +324,9 @@ pub fn create_api_router(
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/portal", portal_api)
-        .fallback(get(not_a_frontend))
+        .fallback(get(move |headers| {
+            not_a_frontend(headers, client_origin.clone())
+        }))
         // Apply global middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
@@ -335,8 +337,12 @@ pub fn create_api_router(
 /// "this is an API endpoint" page so direct browser visits to
 /// `api.msp.<tld>` are friendly instead of leaking 404 internals. The
 /// link points at the Bunyip SaaS shell on the matching apex; if the
-/// host can't be parsed, falls back to the staging URL.
-async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
+/// host can't be parsed, falls back to `fallback_origin` (the env-injected
+/// `CLIENT_ORIGIN`). No domain is ever hardcoded here.
+async fn not_a_frontend(
+    headers: axum::http::HeaderMap,
+    fallback_origin: String,
+) -> impl IntoResponse {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -344,7 +350,7 @@ async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
     let hub_link = host
         .strip_prefix("api.msp.")
         .map(|tld| format!("https://{tld}"))
-        .unwrap_or_else(|| "https://a8n.systems".to_string());
+        .unwrap_or(fallback_origin);
     let body = format!(
         "<!doctype html>\n\
          <html lang=\"en\">\n\

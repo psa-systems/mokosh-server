@@ -199,7 +199,7 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   //
   // Filter to the OP host and its parent domain. Cookies on bunyip-as-OP
   // deploys are split: the OP-session cookie lives on the OP host
-  // (e.g. `api.a8n.systems`) while the hub access/refresh cookies live
+  // (e.g. `api.msp.a8n.systems`) while the hub access/refresh cookies live
   // on the apex (`a8n.systems`). Including both covers the authorize
   // path completely without sweeping in unrelated cookies (font CDNs,
   // analytics, etc.) that would just bloat the file. Normalise

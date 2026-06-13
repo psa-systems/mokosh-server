@@ -22,7 +22,8 @@ pub struct AppConfig {
     /// All origins permitted to make credentialed CORS requests against
     /// the API. Defaults to `[client_origin]` if `CORS_ORIGIN` is unset.
     /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
-    /// `https://msp.a8n.systems,https://a8n.systems`).
+    /// staging `https://msp.a8n.systems,https://a8n.systems`, prod
+    /// `https://msp.psa.systems,https://psa.systems`).
     pub cors_origins: Vec<String>,
     /// Lowercased exact-email allowlist; only these emails may auto-provision
     /// a super_admin on first Google sign-in (everyone else is rejected).
