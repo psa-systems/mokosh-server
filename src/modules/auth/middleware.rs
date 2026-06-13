@@ -301,6 +301,19 @@ impl RoleRequirement for AdminRoles {
     }
 }
 
+/// Super-admin role requirement. The narrowest gate: only the platform
+/// operator role, never a tenant `admin`. Use it for cross-tenant
+/// administrative surfaces (e.g. the `/tenants` CRUD routes) so the
+/// "super admin only" rule lives in the route signature instead of a
+/// hand-rolled `if user.role != UserRole::SuperAdmin` block in every
+/// handler (PMS-198).
+pub struct SuperAdminRoles;
+impl RoleRequirement for SuperAdminRoles {
+    fn allowed_roles() -> &'static [&'static str] {
+        &["super_admin"]
+    }
+}
+
 /// Manager role requirement
 pub struct ManagerRoles;
 impl RoleRequirement for ManagerRoles {
@@ -318,6 +331,7 @@ impl RoleRequirement for FinanceRoles {
 }
 
 /// Helper type aliases for common role requirements
+pub type RequireSuperAdmin = RequireRole<SuperAdminRoles>;
 pub type RequireAdmin = RequireRole<AdminRoles>;
 pub type RequireManager = RequireRole<ManagerRoles>;
 pub type RequireFinance = RequireRole<FinanceRoles>;

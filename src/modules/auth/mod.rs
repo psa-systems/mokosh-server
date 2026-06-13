@@ -28,7 +28,8 @@ pub use middleware::{
     AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,
     RequireAssets, RequireAuth, RequireBilling, RequireCalendar, RequireContracts, RequireFinance,
     RequireKnowledgeBase, RequireManager, RequireModuleEnabled, RequireProjects, RequireReports,
-    RequireRmm, RequireRole, RequireTimeTracking, RoleRequirement, TenantScope,
+    RequireRmm, RequireRole, RequireSuperAdmin, RequireTimeTracking, RoleRequirement,
+    SuperAdminRoles, TenantScope,
 };
 pub use models::*;
 #[cfg(feature = "server")]

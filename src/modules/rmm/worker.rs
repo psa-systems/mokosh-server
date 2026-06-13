@@ -17,11 +17,12 @@
 //! See PMS-103 for the AC list.
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::scheduler::Job;
 use crate::utils::error::{AppError, AppResult};
 
 use super::provider::{build_provider, ProviderConfig, ProviderDevice, RmmProvider};
@@ -47,30 +48,6 @@ pub struct RmmSyncWorker {
 impl RmmSyncWorker {
     pub fn new(db: Database, encryption_key: [u8; 32]) -> Self {
         Self { db, encryption_key }
-    }
-
-    /// Long-running loop. Tick every `interval`. Log errors and keep
-    /// going - one bad provider should not stall the rest.
-    #[tracing::instrument(skip_all)]
-    pub async fn run_forever(self, interval: Duration) {
-        tracing::info!(
-            interval_secs = interval.as_secs(),
-            "rmm sync worker started",
-        );
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            match self.run_tick().await {
-                Ok(n) if n > 0 => {
-                    tracing::debug!(connections_synced = n, "rmm sync tick");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = ?e, "rmm sync tick failed; will retry on next interval");
-                }
-            }
-        }
     }
 
     /// Pick up every active connection past its `sync_interval_minutes`
@@ -438,6 +415,21 @@ impl RmmSyncWorker {
             api_key,
             api_secret,
         })
+    }
+}
+
+#[async_trait]
+impl Job for RmmSyncWorker {
+    fn name(&self) -> &'static str {
+        "rmm_sync"
+    }
+
+    async fn run(&self) -> AppResult<()> {
+        let synced = self.run_tick().await?;
+        if synced > 0 {
+            tracing::debug!(connections_synced = synced, "rmm sync tick");
+        }
+        Ok(())
     }
 }
 

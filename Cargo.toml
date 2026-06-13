@@ -13,6 +13,8 @@ members = [
     "crates/google-oauth-flow",
     # Shared DTOs between mokosh-server and mokosh-clients (PMS-129).
     "crates/mokosh-types",
+    # Shared build-script logic for the root build.rs and google-oauth-flow (PMS-198).
+    "crates/build-metadata",
 ]
 
 [workspace.package]
@@ -207,6 +209,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 # Drive #[sqlx::test] from this crate's test binaries. The macro reads
 # DATABASE_URL and provisions a fresh database per test invocation.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+
+[build-dependencies]
+# Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().
+build-metadata = { path = "crates/build-metadata" }
 
 [profile.release]
 lto = true

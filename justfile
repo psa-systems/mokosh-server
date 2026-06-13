@@ -191,9 +191,15 @@ infisical-bootstrap: ensure-env
         cargo run --quiet --bin mokosh-bootstrap -- bootstrap-infisical
     }
 
-# Run all checks (compile, clippy, fmt)
+# Run all checks (compile, clippy, fmt, migration prefixes)
 [group: 'check']
-check: check-compile check-clippy check-fmt
+check: check-compile check-clippy check-fmt check-migrations
+
+# Enforce unique migration prefixes (PMS-198). Fails if two migrations
+# share a numeric prefix (sqlx keys its ledger on that prefix).
+[group: 'check']
+check-migrations:
+    nu scripts/check-migration-prefixes.nu
 
 # Check compilation
 [group: 'check']
@@ -291,7 +297,14 @@ create-release bump:
     let release_branch = $"release/($tag)"
 
     git checkout -b $release_branch
-    open Cargo.toml | update package.version $bare | to toml | collect | save --force Cargo.toml
+    # Targeted version bump: rewrite only the `version = "..."` line so the
+    # Cargo.toml comments and PMS docs survive. Round-tripping the whole file
+    # through `to toml` stripped every comment on each release. Stage through a
+    # tempfile + external mv so we never reach for `save --force`, per the repo
+    # no-force safety policy.
+    let toml_tmp = (mktemp --tmpdir --suffix .toml)
+    open Cargo.toml --raw | str replace --regex '(?m)^version = "[^"]*"' $'version = "($bare)"' | save --append $toml_tmp
+    ^mv $toml_tmp Cargo.toml
     git add Cargo.toml
     git commit --signoff --message $"Release ($tag)"
 
@@ -304,7 +317,7 @@ create-release bump:
         $"Automated release PR for ($tag)."
         ""
         $"After merge, `.forgejo/workflows/create-release.yml` tags and publishes ($tag) to the Generic Packages registry."
-    ] | str join "\n" | save --force $body_file
+    ] | str join "\n" | save --append $body_file
     let fj_result = (^fj --host dev.a8n.run pr create $"Release ($tag)" --body-file $body_file | complete)
     rm $body_file
     if $fj_result.exit_code != 0 {
