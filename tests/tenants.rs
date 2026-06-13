@@ -10,8 +10,9 @@ mod common;
 
 use sqlx::PgPool;
 
+use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::AuthService;
-use mokosh_server::modules::tenants::TenantService;
+use mokosh_server::modules::tenants::{CreateTenantRequest, TenantService};
 use mokosh_server::Database;
 
 async fn user_tenant(pool: &PgPool, user_id: uuid::Uuid) -> uuid::Uuid {
@@ -340,4 +341,36 @@ async fn cross_tenant_get_tenant_returns_403(pool: PgPool) {
         reqwest::StatusCode::FORBIDDEN,
         "tenant-A technician must not read tenant-B's record"
     );
+}
+
+#[sqlx::test]
+async fn create_tenant_sets_org_kind(pool: PgPool) {
+    // PMS-287: `create_tenant` must set the NOT-NULL `kind` column. Migration
+    // 019_tenant_kind dropped the column default, so omitting it inserts NULL
+    // and the INSERT fails with SQLSTATE 23502 (POST /api/v1/tenants 500s). This
+    // is the org-create path, so kind must be 'org'. No existing test exercised
+    // the create_tenant insert, which is why the missing column went unnoticed.
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "PMS-287 Org".into(),
+        slug: "pms287-org".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-pms287@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Pms287".into(),
+    };
+
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant must succeed (regression: missing NOT NULL kind)");
+
+    let kind: String = sqlx::query_scalar("SELECT kind FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read kind");
+    assert_eq!(kind, "org", "create_tenant provisions an org-kind tenant");
 }
