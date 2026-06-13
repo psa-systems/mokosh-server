@@ -112,10 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::new(&config.database_url).await?;
 
     if config.run_migrations {
-        match db.run_migrations().await {
-            Ok(()) => tracing::info!("Database migrations complete"),
-            Err(e) => tracing::warn!("Failed to run migrations: {}", e),
-        }
+        // Fail fast: a migration error means the schema is stale or a shipped
+        // migration was altered (checksum mismatch). Starting the server on an
+        // unknown schema is more dangerous than refusing to start, so propagate
+        // the error and let the process exit non-zero.
+        db.run_migrations()
+            .await
+            .expect("Database migrations failed");
+        tracing::info!("Database migrations complete");
     }
 
     tracing::info!("Database connected");
