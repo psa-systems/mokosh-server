@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
+use crate::handlers::shared::{TokenBundle, DEFAULT_FIRST_PARTY_SCOPE};
 use crate::router::AuthHttpState;
 
 #[derive(Debug, Serialize)]
@@ -98,18 +99,6 @@ pub struct SwitchResponse {
     pub active_tenant_id: String,
     pub tokens: TokenBundle,
 }
-
-#[derive(Debug, Serialize)]
-pub struct TokenBundle {
-    pub access_token: String,
-    pub token_type: &'static str,
-    pub expires_in: i64,
-    pub id_token: String,
-    pub refresh_token: String,
-    pub scope: String,
-}
-
-const DEFAULT_FIRST_PARTY_SCOPE: &[&str] = &["openid", "email", "offline_access"];
 
 /// `POST /v1/auth/active-tenant`
 ///

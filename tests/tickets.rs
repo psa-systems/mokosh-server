@@ -16,23 +16,6 @@
 mod common;
 
 use sqlx::PgPool;
-use uuid::Uuid;
-
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO companies (id, tenant_id, name)
-        VALUES ($1, $2, 'Acme Co')
-        "#,
-    )
-    .bind(id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("seed test company");
-    id
-}
 
 /// Assert a ticket DTO carries its JOINed name/color fields populated from
 /// the database. This is the F3 regression guard: the route layer used to
@@ -58,7 +41,7 @@ fn assert_joined_fields_populated(t: &serde_json::Value, label: &str) {
 #[sqlx::test]
 async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 
@@ -203,7 +186,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
 #[sqlx::test]
 async fn ticket_history_records_description_edit(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 

@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
+use crate::handlers::shared::require_admin;
 use crate::router::AuthHttpState;
 
 // --- Token TTLs ---------------------------------------------------------
@@ -127,16 +128,6 @@ pub struct DeleteUserBody {
 }
 
 // --- Helpers ------------------------------------------------------------
-
-fn require_admin(user: &User) -> Result<(), HttpError> {
-    if matches!(user.role, UserRole::Admin) {
-        Ok(())
-    } else {
-        Err(HttpError(AuthError::Forbidden(
-            "only admins may manage users".into(),
-        )))
-    }
-}
 
 fn parse_role(s: &str) -> Result<UserRole, HttpError> {
     UserRole::parse(s).ok_or_else(|| {
@@ -284,7 +275,7 @@ pub async fn list_users(
     BearerUser(admin): BearerUser,
     Query(q): Query<ListUsersQuery>,
 ) -> Result<Json<UserListResponse>, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
 
     let role = match q.role.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => Some(parse_role(s)?),
@@ -377,7 +368,7 @@ async fn set_status(
     user_id: UserId,
     new_status: UserStatus,
 ) -> Result<Response, HttpError> {
-    require_admin(admin)?;
+    require_admin(admin.role)?;
     let ResolvedTarget {
         user: target,
         is_owner,
@@ -487,7 +478,7 @@ pub async fn change_role(
     Path(user_id): Path<uuid::Uuid>,
     Json(body): Json<ChangeRoleBody>,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
     let reason = body.reason.unwrap_or_default();
     if reason.len() > REASON_MAX_LEN {
         return Err(HttpError(AuthError::InvalidRequest(format!(
@@ -608,7 +599,7 @@ pub async fn delete_user(
     Path(user_id): Path<uuid::Uuid>,
     Json(body): Json<DeleteUserBody>,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
     let reason = body.reason.trim().to_string();
     if reason.is_empty() || reason.len() > REASON_MAX_LEN {
         return Err(HttpError(AuthError::InvalidRequest(format!(
@@ -736,7 +727,7 @@ pub async fn resend_verify(
     BearerUser(admin): BearerUser,
     Path(user_id): Path<uuid::Uuid>,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
     let target = resolve_target(&st, admin.tenant_id, UserId(user_id))
         .await?
         .user;
@@ -808,7 +799,7 @@ pub async fn admin_trigger_password_reset(
     BearerUser(admin): BearerUser,
     Path(user_id): Path<uuid::Uuid>,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
     let target = resolve_target(&st, admin.tenant_id, UserId(user_id))
         .await?
         .user;

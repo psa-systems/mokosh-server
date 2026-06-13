@@ -7,7 +7,7 @@ use mokosh_auth_core::{
 };
 use uuid::Uuid;
 
-use crate::conv::db_err;
+use crate::conv::{db_err, retry_serializable};
 use crate::pool::AuthPool;
 
 const SELECT_RESET: &str = r#"
@@ -118,22 +118,10 @@ impl PasswordResetTokenRepository for PgPasswordResetTokenRepository {
         token_hash: [u8; 32],
         new_password_hash: &str,
     ) -> Result<UserId, AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self.complete_once(token_hash, new_password_hash).await {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(
-                        attempt,
-                        "password reset complete serialization conflict; retrying"
-                    );
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("password reset complete", || {
+            self.complete_once(token_hash, new_password_hash)
+        })
+        .await
     }
 }
 

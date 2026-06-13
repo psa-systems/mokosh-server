@@ -64,7 +64,7 @@ async fn list_users_pagination_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     for i in 0..14 {
         let e = format!("tech-{i:02}@example.com");
-        common::seed_user(&pool, &e, "technician").await;
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, &e, "technician").await;
     }
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
@@ -94,11 +94,11 @@ async fn list_users_filter_by_role_and_q(pool: PgPool) {
     let (_admin_id, admin_email, password) = common::seed_admin(&pool).await;
     for i in 0..3 {
         let e = format!("pms4test-tech-{i}@example.com");
-        common::seed_user(&pool, &e, "technician").await;
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, &e, "technician").await;
     }
     for i in 0..2 {
         let e = format!("pms4test-mgr-{i}@example.com");
-        common::seed_user(&pool, &e, "manager").await;
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, &e, "manager").await;
     }
     let app = common::boot(pool).await;
     let token = common::login(&app, &admin_email, &password).await;
@@ -156,8 +156,13 @@ async fn list_users_filter_validation_rejects_oversize_q(pool: PgPool) {
 /// admin/manager gate pin.
 #[sqlx::test]
 async fn list_users_requires_admin(pool: PgPool) {
-    let (_uid, email, password) =
-        common::seed_user(&pool, "techguy@example.com", "technician").await;
+    let (_uid, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "techguy@example.com",
+        "technician",
+    )
+    .await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 
@@ -490,41 +495,6 @@ async fn tenant_isolation_get_user_by_id_returns_404(pool: PgPool) {
 // PMS-138: subdomain-driven `LoginRequest::tenant_id` hint
 // ============================================================================
 
-/// Insert a user under an arbitrary `(tenant_id, email)` with a known
-/// password. Used by the PMS-138 tests to set up the multi-tenant
-/// colliding-email scenario that the seeded helpers can't express on
-/// their own (they hard-code the default tenant or generate a unique
-/// per-tenant email).
-async fn insert_user_in_tenant(
-    pool: &PgPool,
-    tenant_id: Uuid,
-    email: &str,
-    password: &str,
-    role: &str,
-) -> Uuid {
-    let password_hash = mokosh_server::utils::crypto::hash_password(password)
-        .expect("hash PMS-138 colliding user password");
-    let user_id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO users (
-            id, tenant_id, email, password_hash,
-            first_name, last_name, role, status, email_verified_at
-        )
-        VALUES ($1, $2, $3, $4, 'Colliding', 'User', $5, 'active', NOW())
-        "#,
-    )
-    .bind(user_id)
-    .bind(tenant_id)
-    .bind(email)
-    .bind(&password_hash)
-    .bind(role)
-    .execute(pool)
-    .await
-    .expect("insert PMS-138 colliding user");
-    user_id
-}
-
 /// PMS-138 multi-tenant resolution: with the same email under two
 /// tenants the `tenant_id` hint must steer the lookup to the user in
 /// the named tenant. Pre-PMS-138 the email-only lookup returned the
@@ -532,21 +502,14 @@ async fn insert_user_in_tenant(
 #[sqlx::test]
 async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
     let colliding_email = "colliding@example.com";
-    let password_a = "password-tenant-a";
-    let password_b = "password-tenant-b";
 
-    let user_a_id = insert_user_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        colliding_email,
-        password_a,
-        "admin",
-    )
-    .await;
+    // Same email under two tenants, same uniform seed password. The
+    // `tenant_id` hint (not the password) is what must disambiguate.
+    let (user_a_id, _, password) =
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, colliding_email, "admin").await;
     let (tenant_b_id, _admin_b_id, _admin_b_email, _admin_b_password) =
         common::seed_tenant_with_admin(&pool, "pms138-tenant-b").await;
-    let user_b_id =
-        insert_user_in_tenant(&pool, tenant_b_id, colliding_email, password_b, "admin").await;
+    let (user_b_id, _, _) = common::seed_user(&pool, tenant_b_id, colliding_email, "admin").await;
 
     let app = common::boot(pool).await;
 
@@ -556,7 +519,7 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
         .post(app.url("/api/v1/auth/login"))
         .json(&serde_json::json!({
             "email": colliding_email,
-            "password": password_b,
+            "password": password,
             "tenant_id": tenant_b_id,
         }))
         .send()
@@ -585,7 +548,7 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
         .post(app.url("/api/v1/auth/login"))
         .json(&serde_json::json!({
             "email": colliding_email,
-            "password": password_a,
+            "password": password,
             "tenant_id": common::DEFAULT_TENANT_ID,
         }))
         .send()
@@ -670,24 +633,11 @@ async fn login_wrong_tenant_hint_returns_401(pool: PgPool) {
 #[sqlx::test]
 async fn forgot_password_with_tenant_hint_targets_correct_user(pool: PgPool) {
     let colliding_email = "colliding@example.com";
-    let _user_a_id = insert_user_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        colliding_email,
-        "password-tenant-a",
-        "admin",
-    )
-    .await;
+    let (_user_a_id, _, _) =
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, colliding_email, "admin").await;
     let (tenant_b_id, _admin_b_id, _admin_b_email, _admin_b_password) =
         common::seed_tenant_with_admin(&pool, "pms138-tenant-b-forgot").await;
-    let user_b_id = insert_user_in_tenant(
-        &pool,
-        tenant_b_id,
-        colliding_email,
-        "password-tenant-b",
-        "admin",
-    )
-    .await;
+    let (user_b_id, _, _) = common::seed_user(&pool, tenant_b_id, colliding_email, "admin").await;
 
     let app = common::boot(pool).await;
 

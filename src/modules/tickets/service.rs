@@ -1619,24 +1619,10 @@ struct TicketResponseRow {
 
 impl From<TicketResponseRow> for TicketResponse {
     fn from(r: TicketResponseRow) -> Self {
-        // Local mirror of [`Ticket::sla_status`] — kept here because
-        // the joined row already carries everything needed, and pulling
-        // the rest of the Ticket struct just to call the method would
-        // double the bookkeeping.
-        let sla_status = if r.closed_at.is_some() {
-            SlaStatus::NotApplicable
-        } else if let Some(due) = r.sla_due_date {
-            let now = Utc::now();
-            if now > due {
-                SlaStatus::Breached
-            } else if (due - now).num_hours() < 2 {
-                SlaStatus::Warning
-            } else {
-                SlaStatus::OnTrack
-            }
-        } else {
-            SlaStatus::NotApplicable
-        };
+        // The joined row already carries everything `compute_sla_status`
+        // needs, so reuse the shared helper instead of rebuilding a full
+        // Ticket just to call its method.
+        let sla_status = compute_sla_status(r.closed_at, r.sla_due_date);
 
         TicketResponse {
             id: r.id,

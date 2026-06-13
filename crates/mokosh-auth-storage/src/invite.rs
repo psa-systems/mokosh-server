@@ -11,7 +11,7 @@ use mokosh_auth_core::{
 };
 use uuid::Uuid;
 
-use crate::conv::{db_err, UserRow};
+use crate::conv::{db_err, retry_serializable, UserRow};
 use crate::pool::AuthPool;
 
 pub struct PgInviteRepository {
@@ -225,41 +225,17 @@ impl InviteRepository for PgInviteRepository {
         first_name: Option<&str>,
         last_name: Option<&str>,
     ) -> Result<User, AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self
-                .accept_once(token, password_hash, first_name, last_name)
-                .await
-            {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(attempt, "invite accept serialization conflict; retrying");
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("invite accept", || {
+            self.accept_once(token, password_hash, first_name, last_name)
+        })
+        .await
     }
 
     async fn accept_existing(&self, token: &str, user_id: UserId) -> Result<User, AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self.accept_existing_once(token, user_id).await {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(
-                        attempt,
-                        "invite membership-accept serialization conflict; retrying"
-                    );
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("invite membership-accept", || {
+            self.accept_existing_once(token, user_id)
+        })
+        .await
     }
 }
 
