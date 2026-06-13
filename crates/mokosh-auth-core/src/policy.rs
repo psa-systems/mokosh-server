@@ -67,12 +67,15 @@ pub fn parse_scope(s: &str) -> BTreeSet<String> {
 /// Required: 12..=128 chars, at least one upper, one lower, one digit, one
 /// symbol. Must not equal the email local-part.
 pub fn validate_password_strength(plain: &str, email: &str) -> Result<(), AuthError> {
-    if plain.len() < MIN_PASSWORD_LEN {
+    // Count Unicode scalar values, not bytes: a password of multi-byte
+    // characters must not be miscounted against the char-based policy.
+    let char_len = plain.chars().count();
+    if char_len < MIN_PASSWORD_LEN {
         return Err(AuthError::Policy(format!(
             "password must be at least {MIN_PASSWORD_LEN} characters"
         )));
     }
-    if plain.len() > MAX_PASSWORD_LEN {
+    if char_len > MAX_PASSWORD_LEN {
         return Err(AuthError::Policy(format!(
             "password must be at most {MAX_PASSWORD_LEN} characters"
         )));

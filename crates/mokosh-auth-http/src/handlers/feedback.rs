@@ -22,7 +22,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 use mokosh_auth_core::{
-    AuditEvent, AuthError, Feedback, FeedbackStatus, NewFeedback, TenantId, UserId, UserRole,
+    AuditEvent, AuthError, Feedback, FeedbackStatus, NewFeedback, TenantId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
+use crate::handlers::shared::require_admin;
 use crate::router::AuthHttpState;
 
 const MAX_MESSAGE_LEN: usize = 8000;
@@ -113,16 +114,6 @@ pub struct UpdateStatusBody {
 
 // --- Helpers ------------------------------------------------------------
 
-fn require_admin(role: UserRole) -> Result<(), HttpError> {
-    if matches!(role, UserRole::Admin) {
-        Ok(())
-    } else {
-        Err(HttpError(AuthError::Forbidden(
-            "admin role required".into(),
-        )))
-    }
-}
-
 /// Decode a Bearer access token without enforcing auth on the route.
 /// Returns `None` if the header is absent or the token is malformed /
 /// untrusted; `Some(user)` if the token verifies. The public submit
@@ -140,9 +131,16 @@ async fn maybe_bearer_user(
         .or_else(|| raw.strip_prefix("bearer "))?
         .trim();
     let header_data = decode_header(token).ok()?;
+    // The OP issues RFC 9068 `at+jwt` access tokens signed with EdDSA.
+    // Verifying with RS256 (the old value) never validated, so every
+    // signed-in caller was silently treated as anonymous. Require the
+    // correct token type and algorithm.
+    if header_data.typ.as_deref() != Some("at+jwt") {
+        return None;
+    }
     let kid = header_data.kid?;
     let dk = st.provider.keys.decoding_key(&kid)?;
-    let mut validation = Validation::new(Algorithm::RS256);
+    let mut validation = Validation::new(Algorithm::EdDSA);
     validation.validate_aud = false;
     validation.set_issuer(&[st.provider.cfg.issuer_str().trim_end_matches('/')]);
     let data = decode::<serde_json::Value>(token, dk, &validation).ok()?;

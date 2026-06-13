@@ -28,7 +28,7 @@ mod common;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const DEFAULT_TENANT: Uuid = Uuid::from_u128(1);
+use common::DEFAULT_TENANT_ID as DEFAULT_TENANT;
 
 /// The three worker event types a new tenant (and therefore the backfill)
 /// seeds. Mirrors the IN (...) filter in migration 030 and

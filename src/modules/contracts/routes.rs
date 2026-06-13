@@ -229,12 +229,15 @@ async fn update_rate_card(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertRateCardRequest>,
 ) -> AppResult<Json<RateCardResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_rate_card(u.tenant(), id, &req).await?,
+        s.service
+            .update_rate_card(u.tenant(), id, &req, &ctx)
+            .await?,
     ))
 }
 
@@ -285,7 +288,8 @@ async fn delete_rate_card_item(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
     _f: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_rate_card_item(u.tenant(), id).await
+    s.service.delete_rate_card_item(u.tenant(), id, &ctx).await
 }

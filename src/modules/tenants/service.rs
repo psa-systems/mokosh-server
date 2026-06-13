@@ -11,6 +11,26 @@ use crate::utils::validation::slugify;
 
 use super::models::*;
 
+/// Resolve the tenant whose migration-`023` seed rows are copied into every
+/// freshly provisioned tenant (see `copy_default_config`).
+///
+/// PMS-196: this used to be a hardcoded magic UUID parsed with `unwrap()`,
+/// which panics the tenant-provisioning path on any malformed value. The
+/// source is now read from `MOKOSH_SEED_TENANT_ID` (so a deployment can point
+/// the seed at a different template tenant) and parsed fallibly. When the env
+/// var is unset it falls back to the seed tenant created by migration 023,
+/// `Uuid::from_u128(1)` (== `00000000-0000-0000-0000-000000000001`), the same
+/// constant `auth::bootstrap` uses. A malformed env value is a configuration
+/// error, not a panic.
+fn seed_source_tenant_id() -> AppResult<Uuid> {
+    match std::env::var("MOKOSH_SEED_TENANT_ID") {
+        Ok(raw) => Uuid::parse_str(raw.trim()).map_err(|e| {
+            AppError::Configuration(format!("MOKOSH_SEED_TENANT_ID is not a valid UUID: {e}"))
+        }),
+        Err(_) => Ok(Uuid::from_u128(1)),
+    }
+}
+
 /// Tenant management service
 #[derive(Clone)]
 pub struct TenantService {
@@ -56,10 +76,14 @@ impl TenantService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         sqlx::query(
+            // `kind = 'org'` is set explicitly: migration 019_tenant_kind dropped
+            // the column default, so every caller must supply it. This is the
+            // admin/multi-user org-create path (self-signup uses kind='personal');
+            // omitting it inserts NULL and violates the NOT NULL constraint (PMS-287).
             r#"
-            INSERT INTO tenants (id, name, slug, status, billing_email, billing_contact_name,
+            INSERT INTO tenants (id, name, slug, status, kind, billing_email, billing_contact_name,
                                  subscription_plan, subscription_status, trial_ends_at)
-            VALUES ($1, $2, $3, 'active', $4, $5, $6, 'trialing', $7)
+            VALUES ($1, $2, $3, 'active', 'org', $4, $5, $6, 'trialing', $7)
             "#,
         )
         .bind(tenant_id)
@@ -133,6 +157,61 @@ impl TenantService {
         // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
         // is the same minted id, bridged via `from_trusted`.
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
+    }
+
+    /// Idempotently seed the PSA per-tenant lookup/config set (ticket statuses,
+    /// priorities, queues, types, categories, work types, task statuses, asset
+    /// types, rounding rules, business hours, ...) into `tenant_id`, copying it
+    /// from the default tenant. A no-op when the tenant is already seeded (the
+    /// presence guard in `copy_default_config`).
+    ///
+    /// PMS-288: `create_tenant` and `ensure_personal_tenant` seed at creation,
+    /// but a user can be placed into a tenant provisioned off the PSA path (an
+    /// invite into an auth/SSO-created org tenant, or a manually-created tenant)
+    /// that never received this set, so ticket creation - which requires a
+    /// default `ticket_statuses` row AND a `ticket_sequences` row
+    /// (`tickets/service.rs`) - 500s. The placement path calls this so any
+    /// tenant a user actually lands in is seeded.
+    pub async fn ensure_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
+        // This runs on the per-request bunyip auth path (place_bunyip_user), so
+        // the already-seeded common case must stay cheap: a couple of
+        // `SELECT EXISTS` and no write transaction. The sequence step is guarded
+        // here; the lookup step is guarded inside `copy_default_config`.
+        //
+        // Per-tenant sequences power ticket_number / invoice_number generation.
+        // They are not part of `copy_default_config` (create_tenant seeds them
+        // separately), so seed them here too - under the tenant GUC, since the
+        // sequence tables are RLS-protected (mirrors create_tenant). The inserts
+        // keep `ON CONFLICT DO NOTHING` so a concurrent first-request race stays
+        // idempotent even though the cheap guard let both callers through.
+        let has_sequences: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ticket_sequences WHERE tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if !has_sequences {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                "INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)
+                 ON CONFLICT (tenant_id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')
+                 ON CONFLICT (tenant_id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+
+        // Lookup/config set (ticket statuses/priorities/queues/types/...).
+        // Idempotent: copy_default_config early-returns when already seeded.
+        self.copy_default_config(tenant_id).await
     }
 
     /// Find-or-provision the `personal` tenant owned by `owner_id` (PMS-244).
@@ -282,6 +361,7 @@ impl TenantService {
     }
 
     /// Update tenant
+    #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tenant(
         &self,
@@ -310,7 +390,12 @@ impl TenantService {
         }
         if request.branding.is_some() {
             query.push_str(&format!(", branding = ${}", param_idx));
-            // param_idx += 1;
+            // Invariant: every conditional SET advances `param_idx` so the
+            // next field added below is numbered correctly. `branding` is
+            // the last field today, so this increment is currently unread
+            // (`#[allow(unused_assignments)]` on the fn); keep it so the
+            // pattern stays copy-paste safe (PMS-197).
+            param_idx += 1;
         }
 
         query.push_str(" WHERE id = $1");
@@ -476,7 +561,7 @@ impl TenantService {
     /// The copy runs in one transaction so a fresh tenant is either fully
     /// seeded or not at all.
     async fn copy_default_config(&self, new_tenant_id: Uuid) -> AppResult<()> {
-        let default_tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let default_tenant = seed_source_tenant_id()?;
 
         let mut tx = self.db.pool().begin().await?;
 
