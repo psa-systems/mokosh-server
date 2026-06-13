@@ -453,6 +453,11 @@ pub struct UpdateContactRequest {
     pub tags: Option<Vec<String>>,
     pub notes: Option<String>,
     pub status: Option<ContactStatus>,
+    /// Grant (or revoke) customer-portal access. Transitioning `false ->
+    /// true` mints a single-use setup token and emails the contact a
+    /// `/portal/set-password` link (PMS-136). Setting `false` revokes
+    /// access (PMS-17 flag transition). `None` leaves the flag untouched.
+    pub is_portal_user: Option<bool>,
 }
 
 /// Contact summary (for embedding in other responses)
