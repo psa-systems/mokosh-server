@@ -197,6 +197,40 @@ pub async fn seed_user(pool: &PgPool, email: &str, role: &str) -> (Uuid, String,
     (user_id, email.to_string(), password)
 }
 
+/// Seed a user with a caller-chosen `id` and `tenant_id`. Used by the
+/// Bunyip placement tests, where the `users.id` must equal the OIDC `sub`
+/// and the row must start in a specific tenant (e.g. the default tenant)
+/// to exercise the PMS-245 backfill.
+#[allow(dead_code)]
+pub async fn seed_user_in_tenant(
+    pool: &PgPool,
+    id: Uuid,
+    tenant_id: Uuid,
+    email: &str,
+    role: &str,
+) {
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password("test-password-12345").expect("hash password");
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (
+            id, tenant_id, email, password_hash,
+            first_name, last_name, role, status, email_verified_at
+        )
+        VALUES ($1, $2, $3, $4, 'Test', 'User', $5, 'active', NOW())
+        "#,
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(email)
+    .bind(&password_hash)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("insert seeded user in tenant");
+}
+
 /// Seed a fresh tenant + admin so a test can prove tenant isolation.
 /// Returns `(tenant_id, user_id, email, password)`. The tenant uses
 /// the caller-supplied label both as its display name and as the

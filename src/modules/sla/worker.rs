@@ -159,17 +159,10 @@ impl SlaSweepWorker {
                 // the cost is that a dispatch failure leaves the ledger
                 // row in place (the milestone is not retried), which is
                 // acceptable for an at-risk/breach heads-up.
-                let claimed = sqlx::query(
-                    r#"INSERT INTO sla_notifications (tenant_id, ticket_id, kind)
-                       VALUES ($1, $2, $3)
-                       ON CONFLICT (ticket_id, kind) DO NOTHING"#,
-                )
-                .bind(t.tenant_id)
-                .bind(t.id)
-                .bind(kind)
-                .execute(pool)
-                .await?
-                .rows_affected();
+                let claimed = self
+                    .service
+                    .claim_sla_notification(t.tenant_id, t.id, kind)
+                    .await?;
                 if claimed == 0 {
                     continue;
                 }

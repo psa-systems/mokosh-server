@@ -30,12 +30,13 @@ impl ContactService {
         table: &'static str,
         id: Uuid,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
         .bind(tenant_id)
         .bind(id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if exists {
             Ok(())
@@ -86,7 +87,7 @@ impl ContactService {
         // Mutation + audit row in one transaction so a rollback drops
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO companies (
@@ -181,6 +182,7 @@ impl ContactService {
             return Ok(responses);
         }
         let ids: Vec<Uuid> = responses.iter().map(|r| r.id).collect();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, CompanyRollupRow>(
             r#"
             SELECT
@@ -207,7 +209,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(&ids)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         let mut by_id: std::collections::HashMap<Uuid, CompanyRollupRow> =
             rows.into_iter().map(|r| (r.company_id, r)).collect();
@@ -224,6 +226,7 @@ impl ContactService {
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company(&self, tenant_id: TenantId, company_id: Uuid) -> AppResult<Company> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, CompanyRow>(
             r#"
             SELECT id, tenant_id, name, parent_company_id, company_type, status,
@@ -242,7 +245,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Company".to_string()))?;
 
@@ -345,8 +348,9 @@ impl ContactService {
             count_builder = count_builder.bind(am_id);
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -593,7 +597,7 @@ impl ContactService {
         // before and after (Postgres to_jsonb captures exact stored
         // state) and write the audit entry on the same tx so a rollback
         // drops both. PMS-117 AC1.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
         )
@@ -636,13 +640,19 @@ impl ContactService {
         company_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117. The pre-flight
+        // ticket guard runs inside the same tenant-scoped tx so the RLS
+        // GUC is set for it too.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
         // Check for related records
         let ticket_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND company_id = $2",
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         if ticket_count > 0 {
@@ -651,9 +661,6 @@ impl ContactService {
             ));
         }
 
-        // Mutation + audit row in one transaction. DELETE: snapshot
-        // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
         )
@@ -726,7 +733,7 @@ impl ContactService {
         // Mutation + audit row in one transaction so a rollback drops
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO contacts (
@@ -800,6 +807,7 @@ impl ContactService {
     /// Get contact by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_contact(&self, tenant_id: TenantId, contact_id: Uuid) -> AppResult<Contact> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ContactRow>(
             r#"
             SELECT id, tenant_id, company_id, first_name, last_name, email,
@@ -813,7 +821,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(contact_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Contact".to_string()))?;
 
@@ -917,8 +925,9 @@ impl ContactService {
             count_builder = count_builder.bind(status.as_str());
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -931,12 +940,13 @@ impl ContactService {
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Contact>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM contacts WHERE tenant_id = $1 AND company_id = $2",
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, ContactRow>(
@@ -956,7 +966,7 @@ impl ContactService {
         .bind(company_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -975,7 +985,7 @@ impl ContactService {
 
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
         )
@@ -1162,7 +1172,7 @@ impl ContactService {
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
         )
@@ -1217,7 +1227,7 @@ impl ContactService {
         // Mutation + audit row in one transaction so a rollback drops
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // If this is marked as primary, unmark other sites
         if request.is_primary {
@@ -1299,7 +1309,7 @@ impl ContactService {
 
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -1436,6 +1446,7 @@ impl ContactService {
     /// Get site by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_site(&self, tenant_id: TenantId, site_id: Uuid) -> AppResult<Site> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, SiteRow>(
             r#"
             SELECT id, tenant_id, company_id, name,
@@ -1448,7 +1459,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(site_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Site".to_string()))?;
 
@@ -1463,12 +1474,13 @@ impl ContactService {
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Site>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sites WHERE tenant_id = $1 AND company_id = $2",
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, SiteRow>(
@@ -1487,7 +1499,7 @@ impl ContactService {
         .bind(company_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1503,7 +1515,7 @@ impl ContactService {
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)

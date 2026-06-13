@@ -93,8 +93,9 @@ impl Database {
     #[cfg(feature = "multi-tenant")]
     pub async fn begin_with_tenant(
         &self,
-        tenant_id: uuid::Uuid,
+        tenant_id: impl Into<uuid::Uuid>,
     ) -> AppResult<TenantTransaction<'_>> {
+        let tenant_id = tenant_id.into();
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
@@ -130,9 +131,15 @@ impl<'a> TenantTransaction<'a> {
     }
 }
 
+// Deref to the underlying `PgConnection` (one level deeper than the wrapped
+// `Transaction`) so the standard sqlx idiom `.execute(&mut *tx)` yields a
+// `&mut PgConnection` - exactly as it does for a plain `sqlx::Transaction`.
+// sqlx 0.8 does not implement `Executor` for `&mut Transaction`, so deref-ing
+// only to `Transaction` would make `&mut *tx` fail to compile at every call
+// site. `commit`/`rollback`/`tenant_id` stay as inherent methods above.
 #[cfg(feature = "multi-tenant")]
 impl<'a> std::ops::Deref for TenantTransaction<'a> {
-    type Target = sqlx::Transaction<'a, sqlx::Postgres>;
+    type Target = sqlx::PgConnection;
 
     fn deref(&self) -> &Self::Target {
         &self.tx

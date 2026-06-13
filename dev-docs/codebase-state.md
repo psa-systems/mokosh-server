@@ -74,9 +74,19 @@ Notable layer details:
   produced from an authenticated claim via `CurrentUser::tenant()`, so
   a handler that forgets to pass the scope no longer compiles. See
   [Cross-cutting issues](#cross-cutting-issues) #8.
-- **Tenant feature flag** (`multi-tenant` / `single-tenant`,
-  default `multi-tenant`) is currently inert at the routing layer:
-  the same routes are exposed in either mode.
+- **Tenant feature flag** (`multi-tenant`, default-on). PMS-262
+  removed the `single-tenant` counterpart (and its shared
+  `default_tenant_id()` / `Default for TenantContext`): multi-tenant
+  is now the only mode and there is no shared-data fallback. The
+  `/tenants` CRUD routes are still gated on `multi-tenant`.
+- **Default tenant disposition** (`Uuid::from_u128(1)`, a.k.a.
+  `OIDC_DEFAULT_TENANT_ID`): INFRA-ONLY. The only legitimate residents
+  are platform `super_admin`s. Every non-admin who was historically
+  parked there is backfilled into their own personal tenant on next
+  Bunyip login (`place_bunyip_user` / `is_stuck_in_default`,
+  `src/modules/auth/middleware.rs`), so no normal user shares data in
+  it. Enforced end-to-end by the `tests/bunyip_login.rs` placement
+  tests (PMS-262, PMS-245).
 
 ## Per-module status
 
