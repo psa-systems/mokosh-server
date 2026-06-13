@@ -358,3 +358,80 @@ async fn configuration_item_round_trip_no_plaintext_in_list(pool: PgPool) {
         .expect("reveal JSON");
     assert_eq!(revealed["value"].as_str(), Some(SECRET_VAL));
 }
+
+// PMS-188: delete_asset writes a `deleted` asset_audit_log row in the same tx
+// as the delete, and that row survives the asset's removal (migration 042 drops
+// the cascade FK and widens the action CHECK to allow 'deleted'). Regression
+// guard for the CHECK-violation bug where every deletion 500'd.
+#[sqlx::test]
+async fn delete_asset_writes_surviving_deleted_audit_row(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Server").await;
+    let asset_id = create_asset(&app, &token, "doomed-01", &type_id, company).await;
+    let asset_uuid = Uuid::parse_str(&asset_id).expect("asset uuid");
+
+    // Delete succeeds (would 500 with a check_violation before the fix).
+    let del = app
+        .client
+        .delete(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete asset");
+    assert!(
+        del.status().is_success(),
+        "delete asset expected 2xx, got {}",
+        del.status()
+    );
+
+    // The asset row is gone.
+    let assets_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE id = $1")
+        .bind(asset_uuid)
+        .fetch_one(&pool)
+        .await
+        .expect("count assets");
+    assert_eq!(assets_left, 0, "the asset is removed");
+
+    // The `deleted` audit row was written AND survives the delete (FK dropped).
+    let deleted_audit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM asset_audit_log WHERE asset_id = $1 AND action = 'deleted'",
+    )
+    .bind(asset_uuid)
+    .fetch_one(&pool)
+    .await
+    .expect("count deleted audit rows");
+    assert_eq!(
+        deleted_audit, 1,
+        "a surviving 'deleted' audit row records the deletion"
+    );
+
+    // Deleting again is a 404 (the tx that would have written a second audit row
+    // rolls back, so no spurious 'deleted' row for a missing asset).
+    let again = app
+        .client
+        .delete(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("re-delete asset");
+    assert_eq!(
+        again.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "deleting a missing asset is 404"
+    );
+    let deleted_audit_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM asset_audit_log WHERE asset_id = $1 AND action = 'deleted'",
+    )
+    .bind(asset_uuid)
+    .fetch_one(&pool)
+    .await
+    .expect("recount deleted audit rows");
+    assert_eq!(
+        deleted_audit_after, 1,
+        "the failed re-delete writes no extra audit row (tx rolled back)"
+    );
+}

@@ -18,13 +18,9 @@ pub struct AssetsService {
 }
 
 impl AssetsService {
-    pub fn new(db: Database) -> Self {
-        Self {
-            db,
-            encryption_key: [0u8; 32],
-        }
-    }
-
+    // PMS-188: the zero-key `new()` constructor was removed. Every asset
+    // secret (credential_vault, configuration_item) must be encrypted under
+    // the configured key, so the only constructor takes that key explicitly.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
         Self { db, encryption_key }
     }
@@ -352,8 +348,26 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        performer: Uuid,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-188: record the deletion in asset_audit_log before the row is
+        // gone, in the same tx as the delete so a rollback drops both and a
+        // vault deletion is never untraceable. The asset_id FK column is not
+        // declared with ON DELETE, so insert the audit row first.
+        sqlx::query(
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id)
+               VALUES ($1, $2, 'deleted', $3)"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(performer)
+        .execute(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM assets WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)

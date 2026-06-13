@@ -1,5 +1,5 @@
 //! Recovery codes: 80 bits of randomness, base32-encoded, formatted as
-//! `XXXXX-XXXXX`. SHA-256 hash for at-rest storage.
+//! `XXXXXXXX-XXXXXXXX`. SHA-256 hash for at-rest storage.
 
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -9,14 +9,16 @@ use crate::totp::base32_encode;
 pub const RECOVERY_CODE_COUNT: usize = 10;
 pub const RECOVERY_CODE_BYTES: usize = 10;
 
-/// Generate one code. 10 random bytes => 16 base32 chars; we keep the
-/// first 10 and split as 5-5 for readability. 80 bits of entropy.
+/// Generate one code. 10 random bytes => 16 base32 chars (80 bits exactly,
+/// no padding); we keep all 16 and split 8-8 for readability. Retaining the
+/// full 16 chars preserves the 80 bits of entropy (PMS-188: the previous
+/// code kept only the first 10 chars, delivering just 50 bits despite the
+/// 80-bit comment).
 pub fn generate_code() -> String {
     let mut bytes = [0u8; RECOVERY_CODE_BYTES];
     rand::rng().fill_bytes(&mut bytes);
     let raw = base32_encode(&bytes);
-    let raw: String = raw.chars().take(10).collect();
-    format!("{}-{}", &raw[..5], &raw[5..])
+    format!("{}-{}", &raw[..8], &raw[8..])
 }
 
 pub fn generate_set() -> Vec<String> {
@@ -50,9 +52,11 @@ mod tests {
     #[test]
     fn generate_code_matches_format() {
         let c = generate_code();
-        assert_eq!(c.len(), 11);
-        assert_eq!(c.chars().nth(5), Some('-'));
+        // 16 base32 chars + 1 hyphen, split 8-8, so the full 80 bits is kept.
+        assert_eq!(c.len(), 17);
+        assert_eq!(c.chars().nth(8), Some('-'));
         let body = c.replace('-', "");
+        assert_eq!(body.len(), 16);
         assert!(
             body.chars().all(|c| matches!(c, 'A'..='Z' | '2'..='7')),
             "unexpected chars in {c}"

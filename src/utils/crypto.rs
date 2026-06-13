@@ -64,31 +64,51 @@ pub fn decrypt(encrypted: &str, key: &[u8; 32]) -> AppResult<String> {
         .map_err(|e| AppError::Internal(format!("UTF-8 decode error: {}", e)))
 }
 
-/// Parse a hex-encoded encryption key
+/// Parse an encryption key supplied as either 32 raw bytes or 64 hex
+/// characters.
+///
+/// PMS-188: a 32-character key is now always treated as 32 raw bytes. The
+/// previous code special-cased length 32 and copied the *bytes* of what
+/// might be a hex string, so an operator who supplied a 32-char hex string
+/// got a key that differed from their intent. A 32-char hex string is
+/// ambiguous (is it raw bytes or half a hex key?), so it is rejected: hex
+/// keys must be the unambiguous 64-char form, which is hex-decoded.
 pub fn parse_encryption_key(key_hex: &str) -> AppResult<[u8; 32]> {
-    // If the key is already 32 bytes (as a string), use it directly
+    // 64 hex characters: hex-decode to 32 bytes.
+    if key_hex.len() == 64 {
+        let mut key = [0u8; 32];
+        for (i, chunk) in key_hex.as_bytes().chunks(2).enumerate() {
+            let hex_str = std::str::from_utf8(chunk).map_err(|_| {
+                AppError::Configuration("Invalid encryption key format".to_string())
+            })?;
+            key[i] = u8::from_str_radix(hex_str, 16).map_err(|_| {
+                AppError::Configuration("Invalid encryption key format".to_string())
+            })?;
+        }
+        return Ok(key);
+    }
+
+    // 32 characters: only accept as raw bytes when it is unambiguously NOT a
+    // hex string. An all-hex 32-char value is ambiguous (it could be a
+    // mistyped 16-byte hex key or a 32-byte raw passphrase) and is rejected so
+    // it is never silently taken as raw bytes against operator intent.
     if key_hex.len() == 32 {
+        if key_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AppError::Configuration(format!(
+                "Encryption key is an ambiguous 32-character hex-looking string; \
+                 supply 32 raw bytes or a full 64-character hex key (got {} characters)",
+                key_hex.len()
+            )));
+        }
         let mut key = [0u8; 32];
         key.copy_from_slice(key_hex.as_bytes());
         return Ok(key);
     }
 
-    // Otherwise, try to parse as hex
-    if key_hex.len() != 64 {
-        return Err(AppError::Configuration(
-            "Encryption key must be 32 bytes (or 64 hex characters)".to_string(),
-        ));
-    }
-
-    let mut key = [0u8; 32];
-    for (i, chunk) in key_hex.as_bytes().chunks(2).enumerate() {
-        let hex_str = std::str::from_utf8(chunk)
-            .map_err(|_| AppError::Configuration("Invalid encryption key format".to_string()))?;
-        key[i] = u8::from_str_radix(hex_str, 16)
-            .map_err(|_| AppError::Configuration("Invalid encryption key format".to_string()))?;
-    }
-
-    Ok(key)
+    Err(AppError::Configuration(format!(
+        "Encryption key must be 32 raw bytes or 64 hex characters, got {} characters",
+        key_hex.len()
+    )))
 }
 
 /// Generate a random token (for password resets, API keys, etc.)
@@ -163,6 +183,36 @@ mod tests {
         let decrypted = decrypt(&encrypted, &key).unwrap();
 
         assert_eq!(plaintext, decrypted);
+    }
+
+    #[test]
+    fn test_parse_key_64_hex_is_decoded() {
+        // 64 hex chars -> 32 decoded bytes (not the raw ASCII of the string).
+        let key = parse_encryption_key(&"00".repeat(32)).unwrap();
+        assert_eq!(key, [0u8; 32]);
+        let key = parse_encryption_key(&"ff".repeat(32)).unwrap();
+        assert_eq!(key, [0xffu8; 32]);
+    }
+
+    #[test]
+    fn test_parse_key_32_raw_bytes_ok() {
+        // 32 chars containing non-hex characters is unambiguously raw.
+        let raw = "32-byte-key-for-dev-only-change!";
+        assert_eq!(raw.len(), 32);
+        let key = parse_encryption_key(raw).unwrap();
+        assert_eq!(&key, raw.as_bytes());
+    }
+
+    #[test]
+    fn test_parse_key_ambiguous_32_hex_rejected() {
+        // 32 all-hex chars is ambiguous and must be rejected, not taken raw.
+        assert!(parse_encryption_key(&"a".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn test_parse_key_wrong_length_reports_length() {
+        let err = parse_encryption_key("short").unwrap_err();
+        assert!(err.to_string().contains('5'), "error was: {err}");
     }
 
     #[test]

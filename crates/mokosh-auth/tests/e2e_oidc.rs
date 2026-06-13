@@ -121,6 +121,7 @@ async fn make_env(pool: PgPool) -> TestEnv {
         data_encryption_key: secrecy::SecretString::from("0".repeat(64)),
         data_encryption_key_prev: None,
         data_key_version: 1,
+        data_key_version_prev: None,
         access_token_ttl: Duration::seconds(600),
         refresh_token_ttl: Duration::seconds(3600),
         refresh_idle_ttl: Duration::seconds(1800),
