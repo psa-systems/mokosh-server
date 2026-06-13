@@ -23,7 +23,7 @@
 // clear message so the job fails loudly instead of testing a stale deploy.
 //
 // The API lives at a separate host from the SPA on the canonical deploy
-// (`mokosh.systems` SPA -> `api.mokosh.systems` API). Prefer an explicit
+// (`msp.a8n.systems` SPA -> `api.msp.a8n.systems` API). Prefer an explicit
 // E2E_API_BASE_URL; otherwise prepend `api.` to E2E_BASE_URL; otherwise
 // fall back to the SPA host (same-origin deploys only).
 //
@@ -145,7 +145,13 @@ function resolveBuildSha(headSha) {
   );
 }
 
-const spaBaseURL = pick(process.env.E2E_BASE_URL, 'https://mokosh.systems');
+// Required: no domain is hardcoded as a fallback. Inject the per-environment
+// SPA host (staging `https://msp.a8n.systems`, prod `https://msp.psa.systems`).
+const spaBaseURL = pick(process.env.E2E_BASE_URL);
+if (!spaBaseURL) {
+  console.error('E2E_BASE_URL is unset; set it to the SPA host (see e2e/README.md). Aborting.');
+  process.exit(1);
+}
 const apiBaseURL = pick(
   process.env.E2E_API_BASE_URL,
   deriveApiBase(spaBaseURL),

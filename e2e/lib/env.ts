@@ -29,9 +29,10 @@ function optional(name: string): string | undefined {
 }
 
 // Derive the API host from the SPA host by prepending `api.`. The canonical
-// deploy serves the SPA at `mokosh.systems` and the API at
-// `api.mokosh.systems`. Returns null when the SPA host is already prefixed
-// or the URL cannot be parsed.
+// staging deploy serves the SPA at `msp.a8n.systems` and the API at
+// `api.msp.a8n.systems` (prod: `msp.psa.systems` -> `api.msp.psa.systems`).
+// Returns null when the SPA host is already prefixed or the URL cannot be
+// parsed.
 function deriveApiBase(spaUrl: string): string | null {
   try {
     const u = new URL(spaUrl);
@@ -42,7 +43,10 @@ function deriveApiBase(spaUrl: string): string | null {
   }
 }
 
-const spaBaseURL = optional('E2E_BASE_URL') ?? 'https://mokosh.systems';
+// Required: no domain is ever hardcoded as a fallback. The SPA host differs
+// per environment (staging `https://msp.a8n.systems`, prod
+// `https://msp.psa.systems`), so the operator must inject it explicitly.
+const spaBaseURL = required('E2E_BASE_URL');
 const derivedApi = deriveApiBase(spaBaseURL);
 const apiBaseURL = optional('E2E_API_BASE_URL') ?? derivedApi ?? spaBaseURL;
 // The OIDC OP (provider) is a separate host from mokosh-server on
@@ -57,7 +61,7 @@ export const env = {
   baseURL: spaBaseURL,
   // Where the mokosh PSA JSON API lives. The api project and teardown hit
   // this host for `/api/v1/*`. Defaults to prepending `api.` to
-  // E2E_BASE_URL (so `mokosh.systems` -> `api.mokosh.systems`); override
+  // E2E_BASE_URL (so `msp.a8n.systems` -> `api.msp.a8n.systems`); override
   // with E2E_API_BASE_URL when the deployment uses a different naming
   // scheme. OIDC traffic (`/oauth2/*`, `/.well-known/*`) goes to
   // `opBaseURL` below, which can be a different host on bunyip-as-OP deploys.
@@ -102,6 +106,10 @@ export const env = {
 // one-line purpose so the aggregated error message names what each
 // missing value is for, not just which key is empty.
 const REQUIRED: Array<{ name: string; purpose: string }> = [
+  {
+    name: 'E2E_BASE_URL',
+    purpose: 'SPA host the suite navigates to (e.g. https://msp.a8n.systems); no default',
+  },
   { name: 'E2E_EMAIL', purpose: 'login email of the dedicated E2E account' },
   { name: 'E2E_PASSWORD', purpose: 'password for E2E_EMAIL' },
   { name: 'E2E_TENANT_ID', purpose: 'UUID of the dedicated E2E tenant' },

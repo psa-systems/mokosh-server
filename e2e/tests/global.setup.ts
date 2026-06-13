@@ -199,12 +199,12 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   //
   // Filter to the OP host and its parent domain. Cookies on bunyip-as-OP
   // deploys are split: the OP-session cookie lives on the OP host
-  // (e.g. `api.mokosh.systems`) while the hub access/refresh cookies live
-  // on the apex (`mokosh.systems`). Including both covers the authorize
+  // (e.g. `api.msp.a8n.systems`) while the hub access/refresh cookies live
+  // on the apex (`a8n.systems`). Including both covers the authorize
   // path completely without sweeping in unrelated cookies (font CDNs,
   // analytics, etc.) that would just bloat the file. Normalise
-  // leading-dot domains before comparing so `.mokosh.systems` matches
-  // `mokosh.systems` as expected.
+  // leading-dot domains before comparing so `.a8n.systems` matches
+  // `a8n.systems` as expected.
   const opCookieDomains = computeOpCookieDomains(env.opBaseURL);
   const allCookies = await page.context().cookies();
   const opCookies = allCookies.filter((c) => {
@@ -229,8 +229,8 @@ setup('capture bearer from the SPA login', async ({ page }) => {
 
 // Compute the set of cookie-domain values the OIDC test cares about, given
 // the configured OP base URL. Includes the OP host itself plus the
-// immediate parent domain (so e.g. `api.mokosh.systems` yields both
-// `api.mokosh.systems` and `mokosh.systems`). Single-label hosts (`localhost`)
+// immediate parent domain (so e.g. `api.a8n.systems` yields both
+// `api.a8n.systems` and `a8n.systems`). Single-label hosts (`localhost`)
 // and IP literals return just themselves: stripping a leading label off
 // `127.0.0.1` produces the bogus `0.0.1`, which would match no real
 // cookie but would clutter the diagnostic line. We deliberately do NOT

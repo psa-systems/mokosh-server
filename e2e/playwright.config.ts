@@ -17,7 +17,7 @@ export default defineConfig({
   expect: { timeout: 15_000 },
   reporter: [['list'], ['html', { open: 'never' }]],
   // No top-level baseURL: SPA vs API have different hosts on the canonical
-  // deployment (mokosh.systems vs api.mokosh.systems). Each project picks
+  // deployment (msp.a8n.systems vs api.msp.a8n.systems). Each project picks
   // the right one in its own `use:` block.
   use: {
     trace: 'retain-on-failure',
