@@ -423,7 +423,9 @@ impl AuthService {
                 access_token: String::new(),
                 refresh_token: String::new(),
                 expires_at: Utc::now(),
-                user: user.to_current_user(),
+                // Omit the user profile until the second factor is satisfied,
+                // mirroring the password `login()` mfa_required branch.
+                user: None,
                 mfa_required: true,
             });
         }
