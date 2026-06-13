@@ -12,12 +12,6 @@ on:
     branches:
       - main
 
-# sqlx compile-time query checks read the committed `.sqlx/` offline data
-# instead of connecting to a database. Runtime sqlx calls in the
-# integration tests still hit the live Postgres service below.
-env:
-  SQLX_OFFLINE: "true"
-
 jobs:
   check:
     name: fmt + clippy + compile + tests
@@ -34,7 +28,7 @@ jobs:
     # nothing is listening on 5432.
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18.2-alpine3.23
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
@@ -76,6 +70,11 @@ jobs:
         run: cargo test --doc
 
       - name: Integration tests
+        # cargo test --tests runs every integration suite (all `tests/*.rs`
+        # binaries) plus the lib unit tests, so new suites are picked up
+        # automatically instead of via a hand-maintained --test allowlist
+        # that silently dropped 13 of 22 suites from CI.
+        #
         # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
         # Each test creates a per-test database AND holds the sqlx-test
         # maintenance pool; at default per-cpu parallelism on a 16-core
@@ -83,4 +82,4 @@ jobs:
         # tests/auth.rs (14 tests). 4 in-flight is well within the
         # postgres default max_connections (100); slight wall-clock cost,
         # full reliability.
-        run: cargo test --test auth --test contacts --test tenants --test tickets --test notifications --test rmm --test dispatch_stub --test readiness --test scheduler -- --test-threads=4
+        run: cargo test --tests -- --test-threads=4
