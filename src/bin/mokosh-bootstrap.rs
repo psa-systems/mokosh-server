@@ -56,6 +56,19 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        // `mokosh-bootstrap provision-roles` (PMS-285) creates the split DB
+        // roles - `mokosh_migrator` (BYPASSRLS, owns the schema / runs DDL) and
+        // `mokosh_app` (NOSUPERUSER NOBYPASSRLS, the request-serving role) - and
+        // grants `mokosh_app` read/write on existing + future objects. Run once
+        // with privileged creds (it already runs with elevated rights for the
+        // other subcommands). Idempotent: re-running only reconciles grants.
+        Some("provision-roles") => match run_provision_roles().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {:#}", e);
+                ExitCode::FAILURE
+            }
+        },
         // `mokosh-bootstrap clients register` registers a new OAuth/OIDC
         // client in mokosh_auth.oauth_clients. The form in argv is
         // intentional: future client subcommands (`list`, `disable`,
@@ -101,8 +114,14 @@ USAGE:
 
 SUBCOMMANDS:
     bootstrap-infisical    First-run setup of a fresh Infisical instance.
+    provision-roles        Create the split DB roles (mokosh_migrator / mokosh_app).
     clients register       Register a new OAuth/OIDC client in mokosh_auth.
     --version, -V          Print version information and exit.
+
+ENVIRONMENT (provision-roles):
+    DATABASE_URL                  (required) Privileged Postgres URL (BYPASSRLS / superuser).
+    MOKOSH_MIGRATOR_PASSWORD      (required) Password to set on the mokosh_migrator role.
+    MOKOSH_APP_PASSWORD           (required) Password to set on the mokosh_app role.
 
 ENVIRONMENT (clients register):
     DATABASE_URL                     (required) Postgres URL for mokosh_auth.
@@ -194,6 +213,102 @@ async fn run_bootstrap_infisical() -> anyhow::Result<()> {
     println!("INFISICAL_ENVIRONMENT, INFISICAL_ADMIN_EMAIL, INFISICAL_ADMIN_PASSWORD.");
     println!("Restart Mokosh services so they pick up the new credentials.");
     Ok(())
+}
+
+// --- provision-roles (PMS-285) -------------------------------------------
+
+/// Create / reconcile the two-role split that activates RLS at runtime:
+///
+/// - `mokosh_migrator` (`LOGIN BYPASSRLS`) owns the schema and runs DDL / seed
+///   / system-shared writes. Migrations and bootstrap connect as it.
+/// - `mokosh_app` (`LOGIN NOSUPERUSER NOBYPASSRLS`) is the request-serving
+///   role. It is granted read/write on every existing table, sequence and
+///   function, plus `ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator` so
+///   objects created by future migrations are auto-granted. It owns nothing.
+///
+/// Idempotent: roles are created only if absent; passwords and grants are
+/// always reconciled. Connect with privileged creds (`DATABASE_URL`).
+async fn run_provision_roles() -> anyhow::Result<()> {
+    use sqlx::postgres::PgPoolOptions;
+
+    let database_url = require_env("DATABASE_URL")?;
+    let migrator_password = require_env("MOKOSH_MIGRATOR_PASSWORD")?;
+    let app_password = require_env("MOKOSH_APP_PASSWORD")?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+
+    let db_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await?;
+
+    // Role names are fixed identifiers (no injection surface). Passwords are
+    // interpolated as SQL string literals - utility statements (CREATE/ALTER
+    // ROLE) cannot take bind parameters - so escape single quotes by doubling.
+    let migrator_pw = sql_quote(&migrator_password);
+    let app_pw = sql_quote(&app_password);
+    let db = quote_ident(&db_name);
+
+    // CREATE ROLE is not idempotent, so guard each with a DO block; ALTER ROLE
+    // afterwards reconciles the password + attributes on an existing role.
+    let stmts: Vec<String> = vec![
+        format!(
+            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mokosh_migrator') \
+             THEN CREATE ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD {migrator_pw}; END IF; END $do$"
+        ),
+        format!("ALTER ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD {migrator_pw}"),
+        format!(
+            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mokosh_app') \
+             THEN CREATE ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {app_pw}; END IF; END $do$"
+        ),
+        format!("ALTER ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {app_pw}"),
+        // The migrator owns/creates schema objects.
+        "GRANT ALL ON SCHEMA public TO mokosh_migrator".to_string(),
+        // The app role: connect + use the schema, read/write existing objects.
+        format!("GRANT CONNECT ON DATABASE {db} TO mokosh_app"),
+        "GRANT USAGE ON SCHEMA public TO mokosh_app".to_string(),
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mokosh_app"
+            .to_string(),
+        "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mokosh_app".to_string(),
+        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO mokosh_app".to_string(),
+        // Future objects created by the migrator are auto-granted to the app.
+        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
+         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mokosh_app"
+            .to_string(),
+        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
+         GRANT USAGE, SELECT ON SEQUENCES TO mokosh_app"
+            .to_string(),
+        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
+         GRANT EXECUTE ON FUNCTIONS TO mokosh_app"
+            .to_string(),
+    ];
+
+    for stmt in &stmts {
+        sqlx::query(stmt)
+            .execute(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("provision-roles step failed ({e}): {stmt}"))?;
+    }
+
+    println!("Roles provisioned.");
+    println!("  mokosh_migrator: LOGIN BYPASSRLS (owns schema, runs migrations/bootstrap)");
+    println!("  mokosh_app:      LOGIN NOSUPERUSER NOBYPASSRLS (request-serving, owns nothing)");
+    println!("  database:        {db_name}");
+    println!();
+    println!("Point DATABASE_URL at mokosh_migrator and MOKOSH_APP_DATABASE_URL at mokosh_app.");
+    Ok(())
+}
+
+/// Quote a string as a single-quoted SQL literal, doubling embedded quotes.
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Quote an SQL identifier, doubling embedded double-quotes.
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 fn require_env(key: &str) -> anyhow::Result<String> {

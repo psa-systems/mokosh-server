@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use mokosh_auth_core::{AuthError, TenantId, TotpEnrollment, TotpRepository, UserId};
 use uuid::Uuid;
 
-use crate::conv::db_err;
+use crate::conv::{db_err, retry_serializable};
 use crate::pool::AuthPool;
 
 const SELECT_TOTP: &str = r#"
@@ -139,19 +139,7 @@ impl TotpRepository for PgTotpRepository {
     }
 
     async fn confirm(&self, user_id: UserId) -> Result<(), AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self.confirm_once(user_id).await {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(attempt, "totp confirm serialization conflict; retrying");
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("totp confirm", || self.confirm_once(user_id)).await
     }
 
     async fn consume_step(&self, user_id: UserId, step: i64) -> Result<(), AuthError> {
@@ -173,19 +161,7 @@ impl TotpRepository for PgTotpRepository {
     }
 
     async fn disenroll(&self, user_id: UserId) -> Result<(), AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self.disenroll_once(user_id).await {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(attempt, "totp disenroll serialization conflict; retrying");
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("totp disenroll", || self.disenroll_once(user_id)).await
     }
 }
 

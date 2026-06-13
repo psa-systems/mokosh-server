@@ -71,7 +71,12 @@ impl DispatcherWorker {
     /// the worker deterministically (no sleep, no spawn).
     #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self, limit: i64) -> AppResult<TickStats> {
-        let mut tx = self.db.pool().begin().await?;
+        // SAFETY (PMS-285): the dispatcher drains pending `notifications` across
+        // EVERY tenant in one `FOR UPDATE SKIP LOCKED` batch (the worker owns the
+        // cadence), so it cannot set a single tenant GUC and runs on the migrator
+        // (BYPASSRLS) pool. Each row carries its own `tenant_id` for the delivery
+        // / status-update work that follows.
+        let mut tx = self.db.migrator_pool().begin().await?;
 
         let rows = sqlx::query(
             r#"

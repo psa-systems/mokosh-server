@@ -223,17 +223,18 @@ async fn delete_alert_rule(
 async fn ingest_alert(
     State(s): State<RmmRouterState>,
     headers: HeaderMap,
-    Json(req): Json<IngestAlertRequest>,
+    body: axum::body::Bytes,
 ) -> AppResult<Json<serde_json::Value>> {
+    // Parse the raw bytes for field access (the connection id drives the
+    // secret lookup) but keep `body` for the HMAC compare below.
+    let req: IngestAlertRequest =
+        serde_json::from_slice(&body).map_err(|_| AppError::Unauthorized)?;
     req.validate()?;
     let signature = headers
         .get("X-Signature")
         .and_then(|h| h.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
 
-    // The body is parsed twice (axum + our HMAC compare) to avoid a
-    // raw-body extractor; we re-serialise the parsed Json for HMAC.
-    let body = serde_json::to_vec(&req).map_err(|_| AppError::Unauthorized)?;
     // SAFETY (PMS-139): this is an unauthenticated machine webhook, so there is
     // no CurrentUser to scope from. The tenant comes from the signed
     // `X-Tenant-Id` header and is authenticated below by HMAC against that
@@ -251,6 +252,10 @@ async fn ingest_alert(
         .connection_api_secret(tenant_id, req.rmm_connection_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
+    // Verify the HMAC over the ORIGINAL raw bytes (PMS-195). Re-serialising
+    // the parsed JSON reorders fields, drops unknown keys, and normalises
+    // whitespace, so a valid agent signature computed over the wire bytes
+    // would be rejected. Compare against exactly what the agent signed.
     let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes())
         .map_err(|_| AppError::Internal("hmac key invalid".to_string()))?;
     mac.update(&body);

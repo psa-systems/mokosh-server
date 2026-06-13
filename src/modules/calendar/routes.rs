@@ -12,7 +12,6 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::CalendarService;
-use super::{CalendarEvent, CalendarEventFilter};
 use crate::modules::auth::{RequireCalendar, RequireManager, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -23,15 +22,12 @@ pub struct CalendarRouterState {
 }
 
 /// Mount calendar endpoints under `/api/v1` (the parent router uses
-/// `merge`). The pre-existing `/calendar/events` placeholder stays so
-/// existing clients keep working.
+/// `merge`).
 pub fn calendar_routes(service: CalendarService) -> Router {
     let state = CalendarRouterState {
         service: Arc::new(service),
     };
     Router::new()
-        // Legacy events surface
-        .route("/calendar/events", get(list_events))
         // PMS-60 appointments
         .route(
             "/appointments",
@@ -111,20 +107,6 @@ async fn dispatch_view(
             .dispatch_view(u.tenant(), from, to, f.assigned_to_id)
             .await?,
     ))
-}
-
-/// `GET /api/v1/calendar/events?from=<rfc3339>&to=<rfc3339>`
-async fn list_events(
-    RequireCalendar { user: _user, .. }: RequireCalendar,
-    Query(filter): Query<CalendarEventFilter>,
-    Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<CalendarEvent>>> {
-    filter.validate()?;
-    Ok(Json(PaginatedResponse::from_params(
-        Vec::new(),
-        &pagination,
-        0,
-    )))
 }
 
 async fn list_appointments(

@@ -39,16 +39,6 @@ use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::version::VersionInfo;
 use crate::version_check::version_check;
 
-/// Application state shared across all routes. Not constructed yet - the
-/// router threads individual services directly; kept as the intended
-/// shared-state type for handlers that adopt it later.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Database,
-    pub jwt_secret: String,
-}
-
 /// Create the main API router with all routes.
 ///
 /// When `at_jwt` is `Some`, PSA endpoints accept access tokens minted by
@@ -97,7 +87,12 @@ pub fn create_api_router(
     );
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
-    let contact_service = ContactService::new(db.clone());
+    // PMS-136: ContactService emails a `/portal/set-password` setup link when
+    // an agent grants portal access, so it holds the shared mailer + the SPA
+    // origin (the link base). `mailer` is cloned here because TicketService
+    // also takes it below.
+    let contact_service =
+        ContactService::with_mailer(db.clone(), mailer.clone(), client_origin.clone());
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer, notifications_service.clone());
     // PMS-157: first-visit demo seeding. Holds its own clones of the
@@ -532,80 +527,4 @@ async fn probe_infisical() -> Result<bool, String> {
 /// to confirm exactly which revision a running server was built from.
 async fn version_info() -> Json<VersionInfo> {
     Json(VersionInfo::current())
-}
-
-/// Metadata describing a placeholder module surface. Used to render a
-/// self-documenting 501 body (F12 / PMS-125) so an integrator hitting
-/// an unimplemented endpoint learns the module name, the YouTrack
-/// issue tracking the implementation, and the planned endpoint shape
-/// without having to grep the source.
-///
-/// `dispatch` (PMS-58) was the last live caller; it now has a real
-/// router. The helper is kept (not deleted) because the same
-/// self-documenting-501 pattern is the agreed shape for the remaining
-/// placeholder modules - the next module to graduate re-wires it the
-/// same way `dispatch` did. `#[allow(dead_code)]` until then.
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-struct StubModule {
-    /// Module slug as it appears in the URL (e.g. `dispatch`).
-    name: &'static str,
-    /// YouTrack key tracking the implementation (e.g. `PMS-58`).
-    tracking_issue: &'static str,
-    /// One-line description of the module's purpose.
-    summary: &'static str,
-    /// Planned endpoints as `(method, path, summary)`.
-    planned_endpoints: &'static [(&'static str, &'static str, &'static str)],
-}
-
-/// Build a router that responds with a self-documenting 501 for every
-/// request under the module's mount point. Replaces the previous
-/// generic `Not implemented yet` body (audit F12 / PMS-125). The
-/// catch-all route uses Axum's `{*rest}` wildcard so sub-paths under
-/// the module also surface the same payload instead of falling
-/// through to a 404.
-///
-/// Retained for the remaining placeholder modules; see [`StubModule`].
-#[allow(dead_code)]
-fn module_stub_routes(meta: StubModule) -> Router {
-    Router::new()
-        .route("/", get(stub_handler))
-        .route("/{*rest}", get(stub_handler))
-        .with_state(meta)
-}
-
-#[allow(dead_code)]
-async fn stub_handler(
-    axum::extract::State(meta): axum::extract::State<StubModule>,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> impl IntoResponse {
-    let endpoints: Vec<serde_json::Value> = meta
-        .planned_endpoints
-        .iter()
-        .map(|(method, path, summary)| {
-            serde_json::json!({
-                "method": method,
-                "path": path,
-                "summary": summary,
-            })
-        })
-        .collect();
-    let body = serde_json::json!({
-        "error": "not_implemented",
-        "module": meta.name,
-        "path": uri.path(),
-        "summary": meta.summary,
-        "tracking_issue": meta.tracking_issue,
-        "tracking_url": format!(
-            "https://niceguyit.myjetbrains.com/youtrack/issue/{}",
-            meta.tracking_issue
-        ),
-        "planned_endpoints": endpoints,
-        "docs": "dev-docs/codebase-state.md",
-    });
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
 }

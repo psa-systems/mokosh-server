@@ -5,7 +5,7 @@
 //! "portal_access"` so the middleware can distinguish them from agent
 //! tokens.
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use uuid::Uuid;
 
@@ -59,7 +59,15 @@ impl PortalAuthService {
         )
         .bind(&request.tenant_slug)
         .bind(&request.email)
-        .fetch_optional(self.db.pool())
+        // SAFETY (PMS-285): the portal runs on a separate `contacts`-row identity
+        // plane (`CurrentContact`), not the `users`/`AuthState` plane, and
+        // per-user RLS isolation is deliberately NOT applied to portal contacts
+        // yet (see `dev-docs/rls-per-user-isolation.md`, "Portal identity"). This
+        // login is pre-auth - it resolves the contact by `(tenant_slug, email)`
+        // before any session exists - so there is no GUC to set and it runs on
+        // the migrator pool. `contacts` is RLS-covered, so the app pool would
+        // fail this lookup closed.
+        .fetch_optional(self.db.migrator_pool())
         .await?;
 
         let Some((id, tenant_id, company_id, email, first_name, last_name, is_portal_user, hash)) =
@@ -78,11 +86,15 @@ impl PortalAuthService {
             return Err(AppError::Unauthorized);
         }
 
+        // SAFETY (PMS-285): companion write to the portal login above, same
+        // separate `contacts`-identity plane with portal isolation deferred.
+        // Targets the just-authenticated contact by primary key; migrator pool
+        // because `contacts` is RLS-covered and the portal plane sets no GUC.
         sqlx::query(
             "UPDATE contacts SET portal_last_login_at = NOW(), updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
-        .execute(self.db.pool())
+        .execute(self.db.migrator_pool())
         .await?;
 
         let now = Utc::now();
@@ -117,6 +129,25 @@ impl PortalAuthService {
         })
     }
 
+    /// Re-read a contact's display names from the `contacts` row. The
+    /// portal JWT omits names (PII minimisation), so the middleware
+    /// hydrates `first_name` / `last_name` for `/me`-style handlers after
+    /// decoding the token (PMS-195). Scoped by `(tenant_id, id)`.
+    pub async fn contact_names(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT first_name, last_name FROM contacts WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(row)
+    }
+
     /// Decode + validate a portal JWT. Rejects anything that isn't
     /// `typ = "portal_access"` so an agent's access token cannot be
     /// replayed against the portal surface.
@@ -133,6 +164,93 @@ impl PortalAuthService {
         Ok(data.claims)
     }
 
+    /// Redeem a single-use portal setup token and set the contact's
+    /// password (PMS-136). The token is `{contact_id}.{secret}`; only the
+    /// Argon2 hash of the secret is stored (`portal_setup_tokens`), so the
+    /// lookup is scoped by `contact_id` and each candidate row's hash is
+    /// verified in turn. Status contract:
+    ///
+    /// - valid, unused, unexpired -> sets `portal_password_hash`, marks the
+    ///   token used, returns `Ok(())` (the handler maps to 204).
+    /// - already redeemed -> `AppError::Gone` (410).
+    /// - expired -> `AppError::BadRequest` (400).
+    /// - no matching token -> `AppError::BadRequest` (400), so a guessed or
+    ///   stale token is indistinguishable from an expired one.
+    #[tracing::instrument(skip_all)]
+    pub async fn setup_password(&self, token: &str, new_password: &str) -> AppResult<()> {
+        if new_password.len() < 8 {
+            return Err(AppError::BadRequest(
+                "Password must be at least 8 characters".to_string(),
+            ));
+        }
+
+        let (contact_id, secret) = parse_contact_bound_token(token)
+            .ok_or_else(|| AppError::BadRequest("Invalid or expired setup token".to_string()))?;
+
+        // All tokens ever minted for this contact, newest first. We need the
+        // used/expired rows too so a replay can be told apart from an expired
+        // link. Tokens are salted Argon2 hashes and cannot be looked up by
+        // value, so each candidate is verified against the presented secret.
+        let candidates =
+            sqlx::query_as::<_, (Uuid, Uuid, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
+                r#"
+            SELECT id, tenant_id, token_hash, used_at, expires_at
+            FROM portal_setup_tokens
+            WHERE contact_id = $1
+            ORDER BY created_at DESC
+            "#,
+            )
+            .bind(contact_id)
+            .fetch_all(self.db.pool())
+            .await?;
+
+        let mut matched: Option<(Uuid, Uuid)> = None; // (token_id, tenant_id)
+        for (token_id, tenant_id, token_hash, used_at, expires_at) in &candidates {
+            if verify_password(secret, token_hash)? {
+                if used_at.is_some() {
+                    return Err(AppError::Gone("Setup token already used".to_string()));
+                }
+                if *expires_at <= Utc::now() {
+                    return Err(AppError::BadRequest(
+                        "Invalid or expired setup token".to_string(),
+                    ));
+                }
+                matched = Some((*token_id, *tenant_id));
+                break;
+            }
+        }
+        let Some((token_id, tenant_id)) = matched else {
+            return Err(AppError::BadRequest(
+                "Invalid or expired setup token".to_string(),
+            ));
+        };
+
+        let hash = hash_password(new_password)?;
+        // Tenant-scoped write: set the credential and burn the token in one
+        // transaction so a crash cannot leave a usable token behind a set
+        // password.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&hash)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE portal_setup_tokens SET used_at = NOW() WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(token_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     /// Set or replace the portal password for a contact. Surfaces to a
     /// future `PUT /api/v1/portal/auth/password` endpoint that the
     /// customer hits after clicking their setup link.
@@ -145,13 +263,31 @@ impl PortalAuthService {
             ));
         }
         let hash = hash_password(new_password)?;
+        // SAFETY (PMS-285): portal account setup on the separate
+        // `contacts`-identity plane (portal isolation deferred; see the login
+        // note above). Reached via an emailed setup link before any portal
+        // session exists, so it sets no GUC and targets the one contact by id.
+        // Migrator pool because `contacts` is RLS-covered.
         sqlx::query(
             "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, updated_at = NOW() WHERE id = $2",
         )
         .bind(&hash)
         .bind(contact_id)
-        .execute(self.db.pool())
+        .execute(self.db.migrator_pool())
         .await?;
         Ok(())
     }
+}
+
+/// Split a portal setup token `{contact_id}.{secret}` into its parts.
+/// Mirrors the user-bound reset token shape in `auth::service` so the
+/// stored hash can be scoped to a single contact. Returns `None` for any
+/// malformed token (no dot, unparseable id, empty secret).
+fn parse_contact_bound_token(token: &str) -> Option<(Uuid, &str)> {
+    let (id, secret) = token.split_once('.')?;
+    if secret.is_empty() {
+        return None;
+    }
+    let contact_id = Uuid::parse_str(id).ok()?;
+    Some((contact_id, secret))
 }

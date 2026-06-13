@@ -8,7 +8,15 @@ use tokio::net::TcpListener;
 /// Application configuration loaded from environment
 #[derive(Clone, Debug)]
 pub struct AppConfig {
+    /// Privileged (`mokosh_migrator`, BYPASSRLS) connection string. Runs
+    /// migrations, bootstrap, the cross-tenant workers and the
+    /// explicitly-justified pre-auth / cross-tenant paths.
     pub database_url: String,
+    /// Request-serving (`mokosh_app`, NOSUPERUSER NOBYPASSRLS) connection
+    /// string (PMS-285). Falls back to `database_url` when unset, which
+    /// preserves the pre-split single-role behaviour (RLS does not bite
+    /// because the single role bypasses it).
+    pub app_database_url: String,
     pub jwt_secret: String,
     pub host: String,
     pub port: u16,
@@ -48,6 +56,14 @@ impl AppConfig {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
             }),
+            // PMS-285: the request-serving role. Default to DATABASE_URL so a
+            // dev box without the split still boots (RLS stays inert until the
+            // app role is a NOBYPASSRLS one).
+            app_database_url: std::env::var("MOKOSH_APP_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .unwrap_or_else(|_| {
+                    "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
+                }),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -87,6 +103,14 @@ impl AppConfig {
         self.environment == "production"
     }
 
+    /// Dev/test environments run over plain HTTP, where browsers drop
+    /// `Secure` cookies. Only these opt out of secure cookies; every other
+    /// environment (staging, production, or any unrecognized value) defaults
+    /// to secure, so a misconfigured `ENVIRONMENT` fails safe.
+    pub fn is_dev_or_test(&self) -> bool {
+        matches!(self.environment.as_str(), "development" | "dev" | "test")
+    }
+
     // PMS-262: single-tenant mode removed. Multi-tenant is the only mode.
     pub fn is_multi_tenant(&self) -> bool {
         true
@@ -109,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AppConfig::from_env().expect("Failed to load configuration");
 
-    let db = Database::new(&config.database_url).await?;
+    let db = Database::new(&config.app_database_url, &config.database_url).await?;
 
     // A migration failure is fatal: exit non-zero rather than serve a
     // half-migrated database (PMS-286). Warn-and-continue here once let a
@@ -137,7 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // be passed into the PSA router as the at+jwt verifier. The PSA
     // middleware then accepts SSO-issued access tokens alongside its
     // own legacy HS256 cookies.
-    let (sso_router, at_jwt) = match try_bootstrap_sso(db.pool().clone()).await {
+    // SAFETY (PMS-285): SSO bootstrap registers OAuth clients and seeds the
+    // mokosh_auth schema (DDL/system rows) before any request is served, so it
+    // runs on the privileged migrator pool, not the NOBYPASSRLS app pool.
+    let (sso_router, at_jwt) = match try_bootstrap_sso(db.migrator_pool().clone()).await {
         Ok(SsoSetup::Mounted(auth)) => {
             tracing::info!("SSO subsystem mounted (mokosh-auth)");
             let issuer = auth.provider.cfg.issuer.as_str().to_string();
@@ -177,8 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Browsers drop `Secure` cookies on plain HTTP, so disable the flag
-    // in development. In any non-dev environment, set it.
-    let cookie_secure = config.is_production();
+    // only in dev/test. Everywhere else (staging, production, or an
+    // unrecognized ENVIRONMENT) defaults to secure so the OAuth state
+    // cookie is not exposed over a downgraded connection.
+    let cookie_secure = !config.is_dev_or_test();
 
     // Build the host-crate mailer (SmtpMailer when SMTP_HOST is set,
     // LogMailer otherwise). Hard-fail on misconfiguration so an

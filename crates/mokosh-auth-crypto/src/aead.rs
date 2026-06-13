@@ -15,6 +15,8 @@ pub enum AeadError {
     UnknownKeyVersion(u16),
     #[error("decryption failed")]
     Decrypt,
+    #[error("encryption failed")]
+    Encrypt,
 }
 
 /// On-disk / in-DB ciphertext. The `version` field selects which key in
@@ -60,7 +62,7 @@ impl EncryptionKeySet {
         let ct = self
             .current
             .encrypt(&nonce, plaintext)
-            .map_err(|_| AeadError::Decrypt)?;
+            .map_err(|_| AeadError::Encrypt)?;
         Ok(EncryptedBlob {
             version: self.current_version,
             nonce: nonce.to_vec(),

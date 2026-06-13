@@ -190,6 +190,9 @@ where
     };
     audit_write(
         exec,
+        // SAFETY (PMS-285): `tenant_id` is the caller's own authenticated tenant,
+        // threaded in by the auth flow recording this event; the audit row is
+        // written under the same scope, so bridging the bare Uuid is sound.
         TenantId::from_trusted(tenant_id),
         &ctx,
         action,

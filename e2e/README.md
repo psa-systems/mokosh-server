@@ -96,7 +96,7 @@ is manual-dispatch only (see [CI](#ci)).
 | `E2E_OIDC_CLIENT_ID` | public OIDC client id for the token-flow test |
 | `E2E_OIDC_REDIRECT_URI` | redirect_uri registered for that client (no default; must match exactly or the OP returns `invalid_redirect_uri`). Only the `code` is captured, the URL is never loaded |
 | `E2E_TOTP_SECRET` | base32 TOTP secret for the E2E account. Setup generates the second-factor code at runtime; same string you pasted into your authenticator when enrolling 2FA on the account |
-| `E2E_FOREIGN_COMPANY_ID` | *optional* - a company id in **another** tenant; enables the cross-tenant company canary, otherwise that test is skipped |
+| `E2E_FOREIGN_COMPANY_ID` | *optional* - a company id in **another** tenant. The cross-tenant company canary always runs; setting this strengthens it (an existing, foreign-owned company must still 403/404). When unset, `global.setup.ts` falls back to a random, well-formed UUID the E2E tenant cannot own |
 
 ## One-time staging provisioning (manual)
 
@@ -158,7 +158,9 @@ Done once by a human before the suite can pass against a deployment:
    a login screen instead of returning a `code`, register a dedicated E2E client
    whose redirect_uri allows capture-only.
 4. *(optional)* **Foreign company** - note a company id from a different tenant
-   as `E2E_FOREIGN_COMPANY_ID` to enable the cross-tenant leak canary.
+   as `E2E_FOREIGN_COMPANY_ID` to strengthen the cross-tenant leak canary. The
+   canary runs either way: when unset, `global.setup.ts` uses a random,
+   well-formed UUID the E2E tenant cannot own.
 5. Store all of the above as Forgejo Actions secrets for
    `.forgejo/workflows/e2e.yml` (PMS-271). The secret names follow the table in
    [Required configuration](#required-configuration): three vars use the

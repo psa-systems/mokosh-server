@@ -67,7 +67,12 @@ impl RmmSyncWorker {
               )
             "#,
         )
-        .fetch_all(self.db.pool())
+        // SAFETY (PMS-285): the sync worker picks due `rmm_connections` across
+        // EVERY tenant (the worker owns the cadence), so it cannot set a single
+        // tenant GUC and runs on the migrator (BYPASSRLS) pool. Each row carries
+        // its `tenant_id`, and the per-connection device work below sets that
+        // tenant's GUC via `begin_with_tenant`.
+        .fetch_all(self.db.migrator_pool())
         .await
         .map_err(|e| AppError::Database(format!("rmm worker pick: {e}")))?;
 
@@ -134,7 +139,10 @@ impl RmmSyncWorker {
                WHERE id = $1"#,
         )
         .bind(connection_id)
-        .execute(self.db.pool())
+        // SAFETY (PMS-285): `rmm_connections` status bookkeeping for the
+        // cross-tenant sync worker, keyed by connection id. Migrator pool (the
+        // mark_in_progress/mark_failed companions carry no tenant either).
+        .execute(self.db.migrator_pool())
         .await
         .map_err(|e| AppError::Database(format!("rmm mark success: {e}")))?;
         Ok(stats)
@@ -147,7 +155,9 @@ impl RmmSyncWorker {
                WHERE id = $1"#,
         )
         .bind(connection_id)
-        .execute(self.db.pool())
+        // SAFETY (PMS-285): cross-tenant RMM worker connection-status write keyed
+        // by connection id; no tenant in scope. Migrator pool.
+        .execute(self.db.migrator_pool())
         .await
         .map_err(|e| AppError::Database(format!("rmm mark in_progress: {e}")))?;
         Ok(())
@@ -162,7 +172,9 @@ impl RmmSyncWorker {
         )
         .bind(err)
         .bind(connection_id)
-        .execute(self.db.pool())
+        // SAFETY (PMS-285): cross-tenant RMM worker connection-status write keyed
+        // by connection id; no tenant in scope. Migrator pool.
+        .execute(self.db.migrator_pool())
         .await
         .map_err(|e| AppError::Database(format!("rmm mark failed: {e}")))?;
         Ok(())
@@ -234,6 +246,8 @@ impl RmmSyncWorker {
         };
 
         if let Some(asset_id) = existing_asset {
+            // `assets` is RLS-covered and `tenant_id` is in scope, so set the GUC.
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query(
                 r#"UPDATE assets
                    SET last_sync_at = NOW(), rmm_device_id = $1, updated_at = NOW()
@@ -241,9 +255,10 @@ impl RmmSyncWorker {
             )
             .bind(&d.rmm_device_id)
             .bind(asset_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(format!("rmm touch asset: {e}")))?;
+            tx.commit().await?;
             self.write_audit(tenant_id, asset_id, "synced", d).await?;
             return Ok(Some(LinkResult {
                 created: false,
@@ -289,13 +304,16 @@ impl RmmSyncWorker {
         };
 
         if let Some(asset_id) = candidate {
-            // Existing asset, link mapping + bump last_sync_at.
+            // Existing asset, link mapping + bump last_sync_at. Both
+            // `rmm_device_mappings` and `assets` are RLS-covered and `tenant_id`
+            // is in scope, so run them under the tenant GUC.
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query(
                 "UPDATE rmm_device_mappings SET asset_id = $1, updated_at = NOW() WHERE id = $2",
             )
             .bind(asset_id)
             .bind(mapping_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(format!("rmm link mapping: {e}")))?;
             sqlx::query(
@@ -305,9 +323,10 @@ impl RmmSyncWorker {
             )
             .bind(&d.rmm_device_id)
             .bind(asset_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(format!("rmm touch matched asset: {e}")))?;
+            tx.commit().await?;
             self.write_audit(tenant_id, asset_id, "synced", d).await?;
             return Ok(Some(LinkResult {
                 created: false,
@@ -358,14 +377,17 @@ impl RmmSyncWorker {
         .map_err(|e| AppError::Database(format!("rmm create asset: {e}")))?;
         insert_tx.commit().await?;
 
+        // `rmm_device_mappings` is RLS-covered and `tenant_id` is in scope.
+        let mut link_tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE rmm_device_mappings SET asset_id = $1, updated_at = NOW() WHERE id = $2",
         )
         .bind(asset_id)
         .bind(mapping_id)
-        .execute(self.db.pool())
+        .execute(&mut *link_tx)
         .await
         .map_err(|e| AppError::Database(format!("rmm link new mapping: {e}")))?;
+        link_tx.commit().await?;
         self.write_audit(tenant_id, asset_id, "created", d).await?;
         Ok(Some(LinkResult {
             created: true,

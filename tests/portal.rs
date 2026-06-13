@@ -53,6 +53,55 @@ async fn seed_portal_contact(pool: &PgPool, company_id: Uuid, email: &str) -> Uu
     id
 }
 
+/// Seed a portal-enabled contact with NO password hash (the state right
+/// after an agent grants access but before the customer redeems their
+/// setup link). Returns its contact id.
+async fn seed_contact_awaiting_setup(pool: &PgPool, company_id: Uuid, email: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO contacts (
+            id, tenant_id, company_id, first_name, last_name, email, is_portal_user
+        )
+        VALUES ($1, $2, $3, 'Setup', 'Pending', $4, TRUE)
+        "#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(email)
+    .execute(pool)
+    .await
+    .expect("seed contact awaiting setup");
+    id
+}
+
+/// Insert a portal setup token for `contact_id` with the given expiry and
+/// return the plaintext token (`{contact_id}.{secret}`) the customer would
+/// receive in their email. Mirrors `ContactService::insert_setup_token`.
+async fn seed_setup_token(
+    pool: &PgPool,
+    contact_id: Uuid,
+    secret: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let hash = mokosh_server::utils::crypto::hash_password(secret).expect("hash setup secret");
+    sqlx::query(
+        r#"
+        INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .bind(&hash)
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .expect("seed setup token");
+    format!("{contact_id}.{secret}")
+}
+
 /// Seed an invoice for a company. Only the NOT-NULL-without-default
 /// columns are supplied; the rest take their schema defaults. Returns
 /// the invoice id.
@@ -457,6 +506,115 @@ async fn portal_kb_returns_only_visible_articles(pool: PgPool) {
         "another company's client_specific article is hidden"
     );
     assert_eq!(slugs.len(), 2, "exactly the two A-visible articles appear");
+}
+
+// PMS-136 AC4 + AC5 + AC6 + AC7: redeeming a setup token sets the contact's
+// portal password (204), replay is 410, an expired token is 400, and after
+// set-password the PMS-26 login endpoint accepts the new credential.
+#[sqlx::test]
+async fn portal_setup_password_redeem_replay_expire(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    let contact = seed_contact_awaiting_setup(&pool, company, "setup@acme.example").await;
+    let valid_token = seed_setup_token(
+        &pool,
+        contact,
+        "setup-secret-abcdefghijklmnopqrstuvwxyz",
+        chrono::Utc::now() + chrono::Duration::hours(72),
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+
+    let new_password = "fresh-portal-pw-9876";
+
+    // AC4: valid token -> 204 and portal_password_hash is set.
+    let ok = app
+        .client
+        .post(app.url("/api/v1/portal/auth/setup-password"))
+        .json(&serde_json::json!({ "token": valid_token, "password": new_password }))
+        .send()
+        .await
+        .expect("setup-password");
+    assert_eq!(
+        ok.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "valid setup token returns 204"
+    );
+    let hash: Option<String> =
+        sqlx::query_scalar("SELECT portal_password_hash FROM contacts WHERE id = $1")
+            .bind(contact)
+            .fetch_one(&pool)
+            .await
+            .expect("select hash");
+    assert!(
+        hash.is_some(),
+        "set-password writes contacts.portal_password_hash"
+    );
+
+    // AC7: the new credential works on the PMS-26 login endpoint.
+    let login = portal_login(&app, "setup@acme.example", new_password).await;
+    assert!(
+        login.status().is_success(),
+        "login with the new password should 2xx, got {}",
+        login.status()
+    );
+    let body: serde_json::Value = login.json().await.expect("login JSON");
+    assert!(
+        body["access_token"].as_str().is_some(),
+        "login returns a portal-scoped access token"
+    );
+
+    // AC5: replaying the same (now used) token -> 410 Gone.
+    let replay = app
+        .client
+        .post(app.url("/api/v1/portal/auth/setup-password"))
+        .json(&serde_json::json!({ "token": valid_token, "password": "another-pw-12345" }))
+        .send()
+        .await
+        .expect("replay setup-password");
+    assert_eq!(
+        replay.status(),
+        reqwest::StatusCode::GONE,
+        "replaying a used token returns 410"
+    );
+
+    // AC6: an expired token -> 400.
+    let expired_contact = seed_contact_awaiting_setup(&pool, company, "expired@acme.example").await;
+    let expired_token = seed_setup_token(
+        &pool,
+        expired_contact,
+        "expired-secret-abcdefghijklmnop",
+        chrono::Utc::now() - chrono::Duration::hours(1),
+    )
+    .await;
+    let expired = app
+        .client
+        .post(app.url("/api/v1/portal/auth/setup-password"))
+        .json(&serde_json::json!({ "token": expired_token, "password": new_password }))
+        .send()
+        .await
+        .expect("expired setup-password");
+    assert_eq!(
+        expired.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an expired token returns 400"
+    );
+
+    // A garbage token -> 400 (indistinguishable from expired/invalid).
+    let bogus = app
+        .client
+        .post(app.url("/api/v1/portal/auth/setup-password"))
+        .json(&serde_json::json!({
+            "token": format!("{contact}.not-the-real-secret"),
+            "password": new_password,
+        }))
+        .send()
+        .await
+        .expect("bogus setup-password");
+    assert_eq!(
+        bogus.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an unknown token returns 400"
+    );
 }
 
 // AC1 (unauth) + AC5 (no route returns 501): unauthenticated calls to

@@ -190,6 +190,10 @@ impl SeedService {
                RETURNING id"#,
         )
         .bind(tenant_id)
+        // The demo-seed claim flips a flag on the caller's own `tenants` row.
+        // `tenants` is the RLS-exempt isolation root (migration 038), so this is
+        // safe on the app pool; the per-tenant seed writes that follow set the
+        // tenant GUC via `begin_with_tenant`.
         .fetch_optional(self.db.pool())
         .await?;
         Ok(claimed.is_some())
@@ -226,6 +230,8 @@ impl SeedService {
         let primary = self
             .contacts
             .create_contact(
+                // SAFETY (PMS-285): same claimed `tenant_id` as the company
+                // create above - trusted system seeder, not user input.
                 TenantId::from_trusted(tenant_id),
                 &demo_contact_primary(company.id),
                 &ctx,
@@ -233,6 +239,8 @@ impl SeedService {
             .await?;
         self.contacts
             .create_contact(
+                // SAFETY (PMS-285): same claimed `tenant_id` - trusted system
+                // seeder, not user input.
                 TenantId::from_trusted(tenant_id),
                 &demo_contact_secondary(company.id),
                 &ctx,
@@ -248,6 +256,8 @@ impl SeedService {
         for ticket in demo_tickets(company.id, primary.id) {
             if let Err(e) = self
                 .tickets
+                // SAFETY (PMS-285): same claimed `tenant_id` - trusted system
+                // seeder, not user input.
                 .create_ticket(TenantId::from_trusted(tenant_id), user_id, &ticket, &ctx)
                 .await
             {

@@ -28,21 +28,6 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn dec(s: &str) -> Decimal {
-    s.parse().expect("parse decimal literal")
-}
-
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
-        .bind(id)
-        .bind(common::DEFAULT_TENANT_ID)
-        .execute(pool)
-        .await
-        .expect("seed company");
-    id
-}
-
 /// Insert a `block_hours` contract starting `start` with monthly billing.
 async fn seed_block_contract(pool: &PgPool, company_id: Uuid, start: NaiveDate) -> Uuid {
     let id = Uuid::new_v4();
@@ -96,21 +81,34 @@ async fn seed_block_item(
 #[sqlx::test]
 async fn consume_within_allotment_debits_balance(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_block_contract(&pool, company, start).await;
-    seed_block_item(&pool, contract, dec("10"), dec("200"), false, None).await;
+    seed_block_item(
+        &pool,
+        contract,
+        common::dec("10"),
+        common::dec("200"),
+        false,
+        None,
+    )
+    .await;
 
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
     let when = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
 
     let out = svc
-        .consume_hours(TenantId::from_trusted(tenant), contract, dec("4"), when)
+        .consume_hours(
+            TenantId::from_trusted(tenant),
+            contract,
+            common::dec("4"),
+            when,
+        )
         .await
         .expect("consume 4h");
-    assert_eq!(out.hours_applied, dec("4"));
-    assert_eq!(out.overage_hours, dec("0"));
-    assert_eq!(out.overage_amount, dec("0"));
+    assert_eq!(out.hours_applied, common::dec("4"));
+    assert_eq!(out.overage_hours, common::dec("0"));
+    assert_eq!(out.overage_amount, common::dec("0"));
 
     // Balance row created with the included allotment and debited.
     let (used, remaining): (Decimal, Decimal) = sqlx::query_as(
@@ -120,29 +118,42 @@ async fn consume_within_allotment_debits_balance(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("balance row");
-    assert_eq!(used, dec("4"));
-    assert_eq!(remaining, dec("6"));
+    assert_eq!(used, common::dec("4"));
+    assert_eq!(remaining, common::dec("6"));
 }
 
 #[sqlx::test]
 async fn consume_past_allotment_computes_overage(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_block_contract(&pool, company, start).await;
-    seed_block_item(&pool, contract, dec("10"), dec("150"), false, None).await;
+    seed_block_item(
+        &pool,
+        contract,
+        common::dec("10"),
+        common::dec("150"),
+        false,
+        None,
+    )
+    .await;
 
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
     let when = Utc.with_ymd_and_hms(2026, 1, 20, 9, 0, 0).unwrap();
 
     // included 10, request 13 -> 10 applied, 3 overage at 150/h = 450.
     let out = svc
-        .consume_hours(TenantId::from_trusted(tenant), contract, dec("13"), when)
+        .consume_hours(
+            TenantId::from_trusted(tenant),
+            contract,
+            common::dec("13"),
+            when,
+        )
         .await
         .expect("consume 13h");
-    assert_eq!(out.hours_applied, dec("10"));
-    assert_eq!(out.overage_hours, dec("3"));
-    assert_eq!(out.overage_amount, dec("450"));
+    assert_eq!(out.hours_applied, common::dec("10"));
+    assert_eq!(out.overage_hours, common::dec("3"));
+    assert_eq!(out.overage_amount, common::dec("450"));
 
     let remaining: Decimal =
         sqlx::query_scalar("SELECT hours_remaining FROM contract_hour_balances WHERE id = $1")
@@ -150,25 +161,38 @@ async fn consume_past_allotment_computes_overage(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("balance row");
-    assert_eq!(remaining, dec("0"));
+    assert_eq!(remaining, common::dec("0"));
 }
 
 #[sqlx::test]
 async fn rollover_carries_capped_unused_hours(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_block_contract(&pool, company, start).await;
     // 10 included, rollover enabled, capped at 3.
-    seed_block_item(&pool, contract, dec("10"), dec("100"), true, Some(dec("3"))).await;
+    seed_block_item(
+        &pool,
+        contract,
+        common::dec("10"),
+        common::dec("100"),
+        true,
+        Some(common::dec("3")),
+    )
+    .await;
 
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
 
     // January: use 4 of 10 -> 6 unused, but cap rollover at 3.
     let jan = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
-    svc.consume_hours(TenantId::from_trusted(tenant), contract, dec("4"), jan)
-        .await
-        .expect("consume jan");
+    svc.consume_hours(
+        TenantId::from_trusted(tenant),
+        contract,
+        common::dec("4"),
+        jan,
+    )
+    .await
+    .expect("consume jan");
 
     // Close January (period_end = 2026-01-31) and roll into February.
     let jan_end = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
@@ -176,7 +200,11 @@ async fn rollover_carries_capped_unused_hours(pool: PgPool) {
         .roll_to_next_period(TenantId::from_trusted(tenant), contract, jan_end)
         .await
         .expect("roll");
-    assert_eq!(rolled, dec("3"), "6 unused capped at max_rollover 3");
+    assert_eq!(
+        rolled,
+        common::dec("3"),
+        "6 unused capped at max_rollover 3"
+    );
 
     // February balance pre-seeded with 10 + 3 = 13 included / remaining.
     let feb_start = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
@@ -190,18 +218,23 @@ async fn rollover_carries_capped_unused_hours(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("feb balance");
-    assert_eq!(included, dec("13"));
-    assert_eq!(remaining, dec("13"));
-    assert_eq!(rollover, dec("3"));
+    assert_eq!(included, common::dec("13"));
+    assert_eq!(remaining, common::dec("13"));
+    assert_eq!(rollover, common::dec("3"));
 
     // Consuming 13 in February now fits exactly (rollover included).
     let feb = Utc.with_ymd_and_hms(2026, 2, 15, 0, 0, 0).unwrap();
     let out = svc
-        .consume_hours(TenantId::from_trusted(tenant), contract, dec("13"), feb)
+        .consume_hours(
+            TenantId::from_trusted(tenant),
+            contract,
+            common::dec("13"),
+            feb,
+        )
         .await
         .expect("consume feb");
-    assert_eq!(out.hours_applied, dec("13"));
-    assert_eq!(out.overage_hours, dec("0"));
+    assert_eq!(out.hours_applied, common::dec("13"));
+    assert_eq!(out.overage_hours, common::dec("0"));
 }
 
 #[sqlx::test]
@@ -256,15 +289,19 @@ async fn resolve_rate_honours_tier_precedence(pool: PgPool) {
         .await
         .expect("emergency rate");
 
-    assert_eq!(base, dec("150.00"));
-    assert_eq!(after, dec("225.00"));
-    assert_eq!(emergency, dec("300.00"), "emergency wins over after_hours");
+    assert_eq!(base, common::dec("150.00"));
+    assert_eq!(after, common::dec("225.00"));
+    assert_eq!(
+        emergency,
+        common::dec("300.00"),
+        "emergency wins over after_hours"
+    );
 }
 
 #[sqlx::test]
 async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
 
     // Auto-renew contract, 1-year term, already past end_date.
     let renew_id = Uuid::new_v4();
@@ -327,7 +364,7 @@ async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
 #[sqlx::test]
 async fn list_recurring_items_returns_recurring_and_retainer(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_block_contract(&pool, company, start).await;
 

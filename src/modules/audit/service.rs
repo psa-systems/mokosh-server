@@ -113,16 +113,20 @@ impl AuditService {
 
         // When a tenant is in scope, route both reads through a tenant-scoped
         // transaction so the `app.current_tenant` GUC is set. The cross-tenant
-        // admin path (`tenant_id == None`) has no tenant value to set and stays
-        // on the pool.
+        // admin path (`tenant_id == None`) has no tenant value to set.
         let (rows, total) = if let Some(tid) = tenant_id {
             let mut tx = self.db.begin_with_tenant(tid).await?;
             let rows = q.fetch_all(&mut *tx).await?;
             let total = cq.fetch_one(&mut *tx).await?;
             (rows, total)
         } else {
-            let rows = q.fetch_all(self.db.pool()).await?;
-            let total = cq.fetch_one(self.db.pool()).await?;
+            // SAFETY (PMS-285): the `None` branch is the super-admin cross-tenant
+            // audit listing (route-gated on super_admin). It reads `audit_log`
+            // across every tenant with no GUC to set, so it runs on the
+            // privileged migrator pool. Ordinary callers take the GUC branch
+            // above and stay RLS-enforced.
+            let rows = q.fetch_all(self.db.migrator_pool()).await?;
+            let total = cq.fetch_one(self.db.migrator_pool()).await?;
             (rows, total)
         };
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))

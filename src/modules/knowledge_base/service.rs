@@ -303,11 +303,25 @@ impl KbService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.get_article(tenant_id, id).await
+        self.get_article_inner(tenant_id, id, false).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<KbArticleResponse> {
+        // Public reads count as a view.
+        self.get_article_inner(tenant_id, id, true).await
+    }
+
+    /// Fetch an article, bumping `view_count` only when `bump_view` is
+    /// true. Internal refetches after create/update pass `false` so the
+    /// write path does not inflate the counter (PMS-195: a single
+    /// create-then-return or update-then-return previously double-counted).
+    async fn get_article_inner(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        bump_view: bool,
+    ) -> AppResult<KbArticleResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
@@ -320,11 +334,13 @@ impl KbService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("KbArticle".to_string()))?;
-        // Increment view count on read; fire-and-forget if the bump fails.
-        let _ = sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await;
+        if bump_view {
+            // Increment view count on read; fire-and-forget if the bump fails.
+            let _ = sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await;
+        }
         tx.commit().await?;
         Ok(row.into())
     }
@@ -337,7 +353,7 @@ impl KbService {
         editor: Uuid,
         request: &UpdateKbArticleRequest,
     ) -> AppResult<KbArticleResponse> {
-        let prior = self.get_article(tenant_id, id).await?;
+        let prior = self.get_article_inner(tenant_id, id, false).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
@@ -392,7 +408,7 @@ impl KbService {
             .await?;
         }
         tx.commit().await?;
-        self.get_article(tenant_id, id).await
+        self.get_article_inner(tenant_id, id, false).await
     }
 
     /// Append a new monotonic version row for `article_id` inside an open
@@ -480,7 +496,7 @@ impl KbService {
         // on top of it (monotonic numbering preserved).
         Self::snapshot_version(&mut tx, article_id, &title, &content, editor).await?;
         tx.commit().await?;
-        self.get_article(tenant_id, article_id).await
+        self.get_article_inner(tenant_id, article_id, false).await
     }
 
     /// Record a `helpful` vote for `user_id` on a tenant-scoped article.

@@ -124,6 +124,10 @@ pub struct PaginationMeta {
 impl<T> PaginatedResponse<T> {
     /// Create a new paginated response
     pub fn new(data: Vec<T>, page: u32, per_page: u32, total: u64) -> Self {
+        // Guard against per_page == 0: division by zero yields NaN/inf,
+        // which casts to a nonsensical total_pages (0 or u32::MAX). Clamp
+        // to at least one item per page so paging math stays well defined.
+        let per_page = per_page.max(1);
         let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
         Self {
@@ -153,46 +157,6 @@ impl<T> PaginatedResponse<T> {
             data: self.data.into_iter().map(f).collect(),
             meta: self.meta,
         }
-    }
-}
-
-/// Filter parameters that can be combined with pagination
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct FilterParams {
-    /// Search query
-    pub q: Option<String>,
-    /// Filter by status
-    pub status: Option<String>,
-    /// Filter by company ID
-    pub company_id: Option<uuid::Uuid>,
-    /// Filter by assigned user ID
-    pub assigned_to: Option<uuid::Uuid>,
-    /// Filter by date range start
-    pub from_date: Option<chrono::NaiveDate>,
-    /// Filter by date range end
-    pub to_date: Option<chrono::NaiveDate>,
-    /// Filter by tags (comma-separated)
-    pub tags: Option<String>,
-}
-
-impl FilterParams {
-    /// Get tags as a vector
-    pub fn tags_vec(&self) -> Vec<String> {
-        self.tags
-            .as_ref()
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Check if any filter is active
-    pub fn has_filters(&self) -> bool {
-        self.q.is_some()
-            || self.status.is_some()
-            || self.company_id.is_some()
-            || self.assigned_to.is_some()
-            || self.from_date.is_some()
-            || self.to_date.is_some()
-            || self.tags.is_some()
     }
 }
 
@@ -311,6 +275,21 @@ mod tests {
     }
 
     #[test]
+    fn test_paginated_response_clamps_zero_per_page() {
+        // per_page == 0 must not yield a degenerate total_pages from a
+        // divide-by-zero; it is clamped to 1 so every item is one page.
+        let response = PaginatedResponse::new(vec![1, 2, 3], 1, 0, 3);
+        assert_eq!(response.meta.per_page, 1);
+        assert_eq!(response.meta.total_pages, 3);
+
+        // total == 0 with per_page == 0 previously produced NaN -> 0,
+        // which is fine, but the clamp keeps the path well defined.
+        let empty: PaginatedResponse<i32> = PaginatedResponse::new(vec![], 1, 0, 0);
+        assert_eq!(empty.meta.per_page, 1);
+        assert_eq!(empty.meta.total_pages, 0);
+    }
+
+    #[test]
     fn test_paginated_response_map() {
         let data = vec![1, 2, 3];
         let response = PaginatedResponse::new(data, 1, 10, 3);
@@ -318,35 +297,5 @@ mod tests {
 
         assert_eq!(mapped.data, vec![2, 4, 6]);
         assert_eq!(mapped.meta.total, 3);
-    }
-
-    #[test]
-    fn test_filter_params_tags() {
-        let params = FilterParams {
-            tags: Some("tag1, tag2, tag3".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(params.tags_vec(), vec!["tag1", "tag2", "tag3"]);
-
-        let empty = FilterParams::default();
-        assert!(empty.tags_vec().is_empty());
-    }
-
-    #[test]
-    fn test_filter_params_has_filters() {
-        let empty = FilterParams::default();
-        assert!(!empty.has_filters());
-
-        let with_query = FilterParams {
-            q: Some("search".to_string()),
-            ..Default::default()
-        };
-        assert!(with_query.has_filters());
-
-        let with_status = FilterParams {
-            status: Some("active".to_string()),
-            ..Default::default()
-        };
-        assert!(with_status.has_filters());
     }
 }

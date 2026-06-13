@@ -179,6 +179,10 @@ impl AuthService {
             if let Ok(mut tx) = self.db.begin_with_tenant(user.tenant_id).await {
                 let _ = audit_write(
                     &mut *tx,
+                    // SAFETY (PMS-285): `user.tenant_id` is from the user row just
+                    // resolved for this login (the caller's own authenticated
+                    // tenant), and the row is written under the matching
+                    // `begin_with_tenant(user.tenant_id)` GUC above.
                     TenantId::from_trusted(user.tenant_id),
                     &ctx,
                     AuditAction::Login,
@@ -239,7 +243,9 @@ impl AuthService {
                     access_token: String::new(),
                     refresh_token: String::new(),
                     expires_at: Utc::now(),
-                    user: user.to_current_user(),
+                    // Withhold the user profile until the second factor
+                    // is satisfied: no pre-2FA data leak.
+                    user: None,
                     mfa_required: true,
                 });
             }
@@ -282,7 +288,7 @@ impl AuthService {
             access_token,
             refresh_token,
             expires_at,
-            user: user.to_current_user(),
+            user: Some(user.to_current_user()),
             mfa_required: false,
         })
     }
@@ -292,6 +298,10 @@ impl AuthService {
     /// Google login, refresh) so a tenant suspension takes effect immediately
     /// instead of lingering until token expiry.
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
+        // The `tenants` table is the isolation root and is deliberately
+        // excluded from RLS (see migration 038: `table_name != 'tenants'`), so
+        // this single-row status read is safe on the NOBYPASSRLS app pool with
+        // no GUC. `mokosh_app` holds SELECT on it.
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
             .bind(tenant_id)
             .fetch_optional(self.db.pool())
@@ -336,7 +346,7 @@ impl AuthService {
              WHERE provider = 'google' AND subject = $1",
         )
         .bind(&google.sub)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(self.db.migrator_pool())
         .await?;
 
         let user = if let Some(user_id) = linked_user_id {
@@ -345,15 +355,19 @@ impl AuthService {
                  WHERE provider = 'google' AND subject = $1",
             )
             .bind(&google.sub)
-            .execute(self.db.pool())
+            .execute(self.db.migrator_pool())
             .await?;
             // Resolve the tenant from the linked row so the scoped
             // get_user_by_id lookup has the boundary it needs. The
             // OAuth callback path is the only place where we hold a
             // user_id without already knowing the tenant.
+            // SAFETY (PMS-285): still pre-auth - this resolves which tenant the
+            // Google-linked user lives in before any session/GUC exists. Reads
+            // RLS-covered `users` by id on the migrator pool; the subsequent
+            // `get_user_by_id` re-reads under that tenant's GUC.
             let tenant_id: Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
                 .bind(user_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(self.db.migrator_pool())
                 .await?
                 .ok_or_else(|| AppError::NotFound("User".to_string()))?;
             self.get_user_by_id(tenant_id, user_id).await?
@@ -409,6 +423,25 @@ impl AuthService {
         }
         self.ensure_tenant_active(user.tenant_id).await?;
 
+        // 3b. Enforce MFA exactly like the password `login()` path. A
+        // verified Google identity is NOT a substitute for the user's
+        // locally-enabled second factor; minting tokens here without it
+        // would silently bypass MFA for any account that links Google.
+        // The Google callback carries no MFA code, so signal
+        // `mfa_required` (with empty tokens) and let the SPA complete the
+        // second factor, mirroring `login()`'s no-code branch.
+        if user.mfa_enabled {
+            return Ok(LoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: Utc::now(),
+                // Omit the user profile until the second factor is satisfied,
+                // mirroring the password `login()` mfa_required branch.
+                user: None,
+                mfa_required: true,
+            });
+        }
+
         // 4. Issue session + tokens identically to the password flow.
         let session_id = self
             .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
@@ -420,7 +453,7 @@ impl AuthService {
             access_token,
             refresh_token,
             expires_at,
-            user: user.to_current_user(),
+            user: Some(user.to_current_user()),
             mfa_required: false,
         })
     }
@@ -558,9 +591,15 @@ impl AuthService {
     /// Logout - invalidate session
     #[tracing::instrument(skip_all)]
     pub async fn logout(&self, session_id: Uuid) -> AppResult<()> {
+        // SAFETY (PMS-285): logout targets a single session by its primary key,
+        // the unguessable session id the caller already holds. The handler does
+        // not thread the tenant here, so it runs on the migrator pool; the
+        // `WHERE id = $1` predicate keeps the blast radius to exactly that one
+        // session. `user_sessions` carries `tenant_id` and is RLS-covered, so an
+        // app-pool delete with no GUC would silently no-op instead.
         sqlx::query("DELETE FROM user_sessions WHERE id = $1")
             .bind(session_id)
-            .execute(self.db.pool())
+            .execute(self.db.migrator_pool())
             .await?;
 
         Ok(())
@@ -571,11 +610,15 @@ impl AuthService {
     /// exists under more than one tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn logout_all(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
+        // Tenant is in scope, so run under the GUC: RLS scopes the delete to the
+        // caller's tenant in addition to the explicit `WHERE tenant_id`.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND tenant_id = $2")
             .bind(user_id)
             .bind(tenant_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -694,6 +737,12 @@ impl AuthService {
         // user UPDATE can bind it (PMS-4 AC6). Multiple candidate rows
         // are possible if the user requested several resets and none
         // expired yet; verify each in turn.
+        // SAFETY (PMS-285): password reset runs pre-auth - the user is not in a
+        // session, so there is no `app.current_tenant` to set, and the row's
+        // tenant is exactly what this lookup resolves (the user can live under
+        // one tenant only via the user-bound token's `user_id`). Runs on the
+        // migrator pool; `password_reset_tokens` is RLS-covered, so an app-pool
+        // read with no GUC would fail closed and break reset entirely.
         let candidates = sqlx::query_as::<_, (Uuid, String)>(
             r#"
             SELECT tenant_id, token_hash
@@ -703,7 +752,7 @@ impl AuthService {
             "#,
         )
         .bind(user_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.migrator_pool())
         .await?;
 
         let mut matched: Option<Uuid> = None;
@@ -969,6 +1018,7 @@ impl AuthService {
     }
 
     /// Update user
+    #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_user(
         &self,
@@ -1020,7 +1070,13 @@ impl AuthService {
         }
         if request.date_format_string.is_some() {
             updates.push(format!("date_format_string = ${}", param_idx));
-            // param_idx += 1;
+            // Invariant: every conditional update advances `param_idx` so
+            // the next field added below is numbered correctly.
+            // `date_format_string` is the last field today, so this
+            // increment is currently unread (`#[allow(unused_assignments)]`
+            // on the fn); keep it so the pattern stays copy-paste safe
+            // (PMS-197).
+            param_idx += 1;
         }
 
         if updates.is_empty() {
@@ -1501,10 +1557,16 @@ impl AuthService {
     /// tenants' placement. The `routes_do_not_reach_global_login_helpers`
     /// regression test (`tests/auth.rs`) pins that no `routes.rs` references it.
     pub async fn find_user_placement(&self, user_id: Uuid) -> AppResult<Option<(Uuid, String)>> {
+        // SAFETY (PMS-285/PMS-260): resolving which tenant a `sub` belongs to is
+        // this helper's whole job, so it reads `users` across tenants. It runs
+        // only on the pre-session bunyip placement path before any tenant
+        // context exists (pinned by `routes_do_not_reach_global_login_helpers`),
+        // so it has no GUC to set and runs on the privileged migrator pool;
+        // `users` is RLS-covered and would otherwise fail closed to `None`.
         Ok(
             sqlx::query_as::<_, (Uuid, String)>("SELECT tenant_id, role FROM users WHERE id = $1")
                 .bind(user_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(self.db.migrator_pool())
                 .await?,
         )
     }
@@ -1567,6 +1629,7 @@ impl AuthService {
             ON CONFLICT (id) DO UPDATE SET
                 email = EXCLUDED.email,
                 updated_at = NOW()
+            WHERE users.tenant_id = EXCLUDED.tenant_id
             "#,
         )
         .bind(sub)
@@ -1602,13 +1665,19 @@ impl AuthService {
         if from_tenant == to_tenant {
             return Ok(false);
         }
+        // SAFETY (PMS-285): this moves a `users` row BETWEEN tenants
+        // (`from_tenant` -> `to_tenant`), which by definition no single
+        // `app.current_tenant` GUC can satisfy under WITH CHECK. It runs only on
+        // the pre-session bunyip placement/backfill path (PMS-243/245), so it
+        // uses the privileged migrator pool. The `id` + `from_tenant` predicate
+        // makes it idempotent and confines it to the one row being rehomed.
         let res = sqlx::query(
             "UPDATE users SET tenant_id = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
         )
         .bind(to_tenant)
         .bind(user_id)
         .bind(from_tenant)
-        .execute(self.db.pool())
+        .execute(self.db.migrator_pool())
         .await?;
         Ok(res.rows_affected() > 0)
     }
@@ -1676,7 +1745,12 @@ impl AuthService {
         remember_me: bool,
     ) -> AppResult<Uuid> {
         let session_id = Uuid::new_v4();
-        let token_hash = generate_token(32);
+        // The `user_sessions.token_hash` column must never hold a plaintext
+        // secret. Generate a random token and store only its SHA-256 hex
+        // digest. (The session is keyed and validated by `id` + `tenant_id`;
+        // this column is a defence-in-depth opaque handle, not a credential
+        // returned to the client.)
+        let token_hash = sha256_hex(&generate_token(32));
         let expires_at = if remember_me {
             Utc::now() + Duration::days(30)
         } else {
@@ -1787,7 +1861,7 @@ impl AuthService {
             sub: user.id,
             tid: user.tenant_id,
             email: user.email.clone(),
-            role: user.role.as_str().to_string(),
+            role: user.role,
             iat: now.timestamp(),
             exp: access_expires.timestamp(),
             typ: "access".to_string(),
@@ -1798,7 +1872,7 @@ impl AuthService {
             sub: user.id,
             tid: user.tenant_id,
             email: user.email.clone(),
-            role: user.role.as_str().to_string(),
+            role: user.role,
             iat: now.timestamp(),
             exp: refresh_expires.timestamp(),
             typ: "refresh".to_string(),
@@ -1824,13 +1898,15 @@ impl AuthService {
         current_session_id: Uuid,
         pagination: &crate::utils::pagination::PaginationParams,
     ) -> AppResult<(Vec<SessionInfo>, u64)> {
+        // Tenant is in scope: run both reads under the GUC so RLS scopes them.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM user_sessions \
              WHERE user_id = $1 AND tenant_id = $2 AND expires_at > NOW()",
         )
         .bind(user_id)
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, SessionRow>(
@@ -1846,8 +1922,9 @@ impl AuthService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let items = rows
             .into_iter()
@@ -1866,10 +1943,15 @@ impl AuthService {
     /// Delete a specific session
     #[tracing::instrument(skip_all)]
     pub async fn delete_session(&self, user_id: Uuid, session_id: Uuid) -> AppResult<()> {
+        // SAFETY (PMS-285): self-service delete of one session by its primary key
+        // plus owning `user_id`; the handler does not thread the tenant here, so
+        // it runs on the migrator pool. The `id` + `user_id` predicate confines
+        // it to the caller's own session row. `user_sessions` is RLS-covered, so
+        // an app-pool delete with no GUC would silently no-op.
         sqlx::query("DELETE FROM user_sessions WHERE id = $1 AND user_id = $2")
             .bind(session_id)
             .bind(user_id)
-            .execute(self.db.pool())
+            .execute(self.db.migrator_pool())
             .await?;
 
         Ok(())
@@ -1997,6 +2079,20 @@ fn parse_user_bound_token(token: &str) -> Option<(Uuid, &str)> {
     }
     let user_id = Uuid::parse_str(id).ok()?;
     Some((user_id, secret))
+}
+
+/// Lowercase hex SHA-256 of an arbitrary string (avoids storing a plaintext
+/// secret in a `TEXT` column such as `user_sessions.token_hash`).
+#[cfg(feature = "server")]
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Hex SHA-256 of the canonical MFA recovery code form. Mirrors

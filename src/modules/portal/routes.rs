@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -17,7 +18,10 @@ use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
-use super::{CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse};
+use super::{
+    CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse,
+    PortalSetupPasswordRequest,
+};
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::tickets::{TicketResponse, TicketService};
@@ -52,6 +56,10 @@ pub fn portal_routes(
     Router::new()
         // Public: login. No auth required to call this.
         .route("/auth/login", post(login))
+        // Public: redeem a setup token to set the initial portal password
+        // (PMS-136). No auth: the customer is not yet a logged-in contact;
+        // the single-use token IS the credential proving they own the link.
+        .route("/auth/setup-password", post(setup_password))
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
         .route("/auth/me", get(me))
@@ -80,6 +88,21 @@ async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<Cur
     Ok(Json(contact))
 }
 
+/// Redeem a setup token and set the contact's portal password (PMS-136).
+/// Returns 204 on success; the service maps a replayed token to 410 and an
+/// expired/invalid one to 400.
+async fn setup_password(
+    State(state): State<PortalRouterState>,
+    Json(request): Json<PortalSetupPasswordRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    state
+        .service
+        .setup_password(&request.token, &request.password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_invoices(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
@@ -93,9 +116,11 @@ async fn list_invoices(
         company_id: Some(contact.company_id),
         ..Default::default()
     };
-    // PMS-139: bridge the verified contact-JWT tenant through `from_trusted`
-    // (portal runs on contact sessions, not `CurrentUser`; see the KB feed
-    // note below for the full rationale).
+    // SAFETY (PMS-285): `contact.tenant_id` is a verified claim from the portal
+    // JWT (`RequirePortalAuth`), i.e. the caller's own authenticated tenant.
+    // Portal runs on contact sessions, not `CurrentUser`, so it cannot use the
+    // `TenantScoped` extractor; `from_trusted` is the sanctioned bridge (see the
+    // KB feed note below for the full rationale).
     let (items, total) = state
         .billing
         .list_invoices(
@@ -120,7 +145,10 @@ async fn get_invoice(
     // in code: an invoice belonging to another company in the same
     // tenant returns 404 (not 403) so the portal never confirms the
     // existence of another company's invoice.
-    // PMS-139: bridge the verified contact-JWT tenant (see KB feed note below).
+    // SAFETY (PMS-285): `contact.tenant_id` is a verified portal-JWT claim
+    // (`RequirePortalAuth`), the caller's own authenticated tenant; portal
+    // cannot use `TenantScoped`, so `from_trusted` is the sanctioned bridge
+    // (see KB feed note below). The company scope is enforced in code afterward.
     let invoice = state
         .billing
         .get_invoice(
