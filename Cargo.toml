@@ -76,7 +76,6 @@ path = "src/bin/mokosh-bootstrap.rs"
 [features]
 default = ["multi-tenant", "server"]
 multi-tenant = []
-single-tenant = []
 server = []
 
 [lib]

@@ -152,6 +152,37 @@ async fn list_tenants_returns_default(pool: PgPool) {
     assert_eq!(default["slug"].as_str(), Some("default"));
 }
 
+// PMS-260: `tenants::list_tenants` runs no SQL tenant filter (listing every
+// tenant is its whole job); the only thing standing between a tenant-scoped
+// caller and the full list is the route's SuperAdmin guard. Pin that guard: a
+// non-super-admin must get 403, never the global tenant list.
+#[sqlx::test]
+async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
+    let (_admin_id, _admin_email, _admin_password) = common::seed_admin(&pool).await;
+    // A second tenant exists, so an unscoped leak would be observable.
+    let (_tenant_b_id, _b_uid, _b_email, _b_password) =
+        common::seed_tenant_with_admin(&pool, "pms260-list-b").await;
+    // A tenant-A admin (role `admin`, NOT super_admin).
+    let (_tech_id, tech_email, tech_password) =
+        common::seed_user(&pool, "non-super@example.com", "admin").await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &tech_email, &tech_password).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/tenants"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list tenants as non-super-admin");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a non-super-admin must not be able to list all tenants"
+    );
+}
+
 // ============================================================================
 // PMS-21 AC5: module config + cross-tenant authz
 // ============================================================================

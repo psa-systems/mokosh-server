@@ -37,6 +37,7 @@ use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::version::VersionInfo;
+use crate::version_check::version_check;
 
 /// Application state shared across all routes. Not constructed yet - the
 /// router threads individual services directly; kept as the intended
@@ -174,6 +175,11 @@ pub fn create_api_router(
         )
         // Build / version info (public, used for diagnostics)
         .route("/version", get(version_info))
+        // Self-hosted update check (PMS-238). Opt-in via
+        // `MOKOSH_UPDATE_CHECK_URL`; compares the running build against the
+        // latest published release and reports whether an upgrade is
+        // available. Disabled (no outbound request) when the env var is unset.
+        .route("/version/check", get(version_check))
         // Auth routes
         .nest(
             "/auth",

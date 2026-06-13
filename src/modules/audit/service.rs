@@ -35,6 +35,7 @@ impl AuditService {
         ip: Option<String>,
         ua: Option<String>,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let _ = sqlx::query(
             r#"INSERT INTO audit_log
                (tenant_id, user_id, action, entity_type, entity_id, new_values,
@@ -49,8 +50,9 @@ impl AuditService {
         .bind(new_values)
         .bind(ip)
         .bind(ua)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -146,8 +148,20 @@ impl AuditService {
         // $limit_ph / $offset_ph; the count query binds neither.
         q = q.bind(limit).bind(offset);
 
-        let rows = q.fetch_all(self.db.pool()).await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        // When a tenant is in scope, route both reads through a tenant-scoped
+        // transaction so the `app.current_tenant` GUC is set. The cross-tenant
+        // admin path (`tenant_id == None`) has no tenant value to set and stays
+        // on the pool.
+        let (rows, total) = if let Some(tid) = tenant_id {
+            let mut tx = self.db.begin_with_tenant(tid).await?;
+            let rows = q.fetch_all(&mut *tx).await?;
+            let total = cq.fetch_one(&mut *tx).await?;
+            (rows, total)
+        } else {
+            let rows = q.fetch_all(self.db.pool()).await?;
+            let total = cq.fetch_one(self.db.pool()).await?;
+            (rows, total)
+        };
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -164,6 +178,7 @@ impl AuditService {
         entity_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<EntityHistoryEntry>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_log
              WHERE tenant_id = $1 AND entity_type = $2 AND entity_id = $3",
@@ -171,7 +186,7 @@ impl AuditService {
         .bind(tenant_id)
         .bind(entity_type)
         .bind(entity_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, HistoryRow>(
@@ -185,7 +200,7 @@ impl AuditService {
         .bind(entity_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }

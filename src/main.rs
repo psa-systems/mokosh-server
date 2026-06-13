@@ -87,14 +87,9 @@ impl AppConfig {
         self.environment == "production"
     }
 
-    #[cfg(feature = "multi-tenant")]
+    // PMS-262: single-tenant mode removed. Multi-tenant is the only mode.
     pub fn is_multi_tenant(&self) -> bool {
         true
-    }
-
-    #[cfg(feature = "single-tenant")]
-    pub fn is_multi_tenant(&self) -> bool {
-        false
     }
 }
 
@@ -110,11 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting {}", VersionInfo::current().banner());
 
-    #[cfg(feature = "multi-tenant")]
     tracing::info!("Running in multi-tenant mode");
-
-    #[cfg(feature = "single-tenant")]
-    tracing::info!("Running in single-tenant mode");
 
     let config = AppConfig::from_env().expect("Failed to load configuration");
 

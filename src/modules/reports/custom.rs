@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
@@ -320,7 +320,7 @@ enum Bind {
 /// run it tenant-scoped. Returns the generic columns / rows / totals
 /// envelope. Every unknown key is a 400 before any SQL is built.
 pub async fn run(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     tenant_id: TenantId,
     spec: &CustomSpec,
 ) -> AppResult<CustomReportResponse> {
@@ -422,7 +422,7 @@ pub async fn run(
             Bind::Date(d) => q.bind(d),
         };
     }
-    let rows = q.fetch_all(pool).await?;
+    let rows = q.fetch_all(executor).await?;
 
     let ncols = dims.len() + measures.len();
     let mut out_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
