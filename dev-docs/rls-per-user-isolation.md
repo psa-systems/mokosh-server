@@ -173,7 +173,7 @@ These resolve the "Lookup classification" open decision for PMS-255.4:
 ## System-shared class (PMS-259, structural)
 
 Reserved for future non-editable global rows (e.g. system statuses, maintenance windows).
-Implemented by `migrations/038_system_shared_class.sql`. **No table opts in yet and no
+Implemented by `migrations/039_system_shared_class.sql`. **No table opts in yet and no
 system-shared row exists**; every lookup `tenant_id` column is still `NOT NULL`, so the
 mechanism is a no-op for current data.
 

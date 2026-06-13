@@ -5,7 +5,7 @@
 //! tenant must start with the full default set of editable lookups copied from
 //! the migration-023 default tenant, isolated from every other tenant, and the
 //! copy must be idempotent. A second test exercises the reserved system-shared
-//! read-only class mechanism from migration 038.
+//! read-only class mechanism from migration 039.
 
 mod common;
 
@@ -137,7 +137,7 @@ async fn personal_tenant_seeded_with_full_default_lookups(pool: PgPool) {
     );
 }
 
-/// The reserved system-shared class (migration 038): a `tenant_id IS NULL` row
+/// The reserved system-shared class (migration 039): a `tenant_id IS NULL` row
 /// is read-only to ordinary sessions and globally visible once written by a
 /// privileged session.
 #[sqlx::test]

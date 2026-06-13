@@ -17,10 +17,17 @@
 -- READ SIDE: globally-shared rows are visible to every tenant
 -- ============================================================================
 --
--- Recreate the migration-024 `tenant_isolation` policy on every `tenant_id`
--- table, adding `tenant_id IS NULL` so system-shared rows are readable
--- regardless of the `app.current_tenant` GUC. The fail-open tenant match is
--- unchanged here; flipping it fail-closed and adding WITH CHECK is PMS-257.
+-- Recreate the `tenant_isolation` policy on every `tenant_id` table, adding a
+-- `tenant_id IS NULL` read clause so system-shared rows are readable regardless
+-- of the `app.current_tenant` GUC. PMS-257 (038_rls_fail_closed.sql) already
+-- flipped this policy fail-closed and added WITH CHECK; that posture is
+-- PRESERVED here. The only change is the extra `tenant_id IS NULL` disjunct on
+-- the read (USING) side. WITH CHECK is deliberately NOT widened to allow
+-- `tenant_id IS NULL`: an unset GUC still yields zero non-global rows on read
+-- and still rejects writes, and the unprivileged application role can never
+-- create a global row. System-shared rows are written only by a BYPASSRLS
+-- migration / super-admin session (additionally guarded by
+-- mokosh_guard_system_shared_row below).
 DO $$
 DECLARE
     t text;
@@ -37,10 +44,10 @@ BEGIN
             CREATE POLICY tenant_isolation ON %I
             USING (
                 tenant_id IS NULL
-                OR tenant_id = COALESCE(
-                    NULLIF(current_setting('app.current_tenant', true), '')::UUID,
-                    tenant_id
-                )
+                OR tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::UUID
+            )
+            WITH CHECK (
+                tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::UUID
             )
         $pol$, t);
     END LOOP;
