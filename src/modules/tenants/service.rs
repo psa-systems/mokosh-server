@@ -11,6 +11,26 @@ use crate::utils::validation::slugify;
 
 use super::models::*;
 
+/// Resolve the tenant whose migration-`023` seed rows are copied into every
+/// freshly provisioned tenant (see `copy_default_config`).
+///
+/// PMS-196: this used to be a hardcoded magic UUID parsed with `unwrap()`,
+/// which panics the tenant-provisioning path on any malformed value. The
+/// source is now read from `MOKOSH_SEED_TENANT_ID` (so a deployment can point
+/// the seed at a different template tenant) and parsed fallibly. When the env
+/// var is unset it falls back to the seed tenant created by migration 023,
+/// `Uuid::from_u128(1)` (== `00000000-0000-0000-0000-000000000001`), the same
+/// constant `auth::bootstrap` uses. A malformed env value is a configuration
+/// error, not a panic.
+fn seed_source_tenant_id() -> AppResult<Uuid> {
+    match std::env::var("MOKOSH_SEED_TENANT_ID") {
+        Ok(raw) => Uuid::parse_str(raw.trim()).map_err(|e| {
+            AppError::Configuration(format!("MOKOSH_SEED_TENANT_ID is not a valid UUID: {e}"))
+        }),
+        Err(_) => Ok(Uuid::from_u128(1)),
+    }
+}
+
 /// Tenant management service
 #[derive(Clone)]
 pub struct TenantService {
@@ -535,7 +555,7 @@ impl TenantService {
     /// The copy runs in one transaction so a fresh tenant is either fully
     /// seeded or not at all.
     async fn copy_default_config(&self, new_tenant_id: Uuid) -> AppResult<()> {
-        let default_tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let default_tenant = seed_source_tenant_id()?;
 
         let mut tx = self.db.pool().begin().await?;
 
