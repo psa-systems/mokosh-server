@@ -17,22 +17,6 @@ mod common;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO companies (id, tenant_id, name)
-        VALUES ($1, $2, 'Acme Co')
-        "#,
-    )
-    .bind(id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("seed test company");
-    id
-}
-
 /// Seed a technician under the default tenant. Returns
 /// `(user_id, email, plaintext_password)` so the test can drive `/login`.
 async fn seed_technician(pool: &PgPool) -> (Uuid, String, String) {
@@ -64,7 +48,7 @@ async fn seed_technician(pool: &PgPool) -> (Uuid, String, String) {
 async fn service_desk_time_slice_happy_path(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let (tech_id, tech_email, tech_pw) = seed_technician(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool).await;
 
     let admin_token = common::login(&app, &admin_email, &admin_pw).await;

@@ -294,7 +294,11 @@ pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: DateTime<Utc>,
-    pub user: CurrentUser,
+    /// The authenticated user. Omitted (None) while `mfa_required` is
+    /// true so no user profile data leaks before the second factor is
+    /// satisfied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<CurrentUser>,
     /// Whether MFA is required to complete login
     pub mfa_required: bool,
 }
@@ -327,7 +331,10 @@ pub struct ForgotPasswordRequest {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ResetPasswordRequest {
     pub token: String,
-    #[validate(length(min = 8, message = "Password must be at least 8 characters"))]
+    #[validate(
+        length(min = 8, message = "Password must be at least 8 characters"),
+        must_match(other = "confirm_password", message = "Passwords do not match")
+    )]
     pub new_password: String,
     pub confirm_password: String,
 }
@@ -350,8 +357,21 @@ pub struct MfaSetupResponse {
 /// `users.mfa_enabled = true`.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct MfaEnableRequest {
-    #[validate(length(min = 6, max = 8, message = "Code must be 6-8 digits"))]
+    #[validate(
+        length(min = 6, max = 8, message = "Code must be 6-8 digits"),
+        custom(function = "validate_digits", message = "Code must be digits only")
+    )]
     pub code: String,
+}
+
+/// Validate that a TOTP code contains only ASCII digits. A length-only
+/// check would accept `"abc123"`; the second factor must be numeric.
+fn validate_digits(code: &str) -> Result<(), validator::ValidationError> {
+    if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("not_digits"))
+    }
 }
 
 /// MFA enable response. Includes the freshly minted recovery codes,
@@ -376,7 +396,10 @@ pub struct MfaDisableRequest {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ChangePasswordRequest {
     pub current_password: String,
-    #[validate(length(min = 8, message = "Password must be at least 8 characters"))]
+    #[validate(
+        length(min = 8, message = "Password must be at least 8 characters"),
+        must_match(other = "confirm_password", message = "Passwords do not match")
+    )]
     pub new_password: String,
     pub confirm_password: String,
 }
@@ -401,12 +424,8 @@ pub struct CreateUserRequest {
     ))]
     pub date_format_string: Option<String>,
     /// If true, send welcome email with password setup link
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub send_welcome_email: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Update user request
@@ -555,8 +574,10 @@ pub struct JwtClaims {
     pub tid: Uuid,
     /// User email
     pub email: String,
-    /// User role
-    pub role: String,
+    /// User role. Serializes to/from the same snake_case string the
+    /// wire format already used (e.g. `"super_admin"`), so this is
+    /// drop-in compatible with previously-issued tokens.
+    pub role: UserRole,
     /// Issued at
     pub iat: i64,
     /// Expiration

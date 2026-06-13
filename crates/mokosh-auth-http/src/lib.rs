@@ -14,6 +14,8 @@ pub mod rate_limit;
 pub mod router;
 
 pub mod handlers {
+    pub mod shared;
+
     pub mod apps;
     pub mod audit;
     pub mod auth;

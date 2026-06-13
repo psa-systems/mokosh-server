@@ -12,7 +12,6 @@ use chrono::{Duration, Utc};
 use mokosh_auth_core::{AuditEvent, AuthError, Invite, NewInvite, UserRole};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -20,6 +19,7 @@ use uuid::Uuid;
 use crate::email::display_name;
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
+use crate::handlers::shared::{looks_like_email, require_admin, token_hash_prefix};
 use crate::router::AuthHttpState;
 
 /// Build the user-facing accept URL admins copy out of the UI when
@@ -83,31 +83,6 @@ pub struct AcceptInviteBody {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn looks_like_email(s: &str) -> bool {
-    // Lightweight sanity check: one '@', no whitespace, dot in the
-    // domain. Mailer rejects malformed addresses at send time as the
-    // authoritative validation.
-    let s = s.trim();
-    let mut at = s.split('@');
-    match (at.next(), at.next(), at.next()) {
-        (Some(local), Some(domain), None) => {
-            !local.is_empty()
-                && !s.chars().any(char::is_whitespace)
-                && domain.contains('.')
-                && !domain.starts_with('.')
-                && !domain.ends_with('.')
-        }
-        _ => false,
-    }
-}
-
-fn token_hash_prefix(token: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(token.as_bytes());
-    let bytes = h.finalize();
-    bytes[..4].iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 fn invite_view(invite: Invite, inviter_email: String) -> InviteView {
     InviteView {
         id: invite.id,
@@ -131,16 +106,6 @@ fn parse_role(s: &str) -> Result<UserRole, HttpError> {
     UserRole::parse(s).ok_or_else(|| HttpError(AuthError::InvalidRequest("invalid role".into())))
 }
 
-fn require_admin(user: &mokosh_auth_core::User) -> Result<(), HttpError> {
-    if matches!(user.role, UserRole::Admin) {
-        Ok(())
-    } else {
-        Err(HttpError(AuthError::Forbidden(
-            "only admins may manage invites".into(),
-        )))
-    }
-}
-
 fn invite_not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -160,7 +125,7 @@ pub async fn issue(
     BearerUser(admin): BearerUser,
     Json(body): Json<IssueInviteBody>,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
 
     let email = body.email.trim().to_string();
     if !looks_like_email(&email) {
@@ -254,7 +219,7 @@ pub async fn list_open(
     State(st): State<Arc<AuthHttpState>>,
     BearerUser(admin): BearerUser,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
 
     let invites = st.invites.list_open(admin.tenant_id).await?;
 
@@ -285,7 +250,7 @@ pub async fn revoke(
     Path(invite_id): Path<Uuid>,
     Json(body): Json<RevokeBody>,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
 
     // Cross-tenant probe -> 404. find_by_id is tenant-scoped.
     let invite = st
@@ -331,7 +296,7 @@ pub async fn resend(
     BearerUser(admin): BearerUser,
     Path(invite_id): Path<Uuid>,
 ) -> Result<Response, HttpError> {
-    require_admin(&admin)?;
+    require_admin(admin.role)?;
 
     let (invite, raw_token) = match st
         .invites
@@ -621,25 +586,12 @@ pub async fn accept_by_token(
         }
     };
 
-    // Phase 3: also create a membership in the inviter's tenant for
-    // the new user. The classic `accept` path does NOT create one
-    // today (memberships landed in phase 1, after invite-accept was
-    // written), so we do it here. Idempotent under the (user_id,
-    // tenant_id) PK; we swallow the Conflict to keep this best-
-    // effort.
-    let _ = st
-        .memberships
-        .create(mokosh_auth_core::NewMembership {
-            user_id: user.id,
-            tenant_id: invite.tenant_id,
-            role: invite.role,
-            // Admin-issued invites have historically been treated as
-            // admin-level access into the inviter's tenant; mirror
-            // that on the new org-role taxonomy.
-            org_role: mokosh_auth_core::MembershipRole::Admin,
-            status: mokosh_auth_core::MembershipStatus::Active,
-        })
-        .await;
+    // The tenant membership is created atomically inside the
+    // SERIALIZABLE invite-accept tx (see `accept_once` in
+    // mokosh-auth-storage), with the org-role derived from the invite
+    // role. Creating it here fire-and-forget left a crash window where
+    // the user existed with no membership, and hardcoded org_role=Admin
+    // over-privileged Member/ReadOnly invites.
 
     let _ = st
         .provider

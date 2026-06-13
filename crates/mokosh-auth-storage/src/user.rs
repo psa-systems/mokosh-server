@@ -148,7 +148,13 @@ impl UserRepository for PgUserRepository {
         threshold: i32,
         lock_for: chrono::Duration,
     ) -> Result<mokosh_auth_core::FailedLoginOutcome, AuthError> {
-        let lock_for_secs = lock_for.num_seconds().max(0);
+        // Bind the lockout window as a native PgInterval rather than
+        // concatenating seconds into a string and casting to INTERVAL.
+        let lock_interval = sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: lock_for.num_seconds().max(0).saturating_mul(1_000_000),
+        };
         // Increment + conditionally set locked_until in one statement so
         // parallel failed-logins do not race the threshold check.
         let row: (i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
@@ -156,7 +162,7 @@ impl UserRepository for PgUserRepository {
              SET failed_login_count = failed_login_count + 1,
                  last_failed_login_at = NOW(),
                  locked_until = CASE
-                     WHEN failed_login_count + 1 >= $2 THEN NOW() + ($3 || ' seconds')::INTERVAL
+                     WHEN failed_login_count + 1 >= $2 THEN NOW() + $3
                      ELSE locked_until
                  END,
                  updated_at = NOW()
@@ -165,7 +171,7 @@ impl UserRepository for PgUserRepository {
         )
         .bind(id.0)
         .bind(threshold)
-        .bind(lock_for_secs.to_string())
+        .bind(lock_interval)
         .fetch_one(self.pool.pg())
         .await
         .map_err(db_err)?;

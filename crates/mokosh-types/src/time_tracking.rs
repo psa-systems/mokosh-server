@@ -1,10 +1,49 @@
 //! Time-tracking DTOs.
 
+// `ApprovalStatus` exposes `from_str(&str) -> Option<Self>` as a
+// deliberate infallible-style parser API matching the other domain
+// enums; it intentionally does not implement `std::str::FromStr`.
+#![allow(clippy::should_implement_trait)]
+
+use crate::tickets::BillingStatus;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
+
+/// Per-entry approval state for time entries. Mirrors the
+/// `approval_status` column enum (`draft|pending|approved|rejected`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Draft,
+    #[default]
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl ApprovalStatus {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "draft" => Some(Self::Draft),
+            "pending" => Some(Self::Pending),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+}
 
 // ============================================================================
 // Work types
@@ -26,17 +65,13 @@ pub struct UpsertWorkTypeRequest {
     #[validate(length(min = 1, max = 100))]
     pub name: String,
     pub description: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub default_billable: bool,
     pub default_rate: Option<Decimal>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub is_active: bool,
     #[serde(default)]
     pub sort_order: i32,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 // ============================================================================
@@ -57,10 +92,10 @@ pub struct TimeEntryResponse {
     pub company_id: Uuid,
     pub notes: Option<String>,
     pub is_billable: bool,
-    pub billing_status: String,
+    pub billing_status: BillingStatus,
     pub hourly_rate: Option<Decimal>,
     pub total_amount: Option<Decimal>,
-    pub approval_status: String,
+    pub approval_status: ApprovalStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -94,7 +129,7 @@ pub struct CreateTimeEntryRequest {
     pub task_id: Option<Uuid>,
     pub company_id: Uuid,
     pub notes: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub is_billable: bool,
     pub hourly_rate: Option<Decimal>,
 }
