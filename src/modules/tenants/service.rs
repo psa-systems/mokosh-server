@@ -450,11 +450,55 @@ impl TenantService {
     // so there is one canonical writer for `module_config`. The
     // duplicate methods were removed.
 
-    /// Copy default configuration from default tenant
+    /// Seed a freshly provisioned tenant with the full default set of
+    /// user-editable lookup / configuration rows, scoped to that tenant.
+    ///
+    /// PMS-259: under the personal-tenant-per-user isolation model
+    /// (`dev-docs/rls-per-user-isolation.md`) lookup tables are editable, so
+    /// every user owns their own copies; a fresh tenant must not start with
+    /// empty status / priority / type / work-type lists. The rows are copied
+    /// from the migration-`023` seed held by the default tenant
+    /// (`00000000-0000-0000-0000-000000000001`) and re-scoped to
+    /// `new_tenant_id`. Foreign keys between lookups (sla_policies ->
+    /// business_hours, sla_targets -> sla_policies / ticket_priorities,
+    /// rate_card_items -> rate_cards / work_types, child categories ->
+    /// parents) are re-linked to the new tenant's freshly copied rows by name.
+    ///
+    /// Idempotent: if the tenant already holds lookup rows the whole seed is
+    /// skipped, so a re-run (or a retried provisioning) never double-seeds.
+    /// The copy runs in one transaction so a fresh tenant is either fully
+    /// seeded or not at all.
     async fn copy_default_config(&self, new_tenant_id: Uuid) -> AppResult<()> {
         let default_tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
 
-        // Copy ticket statuses
+        let mut tx = self.db.pool().begin().await?;
+
+        // Idempotency guard: ticket_statuses is seeded for every tenant, so its
+        // presence means this tenant was already seeded. Skip rather than
+        // duplicate (AC: "skip when the tenant already has rows").
+        let already_seeded: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ticket_statuses WHERE tenant_id = $1)")
+                .bind(new_tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if already_seeded {
+            return Ok(());
+        }
+
+        // Business hours first: sla_policies references it.
+        sqlx::query(
+            r#"
+            INSERT INTO business_hours (tenant_id, name, timezone, schedule, is_default)
+            SELECT $1, name, timezone, schedule, is_default
+            FROM business_hours WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Ticket statuses
         sqlx::query(
             r#"
             INSERT INTO ticket_statuses (tenant_id, name, color, is_closed, is_default, sort_order)
@@ -464,10 +508,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy ticket priorities
+        // Ticket priorities (sla_targets re-links to these by name)
         sqlx::query(
             r#"
             INSERT INTO ticket_priorities (tenant_id, name, color, icon, sla_multiplier, sort_order, is_default)
@@ -477,10 +521,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy ticket types
+        // Ticket types
         sqlx::query(
             r#"
             INSERT INTO ticket_types (tenant_id, name, description, icon, sort_order)
@@ -490,10 +534,52 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy work types
+        // Ticket categories: parents first, then children re-linked to the new
+        // tenant's parents by name (parent_id references the same table).
+        sqlx::query(
+            r#"
+            INSERT INTO ticket_categories (tenant_id, parent_id, name, description, sort_order)
+            SELECT $1, NULL, name, description, sort_order
+            FROM ticket_categories WHERE tenant_id = $2 AND parent_id IS NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO ticket_categories (tenant_id, parent_id, name, description, sort_order)
+            SELECT $1, np.id, c.name, c.description, c.sort_order
+            FROM ticket_categories c
+            JOIN ticket_categories dp ON dp.id = c.parent_id AND dp.tenant_id = $2
+            JOIN ticket_categories np ON np.tenant_id = $1 AND np.name = dp.name AND np.parent_id IS NULL
+            WHERE c.tenant_id = $2 AND c.parent_id IS NOT NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Ticket queues (team / sla links are tenant-specific and stay NULL,
+        // matching the migration-023 seed)
+        sqlx::query(
+            r#"
+            INSERT INTO ticket_queues (tenant_id, name, description, color, is_default, sort_order)
+            SELECT $1, name, description, color, is_default, sort_order
+            FROM ticket_queues WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Work types (rate_card_items re-links to these by name)
         sqlx::query(
             r#"
             INSERT INTO work_types (tenant_id, name, description, default_billable, default_rate, sort_order)
@@ -503,10 +589,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy task statuses
+        // Task statuses
         sqlx::query(
             r#"
             INSERT INTO task_statuses (tenant_id, name, color, is_completed, sort_order)
@@ -516,10 +602,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy asset types
+        // Asset types (top-level only, matching prior behaviour)
         sqlx::query(
             r#"
             INSERT INTO asset_types (tenant_id, name, icon, custom_fields_schema)
@@ -529,10 +615,124 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy module config
+        // Time rounding rules
+        sqlx::query(
+            r#"
+            INSERT INTO time_rounding_rules (tenant_id, name, increment_minutes, rounding_method, minimum_minutes, is_default)
+            SELECT $1, name, increment_minutes, rounding_method, minimum_minutes, is_default
+            FROM time_rounding_rules WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Tax rates
+        sqlx::query(
+            r#"
+            INSERT INTO tax_rates (tenant_id, name, rate, is_default, is_active)
+            SELECT $1, name, rate, is_default, is_active
+            FROM tax_rates WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // KB categories: parents first, then children re-linked by name.
+        sqlx::query(
+            r#"
+            INSERT INTO kb_categories (tenant_id, parent_id, name, description, slug, visibility, sort_order)
+            SELECT $1, NULL, name, description, slug, visibility, sort_order
+            FROM kb_categories WHERE tenant_id = $2 AND parent_id IS NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO kb_categories (tenant_id, parent_id, name, description, slug, visibility, sort_order)
+            SELECT $1, np.id, c.name, c.description, c.slug, c.visibility, c.sort_order
+            FROM kb_categories c
+            JOIN kb_categories dp ON dp.id = c.parent_id AND dp.tenant_id = $2
+            JOIN kb_categories np ON np.tenant_id = $1 AND np.name = dp.name AND np.parent_id IS NULL
+            WHERE c.tenant_id = $2 AND c.parent_id IS NOT NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Rate cards, then their items re-linked to the new tenant's rate cards
+        // and work types by name.
+        sqlx::query(
+            r#"
+            INSERT INTO rate_cards (tenant_id, name, description, is_default)
+            SELECT $1, name, description, is_default
+            FROM rate_cards WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO rate_card_items (rate_card_id, work_type_id, hourly_rate, after_hours_rate, emergency_rate)
+            SELECT nrc.id, nwt.id, i.hourly_rate, i.after_hours_rate, i.emergency_rate
+            FROM rate_card_items i
+            JOIN rate_cards drc ON drc.id = i.rate_card_id AND drc.tenant_id = $2
+            JOIN rate_cards nrc ON nrc.tenant_id = $1 AND nrc.name = drc.name
+            JOIN work_types dwt ON dwt.id = i.work_type_id AND dwt.tenant_id = $2
+            JOIN work_types nwt ON nwt.tenant_id = $1 AND nwt.name = dwt.name
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // SLA policies (business_hours re-linked by name), then targets
+        // (sla_policies + ticket_priorities re-linked by name).
+        sqlx::query(
+            r#"
+            INSERT INTO sla_policies (tenant_id, name, description, business_hours_id, is_default)
+            SELECT $1, p.name, p.description, nbh.id, p.is_default
+            FROM sla_policies p
+            LEFT JOIN business_hours dbh ON dbh.id = p.business_hours_id AND dbh.tenant_id = $2
+            LEFT JOIN business_hours nbh ON nbh.tenant_id = $1 AND nbh.name = dbh.name
+            WHERE p.tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO sla_targets (sla_policy_id, priority_id, first_response_hours, resolution_hours, operational_hours)
+            SELECT np.id, npr.id, t.first_response_hours, t.resolution_hours, t.operational_hours
+            FROM sla_targets t
+            JOIN sla_policies dp ON dp.id = t.sla_policy_id AND dp.tenant_id = $2
+            JOIN sla_policies np ON np.tenant_id = $1 AND np.name = dp.name
+            JOIN ticket_priorities dpr ON dpr.id = t.priority_id AND dpr.tenant_id = $2
+            JOIN ticket_priorities npr ON npr.tenant_id = $1 AND npr.name = dpr.name
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Module config
         sqlx::query(
             r#"
             INSERT INTO module_config (tenant_id, module_name, is_enabled, config)
@@ -542,7 +742,7 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Copy the in-app notification templates + rules the background
@@ -563,7 +763,7 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Copy each default-tenant rule, re-linking template_id to the new
@@ -588,9 +788,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 }
