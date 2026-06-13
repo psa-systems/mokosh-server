@@ -1,23 +1,35 @@
 ---
 
-# Playwright E2E suite against the deployed staging instance (PMS-140 phase 1;
-# PMS-141 promotion to merge gate).
+# Playwright E2E suite against a deployed instance (PMS-140 phase 1;
+# PMS-141 promotion to merge gate; PMS-271 staging/production secret split).
+#
+# Environments (PMS-271): CI holds both staging and production config side by
+# side as environment-prefixed Forgejo Actions secrets (`E2E_STAGING_*` /
+# `E2E_PRODUCTION_*`). The job env: block maps the selected environment onto
+# the plain `E2E_*` names per var, so env.ts and the gate scripts never need
+# to know which environment they target. Automatic triggers (push, PR) always
+# resolve to staging; production runs only on a manual dispatch that selects
+# it (the suite is write-heavy and shares one rate-limited account, so it must
+# not churn live prod unattended).
 #
 # Triggers:
-#   - push to main: post-merge validation. Runs the deploy-sync gate
-#     (`wait-for-deploy.mjs`) so it asserts staging is actually serving the
-#     pushed commit before the suite runs.
-#   - pull_request targeting main (including release/* PRs): merge gate. PR
-#     SHAs never deploy to staging, so the version gate is replaced with a
-#     `/api/v1/health` reachability check; the suite still runs against
+#   - push to main: post-merge validation against staging. Runs the deploy-sync
+#     gate (`wait-for-deploy.mjs`) so it asserts staging is actually serving
+#     the pushed commit before the suite runs.
+#   - pull_request targeting main (including release/* PRs): merge gate against
+#     staging. PR SHAs never deploy to staging, so the version gate is replaced
+#     with a `/api/v1/health` reachability check; the suite still runs against
 #     whatever staging is currently serving. The intended semantics is
 #     "staging is healthy and the suite passes against it".
-#   - workflow_dispatch: manual ad-hoc runs (treated like post-merge).
+#   - workflow_dispatch: manual ad-hoc runs. `environment=staging` (default)
+#     behaves like a post-merge run (deploy-sync gate). `environment=production`
+#     targets prod; the dispatched SHA is unlikely to be what prod serves, so
+#     it runs the reachability check instead of the SHA-polling gate.
 #
 # To make this a real gate, add `e2e` to the required status checks on the
 # main branch in Forgejo branch protection. PMS-141 sets a stability bar
 # (10 consecutive green post-merge runs) before flipping that switch.
-name: E2E (staging)
+name: E2E
 
 on:
   push:
@@ -27,6 +39,14 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Target deployment for the manual run
+        type: choice
+        default: staging
+        options:
+          - staging
+          - production
 
 # Back-to-back runs (post-merge + PR + multi-PR) must not collide on the
 # shared E2E tenant and single account (per-email login rate limit is 5/min,
@@ -48,16 +68,22 @@ jobs:
       run:
         working-directory: e2e
 
+    # PMS-271: map the selected environment's prefixed secret onto the plain
+    # E2E_* name per var. On push / pull_request the `inputs` context is empty,
+    # so `inputs.environment == 'production'` is false and every var resolves to
+    # its E2E_STAGING_* secret; on a manual dispatch the operator's choice
+    # drives it. env.ts and the gate scripts read the plain E2E_* names and stay
+    # environment-agnostic.
     env:
-      E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
-      E2E_EMAIL: ${{ secrets.E2E_EMAIL }}
-      E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
-      E2E_TENANT_ID: ${{ secrets.E2E_TENANT_ID }}
-      E2E_OIDC_CLIENT_ID: ${{ secrets.E2E_OIDC_CLIENT_ID }}
-      E2E_OIDC_REDIRECT_URI: ${{ secrets.E2E_OIDC_REDIRECT_URI }}
-      E2E_OP_BASE_URL: ${{ secrets.E2E_OP_BASE_URL }}
-      E2E_TOTP_SECRET: ${{ secrets.E2E_TOTP_SECRET }}
-      E2E_FOREIGN_COMPANY_ID: ${{ secrets.E2E_FOREIGN_COMPANY_ID }}
+      E2E_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_BASE_URL || secrets.E2E_STAGING_BASE_URL }}
+      E2E_EMAIL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_EMAIL || secrets.E2E_STAGING_EMAIL }}
+      E2E_PASSWORD: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_PASSWORD || secrets.E2E_STAGING_PASSWORD }}
+      E2E_TENANT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TENANT_ID || secrets.E2E_STAGING_TENANT_ID }}
+      E2E_OIDC_CLIENT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_CLIENT_ID || secrets.E2E_STAGING_OIDC_CLIENT_ID }}
+      E2E_OIDC_REDIRECT_URI: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_REDIRECT_URI || secrets.E2E_STAGING_OIDC_REDIRECT_URI }}
+      E2E_OP_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OP_BASE_URL || secrets.E2E_STAGING_OP_BASE_URL }}
+      E2E_TOTP_SECRET: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TOTP_SECRET || secrets.E2E_STAGING_TOTP_SECRET }}
+      E2E_FOREIGN_COMPANY_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_FOREIGN_COMPANY_ID || secrets.E2E_STAGING_FOREIGN_COMPANY_ID }}
       # The opensuse-base runner does not grant write access to the default
       # /opt/hostedtoolcache, so actions/setup-node fails when it tries to
       # cache the downloaded Node tarball. Point the tool cache at a path the
@@ -94,12 +120,17 @@ jobs:
         # install -y` step here for the missing sonames.
         run: npx playwright install chromium
 
-      - name: Wait for staging to serve this commit (push / dispatch)
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
+      # dispatched commit is unlikely to be what prod currently serves, so the
+      # version-sync poll would time out. Version-sync runs on push and on a
+      # staging dispatch; reachability runs on pull_request and on a production
+      # dispatch.
+      - name: Wait for deploy to serve this commit (push / staging dispatch)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
         run: node scripts/wait-for-deploy.mjs
 
-      - name: Verify staging is reachable (pull_request)
-        if: github.event_name == 'pull_request'
+      - name: Verify deployment is reachable (pull_request / production dispatch)
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
         run: node scripts/health-check.mjs
 
       - name: Run E2E suite
