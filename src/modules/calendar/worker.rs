@@ -81,6 +81,16 @@ impl CalendarReminderWorker {
                 "start": c.occurrence_start,
                 "reminder_minutes": c.reminder_minutes,
             });
+            // SAFETY (PMS-261): cross-tenant worker. `c.tenant_id` is projected
+            // straight off the `appointments` row by `due_reminders` (a real
+            // tenant id, not user input), and every per-tenant unit of work
+            // below - `claim_reminder` and `dispatch` - opens its own
+            // `begin_with_tenant(c.tenant_id)` transaction, so each tick sets
+            // `app.current_tenant` to exactly the tenant it is processing and
+            // never runs a per-tenant query with a stale or absent GUC. The
+            // enumeration scan in `due_reminders` is the deliberate
+            // cross-tenant step that drives this loop. `from_trusted` is the
+            // sanctioned bridge for that DB-derived scope.
             if let Err(e) = notifications
                 .dispatch(
                     TenantId::from_trusted(c.tenant_id),

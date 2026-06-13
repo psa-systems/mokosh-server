@@ -463,11 +463,25 @@ impl NotificationsService {
 
         let mut fanout = 0u64;
         for rule in rules {
+            // PMS-261: scope the template lookup through `begin_with_tenant`
+            // so the RLS GUC is set. `notification_templates` carries a
+            // `tenant_id` and is covered by the fail-closed policy (migration
+            // 038); the previous bare `self.db.pool()` read ran with NO GUC,
+            // which under an unprivileged (NOBYPASSRLS) connection matches zero
+            // rows and would silently drop the template, falling back to the
+            // default subject/body. The `template_id` came off this tenant's
+            // own rule, so the row lives under this same tenant.
             let template = match rule.template_id {
-                Some(tid) => sqlx::query_as::<_, TemplateRow>(
-                    "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
-                     FROM notification_templates WHERE id = $1",
-                ).bind(tid).fetch_optional(self.db.pool()).await?,
+                Some(tid) => {
+                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                    sqlx::query_as::<_, TemplateRow>(
+                        "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
+                         FROM notification_templates WHERE id = $1",
+                    )
+                    .bind(tid)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
                 None => None,
             };
 

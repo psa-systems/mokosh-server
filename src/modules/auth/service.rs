@@ -615,6 +615,11 @@ impl AuthService {
                     "recipient_email": user.email,
                     "reset_link": reset_link,
                 });
+                // SAFETY (PMS-261): `user.tenant_id` is read off the `users`
+                // row resolved by the reset request (a real tenant id, not
+                // caller input); `dispatch` re-derives the GUC per query via
+                // `begin_with_tenant`. `from_trusted` bridges the legacy auth
+                // path (not yet swept to `TenantScoped`) into the typed scope.
                 if let Err(e) = notify
                     .dispatch(
                         TenantId::from_trusted(user.tenant_id),
@@ -850,6 +855,11 @@ impl AuthService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SAFETY (PMS-261): `tenant_id` is the authenticated scope `create_user`
+        // was called with; the whole method runs inside `begin_with_tenant`, so
+        // the audit row is written under the same GUC. `from_trusted` only
+        // bridges the legacy auth `Uuid` into the typed scope `audit_write`
+        // requires (auth not yet swept to `TenantScoped`).
         audit_write(
             &mut *tx,
             TenantId::from_trusted(tenant_id),
@@ -905,6 +915,10 @@ impl AuthService {
                         "display_name": display_name,
                         "setup_link": setup_link,
                     });
+                    // SAFETY (PMS-261): same authenticated `tenant_id` scope as
+                    // the surrounding `create_user`; `dispatch` sets the GUC per
+                    // query via `begin_with_tenant`. `from_trusted` bridges the
+                    // legacy auth `Uuid` into the typed scope.
                     if let Err(e) = notify
                         .dispatch(TenantId::from_trusted(tenant_id), "auth.welcome", &context)
                         .await
@@ -1068,6 +1082,11 @@ impl AuthService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SAFETY (PMS-261): `tenant_id` is the authenticated scope `update_user`
+        // was called with; the snapshot SELECTs above filter `AND tenant_id =
+        // $2` and the whole method runs inside `begin_with_tenant`, so the audit
+        // row is confined to that tenant. `from_trusted` bridges the legacy auth
+        // `Uuid` into the typed scope (auth not yet swept to `TenantScoped`).
         audit_write(
             &mut *tx,
             TenantId::from_trusted(tenant_id),

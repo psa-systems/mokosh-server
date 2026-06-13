@@ -109,6 +109,11 @@ async fn get_tenant(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
+    // SAFETY (PMS-261): this super-admin surface deliberately addresses an
+    // arbitrary path `tenant_id`, not the caller's own claim. The role guard
+    // above is the gate (super-admin, or same-tenant), so `from_trusted` is
+    // sound: a non-super-admin can only reach this with `tenant_id ==
+    // user.tenant_id`.
     let tenant = state
         .tenant_service
         .get_tenant(TenantId::from_trusted(tenant_id))
@@ -132,6 +137,9 @@ async fn update_tenant(
 
     request.validate()?;
 
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
+    // the role guard above; the arbitrary path `tenant_id` is sound to bridge
+    // via `from_trusted` only because of that guard.
     let tenant = state
         .tenant_service
         .update_tenant(TenantId::from_trusted(tenant_id), &request, &ctx)
@@ -152,6 +160,9 @@ async fn suspend_tenant(
         ));
     }
 
+    // SAFETY (PMS-261): super-admin-only path (guard above); the arbitrary path
+    // `tenant_id` is an administrative target, not the caller's claim, so
+    // `from_trusted` is the sanctioned bridge.
     state
         .tenant_service
         .suspend_tenant(TenantId::from_trusted(tenant_id))
@@ -172,6 +183,8 @@ async fn activate_tenant(
         ));
     }
 
+    // SAFETY (PMS-261): super-admin-only path (guard above); arbitrary path
+    // `tenant_id` is an administrative target, bridged via `from_trusted`.
     state
         .tenant_service
         .activate_tenant(TenantId::from_trusted(tenant_id))
@@ -191,6 +204,8 @@ async fn get_tenant_usage(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
+    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
     let usage = state
         .tenant_service
         .get_tenant_usage(TenantId::from_trusted(tenant_id))
@@ -215,6 +230,8 @@ async fn get_module_config(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
+    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
     let config = state
         .settings_service
         .get_module_config(TenantId::from_trusted(tenant_id), &module)
@@ -235,6 +252,8 @@ async fn update_module_config(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
+    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
     let config = state
         .settings_service
         .upsert_module_config(TenantId::from_trusted(tenant_id), &module, &request)
