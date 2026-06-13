@@ -55,7 +55,7 @@ impl InvitationsService {
         let email = request.email.trim().to_ascii_lowercase();
         let expires_at = Utc::now() + Duration::days(INVITE_TTL_DAYS);
 
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         let invite = sqlx::query_as::<_, InvitationResponse>(
             r#"INSERT INTO tenant_invitations (tenant_id, email, role, invited_by, expires_at)
@@ -123,11 +123,12 @@ impl InvitationsService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<InvitationResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tenant_invitations WHERE tenant_id = $1 AND status = 'pending'",
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, InvitationResponse>(
@@ -140,7 +141,7 @@ impl InvitationsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows, total as u64))
@@ -182,17 +183,19 @@ impl InvitationsService {
     /// no longer pending.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn revoke(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let res = sqlx::query(
             "UPDATE tenant_invitations SET status = 'revoked', updated_at = NOW()
              WHERE id = $1 AND tenant_id = $2 AND status = 'pending'",
         )
         .bind(id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
         if res.rows_affected() == 0 {
             return Err(AppError::NotFound("Invitation".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 }

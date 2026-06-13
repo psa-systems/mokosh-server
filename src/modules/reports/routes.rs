@@ -196,7 +196,7 @@ async fn custom_run(
     RequireReports { user: u, .. }: RequireReports,
     Json(spec): Json<custom::CustomSpec>,
 ) -> AppResult<Response> {
-    let report = custom::run(s.service.pool(), u.tenant(), &spec).await?;
+    let report = s.service.run_custom(u.tenant(), &spec).await?;
     if spec.format.as_deref() == Some("csv") {
         let csv = custom::to_csv(&report);
         return Ok((

@@ -50,7 +50,10 @@ impl TenantService {
         // seed rows, snapshot the new tenant with Postgres to_jsonb, and write
         // the audit entry on the same tx so a rollback drops both. PMS-117 AC1.
         // The tenant is its own audit scope, so tenant_id == entity_id here.
-        let mut tx = self.db.pool().begin().await?;
+        // The block writes tenant-scoped tables (users, sequences, audit_log)
+        // under the new tenant, so route through the tenant GUC tx so the RLS
+        // WITH CHECK policies see app.current_tenant. PMS-256.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         sqlx::query(
             r#"
@@ -163,16 +166,22 @@ impl TenantService {
 
         match inserted {
             Some(id) => {
+                // Seed the new tenant's RLS-protected sequence rows under its
+                // own tenant GUC so the WITH CHECK policies pass. The earlier
+                // INSERT into `tenants` stays on the pool because RLS is not
+                // enabled on that table. PMS-256.
+                let mut tx = self.db.begin_with_tenant(id).await?;
                 sqlx::query("INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)")
                     .bind(id)
-                    .execute(self.db.pool())
+                    .execute(&mut *tx)
                     .await?;
                 sqlx::query(
                     "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')",
                 )
                 .bind(id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 self.copy_default_config(id).await?;
                 tracing::info!(tenant_id = %id, owner_id = %owner_id, "provisioned personal tenant");
                 Ok(id)
@@ -322,7 +331,10 @@ impl TenantService {
         // audit entry on the same tx so a rollback drops both. PMS-117 AC1. The
         // tenant is its own audit scope (tenant_id == entity_id) and the
         // `tenants` table is keyed by `id` alone (no `tenant_id` column).
-        let mut tx = self.db.pool().begin().await?;
+        // The audit_log write at the end of this tx IS RLS-protected, so route
+        // the block through the tenant GUC tx so its WITH CHECK policy passes.
+        // PMS-256.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(t) FROM tenants t WHERE id = $1")
                 .bind(tenant_id)
@@ -378,40 +390,45 @@ impl TenantService {
     /// Get tenant usage statistics
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_tenant_usage(&self, tenant_id: TenantId) -> AppResult<TenantUsage> {
+        // All counts read RLS-protected per-tenant tables filtered by
+        // tenant_id = $1, so run them on one shared tenant GUC tx so the RLS
+        // USING policies see app.current_tenant. Reads need no commit. PMS-256.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
             .bind(tenant_id)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
         let company_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM companies WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let contact_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM contacts WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let ticket_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let asset_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let storage_bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(file_size), 0) FROM files WHERE tenant_id = $1",
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         Ok(TenantUsage {
