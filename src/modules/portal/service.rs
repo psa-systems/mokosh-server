@@ -117,6 +117,25 @@ impl PortalAuthService {
         })
     }
 
+    /// Re-read a contact's display names from the `contacts` row. The
+    /// portal JWT omits names (PII minimisation), so the middleware
+    /// hydrates `first_name` / `last_name` for `/me`-style handlers after
+    /// decoding the token (PMS-195). Scoped by `(tenant_id, id)`.
+    pub async fn contact_names(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT first_name, last_name FROM contacts WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(row)
+    }
+
     /// Decode + validate a portal JWT. Rejects anything that isn't
     /// `typ = "portal_access"` so an agent's access token cannot be
     /// replayed against the portal surface.

@@ -127,6 +127,7 @@ async fn list_articles(
 async fn create_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
     Json(req): Json<CreateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
@@ -146,6 +147,7 @@ async fn get_article(
 async fn update_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
