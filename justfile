@@ -191,9 +191,15 @@ infisical-bootstrap: ensure-env
         cargo run --quiet --bin mokosh-bootstrap -- bootstrap-infisical
     }
 
-# Run all checks (compile, clippy, fmt)
+# Run all checks (compile, clippy, fmt, migration prefixes)
 [group: 'check']
-check: check-compile check-clippy check-fmt
+check: check-compile check-clippy check-fmt check-migrations
+
+# Enforce unique migration prefixes (PMS-198). Fails if two migrations
+# share a numeric prefix (sqlx keys its ledger on that prefix).
+[group: 'check']
+check-migrations:
+    nu scripts/check-migration-prefixes.nu
 
 # Check compilation
 [group: 'check']

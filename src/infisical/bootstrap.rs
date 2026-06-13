@@ -41,7 +41,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::error::CoreError;
+use crate::utils::error::AppError;
 
 /// Inputs for [`bootstrap_infisical`]. All `*_name` and credential fields
 /// are required; description fields default to sensible values when omitted.
@@ -247,13 +247,16 @@ struct BootstrapClient {
 const USER_AGENT: &str = concat!("mokosh-bootstrap/", env!("CARGO_PKG_VERSION"));
 
 impl BootstrapClient {
-    fn new(base_url: &str) -> Result<Self, CoreError> {
+    fn new(base_url: &str) -> Result<Self, AppError> {
         let http = Client::builder()
             .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| {
-                CoreError::ExternalService(format!("Failed to create HTTP client: {}", e))
+                AppError::external_service(
+                    "Infisical",
+                    format!("Failed to create HTTP client: {}", e),
+                )
             })?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -273,7 +276,7 @@ impl BootstrapClient {
         &self,
         path: &str,
         body: &Req,
-    ) -> Result<Resp, CoreError> {
+    ) -> Result<Resp, AppError> {
         let url = format!("{}{}", self.base_url, path);
         debug!("POST {}", url);
         let resp = self
@@ -281,7 +284,10 @@ impl BootstrapClient {
             .send()
             .await
             .map_err(|e| {
-                CoreError::ExternalService(format!("Request to {} failed: {}", path, e))
+                AppError::external_service(
+                    "Infisical",
+                    format!("Request to {} failed: {}", path, e),
+                )
             })?;
         Self::parse_json(path, resp).await
     }
@@ -290,7 +296,7 @@ impl BootstrapClient {
         &self,
         path: &str,
         body: &Req,
-    ) -> Result<Resp, CoreError> {
+    ) -> Result<Resp, AppError> {
         let url = format!("{}{}", self.base_url, path);
         debug!("PATCH {}", url);
         let resp = self
@@ -298,7 +304,10 @@ impl BootstrapClient {
             .send()
             .await
             .map_err(|e| {
-                CoreError::ExternalService(format!("Request to {} failed: {}", path, e))
+                AppError::external_service(
+                    "Infisical",
+                    format!("Request to {} failed: {}", path, e),
+                )
             })?;
         Self::parse_json(path, resp).await
     }
@@ -306,17 +315,23 @@ impl BootstrapClient {
     async fn parse_json<Resp: for<'de> Deserialize<'de>>(
         path: &str,
         resp: reqwest::Response,
-    ) -> Result<Resp, CoreError> {
+    ) -> Result<Resp, AppError> {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CoreError::ExternalService(format!(
-                "Infisical bootstrap call {} returned {}: {}",
-                path, status, body
-            )));
+            return Err(AppError::external_service(
+                "Infisical",
+                format!(
+                    "Infisical bootstrap call {} returned {}: {}",
+                    path, status, body
+                ),
+            ));
         }
         resp.json::<Resp>().await.map_err(|e| {
-            CoreError::ExternalService(format!("Failed to parse response from {}: {}", path, e))
+            AppError::external_service(
+                "Infisical",
+                format!("Failed to parse response from {}: {}", path, e),
+            )
         })
     }
 
@@ -328,7 +343,7 @@ impl BootstrapClient {
         environment: &str,
         path: &str,
         name: &str,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), AppError> {
         debug!("Creating folder {}/{} (env {})", path, name, environment);
         let req = CreateFolderReq {
             workspace_id,
@@ -360,7 +375,7 @@ impl BootstrapClient {
 pub async fn bootstrap_infisical(
     base_url: &str,
     input: &BootstrapInput,
-) -> Result<BootstrapOutput, CoreError> {
+) -> Result<BootstrapOutput, AppError> {
     let mut client = BootstrapClient::new(base_url)?;
 
     info!("Bootstrapping Infisical at {}", base_url);

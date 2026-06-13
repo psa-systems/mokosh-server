@@ -1,0 +1,9 @@
+[package]
+name = "build-metadata"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+authors = ["Mokosh Server Team"]
+description = "Shared build-script helper: emits MOKOSH_GIT_HASH / MOKOSH_GIT_DESCRIBE / MOKOSH_BUILD_DATE rustc-env vars and the matching rerun-if directives. Used as a build-dependency by the workspace-root build.rs and crates/google-oauth-flow/build.rs (PMS-198)."
+
+[dependencies]
