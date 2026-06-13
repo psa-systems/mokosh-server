@@ -4,13 +4,11 @@
 //! `docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md` in the docs repo),
 //! mokosh-server stops minting tokens and starts validating Bearer `at+jwt`s
 //! issued by bunyip-api against bunyip's JWKS. This module owns that verifier.
-//! It is NOT yet wired into `AuthMiddleware` so the existing IdP code path
-//! keeps working through the transitional dual-issuer state; a follow-up
-//! commit on the same branch flips the switch.
+//! It is wired into `AuthMiddleware` via `with_bunyip` (see
+//! `create_api_router`), alongside the existing IdP code path during the
+//! transitional dual-issuer state.
 //!
 //! Ported in shape from `rusty-links/src/auth/oidc_rs.rs`.
-
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -138,7 +136,6 @@ impl VerifierConfig {
 
 struct JwksCache {
     keys: HashMap<String, DecodingKey>,
-    jwks_uri: String,
     userinfo_endpoint: Option<String>,
     refreshed_at: DateTime<Utc>,
 }
@@ -358,7 +355,6 @@ impl Verifier {
         let mut guard = self.cache.write().await;
         *guard = Some(JwksCache {
             keys,
-            jwks_uri: discovery.jwks_uri,
             userinfo_endpoint: discovery.userinfo_endpoint,
             refreshed_at: Utc::now(),
         });

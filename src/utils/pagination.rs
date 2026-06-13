@@ -156,46 +156,6 @@ impl<T> PaginatedResponse<T> {
     }
 }
 
-/// Filter parameters that can be combined with pagination
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct FilterParams {
-    /// Search query
-    pub q: Option<String>,
-    /// Filter by status
-    pub status: Option<String>,
-    /// Filter by company ID
-    pub company_id: Option<uuid::Uuid>,
-    /// Filter by assigned user ID
-    pub assigned_to: Option<uuid::Uuid>,
-    /// Filter by date range start
-    pub from_date: Option<chrono::NaiveDate>,
-    /// Filter by date range end
-    pub to_date: Option<chrono::NaiveDate>,
-    /// Filter by tags (comma-separated)
-    pub tags: Option<String>,
-}
-
-impl FilterParams {
-    /// Get tags as a vector
-    pub fn tags_vec(&self) -> Vec<String> {
-        self.tags
-            .as_ref()
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Check if any filter is active
-    pub fn has_filters(&self) -> bool {
-        self.q.is_some()
-            || self.status.is_some()
-            || self.company_id.is_some()
-            || self.assigned_to.is_some()
-            || self.from_date.is_some()
-            || self.to_date.is_some()
-            || self.tags.is_some()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,35 +278,5 @@ mod tests {
 
         assert_eq!(mapped.data, vec![2, 4, 6]);
         assert_eq!(mapped.meta.total, 3);
-    }
-
-    #[test]
-    fn test_filter_params_tags() {
-        let params = FilterParams {
-            tags: Some("tag1, tag2, tag3".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(params.tags_vec(), vec!["tag1", "tag2", "tag3"]);
-
-        let empty = FilterParams::default();
-        assert!(empty.tags_vec().is_empty());
-    }
-
-    #[test]
-    fn test_filter_params_has_filters() {
-        let empty = FilterParams::default();
-        assert!(!empty.has_filters());
-
-        let with_query = FilterParams {
-            q: Some("search".to_string()),
-            ..Default::default()
-        };
-        assert!(with_query.has_filters());
-
-        let with_status = FilterParams {
-            status: Some("active".to_string()),
-            ..Default::default()
-        };
-        assert!(with_status.has_filters());
     }
 }

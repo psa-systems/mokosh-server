@@ -86,11 +86,6 @@ impl AppConfig {
     pub fn is_production(&self) -> bool {
         self.environment == "production"
     }
-
-    // PMS-262: single-tenant mode removed. Multi-tenant is the only mode.
-    pub fn is_multi_tenant(&self) -> bool {
-        true
-    }
 }
 
 #[tokio::main]

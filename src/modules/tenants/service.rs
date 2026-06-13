@@ -233,26 +233,6 @@ impl TenantService {
         Ok(row.into())
     }
 
-    /// Get tenant by slug
-    #[tracing::instrument(skip_all)]
-    pub async fn get_tenant_by_slug(&self, slug: &str) -> AppResult<Tenant> {
-        let row = sqlx::query_as::<_, TenantRow>(
-            r#"
-            SELECT id, name, slug, status, settings, branding, billing_email,
-                   billing_contact_name, subscription_plan, subscription_status,
-                   trial_ends_at, created_at, updated_at
-            FROM tenants
-            WHERE slug = $1
-            "#,
-        )
-        .bind(slug)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
-
-        Ok(row.into())
-    }
-
     /// List all tenants
     #[tracing::instrument(skip_all)]
     pub async fn list_tenants(

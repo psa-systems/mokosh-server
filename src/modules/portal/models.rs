@@ -35,12 +35,6 @@ pub struct CurrentContact {
     pub last_name: String,
 }
 
-impl CurrentContact {
-    pub fn full_name(&self) -> String {
-        format!("{} {}", self.first_name, self.last_name)
-    }
-}
-
 /// `POST /api/v1/portal/auth/login` request body. `tenant_slug` is
 /// required because `contacts.email` is only unique within a tenant.
 /// A portal hosted at e.g. `portal.acme.example.com` should supply the

@@ -10,7 +10,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::utils::crypto::{hash_password, verify_password};
+use crate::utils::crypto::verify_password;
 use crate::utils::error::{AppError, AppResult};
 
 use super::models::*;
@@ -131,27 +131,5 @@ impl PortalAuthService {
             return Err(AppError::Unauthorized);
         }
         Ok(data.claims)
-    }
-
-    /// Set or replace the portal password for a contact. Surfaces to a
-    /// future `PUT /api/v1/portal/auth/password` endpoint that the
-    /// customer hits after clicking their setup link.
-    #[allow(dead_code)]
-    #[tracing::instrument(skip_all)]
-    pub async fn set_password(&self, contact_id: Uuid, new_password: &str) -> AppResult<()> {
-        if new_password.len() < 8 {
-            return Err(AppError::BadRequest(
-                "Password must be at least 8 characters".to_string(),
-            ));
-        }
-        let hash = hash_password(new_password)?;
-        sqlx::query(
-            "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, updated_at = NOW() WHERE id = $2",
-        )
-        .bind(&hash)
-        .bind(contact_id)
-        .execute(self.db.pool())
-        .await?;
-        Ok(())
     }
 }

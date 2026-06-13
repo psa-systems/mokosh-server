@@ -2,7 +2,6 @@
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
     middleware::Next,
     response::Response,
 };
@@ -154,24 +153,6 @@ fn bearer(req: &Request) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// Middleware that requires authentication
-pub async fn require_auth(request: Request, next: Next) -> Result<Response, (StatusCode, String)> {
-    let auth_state = request
-        .extensions()
-        .get::<AuthState>()
-        .cloned()
-        .unwrap_or_default();
-
-    if !auth_state.is_authenticated {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Authentication required".to_string(),
-        ));
-    }
-
-    Ok(next.run(request).await)
-}
-
 /// Extractor for requiring authentication
 #[derive(Clone)]
 pub struct RequireAuth(pub CurrentUser);
@@ -214,7 +195,7 @@ where
 ///     scope: TenantScope,
 ///     ...
 /// ) -> AppResult<Json<...>> {
-///     state.ticket_service.list_tickets(scope.tenant_id, ...).await
+///     state.ticket_service.list_ticket_responses(scope.tenant_id, ...).await
 /// }
 /// ```
 ///
@@ -442,22 +423,6 @@ gated_module!(KnowledgeBaseModule, "knowledge_base", RequireKnowledgeBase);
 gated_module!(RmmModule, "rmm_integration", RequireRmm);
 gated_module!(ReportsModule, "reports", RequireReports);
 gated_module!(TimeTrackingModule, "time_tracking", RequireTimeTracking);
-
-/// Get the current user's tenant ID from the request
-pub fn get_tenant_id(request: &Request) -> Option<uuid::Uuid> {
-    request
-        .extensions()
-        .get::<AuthState>()
-        .and_then(|state| state.tenant_id)
-}
-
-/// Get the current user from the request
-pub fn get_current_user(request: &Request) -> Option<CurrentUser> {
-    request
-        .extensions()
-        .get::<AuthState>()
-        .and_then(|state| state.user.clone())
-}
 
 // ── Bunyip RS helper ─────────────────────────────────────────────────────────
 
