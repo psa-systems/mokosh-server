@@ -120,7 +120,9 @@ Ordered by dependency. Each is a runner-sized PR.
 7. **Remove/redefine the `single-tenant` cargo feature + default-tenant landing audit.**
    `main.rs:94-116`, `db/tenant.rs:45-56`; prove no normal user lands in `Uuid::from_u128(1)`.
 8. **Backfill migration + verification query** for existing co-mingled default-tenant rows.
-   See open decision below.
+   Resolved: no production data exists (the DB is wiped before go-live), so the backfill is a
+   no-op; `migrations/040_backfill_comingled_default_tenant.sql` records that and asserts the
+   zero-co-mingling invariant fail-loud. See the resolved decision below.
 9. **Per-user isolation integration test suite.** Two users in two personal tenants; assert
    every module denies cross-user read AND write; aggregates scoped; RLS fail-closed regression.
 
@@ -202,10 +204,15 @@ strict per-user isolation for everything editable.
 
 ## Open decisions to confirm (do not block the analysis, but resolve before the affected issue)
 
-- **Legacy co-mingled data ownership (PMS-255.8).** PMS-243 deliberately left co-mingled rows in
-  the default tenant "put." Under strict isolation, who owns pre-existing rows? Proposed default:
-  re-home each row to the tenant of its `created_by`/owner column where one exists; quarantine the
-  remainder into an admin-only tenant rather than expose them. Confirm.
+- ~~**Legacy co-mingled data ownership (PMS-255.8).**~~ Resolved with the product owner
+  (2026-06-13): Mokosh is not in production and the database is wiped before go-live, so there is
+  no legacy co-mingled business data to re-home or quarantine. The backfill
+  (`migrations/040_backfill_comingled_default_tenant.sql`) is intentionally a no-op; it instead
+  asserts the end-state invariant fail-loud (no business row sits in the default tenant
+  `00000000-0000-0000-0000-000000000001`; lookup/auth/seq rows are excluded). The standalone
+  verification query is `dev-docs/audits/pms-263-verify-no-comingled-business-rows.sql`. This also
+  sidesteps the unsafe one-shot path: personal tenants are provisioned lazily on login
+  (PMS-243/245), so a bulk SQL backfill would have no tenant to resolve most owners to.
 - **Portal identity (PMS-255.6).** Portal runs on a `contacts`-row identity (`CurrentContact`,
   company-scoped), a separate plane from `users`. Proposed default: keep portal company-scoped for
   now and revisit with the orgs work; do not force per-user isolation on portal contacts. Confirm.
