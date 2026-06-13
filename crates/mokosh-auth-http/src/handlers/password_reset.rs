@@ -245,6 +245,21 @@ pub async fn complete(
     }
     let target_email = preview.unwrap().email;
 
+    // Confirmation match first: cheap equality check before the password
+    // policy + argon2 work, and a mismatch should never trigger an
+    // expensive hash or leak policy details about a password the user
+    // did not intend to set.
+    if body.password != body.password_confirmation {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_request",
+                "details": { "password_confirmation": "Passwords do not match" },
+            })),
+        )
+            .into_response());
+    }
+
     // Password policy.
     if let Err(e) =
         mokosh_auth_core::policy::validate_password_strength(&body.password, &target_email)
@@ -268,16 +283,6 @@ pub async fn complete(
             Json(json!({
                 "error": "invalid_request",
                 "details": { "password": e.to_string() },
-            })),
-        )
-            .into_response());
-    }
-    if body.password != body.password_confirmation {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "invalid_request",
-                "details": { "password_confirmation": "Passwords do not match" },
             })),
         )
             .into_response());

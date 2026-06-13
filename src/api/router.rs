@@ -16,7 +16,7 @@ use tower_http::{
 
 use crate::db::Database;
 use crate::modules::assets::{assets_routes, AssetsService};
-use crate::modules::audit::{audit_log_middleware, audit_routes, AuditService};
+use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::billing::{billing_routes, BillingService};
@@ -256,16 +256,15 @@ pub fn create_api_router(
         // Settings: tenant settings + module configs. PMS-114.
         .merge(settings_routes(settings_service.clone()))
         // Audit log read. PMS-118.
-        .merge(audit_routes(audit_service.clone()))
-        // Audit log middleware. PMS-119. Fires per-request after
-        // auth_middleware has populated AuthState; only logs successful
-        // mutating requests.
-        .layer(middleware::from_fn_with_state(
-            crate::modules::audit::middleware::AuditMiddlewareState {
-                service: std::sync::Arc::new(audit_service),
-            },
-            audit_log_middleware,
-        ))
+        .merge(audit_routes(audit_service))
+        // PMS-275: the coarse per-request audit middleware (PMS-119) was
+        // removed. It ran post-response with only the HTTP method + URL, so it
+        // could never populate `entity_id` or the old/new value payload, and
+        // because this router is nested under `/api/v1` the path it saw was
+        // already prefix-stripped, leaving every row tagged entity_type
+        // "unknown". The in-transaction `audit_write` path (PMS-117) is the
+        // sole audit writer and records the entity type, record id, and
+        // before/after snapshots that the audit trail needs.
         // First-visit demo seeding (PMS-157). Added before the auth layer
         // so it runs *inner* of it: auth populates AuthState, then this
         // reads the resolved tenant/user and seeds a new account's demo

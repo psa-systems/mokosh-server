@@ -65,12 +65,25 @@ Set via `e2e/.env` locally (copy from `.env.example`) or Forgejo Actions secrets
 in CI. Required unless noted.
 
 **Local vs CI naming (PMS-271).** Locally these are the plain `E2E_*` names
-below, holding one environment at a time. In CI the Forgejo Actions secrets are
-environment-prefixed - an `E2E_STAGING_<NAME>` and `E2E_PRODUCTION_<NAME>` pair
-for each var - and `.forgejo/workflows/e2e.yml` maps the selected environment
-onto the plain `E2E_*` names per run. So `env.ts` and the gate scripts only ever
-read the plain names and stay environment-agnostic. Automatic runs (push, PR)
-always resolve to staging; production is manual-dispatch only (see [CI](#ci)).
+below, holding one environment at a time. In CI the Forgejo Actions secrets hold
+both environments at once, and `.forgejo/workflows/e2e.yml` selects per var and
+exposes the result on the plain `E2E_*` names per run, so `env.ts` and the gate
+scripts only ever read the plain names and stay environment-agnostic. The CI
+secret names follow the **deployment's own variable names** where one exists
+(verified against the mokosh infra repo, `server/{c-01 staging, nc-01
+production}`):
+
+| `E2E_*` var | CI secret(s) | Deployment source |
+| --- | --- | --- |
+| `E2E_OIDC_CLIENT_ID` | `MOKOSH_OIDC_CLIENT_ID` (single, shared) | the mokosh-apps public PKCE client, seeded by `bunyip-api` with the **same id in both envs**, read by the SPA as `MOKOSH_OIDC_CLIENT_ID` |
+| `E2E_OIDC_REDIRECT_URI` | `MOKOSH_APPS_REDIRECT_URIS_STAGING` / `_PRODUCTION` | `bunyip-api` `MOKOSH_APPS_REDIRECT_URIS` (per env: `https://msp.a8n.systems/auth/callback` vs `https://msp.psa.systems/auth/callback`) |
+| `E2E_OP_BASE_URL` | `OIDC_ISSUER_STAGING` / `OIDC_ISSUER_PRODUCTION` | `mokosh-server` `OIDC_ISSUER` (the bunyip OP apex: `https://api.a8n.systems` vs `https://api.psa.systems`) |
+| everything else (`BASE_URL`, `EMAIL`, `PASSWORD`, `TENANT_ID`, `TOTP_SECRET`, `FOREIGN_COMPANY_ID`) | `E2E_STAGING_<NAME>` / `E2E_PRODUCTION_<NAME>` | test-only; no deployment variable to match |
+
+Forgejo must hold both env values at once, so per-env secrets keep a
+`_STAGING`/`_PRODUCTION` suffix on the deployment base name; the shared client id
+needs no suffix. Automatic runs (push, PR) always resolve to staging; production
+is manual-dispatch only (see [CI](#ci)).
 
 | Var | Purpose |
 | --- | --- |
@@ -147,12 +160,15 @@ Done once by a human before the suite can pass against a deployment:
 4. *(optional)* **Foreign company** - note a company id from a different tenant
    as `E2E_FOREIGN_COMPANY_ID` to enable the cross-tenant leak canary.
 5. Store all of the above as Forgejo Actions secrets for
-   `.forgejo/workflows/e2e.yml`, **environment-prefixed** (PMS-271): each value
-   goes in as `E2E_STAGING_<NAME>` or `E2E_PRODUCTION_<NAME>` (e.g.
-   `E2E_STAGING_BASE_URL`, `E2E_PRODUCTION_TOTP_SECRET`), NOT the bare `E2E_*`
-   name. Provision the staging set first, then production. The workflow maps the
-   selected environment's pair onto the plain `E2E_*` job env per run. Run this
-   provisioning step once per environment.
+   `.forgejo/workflows/e2e.yml` (PMS-271). The secret names follow the table in
+   [Required configuration](#required-configuration): three vars use the
+   deployment's own variable names (`MOKOSH_OIDC_CLIENT_ID`, a single shared
+   value; `MOKOSH_APPS_REDIRECT_URIS_STAGING` / `_PRODUCTION`;
+   `OIDC_ISSUER_STAGING` / `OIDC_ISSUER_PRODUCTION`), and the test-only vars use
+   `E2E_STAGING_<NAME>` / `E2E_PRODUCTION_<NAME>` (e.g. `E2E_STAGING_BASE_URL`,
+   `E2E_PRODUCTION_TOTP_SECRET`). Provision the staging set first, then
+   production; the shared `MOKOSH_OIDC_CLIENT_ID` is set once. The workflow
+   selects per var and exposes the result on the plain `E2E_*` job env per run.
 
    **Secret-rotation source (record per secret).** So each value can be rotated
    later, document where it is generated/provisioned, per environment: the
@@ -229,14 +245,18 @@ login rate limit is 5/min, so parallel runs would collide):
 | `workflow_dispatch` | `environment` input (`staging` default / `production`) | Manual ad-hoc runs | `staging`: deploy-sync gate (`wait-for-deploy.mjs`), like `push`. `production`: reachability check (`health-check.mjs`) - the dispatched SHA is unlikely to be what prod serves, so the SHA-polling gate would time out | Production runs ONLY here (PMS-271). The write-heavy suite is never run against prod automatically; a human dispatches and selects it |
 
 **Environment secrets (PMS-271).** CI holds staging and production config side
-by side as environment-prefixed Forgejo Actions secrets (`E2E_STAGING_*` /
-`E2E_PRODUCTION_*`). The job `env:` block maps the selected environment onto the
-plain `E2E_*` names per var via a Forgejo expression
-(`${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_<NAME> || secrets.E2E_STAGING_<NAME> }}`).
-On `push` / `pull_request` the `inputs` context is empty, so the expression
-resolves to the staging secret; a manual dispatch lets the operator pick. See
-[One-time provisioning](#one-time-staging-provisioning-manual) step 5 for the
-secret names and rotation sources.
+by side as Forgejo Actions secrets. The job `env:` block selects per var and
+exposes the result on the plain `E2E_*` names via a Forgejo expression
+(`${{ inputs.environment == 'production' && secrets.<PRODUCTION> || secrets.<STAGING> }}`),
+except the shared client id which is a single `secrets.MOKOSH_OIDC_CLIENT_ID`
+with no switch. Secret names match the deployment's own variable names where one
+exists (`MOKOSH_OIDC_CLIENT_ID`, `MOKOSH_APPS_REDIRECT_URIS_*`, `OIDC_ISSUER_*`);
+test-only vars use `E2E_STAGING_*` / `E2E_PRODUCTION_*`. On `push` /
+`pull_request` the `inputs` context is empty, so each expression resolves to its
+staging secret; a manual dispatch lets the operator pick. See the
+[Required configuration](#required-configuration) table for the full mapping and
+[One-time provisioning](#one-time-staging-provisioning-manual) step 5 for
+rotation sources.
 
 Each run installs Node + Chromium, runs the suite against the selected
 deployment, and uploads `playwright-report/` + `test-results/` as artifacts on

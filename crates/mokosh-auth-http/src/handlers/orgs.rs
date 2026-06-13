@@ -612,15 +612,32 @@ pub async fn revoke_invitation(
 // --- Cross-org invite accept (bound to a signed-in user) ---------------
 
 /// POST /v1/invitations/accept - accept an invitation by raw token.
-/// The caller must be signed in (Bearer token); the invitation's email
-/// is informational, not enforced against the caller's identity (the
-/// SPA already shows the recipient who is accepting).
+/// The caller must be signed in (Bearer token) AND be the invited
+/// recipient: the invitation's email must match the caller's email
+/// (case-insensitive). Without this check a forwarded invite link would
+/// let any authenticated user join the org.
 pub async fn accept_invitation(
     State(st): State<Arc<AuthHttpState>>,
     BearerUser(caller): BearerUser,
     Json(body): Json<AcceptInvitationBody>,
 ) -> Result<Json<OrgView>, HttpError> {
     let token_hash = mokosh_auth_crypto::hash_opaque_token(&body.token);
+
+    // Enforce caller-email == invite-email before accepting. The invite
+    // email does not change between this peek and the SERIALIZABLE
+    // accept below, so the brief gap is not a security-relevant TOCTOU.
+    let pending = st
+        .org_invitations
+        .find_by_token_hash(token_hash)
+        .await
+        .map_err(HttpError)?
+        .ok_or(HttpError(AuthError::NotFound))?;
+    if !pending.email.eq_ignore_ascii_case(&caller.email) {
+        return Err(HttpError(AuthError::Forbidden(
+            "invitation was issued to a different email".into(),
+        )));
+    }
+
     let invite: OrgInvitation = st
         .org_invitations
         .accept(token_hash, caller.id, caller.role)

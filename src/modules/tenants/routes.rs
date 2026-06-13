@@ -10,7 +10,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
-use crate::modules::auth::{RequireAuth, TenantId, UserRole};
+use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -57,16 +57,9 @@ pub fn tenant_routes(
 /// List all tenants (super admin only)
 async fn list_tenants(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TenantResponse>>> {
-    // Only super admins can list all tenants
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
     let (tenants, total) = state.tenant_service.list_tenants(&pagination).await?;
 
     let response = PaginatedResponse::from_params(
@@ -81,16 +74,10 @@ async fn list_tenants(
 /// Create a new tenant (super admin only)
 async fn create_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
     request.validate()?;
 
     let tenant = state.tenant_service.create_tenant(&request, &ctx).await?;
@@ -151,18 +138,13 @@ async fn update_tenant(
 /// Suspend tenant (super admin only)
 async fn suspend_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
-    // SAFETY (PMS-261): super-admin-only path (guard above); the arbitrary path
-    // `tenant_id` is an administrative target, not the caller's claim, so
-    // `from_trusted` is the sanctioned bridge.
+    // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
+    // is the guard); the arbitrary path `tenant_id` is an administrative
+    // target, not the caller's claim, so `from_trusted` is the sanctioned
+    // bridge.
     state
         .tenant_service
         .suspend_tenant(TenantId::from_trusted(tenant_id))
@@ -174,17 +156,12 @@ async fn suspend_tenant(
 /// Activate tenant (super admin only)
 async fn activate_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
-    // SAFETY (PMS-261): super-admin-only path (guard above); arbitrary path
-    // `tenant_id` is an administrative target, bridged via `from_trusted`.
+    // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
+    // is the guard); arbitrary path `tenant_id` is an administrative target,
+    // bridged via `from_trusted`.
     state
         .tenant_service
         .activate_tenant(TenantId::from_trusted(tenant_id))
