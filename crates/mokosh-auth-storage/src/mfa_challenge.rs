@@ -10,7 +10,7 @@ use mokosh_auth_core::{
 use std::net::IpAddr;
 use uuid::Uuid;
 
-use crate::conv::db_err;
+use crate::conv::{db_err, retry_serializable};
 use crate::pool::AuthPool;
 
 const SELECT_CHALLENGE: &str = r#"
@@ -125,19 +125,10 @@ impl MfaChallengeRepository for PgMfaChallengeRepository {
         token_hash: [u8; 32],
         expected_purpose: MfaChallengePurpose,
     ) -> Result<MfaChallenge, AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self.consume_once(token_hash, expected_purpose).await {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(attempt, "mfa challenge consume serialization conflict");
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("mfa challenge consume", || {
+            self.consume_once(token_hash, expected_purpose)
+        })
+        .await
     }
 }
 
@@ -172,20 +163,21 @@ impl PgMfaChallengeRepository {
             return Err(AuthError::NotFound);
         }
 
-        sqlx::query(
+        let (consumed_at,): (DateTime<Utc>,) = sqlx::query_as(
             "UPDATE mokosh_auth.mfa_challenges
              SET consumed_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+             RETURNING consumed_at",
         )
         .bind(row.id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
 
         tx.commit().await.map_err(db_err)?;
 
         let mut challenge = MfaChallenge::try_from(row)?;
-        challenge.consumed_at = Some(Utc::now());
+        challenge.consumed_at = Some(consumed_at);
         Ok(challenge)
     }
 }

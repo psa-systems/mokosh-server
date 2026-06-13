@@ -38,6 +38,11 @@ pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    /// Resource is gone - the target existed but is no longer usable
+    /// (e.g. a one-time token that was already redeemed). 410 Gone.
+    #[error("Gone: {0}")]
+    Gone(String),
+
     /// Rate limit exceeded
     #[error("Rate limit exceeded. Please try again later.")]
     RateLimited,
@@ -160,6 +165,7 @@ impl AppError {
             Self::Validation { .. } => 422,
             Self::Conflict(_) => 409,
             Self::BadRequest(_) => 400,
+            Self::Gone(_) => 410,
             Self::RateLimited => 429,
             Self::Database(_) => 500,
             Self::ExternalService { .. } => 502,
@@ -182,6 +188,7 @@ impl AppError {
             Self::Validation { .. } => "VALIDATION_ERROR",
             Self::Conflict(_) => "CONFLICT",
             Self::BadRequest(_) => "BAD_REQUEST",
+            Self::Gone(_) => "GONE",
             Self::RateLimited => "RATE_LIMITED",
             Self::Database(_) => "DATABASE_ERROR",
             Self::ExternalService { .. } => "EXTERNAL_SERVICE_ERROR",

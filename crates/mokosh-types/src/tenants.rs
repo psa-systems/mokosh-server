@@ -144,19 +144,3 @@ pub struct TenantUsage {
     pub asset_count: i64,
     pub storage_bytes: i64,
 }
-
-/// Module configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModuleConfig {
-    pub module_name: String,
-    pub is_enabled: bool,
-    pub config: serde_json::Value,
-}
-
-/// Audit F5: payload for updating a tenant's per-module config.
-#[derive(Debug, Clone, Deserialize)]
-pub struct UpdateModuleConfigRequest {
-    pub is_enabled: bool,
-    #[serde(default)]
-    pub config: serde_json::Value,
-}

@@ -20,7 +20,7 @@ use super::{
     MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse,
     ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
-use crate::modules::auth::middleware::RequireAuth;
+use crate::modules::auth::middleware::{RequireAuth, RequireManager};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -422,13 +422,11 @@ async fn revoke_api_key(
 /// closeout for the auth module).
 async fn list_users(
     State(state): State<AuthRouterState>,
-    RequireAuth(user): RequireAuth,
+    manager: RequireManager,
     Query(filter): Query<ListUsersFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<UserResponse>>> {
-    if !user.role.is_admin() && !matches!(user.role, super::UserRole::Manager) {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
-    }
+    let user = manager.0;
     filter.validate()?;
 
     let (users, total) = state

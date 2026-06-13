@@ -62,7 +62,7 @@ ensure-oidc-keys:
 
 # Per-developer Traefik-routed instance for SSO testing.
 #   API:  https://{USER}-mokosh-api.a8n.run
-# Run `just dev-sso` here AND in mokosh-clients to get both ends up.
+# Run `just dev-sso` here AND in mokosh-apps to get both ends up.
 # Each per-developer stack gets its OWN private network,
 # `dev-mokosh-private-${USER}`, matching the name compose.dev.yml
 # assigns. The dev-sso overlay marks that network external (it only
@@ -86,9 +86,9 @@ dev-sso: ensure-env ensure-oidc-keys ensure-private-network
     @echo "  https://{{env('USER')}}-mokosh-api.a8n.run/.well-known/openid-configuration"
     @echo ""
     @echo "Next:"
-    @echo "  1. (cd ../mokosh-clients && just dev-sso)"
-    @echo "  2. just register-client     # registers mokosh-clients-web in oauth_clients"
-    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-clients/.env to the printed UUID"
+    @echo "  1. (cd ../mokosh-apps && just dev-sso)"
+    @echo "  2. just register-client     # registers mokosh-apps-web in oauth_clients"
+    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-apps/.env to the printed UUID"
 
 # Stop the SSO dev stack.
 [doc("Stop the SSO dev stack")]
@@ -106,9 +106,9 @@ dev-sso-down: ensure-env
 [group: 'dev']
 restart: down dev-sso
 
-# Register mokosh-clients as a public OIDC client. Run once after
+# Register mokosh-apps as a public OIDC client. Run once after
 # `just dev-sso` is up. Prints the client_id UUID; copy it into
-# mokosh-clients/.env as MOKOSH_OIDC_CLIENT_ID.
+# mokosh-apps/.env as MOKOSH_OIDC_CLIENT_ID.
 [doc("Register bunyip-web as a public OIDC client (one-shot, idempotent on (name))")]
 register-bunyip-client: ensure-env
     #!/usr/bin/env nu
@@ -134,7 +134,7 @@ register-lets-chat-client: ensure-env
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/default/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
 
-[doc("Register mokosh-clients as a public OIDC client (one-shot, idempotent on (name))")]
+[doc("Register mokosh-apps as a public OIDC client (one-shot, idempotent on (name))")]
 register-client: ensure-env
     #!/usr/bin/env nu
     let user = $env.USER
@@ -163,14 +163,6 @@ down: ensure-env
 [group: 'dev']
 dev-down: ensure-env
     docker compose --file {{ compose_file }} down
-
-# Wipe the dev stack: stop, remove volumes, remove .env. Preserves .env.infisical.
-[doc("Wipe Infisical volumes and .env. Preserves .env.infisical.")]
-[group: 'dev']
-dev-clean: ensure-env
-    #!/usr/bin/env nu
-    docker compose --file {{ compose_file }} down --volumes
-    if ('.env' | path exists) { rm .env }
 
 # Bootstrap Infisical for the dev stack (run once after `just dev`).
 [doc("Bootstrap Infisical for the dev stack (run once after `just dev`)")]
@@ -264,6 +256,57 @@ migrate-run:
 [group: 'db']
 migrate-create name:
     sqlx migrate add {{ name }}
+
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+
+# Tear down this repo's dev footprint: stop both dev stacks (LAN-IP compose.dev.yml and the SSO overlay compose.dev-sso.yml) with their default network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+[group: 'cleanup']
+dev-clean:
+    #!/usr/bin/env nu
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
+    let suffix = $env.USER
+    let vols = [
+        $"dev-mokosh-postgres-data-($suffix)"
+        $"dev-mokosh-infisical-postgres-data-($suffix)"
+        $"dev-mokosh-server-target-($suffix)"
+    ]
+    let existing = docker volume ls --quiet | lines
+    for vol in $vols {
+        if $vol in $existing {
+            docker volume rm $vol
+        }
+    }
+    let paths = [target]
+    for p in $paths {
+        if ($p | path exists) {
+            rm --recursive $p
+            print $"removed ($p)"
+        }
+    }
+    if ('.env' | path exists) {
+        rm .env
+        print "removed .env"
+    }
+    print "dev-clean: done"
+
+# Everything dev-clean does, plus remove the Docker images this repo builds and prune its buildx cache. Run for a from-scratch rebuild.
+[group: 'cleanup']
+dev-clean-all: dev-clean
+    #!/usr/bin/env nu
+    let images = [
+        "mokosh-server:check"
+        "mokosh-server:local"
+    ]
+    for img in $images {
+        let present = (do { ^docker image inspect $img } | complete).exit_code == 0
+        if $present {
+            docker image rm $img
+        }
+    }
+    docker buildx prune --force
+    print "dev-clean-all: done"
+
+# ── Release ──────────────────────────────────────────────────────────────────
 
 # Create a release: bump version, push branch, print PR link
 [group: 'release']
