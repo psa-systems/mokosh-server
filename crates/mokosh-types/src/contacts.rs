@@ -93,6 +93,7 @@ impl Address {
             && self.city.is_none()
             && self.state.is_none()
             && self.postal_code.is_none()
+            && self.country.is_none()
     }
 
     pub fn formatted(&self) -> String {

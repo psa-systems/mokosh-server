@@ -35,83 +35,48 @@ impl OpSessionRepository for PgOpSessionRepository {
         acr: &str,
         amr: &[String],
     ) -> Result<OpSession, AuthError> {
-        // Resume-or-create: if the user already has a session row for
-        // this exact user_agent (active OR revoked-from-an-earlier-
-        // logout), rotate its sid + expires + acr/amr/ip and clear
-        // revoked_at. The display_name and created_at stay so the
-        // user-supplied label persists across logout/login cycles.
-        // Otherwise insert a fresh row.
+        // Resume-or-create as a single atomic upsert. A UNIQUE index on
+        // (user_id, user_agent) NULLS NOT DISTINCT (migration
+        // 20260613000001) guarantees at most one row per (user, UA), so
+        // two concurrent first-logins can no longer race into two rows:
+        // the loser collides on the index and takes the UPDATE branch.
+        // On conflict we rotate sid + expires + acr/amr/ip and clear
+        // revoked_at, but keep created_at and the user-supplied
+        // display_name so the label persists across logout/login cycles.
+        // `IS NOT DISTINCT FROM` semantics for NULL user_agents (e.g.
+        // CLI) come from the index's NULLS NOT DISTINCT.
         let sid = mokosh_auth_crypto::generate_opaque_token();
         let expires_at = Utc::now() + ttl;
         let ip_net = ip_to_inet(ip);
 
-        let mut tx = self.pool.pg().begin().await.map_err(db_err)?;
-
-        // `IS NOT DISTINCT FROM` makes NULL = NULL work the way we want
-        // for unknown UAs (e.g. CLI). FOR UPDATE so a parallel login
-        // does not race us into two rows.
-        let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT id
-             FROM mokosh_auth.op_sessions
-             WHERE user_id = $1
-               AND user_agent IS NOT DISTINCT FROM $2
-             ORDER BY last_active_at DESC
-             LIMIT 1
-             FOR UPDATE",
+        let row: OpSessionRow = sqlx::query_as(
+            "INSERT INTO mokosh_auth.op_sessions
+                (sid, user_id, tenant_id, expires_at, user_agent, ip, acr, amr)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (user_id, user_agent) DO UPDATE
+             SET sid = EXCLUDED.sid,
+                 tenant_id = EXCLUDED.tenant_id,
+                 expires_at = EXCLUDED.expires_at,
+                 last_active_at = NOW(),
+                 revoked_at = NULL,
+                 ip = EXCLUDED.ip,
+                 acr = EXCLUDED.acr,
+                 amr = EXCLUDED.amr
+             RETURNING id, sid, user_id, tenant_id, created_at, last_active_at,
+                       expires_at, revoked_at, user_agent, ip, acr, amr, display_name",
         )
+        .bind(&sid)
         .bind(user_id.0)
+        .bind(tenant_id.0)
+        .bind(expires_at)
         .bind(user_agent)
-        .fetch_optional(&mut *tx)
+        .bind(ip_net)
+        .bind(acr)
+        .bind(amr)
+        .fetch_one(self.pool.pg())
         .await
         .map_err(db_err)?;
 
-        let row: OpSessionRow = if let Some((existing_id,)) = existing {
-            sqlx::query_as(
-                "UPDATE mokosh_auth.op_sessions
-                 SET sid = $1,
-                     tenant_id = $2,
-                     expires_at = $3,
-                     last_active_at = NOW(),
-                     revoked_at = NULL,
-                     ip = $4,
-                     acr = $5,
-                     amr = $6
-                 WHERE id = $7
-                 RETURNING id, sid, user_id, tenant_id, created_at, last_active_at,
-                           expires_at, revoked_at, user_agent, ip, acr, amr, display_name",
-            )
-            .bind(&sid)
-            .bind(tenant_id.0)
-            .bind(expires_at)
-            .bind(ip_net)
-            .bind(acr)
-            .bind(amr)
-            .bind(existing_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db_err)?
-        } else {
-            sqlx::query_as(
-                "INSERT INTO mokosh_auth.op_sessions
-                    (sid, user_id, tenant_id, expires_at, user_agent, ip, acr, amr)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 RETURNING id, sid, user_id, tenant_id, created_at, last_active_at,
-                           expires_at, revoked_at, user_agent, ip, acr, amr, display_name",
-            )
-            .bind(&sid)
-            .bind(user_id.0)
-            .bind(tenant_id.0)
-            .bind(expires_at)
-            .bind(user_agent)
-            .bind(ip_net)
-            .bind(acr)
-            .bind(amr)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db_err)?
-        };
-
-        tx.commit().await.map_err(db_err)?;
         Ok(row.into())
     }
 

@@ -30,9 +30,14 @@ use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::modules::sla::{SlaService, SlaSweepWorker};
 use mokosh_server::Database;
 
-/// Count in-app notification rows targeting `user_id` for the SLA
-/// breach event in this tenant.
-async fn breach_notification_count(pool: &PgPool, tenant_id: Uuid, user_id: Uuid) -> i64 {
+/// Count in-app notification rows targeting `user_id` for a given SLA
+/// `event_type` (`sla.breached` or `sla.at_risk`) in this tenant.
+async fn notification_count(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    event_type: &str,
+) -> i64 {
     sqlx::query_scalar(
         r#"SELECT COUNT(*)
            FROM notifications n
@@ -40,13 +45,20 @@ async fn breach_notification_count(pool: &PgPool, tenant_id: Uuid, user_id: Uuid
            WHERE n.tenant_id = $1
              AND n.user_id = $2
              AND n.channel_type = 'in_app'
-             AND t.event_type = 'sla.breached'"#,
+             AND t.event_type = $3"#,
     )
     .bind(tenant_id)
     .bind(user_id)
+    .bind(event_type)
     .fetch_one(pool)
     .await
-    .expect("count breach notifications")
+    .expect("count notifications")
+}
+
+/// Count in-app notification rows targeting `user_id` for the SLA
+/// breach event in this tenant.
+async fn breach_notification_count(pool: &PgPool, tenant_id: Uuid, user_id: Uuid) -> i64 {
+    notification_count(pool, tenant_id, user_id, "sla.breached").await
 }
 
 #[sqlx::test]
@@ -165,6 +177,126 @@ async fn sweep_dispatches_breach_then_dedupes(pool: PgPool) {
 
     assert_eq!(
         breach_notification_count(&pool, tenant_id, assignee_id).await,
+        1,
+        "no duplicate notification on a second tick",
+    );
+}
+
+#[sqlx::test]
+async fn sweep_dispatches_first_response_at_risk_then_dedupes(pool: PgPool) {
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let (assignee_id, _email, _password) = common::seed_admin(&pool).await;
+
+    let priority_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_priorities WHERE tenant_id = $1 AND is_default = TRUE",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded default priority");
+    let status_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded default status");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded queue");
+
+    let company_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'SLA AtRisk Co')")
+        .bind(company_id)
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .expect("seed company");
+
+    // Ticket created 10h ago. first_response_due is 30m in the FUTURE
+    // with no first_response_at, so the first-response milestone is
+    // at-risk now: the lead is 20% of the 10h30m window (~2.1h, inside
+    // [5m, 24h]), and now >= due - lead while now < due. resolution_due
+    // is set 10h out so its at-risk threshold (~due - 4h) has not been
+    // reached: only the first_response milestone fires this tick.
+    let ticket_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO tickets
+           (id, tenant_id, ticket_number, title, status_id, priority_id, queue_id,
+            company_id, assigned_to_id, created_by_id, created_at,
+            first_response_due, resolution_due)
+           VALUES ($1, $2, 'SLA-ATRISK-1', 'First-response at risk', $3, $4, $5, $6, $7, $8,
+                   NOW() - INTERVAL '10 hours', NOW() + INTERVAL '30 minutes',
+                   NOW() + INTERVAL '10 hours')"#,
+    )
+    .bind(ticket_id)
+    .bind(tenant_id)
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(assignee_id)
+    .bind(assignee_id)
+    .execute(&pool)
+    .await
+    .expect("seed ticket");
+
+    let notifications =
+        NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
+    let service = SlaService::with_dispatcher(Database::from_pool(pool.clone()), notifications);
+    let worker = SlaSweepWorker::new(service);
+
+    // First tick: exactly one at-risk fan-out for the first-response
+    // milestone.
+    let dispatched = worker.run_tick().await.expect("first sweep tick");
+    assert_eq!(
+        dispatched, 1,
+        "first tick should dispatch exactly one at-risk alert",
+    );
+
+    // Ledger row exists with the first_response_at_risk kind and nothing
+    // else (resolution is not yet at-risk).
+    let ledger: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT kind, sent_at FROM sla_notifications WHERE tenant_id = $1 AND ticket_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(ticket_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query ledger");
+    assert_eq!(ledger.len(), 1, "exactly one ledger row, got {ledger:?}");
+    assert_eq!(
+        ledger[0].0, "first_response_at_risk",
+        "ledger kind must be first_response_at_risk",
+    );
+
+    // One in-app at-risk notification was enqueued for the assignee.
+    assert_eq!(
+        notification_count(&pool, tenant_id, assignee_id, "sla.at_risk").await,
+        1,
+        "exactly one in-app at-risk notification for the assignee",
+    );
+
+    // Second tick: dedupe. No new dispatch, counts unchanged.
+    let dispatched2 = worker.run_tick().await.expect("second sweep tick");
+    assert_eq!(
+        dispatched2, 0,
+        "second tick must be a no-op (ledger dedupe)",
+    );
+
+    let ledger_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sla_notifications WHERE ticket_id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("re-count ledger");
+    assert_eq!(ledger_count, 1, "ledger must not grow on a second tick");
+
+    assert_eq!(
+        notification_count(&pool, tenant_id, assignee_id, "sla.at_risk").await,
         1,
         "no duplicate notification on a second tick",
     );
