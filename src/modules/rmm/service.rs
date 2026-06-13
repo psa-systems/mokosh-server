@@ -285,52 +285,40 @@ impl RmmService {
         connection_id: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RmmDeviceMappingResponse>, u64)> {
-        let (total, rows) = if let Some(cid) = connection_id {
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            let total: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = $1 AND rmm_connection_id = $2",
-            )
-            .bind(tenant_id)
-            .bind(cid)
-            .fetch_one(&mut *tx)
-            .await?;
+        // PMS-198: the optional `connection_id` filter is appended
+        // dynamically instead of duplicating the whole query in an
+        // if/else. Both the COUNT and the page SELECT share the same
+        // base predicate plus the conditional `AND rmm_connection_id`.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-            let rows = sqlx::query_as::<_, DevMapRow>(
-                r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
-                          device_name, last_seen, sync_status
-                   FROM rmm_device_mappings WHERE tenant_id = $1 AND rmm_connection_id = $2
-                   ORDER BY device_name
-                   LIMIT $3 OFFSET $4"#,
-            )
-            .bind(tenant_id)
-            .bind(cid)
-            .bind(pagination.limit() as i64)
-            .bind(pagination.offset() as i64)
+        let mut count_qb =
+            sqlx::QueryBuilder::new("SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = ");
+        count_qb.push_bind(tenant_id);
+        if let Some(cid) = connection_id {
+            count_qb.push(" AND rmm_connection_id = ");
+            count_qb.push_bind(cid);
+        }
+        let total: i64 = count_qb.build_query_scalar().fetch_one(&mut *tx).await?;
+
+        let mut rows_qb = sqlx::QueryBuilder::new(
+            r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
+                      device_name, last_seen, sync_status
+               FROM rmm_device_mappings WHERE tenant_id = "#,
+        );
+        rows_qb.push_bind(tenant_id);
+        if let Some(cid) = connection_id {
+            rows_qb.push(" AND rmm_connection_id = ");
+            rows_qb.push_bind(cid);
+        }
+        rows_qb.push(" ORDER BY device_name LIMIT ");
+        rows_qb.push_bind(pagination.limit() as i64);
+        rows_qb.push(" OFFSET ");
+        rows_qb.push_bind(pagination.offset() as i64);
+        let rows = rows_qb
+            .build_query_as::<DevMapRow>()
             .fetch_all(&mut *tx)
             .await?;
-            (total, rows)
-        } else {
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            let total: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = $1")
-                    .bind(tenant_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
 
-            let rows = sqlx::query_as::<_, DevMapRow>(
-                r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
-                          device_name, last_seen, sync_status
-                   FROM rmm_device_mappings WHERE tenant_id = $1
-                   ORDER BY device_name
-                   LIMIT $2 OFFSET $3"#,
-            )
-            .bind(tenant_id)
-            .bind(pagination.limit() as i64)
-            .bind(pagination.offset() as i64)
-            .fetch_all(&mut *tx)
-            .await?;
-            (total, rows)
-        };
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
