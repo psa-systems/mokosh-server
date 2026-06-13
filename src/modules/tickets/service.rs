@@ -80,12 +80,13 @@ impl TicketService {
         table: &'static str,
         id: Uuid,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
         .bind(tenant_id)
         .bind(id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if exists {
             Ok(())
@@ -110,6 +111,7 @@ impl TicketService {
 
     /// Generate next ticket number for tenant
     async fn next_ticket_number(&self, tenant_id: TenantId) -> AppResult<String> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, (i32,)>(
             r#"
             UPDATE ticket_sequences
@@ -119,8 +121,9 @@ impl TicketService {
             "#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(format!("T{:06}", row.0))
     }
@@ -138,11 +141,12 @@ impl TicketService {
         let ticket_number = self.next_ticket_number(tenant_id).await?;
 
         // Get default status
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let default_status_id: Uuid = sqlx::query_scalar(
             "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| {
             AppError::Configuration("No default ticket status configured".to_string())
@@ -155,7 +159,7 @@ impl TicketService {
                 "SELECT id FROM ticket_priorities WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
             )
             .bind(tenant_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::Configuration("No default priority configured".to_string()))?,
         };
@@ -167,10 +171,11 @@ impl TicketService {
                 "SELECT id FROM ticket_queues WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
             )
             .bind(tenant_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::Configuration("No default queue configured".to_string()))?,
         };
+        drop(tx);
 
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked, so a request cannot point a
@@ -195,7 +200,7 @@ impl TicketService {
         // Insert + audit row in one transaction: capture the new row
         // with Postgres to_jsonb and write the audit entry on the same
         // tx so a rollback drops both. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO tickets (
@@ -281,6 +286,7 @@ impl TicketService {
     /// Get ticket by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<Ticket> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketRow>(
             r#"
             SELECT id, tenant_id, ticket_number, title, description,
@@ -298,7 +304,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(ticket_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
 
@@ -312,6 +318,7 @@ impl TicketService {
         tenant_id: TenantId,
         ticket_number: &str,
     ) -> AppResult<Ticket> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketRow>(
             r#"
             SELECT id, tenant_id, ticket_number, title, description,
@@ -329,7 +336,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(ticket_number)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
 
@@ -477,8 +484,9 @@ impl TicketService {
             count_builder = count_builder.bind(assigned_to_id);
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -520,7 +528,7 @@ impl TicketService {
         // before and after (Postgres to_jsonb captures exact stored
         // state) and write the audit entry on the same tx so a rollback
         // drops both. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
         )
@@ -684,7 +692,7 @@ impl TicketService {
 
         // Mutation + audit row in one transaction. DELETE: snapshot before,
         // old = before, after = None. PMS-117 audit convention.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
         )
@@ -739,6 +747,7 @@ impl TicketService {
         assigned_to_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<Ticket> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE tickets SET assigned_to_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4",
         )
@@ -746,8 +755,9 @@ impl TicketService {
         .bind(user_id)
         .bind(tenant_id)
         .bind(ticket_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         self.get_ticket(tenant_id, ticket_id).await
     }
@@ -763,6 +773,7 @@ impl TicketService {
     ) -> AppResult<TicketNote> {
         let note_id = Uuid::new_v4();
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type, content, created_by_id)
@@ -775,14 +786,14 @@ impl TicketService {
         .bind(request.note_type.as_str())
         .bind(&request.content)
         .bind(user_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Update ticket's updated_at
         sqlx::query("UPDATE tickets SET updated_at = NOW(), last_updated_by_id = $1 WHERE id = $2")
             .bind(user_id)
             .bind(ticket_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
 
         // Record first response if this is a public note and first response hasn't been recorded
@@ -791,9 +802,10 @@ impl TicketService {
                 "UPDATE tickets SET first_response_at = COALESCE(first_response_at, NOW()) WHERE id = $1",
             )
             .bind(ticket_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
 
         // PMS-15: customer notification on public notes. Internal notes
         // never leave the building no matter what `send_email` says.
@@ -821,6 +833,13 @@ impl TicketService {
         content: &str,
     ) {
         // One round-trip fetches ticket-number/title + contact email.
+        let mut tx = match self.db.begin_with_tenant(tenant_id).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(?e, %ticket_id, "open tenant tx for note email failed");
+                return;
+            }
+        };
         let row: Option<(String, String, Option<String>)> = match sqlx::query_as(
             r#"
             SELECT t.ticket_number, t.title, ct.email
@@ -831,7 +850,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(ticket_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await
         {
             Ok(r) => r,
@@ -840,6 +859,10 @@ impl TicketService {
                 return;
             }
         };
+        // Close the read tx before the network send so it isn't held
+        // across the dispatch/mailer await; the post-send mark-sent
+        // write opens its own tenant tx.
+        drop(tx);
 
         let Some((ticket_number, title, Some(email))) = row else {
             tracing::debug!(
@@ -880,13 +903,17 @@ impl TicketService {
 
         match send_result {
             Ok(()) => {
-                if let Err(e) = sqlx::query(
-                    "UPDATE ticket_notes SET is_email_sent = TRUE, email_sent_at = NOW() WHERE id = $1",
-                )
-                .bind(note_id)
-                .execute(self.db.pool())
-                .await
-                {
+                let mark_sent = async {
+                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                    sqlx::query(
+                        "UPDATE ticket_notes SET is_email_sent = TRUE, email_sent_at = NOW() WHERE id = $1",
+                    )
+                    .bind(note_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await
+                };
+                if let Err(e) = mark_sent.await {
                     tracing::warn!(?e, %note_id, "mark is_email_sent failed");
                 } else {
                     tracing::info!(%note_id, "ticket note email queued");
@@ -899,6 +926,7 @@ impl TicketService {
     /// Get note by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_note(&self, tenant_id: TenantId, note_id: Uuid) -> AppResult<TicketNote> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketNoteRow>(
             r#"
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
@@ -911,7 +939,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(note_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Note".to_string()))?;
 
@@ -926,12 +954,13 @@ impl TicketService {
         ticket_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketNote>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM ticket_notes WHERE tenant_id = $1 AND ticket_id = $2",
         )
         .bind(tenant_id)
         .bind(ticket_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, TicketNoteRow>(
@@ -950,7 +979,7 @@ impl TicketService {
         .bind(ticket_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -966,11 +995,12 @@ impl TicketService {
             Some(id) => id,
             None => {
                 // Try to get default SLA
+                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let default: Option<Uuid> = sqlx::query_scalar(
                     "SELECT id FROM sla_policies WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
                 )
                 .bind(tenant_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(&mut *tx)
                 .await?;
 
                 match default {
@@ -1006,6 +1036,7 @@ impl TicketService {
             let sla_due_date =
                 resolution_hours.map(|h| now + chrono::Duration::minutes((h * 60.0) as i64));
 
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query(
                 "UPDATE tickets SET sla_id = $1, first_response_due = $2, sla_due_date = $3, resolution_due = $3 WHERE id = $4",
             )
@@ -1013,8 +1044,9 @@ impl TicketService {
             .bind(first_response_due)
             .bind(sla_due_date)
             .bind(ticket_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
         }
 
         Ok(())
@@ -1027,10 +1059,11 @@ impl TicketService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketStatus>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TicketStatusRow>(
@@ -1045,7 +1078,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1058,10 +1091,11 @@ impl TicketService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketPriority>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ticket_priorities WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TicketPriorityRow>(
@@ -1076,7 +1110,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1089,10 +1123,11 @@ impl TicketService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketQueue>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ticket_queues WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TicketQueueRow>(
@@ -1107,7 +1142,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1120,11 +1155,12 @@ impl TicketService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketType>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM ticket_types WHERE tenant_id = $1 AND is_active = TRUE",
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, TicketTypeRow>(
@@ -1139,7 +1175,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1163,6 +1199,7 @@ impl TicketService {
         priority_id: Option<Uuid>,
         type_id: Option<Uuid>,
     ) -> AppResult<TicketResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let default_creator: Option<Uuid> = sqlx::query_scalar(
             r#"
             SELECT id FROM users
@@ -1173,8 +1210,9 @@ impl TicketService {
             "#,
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
+        drop(tx);
 
         let Some(creator) = default_creator else {
             return Err(AppError::Configuration(
@@ -1271,10 +1309,11 @@ impl TicketService {
             "{} WHERE t.tenant_id = $1 AND t.id = $2",
             TICKET_RESPONSE_SELECT
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketResponseRow>(&sql)
             .bind(tenant_id)
             .bind(ticket_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
         Ok(row.into())
@@ -1402,8 +1441,9 @@ impl TicketService {
             count_builder = count_builder.bind(assigned_to_id);
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
