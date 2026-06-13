@@ -6,7 +6,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use mokosh_auth_core::{
-    AuthError, Invite, InviteRepository, NewInvite, TenantId, User, UserId, UserRole, UserStatus,
+    AuthError, Invite, InviteRepository, MembershipRole, NewInvite, TenantId, User, UserId,
+    UserRole, UserStatus,
 };
 use uuid::Uuid;
 
@@ -152,6 +153,7 @@ impl InviteRepository for PgInviteRepository {
         let rows: Vec<InviteRow> = sqlx::query_as(&format!(
             "{SELECT_INVITE}
              WHERE tenant_id = $1 AND used_at IS NULL AND revoked_at IS NULL
+               AND expires_at > NOW()
              ORDER BY issued_at DESC"
         ))
         .bind(tenant_id.0)
@@ -340,7 +342,35 @@ impl PgInviteRepository {
             _ => db_err(e),
         })?;
 
-        // 4. Mark the invite used.
+        // 4. Create the tenant membership inside the SAME SERIALIZABLE
+        //    tx. Previously the membership was created fire-and-forget in
+        //    the HTTP handler after this tx committed, so a crash between
+        //    commit and the handler INSERT left a user with no
+        //    membership. The org-role is derived from the invite role
+        //    instead of hardcoded to Admin, so Member/ReadOnly invites
+        //    are not over-privileged.
+        let invite_role = UserRole::parse(&row.role)
+            .ok_or_else(|| AuthError::Storage(format!("invalid invite role: {}", row.role)))?;
+        let org_role = MembershipRole::from_user_role(invite_role);
+        sqlx::query(
+            "INSERT INTO mokosh_auth.memberships
+                (user_id, tenant_id, role, org_role, status)
+             VALUES ($1, $2, $3, $4, 'active')",
+        )
+        .bind(new_user_id)
+        .bind(row.tenant_id)
+        .bind(&row.role)
+        .bind(org_role.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                AuthError::Conflict("user is already a member of this tenant".into())
+            }
+            _ => db_err(e),
+        })?;
+
+        // 5. Mark the invite used.
         sqlx::query(
             "UPDATE mokosh_auth.admin_invites
              SET used_at = NOW(), used_by = $1

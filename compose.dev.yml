@@ -74,7 +74,10 @@ services:
       retries: 5
 
   # Prefer Valkey over Redis (required by Infisical). Internal only.
+  # Only Infisical consumes Valkey, so gate it behind the same profile to
+  # keep it from starting when the infisical profile is not selected.
   valkey:
+    profiles: ["infisical"]
     container_name: dev-mokosh-valkey-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/r/valkey/valkey
     image: docker.io/valkey/valkey:8-alpine
@@ -92,7 +95,7 @@ services:
   infisical:
     profiles: ["infisical"]
     container_name: dev-mokosh-infisical-${USER:?USER missing - run via just dev}
-    image: infisical/infisical:latest
+    image: infisical/infisical:v0.161.0
     environment:
       ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
       AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev` (which copies .env.dev to .env)}

@@ -47,33 +47,23 @@ impl SettingsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// Upsert a single tenant setting from a request DTO. PMS-198: this
+    /// is a thin wrapper over [`put_setting`](Self::put_setting), the
+    /// single canonical `INSERT ... ON CONFLICT` for `tenant_settings`,
+    /// so the SQL is not duplicated across the two call sites.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_tenant_setting(
         &self,
         tenant_id: TenantId,
         request: &UpsertTenantSettingRequest,
     ) -> AppResult<TenantSettingResponse> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let id: Uuid = sqlx::query_scalar(
-            r#"INSERT INTO tenant_settings (tenant_id, category, key, value)
-               VALUES ($1, $2, $3, $4)
-               ON CONFLICT (tenant_id, category, key) DO UPDATE SET
-                 value = EXCLUDED.value, updated_at = NOW()
-               RETURNING id"#,
+        self.put_setting(
+            tenant_id,
+            &request.category,
+            &request.key,
+            request.value.clone(),
         )
-        .bind(tenant_id)
-        .bind(&request.category)
-        .bind(&request.key)
-        .bind(&request.value)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(TenantSettingResponse {
-            id,
-            category: request.category.clone(),
-            key: request.key.clone(),
-            value: request.value.clone(),
-        })
+        .await
     }
 
     // Category- and key-scoped tenant_settings access (PMS-113 AC1) ----------

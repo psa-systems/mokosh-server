@@ -8,7 +8,6 @@ on:
   push:
     branches:
       - "main"
-      - "**"
     tags:
       - "v*"
     paths:
@@ -30,6 +29,10 @@ on:
 jobs:
   build-and-push:
     name: Build and push mokosh-api image
+    # Only main and version tags publish the production image. workflow_dispatch
+    # from a feature branch must not overwrite :latest, so gate the job on the
+    # ref in addition to the push-trigger branch filter above.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
     permissions:
       contents: read

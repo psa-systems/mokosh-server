@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 
-use crate::error::CoreError;
 use crate::infisical::{bootstrap_infisical, BootstrapInput, BootstrapOutput};
+use crate::utils::error::AppError;
 
 /// Inputs to the dev bootstrap flow. Maps closely onto the CLI flags so the
 /// subcommand handler can build this directly.
@@ -29,7 +29,7 @@ pub struct DevBootstrapConfig {
 
 /// Run the dev bootstrap. Returns the same output as
 /// [`bootstrap_infisical`], so the caller can also print it for the user.
-pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOutput, CoreError> {
+pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOutput, AppError> {
     info!(
         "Bootstrapping Infisical at {} (writing creds to {})",
         config.url,
@@ -74,10 +74,10 @@ pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOu
 ///
 /// Creates the file if it doesn't exist. The file gets a trailing newline
 /// either way.
-fn upsert_env_file(path: &Path, updates: &[(&str, &str)]) -> Result<(), CoreError> {
+fn upsert_env_file(path: &Path, updates: &[(&str, &str)]) -> Result<(), AppError> {
     let existing = if path.exists() {
         fs::read_to_string(path)
-            .map_err(|e| CoreError::Internal(format!("Failed to read {}: {}", path.display(), e)))?
+            .map_err(|e| AppError::Internal(format!("Failed to read {}: {}", path.display(), e)))?
     } else {
         String::new()
     };
@@ -114,7 +114,7 @@ fn upsert_env_file(path: &Path, updates: &[(&str, &str)]) -> Result<(), CoreErro
         content.push('\n');
     }
     fs::write(path, content)
-        .map_err(|e| CoreError::Internal(format!("Failed to write {}: {}", path.display(), e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to write {}: {}", path.display(), e)))?;
     Ok(())
 }
 

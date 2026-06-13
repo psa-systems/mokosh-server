@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -17,7 +18,10 @@ use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
-use super::{CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse};
+use super::{
+    CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse,
+    PortalSetupPasswordRequest,
+};
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::tickets::{TicketResponse, TicketService};
@@ -52,6 +56,10 @@ pub fn portal_routes(
     Router::new()
         // Public: login. No auth required to call this.
         .route("/auth/login", post(login))
+        // Public: redeem a setup token to set the initial portal password
+        // (PMS-136). No auth: the customer is not yet a logged-in contact;
+        // the single-use token IS the credential proving they own the link.
+        .route("/auth/setup-password", post(setup_password))
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
         .route("/auth/me", get(me))
@@ -78,6 +86,21 @@ async fn login(
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {
     Ok(Json(contact))
+}
+
+/// Redeem a setup token and set the contact's portal password (PMS-136).
+/// Returns 204 on success; the service maps a replayed token to 410 and an
+/// expired/invalid one to 400.
+async fn setup_password(
+    State(state): State<PortalRouterState>,
+    Json(request): Json<PortalSetupPasswordRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    state
+        .service
+        .setup_password(&request.token, &request.password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_invoices(
