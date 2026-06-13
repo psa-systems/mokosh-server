@@ -46,6 +46,7 @@ impl ContractsService {
         }
         let where_clause = conditions.join(" AND ");
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let count_query = format!("SELECT COUNT(*) FROM contracts WHERE {where_clause}");
         let mut count_q = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
         if let Some(v) = filter.company_id {
@@ -57,7 +58,7 @@ impl ContractsService {
         if let Some(v) = &filter.status {
             count_q = count_q.bind(v);
         }
-        let total: i64 = count_q.fetch_one(self.db.pool()).await?;
+        let total: i64 = count_q.fetch_one(&mut *tx).await?;
 
         let query = format!(
             r#"SELECT id, contract_number, name, company_id, contract_type, status,
@@ -82,7 +83,7 @@ impl ContractsService {
         q = q
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64);
-        let rows = q.fetch_all(self.db.pool()).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -96,7 +97,7 @@ impl ContractsService {
         let id = Uuid::new_v4();
         // Mutation + audit row in one transaction. CREATE: old = None,
         // after captured by the new contract id. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO contracts (
                 id, tenant_id, contract_number, name, company_id, contract_type, status,
@@ -147,6 +148,7 @@ impl ContractsService {
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_contract(&self, tenant_id: TenantId, id: Uuid) -> AppResult<ContractResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ContractRow>(
             r#"SELECT id, contract_number, name, company_id, contract_type, status,
                       start_date, end_date, auto_renew, billing_cycle, billing_amount,
@@ -155,7 +157,7 @@ impl ContractsService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Contract".to_string()))?;
         Ok(row.into())
@@ -171,7 +173,7 @@ impl ContractsService {
     ) -> AppResult<ContractResponse> {
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM contracts t WHERE tenant_id = $1 AND id = $2",
         )
@@ -247,7 +249,7 @@ impl ContractsService {
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM contracts t WHERE tenant_id = $1 AND id = $2",
         )
@@ -287,12 +289,13 @@ impl ContractsService {
         contract_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ContractItemResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM contract_items WHERE tenant_id = $1 AND contract_id = $2",
         )
         .bind(tenant_id)
         .bind(contract_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, ContractItemRow>(
@@ -307,7 +310,7 @@ impl ContractsService {
         .bind(contract_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -324,7 +327,7 @@ impl ContractsService {
         let id = Uuid::new_v4();
         // Mutation + audit row in one transaction. CREATE: old = None,
         // after captured by the new item id. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO contract_items (id, tenant_id, contract_id, name, description, item_type,
                                             quantity, unit_price, total_price, billing_frequency, work_type_id,
@@ -389,7 +392,7 @@ impl ContractsService {
         let total = request.quantity * request.unit_price;
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
         )
@@ -473,7 +476,7 @@ impl ContractsService {
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
         )
@@ -513,12 +516,13 @@ impl ContractsService {
         contract_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ContractHourBalanceResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM contract_hour_balances WHERE tenant_id = $1 AND contract_id = $2",
         )
         .bind(tenant_id)
         .bind(contract_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, BalanceRow>(
@@ -532,7 +536,7 @@ impl ContractsService {
         .bind(contract_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -544,9 +548,10 @@ impl ContractsService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RateCardResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rate_cards WHERE tenant_id = $1")
             .bind(tenant_id)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
         let rows = sqlx::query_as::<_, RateCardRow>(
@@ -558,7 +563,7 @@ impl ContractsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -570,7 +575,7 @@ impl ContractsService {
         request: &UpsertRateCardRequest,
         ctx: &AuditCtx,
     ) -> AppResult<RateCardResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
             sqlx::query("UPDATE rate_cards SET is_default = FALSE WHERE tenant_id = $1")
                 .bind(tenant_id)
@@ -626,7 +631,7 @@ impl ContractsService {
         id: Uuid,
         request: &UpsertRateCardRequest,
     ) -> AppResult<RateCardResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
             sqlx::query(
                 "UPDATE rate_cards SET is_default = FALSE WHERE tenant_id = $1 AND id <> $2",
@@ -663,7 +668,7 @@ impl ContractsService {
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM rate_cards t WHERE tenant_id = $1 AND id = $2",
         )
@@ -703,6 +708,7 @@ impl ContractsService {
         rate_card_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RateCardItemResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*)
                FROM rate_card_items rci
@@ -711,7 +717,7 @@ impl ContractsService {
         )
         .bind(tenant_id)
         .bind(rate_card_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, RateCardItemRow>(
@@ -726,7 +732,7 @@ impl ContractsService {
         .bind(rate_card_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -740,12 +746,13 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<RateCardItemResponse> {
         // Verify rate card belongs to tenant first.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM rate_cards WHERE id = $1 AND tenant_id = $2)",
         )
         .bind(rate_card_id)
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if !exists {
             return Err(AppError::NotFound("RateCard".to_string()));
@@ -759,7 +766,6 @@ impl ContractsService {
         // for `after`. This is an INSERT .. ON CONFLICT upsert, so the
         // action is Update when a row already existed (the `before`
         // snapshot doubles as the existence check) else Create.
-        let mut tx = self.db.pool().begin().await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM rate_card_items t \
              WHERE t.rate_card_id = $1 AND t.work_type_id = $2",
@@ -822,18 +828,20 @@ impl ContractsService {
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rate_card_item(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"DELETE FROM rate_card_items rci USING rate_cards rc
                WHERE rci.rate_card_id = rc.id AND rc.tenant_id = $1 AND rci.id = $2"#,
         )
         .bind(tenant_id)
         .bind(id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("RateCardItem".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -872,7 +880,7 @@ impl ContractsService {
             ));
         }
 
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // 1. block-hours contract item + the contract's billing cycle / start.
         let item = sqlx::query_as::<_, BlockItemRow>(
@@ -994,7 +1002,7 @@ impl ContractsService {
         contract_id: Uuid,
         closing_period_end: NaiveDate,
     ) -> AppResult<Decimal> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         let item = sqlx::query_as::<_, BlockItemRow>(
             r#"SELECT ci.id, ci.included_hours, ci.overage_rate,
@@ -1148,6 +1156,7 @@ impl ContractsService {
         after_hours: bool,
         emergency: bool,
     ) -> AppResult<Decimal> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, RateTierRow>(
             r#"SELECT rci.hourly_rate, rci.after_hours_rate, rci.emergency_rate
                FROM rate_card_items rci
@@ -1157,7 +1166,7 @@ impl ContractsService {
         .bind(tenant_id)
         .bind(rate_card_id)
         .bind(work_type_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("RateCardItem".to_string()))?;
 
@@ -1271,6 +1280,7 @@ impl ContractsService {
         tenant_id: TenantId,
         contract_id: Uuid,
     ) -> AppResult<Vec<ContractItemResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, ContractItemRow>(
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
@@ -1282,7 +1292,7 @@ impl ContractsService {
         )
         .bind(tenant_id)
         .bind(contract_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }

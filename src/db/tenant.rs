@@ -42,17 +42,18 @@ impl TenantContext {
     }
 }
 
-/// Default tenant ID for single-tenant mode
-#[cfg(feature = "single-tenant")]
-pub fn default_tenant_id() -> Uuid {
-    // A fixed UUID for single-tenant installations
-    // This allows the same schema to work in both modes
-    Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
-}
-
-#[cfg(feature = "single-tenant")]
-impl Default for TenantContext {
-    fn default() -> Self {
-        Self::new(default_tenant_id())
-    }
-}
+// PMS-262: the `single-tenant` cargo feature (and the
+// `default_tenant_id()` / `Default for TenantContext` it gated) has been
+// removed. That code pinned every operation to a single shared tenant
+// (`00000000-0000-0000-0000-000000000001`), which is the original
+// "everyone shares one tenant" design and the single biggest cross-tenant
+// data-leak vector. There is deliberately no `Default` for `TenantContext`
+// any more: a tenant must always be resolved from an authenticated identity,
+// never fall back to a shared constant.
+//
+// The Bunyip default landing tenant (`Uuid::from_u128(1)`,
+// `modules::auth::middleware::default_bunyip_tenant_id`) is now an
+// INFRA-ONLY tenant: the only residents are platform `super_admin`s.
+// `place_bunyip_user` backfills every non-admin out of it into their own
+// personal tenant on next login (see `is_stuck_in_default`), so no normal
+// user shares data there.

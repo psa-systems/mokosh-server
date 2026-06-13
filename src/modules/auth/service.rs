@@ -74,6 +74,13 @@ impl AuthService {
         self.db.pool()
     }
 
+    /// Database accessor so auth handlers can open a tenant-scoped
+    /// transaction (`begin_with_tenant`) for out-of-band audit writes
+    /// that must still carry the RLS `app.current_tenant` GUC (PMS-256).
+    pub(crate) fn db(&self) -> &crate::db::Database {
+        &self.db
+    }
+
     /// Create a new auth service with an explicit mailer + frontend
     /// origin. `frontend_base_url` is used as the prefix for any link
     /// the service emails to a user (password reset, welcome).
@@ -167,17 +174,22 @@ impl AuthService {
                 ip: audit_ip.clone(),
                 user_agent: audit_ua.clone(),
             };
-            let _ = audit_write(
-                self.db.pool(),
-                TenantId::from_trusted(user.tenant_id),
-                &ctx,
-                AuditAction::Login,
-                "auth",
-                Some(user.id),
-                None,
-                Some(serde_json::json!({ "outcome": "failed", "reason": "bad_password" })),
-            )
-            .await;
+            // Out-of-band on its own tenant-scoped tx; a log-write failure
+            // must not fail the login. PMS-256: carry the RLS GUC even here.
+            if let Ok(mut tx) = self.db.begin_with_tenant(user.tenant_id).await {
+                let _ = audit_write(
+                    &mut *tx,
+                    TenantId::from_trusted(user.tenant_id),
+                    &ctx,
+                    AuditAction::Login,
+                    "auth",
+                    Some(user.id),
+                    None,
+                    Some(serde_json::json!({ "outcome": "failed", "reason": "bad_password" })),
+                )
+                .await;
+                let _ = tx.commit().await;
+            }
             return Err(AppError::Unauthorized);
         }
 
@@ -187,6 +199,7 @@ impl AuthService {
         if user.mfa_enabled {
             if let Some(rc) = request.recovery_code.as_deref() {
                 let candidate = recovery_code_hex_hash(rc);
+                let mut tx = self.db.begin_with_tenant(user.tenant_id).await?;
                 let removed: bool = sqlx::query_scalar(
                     r#"
                     WITH popped AS (
@@ -204,8 +217,9 @@ impl AuthService {
                 .bind(&candidate)
                 .bind(user.id)
                 .bind(user.tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 if !removed {
                     return Err(AppError::Unauthorized);
                 }
@@ -248,17 +262,21 @@ impl AuthService {
         // Update last login
         self.update_last_login(user.tenant_id, user.id).await?;
 
-        // Record the successful login (PMS-117 AC3). Out-of-band on the
-        // pool; a log-write failure must not fail the login itself.
-        let _ = audit_auth_event(
-            self.db.pool(),
-            user.tenant_id,
-            Some(user.id),
-            AuditAction::Login,
-            audit_ip,
-            audit_ua,
-        )
-        .await;
+        // Record the successful login (PMS-117 AC3). Out-of-band on its own
+        // tenant-scoped tx; a log-write failure must not fail the login
+        // itself. PMS-256: carry the RLS GUC even here.
+        if let Ok(mut tx) = self.db.begin_with_tenant(user.tenant_id).await {
+            let _ = audit_auth_event(
+                &mut *tx,
+                user.tenant_id,
+                Some(user.id),
+                AuditAction::Login,
+                audit_ip,
+                audit_ua,
+            )
+            .await;
+            let _ = tx.commit().await;
+        }
 
         Ok(LoginResponse {
             access_token,
@@ -416,6 +434,7 @@ impl AuthService {
         let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001")
             .expect("default tenant UUID is valid");
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO users (
@@ -431,7 +450,7 @@ impl AuthService {
         .bind(google.given_name.clone().unwrap_or_default())
         .bind(google.family_name.clone().unwrap_or_default())
         .bind(role)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         sqlx::query(
@@ -442,8 +461,9 @@ impl AuthService {
         .bind(user_id)
         .bind(&google.sub)
         .bind(&google.email)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         self.get_user_by_id(tenant_id, user_id).await
     }
@@ -457,6 +477,7 @@ impl AuthService {
         tenant_id: Uuid,
         email: &str,
     ) -> AppResult<Option<User>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
@@ -471,7 +492,7 @@ impl AuthService {
         )
         .bind(tenant_id)
         .bind(email)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         Ok(row.map(Into::into))
     }
@@ -571,6 +592,7 @@ impl AuthService {
         let expires_at = Utc::now() + Duration::hours(24);
 
         // Store token
+        let mut tx = self.db.begin_with_tenant(user.tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
@@ -581,8 +603,9 @@ impl AuthService {
         .bind(user.id)
         .bind(&token_hash)
         .bind(expires_at)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let reset_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
         match &self.notifications {
@@ -683,6 +706,7 @@ impl AuthService {
         let new_hash = hash_password(&request.new_password)?;
 
         // Update password
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE users SET password_hash = $1, updated_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
@@ -690,7 +714,7 @@ impl AuthService {
         .bind(&new_hash)
         .bind(user_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Mark token as used
@@ -700,8 +724,9 @@ impl AuthService {
         )
         .bind(user_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         // Invalidate all sessions
         self.logout_all(tenant_id, user_id).await?;
@@ -726,11 +751,12 @@ impl AuthService {
         }
 
         // Get current password hash
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let current_hash: String =
             sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND tenant_id = $2")
                 .bind(user_id)
                 .bind(tenant_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(&mut *tx)
                 .await?
                 .ok_or_else(|| AppError::NotFound("User".to_string()))?;
 
@@ -752,8 +778,9 @@ impl AuthService {
         .bind(&new_hash)
         .bind(user_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -767,13 +794,16 @@ impl AuthService {
         ctx: &AuditCtx,
     ) -> AppResult<User> {
         // Check if email already exists
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id = $1 AND email = $2)",
-        )
-        .bind(tenant_id)
-        .bind(&request.email)
-        .fetch_one(self.db.pool())
-        .await?;
+        let exists: bool = {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id = $1 AND email = $2)",
+            )
+            .bind(tenant_id)
+            .bind(&request.email)
+            .fetch_one(&mut *tx)
+            .await?
+        };
 
         if exists {
             return Err(AppError::conflict("A user with this email already exists"));
@@ -789,7 +819,7 @@ impl AuthService {
         // both. CREATE: old = None, after captured by the new row id.
         // Secret columns (password_hash, mfa_secret) are stripped from the
         // snapshot. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO users (
@@ -845,6 +875,7 @@ impl AuthService {
             let token_hash = hash_password(&secret)?;
             let token = format!("{}.{}", user_id, secret);
             let expires_at = Utc::now() + Duration::days(7);
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query(
                 r#"
                 INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
@@ -855,8 +886,9 @@ impl AuthService {
             .bind(user_id)
             .bind(&token_hash)
             .bind(expires_at)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
 
             let setup_link = format!("{}/reset-password/{}", self.frontend_base_url, token);
             let display_name = match (request.first_name.trim(), request.last_name.trim()) {
@@ -1014,7 +1046,7 @@ impl AuthService {
         // include `AND tenant_id = $2` so the audit cannot accidentally
         // capture another tenant's row even if the caller threads a
         // wrong user_id. PMS-117 + PMS-4 AC6.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) - 'password_hash' - 'mfa_secret' FROM users t \
@@ -1073,6 +1105,7 @@ impl AuthService {
         let secret = mokosh_auth_crypto::totp::generate_secret();
         let secret_b32 = mokosh_auth_crypto::totp::base32_encode(&secret);
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
@@ -1080,8 +1113,9 @@ impl AuthService {
         .bind(&secret_b32)
         .bind(user_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let label = format!("Mokosh:{}", user.email);
         let provisioning_uri =
@@ -1124,6 +1158,7 @@ impl AuthService {
             .map(|c| recovery_code_hex_hash(c))
             .collect();
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             UPDATE users
@@ -1137,8 +1172,9 @@ impl AuthService {
         .bind(&hashes)
         .bind(user_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(crate::modules::auth::models::MfaEnableResponse { recovery_codes })
     }
@@ -1162,6 +1198,7 @@ impl AuthService {
             return Err(AppError::Unauthorized);
         }
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             UPDATE users
@@ -1175,8 +1212,9 @@ impl AuthService {
         )
         .bind(user_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1208,6 +1246,7 @@ impl AuthService {
         let scopes_json = serde_json::to_value(&scopes)
             .map_err(|e| AppError::Internal(format!("api key scopes serialise: {e}")))?;
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
             r#"
             INSERT INTO api_keys (
@@ -1226,8 +1265,9 @@ impl AuthService {
         .bind(&key_hash)
         .bind(scopes_json)
         .bind(request.expires_at)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(crate::modules::auth::models::CreateApiKeyResponse {
             id,
@@ -1248,12 +1288,13 @@ impl AuthService {
         user_id: Uuid,
         pagination: &crate::utils::pagination::PaginationParams,
     ) -> AppResult<(Vec<crate::modules::auth::models::ApiKeyResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM api_keys WHERE tenant_id = $1 AND user_id = $2",
         )
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, ApiKeyRow>(
@@ -1270,7 +1311,7 @@ impl AuthService {
         .bind(user_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1285,14 +1326,16 @@ impl AuthService {
         user_id: Uuid,
         key_id: Uuid,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let affected =
             sqlx::query("DELETE FROM api_keys WHERE id = $1 AND tenant_id = $2 AND user_id = $3")
                 .bind(key_id)
                 .bind(tenant_id)
                 .bind(user_id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?
                 .rows_affected();
+        tx.commit().await?;
 
         if affected == 0 {
             return Err(AppError::NotFound("API key".to_string()));
@@ -1395,8 +1438,9 @@ impl AuthService {
             count = count.bind(status.as_str());
         }
 
-        let rows = data.fetch_all(self.db.pool()).await?;
-        let total = count.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = data.fetch_all(&mut *tx).await?;
+        let total = count.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -1433,6 +1477,7 @@ impl AuthService {
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_by_id(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<User> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
@@ -1447,7 +1492,7 @@ impl AuthService {
         )
         .bind(user_id)
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("User".to_string()))?;
 
@@ -1477,6 +1522,7 @@ impl AuthService {
         // a later refresh of userinfo (or an explicit profile sync) can
         // overwrite this default.
         let (default_first, default_last) = synthetic_name_from_email(email);
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO users (
@@ -1495,8 +1541,9 @@ impl AuthService {
         .bind(role.as_str())
         .bind(&default_first)
         .bind(&default_last)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get_user_by_id(tenant_id, sub).await
     }
 
@@ -1540,6 +1587,7 @@ impl AuthService {
     /// columns; the `users.UNIQUE(tenant_id, email)` constraint
     /// guarantees at most one row.
     async fn find_user_by_email_for_tenant(&self, tenant_id: Uuid, email: &str) -> AppResult<User> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
@@ -1554,7 +1602,7 @@ impl AuthService {
         )
         .bind(tenant_id)
         .bind(email)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::Unauthorized)?;
 
@@ -1563,13 +1611,13 @@ impl AuthService {
 
     /// PMS-138 backward-compat fallback: when the caller does not
     /// supply a tenant hint, resolve to the default tenant
-    /// `Uuid::from_u128(1)`. This matches both
-    /// `db::tenant::default_tenant_id()` (cfg-gated on
-    /// `single-tenant`) and `OIDC_DEFAULT_TENANT_ID` in
-    /// `auth::middleware`, so behaviour converges across the
-    /// legacy login path and the Bunyip-issued at+jwt path. Keep
-    /// the literal value in lockstep with those two sites if it
-    /// ever changes.
+    /// `Uuid::from_u128(1)`. This matches `OIDC_DEFAULT_TENANT_ID` in
+    /// `auth::middleware` (`default_bunyip_tenant_id`), so behaviour
+    /// converges across the legacy login path and the Bunyip-issued
+    /// at+jwt path. Keep the literal value in lockstep with that site
+    /// if it ever changes. PMS-262: the `single-tenant` feature's
+    /// `db::tenant::default_tenant_id()` that this used to mirror has
+    /// been removed; the default tenant is now infra-only.
     fn resolve_tenant_for_login(hint: Option<Uuid>) -> Uuid {
         hint.unwrap_or_else(|| Uuid::from_u128(1))
     }
@@ -1601,6 +1649,7 @@ impl AuthService {
             Utc::now() + Duration::days(7)
         };
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO user_sessions (id, tenant_id, user_id, token_hash, ip_address, user_agent, expires_at)
@@ -1614,21 +1663,23 @@ impl AuthService {
         .bind(&ip_address)
         .bind(&user_agent)
         .bind(expires_at)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(session_id)
     }
 
     /// Get session by ID, scoped to a tenant. PMS-4 AC6.
     async fn get_session(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<Option<Uuid>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let result: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM user_sessions \
              WHERE id = $1 AND tenant_id = $2 AND expires_at > NOW()",
         )
         .bind(session_id)
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
 
         Ok(result)
@@ -1636,25 +1687,29 @@ impl AuthService {
 
     /// Update session last activity. PMS-4 AC6.
     async fn update_session_activity(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE user_sessions SET last_activity_at = NOW() \
              WHERE id = $1 AND tenant_id = $2",
         )
         .bind(session_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(())
     }
 
     /// Update user's last login timestamp. PMS-4 AC6.
     async fn update_last_login(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query("UPDATE users SET last_login_at = NOW() WHERE id = $1 AND tenant_id = $2")
             .bind(user_id)
             .bind(tenant_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1670,14 +1725,16 @@ impl AuthService {
         user_id: Uuid,
         role: UserRole,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
         )
         .bind(role.as_str())
         .bind(user_id)
         .bind(tenant_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(())
     }

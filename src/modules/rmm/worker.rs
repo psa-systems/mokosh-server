@@ -197,6 +197,7 @@ impl RmmSyncWorker {
         connection_id: Uuid,
         d: &ProviderDevice,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO rmm_device_mappings
@@ -217,9 +218,10 @@ impl RmmSyncWorker {
         .bind(d.hostname.as_deref())
         .bind(&d.raw)
         .bind(d.last_seen)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(format!("rmm upsert mapping: {e}")))?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -233,6 +235,7 @@ impl RmmSyncWorker {
         connection_id: Uuid,
         d: &ProviderDevice,
     ) -> AppResult<Option<LinkResult>> {
+        let mut map_tx = self.db.begin_with_tenant(tenant_id).await?;
         let mapping_row: Option<(Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
             r#"SELECT id, asset_id, company_id
                FROM rmm_device_mappings
@@ -241,9 +244,10 @@ impl RmmSyncWorker {
         .bind(tenant_id)
         .bind(connection_id)
         .bind(&d.rmm_device_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *map_tx)
         .await
         .map_err(|e| AppError::Database(format!("rmm read mapping: {e}")))?;
+        drop(map_tx);
 
         let Some((mapping_id, existing_asset, company_id)) = mapping_row else {
             return Ok(None);
@@ -276,12 +280,13 @@ impl RmmSyncWorker {
         // the CMDB before the sync started.
         let candidate: Option<Uuid> =
             if let Some(serial) = d.serial_number.as_ref().filter(|s| !s.is_empty()) {
+                let mut serial_tx = self.db.begin_with_tenant(tenant_id).await?;
                 sqlx::query_scalar(
                     "SELECT id FROM assets WHERE tenant_id = $1 AND serial_number = $2 LIMIT 1",
                 )
                 .bind(tenant_id)
                 .bind(serial)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(&mut *serial_tx)
                 .await
                 .map_err(|e| AppError::Database(format!("rmm match serial: {e}")))?
             } else {
@@ -291,12 +296,13 @@ impl RmmSyncWorker {
             Some(id) => Some(id),
             None => {
                 if let Some(host) = d.hostname.as_ref().filter(|s| !s.is_empty()) {
+                    let mut name_tx = self.db.begin_with_tenant(tenant_id).await?;
                     sqlx::query_scalar(
                         "SELECT id FROM assets WHERE tenant_id = $1 AND name = $2 LIMIT 1",
                     )
                     .bind(tenant_id)
                     .bind(host)
-                    .fetch_optional(self.db.pool())
+                    .fetch_optional(&mut *name_tx)
                     .await
                     .map_err(|e| AppError::Database(format!("rmm match name: {e}")))?
                 } else {
@@ -336,13 +342,15 @@ impl RmmSyncWorker {
         // in the tenant as a default; an admin can re-categorize from
         // the UI later. Fail gracefully if no asset types exist (the
         // tenant has not been seeded), leaving the mapping unlinked.
+        let mut type_tx = self.db.begin_with_tenant(tenant_id).await?;
         let asset_type_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM asset_types WHERE tenant_id = $1 ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *type_tx)
         .await
         .map_err(|e| AppError::Database(format!("rmm read asset_type: {e}")))?;
+        drop(type_tx);
         let Some(asset_type_id) = asset_type_id else {
             return Ok(None);
         };
@@ -352,6 +360,7 @@ impl RmmSyncWorker {
             .hostname
             .clone()
             .unwrap_or_else(|| format!("rmm:{}", d.rmm_device_id));
+        let mut insert_tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO assets
@@ -367,9 +376,10 @@ impl RmmSyncWorker {
         .bind(company_id)
         .bind(d.serial_number.as_deref())
         .bind(&d.rmm_device_id)
-        .execute(self.db.pool())
+        .execute(&mut *insert_tx)
         .await
         .map_err(|e| AppError::Database(format!("rmm create asset: {e}")))?;
+        insert_tx.commit().await?;
 
         sqlx::query(
             "UPDATE rmm_device_mappings SET asset_id = $1, updated_at = NOW() WHERE id = $2",
@@ -398,6 +408,7 @@ impl RmmSyncWorker {
             "hostname": d.hostname,
             "last_seen": d.last_seen,
         });
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO asset_audit_log
                (tenant_id, asset_id, action, changes)
@@ -407,9 +418,10 @@ impl RmmSyncWorker {
         .bind(asset_id)
         .bind(action)
         .bind(changes)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(format!("rmm audit: {e}")))?;
+        tx.commit().await?;
         Ok(())
     }
 
