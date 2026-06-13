@@ -361,6 +361,7 @@ impl TenantService {
     }
 
     /// Update tenant
+    #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tenant(
         &self,
@@ -389,7 +390,12 @@ impl TenantService {
         }
         if request.branding.is_some() {
             query.push_str(&format!(", branding = ${}", param_idx));
-            // param_idx += 1;
+            // Invariant: every conditional SET advances `param_idx` so the
+            // next field added below is numbered correctly. `branding` is
+            // the last field today, so this increment is currently unread
+            // (`#[allow(unused_assignments)]` on the fn); keep it so the
+            // pattern stays copy-paste safe (PMS-197).
+            param_idx += 1;
         }
 
         query.push_str(" WHERE id = $1");
