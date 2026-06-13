@@ -401,12 +401,8 @@ pub struct CreateUserRequest {
     ))]
     pub date_format_string: Option<String>,
     /// If true, send welcome email with password setup link
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub send_welcome_email: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Update user request
@@ -555,8 +551,10 @@ pub struct JwtClaims {
     pub tid: Uuid,
     /// User email
     pub email: String,
-    /// User role
-    pub role: String,
+    /// User role. Serializes to/from the same snake_case string the
+    /// wire format already used (e.g. `"super_admin"`), so this is
+    /// drop-in compatible with previously-issued tokens.
+    pub role: UserRole,
     /// Issued at
     pub iat: i64,
     /// Expiration

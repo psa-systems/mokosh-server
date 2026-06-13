@@ -32,13 +32,8 @@ use std::sync::Arc;
 use crate::cookies::{clear_op_session_cookie, set_op_session_cookie};
 use crate::errors::HttpError;
 use crate::extractors::CurrentOpSession;
+use crate::handlers::shared::{TokenBundle, DEFAULT_FIRST_PARTY_SCOPE};
 use crate::router::AuthHttpState;
-
-/// Default scopes minted for first-party SPA logins when the client
-/// omits an explicit `scope` field. `openid` is required for an ID
-/// token; `email` populates the email/email_verified ID-token claims;
-/// `offline_access` opts the SPA into receiving a refresh token.
-const DEFAULT_FIRST_PARTY_SCOPE: &[&str] = &["openid", "email", "offline_access"];
 
 /// Request body for `/v1/auth/login`. The local-auth fields
 /// (email, password) come from [`crate::local_auth::LocalLoginRequest`];
@@ -90,16 +85,6 @@ pub struct LoginResponse {
     /// Present when the request supplied `client_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenBundle>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TokenBundle {
-    pub access_token: String,
-    pub token_type: &'static str,
-    pub expires_in: i64,
-    pub id_token: String,
-    pub refresh_token: String,
-    pub scope: String,
 }
 
 pub async fn login(

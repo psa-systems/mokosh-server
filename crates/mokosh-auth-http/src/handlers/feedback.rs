@@ -22,7 +22,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 use mokosh_auth_core::{
-    AuditEvent, AuthError, Feedback, FeedbackStatus, NewFeedback, TenantId, UserId, UserRole,
+    AuditEvent, AuthError, Feedback, FeedbackStatus, NewFeedback, TenantId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
+use crate::handlers::shared::require_admin;
 use crate::router::AuthHttpState;
 
 const MAX_MESSAGE_LEN: usize = 8000;
@@ -112,16 +113,6 @@ pub struct UpdateStatusBody {
 }
 
 // --- Helpers ------------------------------------------------------------
-
-fn require_admin(role: UserRole) -> Result<(), HttpError> {
-    if matches!(role, UserRole::Admin) {
-        Ok(())
-    } else {
-        Err(HttpError(AuthError::Forbidden(
-            "admin role required".into(),
-        )))
-    }
-}
 
 /// Decode a Bearer access token without enforcing auth on the route.
 /// Returns `None` if the header is absent or the token is malformed /

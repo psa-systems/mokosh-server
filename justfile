@@ -62,7 +62,7 @@ ensure-oidc-keys:
 
 # Per-developer Traefik-routed instance for SSO testing.
 #   API:  https://{USER}-mokosh-api.a8n.run
-# Run `just dev-sso` here AND in mokosh-clients to get both ends up.
+# Run `just dev-sso` here AND in mokosh-apps to get both ends up.
 # Each per-developer stack gets its OWN private network,
 # `dev-mokosh-private-${USER}`, matching the name compose.dev.yml
 # assigns. The dev-sso overlay marks that network external (it only
@@ -86,9 +86,9 @@ dev-sso: ensure-env ensure-oidc-keys ensure-private-network
     @echo "  https://{{env('USER')}}-mokosh-api.a8n.run/.well-known/openid-configuration"
     @echo ""
     @echo "Next:"
-    @echo "  1. (cd ../mokosh-clients && just dev-sso)"
-    @echo "  2. just register-client     # registers mokosh-clients-web in oauth_clients"
-    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-clients/.env to the printed UUID"
+    @echo "  1. (cd ../mokosh-apps && just dev-sso)"
+    @echo "  2. just register-client     # registers mokosh-apps-web in oauth_clients"
+    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-apps/.env to the printed UUID"
 
 # Stop the SSO dev stack.
 [doc("Stop the SSO dev stack")]
@@ -106,9 +106,9 @@ dev-sso-down: ensure-env
 [group: 'dev']
 restart: down dev-sso
 
-# Register mokosh-clients as a public OIDC client. Run once after
+# Register mokosh-apps as a public OIDC client. Run once after
 # `just dev-sso` is up. Prints the client_id UUID; copy it into
-# mokosh-clients/.env as MOKOSH_OIDC_CLIENT_ID.
+# mokosh-apps/.env as MOKOSH_OIDC_CLIENT_ID.
 [doc("Register bunyip-web as a public OIDC client (one-shot, idempotent on (name))")]
 register-bunyip-client: ensure-env
     #!/usr/bin/env nu
@@ -134,7 +134,7 @@ register-lets-chat-client: ensure-env
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/default/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
 
-[doc("Register mokosh-clients as a public OIDC client (one-shot, idempotent on (name))")]
+[doc("Register mokosh-apps as a public OIDC client (one-shot, idempotent on (name))")]
 register-client: ensure-env
     #!/usr/bin/env nu
     let user = $env.USER

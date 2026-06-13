@@ -10,6 +10,7 @@ use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+use mokosh_types::tickets::BillingStatus;
 
 #[derive(Clone)]
 pub struct TimeTrackingService {
@@ -1372,10 +1373,18 @@ impl From<TimeEntryRow> for TimeEntryResponse {
             company_id: r.company_id,
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
-            billing_status: r.billing_status.unwrap_or_else(|| "not_billed".to_string()),
+            billing_status: r
+                .billing_status
+                .as_deref()
+                .and_then(BillingStatus::from_str)
+                .unwrap_or_default(),
             hourly_rate: r.hourly_rate,
             total_amount: r.total_amount,
-            approval_status: r.approval_status.unwrap_or_else(|| "pending".to_string()),
+            approval_status: r
+                .approval_status
+                .as_deref()
+                .and_then(ApprovalStatus::from_str)
+                .unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

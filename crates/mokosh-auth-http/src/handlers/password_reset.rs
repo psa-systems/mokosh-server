@@ -4,6 +4,7 @@
 //!
 //! See docs/mokosh-smtp/05-password-reset.md.
 
+use crate::handlers::shared::{looks_like_email, token_hash_prefix};
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -12,7 +13,6 @@ use chrono::{Duration, Utc};
 use mokosh_auth_core::{AuditEvent, AuthError, NewPasswordResetToken};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -51,28 +51,6 @@ pub struct CompleteBody {
 pub struct CompleteResponse {
     pub user_id: String,
     pub redirect_to: String,
-}
-
-fn looks_like_email(s: &str) -> bool {
-    let s = s.trim();
-    let mut at = s.split('@');
-    match (at.next(), at.next(), at.next()) {
-        (Some(local), Some(domain), None) => {
-            !local.is_empty()
-                && !s.chars().any(char::is_whitespace)
-                && domain.contains('.')
-                && !domain.starts_with('.')
-                && !domain.ends_with('.')
-        }
-        _ => false,
-    }
-}
-
-fn token_hash_prefix(token: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(token.as_bytes());
-    let bytes = h.finalize();
-    bytes[..4].iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn reset_not_found() -> Response {

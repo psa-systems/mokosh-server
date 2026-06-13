@@ -163,8 +163,13 @@ async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
     let (_tenant_b_id, _b_uid, _b_email, _b_password) =
         common::seed_tenant_with_admin(&pool, "pms260-list-b").await;
     // A tenant-A admin (role `admin`, NOT super_admin).
-    let (_tech_id, tech_email, tech_password) =
-        common::seed_user(&pool, "non-super@example.com", "admin").await;
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "non-super@example.com",
+        "admin",
+    )
+    .await;
 
     let app = common::boot(pool).await;
     let token = common::login(&app, &tech_email, &tech_password).await;
@@ -280,8 +285,13 @@ async fn module_config_cross_tenant_returns_403(pool: PgPool) {
     let (tenant_b_id, _b_user_id, _b_email, _b_password) =
         common::seed_tenant_with_admin(&pool, "pms21-tenant-b").await;
     // Tenant-A admin (not super_admin) - cannot reach tenant B.
-    let (_tech_a_id, tech_a_email, tech_a_password) =
-        common::seed_user(&pool, "tech-a@example.com", "admin").await;
+    let (_tech_a_id, tech_a_email, tech_a_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech-a@example.com",
+        "admin",
+    )
+    .await;
 
     let app = common::boot(pool).await;
     let token = common::login(&app, &tech_a_email, &tech_a_password).await;
@@ -322,8 +332,13 @@ async fn cross_tenant_get_tenant_returns_403(pool: PgPool) {
     let (_admin_id, _admin_email, _admin_password) = common::seed_admin(&pool).await;
     let (tenant_b_id, _b_user_id, _b_email, _b_password) =
         common::seed_tenant_with_admin(&pool, "pms21-tenant-b-get").await;
-    let (_tech_id, tech_email, tech_password) =
-        common::seed_user(&pool, "techguy-a@example.com", "technician").await;
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "techguy-a@example.com",
+        "technician",
+    )
+    .await;
 
     let app = common::boot(pool).await;
     let token = common::login(&app, &tech_email, &tech_password).await;

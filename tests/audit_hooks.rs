@@ -23,23 +23,10 @@ mod common;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Seed a company under the default tenant; returns its id. Invoices and
-/// contracts both require a real `company_id` FK.
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
-        .bind(id)
-        .bind(common::DEFAULT_TENANT_ID)
-        .execute(pool)
-        .await
-        .expect("seed test company");
-    id
-}
-
 #[sqlx::test]
 async fn invoice_create_then_update_writes_audit_rows(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 
@@ -134,7 +121,7 @@ async fn invoice_create_then_update_writes_audit_rows(pool: PgPool) {
 #[sqlx::test]
 async fn contract_create_then_update_writes_audit_rows(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 

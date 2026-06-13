@@ -10,34 +10,15 @@
 //! - Recording a payment against that invoice (via the existing
 //!   `POST /api/v1/payments`) transitions the invoice status.
 //!
-//! Money columns are written with SQL numeric literals rather than bound
-//! `Decimal`s because the dev-dependency `sqlx` feature set used by the
-//! integration-test binaries does not enable `rust_decimal`. Assertions
-//! read money back through the JSON API, where it is serialised by the
-//! service layer.
+//! Money columns are bound as `Decimal` values (the dev `sqlx` feature
+//! set enables `rust_decimal`, PMS-199). Assertions read money back
+//! through the JSON API, where it is serialised by the service layer.
 
 mod common;
 
 use sqlx::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
-
-/// Seed a company under the default tenant; returns its id.
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO companies (id, tenant_id, name)
-        VALUES ($1, $2, 'Acme Co')
-        "#,
-    )
-    .bind(id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("seed test company");
-    id
-}
 
 /// Seed a billable work type under the default tenant; returns its id.
 /// `time_entries.work_type_id` is `NOT NULL REFERENCES work_types(id)`,
@@ -58,10 +39,10 @@ async fn seed_work_type(pool: &PgPool) -> Uuid {
     id
 }
 
-/// Seed one billable, unbilled time entry directly. `duration_minutes`
-/// and the money columns are interpolated as SQL literals (see the
-/// module note on the missing `rust_decimal` dev feature). Returns the
-/// new entry id.
+/// Seed one billable, unbilled time entry directly. The money columns
+/// are bound as `Decimal` values (parsed from the string literals via
+/// [`common::dec`]) rather than interpolated as SQL literals. Returns
+/// the new entry id.
 async fn seed_time_entry(
     pool: &PgPool,
     user_id: Uuid,
@@ -72,34 +53,36 @@ async fn seed_time_entry(
     total_amount: &str,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let sql = format!(
+    sqlx::query(
         r#"
         INSERT INTO time_entries (
             id, tenant_id, user_id, date, duration_minutes, work_type_id,
             company_id, is_billable, billing_status, invoice_id,
             hourly_rate, total_amount
         )
-        VALUES ($1, $2, $3, CURRENT_DATE, {duration_minutes}, $4,
-                $5, TRUE, 'ready_to_bill', NULL,
-                {hourly_rate}, {total_amount})
-        "#
-    );
-    sqlx::query(&sql)
-        .bind(id)
-        .bind(common::DEFAULT_TENANT_ID)
-        .bind(user_id)
-        .bind(work_type_id)
-        .bind(company_id)
-        .execute(pool)
-        .await
-        .expect("seed test time entry");
+        VALUES ($1, $2, $3, CURRENT_DATE, $4, $5,
+                $6, TRUE, 'ready_to_bill', NULL,
+                $7, $8)
+        "#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(user_id)
+    .bind(duration_minutes)
+    .bind(work_type_id)
+    .bind(company_id)
+    .bind(common::dec(hourly_rate))
+    .bind(common::dec(total_amount))
+    .execute(pool)
+    .await
+    .expect("seed test time entry");
     id
 }
 
 #[sqlx::test]
 async fn generate_invoice_from_time_entries(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let work_type_id = seed_work_type(&pool).await;
 
     // Two billable entries: 60 min @ $150 = $150, 90 min @ $200 = $300.
@@ -291,7 +274,7 @@ async fn generate_invoice_from_time_entries(pool: PgPool) {
 #[sqlx::test]
 async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let work_type_id = seed_work_type(&pool).await;
 
     // One billable entry: 60 min @ $150 = $150 total.
@@ -377,7 +360,7 @@ async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
 #[sqlx::test]
 async fn billing_responses_carry_company_name(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await; // seeded as "Acme Co"
+    let company_id = common::seed_company(&pool).await; // seeded as "Acme Co"
     let work_type_id = seed_work_type(&pool).await;
     seed_time_entry(
         &pool,

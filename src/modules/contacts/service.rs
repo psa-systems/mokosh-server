@@ -1706,7 +1706,7 @@ impl From<ContactRow> for Contact {
             tags: row.tags,
             notes: row.notes,
             avatar_url: row.avatar_url,
-            status: row.status.parse::<ContactStatus>().unwrap_or_default(),
+            status: ContactStatus::from_str(&row.status).unwrap_or_default(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
