@@ -72,63 +72,11 @@ pub fn validate_password_strength(password: &str) -> Result<(), ValidationError>
     }
 }
 
-/// Validate a hex color code
-pub fn validate_hex_color(color: &str) -> Result<(), ValidationError> {
-    let color = color.strip_prefix('#').unwrap_or(color);
-
-    if (color.len() == 3 || color.len() == 6) && color.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(ValidationError::new("invalid_color"))
-    }
-}
-
-/// Validate a timezone string
-pub fn validate_timezone(tz: &str) -> Result<(), ValidationError> {
-    // Common timezone validation - could use chrono-tz for full validation
-    if tz.is_empty() {
-        return Err(ValidationError::new("empty_timezone"));
-    }
-
-    // Check for IANA timezone format (e.g., "America/New_York")
-    if tz.contains('/') && tz.len() >= 5 {
-        return Ok(());
-    }
-
-    // Check for offset format (e.g., "UTC", "+05:00", "-08:00")
-    if tz == "UTC" || tz == "GMT" {
-        return Ok(());
-    }
-
-    if (tz.starts_with('+') || tz.starts_with('-')) && tz.len() == 6 && tz.contains(':') {
-        return Ok(());
-    }
-
-    Err(ValidationError::new("invalid_timezone"))
-}
-
 /// Validate a CRON expression
 pub fn validate_cron(expr: &str) -> Result<(), ValidationError> {
     match cron::Schedule::try_from(expr) {
         Ok(_) => Ok(()),
         Err(_) => Err(ValidationError::new("invalid_cron")),
-    }
-}
-
-/// Validate that a string is not empty after trimming
-pub fn validate_not_blank(s: &str) -> Result<(), ValidationError> {
-    if s.trim().is_empty() {
-        Err(ValidationError::new("blank"))
-    } else {
-        Ok(())
-    }
-}
-
-/// Validate a UUID string
-pub fn validate_uuid(s: &str) -> Result<(), ValidationError> {
-    match uuid::Uuid::parse_str(s) {
-        Ok(_) => Ok(()),
-        Err(_) => Err(ValidationError::new("invalid_uuid")),
     }
 }
 

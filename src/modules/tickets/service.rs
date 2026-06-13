@@ -1270,9 +1270,8 @@ impl TicketService {
         Ok(row.into())
     }
 
-    /// List fully-joined ticket responses + total. Mirrors the filter
-    /// semantics of [`TicketService::list_tickets`] but produces
-    /// response DTOs directly. Audit F3.
+    /// List fully-joined ticket responses + total, applying the ticket
+    /// filter semantics and producing response DTOs directly. Audit F3.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_ticket_responses(
         &self,
