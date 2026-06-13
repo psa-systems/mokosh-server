@@ -18,7 +18,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 // ── Token claim types ─────────────────────────────────────────────────────────
 
@@ -148,6 +148,11 @@ pub struct Verifier {
     pub config: VerifierConfig,
     http: reqwest::Client,
     cache: Arc<RwLock<Option<JwksCache>>>,
+    /// Serializes JWKS refreshes so a cache expiry (or kid miss) under
+    /// concurrent load triggers a single network fetch, not one per request
+    /// (thundering herd). Refresh logic re-checks the cache under this lock
+    /// and skips the fetch if a peer already refreshed.
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -193,6 +198,7 @@ impl Verifier {
                 .build()
                 .expect("reqwest client build"),
             cache: Arc::new(RwLock::new(None)),
+            refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -215,7 +221,7 @@ impl Verifier {
         match self.try_validate(token, &kid).await {
             Ok(claims) => Ok(claims),
             Err(VerifyError::InvalidSignature) => {
-                self.refresh_jwks().await?;
+                self.force_refresh_jwks().await?;
                 self.try_validate(token, &kid).await
             }
             Err(e) => Err(e),
@@ -275,21 +281,47 @@ impl Verifier {
         }
     }
 
-    async fn ensure_cache(&self) -> Result<(), VerifyError> {
-        let needs_refresh = {
-            let guard = self.cache.read().await;
-            match guard.as_ref() {
-                None => true,
-                Some(c) => {
-                    (Utc::now() - c.refreshed_at).num_seconds()
-                        > self.config.jwks_cache_ttl_secs as i64
-                }
+    /// True when the cache is empty or older than the configured TTL.
+    async fn cache_is_stale(&self) -> bool {
+        let guard = self.cache.read().await;
+        match guard.as_ref() {
+            None => true,
+            Some(c) => {
+                (Utc::now() - c.refreshed_at).num_seconds() > self.config.jwks_cache_ttl_secs as i64
             }
-        };
-        if needs_refresh {
-            self.refresh_jwks().await?;
         }
-        Ok(())
+    }
+
+    async fn ensure_cache(&self) -> Result<(), VerifyError> {
+        if !self.cache_is_stale().await {
+            return Ok(());
+        }
+        // Coalesce concurrent expiry refreshes: take the refresh lock, then
+        // re-check, since a peer may have refreshed while we waited.
+        let _lock = self.refresh_lock.lock().await;
+        if !self.cache_is_stale().await {
+            return Ok(());
+        }
+        self.refresh_jwks().await
+    }
+
+    /// Force a refresh after a kid miss, but coalesce concurrent callers: if a
+    /// peer already refreshed (the cache's `refreshed_at` advanced) while we
+    /// waited for the lock, skip the redundant network fetch.
+    async fn force_refresh_jwks(&self) -> Result<(), VerifyError> {
+        let before = {
+            let guard = self.cache.read().await;
+            guard.as_ref().map(|c| c.refreshed_at)
+        };
+        let _lock = self.refresh_lock.lock().await;
+        let after = {
+            let guard = self.cache.read().await;
+            guard.as_ref().map(|c| c.refreshed_at)
+        };
+        if before != after {
+            return Ok(());
+        }
+        self.refresh_jwks().await
     }
 
     async fn refresh_jwks(&self) -> Result<(), VerifyError> {

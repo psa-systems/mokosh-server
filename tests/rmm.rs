@@ -64,7 +64,7 @@ async fn sync_writes_mapping_asset_audit_and_status(pool: PgPool) {
     common::seed_admin(&pool).await;
     let tenant_id = common::DEFAULT_TENANT_ID;
 
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let conn_id = seed_connection(&pool, "canary-key-not-in-cipher", Some("hmac-secret")).await;
     // Pre-bind the mapping to the company so the worker promotes it
     // into an asset (per PMS-103 spec: company_id on mapping is the
@@ -160,7 +160,7 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
     let tenant_id = common::DEFAULT_TENANT_ID;
 
     let secret = "rmm-shared-secret-xyz";
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let conn_id = seed_connection(&pool, "api-key", Some(secret)).await;
     seed_unlinked_mapping(&pool, conn_id, "device-A", company_id).await;
     seed_alert_rule(
@@ -309,17 +309,6 @@ async fn channel_credentials_are_encrypted_at_rest(pool: PgPool) {
 }
 
 // --- helpers ---------------------------------------------------------------
-
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
-        .bind(id)
-        .bind(common::DEFAULT_TENANT_ID)
-        .execute(pool)
-        .await
-        .expect("seed test company");
-    id
-}
 
 async fn seed_connection(pool: &PgPool, api_key: &str, api_secret: Option<&str>) -> Uuid {
     let key_enc = crypto::encrypt(api_key, &TEST_KEY).expect("encrypt api_key");

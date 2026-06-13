@@ -86,6 +86,19 @@ impl AppConfig {
     pub fn is_production(&self) -> bool {
         self.environment == "production"
     }
+
+    /// Dev/test environments run over plain HTTP, where browsers drop
+    /// `Secure` cookies. Only these opt out of secure cookies; every other
+    /// environment (staging, production, or any unrecognized value) defaults
+    /// to secure, so a misconfigured `ENVIRONMENT` fails safe.
+    pub fn is_dev_or_test(&self) -> bool {
+        matches!(self.environment.as_str(), "development" | "dev" | "test")
+    }
+
+    // PMS-262: single-tenant mode removed. Multi-tenant is the only mode.
+    pub fn is_multi_tenant(&self) -> bool {
+        true
+    }
 }
 
 #[tokio::main]
@@ -172,8 +185,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Browsers drop `Secure` cookies on plain HTTP, so disable the flag
-    // in development. In any non-dev environment, set it.
-    let cookie_secure = config.is_production();
+    // only in dev/test. Everywhere else (staging, production, or an
+    // unrecognized ENVIRONMENT) defaults to secure so the OAuth state
+    // cookie is not exposed over a downgraded connection.
+    let cookie_secure = !config.is_dev_or_test();
 
     // Build the host-crate mailer (SmtpMailer when SMTP_HOST is set,
     // LogMailer otherwise). Hard-fail on misconfiguration so an

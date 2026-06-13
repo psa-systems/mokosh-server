@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use mokosh_auth_core::{AuthError, RecoveryCodeRepository, TenantId, UserId};
 use uuid::Uuid;
 
-use crate::conv::db_err;
+use crate::conv::{db_err, retry_serializable};
 use crate::pool::AuthPool;
 
 pub struct PgRecoveryCodeRepository {
@@ -20,22 +20,10 @@ impl PgRecoveryCodeRepository {
 #[async_trait]
 impl RecoveryCodeRepository for PgRecoveryCodeRepository {
     async fn consume_unused(&self, user_id: UserId, code_hash: [u8; 32]) -> Result<(), AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self.consume_unused_once(user_id, code_hash).await {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(
-                        attempt,
-                        "recovery code consume serialization conflict; retrying"
-                    );
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("recovery code consume", || {
+            self.consume_unused_once(user_id, code_hash)
+        })
+        .await
     }
 
     async fn count_unused(&self, user_id: UserId) -> Result<usize, AuthError> {
@@ -57,25 +45,10 @@ impl RecoveryCodeRepository for PgRecoveryCodeRepository {
         user_totp_id: Uuid,
         new_hashes: &[[u8; 32]],
     ) -> Result<(), AuthError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self
-                .replace_all_once(user_id, tenant_id, user_totp_id, new_hashes)
-                .await
-            {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(
-                        attempt,
-                        "recovery codes replace_all serialization conflict; retrying"
-                    );
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("recovery codes replace_all", || {
+            self.replace_all_once(user_id, tenant_id, user_totp_id, new_hashes)
+        })
+        .await
     }
 }
 

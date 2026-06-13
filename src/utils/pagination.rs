@@ -124,6 +124,10 @@ pub struct PaginationMeta {
 impl<T> PaginatedResponse<T> {
     /// Create a new paginated response
     pub fn new(data: Vec<T>, page: u32, per_page: u32, total: u64) -> Self {
+        // Guard against per_page == 0: division by zero yields NaN/inf,
+        // which casts to a nonsensical total_pages (0 or u32::MAX). Clamp
+        // to at least one item per page so paging math stays well defined.
+        let per_page = per_page.max(1);
         let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
         Self {
@@ -268,6 +272,21 @@ mod tests {
         assert_eq!(response.meta.total_pages, 4);
         assert!(!response.meta.has_next);
         assert!(response.meta.has_prev);
+    }
+
+    #[test]
+    fn test_paginated_response_clamps_zero_per_page() {
+        // per_page == 0 must not yield a degenerate total_pages from a
+        // divide-by-zero; it is clamped to 1 so every item is one page.
+        let response = PaginatedResponse::new(vec![1, 2, 3], 1, 0, 3);
+        assert_eq!(response.meta.per_page, 1);
+        assert_eq!(response.meta.total_pages, 3);
+
+        // total == 0 with per_page == 0 previously produced NaN -> 0,
+        // which is fine, but the clamp keeps the path well defined.
+        let empty: PaginatedResponse<i32> = PaginatedResponse::new(vec![], 1, 0, 0);
+        assert_eq!(empty.meta.per_page, 1);
+        assert_eq!(empty.meta.total_pages, 0);
     }
 
     #[test]

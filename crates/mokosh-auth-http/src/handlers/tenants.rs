@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
+use crate::handlers::shared::{TokenBundle, DEFAULT_FIRST_PARTY_SCOPE};
 use crate::router::AuthHttpState;
 
 #[derive(Debug, Serialize)]
@@ -99,18 +100,6 @@ pub struct SwitchResponse {
     pub tokens: TokenBundle,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TokenBundle {
-    pub access_token: String,
-    pub token_type: &'static str,
-    pub expires_in: i64,
-    pub id_token: String,
-    pub refresh_token: String,
-    pub scope: String,
-}
-
-const DEFAULT_FIRST_PARTY_SCOPE: &[&str] = &["openid", "email", "offline_access"];
-
 /// `POST /v1/auth/active-tenant`
 ///
 /// Validates that the user has an active membership in the requested
@@ -175,8 +164,20 @@ pub async fn switch_active_tenant(
         });
 
     let now = provider.clock.now();
-    let acr = "urn:mokosh:loa:pwd";
-    let amr: Vec<String> = vec!["pwd".to_string()];
+    // Preserve the originating session's authentication strength across the
+    // tenant switch. Looking up the OP session by its sid keeps an MFA
+    // session's acr/amr intact instead of downgrading every switched token
+    // to bare-password LoA. Fall back to pwd defaults only when the caller's
+    // token carried no sid (e.g. a nested tenant-switched grant).
+    let session = match current_sid {
+        Some(sid) => provider.sessions.find_by_id(sid).await.map_err(HttpError)?,
+        None => None,
+    };
+    let (acr, amr): (String, Vec<String>) = match session {
+        Some(s) => (s.acr, s.amr),
+        None => ("urn:mokosh:loa:pwd".to_string(), vec!["pwd".to_string()]),
+    };
+    let acr = acr.as_str();
 
     let access = mint_access_token(
         &provider.keys,

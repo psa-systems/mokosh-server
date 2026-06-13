@@ -13,7 +13,7 @@ use mokosh_auth_core::{
 };
 use std::collections::BTreeSet;
 
-use crate::conv::{db_err, ip_to_inet};
+use crate::conv::{db_err, ip_to_inet, retry_serializable};
 use crate::pool::AuthPool;
 
 pub struct PgRefreshTokenRepository {
@@ -80,29 +80,11 @@ impl RefreshTokenRepository for PgRefreshTokenRepository {
         new_token: NewRefreshToken,
         narrowed_scope: &BTreeSet<String>,
     ) -> Result<RotatedTokens, AuthError> {
-        // Up to a small number of serialization-failure retries. Postgres
-        // returns SQLSTATE 40001 ("could not serialize access") when two
-        // concurrent SERIALIZABLE transactions conflict; that is the
-        // *correct* outcome (the loser must retry or fail), but we give
-        // legitimate retries a small budget before surfacing the error.
-        const MAX_ATTEMPTS: u32 = 3;
-
         let scope_vec: Vec<String> = narrowed_scope.iter().cloned().collect();
-        for attempt in 0..MAX_ATTEMPTS {
-            match self
-                .rotate_once(&presented_hash, &new_token, &scope_vec)
-                .await
-            {
-                Err(AuthError::Storage(msg))
-                    if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS =>
-                {
-                    tracing::debug!(attempt, "refresh rotation serialization conflict, retrying");
-                    continue;
-                }
-                other => return other,
-            }
-        }
-        unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+        retry_serializable("refresh rotation", || {
+            self.rotate_once(&presented_hash, &new_token, &scope_vec)
+        })
+        .await
     }
 
     async fn revoke_by_token_hash(

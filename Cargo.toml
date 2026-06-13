@@ -65,7 +65,7 @@ edition = "2021"
 authors = ["Mokosh Server Team"]
 description = "Professional Services Automation platform for MSPs - API server"
 license = "Proprietary"
-repository = "https://github.com/your-org/mokosh-server"
+repository = "https://dev.a8n.run/psa-systems/mokosh-server"
 
 [[bin]]
 name = "mokosh-server"
@@ -207,8 +207,12 @@ tempfile = "3"
 # from `Authorization: Bearer ...`, not from a cookie).
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 # Drive #[sqlx::test] from this crate's test binaries. The macro reads
-# DATABASE_URL and provisions a fresh database per test invocation.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+# DATABASE_URL and provisions a fresh database per test invocation. The
+# `rust_decimal` feature lets test fixtures bind `Decimal` money columns
+# directly instead of interpolating SQL literals (PMS-199).
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros", "rust_decimal"] }
+# Name the `Decimal` type in test fixtures that bind money columns.
+rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
 
 [build-dependencies]
 # Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().

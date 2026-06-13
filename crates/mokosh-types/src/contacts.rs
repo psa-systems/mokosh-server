@@ -93,6 +93,7 @@ impl Address {
             && self.city.is_none()
             && self.state.is_none()
             && self.postal_code.is_none()
+            && self.country.is_none()
     }
 
     pub fn formatted(&self) -> String {
@@ -184,12 +185,8 @@ pub struct CreateCompanyRequest {
     #[serde(default)]
     pub tags: Vec<String>,
     pub notes: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub portal_enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Update company request
@@ -346,22 +343,18 @@ pub enum ContactStatus {
 }
 
 impl ContactStatus {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "inactive" => Some(Self::Inactive),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             ContactStatus::Active => "active",
             ContactStatus::Inactive => "inactive",
-        }
-    }
-}
-
-impl std::str::FromStr for ContactStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "active" => Ok(ContactStatus::Active),
-            "inactive" => Ok(ContactStatus::Inactive),
-            _ => Err(format!("Unknown contact status: {}", s)),
         }
     }
 }
@@ -453,6 +446,11 @@ pub struct UpdateContactRequest {
     pub tags: Option<Vec<String>>,
     pub notes: Option<String>,
     pub status: Option<ContactStatus>,
+    /// Grant (or revoke) customer-portal access. Transitioning `false ->
+    /// true` mints a single-use setup token and emails the contact a
+    /// `/portal/set-password` link (PMS-136). Setting `false` revokes
+    /// access (PMS-17 flag transition). `None` leaves the flag untouched.
+    pub is_portal_user: Option<bool>,
 }
 
 /// Contact summary (for embedding in other responses)

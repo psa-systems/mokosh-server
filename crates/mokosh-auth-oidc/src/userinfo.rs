@@ -12,6 +12,12 @@ use crate::tokens::AccessTokenClaims;
 pub struct UserInfoResponse {
     pub sub: String,
     pub mokosh_tenant_id: String,
+    /// The tenant the bearer token authorizes the caller to act under.
+    /// This is the authorization-gating claim: RPs MUST gate on it, not
+    /// on `mokosh_tenant_id` (the user's home tenant). Mirrored from the
+    /// access token so /userinfo callers see the same value the token
+    /// carried.
+    pub mokosh_active_tenant: String,
     pub mokosh_role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -66,6 +72,7 @@ pub async fn handle_userinfo(
     Ok(UserInfoResponse {
         sub: user.id.0.to_string(),
         mokosh_tenant_id: user.tenant_id.0.to_string(),
+        mokosh_active_tenant: claims.mokosh_active_tenant.clone(),
         mokosh_role: user.role.as_str().to_string(),
         email: include_email.then(|| user.email.clone()),
         email_verified: include_email.then(|| user.email_verified_at.is_some()),
