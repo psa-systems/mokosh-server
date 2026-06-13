@@ -206,3 +206,33 @@ pub fn ip_to_inet(ip: Option<std::net::IpAddr>) -> Option<ipnetwork::IpNetwork> 
 pub fn db_err(e: sqlx::Error) -> AuthError {
     AuthError::Storage(e.to_string())
 }
+
+/// Run a SERIALIZABLE operation with retry-on-serialization-failure.
+///
+/// Postgres returns SQLSTATE `40001` ("could not serialize access") when
+/// two concurrent SERIALIZABLE transactions conflict; the loser must
+/// retry or fail. This retries `op` up to a small budget before
+/// surfacing the error, and is shared by every repository that runs a
+/// SERIALIZABLE transaction. `label` names the operation in the
+/// retry debug log.
+pub async fn retry_serializable<T, F, Fut>(label: &str, mut op: F) -> Result<T, AuthError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AuthError>>,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        match op().await {
+            Err(AuthError::Storage(msg)) if msg.contains("40001") && attempt + 1 < MAX_ATTEMPTS => {
+                tracing::debug!(
+                    attempt,
+                    operation = label,
+                    "serialization conflict; retrying"
+                );
+                continue;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("loop returns or continues at most MAX_ATTEMPTS times")
+}

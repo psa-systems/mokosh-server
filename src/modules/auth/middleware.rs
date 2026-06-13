@@ -2,7 +2,6 @@
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
     middleware::Next,
     response::Response,
 };
@@ -123,9 +122,13 @@ pub async fn auth_middleware(
                 let user = current_user_from_at_jwt(&verified);
                 AuthState::authenticated(user, tenant_id)
             } else {
-                // 3. Legacy HS256 cookie path.
+                // 3. Legacy HS256 cookie path. Only an `access` token is a
+                // valid Bearer credential; `decode_token` runs
+                // `Validation::default()` and does not assert `typ`, so a
+                // `typ:"refresh"` token would otherwise be accepted here.
+                // Guard it explicitly, mirroring `refresh_token()`.
                 match auth_middleware.auth_service.decode_token(token) {
-                    Ok(claims) => match auth_middleware
+                    Ok(claims) if claims.typ == "access" => match auth_middleware
                         .auth_service
                         .get_user_by_id(claims.tid, claims.sub)
                         .await
@@ -133,7 +136,7 @@ pub async fn auth_middleware(
                         Ok(user) => AuthState::authenticated(user.to_current_user(), claims.tid),
                         Err(_) => AuthState::default(),
                     },
-                    Err(_) => AuthState::default(),
+                    _ => AuthState::default(),
                 }
             }
         }
@@ -152,24 +155,6 @@ fn bearer(req: &Request) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
-}
-
-/// Middleware that requires authentication
-pub async fn require_auth(request: Request, next: Next) -> Result<Response, (StatusCode, String)> {
-    let auth_state = request
-        .extensions()
-        .get::<AuthState>()
-        .cloned()
-        .unwrap_or_default();
-
-    if !auth_state.is_authenticated {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Authentication required".to_string(),
-        ));
-    }
-
-    Ok(next.run(request).await)
 }
 
 /// Extractor for requiring authentication
@@ -214,7 +199,7 @@ where
 ///     scope: TenantScope,
 ///     ...
 /// ) -> AppResult<Json<...>> {
-///     state.ticket_service.list_tickets(scope.tenant_id, ...).await
+///     state.ticket_service.list_ticket_responses(scope.tenant_id, ...).await
 /// }
 /// ```
 ///
@@ -443,22 +428,6 @@ gated_module!(RmmModule, "rmm_integration", RequireRmm);
 gated_module!(ReportsModule, "reports", RequireReports);
 gated_module!(TimeTrackingModule, "time_tracking", RequireTimeTracking);
 
-/// Get the current user's tenant ID from the request
-pub fn get_tenant_id(request: &Request) -> Option<uuid::Uuid> {
-    request
-        .extensions()
-        .get::<AuthState>()
-        .and_then(|state| state.tenant_id)
-}
-
-/// Get the current user from the request
-pub fn get_current_user(request: &Request) -> Option<CurrentUser> {
-    request
-        .extensions()
-        .get::<AuthState>()
-        .and_then(|state| state.user.clone())
-}
-
 // ── Bunyip RS helper ─────────────────────────────────────────────────────────
 
 /// Resolve a Bunyip-issued at+jwt claim set into an `AuthState`.
@@ -566,6 +535,20 @@ pub async fn place_bunyip_user(
         }
     };
 
+    // PMS-288: the target tenant may have been provisioned off the PSA path - an
+    // invite into an auth/SSO-created org tenant, or an existing placement in a
+    // manually-created tenant - and so never received `copy_default_config`,
+    // leaving ticket creation (which needs a default ticket status + a sequence
+    // row) to 500. Seed it idempotently now that `target` is resolved. The
+    // personal-tenant branch above already seeded via `ensure_personal_tenant`,
+    // so this is a no-op there. Best-effort: a seed failure is logged, not fatal
+    // to the request (a tenant lacking config still authenticates).
+    if let Some(svc) = tenants {
+        if let Err(e) = svc.ensure_default_config(target).await {
+            tracing::warn!(error = %e, sub = %sub, tenant_id = %target, "default config seed failed");
+        }
+    }
+
     // Re-home an already-placed user into the target tenant - invite acceptance,
     // or the PMS-243 backfill out of the legacy default tenant. Idempotent (a
     // no-op when they are already there); co-mingled data stays put (PMS-243).
@@ -593,9 +576,18 @@ pub async fn place_bunyip_user(
     let mut user = match auth_service.get_user_by_id(target, sub).await {
         Ok(user) => user,
         Err(_) => {
-            let email_for_insert = email
-                .clone()
-                .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
+            // Persist the IdP-supplied email on the JIT insert ONLY when the
+            // IdP reports it verified, matching the Google path.
+            // `upsert_user_from_oidc` stamps `email_verified_at = NOW()`, so
+            // writing an unverified address here would falsely mark it
+            // verified and open an auto-link/capture path against the real
+            // owner. An unverified user is still self-signed-up (into their
+            // own isolated personal tenant) under a placeholder address; the
+            // real email is backfilled on a later login once verified.
+            let email_for_insert = match (email.clone(), email_verified) {
+                (Some(em), true) => em,
+                _ => format!("{sub}@unresolved.invalid"),
+            };
             auth_service
                 .upsert_user_from_oidc(sub, target, &email_for_insert, initial_role)
                 .await

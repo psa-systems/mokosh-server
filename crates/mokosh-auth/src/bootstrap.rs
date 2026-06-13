@@ -349,7 +349,10 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
 /// as dev so cookies are not flagged Secure (which would be ignored by
 /// browsers over plain HTTP anyway).
 fn is_local_issuer(u: &Url) -> bool {
-    matches!(u.host_str(), Some("localhost") | Some("127.0.0.1"))
+    matches!(
+        u.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+    )
 }
 
 /// Decode a hex-encoded 32-byte AES-256 key. The encryption-key env vars

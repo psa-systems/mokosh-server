@@ -40,12 +40,6 @@ pub struct TokenResponse {
     pub id_token: Option<String>,
 }
 
-#[derive(Debug)]
-pub enum TokenGrant {
-    AuthorizationCode,
-    RefreshToken,
-}
-
 pub async fn handle_token(p: &OidcProvider, req: TokenRequest) -> Result<TokenResponse, AuthError> {
     // 1. Identify and authenticate the client.
     let client_id_str = req
@@ -64,16 +58,8 @@ pub async fn handle_token(p: &OidcProvider, req: TokenRequest) -> Result<TokenRe
     authenticate_client(&client, &req.client_credentials)?;
 
     // 2. Dispatch on grant type.
-    let grant = match req.grant_type.as_str() {
-        "authorization_code" => TokenGrant::AuthorizationCode,
-        "refresh_token" => TokenGrant::RefreshToken,
-        _ => return Err(AuthError::UnsupportedGrantType),
-    };
-    let core_grant = match grant {
-        TokenGrant::AuthorizationCode => GrantType::AuthorizationCode,
-        TokenGrant::RefreshToken => GrantType::RefreshToken,
-    };
-    if !client.allowed_grant_types.contains(&core_grant) {
+    let grant = GrantType::parse(&req.grant_type).ok_or(AuthError::UnsupportedGrantType)?;
+    if !client.allowed_grant_types.contains(&grant) {
         return Err(AuthError::UnauthorizedClient(format!(
             "grant_type {} not allowed for this client",
             req.grant_type
@@ -81,8 +67,8 @@ pub async fn handle_token(p: &OidcProvider, req: TokenRequest) -> Result<TokenRe
     }
 
     match grant {
-        TokenGrant::AuthorizationCode => exchange_code(p, &client, &req).await,
-        TokenGrant::RefreshToken => exchange_refresh(p, &client, &req).await,
+        GrantType::AuthorizationCode => exchange_code(p, &client, &req).await,
+        GrantType::RefreshToken => exchange_refresh(p, &client, &req).await,
     }
 }
 

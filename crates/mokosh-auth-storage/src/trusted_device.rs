@@ -6,10 +6,9 @@ use ipnetwork::IpNetwork;
 use mokosh_auth_core::{
     AuthError, NewTrustedDevice, TenantId, TrustedDevice, TrustedDeviceRepository, UserId,
 };
-use std::net::IpAddr;
 use uuid::Uuid;
 
-use crate::conv::db_err;
+use crate::conv::{db_err, ip_to_inet};
 use crate::pool::AuthPool;
 
 pub struct PgTrustedDeviceRepository {
@@ -65,7 +64,7 @@ impl TryFrom<Row> for TrustedDevice {
 #[async_trait]
 impl TrustedDeviceRepository for PgTrustedDeviceRepository {
     async fn issue(&self, new: NewTrustedDevice) -> Result<TrustedDevice, AuthError> {
-        let ip_net: Option<IpNetwork> = new.ip.map(IpAddr::into);
+        let ip_net = ip_to_inet(new.ip);
         let row: Row = sqlx::query_as(
             "INSERT INTO mokosh_auth.trusted_devices
                 (user_id, tenant_id, token_hash, expires_at, ip, user_agent)

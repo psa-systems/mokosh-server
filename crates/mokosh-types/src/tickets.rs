@@ -253,17 +253,13 @@ pub struct CreateTicketRequest {
     pub scheduled_start: Option<DateTime<Utc>>,
     pub scheduled_end: Option<DateTime<Utc>>,
     pub estimated_hours: Option<f64>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub is_billable: bool,
     pub asset_id: Option<Uuid>,
     #[serde(default)]
     pub custom_fields: serde_json::Value,
     #[serde(default)]
     pub tags: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Update ticket request
@@ -349,25 +345,36 @@ pub enum SlaStatus {
     NotApplicable,
 }
 
+/// Compute the SLA status from the two fields it depends on.
+///
+/// Shared by [`Ticket::sla_status`] and the joined-row mapping in the
+/// server's tickets service, so the threshold logic lives in one place.
+pub fn compute_sla_status(
+    closed_at: Option<DateTime<Utc>>,
+    sla_due_date: Option<DateTime<Utc>>,
+) -> SlaStatus {
+    if closed_at.is_some() {
+        return SlaStatus::NotApplicable;
+    }
+
+    let Some(due) = sla_due_date else {
+        return SlaStatus::NotApplicable;
+    };
+
+    let now = Utc::now();
+    if now > due {
+        SlaStatus::Breached
+    } else if (due - now).num_hours() < 2 {
+        SlaStatus::Warning
+    } else {
+        SlaStatus::OnTrack
+    }
+}
+
 impl Ticket {
     /// Calculate SLA status
     pub fn sla_status(&self) -> SlaStatus {
-        if self.closed_at.is_some() {
-            return SlaStatus::NotApplicable;
-        }
-
-        let Some(due) = self.sla_due_date else {
-            return SlaStatus::NotApplicable;
-        };
-
-        let now = Utc::now();
-        if now > due {
-            SlaStatus::Breached
-        } else if (due - now).num_hours() < 2 {
-            SlaStatus::Warning
-        } else {
-            SlaStatus::OnTrack
-        }
+        compute_sla_status(self.closed_at, self.sla_due_date)
     }
 }
 

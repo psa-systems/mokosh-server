@@ -76,6 +76,52 @@ impl BillingService {
         Ok(rows.into_iter().collect())
     }
 
+    /// Allocate the next gapless, per-tenant invoice number inside the
+    /// caller's transaction (PMS-194).
+    ///
+    /// Atomically bumps `invoice_sequences.last_number` (the row-lock
+    /// serialises concurrent invoice creates so numbers stay dense and
+    /// unique); seeds the sequence row on the tenant's first invoice. The
+    /// bump lives in the caller's `tx`, so a rollback restores the
+    /// sequence value too and numbers stay gapless. Shared by every
+    /// invoice-creating path (`create_invoice`,
+    /// `create_invoice_from_time_entries`, and the recurring-billing run)
+    /// so the seed-or-bump logic lives in one place.
+    async fn next_invoice_number(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+    ) -> AppResult<String> {
+        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
+            r#"
+            UPDATE invoice_sequences
+            SET last_number = last_number + 1
+            WHERE tenant_id = $1
+            RETURNING last_number, prefix
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (next_number, prefix) = match seq_row {
+            Some(v) => v,
+            None => {
+                // First invoice for this tenant: seed the sequence row.
+                sqlx::query(
+                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
+                )
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+                (1, Some("INV-".to_string()))
+            }
+        };
+        Ok(format!(
+            "{}{:06}",
+            prefix.unwrap_or_else(|| "INV-".to_string()),
+            next_number
+        ))
+    }
+
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
@@ -234,38 +280,10 @@ impl BillingService {
     ) -> AppResult<InvoiceResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        // Per-tenant invoice sequence is row-locked by UPDATE
-        // RETURNING; concurrent invoice creates serialise on this row
-        // so numbers are dense and unique.
-        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
-            r#"
-            UPDATE invoice_sequences
-            SET last_number = last_number + 1
-            WHERE tenant_id = $1
-            RETURNING last_number, prefix
-            "#,
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (next_number, prefix) = match seq_row {
-            Some(v) => v,
-            None => {
-                // First invoice for this tenant: seed the sequence row.
-                sqlx::query(
-                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
-                )
-                .bind(tenant_id)
-                .execute(&mut *tx)
-                .await?;
-                (1, Some("INV-".to_string()))
-            }
-        };
-        let invoice_number = format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
-        );
+        // Per-tenant invoice sequence is row-locked by the shared helper;
+        // concurrent invoice creates serialise on this row so numbers are
+        // dense and unique.
+        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
         // Compute totals from the supplied lines. Tax / discount are
         // optional - default to 0.
@@ -427,34 +445,7 @@ impl BillingService {
 
         // 2. Allocate a gapless invoice number (same row-lock as
         //    `create_invoice`). Concurrent creates serialise on this row.
-        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
-            r#"
-            UPDATE invoice_sequences
-            SET last_number = last_number + 1
-            WHERE tenant_id = $1
-            RETURNING last_number, prefix
-            "#,
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (next_number, prefix) = match seq_row {
-            Some(v) => v,
-            None => {
-                sqlx::query(
-                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
-                )
-                .bind(tenant_id)
-                .execute(&mut *tx)
-                .await?;
-                (1, Some("INV-".to_string()))
-            }
-        };
-        let invoice_number = format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
-        );
+        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
         // 3. Build one line per entry, accumulating the subtotal. The
         //    sixty-minute divisor is a Decimal so quantity keeps its
@@ -817,34 +808,7 @@ impl BillingService {
         // ledger insert below conflicts and we roll back; the rollback
         // restores the sequence value too (the UPDATE is part of this tx),
         // so numbers stay gapless.
-        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
-            r#"
-            UPDATE invoice_sequences
-            SET last_number = last_number + 1
-            WHERE tenant_id = $1
-            RETURNING last_number, prefix
-            "#,
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (next_number, prefix) = match seq_row {
-            Some(v) => v,
-            None => {
-                sqlx::query(
-                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
-                )
-                .bind(tenant_id)
-                .execute(&mut *tx)
-                .await?;
-                (1, Some("INV-".to_string()))
-            }
-        };
-        let invoice_number = format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
-        );
+        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
         sqlx::query(
             r#"
@@ -1507,6 +1471,17 @@ impl BillingService {
             let Some((total, prior_paid)) = current else {
                 return Err(AppError::NotFound("Invoice".to_string()));
             };
+            // Reject overpayment so `balance_due` never goes negative
+            // (PMS-194). The remaining balance is `total - prior_paid`; a
+            // payment larger than that is a data-integrity error, not a
+            // valid partial/full payment.
+            let remaining = total - prior_paid;
+            if request.amount > remaining {
+                return Err(AppError::BadRequest(format!(
+                    "payment amount {} exceeds invoice balance due {}",
+                    request.amount, remaining
+                )));
+            }
             let new_paid = prior_paid + request.amount;
             let new_balance = total - new_paid;
             let new_status = if new_balance <= Decimal::ZERO {
@@ -2130,6 +2105,3 @@ impl From<InvoiceRow> for InvoiceResponse {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _force_use(_: &AppError) {}

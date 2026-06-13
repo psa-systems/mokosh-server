@@ -516,8 +516,13 @@ async fn get_vote(app: &common::TestApp, token: &str, article_id: &str) -> serde
 async fn vote_is_per_user_exclusive_and_toggleable(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     // A second user in the same tenant to prove votes are per-account.
-    let (_u2_id, email2, password2) =
-        common::seed_user(&pool, "voter-two@example.com", "technician").await;
+    let (_u2_id, email2, password2) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "voter-two@example.com",
+        "technician",
+    )
+    .await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
     let token2 = common::login(&app, &email2, &password2).await;

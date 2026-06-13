@@ -64,6 +64,7 @@ pub fn openid_configuration(issuer: &Url) -> OpenIdConfiguration {
             "email",
             "email_verified",
             "mokosh_tenant_id",
+            "mokosh_active_tenant",
             "mokosh_role",
             "acr",
             "amr",

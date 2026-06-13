@@ -339,7 +339,7 @@ async fn disabled_module_returns_404_on_route_access(pool: PgPool) {
     // with is_enabled=TRUE for the default tenant).
     let before = app
         .client
-        .get(app.url("/api/v1/billing/invoices?per_page=5"))
+        .get(app.url("/api/v1/invoices?per_page=5"))
         .bearer_auth(&token)
         .send()
         .await
@@ -365,7 +365,7 @@ async fn disabled_module_returns_404_on_route_access(pool: PgPool) {
     // The gated route now 404s.
     let gated = app
         .client
-        .get(app.url("/api/v1/billing/invoices?per_page=5"))
+        .get(app.url("/api/v1/invoices?per_page=5"))
         .bearer_auth(&token)
         .send()
         .await
@@ -390,7 +390,7 @@ async fn disabled_module_returns_404_on_route_access(pool: PgPool) {
 
     let after = app
         .client
-        .get(app.url("/api/v1/billing/invoices?per_page=5"))
+        .get(app.url("/api/v1/invoices?per_page=5"))
         .bearer_auth(&token)
         .send()
         .await
@@ -412,7 +412,7 @@ async fn enabled_module_response_unchanged(pool: PgPool) {
     // Default billing is enabled; the extractor should pass through.
     let resp = app
         .client
-        .get(app.url("/api/v1/billing/invoices?per_page=5"))
+        .get(app.url("/api/v1/invoices?per_page=5"))
         .bearer_auth(&token)
         .send()
         .await

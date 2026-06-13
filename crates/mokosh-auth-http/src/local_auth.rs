@@ -263,6 +263,19 @@ impl LocalAuth {
                 let mut matches = self.users.find_by_email_globally(&req.email).await?;
                 if matches.len() >= 2 {
                     let _ = verify_password(&req.password, DUMMY_HASH);
+                    let _ = self
+                        .audit
+                        .record(
+                            None,
+                            None,
+                            ip,
+                            AuditEvent::LoginFailed {
+                                email: req.email.clone(),
+                                ip: ip.map(|i| i.to_string()),
+                                reason: "ambiguous email across tenants".into(),
+                            },
+                        )
+                        .await;
                     return Err(AuthError::AccessDenied("invalid credentials".into()));
                 }
                 matches.pop()
@@ -272,11 +285,37 @@ impl LocalAuth {
             Some(u) => u,
             None => {
                 let _ = verify_password(&req.password, DUMMY_HASH);
+                let _ = self
+                    .audit
+                    .record(
+                        req.tenant_id.map(TenantId),
+                        None,
+                        ip,
+                        AuditEvent::LoginFailed {
+                            email: req.email.clone(),
+                            ip: ip.map(|i| i.to_string()),
+                            reason: "no such user".into(),
+                        },
+                    )
+                    .await;
                 return Err(AuthError::AccessDenied("invalid credentials".into()));
             }
         };
         if !matches!(user.status, mokosh_auth_core::UserStatus::Active) {
             let _ = verify_password(&req.password, DUMMY_HASH);
+            let _ = self
+                .audit
+                .record(
+                    Some(user.tenant_id),
+                    Some(user.id),
+                    ip,
+                    AuditEvent::LoginFailed {
+                        email: req.email.clone(),
+                        ip: ip.map(|i| i.to_string()),
+                        reason: format!("status={}", user.status.as_str()),
+                    },
+                )
+                .await;
             return Err(AuthError::AccessDenied("invalid credentials".into()));
         }
         let stored_hash = match user.password_hash.as_deref() {
