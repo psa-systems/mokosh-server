@@ -111,11 +111,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = Database::new(&config.database_url).await?;
 
+    // A migration failure is fatal: exit non-zero rather than serve a
+    // half-migrated database (PMS-286). Warn-and-continue here once let a
+    // failed verification migration (040) boot a server that never became
+    // healthy - the container went unhealthy and Traefik dropped its router,
+    // so every request 404'd with no hint at the real cause. Fail loud at boot,
+    // consistent with the other startup checks (SMTP/Google/ENCRYPTION_KEY/CORS
+    // all hard-fail). `RUN_MIGRATIONS=false` still skips the step entirely for
+    // operators who manage migrations out of band.
     if config.run_migrations {
-        match db.run_migrations().await {
-            Ok(()) => tracing::info!("Database migrations complete"),
-            Err(e) => tracing::warn!("Failed to run migrations: {}", e),
+        if let Err(e) = db.run_migrations().await {
+            tracing::error!("Failed to run database migrations: {e}");
+            return Err(e.into());
         }
+        tracing::info!("Database migrations complete");
     }
 
     tracing::info!("Database connected");
