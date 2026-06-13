@@ -123,9 +123,13 @@ pub async fn auth_middleware(
                 let user = current_user_from_at_jwt(&verified);
                 AuthState::authenticated(user, tenant_id)
             } else {
-                // 3. Legacy HS256 cookie path.
+                // 3. Legacy HS256 cookie path. Only an `access` token is a
+                // valid Bearer credential; `decode_token` runs
+                // `Validation::default()` and does not assert `typ`, so a
+                // `typ:"refresh"` token would otherwise be accepted here.
+                // Guard it explicitly, mirroring `refresh_token()`.
                 match auth_middleware.auth_service.decode_token(token) {
-                    Ok(claims) => match auth_middleware
+                    Ok(claims) if claims.typ == "access" => match auth_middleware
                         .auth_service
                         .get_user_by_id(claims.tid, claims.sub)
                         .await
@@ -133,7 +137,7 @@ pub async fn auth_middleware(
                         Ok(user) => AuthState::authenticated(user.to_current_user(), claims.tid),
                         Err(_) => AuthState::default(),
                     },
-                    Err(_) => AuthState::default(),
+                    _ => AuthState::default(),
                 }
             }
         }
@@ -579,9 +583,18 @@ pub async fn place_bunyip_user(
     let mut user = match auth_service.get_user_by_id(target, sub).await {
         Ok(user) => user,
         Err(_) => {
-            let email_for_insert = email
-                .clone()
-                .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
+            // Persist the IdP-supplied email on the JIT insert ONLY when the
+            // IdP reports it verified, matching the Google path.
+            // `upsert_user_from_oidc` stamps `email_verified_at = NOW()`, so
+            // writing an unverified address here would falsely mark it
+            // verified and open an auto-link/capture path against the real
+            // owner. An unverified user is still self-signed-up (into their
+            // own isolated personal tenant) under a placeholder address; the
+            // real email is backfilled on a later login once verified.
+            let email_for_insert = match (email.clone(), email_verified) {
+                (Some(em), true) => em,
+                _ => format!("{sub}@unresolved.invalid"),
+            };
             auth_service
                 .upsert_user_from_oidc(sub, target, &email_for_insert, initial_role)
                 .await
