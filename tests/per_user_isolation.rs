@@ -283,7 +283,7 @@ async fn create_time_entry(
 /// the policy scopes per tenant rather than blanket-denying).
 #[sqlx::test]
 async fn cross_user_read_and_write_denied_across_modules(pool: PgPool) {
-    let app = common::boot(pool.clone()).await;
+    let app = common::boot_rls(pool.clone()).await;
     let a = provision_actor(&pool, &app, "alice").await;
     let b = provision_actor(&pool, &app, "bob").await;
     assert_ne!(
@@ -431,7 +431,7 @@ async fn cross_user_read_and_write_denied_across_modules(pool: PgPool) {
 /// tenant list never leaks A's tenant.
 #[sqlx::test]
 async fn cross_user_tenant_endpoint_denied(pool: PgPool) {
-    let app = common::boot(pool.clone()).await;
+    let app = common::boot_rls(pool.clone()).await;
     let a = provision_actor(&pool, &app, "alice").await;
     let b = provision_actor(&pool, &app, "bob").await;
 
@@ -455,7 +455,7 @@ async fn cross_user_tenant_endpoint_denied(pool: PgPool) {
 /// `reports::dashboard` counts only the caller's own tickets.
 #[sqlx::test]
 async fn dashboard_aggregate_is_caller_scoped(pool: PgPool) {
-    let app = common::boot(pool.clone()).await;
+    let app = common::boot_rls(pool.clone()).await;
     let a = provision_actor(&pool, &app, "alice").await;
     let b = provision_actor(&pool, &app, "bob").await;
 
@@ -526,5 +526,58 @@ async fn dashboard_aggregate_is_caller_scoped(pool: PgPool) {
         open_count(&b).await,
         3,
         "B's dashboard counts only B's three open tickets, not A's two"
+    );
+}
+
+/// PMS-285 AC #7: fail-closed proven THROUGH the application role, not only via
+/// `SET ROLE` in `tests/rls_isolation.rs`. With the request-serving pool
+/// connecting as the unprivileged `NOBYPASSRLS` role (`boot_rls`), a read that
+/// sets no `app.current_tenant` GUC must return zero rows; the same read under
+/// the matching GUC must see the row. This is the runtime activation the whole
+/// epic was building toward: a forgotten `WHERE tenant_id` filter is now
+/// backstopped by RLS on the live serving connection.
+#[sqlx::test]
+async fn app_role_read_is_fail_closed_without_guc(pool: PgPool) {
+    let app = common::boot_rls(pool.clone()).await;
+    let app_pool = app
+        .app_pool
+        .clone()
+        .expect("boot_rls wires the unprivileged app pool");
+
+    // Seed a company under the default tenant as the superuser (bypasses RLS),
+    // so there is a real row the app role should not see without a GUC.
+    let tenant = common::DEFAULT_TENANT_ID;
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'fail-closed probe')")
+        .bind(Uuid::new_v4())
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .expect("seed company as superuser");
+
+    // 1) No GUC on this fresh app-role connection => zero rows (fail-closed).
+    let mut conn = app_pool.acquire().await.expect("acquire app-role conn");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM companies")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count with no GUC on the app role");
+    assert_eq!(
+        count, 0,
+        "the NOBYPASSRLS app role must see zero rows with no app.current_tenant GUC"
+    );
+
+    // 2) With the matching GUC the row becomes visible (not a blanket deny / a
+    //    missing-grant artifact).
+    sqlx::query("SELECT set_config('app.current_tenant', $1, false)")
+        .bind(tenant.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("set GUC to the default tenant");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM companies")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count with the matching GUC on the app role");
+    assert!(
+        count >= 1,
+        "the matching GUC must expose the seeded row to the app role, got {count}"
     );
 }

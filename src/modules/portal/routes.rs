@@ -93,9 +93,11 @@ async fn list_invoices(
         company_id: Some(contact.company_id),
         ..Default::default()
     };
-    // PMS-139: bridge the verified contact-JWT tenant through `from_trusted`
-    // (portal runs on contact sessions, not `CurrentUser`; see the KB feed
-    // note below for the full rationale).
+    // SAFETY (PMS-285): `contact.tenant_id` is a verified claim from the portal
+    // JWT (`RequirePortalAuth`), i.e. the caller's own authenticated tenant.
+    // Portal runs on contact sessions, not `CurrentUser`, so it cannot use the
+    // `TenantScoped` extractor; `from_trusted` is the sanctioned bridge (see the
+    // KB feed note below for the full rationale).
     let (items, total) = state
         .billing
         .list_invoices(
@@ -120,7 +122,10 @@ async fn get_invoice(
     // in code: an invoice belonging to another company in the same
     // tenant returns 404 (not 403) so the portal never confirms the
     // existence of another company's invoice.
-    // PMS-139: bridge the verified contact-JWT tenant (see KB feed note below).
+    // SAFETY (PMS-285): `contact.tenant_id` is a verified portal-JWT claim
+    // (`RequirePortalAuth`), the caller's own authenticated tenant; portal
+    // cannot use `TenantScoped`, so `from_trusted` is the sanctioned bridge
+    // (see KB feed note below). The company scope is enforced in code afterward.
     let invoice = state
         .billing
         .get_invoice(

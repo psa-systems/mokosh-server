@@ -59,7 +59,15 @@ impl PortalAuthService {
         )
         .bind(&request.tenant_slug)
         .bind(&request.email)
-        .fetch_optional(self.db.pool())
+        // SAFETY (PMS-285): the portal runs on a separate `contacts`-row identity
+        // plane (`CurrentContact`), not the `users`/`AuthState` plane, and
+        // per-user RLS isolation is deliberately NOT applied to portal contacts
+        // yet (see `dev-docs/rls-per-user-isolation.md`, "Portal identity"). This
+        // login is pre-auth - it resolves the contact by `(tenant_slug, email)`
+        // before any session exists - so there is no GUC to set and it runs on
+        // the migrator pool. `contacts` is RLS-covered, so the app pool would
+        // fail this lookup closed.
+        .fetch_optional(self.db.migrator_pool())
         .await?;
 
         let Some((id, tenant_id, company_id, email, first_name, last_name, is_portal_user, hash)) =
@@ -78,11 +86,15 @@ impl PortalAuthService {
             return Err(AppError::Unauthorized);
         }
 
+        // SAFETY (PMS-285): companion write to the portal login above, same
+        // separate `contacts`-identity plane with portal isolation deferred.
+        // Targets the just-authenticated contact by primary key; migrator pool
+        // because `contacts` is RLS-covered and the portal plane sets no GUC.
         sqlx::query(
             "UPDATE contacts SET portal_last_login_at = NOW(), updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
-        .execute(self.db.pool())
+        .execute(self.db.migrator_pool())
         .await?;
 
         let now = Utc::now();
@@ -145,12 +157,17 @@ impl PortalAuthService {
             ));
         }
         let hash = hash_password(new_password)?;
+        // SAFETY (PMS-285): portal account setup on the separate
+        // `contacts`-identity plane (portal isolation deferred; see the login
+        // note above). Reached via an emailed setup link before any portal
+        // session exists, so it sets no GUC and targets the one contact by id.
+        // Migrator pool because `contacts` is RLS-covered.
         sqlx::query(
             "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, updated_at = NOW() WHERE id = $2",
         )
         .bind(&hash)
         .bind(contact_id)
-        .execute(self.db.pool())
+        .execute(self.db.migrator_pool())
         .await?;
         Ok(())
     }

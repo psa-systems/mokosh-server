@@ -53,10 +53,15 @@ impl SlaService {
         self.notifications.as_ref()
     }
 
-    /// Connection pool accessor for the `sla_sweep` worker's ledger
-    /// reads/writes.
+    /// Privileged connection pool for the `sla_sweep` worker.
+    ///
+    /// SAFETY (PMS-285): the sweep scans open tickets across EVERY tenant (the
+    /// worker owns the cadence, like the notifications dispatcher's cross-tenant
+    /// drain), so it cannot set a single `app.current_tenant` GUC and runs on the
+    /// migrator (BYPASSRLS) pool. Per-ticket alert ledger writes that follow are
+    /// scoped to the ticket's own tenant via `begin_with_tenant`.
     pub(crate) fn pool(&self) -> &sqlx::PgPool {
-        self.db.pool()
+        self.db.migrator_pool()
     }
 
     /// Claim a `(ticket, kind)` ledger row for the `sla_sweep` worker
@@ -266,6 +271,10 @@ impl SlaService {
         policy_id: Uuid,
         request: &UpsertSlaTargetRequest,
     ) -> AppResult<SlaTargetResponse> {
+        // Keep the existence check and the write in ONE tenant-scoped
+        // transaction. `sla_targets` is RLS-covered via its parent join to
+        // `sla_policies` (migration 041), so the INSERT must run under the
+        // tenant GUC or WITH CHECK rejects it on the NOBYPASSRLS app pool.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sla_policies WHERE id = $1 AND tenant_id = $2)",
@@ -274,7 +283,6 @@ impl SlaService {
         .bind(tenant_id)
         .fetch_one(&mut *tx)
         .await?;
-        drop(tx);
         if !exists {
             return Err(AppError::NotFound("SlaPolicy".to_string()));
         }
@@ -292,7 +300,8 @@ impl SlaService {
         .bind(policy_id).bind(request.priority_id)
         .bind(request.first_response_hours).bind(request.resolution_hours)
         .bind(&request.operational_hours)
-        .fetch_one(self.db.pool()).await?;
+        .fetch_one(&mut *tx).await?;
+        tx.commit().await?;
         Ok(SlaTargetResponse {
             id,
             sla_policy_id: policy_id,
@@ -586,11 +595,13 @@ impl SlaService {
                 .await?
             }
         };
-        drop(tx);
         let Some((policy_id, business_hours_id)) = policy else {
             return Ok(()); // no policy configured; nothing to evaluate
         };
 
+        // `sla_targets` is RLS-covered via its parent join to `sla_policies`
+        // (migration 041), so keep this read inside the tenant-scoped tx (GUC
+        // set) rather than dropping to the bare pool.
         let target: Option<(Option<Decimal>, Option<Decimal>, Option<String>)> = sqlx::query_as(
             r#"SELECT first_response_hours, resolution_hours, operational_hours
                FROM sla_targets
@@ -598,8 +609,9 @@ impl SlaService {
         )
         .bind(policy_id)
         .bind(priority_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
+        drop(tx);
         let Some((fr, res, op_hours)) = target else {
             return Ok(());
         };

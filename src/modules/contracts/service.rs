@@ -1199,7 +1199,10 @@ impl ContractsService {
     #[tracing::instrument(skip_all)]
     pub async fn expire_due_contracts(&self, now: DateTime<Utc>) -> AppResult<(u64, u64)> {
         let today = now.date_naive();
-        let mut tx = self.db.pool().begin().await?;
+        // SAFETY (PMS-285): the contract-lifecycle sweep runs across EVERY
+        // tenant's `contracts` (the worker owns the cadence), so it cannot set a
+        // single tenant GUC and runs on the migrator (BYPASSRLS) pool.
+        let mut tx = self.db.migrator_pool().begin().await?;
 
         let due = sqlx::query_as::<_, DueContractRow>(
             r#"SELECT id, start_date, end_date, auto_renew, renewal_terms

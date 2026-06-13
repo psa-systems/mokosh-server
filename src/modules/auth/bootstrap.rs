@@ -26,8 +26,13 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
         _ => return Ok(()),
     };
 
+    // SAFETY (PMS-285): first-run admin bootstrap runs at startup before any
+    // request is served and seeds the very first `users` row under the default
+    // tenant, a privileged cross-tenant provisioning act. It uses the migrator
+    // (BYPASSRLS) pool; `users` is RLS-covered, so an app-pool count/insert with
+    // no GUC would fail closed and the bootstrap could never see/create rows.
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(db.pool())
+        .fetch_one(db.migrator_pool())
         .await?;
 
     if user_count > 0 {
@@ -59,7 +64,7 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     .bind(&password_hash)
     .bind(&first_name)
     .bind(&last_name)
-    .execute(db.pool())
+    .execute(db.migrator_pool())
     .await?;
 
     tracing::warn!(
