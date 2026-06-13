@@ -17,13 +17,11 @@ use super::models::*;
 pub struct RmmService {
     db: Database,
     encryption_key: [u8; 32],
-    /// When `Some`, alert ingest creates tickets through `TicketService`
-    /// (validation, automation engine, audit log, notifications
-    /// dispatch). When `None`, ingest falls back to a direct `INSERT
-    /// INTO tickets ...` so legacy test fixtures that build the service
-    /// without the full router keep compiling. The server always passes
-    /// `Some` via [`Self::with_dependencies`].
-    tickets: Option<Arc<TicketService>>,
+    /// Alert ingest creates tickets through `TicketService` (validation,
+    /// automation engine, audit log, notifications dispatch). There is no
+    /// direct-`INSERT` fallback: every RMM-originated ticket goes through
+    /// the canonical creation path (PMS-195).
+    tickets: Arc<TicketService>,
 }
 
 impl RmmService {
@@ -38,18 +36,10 @@ impl RmmService {
     /// the at-rest encryption a no-op for any caller that forgot to
     /// pass the key (see PMS-103, mirroring the PMS-92 fix on
     /// `NotificationsService`).
-    pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        Self {
-            db,
-            encryption_key,
-            tickets: None,
-        }
-    }
-
-    /// Like [`Self::with_encryption_key`] but additionally wires
-    /// `TicketService` so RMM-originated tickets go through the
-    /// canonical creation path (validation + automation + audit +
-    /// notifications). The server uses this constructor in
+    ///
+    /// Wires the `TicketService` dependency so RMM-originated tickets go
+    /// through the canonical creation path (validation + automation +
+    /// audit + notifications). The server uses this constructor in
     /// `create_api_router`.
     pub fn with_dependencies(
         db: Database,
@@ -59,7 +49,7 @@ impl RmmService {
         Self {
             db,
             encryption_key,
-            tickets: Some(Arc::new(tickets)),
+            tickets: Arc::new(tickets),
         }
     }
 
@@ -596,132 +586,48 @@ impl RmmService {
                 }
             }
 
-            match &self.tickets {
-                Some(svc) => {
-                    let Some(default_creator) = self.default_creator(tenant_id).await? else {
-                        continue;
-                    };
-                    let req = CreateTicketRequest {
-                        title: title.clone(),
-                        description: Some(description.clone()),
-                        priority_id: None,
-                        type_id: None,
-                        category_id: None,
-                        queue_id: rule.queue_id,
-                        source: TicketSource::Rmm,
-                        company_id,
-                        contact_id: None,
-                        site_id: None,
-                        assigned_to_id: rule.assign_to_id,
-                        team_id: None,
-                        contract_id: None,
-                        sla_id: None,
-                        scheduled_start: None,
-                        scheduled_end: None,
-                        estimated_hours: None,
-                        is_billable: false,
-                        asset_id: None,
-                        custom_fields: serde_json::json!({}),
-                        tags: vec![],
-                    };
-                    // RMM ingest is a background path (no AuditCtx extractor);
-                    // attribute the auto-created ticket to the system actor.
-                    // `TicketService` is on `TenantId`, so the scope flows
-                    // straight through; `AuditCtx::system` is still a `Uuid`
-                    // context bag, so unwrap only there.
-                    svc.create_ticket(
-                        tenant_id,
-                        default_creator,
-                        &req,
-                        &crate::modules::audit::AuditCtx::system(tenant_id.get()),
-                    )
-                    .await?;
-                }
-                None => {
-                    self.legacy_insert_ticket(tenant_id, &rule, company_id, &title, &description)
-                        .await?;
-                }
-            }
+            let Some(default_creator) = self.default_creator(tenant_id).await? else {
+                continue;
+            };
+            let req = CreateTicketRequest {
+                title: title.clone(),
+                description: Some(description.clone()),
+                priority_id: None,
+                type_id: None,
+                category_id: None,
+                queue_id: rule.queue_id,
+                source: TicketSource::Rmm,
+                company_id,
+                contact_id: None,
+                site_id: None,
+                assigned_to_id: rule.assign_to_id,
+                team_id: None,
+                contract_id: None,
+                sla_id: None,
+                scheduled_start: None,
+                scheduled_end: None,
+                estimated_hours: None,
+                is_billable: false,
+                asset_id: None,
+                custom_fields: serde_json::json!({}),
+                tags: vec![],
+            };
+            // RMM ingest is a background path (no AuditCtx extractor);
+            // attribute the auto-created ticket to the system actor.
+            // `TicketService` is on `TenantId`, so the scope flows
+            // straight through; `AuditCtx::system` is still a `Uuid`
+            // context bag, so unwrap only there.
+            self.tickets
+                .create_ticket(
+                    tenant_id,
+                    default_creator,
+                    &req,
+                    &crate::modules::audit::AuditCtx::system(tenant_id.get()),
+                )
+                .await?;
             created += 1;
         }
         Ok(created)
-    }
-
-    /// Legacy direct-SQL ticket insert preserved for the
-    /// `tickets = None` fallback (old test fixtures that build
-    /// `RmmService::with_encryption_key` without the router's
-    /// `with_dependencies`). The router always passes the dispatcher
-    /// path; new call sites should not extend this.
-    async fn legacy_insert_ticket(
-        &self,
-        tenant_id: TenantId,
-        rule: &AlertRuleRow,
-        company_id: Uuid,
-        title: &str,
-        description: &str,
-    ) -> AppResult<()> {
-        let mut read_tx = self.db.begin_with_tenant(tenant_id).await?;
-        let default_status: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *read_tx)
-        .await?;
-        let default_priority: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM ticket_priorities WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *read_tx)
-        .await?;
-        let queue_id: Option<Uuid> = match rule.queue_id {
-            Some(q) => Some(q),
-            None => sqlx::query_scalar(
-                "SELECT id FROM ticket_queues WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-            )
-            .bind(tenant_id)
-            .fetch_optional(&mut *read_tx)
-            .await?,
-        };
-        drop(read_tx);
-        let Some(default_creator) = self.default_creator(tenant_id).await? else {
-            return Ok(());
-        };
-        let (Some(status_id), Some(priority_id), Some(queue_id)) =
-            (default_status, default_priority, queue_id)
-        else {
-            return Ok(());
-        };
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let ticket_number: i32 = sqlx::query_scalar(
-            r#"UPDATE ticket_sequences SET last_number = last_number + 1
-               WHERE tenant_id = $1 RETURNING last_number"#,
-        )
-        .bind(tenant_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let id = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO tickets (
-                id, tenant_id, ticket_number, title, description, status_id,
-                priority_id, queue_id, source, company_id, assigned_to_id,
-                is_billable, created_by_id
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'rmm',$9,$10,FALSE,$11)"#,
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(format!("T{:06}", ticket_number))
-        .bind(title)
-        .bind(description)
-        .bind(status_id)
-        .bind(priority_id)
-        .bind(queue_id)
-        .bind(company_id)
-        .bind(rule.assign_to_id)
-        .bind(default_creator)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
     }
 
     async fn default_creator(&self, tenant_id: TenantId) -> AppResult<Option<Uuid>> {

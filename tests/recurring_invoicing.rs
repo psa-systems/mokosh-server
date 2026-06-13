@@ -30,21 +30,6 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn dec(s: &str) -> Decimal {
-    s.parse().expect("parse decimal literal")
-}
-
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
-        .bind(id)
-        .bind(common::DEFAULT_TENANT_ID)
-        .execute(pool)
-        .await
-        .expect("seed company");
-    id
-}
-
 /// Insert an `active` contract with the given billing cycle, start date,
 /// and optional end date. Returns the contract id.
 async fn seed_contract(
@@ -105,13 +90,29 @@ async fn seed_recurring_item(
 #[sqlx::test]
 async fn monthly_contract_generates_one_invoice_for_due_period(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_contract(&pool, company, "monthly", start, None).await;
 
     // Two recurring items: 1 @ $100 + 2 @ $50 = $200 subtotal.
-    seed_recurring_item(&pool, contract, "Managed Services", dec("1"), dec("100"), 0).await;
-    seed_recurring_item(&pool, contract, "Backup Add-on", dec("2"), dec("50"), 1).await;
+    seed_recurring_item(
+        &pool,
+        contract,
+        "Managed Services",
+        common::dec("1"),
+        common::dec("100"),
+        0,
+    )
+    .await;
+    seed_recurring_item(
+        &pool,
+        contract,
+        "Backup Add-on",
+        common::dec("2"),
+        common::dec("50"),
+        1,
+    )
+    .await;
 
     let svc = BillingService::new(Database::from_pool(pool.clone()));
     let ctx = AuditCtx::system(tenant);
@@ -135,7 +136,7 @@ async fn monthly_contract_generates_one_invoice_for_due_period(pool: PgPool) {
     assert_eq!(linked_contract, Some(contract));
     assert_eq!(linked_company, company);
     assert_eq!(status, "draft");
-    assert_eq!(total, dec("200"), "subtotal = 1*100 + 2*50 = 200");
+    assert_eq!(total, common::dec("200"), "subtotal = 1*100 + 2*50 = 200");
 
     // One line per recurring item.
     let line_count: i64 =
@@ -161,10 +162,18 @@ async fn monthly_contract_generates_one_invoice_for_due_period(pool: PgPool) {
 #[sqlx::test]
 async fn second_run_same_period_is_idempotent(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_contract(&pool, company, "monthly", start, None).await;
-    seed_recurring_item(&pool, contract, "Managed Services", dec("1"), dec("100"), 0).await;
+    seed_recurring_item(
+        &pool,
+        contract,
+        "Managed Services",
+        common::dec("1"),
+        common::dec("100"),
+        0,
+    )
+    .await;
 
     let svc = BillingService::new(Database::from_pool(pool.clone()));
     let ctx = AuditCtx::system(tenant);
@@ -207,7 +216,7 @@ async fn second_run_same_period_is_idempotent(pool: PgPool) {
 #[sqlx::test]
 async fn one_time_and_expired_contracts_generate_nothing(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let now = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
 
     // one_time contract with a recurring item: must be skipped.
@@ -219,7 +228,15 @@ async fn one_time_and_expired_contracts_generate_nothing(pool: PgPool) {
         None,
     )
     .await;
-    seed_recurring_item(&pool, one_time, "Setup", dec("1"), dec("500"), 0).await;
+    seed_recurring_item(
+        &pool,
+        one_time,
+        "Setup",
+        common::dec("1"),
+        common::dec("500"),
+        0,
+    )
+    .await;
 
     // Expired contract: its end_date precedes the period that `now`
     // falls in, so the computed period_start is past end_date -> skip.
@@ -233,7 +250,15 @@ async fn one_time_and_expired_contracts_generate_nothing(pool: PgPool) {
         Some(NaiveDate::from_ymd_opt(2025, 3, 31).unwrap()),
     )
     .await;
-    seed_recurring_item(&pool, expired, "Old Service", dec("1"), dec("100"), 0).await;
+    seed_recurring_item(
+        &pool,
+        expired,
+        "Old Service",
+        common::dec("1"),
+        common::dec("100"),
+        0,
+    )
+    .await;
 
     let svc = BillingService::new(Database::from_pool(pool.clone()));
     let ctx = AuditCtx::system(tenant);
@@ -257,7 +282,7 @@ async fn one_time_and_expired_contracts_generate_nothing(pool: PgPool) {
 #[sqlx::test]
 async fn contract_with_no_recurring_items_generates_nothing(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_contract(&pool, company, "monthly", start, None).await;
 
@@ -299,10 +324,18 @@ async fn contract_with_no_recurring_items_generates_nothing(pool: PgPool) {
 #[sqlx::test]
 async fn next_period_generates_a_new_invoice(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
-    let company = seed_company(&pool).await;
+    let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let contract = seed_contract(&pool, company, "monthly", start, None).await;
-    seed_recurring_item(&pool, contract, "Managed Services", dec("1"), dec("300"), 0).await;
+    seed_recurring_item(
+        &pool,
+        contract,
+        "Managed Services",
+        common::dec("1"),
+        common::dec("300"),
+        0,
+    )
+    .await;
 
     let svc = BillingService::new(Database::from_pool(pool.clone()));
     let ctx = AuditCtx::system(tenant);

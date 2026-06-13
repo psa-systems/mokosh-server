@@ -944,9 +944,8 @@ impl CalendarService {
                 .cloned()
                 .unwrap_or_default();
             let on_call_user_id = match (users.first(), r.rotation_type.as_str(), Utc::now()) {
-                (Some(v), "weekly", now) => {
+                (Some(_), "weekly", now) => {
                     // weekly: index = ISO week mod len(users).
-                    let _ = v;
                     let week = now.iso_week().week() as usize;
                     let len = users.len();
                     if len == 0 {
@@ -957,8 +956,7 @@ impl CalendarService {
                             .and_then(|s| Uuid::parse_str(s).ok())
                     }
                 }
-                (Some(v), "daily", now) => {
-                    let _ = v;
+                (Some(_), "daily", now) => {
                     let day = now.ordinal() as usize;
                     let len = users.len();
                     if len == 0 {

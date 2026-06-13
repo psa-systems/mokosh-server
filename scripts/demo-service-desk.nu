@@ -16,16 +16,16 @@
 #   nu scripts/demo-service-desk.nu
 #
 # Environment (all optional; defaults target the dev stack):
-#   API_BASE        default http://172.16.100.120:4301
+#   API_BASE        default http://localhost:4301
 #   ADMIN_EMAIL     default admin@example.com
 #   ADMIN_PASSWORD  default devpassword12
-#   DATABASE_URL    default postgres://postgres:postgres@172.16.100.120:5433/mokosh
+#   DATABASE_URL    default postgres://postgres:postgres@localhost:5433/mokosh
 
 def main [] {
-    let api = ($env.API_BASE? | default "http://172.16.100.120:4301")
+    let api = ($env.API_BASE? | default "http://localhost:4301")
     let admin_email = ($env.ADMIN_EMAIL? | default "admin@example.com")
     let admin_password = ($env.ADMIN_PASSWORD? | default "devpassword12")
-    let database_url = ($env.DATABASE_URL? | default "postgres://postgres:postgres@172.16.100.120:5433/mokosh")
+    let database_url = ($env.DATABASE_URL? | default "postgres://postgres:postgres@localhost:5433/mokosh")
     let tenant_id = "00000000-0000-0000-0000-000000000001"
     let tech_email = "demo-tech@example.com"
     let tech_password = "demo-tech-pw-12345"

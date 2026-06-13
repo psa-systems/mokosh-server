@@ -92,9 +92,6 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
         issuer: cfg.issuer.clone(),
         authorization_code_ttl: cfg.authorization_code_ttl,
         op_session_ttl: cfg.op_session_ttl,
-        default_access_token_ttl: cfg.access_token_ttl,
-        default_refresh_token_ttl: cfg.refresh_token_ttl,
-        default_refresh_idle_ttl: cfg.refresh_idle_ttl,
         leeway: Duration::seconds(30),
     };
 
@@ -352,7 +349,10 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
 /// as dev so cookies are not flagged Secure (which would be ignored by
 /// browsers over plain HTTP anyway).
 fn is_local_issuer(u: &Url) -> bool {
-    matches!(u.host_str(), Some("localhost") | Some("127.0.0.1"))
+    matches!(
+        u.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+    )
 }
 
 /// Decode a hex-encoded 32-byte AES-256 key. The encryption-key env vars

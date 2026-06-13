@@ -21,6 +21,7 @@ use std::sync::Arc;
 use mokosh_server::api::create_api_router;
 use mokosh_server::utils::email::{LogMailer, Mailer};
 use mokosh_server::Database;
+use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
@@ -61,6 +62,37 @@ impl TestApp {
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
+}
+
+/// Seed a company named "Acme Co" under the default tenant; returns its
+/// id. Consolidates the per-file copies that several billing/time/ticket
+/// test binaries used to each define.
+///
+/// `#[allow(dead_code)]` for the same per-binary reason as the other
+/// helpers: each integration-test binary compiles its own copy of
+/// `common::` and not every one seeds a company.
+#[allow(dead_code)]
+pub async fn seed_company(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO companies (id, tenant_id, name)
+        VALUES ($1, $2, 'Acme Co')
+        "#,
+    )
+    .bind(id)
+    .bind(DEFAULT_TENANT_ID)
+    .execute(pool)
+    .await
+    .expect("seed test company");
+    id
+}
+
+/// Parse a decimal string literal into a [`Decimal`] for test fixtures
+/// that bind money columns. Panics on malformed input (test-only).
+#[allow(dead_code)]
+pub fn dec(s: &str) -> Decimal {
+    s.parse().expect("parse Decimal literal")
 }
 
 /// Bring up the API against `pool` on a random localhost port.
@@ -243,12 +275,20 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     (user_id, email, password)
 }
 
-/// Seed a non-admin user under the default tenant. Returns
-/// `(user_id, email, plaintext_password)`. Caller picks the email +
-/// role so a single test can stand up several distinct seeded users.
-/// Password is uniform across seeds; tests run against an ephemeral DB.
+/// Seed a non-admin user under `tenant_id`. Returns
+/// `(user_id, email, plaintext_password)`. Caller picks the tenant,
+/// email + role so a single test can stand up several distinct seeded
+/// users (including the same email under two tenants, for the PMS-138
+/// colliding-email scenarios). Password is uniform across seeds; tests
+/// run against an ephemeral DB. Pass [`DEFAULT_TENANT_ID`] for the
+/// common single-tenant case.
 #[allow(dead_code)]
-pub async fn seed_user(pool: &PgPool, email: &str, role: &str) -> (Uuid, String, String) {
+pub async fn seed_user(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    email: &str,
+    role: &str,
+) -> (Uuid, String, String) {
     let password = "test-password-12345".to_string();
     let password_hash =
         mokosh_server::utils::crypto::hash_password(&password).expect("hash seeded user password");
@@ -264,7 +304,7 @@ pub async fn seed_user(pool: &PgPool, email: &str, role: &str) -> (Uuid, String,
         "#,
     )
     .bind(user_id)
-    .bind(DEFAULT_TENANT_ID)
+    .bind(tenant_id)
     .bind(email)
     .bind(&password_hash)
     .bind(role)

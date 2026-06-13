@@ -10,6 +10,7 @@ use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+use mokosh_types::tickets::BillingStatus;
 
 #[derive(Clone)]
 pub struct TimeTrackingService {
@@ -914,18 +915,29 @@ impl TimeTrackingService {
         };
         let company_id = match timer.company_id {
             Some(v) => v,
-            None => sqlx::query_scalar::<_, Uuid>(
-                "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
-            )
-            .bind(tenant_id)
-            .bind(timer.ticket_id.unwrap_or(Uuid::nil()))
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "Cannot stop timer without an inferable company_id".to_string(),
+            None => {
+                // With no company on the timer we can only infer one from
+                // an associated ticket. Short-circuit when there is no
+                // ticket either, rather than querying `tickets` by
+                // Uuid::nil() (which never matches and is wasted work).
+                let ticket_id = timer.ticket_id.ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Cannot stop timer without an inferable company_id".to_string(),
+                    )
+                })?;
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
                 )
-            })?,
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Cannot stop timer without an inferable company_id".to_string(),
+                    )
+                })?
+            }
         };
 
         // Derive billing from the resolved, tenant-scoped work type and apply
@@ -1372,10 +1384,18 @@ impl From<TimeEntryRow> for TimeEntryResponse {
             company_id: r.company_id,
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
-            billing_status: r.billing_status.unwrap_or_else(|| "not_billed".to_string()),
+            billing_status: r
+                .billing_status
+                .as_deref()
+                .and_then(BillingStatus::from_str)
+                .unwrap_or_default(),
             hourly_rate: r.hourly_rate,
             total_amount: r.total_amount,
-            approval_status: r.approval_status.unwrap_or_else(|| "pending".to_string()),
+            approval_status: r
+                .approval_status
+                .as_deref()
+                .and_then(ApprovalStatus::from_str)
+                .unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

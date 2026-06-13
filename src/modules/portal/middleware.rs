@@ -37,18 +37,27 @@ pub async fn portal_auth_middleware(
 ) -> Response {
     let auth_state = match bearer(&request) {
         Some(token) => match state.service.decode_token(token) {
-            Ok(claims) => PortalAuthState::authenticated(CurrentContact {
-                id: claims.sub,
-                tenant_id: claims.tid,
-                company_id: claims.cid,
-                email: claims.email,
-                // Names are not minted into the JWT (PII minimisation);
-                // handlers that need them call `PortalAuthService` or
-                // re-read the contacts row. Defaults to empty here so
-                // the handler can spot a stale token cheaply.
-                first_name: String::new(),
-                last_name: String::new(),
-            }),
+            Ok(claims) => {
+                // Names are not minted into the JWT (PII minimisation), so
+                // hydrate them from the contacts row (PMS-195). A missing
+                // row or read error degrades to empty names rather than
+                // failing the request.
+                let (first_name, last_name) = state
+                    .service
+                    .contact_names(claims.tid, claims.sub)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                PortalAuthState::authenticated(CurrentContact {
+                    id: claims.sub,
+                    tenant_id: claims.tid,
+                    company_id: claims.cid,
+                    email: claims.email,
+                    first_name,
+                    last_name,
+                })
+            }
             Err(_) => PortalAuthState::default(),
         },
         None => PortalAuthState::default(),

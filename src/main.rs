@@ -103,6 +103,14 @@ impl AppConfig {
         self.environment == "production"
     }
 
+    /// Dev/test environments run over plain HTTP, where browsers drop
+    /// `Secure` cookies. Only these opt out of secure cookies; every other
+    /// environment (staging, production, or any unrecognized value) defaults
+    /// to secure, so a misconfigured `ENVIRONMENT` fails safe.
+    pub fn is_dev_or_test(&self) -> bool {
+        matches!(self.environment.as_str(), "development" | "dev" | "test")
+    }
+
     // PMS-262: single-tenant mode removed. Multi-tenant is the only mode.
     pub fn is_multi_tenant(&self) -> bool {
         true
@@ -127,11 +135,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = Database::new(&config.app_database_url, &config.database_url).await?;
 
+    // A migration failure is fatal: exit non-zero rather than serve a
+    // half-migrated database (PMS-286). Warn-and-continue here once let a
+    // failed verification migration (040) boot a server that never became
+    // healthy - the container went unhealthy and Traefik dropped its router,
+    // so every request 404'd with no hint at the real cause. Fail loud at boot,
+    // consistent with the other startup checks (SMTP/Google/ENCRYPTION_KEY/CORS
+    // all hard-fail). `RUN_MIGRATIONS=false` still skips the step entirely for
+    // operators who manage migrations out of band.
     if config.run_migrations {
-        match db.run_migrations().await {
-            Ok(()) => tracing::info!("Database migrations complete"),
-            Err(e) => tracing::warn!("Failed to run migrations: {}", e),
+        if let Err(e) = db.run_migrations().await {
+            tracing::error!("Failed to run database migrations: {e}");
+            return Err(e.into());
         }
+        tracing::info!("Database migrations complete");
     }
 
     tracing::info!("Database connected");
@@ -148,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // mokosh_auth schema (DDL/system rows) before any request is served, so it
     // runs on the privileged migrator pool, not the NOBYPASSRLS app pool.
     let (sso_router, at_jwt) = match try_bootstrap_sso(db.migrator_pool().clone()).await {
-        Ok(auth) => {
+        Ok(SsoSetup::Mounted(auth)) => {
             tracing::info!("SSO subsystem mounted (mokosh-auth)");
             let issuer = auth.provider.cfg.issuer.as_str().to_string();
             let verifier = mokosh_server::modules::auth::at_jwt::AtJwtVerifier::new(
@@ -157,14 +174,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             (Some(auth.router()), Some(verifier))
         }
-        Err(e) => {
+        Ok(SsoSetup::NotConfigured) => {
             tracing::warn!(
-                "SSO subsystem not mounted: {e}. The server will run with legacy auth only. \
+                "SSO subsystem not configured; the server will run with legacy auth only. \
                  Set MOKOSH_AUTH_ISSUER, MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH, \
                  MOKOSH_AUTH_JWT_ACTIVE_KID, MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, \
                  and MOKOSH_AUTH_DATA_ENCRYPTION_KEY to enable SSO."
             );
             (None, None)
+        }
+        // PMS-289: SSO IS configured (MOKOSH_AUTH_* set) but failed to
+        // bootstrap - invalid config, or migrations / key load failed. Fail
+        // loud and exit non-zero rather than silently downgrade to legacy auth,
+        // which would drop the OIDC / at+jwt verification path with only a WARN.
+        Err(e) => {
+            tracing::error!("SSO is configured but failed to bootstrap: {e}");
+            return Err(e);
         }
     };
 
@@ -179,8 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Browsers drop `Secure` cookies on plain HTTP, so disable the flag
-    // in development. In any non-dev environment, set it.
-    let cookie_secure = config.is_production();
+    // only in dev/test. Everywhere else (staging, production, or an
+    // unrecognized ENVIRONMENT) defaults to secure so the OAuth state
+    // cookie is not exposed over a downgraded connection.
+    let cookie_secure = !config.is_dev_or_test();
 
     // Build the host-crate mailer (SmtpMailer when SMTP_HOST is set,
     // LogMailer otherwise). Hard-fail on misconfiguration so an
@@ -338,14 +365,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Try to bootstrap the SSO subsystem. Returns the full `MokoshAuth`
-/// handle so the caller can pull both the router and the key set out of
-/// it. On failure (typically required env vars not set in dev), the
-/// error is surfaced so the caller can fall back to legacy auth only.
-async fn try_bootstrap_sso(
-    pool: sqlx::PgPool,
-) -> Result<mokosh_auth::MokoshAuth, Box<dyn std::error::Error>> {
+/// Outcome of the SSO subsystem setup (PMS-289). Distinguishes "SSO was never
+/// configured" (a legitimate legacy-only deployment) from "SSO is configured
+/// but failed to bootstrap" (a real error). The latter is returned as `Err`
+/// from [`try_bootstrap_sso`] and is fatal at the call site - silently running
+/// legacy-only when SSO was meant to be on is a security-relevant downgrade
+/// (the OIDC / at+jwt verification path just disappears), not a graceful
+/// fallback.
+enum SsoSetup {
+    /// Configured and bootstrapped: mount the router + at+jwt verifier.
+    Mounted(Box<mokosh_auth::MokoshAuth>),
+    /// No `MOKOSH_AUTH_*` env set: the operator did not enable SSO.
+    NotConfigured,
+}
+
+/// The required env vars that signal "SSO is intended". If any is set, SSO is
+/// configured and a bootstrap failure must be fatal; if none is set, SSO is off
+/// and the server runs legacy-only.
+const SSO_REQUIRED_ENV: [&str; 5] = [
+    "MOKOSH_AUTH_ISSUER",
+    "MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH",
+    "MOKOSH_AUTH_JWT_ACTIVE_KID",
+    "MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR",
+    "MOKOSH_AUTH_DATA_ENCRYPTION_KEY",
+];
+
+fn sso_is_configured() -> bool {
+    SSO_REQUIRED_ENV
+        .iter()
+        .any(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false))
+}
+
+/// Bootstrap the SSO subsystem when it is configured. Returns
+/// [`SsoSetup::NotConfigured`] (run legacy-only) when no `MOKOSH_AUTH_*` env is
+/// set, [`SsoSetup::Mounted`] on success, or `Err` (fatal) when SSO IS
+/// configured but `from_env` (partial/invalid config) or `bootstrap`
+/// (migrations, key load) fails - so a misconfigured-but-intended SSO never
+/// silently degrades to legacy auth (PMS-289).
+async fn try_bootstrap_sso(pool: sqlx::PgPool) -> Result<SsoSetup, Box<dyn std::error::Error>> {
+    if !sso_is_configured() {
+        return Ok(SsoSetup::NotConfigured);
+    }
     let auth_cfg = mokosh_auth::AuthConfig::from_env()?;
     let auth = mokosh_auth::bootstrap(auth_cfg, pool).await?;
-    Ok(auth)
+    Ok(SsoSetup::Mounted(Box::new(auth)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PMS-289: the fatal-vs-degrade decision hinges on this intent detector -
+    // none of the MOKOSH_AUTH_* env set means "SSO off, run legacy" (degrade);
+    // any set means "SSO intended" so a later bootstrap failure must be fatal.
+    #[test]
+    fn sso_is_configured_tracks_env_presence() {
+        // Snapshot then clear the SSO env so the assertions are deterministic.
+        let saved: Vec<(&str, Option<String>)> = SSO_REQUIRED_ENV
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in SSO_REQUIRED_ENV {
+            std::env::remove_var(k);
+        }
+
+        assert!(
+            !sso_is_configured(),
+            "no MOKOSH_AUTH_* env => SSO not configured"
+        );
+
+        std::env::set_var("MOKOSH_AUTH_ISSUER", "https://issuer.test");
+        assert!(
+            sso_is_configured(),
+            "any MOKOSH_AUTH_* env set => SSO configured"
+        );
+
+        // Restore the prior environment so sibling tests are unaffected.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
 }

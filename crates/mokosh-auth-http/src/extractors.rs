@@ -46,36 +46,6 @@ where
     }
 }
 
-/// The `User` belonging to the current OP session, additionally checked
-/// to be active.
-#[derive(Debug, Clone)]
-pub struct CurrentUser(pub User);
-
-impl<S> FromRequestParts<S> for CurrentUser
-where
-    S: Send + Sync,
-    Arc<AuthHttpState>: axum::extract::FromRef<S>,
-{
-    type Rejection = HttpError;
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let st: Arc<AuthHttpState> = axum::extract::FromRef::from_ref(state);
-        let session = CurrentOpSession::from_request_parts(parts, state).await?.0;
-        let user = st
-            .provider
-            .users
-            .find_by_id(session.user_id)
-            .await
-            .map_err(HttpError)?
-            .ok_or(HttpError(mokosh_auth_core::AuthError::LoginRequired))?;
-        if !matches!(user.status, UserStatus::Active) {
-            return Err(HttpError(mokosh_auth_core::AuthError::Forbidden(
-                "user not active".into(),
-            )));
-        }
-        Ok(CurrentUser(user))
-    }
-}
-
 /// Active `User` resolved from a Bearer at+jwt access token (RFC 9068).
 ///
 /// Use this on routes that the SPA needs to call cross-origin (where

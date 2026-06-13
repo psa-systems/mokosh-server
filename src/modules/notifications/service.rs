@@ -8,6 +8,8 @@
 //! are wired by the `notification_dispatcher` worker once it lands; the
 //! row's `status = pending` is the queue marker.
 
+use std::collections::HashMap;
+
 use crate::modules::auth::TenantId;
 use uuid::Uuid;
 
@@ -315,7 +317,7 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn mark_read(&self, tenant_id: TenantId, user_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+        let n = sqlx::query(
             r#"UPDATE notifications SET read_at = NOW()
                WHERE tenant_id = $1 AND user_id = $2 AND id = $3"#,
         )
@@ -323,7 +325,11 @@ impl NotificationsService {
         .bind(user_id)
         .bind(id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Notification".to_string()));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -516,6 +522,13 @@ impl NotificationsService {
                 }
             }
 
+            // PMS-195: batch-load every recipient's preference row up front
+            // instead of querying once per (channel, user) pair inside the
+            // nested loop below (was N+1).
+            let prefs = self
+                .load_user_preferences(tenant_id, &user_ids, event_type)
+                .await?;
+
             for channel in &rule.channels {
                 let raw_subject = template
                     .as_ref()
@@ -531,10 +544,7 @@ impl NotificationsService {
                 // Fan out to each user_id, honoring user preferences for
                 // this (event_type, channel) pair.
                 for user_id in &user_ids {
-                    if !self
-                        .user_accepts_channel(tenant_id, *user_id, event_type, channel)
-                        .await?
-                    {
+                    if !accepts_channel(prefs.get(user_id), channel) {
                         continue;
                     }
                     let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -583,37 +593,50 @@ impl NotificationsService {
         Ok(fanout)
     }
 
-    /// Return true if `user_id` should receive `channel` for
-    /// `event_type`. Absent prefs row = accept (project default). Row
-    /// with `is_enabled = false` = reject. Row with `is_enabled = true`
-    /// = accept only if `channel_types` contains the channel.
-    async fn user_accepts_channel(
+    /// Batch-load the `user_notification_preferences` rows for every
+    /// recipient in one query (PMS-195), keyed by `user_id`. A user with
+    /// no row is simply absent from the map (treated as accept-all by
+    /// [`accepts_channel`]).
+    async fn load_user_preferences(
         &self,
         tenant_id: TenantId,
-        user_id: Uuid,
+        user_ids: &[Uuid],
         event_type: &str,
-        channel: &str,
-    ) -> AppResult<bool> {
+    ) -> AppResult<HashMap<Uuid, (Option<bool>, Vec<String>)>> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(Option<bool>, Vec<String>)> = sqlx::query_as(
-            r#"SELECT is_enabled, channel_types
+        let rows: Vec<(Uuid, Option<bool>, Vec<String>)> = sqlx::query_as(
+            r#"SELECT user_id, is_enabled, channel_types
                FROM user_notification_preferences
-               WHERE tenant_id = $1 AND user_id = $2 AND event_type = $3"#,
+               WHERE tenant_id = $1 AND user_id = ANY($2) AND event_type = $3"#,
         )
         .bind(tenant_id)
-        .bind(user_id)
+        .bind(user_ids)
         .bind(event_type)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(uid, enabled, channels)| (uid, (enabled, channels)))
+            .collect())
+    }
+}
 
-        match row {
-            None => Ok(true),
-            Some((enabled, channels)) => {
-                if !enabled.unwrap_or(true) {
-                    return Ok(false);
-                }
-                Ok(channels.iter().any(|c| c == channel))
+/// Decide whether a recipient should receive `channel`, given their
+/// preference row (or `None` if they have no row). Absent row = accept
+/// (project default). Row with `is_enabled = false` = reject. Row with
+/// `is_enabled = true` = accept only if `channel_types` contains the
+/// channel.
+fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) -> bool {
+    match pref {
+        None => true,
+        Some((enabled, channels)) => {
+            if !enabled.unwrap_or(true) {
+                return false;
             }
+            channels.iter().any(|c| c == channel)
         }
     }
 }

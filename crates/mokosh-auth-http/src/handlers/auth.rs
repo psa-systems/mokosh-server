@@ -32,13 +32,8 @@ use std::sync::Arc;
 use crate::cookies::{clear_op_session_cookie, set_op_session_cookie};
 use crate::errors::HttpError;
 use crate::extractors::CurrentOpSession;
+use crate::handlers::shared::{TokenBundle, DEFAULT_FIRST_PARTY_SCOPE};
 use crate::router::AuthHttpState;
-
-/// Default scopes minted for first-party SPA logins when the client
-/// omits an explicit `scope` field. `openid` is required for an ID
-/// token; `email` populates the email/email_verified ID-token claims;
-/// `offline_access` opts the SPA into receiving a refresh token.
-const DEFAULT_FIRST_PARTY_SCOPE: &[&str] = &["openid", "email", "offline_access"];
 
 /// Request body for `/v1/auth/login`. The local-auth fields
 /// (email, password) come from [`crate::local_auth::LocalLoginRequest`];
@@ -90,16 +85,6 @@ pub struct LoginResponse {
     /// Present when the request supplied `client_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenBundle>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TokenBundle {
-    pub access_token: String,
-    pub token_type: &'static str,
-    pub expires_in: i64,
-    pub id_token: String,
-    pub refresh_token: String,
-    pub scope: String,
 }
 
 pub async fn login(
@@ -162,7 +147,7 @@ pub async fn login(
     // If the account has MFA on, the session is created downstream by
     // /v1/auth/mfa/verify (with the stronger `acr = urn:mokosh:loa:mfa`).
     // Otherwise we proceed directly to session creation here.
-    let verify = st.local_auth.verify_only(local_req, ip, ua).await?;
+    let verify = st.local_auth.verify_only(local_req, ip).await?;
     let user = verify.user;
 
     // Resolve active tenant: explicit request -> last_active_tenant ->
@@ -384,8 +369,8 @@ async fn mint_first_party_tokens(
         });
 
     let now = provider.clock.now();
-    let acr = "urn:mokosh:loa:pwd";
-    let amr: Vec<String> = vec!["pwd".to_string()];
+    let acr = ok.session.acr.as_str();
+    let amr: Vec<String> = ok.session.amr.clone();
 
     let access = mint_access_token(
         &provider.keys,
