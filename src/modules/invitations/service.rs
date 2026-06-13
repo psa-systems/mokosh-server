@@ -162,6 +162,17 @@ impl InvitationsService {
     /// (`tests/auth.rs`) pins that no `routes.rs` references it.
     pub async fn newest_pending_for(&self, email: &str) -> AppResult<Option<PendingInvite>> {
         let email = email.trim().to_ascii_lowercase();
+        // SAFETY (PMS-285, step 9 decision (a)): kept as a deliberate pre-auth
+        // cross-tenant bridge on the migrator (BYPASSRLS) pool. Finding which
+        // tenant invited an email is this query's whole job, so it reads
+        // `tenant_invitations` across tenants and cannot supply an
+        // `app.current_tenant` GUC (the user is not yet placed in any tenant).
+        // Its sole caller is the pre-session bunyip login/invite-acceptance path
+        // (`middleware::place_bunyip_user`), gated on a verified email and pinned
+        // by `routes_do_not_reach_global_login_helpers` so it can never reach a
+        // request handler. `tenant_invitations` is RLS-covered, so under the app
+        // pool with no GUC this would fail closed to `None` and break invite
+        // acceptance entirely - hence the privileged pool here, not a reshape.
         Ok(sqlx::query_as::<_, PendingInvite>(
             r#"SELECT id, tenant_id, role
                FROM tenant_invitations
@@ -170,13 +181,19 @@ impl InvitationsService {
                LIMIT 1"#,
         )
         .bind(&email)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(self.db.migrator_pool())
         .await?)
     }
 
     /// Mark an invite accepted by `accepted_by`. Best-effort: a no-op if it is
     /// no longer pending (it was revoked or accepted in a concurrent login).
     pub async fn accept(&self, id: Uuid, accepted_by: Uuid) -> AppResult<()> {
+        // SAFETY (PMS-285): the companion write to `newest_pending_for`, on the
+        // same pre-session invite-acceptance path. The accepting user is not yet
+        // placed in the invited tenant, so there is no GUC to set; the migrator
+        // pool is required because `tenant_invitations` is RLS-covered. The
+        // `id` + `status = 'pending'` predicate confines it to the single invite
+        // just resolved for this email.
         sqlx::query(
             "UPDATE tenant_invitations
              SET status = 'accepted', accepted_at = NOW(), accepted_by = $2, updated_at = NOW()
@@ -184,7 +201,7 @@ impl InvitationsService {
         )
         .bind(id)
         .bind(accepted_by)
-        .execute(self.db.pool())
+        .execute(self.db.migrator_pool())
         .await?;
         Ok(())
     }

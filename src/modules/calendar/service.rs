@@ -333,20 +333,19 @@ impl CalendarService {
     pub async fn due_reminders(&self, now: DateTime<Utc>) -> AppResult<Vec<ReminderCandidate>> {
         // PMS-261: these two reads are the worker's deliberate cross-tenant
         // enumeration - they project `tenant_id` off every tenant's
-        // `appointments` rows to build the per-tenant work list, so they run on
-        // the bare pool with NO `app.current_tenant` GUC by design. This is
-        // sound only because the worker connects as the BYPASSRLS (migration)
-        // role; the per-tenant work the worker then performs (`claim_reminder`,
-        // `dispatch`) each sets the GUC via `begin_with_tenant`. When the app
-        // connection moves to an unprivileged NOBYPASSRLS role (parent
-        // PMS-255), this enumeration must move to a BYPASSRLS-scoped path.
+        // `appointments` rows to build the per-tenant work list, so they run with
+        // NO `app.current_tenant` GUC by design. SAFETY (PMS-285): this is the
+        // BYPASSRLS-scoped path that comment foresaw - the cross-tenant
+        // enumeration now runs explicitly on the migrator pool, while the
+        // per-tenant work the worker then performs (`claim_reminder`, `dispatch`)
+        // each sets the GUC via `begin_with_tenant`.
         // Largest configured offset across the whole table bounds the
         // expansion window. NULL (no appointment has reminders) => no work.
         let max_offset_min: Option<i32> = sqlx::query_scalar(
             r#"SELECT MAX(m) FROM appointments a, unnest(a.reminder_minutes) AS m
                WHERE a.reminder_minutes IS NOT NULL"#,
         )
-        .fetch_one(self.db.pool())
+        .fetch_one(self.db.migrator_pool())
         .await?;
         let Some(max_offset_min) = max_offset_min else {
             return Ok(Vec::new());
@@ -373,7 +372,9 @@ impl CalendarService {
         )
         .bind(now)
         .bind(window_end)
-        .fetch_all(self.db.pool())
+        // SAFETY (PMS-285): cross-tenant reminder enumeration; migrator pool
+        // (see the `max_offset_min` note above).
+        .fetch_all(self.db.migrator_pool())
         .await?;
 
         let mut out: Vec<ReminderCandidate> = Vec::new();

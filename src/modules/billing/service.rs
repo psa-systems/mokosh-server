@@ -710,8 +710,12 @@ impl BillingService {
         &self,
         now: DateTime<Utc>,
     ) -> AppResult<u64> {
+        // SAFETY (PMS-285): the recurring-invoicing worker enumerates EVERY
+        // tenant to draft due invoices (the worker owns the cadence), reading the
+        // RLS-exempt `tenants` root across all tenants. Migrator pool; the
+        // per-tenant invoice generation it dispatches below sets each tenant GUC.
         let tenant_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tenants")
-            .fetch_all(self.db.pool())
+            .fetch_all(self.db.migrator_pool())
             .await?;
 
         let mut total = 0u64;

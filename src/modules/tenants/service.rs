@@ -52,11 +52,13 @@ impl TenantService {
         let tenant_id = Uuid::new_v4();
         let slug = slugify(&request.slug);
 
-        // Check if slug is unique
+        // SAFETY (PMS-285): create_tenant is a super-admin, cross-tenant handler.
+        // This uniqueness probe scans `tenants` (the RLS-exempt isolation root)
+        // across every tenant, so it runs on the privileged migrator pool.
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants WHERE slug = $1)")
                 .bind(&slug)
-                .fetch_one(self.db.pool())
+                .fetch_one(self.db.migrator_pool())
                 .await?;
 
         if exists {
@@ -247,7 +249,12 @@ impl TenantService {
         .bind("My workspace")
         .bind(&slug)
         .bind(owner_id)
-        .fetch_optional(self.db.pool())
+        // SAFETY (PMS-285): personal-tenant provisioning runs on the pre-session
+        // bunyip placement path before the owner has any tenant context. It
+        // writes the RLS-exempt `tenants` root row, so it uses the migrator pool;
+        // the new tenant's own RLS-covered sequence rows are seeded under its GUC
+        // in the `begin_with_tenant` block below.
+        .fetch_optional(self.db.migrator_pool())
         .await?;
 
         match inserted {
@@ -284,10 +291,13 @@ impl TenantService {
 
     /// The `personal` tenant id owned by `owner_id`, if one exists yet.
     async fn personal_tenant_for_owner(&self, owner_id: Uuid) -> AppResult<Option<Uuid>> {
+        // SAFETY (PMS-285): resolves a personal tenant by its `personal_owner_id`
+        // on the pre-session provisioning path, a cross-tenant lookup of the
+        // RLS-exempt `tenants` root with no owner GUC available. Migrator pool.
         Ok(
             sqlx::query_scalar("SELECT id FROM tenants WHERE personal_owner_id = $1")
                 .bind(owner_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(self.db.migrator_pool())
                 .await?,
         )
     }
@@ -305,6 +315,10 @@ impl TenantService {
             "#,
         )
         .bind(tenant_id)
+        // The `tenants` table is the RLS-exempt isolation root (migration 038
+        // skips it), so this single-row read is safe on the app pool; the route
+        // handler enforces that a non-super-admin caller may only read its own
+        // tenant id (the `cross_user_tenant_endpoint_denied` regression pins it).
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
@@ -318,8 +332,11 @@ impl TenantService {
         &self,
         pagination: &crate::utils::pagination::PaginationParams,
     ) -> AppResult<(Vec<Tenant>, u64)> {
+        // SAFETY (PMS-285): list_tenants is a super-admin, cross-tenant handler
+        // (the route gates it on super_admin) that enumerates every tenant in the
+        // RLS-exempt `tenants` root. It runs on the privileged migrator pool.
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
-            .fetch_one(self.db.pool())
+            .fetch_one(self.db.migrator_pool())
             .await?;
 
         let rows = sqlx::query_as::<_, TenantRow>(
@@ -334,7 +351,7 @@ impl TenantService {
         )
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.migrator_pool())
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -440,9 +457,11 @@ impl TenantService {
     /// Suspend tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn suspend_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
+        // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
+        // RLS-exempt `tenants` root row by id. Migrator pool.
         sqlx::query("UPDATE tenants SET status = 'suspended', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
-            .execute(self.db.pool())
+            .execute(self.db.migrator_pool())
             .await?;
 
         Ok(())
@@ -451,9 +470,11 @@ impl TenantService {
     /// Activate tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn activate_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
+        // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
+        // RLS-exempt `tenants` root row by id. Migrator pool.
         sqlx::query("UPDATE tenants SET status = 'active', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
-            .execute(self.db.pool())
+            .execute(self.db.migrator_pool())
             .await?;
 
         Ok(())
@@ -543,7 +564,14 @@ impl TenantService {
     async fn copy_default_config(&self, new_tenant_id: Uuid) -> AppResult<()> {
         let default_tenant = seed_source_tenant_id()?;
 
-        let mut tx = self.db.pool().begin().await?;
+        // SAFETY (PMS-285): this seed is intrinsically cross-tenant - it READS
+        // the default tenant's lookup rows and WRITES copies re-scoped to
+        // `new_tenant_id`. No single `app.current_tenant` GUC can satisfy both
+        // sides (a GUC of `new_tenant_id` would RLS-hide the default-tenant
+        // source rows; a GUC of the default tenant would reject the WITH CHECK on
+        // the new-tenant inserts). It is provisioning, run before the owner has a
+        // session, so it uses the privileged migrator (BYPASSRLS) pool.
+        let mut tx = self.db.migrator_pool().begin().await?;
 
         // Idempotency guard: ticket_statuses is seeded for every tenant, so its
         // presence means this tenant was already seeded. Skip rather than

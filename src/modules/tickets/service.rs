@@ -967,6 +967,10 @@ impl TicketService {
         // harness in `tests/tickets.rs` surfaced this as
         // `ColumnDecode { ... Rust type Option<f64> is not compatible
         // with SQL type NUMERIC }`).
+        // `sla_targets` has no `tenant_id` column but is RLS-covered via a parent
+        // join to `sla_policies` (migration 041), so the read needs the tenant
+        // GUC set; run it through a tenant-scoped transaction.
+        let mut sla_tx = self.db.begin_with_tenant(tenant_id).await?;
         let targets = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
             r#"
             SELECT first_response_hours::float8, resolution_hours::float8
@@ -976,8 +980,9 @@ impl TicketService {
         )
         .bind(sla_id)
         .bind(ticket.priority_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *sla_tx)
         .await?;
+        drop(sla_tx);
 
         if let Some((first_response_hours, resolution_hours)) = targets {
             let now = Utc::now();

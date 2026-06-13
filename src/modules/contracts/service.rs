@@ -1266,6 +1266,11 @@ impl ContractsService {
     pub async fn expire_due_contracts(&self, now: DateTime<Utc>) -> AppResult<(u64, u64)> {
         let today = now.date_naive();
 
+        // SAFETY (PMS-285): the contract-lifecycle sweep runs across EVERY
+        // tenant's `contracts` (the worker owns the cadence), so it cannot set a
+        // single tenant GUC and runs on the migrator (BYPASSRLS) pool. The
+        // per-tenant drain below preserves PMS-194's bounded transactions while
+        // routing every statement through that pool.
         // Tenants with at least one due contract. Resolved up front so the
         // per-tenant drain below never holds a lock spanning all tenants.
         let tenants: Vec<Uuid> = sqlx::query_scalar(
@@ -1274,7 +1279,7 @@ impl ContractsService {
                WHERE status = 'active' AND end_date IS NOT NULL AND end_date < $1"#,
         )
         .bind(today)
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.migrator_pool())
         .await?;
 
         let mut renewed = 0u64;
@@ -1289,7 +1294,7 @@ impl ContractsService {
             // 'active'), so a batch returning no rows means the tenant is
             // done and the loop terminates.
             loop {
-                let mut tx = self.db.pool().begin().await?;
+                let mut tx = self.db.migrator_pool().begin().await?;
                 let due = sqlx::query_as::<_, DueContractRow>(
                     r#"SELECT id, start_date, end_date, auto_renew, renewal_terms
                        FROM contracts
