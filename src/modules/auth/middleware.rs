@@ -531,6 +531,20 @@ pub async fn place_bunyip_user(
         }
     };
 
+    // PMS-288: the target tenant may have been provisioned off the PSA path - an
+    // invite into an auth/SSO-created org tenant, or an existing placement in a
+    // manually-created tenant - and so never received `copy_default_config`,
+    // leaving ticket creation (which needs a default ticket status + a sequence
+    // row) to 500. Seed it idempotently now that `target` is resolved. The
+    // personal-tenant branch above already seeded via `ensure_personal_tenant`,
+    // so this is a no-op there. Best-effort: a seed failure is logged, not fatal
+    // to the request (a tenant lacking config still authenticates).
+    if let Some(svc) = tenants {
+        if let Err(e) = svc.ensure_default_config(target).await {
+            tracing::warn!(error = %e, sub = %sub, tenant_id = %target, "default config seed failed");
+        }
+    }
+
     // Re-home an already-placed user into the target tenant - invite acceptance,
     // or the PMS-243 backfill out of the legacy default tenant. Idempotent (a
     // no-op when they are already there); co-mingled data stays put (PMS-243).
