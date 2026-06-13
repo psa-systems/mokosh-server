@@ -29,10 +29,6 @@ pub trait UserRepository: Send + Sync {
     /// caller MUST treat ambiguity as a soft failure (do not reveal
     /// which tenants own the email).
     async fn find_by_email_globally(&self, email: &str) -> Result<Vec<User>, AuthError>;
-    /// All non-deleted users in a tenant, newest first. Powers the
-    /// admin "User management" page; not used in any auth-critical
-    /// path.
-    async fn list_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<User>, AuthError>;
     async fn create(&self, new: NewUser) -> Result<User, AuthError>;
     async fn update_last_login(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
     /// Atomically increment `failed_login_count`, set `last_failed_login_at = NOW()`,
@@ -265,26 +261,9 @@ pub trait AuditLogger: Send + Sync {
         event: AuditEvent,
     ) -> Result<(), AuthError>;
 
-    /// List the most recent rows for a tenant. Pagination is offset-based
-    /// because the admin UI is the only consumer today and the volumes
-    /// are modest; if this grows we switch to a `(created_at, id)` cursor.
-    /// `kind` is an optional `event_kind` filter; `actor_id` filters to
-    /// rows where the actor matches (used for "show me everything user X
-    /// did").
-    async fn list_recent(
-        &self,
-        tenant_id: TenantId,
-        kind: Option<&str>,
-        actor_id: Option<UserId>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AuditEntry>, AuthError>;
-
-    /// Filtered listing. Superset of `list_recent`: adds date-range,
-    /// free-text metadata search, and severity filter, plus a
-    /// `actor_email` LEFT JOIN on the users table so the SPA can
-    /// render names instead of raw UUIDs. The legacy `list_recent`
-    /// still exists for callers that haven't migrated.
+    /// Filtered listing: date-range, free-text metadata search, and
+    /// severity filter, plus a `actor_email` LEFT JOIN on the users
+    /// table so the SPA can render names instead of raw UUIDs.
     async fn list_filtered(
         &self,
         tenant_id: TenantId,

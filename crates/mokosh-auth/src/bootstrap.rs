@@ -92,9 +92,6 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
         issuer: cfg.issuer.clone(),
         authorization_code_ttl: cfg.authorization_code_ttl,
         op_session_ttl: cfg.op_session_ttl,
-        default_access_token_ttl: cfg.access_token_ttl,
-        default_refresh_token_ttl: cfg.refresh_token_ttl,
-        default_refresh_idle_ttl: cfg.refresh_idle_ttl,
         leeway: Duration::seconds(30),
     };
 

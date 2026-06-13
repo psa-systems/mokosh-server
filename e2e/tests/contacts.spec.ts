@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { expect, test } from '../lib/fixtures';
 import { routes } from '../lib/api';
 import { env } from '../lib/env';
+import { readForeignCompanyId } from '../lib/auth-state';
 import { createCompany, createContact } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -61,11 +62,12 @@ test.describe('cross-tenant isolation', () => {
   });
 
   test('E2E account cannot read a foreign tenant company', async ({ request }) => {
-    test.skip(
-      !env.foreignCompanyId,
-      'set E2E_FOREIGN_COMPANY_ID (a company in another tenant) to enable - see README',
-    );
-    const res = await request.get(routes.company(env.foreignCompanyId!));
+    // Fixture from global.setup.ts: a real foreign-tenant company id when the
+    // operator pinned E2E_FOREIGN_COMPANY_ID, otherwise a random, well-formed
+    // UUID the E2E tenant cannot own. Either way the company route must never
+    // return 200 (or a 5xx) for an id the caller does not own.
+    const foreignCompanyId = readForeignCompanyId();
+    const res = await request.get(routes.company(foreignCompanyId));
     expect([403, 404], `foreign company read -> ${res.status()}`).toContain(res.status());
   });
 });
