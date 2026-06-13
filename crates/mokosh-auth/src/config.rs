@@ -32,10 +32,6 @@ pub struct AuthConfig {
     pub refresh_idle_ttl: Duration,
     pub authorization_code_ttl: Duration,
     pub op_session_ttl: Duration,
-    pub require_email_verification: bool,
-    pub allow_signup: bool,
-    pub allow_first_run: bool,
-    pub federation_enabled: bool,
 }
 
 impl AuthConfig {
@@ -54,20 +50,6 @@ impl AuthConfig {
                 Err(_) => Ok(default),
             }
         }
-        fn parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
-            match std::env::var(key) {
-                Ok(s) => match s.as_str() {
-                    "true" | "1" | "yes" => Ok(true),
-                    "false" | "0" | "no" => Ok(false),
-                    other => Err(ConfigError::InvalidEnv(
-                        key,
-                        format!("expected bool, got {other}"),
-                    )),
-                },
-                Err(_) => Ok(default),
-            }
-        }
-
         let issuer_s = req("MOKOSH_AUTH_ISSUER")?;
         let issuer = Url::parse(&issuer_s)
             .map_err(|e| ConfigError::InvalidEnv("MOKOSH_AUTH_ISSUER", e.to_string()))?;
@@ -100,10 +82,6 @@ impl AuthConfig {
             op_session_ttl: Duration::seconds(
                 parse_u64("MOKOSH_AUTH_OP_SESSION_TTL", 604_800)? as i64
             ),
-            require_email_verification: parse_bool("MOKOSH_AUTH_REQUIRE_EMAIL_VERIFICATION", true)?,
-            allow_signup: parse_bool("MOKOSH_AUTH_ALLOW_SIGNUP", false)?,
-            allow_first_run: parse_bool("MOKOSH_AUTH_ALLOW_FIRST_RUN", false)?,
-            federation_enabled: parse_bool("MOKOSH_AUTH_FEDERATION_ENABLED", false)?,
         })
     }
 }
@@ -127,13 +105,6 @@ impl std::fmt::Debug for AuthConfig {
             .field("refresh_idle_ttl", &self.refresh_idle_ttl)
             .field("authorization_code_ttl", &self.authorization_code_ttl)
             .field("op_session_ttl", &self.op_session_ttl)
-            .field(
-                "require_email_verification",
-                &self.require_email_verification,
-            )
-            .field("allow_signup", &self.allow_signup)
-            .field("allow_first_run", &self.allow_first_run)
-            .field("federation_enabled", &self.federation_enabled)
             .finish()
     }
 }

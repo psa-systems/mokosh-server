@@ -102,29 +102,6 @@ impl AuditLogger for PgAuditLogger {
         Ok(())
     }
 
-    async fn list_recent(
-        &self,
-        tenant_id: TenantId,
-        kind: Option<&str>,
-        actor_id: Option<UserId>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AuditEntry>, AuthError> {
-        // Legacy thin wrapper around list_filtered for callers that
-        // haven't migrated to the filter struct.
-        self.list_filtered(
-            tenant_id,
-            AuditListFilter {
-                kind: kind.map(str::to_string),
-                actor_id,
-                limit,
-                offset,
-                ..Default::default()
-            },
-        )
-        .await
-    }
-
     async fn list_filtered(
         &self,
         tenant_id: TenantId,

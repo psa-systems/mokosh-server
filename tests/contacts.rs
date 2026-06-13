@@ -15,7 +15,6 @@ use sqlx::PgPool;
 /// Every PMS-17 test starts from "I have a company"; this consolidates
 /// the bearer + POST boilerplate so each test body stays on the actual
 /// behaviour under test.
-#[allow(dead_code)]
 async fn create_company(app: &common::TestApp, token: &str, name: &str) -> String {
     let body = serde_json::json!({ "name": name });
     let resp = app
@@ -39,7 +38,6 @@ async fn create_company(app: &common::TestApp, token: &str, name: &str) -> Strin
 }
 
 /// Helper: create a site through the API and return its id.
-#[allow(dead_code)]
 async fn create_site(
     app: &common::TestApp,
     token: &str,

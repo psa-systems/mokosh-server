@@ -21,8 +21,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{Duration, Utc};
 use mokosh_auth_core::{
-    AuditEvent, AuthError, MembershipStatus, NewMembership, NewSignupToken, NewUser, UserId,
-    UserRole, UserStatus,
+    AuditEvent, AuthError, MembershipStatus, NewMembership, NewSignupToken, NewUser, UserRole,
+    UserStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -385,8 +385,3 @@ pub async fn complete(
     )
         .into_response())
 }
-
-// Suppresses the unused-import warning on the bin target where
-// SignupTokenRepository is reachable through Arc<dyn ...>.
-#[allow(dead_code)]
-fn _enforce_user_id_used(_id: UserId) {}

@@ -53,8 +53,6 @@ pub struct OidcKeySet {
     active_kid: String,
     encoding_key: EncodingKey,
     decoding_keys: HashMap<String, DecodingKey>,
-    /// Kept for completeness / future inspection; unused by the OIDC engine.
-    _verifying_keys: HashMap<String, VerifyingKey>,
     jwks_cache: serde_json::Value,
 }
 
@@ -88,7 +86,6 @@ impl OidcKeySet {
         // Walk the public keys directory.
         let dir = public_keys_dir.as_ref().to_path_buf();
         let mut decoding_keys: HashMap<String, DecodingKey> = HashMap::new();
-        let mut verifying_keys: HashMap<String, VerifyingKey> = HashMap::new();
         let mut jwks_entries: Vec<EdJwk> = Vec::new();
 
         for entry in std::fs::read_dir(&dir)? {
@@ -126,7 +123,6 @@ impl OidcKeySet {
             let x_b64 = URL_SAFE_NO_PAD.encode(vk.to_bytes());
 
             decoding_keys.insert(kid.clone(), dk);
-            verifying_keys.insert(kid.clone(), vk);
             jwks_entries.push(EdJwk {
                 kty: "OKP",
                 crv: "Ed25519",
@@ -154,7 +150,6 @@ impl OidcKeySet {
             active_kid,
             encoding_key,
             decoding_keys,
-            _verifying_keys: verifying_keys,
             jwks_cache,
         })
     }

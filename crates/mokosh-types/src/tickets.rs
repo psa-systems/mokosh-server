@@ -472,52 +472,6 @@ pub struct TicketFilter {
 }
 
 // ============================================================================
-// TICKET ACTIVITY
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TicketActivity {
-    Created {
-        user_id: Uuid,
-        user_name: String,
-        timestamp: DateTime<Utc>,
-    },
-    StatusChanged {
-        user_id: Uuid,
-        user_name: String,
-        from_status: String,
-        to_status: String,
-        timestamp: DateTime<Utc>,
-    },
-    Assigned {
-        user_id: Uuid,
-        user_name: String,
-        assigned_to_name: String,
-        timestamp: DateTime<Utc>,
-    },
-    NoteAdded {
-        user_id: Uuid,
-        user_name: String,
-        note_type: NoteType,
-        timestamp: DateTime<Utc>,
-    },
-    PriorityChanged {
-        user_id: Uuid,
-        user_name: String,
-        from_priority: String,
-        to_priority: String,
-        timestamp: DateTime<Utc>,
-    },
-    TimeLogged {
-        user_id: Uuid,
-        user_name: String,
-        duration_minutes: i32,
-        timestamp: DateTime<Utc>,
-    },
-}
-
-// ============================================================================
 // AUTOMATION TYPES
 // ============================================================================
 

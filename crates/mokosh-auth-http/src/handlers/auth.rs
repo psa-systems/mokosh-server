@@ -162,7 +162,7 @@ pub async fn login(
     // If the account has MFA on, the session is created downstream by
     // /v1/auth/mfa/verify (with the stronger `acr = urn:mokosh:loa:mfa`).
     // Otherwise we proceed directly to session creation here.
-    let verify = st.local_auth.verify_only(local_req, ip, ua).await?;
+    let verify = st.local_auth.verify_only(local_req, ip).await?;
     let user = verify.user;
 
     // Resolve active tenant: explicit request -> last_active_tenant ->

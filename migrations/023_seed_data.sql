@@ -313,18 +313,6 @@ INSERT INTO notification_templates (tenant_id, name, event_type, channel_type, s
     'Ticket #{{ticket.number}} has been updated.\n\nTitle: {{ticket.title}}\nStatus: {{ticket.status}}\n\nLatest Update:\n{{ticket.last_note}}\n\nView ticket: {{ticket.url}}',
     '<h2>Ticket Updated</h2><p><strong>Ticket #:</strong> {{ticket.number}}<br><strong>Title:</strong> {{ticket.title}}<br><strong>Status:</strong> {{ticket.status}}</p><h3>Latest Update</h3><p>{{ticket.last_note}}</p><p><a href="{{ticket.url}}">View Ticket</a></p>'),
 
--- SLA warning (Email)
-('00000000-0000-0000-0000-000000000001', 'SLA Warning - Email', 'ticket.sla_warning', 'email',
-    'SLA Warning: Ticket #{{ticket.number}} due soon',
-    'Warning: Ticket #{{ticket.number}} is approaching its SLA deadline.\n\nTitle: {{ticket.title}}\nPriority: {{ticket.priority}}\nDue: {{ticket.sla_due_date}}\n\nPlease take action immediately.\n\nView ticket: {{ticket.url}}',
-    '<h2>SLA Warning</h2><p style="color: #F59E0B;"><strong>Ticket #{{ticket.number}} is approaching its SLA deadline!</strong></p><p><strong>Title:</strong> {{ticket.title}}<br><strong>Priority:</strong> {{ticket.priority}}<br><strong>Due:</strong> {{ticket.sla_due_date}}</p><p><a href="{{ticket.url}}">View Ticket</a></p>'),
-
--- SLA breach (Email)
-('00000000-0000-0000-0000-000000000001', 'SLA Breach - Email', 'ticket.sla_breach', 'email',
-    'SLA BREACH: Ticket #{{ticket.number}}',
-    'ALERT: Ticket #{{ticket.number}} has breached its SLA!\n\nTitle: {{ticket.title}}\nPriority: {{ticket.priority}}\nDue: {{ticket.sla_due_date}}\n\nImmediate action required.\n\nView ticket: {{ticket.url}}',
-    '<h2 style="color: #EF4444;">SLA BREACH</h2><p><strong>Ticket #{{ticket.number}} has breached its SLA!</strong></p><p><strong>Title:</strong> {{ticket.title}}<br><strong>Priority:</strong> {{ticket.priority}}<br><strong>Due:</strong> {{ticket.sla_due_date}}</p><p><a href="{{ticket.url}}">View Ticket</a></p>'),
-
 -- Invoice sent (Email)
 ('00000000-0000-0000-0000-000000000001', 'Invoice Sent - Email', 'invoice.sent', 'email',
     'Invoice #{{invoice.number}} from {{tenant.name}}',

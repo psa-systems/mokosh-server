@@ -9,7 +9,7 @@ Professional Services Automation (PSA) platform for MSPs. REST API server built 
 - **Secrets**: Infisical (Universal Auth machine identity) reached over HTTP.
 - **Email**: Lettre (SMTP).
 - **Auth**: JWT (HS256) plus Argon2 password hashing.
-- **Tenancy**: feature-flagged. `multi-tenant` is the default; `single-tenant` is also supported.
+- **Tenancy**: multi-tenant only. Every service method takes an explicit `tenant_id`; the former `single-tenant` cargo feature was removed in PMS-262.
 
 Modules under `src/modules/` cover the typical PSA surface area: `tickets`, `contracts`, `contacts`, `billing`, `projects`, `assets`, `time_tracking`, `sla`, `rmm`, `knowledge_base`, `portal`, `reports`, `notifications`, `audit`, `auth`, `tenants`, `settings`, `calendar`.
 

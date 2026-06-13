@@ -6,8 +6,7 @@
 use chrono::{DateTime, Utc};
 use mokosh_auth_core::{
     AuthError, ClientAuthMethod, ClientId, ClientType, GrantType, OAuthClient, OpSession,
-    OpSessionId, RefreshFamilyId, RefreshToken, RefreshTokenFamily, RefreshTokenId, TenantId, User,
-    UserId, UserRole, UserStatus,
+    OpSessionId, TenantId, User, UserId, UserRole, UserStatus,
 };
 use std::collections::BTreeSet;
 use url::Url;
@@ -193,74 +192,6 @@ impl From<OpSessionRow> for OpSession {
             acr: r.acr,
             amr: r.amr,
             display_name: r.display_name,
-        }
-    }
-}
-
-// --- Refresh tokens -----------------------------------------------------
-
-#[derive(sqlx::FromRow)]
-pub(crate) struct RefreshTokenRow {
-    pub id: Uuid,
-    pub family_id: Uuid,
-    pub parent_id: Option<Uuid>,
-    pub client_id: Uuid,
-    pub user_id: Uuid,
-    pub tenant_id: Uuid,
-    pub scope: Vec<String>,
-    pub issued_at: DateTime<Utc>,
-    pub used_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
-    pub idle_expires_at: DateTime<Utc>,
-    pub absolute_expires_at: DateTime<Utc>,
-    pub ip: Option<ipnetwork::IpNetwork>,
-    pub user_agent: Option<String>,
-}
-
-impl From<RefreshTokenRow> for RefreshToken {
-    fn from(r: RefreshTokenRow) -> Self {
-        RefreshToken {
-            id: RefreshTokenId(r.id),
-            family_id: RefreshFamilyId(r.family_id),
-            parent_id: r.parent_id.map(RefreshTokenId),
-            client_id: ClientId(r.client_id),
-            user_id: UserId(r.user_id),
-            tenant_id: TenantId(r.tenant_id),
-            scope: r.scope,
-            issued_at: r.issued_at,
-            used_at: r.used_at,
-            revoked_at: r.revoked_at,
-            idle_expires_at: r.idle_expires_at,
-            absolute_expires_at: r.absolute_expires_at,
-            ip: r.ip.map(|n| n.ip()),
-            user_agent: r.user_agent,
-        }
-    }
-}
-
-#[derive(sqlx::FromRow)]
-pub(crate) struct RefreshFamilyRow {
-    pub id: Uuid,
-    pub client_id: Uuid,
-    pub user_id: Uuid,
-    pub tenant_id: Uuid,
-    pub op_session_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub revoked_at: Option<DateTime<Utc>>,
-    pub revoke_reason: Option<String>,
-}
-
-impl From<RefreshFamilyRow> for RefreshTokenFamily {
-    fn from(r: RefreshFamilyRow) -> Self {
-        RefreshTokenFamily {
-            id: RefreshFamilyId(r.id),
-            client_id: ClientId(r.client_id),
-            user_id: UserId(r.user_id),
-            tenant_id: TenantId(r.tenant_id),
-            op_session_id: r.op_session_id.map(OpSessionId),
-            created_at: r.created_at,
-            revoked_at: r.revoked_at,
-            revoke_reason: r.revoke_reason,
         }
     }
 }

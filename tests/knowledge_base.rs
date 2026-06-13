@@ -33,7 +33,6 @@ mod common;
 use sqlx::PgPool;
 
 /// Create a category through the API and return its id.
-#[allow(dead_code)]
 async fn create_category(app: &common::TestApp, token: &str, name: &str, slug: &str) -> String {
     let body = serde_json::json!({ "name": name, "slug": slug });
     let resp = app
@@ -57,7 +56,6 @@ async fn create_category(app: &common::TestApp, token: &str, name: &str, slug: &
 }
 
 /// Create an article through the API and return the full JSON body.
-#[allow(dead_code)]
 async fn create_article(
     app: &common::TestApp,
     token: &str,
@@ -83,7 +81,6 @@ async fn create_article(
 /// can stage portal-feed fixtures with explicit visibility / status /
 /// company_ids. `published_at` is stamped only when `status` is
 /// `published`, matching the service's create path.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn seed_kb_article(
     pool: &PgPool,
@@ -261,7 +258,6 @@ async fn create_as_published_stamps_published_at(pool: PgPool) {
 }
 
 /// Pull the version list for an article and return (total, data array).
-#[allow(dead_code)]
 async fn versions(app: &common::TestApp, token: &str, article_id: &str) -> serde_json::Value {
     let resp = app
         .client
@@ -474,7 +470,6 @@ async fn duplicate_slug_is_rejected(pool: PgPool) {
 }
 
 /// POST a vote and return the parsed feedback JSON.
-#[allow(dead_code)]
 async fn post_vote(
     app: &common::TestApp,
     token: &str,
@@ -497,7 +492,6 @@ async fn post_vote(
 }
 
 /// GET the caller's current vote + counts.
-#[allow(dead_code)]
 async fn get_vote(app: &common::TestApp, token: &str, article_id: &str) -> serde_json::Value {
     let resp = app
         .client
@@ -618,7 +612,6 @@ async fn vote_is_per_user_exclusive_and_toggleable(pool: PgPool) {
 /// `POST /api/v1/portal/auth/login`. The company is created under the
 /// given tenant first because `contacts.company_id` is `NOT NULL` with an
 /// FK to `companies`.
-#[allow(dead_code)]
 async fn seed_portal_contact(
     pool: &PgPool,
     tenant_id: uuid::Uuid,
@@ -655,7 +648,6 @@ async fn seed_portal_contact(
 }
 
 /// Log a portal contact in and return its access token.
-#[allow(dead_code)]
 async fn portal_login(
     app: &common::TestApp,
     tenant_slug: &str,

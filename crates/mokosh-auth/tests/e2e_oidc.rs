@@ -126,10 +126,6 @@ async fn make_env(pool: PgPool) -> TestEnv {
         refresh_idle_ttl: Duration::seconds(1800),
         authorization_code_ttl: Duration::seconds(60),
         op_session_ttl: Duration::days(1),
-        require_email_verification: false,
-        allow_signup: false,
-        allow_first_run: true,
-        federation_enabled: false,
     };
 
     let auth = bootstrap(cfg, pool.clone()).await.expect("bootstrap");
