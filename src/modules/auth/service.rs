@@ -239,7 +239,9 @@ impl AuthService {
                     access_token: String::new(),
                     refresh_token: String::new(),
                     expires_at: Utc::now(),
-                    user: user.to_current_user(),
+                    // Withhold the user profile until the second factor
+                    // is satisfied: no pre-2FA data leak.
+                    user: None,
                     mfa_required: true,
                 });
             }
@@ -282,7 +284,7 @@ impl AuthService {
             access_token,
             refresh_token,
             expires_at,
-            user: user.to_current_user(),
+            user: Some(user.to_current_user()),
             mfa_required: false,
         })
     }
@@ -406,7 +408,7 @@ impl AuthService {
             access_token,
             refresh_token,
             expires_at,
-            user: user.to_current_user(),
+            user: Some(user.to_current_user()),
             mfa_required: false,
         })
     }
