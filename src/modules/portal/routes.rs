@@ -172,6 +172,12 @@ async fn get_ticket(
     RequirePortalAuth(contact): RequirePortalAuth,
     Path(ticket_id): Path<Uuid>,
 ) -> AppResult<Json<TicketResponse>> {
+    // SAFETY (PMS-261): `contact.tenant_id` and `contact.company_id` are
+    // verified claims from the portal JWT (`RequirePortalAuth`), not user
+    // input. Portal runs on contact sessions rather than `CurrentUser`, so it
+    // cannot use the `TenantScoped` extractor; `from_trusted` is the sanctioned
+    // bridge. `get_portal_ticket` scopes by both tenant and company, so a
+    // contact can only read its own company's ticket within its own tenant.
     let resp = state
         .tickets
         .get_portal_ticket(
@@ -188,6 +194,10 @@ async fn list_tickets(
     RequirePortalAuth(contact): RequirePortalAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
+    // SAFETY (PMS-261): verified contact-JWT claims (`RequirePortalAuth`), not
+    // user input; portal cannot use `TenantScoped`. `list_portal_tickets`
+    // scopes by both tenant and company, so the feed is confined to the
+    // contact's own company within its own tenant.
     let (tickets, total) = state
         .tickets
         .list_portal_tickets(
@@ -209,6 +219,10 @@ async fn create_ticket(
     Json(request): Json<CreatePortalTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
     request.validate()?;
+    // SAFETY (PMS-261): verified contact-JWT claims (`RequirePortalAuth`), not
+    // user input; portal cannot use `TenantScoped`. `create_portal_ticket`
+    // writes under `contact.tenant_id` / `contact.company_id`, so a contact can
+    // only create a ticket inside its own company and tenant.
     let resp = state
         .tickets
         .create_portal_ticket(

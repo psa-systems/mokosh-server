@@ -109,6 +109,11 @@ impl TenantService {
                 .fetch_optional(&mut *tx)
                 .await?;
 
+        // SAFETY (PMS-261): `tenant_id` is freshly minted for the tenant being
+        // created (not a caller-supplied claim) and the whole block runs inside
+        // `begin_with_tenant(tenant_id)` (see the GUC note above), so the audit
+        // row is written under that tenant's GUC. `from_trusted` bridges the
+        // minted `Uuid` into the typed scope `audit_write` requires.
         audit_write(
             &mut *tx,
             TenantId::from_trusted(tenant_id),
@@ -125,6 +130,8 @@ impl TenantService {
         // Copy default configuration from default tenant
         self.copy_default_config(tenant_id).await?;
 
+        // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
+        // is the same minted id, bridged via `from_trusted`.
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
     }
 
