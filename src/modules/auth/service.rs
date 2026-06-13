@@ -551,11 +551,14 @@ impl AuthService {
         Ok(())
     }
 
-    /// Logout all sessions for a user
-    #[tracing::instrument(skip_all)]
-    pub async fn logout_all(&self, user_id: Uuid) -> AppResult<()> {
-        sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
+    /// Logout all sessions for a user. PMS-260: scoped to the caller's tenant
+    /// as well as the user so logout cannot span tenants when a `user_id`
+    /// exists under more than one tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn logout_all(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
+        sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND tenant_id = $2")
             .bind(user_id)
+            .bind(tenant_id)
             .execute(self.db.pool())
             .await?;
 
@@ -726,7 +729,7 @@ impl AuthService {
         tx.commit().await?;
 
         // Invalidate all sessions
-        self.logout_all(user_id).await?;
+        self.logout_all(tenant_id, user_id).await?;
 
         Ok(())
     }
@@ -1454,6 +1457,15 @@ impl AuthService {
     /// (PMS-244) to decide between joining an invited tenant, staying put, or
     /// self-signup, and (PMS-245) to back-fill non-admin users out of the shared
     /// default tenant - the `role` lets it exempt platform `super_admin`s.
+    ///
+    /// PMS-260: this lookup is deliberately NOT tenant-scoped - resolving which
+    /// tenant a `sub` belongs to is its whole job, so it must read across
+    /// tenants. That is only safe because its sole caller is the pre-session
+    /// bunyip login/placement path (`middleware::place_bunyip_user`), which runs
+    /// before any `AuthState`/tenant context exists. It must NEVER be wired into
+    /// a request handler, where it would let an authenticated caller probe other
+    /// tenants' placement. The `routes_do_not_reach_global_login_helpers`
+    /// regression test (`tests/auth.rs`) pins that no `routes.rs` references it.
     pub async fn find_user_placement(&self, user_id: Uuid) -> AppResult<Option<(Uuid, String)>> {
         Ok(
             sqlx::query_as::<_, (Uuid, String)>("SELECT tenant_id, role FROM users WHERE id = $1")
@@ -1767,18 +1779,23 @@ impl AuthService {
         Ok((access_token, refresh_token, access_expires))
     }
 
-    /// Get all active sessions for a user
-    #[tracing::instrument(skip_all)]
+    /// Get all active sessions for a user. PMS-260: scoped to the caller's
+    /// tenant as well as the user so a `user_id` that exists under more than
+    /// one tenant cannot enumerate sessions outside the caller's tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_sessions(
         &self,
+        tenant_id: Uuid,
         user_id: Uuid,
         current_session_id: Uuid,
         pagination: &crate::utils::pagination::PaginationParams,
     ) -> AppResult<(Vec<SessionInfo>, u64)> {
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_sessions WHERE user_id = $1 AND expires_at > NOW()",
+            "SELECT COUNT(*) FROM user_sessions \
+             WHERE user_id = $1 AND tenant_id = $2 AND expires_at > NOW()",
         )
         .bind(user_id)
+        .bind(tenant_id)
         .fetch_one(self.db.pool())
         .await?;
 
@@ -1786,12 +1803,13 @@ impl AuthService {
             r#"
             SELECT id, ip_address, user_agent, last_activity_at, created_at
             FROM user_sessions
-            WHERE user_id = $1 AND expires_at > NOW()
+            WHERE user_id = $1 AND tenant_id = $2 AND expires_at > NOW()
             ORDER BY last_activity_at DESC
-            LIMIT $2 OFFSET $3
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(user_id)
+        .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
         .fetch_all(self.db.pool())

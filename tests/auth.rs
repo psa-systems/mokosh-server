@@ -16,6 +16,10 @@ use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use mokosh_server::modules::auth::AuthService;
+use mokosh_server::utils::pagination::PaginationParams;
+use mokosh_server::Database;
+
 #[sqlx::test]
 async fn login_then_me_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -725,4 +729,170 @@ async fn forgot_password_with_tenant_hint_targets_correct_user(pool: PgPool) {
         default_tenant_token_count, 0,
         "no reset token should have been issued for the default-tenant collider"
     );
+}
+
+// ============================================================================
+// PMS-260: cross-tenant leak fixes in the auth session methods
+// ============================================================================
+
+/// Insert an active (`expires_at` in the future) session row directly, so a
+/// test can stand up the leak scenario the seed helpers cannot express: the
+/// same `user_id` carrying sessions under more than one tenant. The
+/// `user_sessions.tenant_id` / `user_id` FKs are independent (no composite
+/// constraint), so a session can legally reference a tenant other than the
+/// user's home tenant - which is exactly the leak PMS-260 closes.
+fn build_pagination() -> PaginationParams {
+    PaginationParams {
+        page: 1,
+        per_page: 25,
+        sort: None,
+        sort_dir: "desc".to_string(),
+    }
+}
+
+async fn insert_active_session(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    token_hash: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO user_sessions (id, tenant_id, user_id, token_hash, expires_at)
+        VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour')
+        "#,
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(token_hash)
+    .execute(pool)
+    .await
+    .expect("insert active session");
+    id
+}
+
+/// PMS-260: `get_user_sessions` must bind `tenant_id` so a `user_id` that
+/// carries sessions under two tenants only ever enumerates the caller's-tenant
+/// sessions. Pre-fix the `WHERE user_id = $1`-only query returned both rows.
+#[sqlx::test]
+async fn get_user_sessions_is_tenant_scoped(pool: PgPool) {
+    let (user_id, _email, _password) = common::seed_admin(&pool).await;
+    let (tenant_b_id, _b_uid, _b_email, _b_password) =
+        common::seed_tenant_with_admin(&pool, "pms260-sessions-b").await;
+
+    // Same user_id, two tenants: one session in the caller's (default) tenant,
+    // one planted under tenant B.
+    let session_a =
+        insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
+    let _session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
+
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    let (sessions, total) = auth
+        .get_user_sessions(
+            common::DEFAULT_TENANT_ID,
+            user_id,
+            Uuid::nil(),
+            &build_pagination(),
+        )
+        .await
+        .expect("get_user_sessions");
+
+    assert_eq!(total, 1, "only the caller's-tenant session is counted");
+    assert_eq!(sessions.len(), 1, "only the caller's-tenant session listed");
+    assert_eq!(
+        sessions[0].id, session_a,
+        "the listed session is the one in the caller's tenant, not tenant B's"
+    );
+}
+
+/// PMS-260: `logout_all` must bind `tenant_id` so it cannot delete sessions a
+/// user holds under a different tenant. Pre-fix the `WHERE user_id = $1`-only
+/// DELETE wiped both rows.
+#[sqlx::test]
+async fn logout_all_is_tenant_scoped(pool: PgPool) {
+    let (user_id, _email, _password) = common::seed_admin(&pool).await;
+    let (tenant_b_id, _b_uid, _b_email, _b_password) =
+        common::seed_tenant_with_admin(&pool, "pms260-logout-b").await;
+
+    insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
+    let session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
+
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    auth.logout_all(common::DEFAULT_TENANT_ID, user_id)
+        .await
+        .expect("logout_all");
+
+    let remaining: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT id, tenant_id FROM user_sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(&pool)
+            .await
+            .expect("read remaining sessions");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the caller's-tenant session is deleted; tenant B's survives"
+    );
+    assert_eq!(
+        remaining[0].0, session_b,
+        "tenant B's session is the survivor"
+    );
+    assert_eq!(
+        remaining[0].1, tenant_b_id,
+        "survivor is scoped to tenant B"
+    );
+}
+
+/// PMS-260: the two intentionally-cross-tenant login helpers
+/// (`auth::find_user_placement`, `invitations::newest_pending_for`) read across
+/// tenants by design and are only safe because the sole caller is the
+/// pre-session bunyip login/placement path (`middleware::place_bunyip_user`).
+/// This guard pins that invariant: no HTTP route handler (`*/routes.rs`) may
+/// reference them, where an authenticated caller could probe other tenants.
+#[test]
+fn routes_do_not_reach_global_login_helpers() {
+    const FORBIDDEN: [&str; 2] = ["find_user_placement", "newest_pending_for"];
+
+    let modules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules");
+
+    fn collect_routes(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir under src/modules") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_routes(&path, out);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("routes.rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut route_files = Vec::new();
+    collect_routes(&modules_dir, &mut route_files);
+    assert!(
+        !route_files.is_empty(),
+        "expected at least one routes.rs under src/modules"
+    );
+
+    for file in &route_files {
+        let src = std::fs::read_to_string(file).expect("read routes.rs");
+        for needle in FORBIDDEN {
+            assert!(
+                !src.contains(needle),
+                "{} references `{}`: a request handler must never call the \
+                 cross-tenant login helper (PMS-260)",
+                file.display(),
+                needle
+            );
+        }
+    }
 }

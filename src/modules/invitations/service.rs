@@ -150,6 +150,16 @@ impl InvitationsService {
     /// The newest live (pending, unexpired) invite for `email`, across tenants.
     /// The login path uses this to place an invited user (PMS-244). Most-recent
     /// wins if an email has several pending invites.
+    ///
+    /// PMS-260: this query is deliberately NOT tenant-scoped - finding which
+    /// tenant invited an email is its whole job, so it must read across tenants.
+    /// That is only safe because its sole caller is the pre-session bunyip
+    /// login/invite-acceptance path (`middleware::place_bunyip_user`), gated on a
+    /// verified email, before any tenant context exists. It must NEVER be wired
+    /// into a general API handler, where it would leak which tenants have
+    /// outstanding invites for an arbitrary address. The
+    /// `routes_do_not_reach_global_login_helpers` regression test
+    /// (`tests/auth.rs`) pins that no `routes.rs` references it.
     pub async fn newest_pending_for(&self, email: &str) -> AppResult<Option<PendingInvite>> {
         let email = email.trim().to_ascii_lowercase();
         Ok(sqlx::query_as::<_, PendingInvite>(
