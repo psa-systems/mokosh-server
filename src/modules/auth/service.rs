@@ -969,6 +969,7 @@ impl AuthService {
     }
 
     /// Update user
+    #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_user(
         &self,
@@ -1020,7 +1021,13 @@ impl AuthService {
         }
         if request.date_format_string.is_some() {
             updates.push(format!("date_format_string = ${}", param_idx));
-            // param_idx += 1;
+            // Invariant: every conditional update advances `param_idx` so
+            // the next field added below is numbered correctly.
+            // `date_format_string` is the last field today, so this
+            // increment is currently unread (`#[allow(unused_assignments)]`
+            // on the fn); keep it so the pattern stays copy-paste safe
+            // (PMS-197).
+            param_idx += 1;
         }
 
         if updates.is_empty() {
