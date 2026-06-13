@@ -80,12 +80,16 @@ impl Database {
     /// connection. The value is bound as a parameter (not interpolated) so
     /// there is no SQL-injection surface even though tenant_id is a Uuid.
     ///
-    /// The policy is currently fail-open (it reduces to `tenant_id = tenant_id`
-    /// when the GUC is unset), so queries that have not yet been migrated onto
-    /// this helper keep working against their explicit `WHERE tenant_id = $1`
-    /// filters. Queries run through a transaction from this helper get real
-    /// row-level isolation. Follow-up: migrate the remaining read paths, then
-    /// flip the policy fail-closed (the migration role needs BYPASSRLS).
+    /// The policy is fail-closed as of migration `038_rls_fail_closed.sql`: an
+    /// unset GUC matches no rows and a write whose `tenant_id` does not equal
+    /// the GUC is rejected (WITH CHECK), with `FORCE ROW LEVEL SECURITY` so the
+    /// owner is not exempt. This bites only for connections whose role lacks
+    /// BYPASSRLS. The application currently connects as the bypassing
+    /// (migration) role and still relies on explicit `WHERE tenant_id = $1`
+    /// filters on the read paths not yet moved onto this helper; switching the
+    /// app connection to an unprivileged NOBYPASSRLS role is gated on migrating
+    /// those remaining paths (parent PMS-255). Queries run through a transaction
+    /// from this helper get the tenant GUC set and so satisfy the policy.
     #[cfg(feature = "multi-tenant")]
     pub async fn begin_with_tenant(
         &self,
