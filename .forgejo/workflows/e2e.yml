@@ -3,14 +3,15 @@
 # Playwright E2E suite against a deployed instance (PMS-140 phase 1;
 # PMS-141 promotion to merge gate; PMS-271 staging/production secret split).
 #
-# Environments (PMS-271): CI holds both staging and production config side by
-# side as environment-prefixed Forgejo Actions secrets (`E2E_STAGING_*` /
-# `E2E_PRODUCTION_*`). The job env: block maps the selected environment onto
-# the plain `E2E_*` names per var, so env.ts and the gate scripts never need
-# to know which environment they target. Automatic triggers (push, PR) always
-# resolve to staging; production runs only on a manual dispatch that selects
-# it (the suite is write-heavy and shares one rate-limited account, so it must
-# not churn live prod unattended).
+# Environments (PMS-271): CI holds staging and production config side by side.
+# The bare `E2E_*` Forgejo Actions secrets ARE the staging set (unchanged);
+# production adds a parallel `E2E_PRODUCTION_*` set. The job env: block selects
+# between them per var and exposes the result on the plain `E2E_*` names, so
+# env.ts and the gate scripts never need to know which environment they target.
+# Automatic triggers (push, PR) always resolve to the bare staging secrets;
+# production runs only on a manual dispatch that selects it (the suite is
+# write-heavy and shares one rate-limited account, so it must not churn live
+# prod unattended).
 #
 # Triggers:
 #   - push to main: post-merge validation against staging. Runs the deploy-sync
@@ -68,22 +69,23 @@ jobs:
       run:
         working-directory: e2e
 
-    # PMS-271: map the selected environment's prefixed secret onto the plain
-    # E2E_* name per var. On push / pull_request the `inputs` context is empty,
+    # PMS-271: select staging vs production per var and expose on the plain
+    # E2E_* name. The bare E2E_* secrets ARE staging; E2E_PRODUCTION_* is the
+    # production override. On push / pull_request the `inputs` context is empty,
     # so `inputs.environment == 'production'` is false and every var resolves to
-    # its E2E_STAGING_* secret; on a manual dispatch the operator's choice
-    # drives it. env.ts and the gate scripts read the plain E2E_* names and stay
+    # its bare staging secret; on a manual dispatch the operator's choice drives
+    # it. env.ts and the gate scripts read the plain E2E_* names and stay
     # environment-agnostic.
     env:
-      E2E_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_BASE_URL || secrets.E2E_STAGING_BASE_URL }}
-      E2E_EMAIL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_EMAIL || secrets.E2E_STAGING_EMAIL }}
-      E2E_PASSWORD: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_PASSWORD || secrets.E2E_STAGING_PASSWORD }}
-      E2E_TENANT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TENANT_ID || secrets.E2E_STAGING_TENANT_ID }}
-      E2E_OIDC_CLIENT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_CLIENT_ID || secrets.E2E_STAGING_OIDC_CLIENT_ID }}
-      E2E_OIDC_REDIRECT_URI: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_REDIRECT_URI || secrets.E2E_STAGING_OIDC_REDIRECT_URI }}
-      E2E_OP_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OP_BASE_URL || secrets.E2E_STAGING_OP_BASE_URL }}
-      E2E_TOTP_SECRET: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TOTP_SECRET || secrets.E2E_STAGING_TOTP_SECRET }}
-      E2E_FOREIGN_COMPANY_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_FOREIGN_COMPANY_ID || secrets.E2E_STAGING_FOREIGN_COMPANY_ID }}
+      E2E_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_BASE_URL || secrets.E2E_BASE_URL }}
+      E2E_EMAIL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_EMAIL || secrets.E2E_EMAIL }}
+      E2E_PASSWORD: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_PASSWORD || secrets.E2E_PASSWORD }}
+      E2E_TENANT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TENANT_ID || secrets.E2E_TENANT_ID }}
+      E2E_OIDC_CLIENT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_CLIENT_ID || secrets.E2E_OIDC_CLIENT_ID }}
+      E2E_OIDC_REDIRECT_URI: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_REDIRECT_URI || secrets.E2E_OIDC_REDIRECT_URI }}
+      E2E_OP_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OP_BASE_URL || secrets.E2E_OP_BASE_URL }}
+      E2E_TOTP_SECRET: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TOTP_SECRET || secrets.E2E_TOTP_SECRET }}
+      E2E_FOREIGN_COMPANY_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_FOREIGN_COMPANY_ID || secrets.E2E_FOREIGN_COMPANY_ID }}
       # The opensuse-base runner does not grant write access to the default
       # /opt/hostedtoolcache, so actions/setup-node fails when it tries to
       # cache the downloaded Node tarball. Point the tool cache at a path the
