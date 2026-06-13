@@ -105,6 +105,7 @@ impl OrgInvitationRepository for PgOrgInvitationRepository {
             "{SELECT_ORG_INVITE}
              WHERE tenant_id = $1
                AND accepted_at IS NULL AND revoked_at IS NULL
+               AND expires_at > NOW()
              ORDER BY issued_at DESC"
         ))
         .bind(tenant_id.0)

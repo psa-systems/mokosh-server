@@ -914,18 +914,29 @@ impl TimeTrackingService {
         };
         let company_id = match timer.company_id {
             Some(v) => v,
-            None => sqlx::query_scalar::<_, Uuid>(
-                "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
-            )
-            .bind(tenant_id)
-            .bind(timer.ticket_id.unwrap_or(Uuid::nil()))
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "Cannot stop timer without an inferable company_id".to_string(),
+            None => {
+                // With no company on the timer we can only infer one from
+                // an associated ticket. Short-circuit when there is no
+                // ticket either, rather than querying `tickets` by
+                // Uuid::nil() (which never matches and is wasted work).
+                let ticket_id = timer.ticket_id.ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Cannot stop timer without an inferable company_id".to_string(),
+                    )
+                })?;
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
                 )
-            })?,
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Cannot stop timer without an inferable company_id".to_string(),
+                    )
+                })?
+            }
         };
 
         // Derive billing from the resolved, tenant-scoped work type and apply

@@ -154,6 +154,7 @@ pub fn build_router(state: Arc<AuthHttpState>) -> Router {
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
