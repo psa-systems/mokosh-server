@@ -447,20 +447,48 @@ async fn ticket_number_sequence_is_per_tenant(pool: PgPool) {
     };
 
     // A burns three numbers; B then creates its first.
-    let a_first = make_ticket(a.token.clone(), a_company.clone(), 0).await;
-    let a_second = make_ticket(a.token.clone(), a_company.clone(), 1).await;
+    let a_first = ticket_seq(&make_ticket(a.token.clone(), a_company.clone(), 0).await);
+    let a_second = ticket_seq(&make_ticket(a.token.clone(), a_company.clone(), 1).await);
     let _a_third = make_ticket(a.token.clone(), a_company.clone(), 2).await;
-    let b_first = make_ticket(b.token.clone(), b_company.clone(), 0).await;
+    let b_first = ticket_seq(&make_ticket(b.token.clone(), b_company.clone(), 0).await);
 
-    assert_ne!(
-        a_first, a_second,
-        "the sequence must advance within a tenant"
+    assert_eq!(
+        a_second,
+        a_first + 1,
+        "the sequence must advance by one within a tenant (a_first={a_first}, a_second={a_second})"
     );
     assert_eq!(
-        a_first, b_first,
+        b_first, a_first,
         "each tenant's first ticket_number must match (per-tenant sequence); \
-         B's first must not be offset by A's volume. a_first={a_first:?} b_first={b_first:?}"
+         B's first must not be offset by A's volume (a_first={a_first}, b_first={b_first})"
     );
+}
+
+/// Extract the numeric sequence value from a `ticket_number`, tolerant of both
+/// a bare JSON number and a prefixed string form (e.g. `"TKT-000007"` -> 7), so
+/// the per-tenant-sequence assertions do not silently pass on a `null`/missing
+/// field and do not break if a display prefix is added later. Panics if no
+/// number is present, which is the correct (loud) failure for a broken field.
+fn ticket_seq(v: &serde_json::Value) -> u64 {
+    match v {
+        serde_json::Value::Number(n) => {
+            n.as_u64().expect("ticket_number is a non-negative integer")
+        }
+        serde_json::Value::String(s) => {
+            let digits: String = s
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            digits
+                .parse()
+                .unwrap_or_else(|_| panic!("ticket_number {s:?} has no trailing number"))
+        }
+        other => panic!("unexpected ticket_number JSON type: {other:?}"),
+    }
 }
 
 /// AC #3: deletion is tenant-scoped. A deleting its own company leaves B's
@@ -591,6 +619,17 @@ async fn settings_and_branding_are_tenant_scoped(pool: PgPool) {
         .await,
         StatusCode::OK,
         "A enables its own assets module"
+    );
+    // Confirm A's write actually took effect in A's own tenant. Without this the
+    // B-before == B-after check below could pass vacuously: a silently no-op'd
+    // write would leave both A and B unchanged, hiding a broken write (and, if
+    // the module default were ever flipped to enabled, hiding a leak too).
+    let a_after =
+        get_json(&app, &a.token, "/api/v1/settings/modules/assets").await["is_enabled"].clone();
+    assert_eq!(
+        a_after,
+        serde_json::Value::Bool(true),
+        "A's own assets module must read back enabled after A's write"
     );
     let b_after =
         get_json(&app, &b.token, "/api/v1/settings/modules/assets").await["is_enabled"].clone();
