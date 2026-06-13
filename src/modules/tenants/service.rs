@@ -56,10 +56,14 @@ impl TenantService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         sqlx::query(
+            // `kind = 'org'` is set explicitly: migration 019_tenant_kind dropped
+            // the column default, so every caller must supply it. This is the
+            // admin/multi-user org-create path (self-signup uses kind='personal');
+            // omitting it inserts NULL and violates the NOT NULL constraint (PMS-287).
             r#"
-            INSERT INTO tenants (id, name, slug, status, billing_email, billing_contact_name,
+            INSERT INTO tenants (id, name, slug, status, kind, billing_email, billing_contact_name,
                                  subscription_plan, subscription_status, trial_ends_at)
-            VALUES ($1, $2, $3, 'active', $4, $5, $6, 'trialing', $7)
+            VALUES ($1, $2, $3, 'active', 'org', $4, $5, $6, 'trialing', $7)
             "#,
         )
         .bind(tenant_id)
