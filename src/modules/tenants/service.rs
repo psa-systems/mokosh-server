@@ -153,27 +153,41 @@ impl TenantService {
     /// (`tickets/service.rs`) - 500s. The placement path calls this so any
     /// tenant a user actually lands in is seeded.
     pub async fn ensure_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
+        // This runs on the per-request bunyip auth path (place_bunyip_user), so
+        // the already-seeded common case must stay cheap: a couple of
+        // `SELECT EXISTS` and no write transaction. The sequence step is guarded
+        // here; the lookup step is guarded inside `copy_default_config`.
+        //
         // Per-tenant sequences power ticket_number / invoice_number generation.
         // They are not part of `copy_default_config` (create_tenant seeds them
         // separately), so seed them here too - under the tenant GUC, since the
-        // sequence tables are RLS-protected (mirrors create_tenant). Each insert
-        // is independently idempotent via ON CONFLICT on the tenant_id PK.
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            "INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)
-             ON CONFLICT (tenant_id) DO NOTHING",
+        // sequence tables are RLS-protected (mirrors create_tenant). The inserts
+        // keep `ON CONFLICT DO NOTHING` so a concurrent first-request race stays
+        // idempotent even though the cheap guard let both callers through.
+        let has_sequences: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ticket_sequences WHERE tenant_id = $1)",
         )
         .bind(tenant_id)
-        .execute(&mut *tx)
+        .fetch_one(self.db.pool())
         .await?;
-        sqlx::query(
-            "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')
-             ON CONFLICT (tenant_id) DO NOTHING",
-        )
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        if !has_sequences {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                "INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)
+                 ON CONFLICT (tenant_id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')
+                 ON CONFLICT (tenant_id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
 
         // Lookup/config set (ticket statuses/priorities/queues/types/...).
         // Idempotent: copy_default_config early-returns when already seeded.
