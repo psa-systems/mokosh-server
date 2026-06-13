@@ -176,6 +176,94 @@ async fn two_uninvited_users_are_isolated_in_distinct_tenants(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn non_admin_stuck_in_default_tenant_is_backfilled_out(pool: PgPool) {
+    // PMS-262 AC: a non-admin Bunyip user must never RESOLVE to the default
+    // tenant. A user historically parked in the shared default tenant (id 1)
+    // is moved into their own personal tenant on next login (PMS-245 backfill),
+    // proving the default tenant holds no normal users.
+    let (auth, tenants, invitations) = services(&pool);
+
+    // Seed the user already sitting in the default tenant with a non-admin role.
+    let sub = Uuid::new_v4();
+    common::seed_user_in_tenant(
+        &pool,
+        sub,
+        common::DEFAULT_TENANT_ID,
+        "stuck@example.com",
+        "technician",
+    )
+    .await;
+
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("stuck@example.com".to_string()),
+        true,
+        &claims(sub, Some("subscriber")),
+    )
+    .await
+    .expect("placed");
+
+    let (tenant, _role) = user_tenant_role(&pool, sub).await;
+    assert_ne!(
+        tenant,
+        common::DEFAULT_TENANT_ID,
+        "a non-admin must be backfilled out of the shared default tenant"
+    );
+    let (kind, owner): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT kind, personal_owner_id FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("tenant");
+    assert_eq!(
+        kind, "personal",
+        "backfill lands the user in a personal tenant"
+    );
+    assert_eq!(owner, Some(sub), "the personal tenant is owned by the user");
+}
+
+#[sqlx::test]
+async fn super_admin_in_default_tenant_stays(pool: PgPool) {
+    // PMS-262 disposition pin: the default tenant is infra-only. A platform
+    // super_admin legitimately lives there and is NOT backfilled out, so the
+    // default tenant remains a valid (super_admin-only) residence.
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    common::seed_user_in_tenant(
+        &pool,
+        sub,
+        common::DEFAULT_TENANT_ID,
+        "infra-admin@example.com",
+        "super_admin",
+    )
+    .await;
+
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("infra-admin@example.com".to_string()),
+        true,
+        &claims(sub, None),
+    )
+    .await
+    .expect("placed");
+
+    let (tenant, role) = user_tenant_role(&pool, sub).await;
+    assert_eq!(
+        tenant,
+        common::DEFAULT_TENANT_ID,
+        "a platform super_admin stays in the infra/default tenant"
+    );
+    assert_eq!(role, "super_admin");
+}
+
+#[sqlx::test]
 async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
     // PMS-248 gate, end to end: an invite is honored only for a VERIFIED email.
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
