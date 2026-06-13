@@ -195,10 +195,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // their way past each other so it is safe to run several. The
     // tick interval is intentionally low (5s) so transactional
     // emails (password reset, welcome, ticket-note) feel synchronous
-    // from the operator's perspective.
+    // from the operator's perspective. PMS-198: now runs on the shared
+    // Scheduler (registered below) instead of a raw `tokio::spawn`, so
+    // it gets the same per-tick tracing span and missed-tick-skip
+    // semantics as the other jobs.
     let dispatcher =
         mokosh_server::modules::notifications::DispatcherWorker::new(db.clone(), mailer.clone());
-    tokio::spawn(dispatcher.run_forever(std::time::Duration::from_secs(5), 25));
 
     // RMM device-sync worker. Picks up every active `rmm_connections`
     // row past its `sync_interval_minutes` window, pulls devices via
@@ -206,9 +208,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // creates `assets`, and updates `sync_status` / `last_error`.
     // Tick is 60s so the worker fires at minute granularity; per-
     // connection cadence is enforced by the `sync_interval_minutes`
-    // gate in its query.
+    // gate in its query. PMS-198: migrated onto the shared Scheduler
+    // (registered below) alongside the other jobs.
     let rmm_worker = mokosh_server::modules::rmm::RmmSyncWorker::new(db.clone(), encryption_key);
-    tokio::spawn(rmm_worker.run_forever(std::time::Duration::from_secs(60)));
 
     // Contract lifecycle worker (PMS-64). Sweeps `active` contracts past
     // their `end_date` and renews (auto_renew) or expires them. Contract
@@ -253,6 +255,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
+    // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
+    // now run on the Scheduler too; the intervals match their former raw
+    // `tokio::spawn(run_forever(..))` cadences.
+    scheduler.register(dispatcher, std::time::Duration::from_secs(5));
+    scheduler.register(rmm_worker, std::time::Duration::from_secs(60));
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
     scheduler.register(
         recurring_invoicing_worker,

@@ -51,6 +51,15 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Migration prefix uniqueness
+        # PMS-198: fail loud when two migrations share a numeric prefix.
+        # sqlx keys its `_sqlx_migrations` ledger on that prefix, so a
+        # cross-branch collision (e.g. two branches both picking 027) makes
+        # the applied version ambiguous. Cheap static check, runs first.
+        shell: nu {0}
+        run: |
+          nu scripts/check-migration-prefixes.nu
+
       - name: Check formatting
         run: cargo fmt --all --check
 

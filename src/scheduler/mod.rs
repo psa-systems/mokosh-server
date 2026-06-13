@@ -26,9 +26,12 @@
 //! ad-hoc spawn sites) but the caller MAY keep them for graceful
 //! shutdown / `abort()` on signal.
 //!
-//! Existing workers (`DispatcherWorker`, `RmmSyncWorker`) keep their
-//! current `run_forever(interval)` entry points; migration to the
-//! [`Job`] trait happens in follow-up PRs so each diff stays small.
+//! Every background worker now implements [`Job`] and is registered here:
+//! `DispatcherWorker` and `RmmSyncWorker` were migrated off their raw
+//! `tokio::spawn(run_forever(..))` sites in PMS-198, joining the contract /
+//! recurring-invoicing / SLA / calendar-reminder jobs already on the
+//! Scheduler. Workers expose a `run_tick`-style method for deterministic
+//! tests; the `Job::run` impl is a thin wrapper the Scheduler ticks.
 
 use std::collections::HashSet;
 use std::sync::Arc;
