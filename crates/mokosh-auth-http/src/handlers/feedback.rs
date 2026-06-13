@@ -131,9 +131,16 @@ async fn maybe_bearer_user(
         .or_else(|| raw.strip_prefix("bearer "))?
         .trim();
     let header_data = decode_header(token).ok()?;
+    // The OP issues RFC 9068 `at+jwt` access tokens signed with EdDSA.
+    // Verifying with RS256 (the old value) never validated, so every
+    // signed-in caller was silently treated as anonymous. Require the
+    // correct token type and algorithm.
+    if header_data.typ.as_deref() != Some("at+jwt") {
+        return None;
+    }
     let kid = header_data.kid?;
     let dk = st.provider.keys.decoding_key(&kid)?;
-    let mut validation = Validation::new(Algorithm::RS256);
+    let mut validation = Validation::new(Algorithm::EdDSA);
     validation.validate_aud = false;
     validation.set_issuer(&[st.provider.cfg.issuer_str().trim_end_matches('/')]);
     let data = decode::<serde_json::Value>(token, dk, &validation).ok()?;

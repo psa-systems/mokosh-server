@@ -586,25 +586,12 @@ pub async fn accept_by_token(
         }
     };
 
-    // Phase 3: also create a membership in the inviter's tenant for
-    // the new user. The classic `accept` path does NOT create one
-    // today (memberships landed in phase 1, after invite-accept was
-    // written), so we do it here. Idempotent under the (user_id,
-    // tenant_id) PK; we swallow the Conflict to keep this best-
-    // effort.
-    let _ = st
-        .memberships
-        .create(mokosh_auth_core::NewMembership {
-            user_id: user.id,
-            tenant_id: invite.tenant_id,
-            role: invite.role,
-            // Admin-issued invites have historically been treated as
-            // admin-level access into the inviter's tenant; mirror
-            // that on the new org-role taxonomy.
-            org_role: mokosh_auth_core::MembershipRole::Admin,
-            status: mokosh_auth_core::MembershipStatus::Active,
-        })
-        .await;
+    // The tenant membership is created atomically inside the
+    // SERIALIZABLE invite-accept tx (see `accept_once` in
+    // mokosh-auth-storage), with the org-role derived from the invite
+    // role. Creating it here fire-and-forget left a crash window where
+    // the user existed with no membership, and hardcoded org_role=Admin
+    // over-privileged Member/ReadOnly invites.
 
     let _ = st
         .provider

@@ -369,8 +369,8 @@ async fn mint_first_party_tokens(
         });
 
     let now = provider.clock.now();
-    let acr = "urn:mokosh:loa:pwd";
-    let amr: Vec<String> = vec!["pwd".to_string()];
+    let acr = ok.session.acr.as_str();
+    let amr: Vec<String> = ok.session.amr.clone();
 
     let access = mint_access_token(
         &provider.keys,

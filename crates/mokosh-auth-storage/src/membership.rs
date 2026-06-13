@@ -183,7 +183,7 @@ impl MembershipRepository for PgMembershipRepository {
         tenant_id: TenantId,
         status: MembershipStatus,
     ) -> Result<(), AuthError> {
-        sqlx::query(
+        let affected = sqlx::query(
             "UPDATE mokosh_auth.memberships
              SET status = $1
              WHERE user_id = $2 AND tenant_id = $3",
@@ -193,7 +193,11 @@ impl MembershipRepository for PgMembershipRepository {
         .bind(tenant_id.0)
         .execute(self.pool.pg())
         .await
-        .map_err(db_err)?;
+        .map_err(db_err)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(AuthError::NotFound);
+        }
         Ok(())
     }
 

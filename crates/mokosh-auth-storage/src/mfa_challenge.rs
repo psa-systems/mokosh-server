@@ -163,20 +163,21 @@ impl PgMfaChallengeRepository {
             return Err(AuthError::NotFound);
         }
 
-        sqlx::query(
+        let (consumed_at,): (DateTime<Utc>,) = sqlx::query_as(
             "UPDATE mokosh_auth.mfa_challenges
              SET consumed_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+             RETURNING consumed_at",
         )
         .bind(row.id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
 
         tx.commit().await.map_err(db_err)?;
 
         let mut challenge = MfaChallenge::try_from(row)?;
-        challenge.consumed_at = Some(Utc::now());
+        challenge.consumed_at = Some(consumed_at);
         Ok(challenge)
     }
 }
