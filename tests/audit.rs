@@ -46,9 +46,10 @@ async fn update_writes_audit_entry_with_before_and_after(pool: PgPool) {
         update_resp.status()
     );
 
-    // The in-transaction writer records entity_type='companies' (the
-    // coarse middleware records entity_type='contacts', so this row is
-    // unambiguously the AC1 one).
+    // The in-transaction writer records entity_type='companies' with the
+    // company id and before/after snapshots (PMS-117). Since PMS-275 removed
+    // the coarse per-request middleware, this is the only audit row for the
+    // update.
     let (action, old_values, new_values, user_id): (
         String,
         Option<serde_json::Value>,

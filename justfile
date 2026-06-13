@@ -164,14 +164,6 @@ down: ensure-env
 dev-down: ensure-env
     docker compose --file {{ compose_file }} down
 
-# Wipe the dev stack: stop, remove volumes, remove .env. Preserves .env.infisical.
-[doc("Wipe Infisical volumes and .env. Preserves .env.infisical.")]
-[group: 'dev']
-dev-clean: ensure-env
-    #!/usr/bin/env nu
-    docker compose --file {{ compose_file }} down --volumes
-    if ('.env' | path exists) { rm .env }
-
 # Bootstrap Infisical for the dev stack (run once after `just dev`).
 [doc("Bootstrap Infisical for the dev stack (run once after `just dev`)")]
 infisical-bootstrap: ensure-env
@@ -191,9 +183,15 @@ infisical-bootstrap: ensure-env
         cargo run --quiet --bin mokosh-bootstrap -- bootstrap-infisical
     }
 
-# Run all checks (compile, clippy, fmt)
+# Run all checks (compile, clippy, fmt, migration prefixes)
 [group: 'check']
-check: check-compile check-clippy check-fmt
+check: check-compile check-clippy check-fmt check-migrations
+
+# Enforce unique migration prefixes (PMS-198). Fails if two migrations
+# share a numeric prefix (sqlx keys its ledger on that prefix).
+[group: 'check']
+check-migrations:
+    nu scripts/check-migration-prefixes.nu
 
 # Check compilation
 [group: 'check']
@@ -259,6 +257,57 @@ migrate-run:
 migrate-create name:
     sqlx migrate add {{ name }}
 
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+
+# Tear down this repo's dev footprint: stop both dev stacks (LAN-IP compose.dev.yml and the SSO overlay compose.dev-sso.yml) with their default network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+[group: 'cleanup']
+dev-clean:
+    #!/usr/bin/env nu
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
+    let suffix = $env.USER
+    let vols = [
+        $"dev-mokosh-postgres-data-($suffix)"
+        $"dev-mokosh-infisical-postgres-data-($suffix)"
+        $"dev-mokosh-server-target-($suffix)"
+    ]
+    let existing = docker volume ls --quiet | lines
+    for vol in $vols {
+        if $vol in $existing {
+            docker volume rm $vol
+        }
+    }
+    let paths = [target]
+    for p in $paths {
+        if ($p | path exists) {
+            rm --recursive $p
+            print $"removed ($p)"
+        }
+    }
+    if ('.env' | path exists) {
+        rm .env
+        print "removed .env"
+    }
+    print "dev-clean: done"
+
+# Everything dev-clean does, plus remove the Docker images this repo builds and prune its buildx cache. Run for a from-scratch rebuild.
+[group: 'cleanup']
+dev-clean-all: dev-clean
+    #!/usr/bin/env nu
+    let images = [
+        "mokosh-server:check"
+        "mokosh-server:local"
+    ]
+    for img in $images {
+        let present = (do { ^docker image inspect $img } | complete).exit_code == 0
+        if $present {
+            docker image rm $img
+        }
+    }
+    docker buildx prune --force
+    print "dev-clean-all: done"
+
+# ── Release ──────────────────────────────────────────────────────────────────
+
 # Create a release: bump version, push branch, print PR link
 [group: 'release']
 create-release bump:
@@ -291,7 +340,14 @@ create-release bump:
     let release_branch = $"release/($tag)"
 
     git checkout -b $release_branch
-    open Cargo.toml | update package.version $bare | to toml | collect | save --force Cargo.toml
+    # Targeted version bump: rewrite only the `version = "..."` line so the
+    # Cargo.toml comments and PMS docs survive. Round-tripping the whole file
+    # through `to toml` stripped every comment on each release. Stage through a
+    # tempfile + external mv so we never reach for `save --force`, per the repo
+    # no-force safety policy.
+    let toml_tmp = (mktemp --tmpdir --suffix .toml)
+    open Cargo.toml --raw | str replace --regex '(?m)^version = "[^"]*"' $'version = "($bare)"' | save --append $toml_tmp
+    ^mv $toml_tmp Cargo.toml
     git add Cargo.toml
     git commit --signoff --message $"Release ($tag)"
 
@@ -304,7 +360,7 @@ create-release bump:
         $"Automated release PR for ($tag)."
         ""
         $"After merge, `.forgejo/workflows/create-release.yml` tags and publishes ($tag) to the Generic Packages registry."
-    ] | str join "\n" | save --force $body_file
+    ] | str join "\n" | save --append $body_file
     let fj_result = (^fj --host dev.a8n.run pr create $"Release ($tag)" --body-file $body_file | complete)
     rm $body_file
     if $fj_result.exit_code != 0 {

@@ -4,13 +4,16 @@
 # PMS-141 promotion to merge gate; PMS-271 staging/production secret split).
 #
 # Environments (PMS-271): CI holds both staging and production config side by
-# side as environment-prefixed Forgejo Actions secrets (`E2E_STAGING_*` /
-# `E2E_PRODUCTION_*`). The job env: block maps the selected environment onto
-# the plain `E2E_*` names per var, so env.ts and the gate scripts never need
-# to know which environment they target. Automatic triggers (push, PR) always
-# resolve to staging; production runs only on a manual dispatch that selects
-# it (the suite is write-heavy and shares one rate-limited account, so it must
-# not churn live prod unattended).
+# side as Forgejo Actions secrets, and the job env: block selects per var and
+# exposes the result on the plain `E2E_*` names, so env.ts and the gate scripts
+# never need to know which environment they target. Secret names follow the
+# deployment's own variable names where one exists (MOKOSH_OIDC_CLIENT_ID,
+# MOKOSH_APPS_REDIRECT_URIS_*, OIDC_ISSUER_*; see the env: block below);
+# test-only vars with no deployment equivalent keep the E2E_STAGING_* /
+# E2E_PRODUCTION_* names. Automatic triggers (push, PR) always resolve to
+# staging; production runs only on a manual dispatch that selects it (the suite
+# is write-heavy and shares one rate-limited account, so it must not churn live
+# prod unattended).
 #
 # Triggers:
 #   - push to main: post-merge validation against staging. Runs the deploy-sync
@@ -68,20 +71,34 @@ jobs:
       run:
         working-directory: e2e
 
-    # PMS-271: map the selected environment's prefixed secret onto the plain
-    # E2E_* name per var. On push / pull_request the `inputs` context is empty,
-    # so `inputs.environment == 'production'` is false and every var resolves to
-    # its E2E_STAGING_* secret; on a manual dispatch the operator's choice
-    # drives it. env.ts and the gate scripts read the plain E2E_* names and stay
-    # environment-agnostic.
+    # PMS-271: select the staging vs production secret per var and expose it on
+    # the plain E2E_* name that env.ts and the gate scripts read. On push /
+    # pull_request the `inputs` context is empty, so `inputs.environment ==
+    # 'production'` is false and every var resolves to its staging secret; a
+    # manual dispatch lets the operator pick.
+    #
+    # Secret names follow the deployment's own variable names where one exists
+    # (verified against the mokosh infra repo, server/{c-01 staging, nc-01
+    # production}):
+    #   - E2E_OIDC_CLIENT_ID  -> MOKOSH_OIDC_CLIENT_ID. The mokosh-apps public
+    #     PKCE client, seeded by bunyip-api with the SAME id in both envs, so a
+    #     single shared secret (no _STAGING/_PRODUCTION split).
+    #   - E2E_OIDC_REDIRECT_URI -> MOKOSH_APPS_REDIRECT_URIS (bunyip-api),
+    #     per-env (msp.a8n.systems vs msp.psa.systems).
+    #   - E2E_OP_BASE_URL     -> OIDC_ISSUER (mokosh-server), the bunyip OP apex
+    #     (api.a8n.systems vs api.psa.systems), per-env.
+    # The rest are test-only (no deployment equivalent) and keep the E2E_* name.
+    # Forgejo must hold both env values at once, so per-env secrets carry a
+    # _STAGING/_PRODUCTION suffix on the deployment base name.
     env:
       E2E_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_BASE_URL || secrets.E2E_STAGING_BASE_URL }}
       E2E_EMAIL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_EMAIL || secrets.E2E_STAGING_EMAIL }}
       E2E_PASSWORD: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_PASSWORD || secrets.E2E_STAGING_PASSWORD }}
       E2E_TENANT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TENANT_ID || secrets.E2E_STAGING_TENANT_ID }}
-      E2E_OIDC_CLIENT_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_CLIENT_ID || secrets.E2E_STAGING_OIDC_CLIENT_ID }}
-      E2E_OIDC_REDIRECT_URI: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OIDC_REDIRECT_URI || secrets.E2E_STAGING_OIDC_REDIRECT_URI }}
-      E2E_OP_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_OP_BASE_URL || secrets.E2E_STAGING_OP_BASE_URL }}
+      # Shared across envs (identical bunyip-seeded client id), so no switch.
+      E2E_OIDC_CLIENT_ID: ${{ secrets.MOKOSH_OIDC_CLIENT_ID }}
+      E2E_OIDC_REDIRECT_URI: ${{ inputs.environment == 'production' && secrets.MOKOSH_APPS_REDIRECT_URIS_PRODUCTION || secrets.MOKOSH_APPS_REDIRECT_URIS_STAGING }}
+      E2E_OP_BASE_URL: ${{ inputs.environment == 'production' && secrets.OIDC_ISSUER_PRODUCTION || secrets.OIDC_ISSUER_STAGING }}
       E2E_TOTP_SECRET: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TOTP_SECRET || secrets.E2E_STAGING_TOTP_SECRET }}
       E2E_FOREIGN_COMPANY_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_FOREIGN_COMPANY_ID || secrets.E2E_STAGING_FOREIGN_COMPANY_ID }}
       # The opensuse-base runner does not grant write access to the default
