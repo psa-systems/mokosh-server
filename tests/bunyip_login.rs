@@ -12,12 +12,15 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::middleware::place_bunyip_user;
 use mokosh_server::modules::auth::oidc_rs::AtClaims;
 use mokosh_server::modules::auth::{AuthService, TenantId};
 use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
 use mokosh_server::modules::tenants::TenantService;
+use mokosh_server::modules::tickets::{CreateTicketRequest, TicketService};
 use mokosh_server::Database;
+use serde_json::json;
 
 fn services(
     pool: &PgPool,
@@ -311,4 +314,77 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
     .await
     .expect("count");
     assert_eq!(still_pending, 1, "the invite is still pending");
+}
+
+#[sqlx::test]
+async fn placement_seeds_off_psa_target_tenant_so_tickets_create(pool: PgPool) {
+    // PMS-288: a user placed in a tenant provisioned off the PSA path (here a
+    // manually-created org tenant with no copy_default_config) gets it seeded on
+    // placement, so ticket creation - which needs a default ticket status AND a
+    // ticket_sequences row - succeeds instead of 500ing. Pre-fix, create_ticket
+    // returns "No default ticket status configured".
+    let (auth, tenants, invitations) = services(&pool);
+
+    // A bare org tenant: no lookup config, no sequences.
+    let tenant = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind)
+         VALUES ($1, 'Off-PSA Org', 'off-psa-288-place', 'active', 'org')",
+    )
+    .bind(tenant)
+    .execute(&pool)
+    .await
+    .expect("insert bare tenant");
+
+    // The user already lives there (existing placement, admin role), so the
+    // placement resolves target = current = the unseeded tenant (no re-home to a
+    // fresh personal tenant, which would seed via ensure_personal_tenant).
+    let sub = Uuid::new_v4();
+    common::seed_user_in_tenant(&pool, sub, tenant, "offpsa@example.com", "admin").await;
+
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("offpsa@example.com".to_string()),
+        true,
+        &claims(sub, Some("admin")),
+    )
+    .await
+    .expect("placed");
+
+    let (resolved, _role) = user_tenant_role(&pool, sub).await;
+    assert_eq!(resolved, tenant, "user stays in their existing tenant");
+
+    // A company to hang the ticket on.
+    let company = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme')")
+        .bind(company)
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .expect("insert company");
+
+    // Ticket creation now succeeds: placement seeded the default status + the
+    // ticket_sequences row.
+    let tickets = TicketService::new(Database::from_pool(pool.clone()));
+    let req: CreateTicketRequest = serde_json::from_value(json!({
+        "title": "PMS-288 first ticket",
+        "company_id": company,
+    }))
+    .expect("build ticket request");
+    let ticket = tickets
+        .create_ticket(
+            TenantId::from_trusted(tenant),
+            sub,
+            &req,
+            &AuditCtx::system(tenant),
+        )
+        .await
+        .expect("create_ticket must succeed after placement seeded the tenant");
+    assert!(
+        !ticket.ticket_number.is_empty(),
+        "ticket received a sequenced number"
+    );
 }

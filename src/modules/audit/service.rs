@@ -19,43 +19,6 @@ impl AuditService {
         Self { db }
     }
 
-    /// Append a new entry. Called by the middleware on every mutating
-    /// request; failures are swallowed so the request itself never
-    /// fails because of a log write.
-    #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn append(
-        &self,
-        tenant_id: TenantId,
-        user_id: Option<Uuid>,
-        action: &str,
-        entity_type: &str,
-        entity_id: Option<Uuid>,
-        new_values: Option<serde_json::Value>,
-        ip: Option<String>,
-        ua: Option<String>,
-    ) -> AppResult<()> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let _ = sqlx::query(
-            r#"INSERT INTO audit_log
-               (tenant_id, user_id, action, entity_type, entity_id, new_values,
-                ip_address, user_agent)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(action)
-        .bind(entity_type)
-        .bind(entity_id)
-        .bind(new_values)
-        .bind(ip)
-        .bind(ua)
-        .execute(&mut *tx)
-        .await;
-        tx.commit().await?;
-        Ok(())
-    }
-
     #[tracing::instrument(skip_all, fields(tenant_id = ?tenant_id))]
     pub async fn list(
         &self,

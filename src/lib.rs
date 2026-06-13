@@ -4,7 +4,6 @@
 
 pub mod api;
 pub mod db;
-pub mod error;
 pub mod infisical;
 pub mod modules;
 pub mod scheduler;

@@ -325,6 +325,14 @@ impl AuthService {
         }
 
         // 1. Look up an existing identity by (provider, subject).
+        // SAFETY (PMS-258/PMS-285): this is a pre-auth, cross-tenant lookup - it
+        // runs before the user is placed in a tenant, so it cannot set
+        // `app.current_tenant`. user_oauth_identities now has FORCE RLS, so once
+        // the app connection moves to a NOBYPASSRLS role (PMS-285) this query and
+        // the last_used_at UPDATE below must run on the privileged (BYPASSRLS)
+        // pool. The tenant-scoped unique key keeps it to at most one row per
+        // tenant; a single human maps to one personal tenant, so it stays unique
+        // in practice.
         let linked_user_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT user_id FROM user_oauth_identities \
              WHERE provider = 'google' AND subject = $1",
@@ -375,16 +383,22 @@ impl AuthService {
                         ));
                     }
                     // Link new identity to existing user; do NOT change role.
+                    // Runs inside the existing user's tenant so the row carries
+                    // the tenant scope (PMS-258) and satisfies the WITH CHECK
+                    // policy even under a NOBYPASSRLS connection.
+                    let mut tx = self.db.begin_with_tenant(existing.tenant_id).await?;
                     sqlx::query(
                         "INSERT INTO user_oauth_identities \
-                         (user_id, provider, subject, email) \
-                         VALUES ($1, 'google', $2, $3)",
+                         (user_id, tenant_id, provider, subject, email) \
+                         VALUES ($1, $2, 'google', $3, $4)",
                     )
                     .bind(existing.id)
+                    .bind(existing.tenant_id)
                     .bind(&google.sub)
                     .bind(&google.email)
-                    .execute(self.db.pool())
+                    .execute(&mut *tx)
                     .await?;
+                    tx.commit().await?;
                     existing
                 }
                 None => self.provision_user_from_google(&google).await?,
@@ -396,6 +410,23 @@ impl AuthService {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
         self.ensure_tenant_active(user.tenant_id).await?;
+
+        // 3b. Enforce MFA exactly like the password `login()` path. A
+        // verified Google identity is NOT a substitute for the user's
+        // locally-enabled second factor; minting tokens here without it
+        // would silently bypass MFA for any account that links Google.
+        // The Google callback carries no MFA code, so signal
+        // `mfa_required` (with empty tokens) and let the SPA complete the
+        // second factor, mirroring `login()`'s no-code branch.
+        if user.mfa_enabled {
+            return Ok(LoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: Utc::now(),
+                user: user.to_current_user(),
+                mfa_required: true,
+            });
+        }
 
         // 4. Issue session + tokens identically to the password flow.
         let session_id = self
@@ -457,10 +488,11 @@ impl AuthService {
 
         sqlx::query(
             "INSERT INTO user_oauth_identities \
-             (user_id, provider, subject, email) \
-             VALUES ($1, 'google', $2, $3)",
+             (user_id, tenant_id, provider, subject, email) \
+             VALUES ($1, $2, 'google', $3, $4)",
         )
         .bind(user_id)
+        .bind(tenant_id)
         .bind(&google.sub)
         .bind(&google.email)
         .execute(&mut *tx)
@@ -1554,6 +1586,7 @@ impl AuthService {
             ON CONFLICT (id) DO UPDATE SET
                 email = EXCLUDED.email,
                 updated_at = NOW()
+            WHERE users.tenant_id = EXCLUDED.tenant_id
             "#,
         )
         .bind(sub)
@@ -1663,7 +1696,12 @@ impl AuthService {
         remember_me: bool,
     ) -> AppResult<Uuid> {
         let session_id = Uuid::new_v4();
-        let token_hash = generate_token(32);
+        // The `user_sessions.token_hash` column must never hold a plaintext
+        // secret. Generate a random token and store only its SHA-256 hex
+        // digest. (The session is keyed and validated by `id` + `tenant_id`;
+        // this column is a defence-in-depth opaque handle, not a credential
+        // returned to the client.)
+        let token_hash = sha256_hex(&generate_token(32));
         let expires_at = if remember_me {
             Utc::now() + Duration::days(30)
         } else {
@@ -1984,6 +2022,20 @@ fn parse_user_bound_token(token: &str) -> Option<(Uuid, &str)> {
     }
     let user_id = Uuid::parse_str(id).ok()?;
     Some((user_id, secret))
+}
+
+/// Lowercase hex SHA-256 of an arbitrary string (avoids storing a plaintext
+/// secret in a `TEXT` column such as `user_sessions.token_hash`).
+#[cfg(feature = "server")]
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Hex SHA-256 of the canonical MFA recovery code form. Mirrors
