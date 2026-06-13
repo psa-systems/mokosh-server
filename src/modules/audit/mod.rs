@@ -1,5 +1,11 @@
-//! Audit log module: middleware-driven request log + admin read, plus the
-//! in-transaction `audit_write` path (PMS-117) for entity mutations.
+//! Audit log module: in-transaction `audit_write` path (PMS-117) for entity
+//! mutations, plus the admin read endpoint.
+//!
+//! The coarse per-request middleware (PMS-119) was removed in PMS-275: it ran
+//! post-response with only the HTTP method + URL, so it could never record the
+//! `entity_id` or old/new value payload, and the nested router stripped the
+//! `/api/v1` prefix before it ran, tagging every row entity_type "unknown".
+//! `audit_write` is now the sole writer.
 //!
 //! # Immutability and retention (PMS-117 AC4)
 //!
@@ -18,13 +24,11 @@
 //! per-row hash chain can be layered on without changing this interface.
 
 pub mod context;
-pub mod middleware;
 pub mod models;
 pub mod routes;
 pub mod service;
 
 pub use context::{audit_auth_event, audit_write, AuditAction, AuditCtx};
-pub use middleware::audit_log_middleware;
 pub use models::*;
 pub use routes::audit_routes;
 pub use service::{field_changes, AuditService};
