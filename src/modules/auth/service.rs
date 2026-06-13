@@ -323,6 +323,14 @@ impl AuthService {
         }
 
         // 1. Look up an existing identity by (provider, subject).
+        // SAFETY (PMS-258/PMS-285): this is a pre-auth, cross-tenant lookup - it
+        // runs before the user is placed in a tenant, so it cannot set
+        // `app.current_tenant`. user_oauth_identities now has FORCE RLS, so once
+        // the app connection moves to a NOBYPASSRLS role (PMS-285) this query and
+        // the last_used_at UPDATE below must run on the privileged (BYPASSRLS)
+        // pool. The tenant-scoped unique key keeps it to at most one row per
+        // tenant; a single human maps to one personal tenant, so it stays unique
+        // in practice.
         let linked_user_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT user_id FROM user_oauth_identities \
              WHERE provider = 'google' AND subject = $1",
@@ -373,16 +381,22 @@ impl AuthService {
                         ));
                     }
                     // Link new identity to existing user; do NOT change role.
+                    // Runs inside the existing user's tenant so the row carries
+                    // the tenant scope (PMS-258) and satisfies the WITH CHECK
+                    // policy even under a NOBYPASSRLS connection.
+                    let mut tx = self.db.begin_with_tenant(existing.tenant_id).await?;
                     sqlx::query(
                         "INSERT INTO user_oauth_identities \
-                         (user_id, provider, subject, email) \
-                         VALUES ($1, 'google', $2, $3)",
+                         (user_id, tenant_id, provider, subject, email) \
+                         VALUES ($1, $2, 'google', $3, $4)",
                     )
                     .bind(existing.id)
+                    .bind(existing.tenant_id)
                     .bind(&google.sub)
                     .bind(&google.email)
-                    .execute(self.db.pool())
+                    .execute(&mut *tx)
                     .await?;
+                    tx.commit().await?;
                     existing
                 }
                 None => self.provision_user_from_google(&google).await?,
@@ -455,10 +469,11 @@ impl AuthService {
 
         sqlx::query(
             "INSERT INTO user_oauth_identities \
-             (user_id, provider, subject, email) \
-             VALUES ($1, 'google', $2, $3)",
+             (user_id, tenant_id, provider, subject, email) \
+             VALUES ($1, $2, 'google', $3, $4)",
         )
         .bind(user_id)
+        .bind(tenant_id)
         .bind(&google.sub)
         .bind(&google.email)
         .execute(&mut *tx)
