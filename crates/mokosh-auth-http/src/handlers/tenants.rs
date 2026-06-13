@@ -175,8 +175,20 @@ pub async fn switch_active_tenant(
         });
 
     let now = provider.clock.now();
-    let acr = "urn:mokosh:loa:pwd";
-    let amr: Vec<String> = vec!["pwd".to_string()];
+    // Preserve the originating session's authentication strength across the
+    // tenant switch. Looking up the OP session by its sid keeps an MFA
+    // session's acr/amr intact instead of downgrading every switched token
+    // to bare-password LoA. Fall back to pwd defaults only when the caller's
+    // token carried no sid (e.g. a nested tenant-switched grant).
+    let session = match current_sid {
+        Some(sid) => provider.sessions.find_by_id(sid).await.map_err(HttpError)?,
+        None => None,
+    };
+    let (acr, amr): (String, Vec<String>) = match session {
+        Some(s) => (s.acr, s.amr),
+        None => ("urn:mokosh:loa:pwd".to_string(), vec!["pwd".to_string()]),
+    };
+    let acr = acr.as_str();
 
     let access = mint_access_token(
         &provider.keys,

@@ -429,7 +429,20 @@ async fn set_status(
         // suspend is heavy-handed but errs on the side of caution -
         // the alternative is letting a tenant-suspended user keep an
         // active session that the next tenant-switch unlocks.
-        let _ = st.provider.sessions.revoke_all_for_user(user_id).await;
+        if let Ok(revoked) = st.provider.sessions.revoke_all_for_user(user_id).await {
+            // Revoking the op_sessions alone leaves their refresh
+            // families live, so a stolen refresh token could mint fresh
+            // access tokens after suspension. Revoke each session's
+            // refresh families too.
+            let now = st.provider.clock.now();
+            for sid in revoked {
+                let _ = st
+                    .provider
+                    .refresh
+                    .revoke_families_for_session(sid, "user_suspended", now)
+                    .await;
+            }
+        }
     }
 
     let _ = st
@@ -681,7 +694,18 @@ pub async fn delete_user(
         // Best-effort: status flip already committed; log + continue.
         tracing::warn!(target=%target.id.0, error=?e, "user.delete: failed to free email");
     }
-    let _ = st.provider.sessions.revoke_all_for_user(target.id).await;
+    if let Ok(revoked) = st.provider.sessions.revoke_all_for_user(target.id).await {
+        // Also revoke each session's refresh families so a stolen
+        // refresh token cannot outlive the deleted account.
+        let now = st.provider.clock.now();
+        for sid in revoked {
+            let _ = st
+                .provider
+                .refresh
+                .revoke_families_for_session(sid, "user_deleted", now)
+                .await;
+        }
+    }
 
     let _ = st
         .provider
