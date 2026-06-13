@@ -65,13 +65,12 @@ Set via `e2e/.env` locally (copy from `.env.example`) or Forgejo Actions secrets
 in CI. Required unless noted.
 
 **Local vs CI naming (PMS-271).** Locally these are the plain `E2E_*` names
-below, holding one environment at a time. In CI the bare `E2E_*` Forgejo Actions
-secrets ARE the staging set; production adds a parallel `E2E_PRODUCTION_<NAME>`
-secret per var. `.forgejo/workflows/e2e.yml` selects between them per run and
-exposes the result on the plain `E2E_*` names, so `env.ts` and the gate scripts
-only ever read the plain names and stay environment-agnostic. Automatic runs
-(push, PR) always resolve to the bare staging secrets; production is
-manual-dispatch only (see [CI](#ci)).
+below, holding one environment at a time. In CI the Forgejo Actions secrets are
+environment-prefixed - an `E2E_STAGING_<NAME>` and `E2E_PRODUCTION_<NAME>` pair
+for each var - and `.forgejo/workflows/e2e.yml` maps the selected environment
+onto the plain `E2E_*` names per run. So `env.ts` and the gate scripts only ever
+read the plain names and stay environment-agnostic. Automatic runs (push, PR)
+always resolve to staging; production is manual-dispatch only (see [CI](#ci)).
 
 | Var | Purpose |
 | --- | --- |
@@ -148,13 +147,12 @@ Done once by a human before the suite can pass against a deployment:
 4. *(optional)* **Foreign company** - note a company id from a different tenant
    as `E2E_FOREIGN_COMPANY_ID` to enable the cross-tenant leak canary.
 5. Store all of the above as Forgejo Actions secrets for
-   `.forgejo/workflows/e2e.yml` (PMS-271). Staging uses the **bare** `E2E_*`
-   names (`E2E_BASE_URL`, `E2E_TOTP_SECRET`, ...) - these are unchanged and are
-   treated as the staging set. To add a production target, provision a parallel
-   `E2E_PRODUCTION_<NAME>` secret for each var (`E2E_PRODUCTION_BASE_URL`,
-   `E2E_PRODUCTION_TOTP_SECRET`, ...). The workflow selects between them per run
-   and exposes the result on the plain `E2E_*` job env. Run this provisioning
-   step once per environment.
+   `.forgejo/workflows/e2e.yml`, **environment-prefixed** (PMS-271): each value
+   goes in as `E2E_STAGING_<NAME>` or `E2E_PRODUCTION_<NAME>` (e.g.
+   `E2E_STAGING_BASE_URL`, `E2E_PRODUCTION_TOTP_SECRET`), NOT the bare `E2E_*`
+   name. Provision the staging set first, then production. The workflow maps the
+   selected environment's pair onto the plain `E2E_*` job env per run. Run this
+   provisioning step once per environment.
 
    **Secret-rotation source (record per secret).** So each value can be rotated
    later, document where it is generated/provisioned, per environment: the
@@ -230,14 +228,14 @@ login rate limit is 5/min, so parallel runs would collide):
 | `pull_request` targeting `main` (incl. `release/*` PRs) | staging | Merge gate: every PR must pass the suite against staging before merge | `scripts/health-check.mjs` GETs `/api/v1/health` (one-shot, 30s timeout). A PR's SHA never deploys to staging so a version-SHA gate would always time out; this checks staging is up and the suite has something to talk to | PMS-141. Add `e2e` to required status checks on main branch protection to make the gate enforceable |
 | `workflow_dispatch` | `environment` input (`staging` default / `production`) | Manual ad-hoc runs | `staging`: deploy-sync gate (`wait-for-deploy.mjs`), like `push`. `production`: reachability check (`health-check.mjs`) - the dispatched SHA is unlikely to be what prod serves, so the SHA-polling gate would time out | Production runs ONLY here (PMS-271). The write-heavy suite is never run against prod automatically; a human dispatches and selects it |
 
-**Environment secrets (PMS-271).** The bare `E2E_*` Forgejo Actions secrets ARE
-the staging set; production adds a parallel `E2E_PRODUCTION_*` set. The job
-`env:` block selects between them per var and exposes the result on the plain
-`E2E_*` names via a Forgejo expression
-(`${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_<NAME> || secrets.E2E_<NAME> }}`).
+**Environment secrets (PMS-271).** CI holds staging and production config side
+by side as environment-prefixed Forgejo Actions secrets (`E2E_STAGING_*` /
+`E2E_PRODUCTION_*`). The job `env:` block maps the selected environment onto the
+plain `E2E_*` names per var via a Forgejo expression
+(`${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_<NAME> || secrets.E2E_STAGING_<NAME> }}`).
 On `push` / `pull_request` the `inputs` context is empty, so the expression
-resolves to the bare staging secret; a manual dispatch lets the operator pick.
-See [One-time provisioning](#one-time-staging-provisioning-manual) step 5 for the
+resolves to the staging secret; a manual dispatch lets the operator pick. See
+[One-time provisioning](#one-time-staging-provisioning-manual) step 5 for the
 secret names and rotation sources.
 
 Each run installs Node + Chromium, runs the suite against the selected
