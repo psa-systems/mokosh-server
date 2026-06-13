@@ -154,13 +154,25 @@ pub fn sanitize_html(html: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// Truncate a string to a maximum length, adding ellipsis if needed
+/// Truncate a string to a maximum length, adding ellipsis if needed.
+///
+/// `max_len` is a byte budget. Slicing at an arbitrary byte index panics when
+/// it lands inside a multi-byte UTF-8 sequence, so the cut point is snapped
+/// back to the nearest char boundary via `char_indices` before slicing.
 pub fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        return s.to_string();
     }
+    // Reserve 3 bytes for the "..." suffix, then find the last char boundary
+    // at or before that byte budget so the slice never splits a code point.
+    let budget = max_len.saturating_sub(3);
+    let cut = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= budget)
+        .last()
+        .unwrap_or(0);
+    format!("{}...", &s[..cut])
 }
 
 #[cfg(test)]
@@ -215,5 +227,16 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("Hello", 10), "Hello");
         assert_eq!(truncate("Hello World", 8), "Hello...");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_no_panic() {
+        // PMS-196: 'ñ' is two bytes, so an odd byte budget lands inside a code
+        // point. The old byte-slice (`&s[..n]`) panicked here.
+        // "ñññññ" is 10 bytes / 5 chars; budget 5 snaps back to byte 4.
+        let s = "ñññññ";
+        assert_eq!(truncate(s, 8), "ññ...");
+        // 4-byte code points (emoji) must also be safe.
+        assert_eq!(truncate("😀😀😀", 8), "😀...");
     }
 }

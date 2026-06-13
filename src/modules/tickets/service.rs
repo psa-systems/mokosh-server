@@ -182,6 +182,10 @@ impl TicketService {
         // ticket at another tenant's company/contact/site/etc.
         self.validate_fk(tenant_id, "companies", request.company_id)
             .await?;
+        self.validate_fk_opt(tenant_id, "ticket_types", request.type_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "ticket_categories", request.category_id)
+            .await?;
         self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
             .await?;
         self.validate_fk_opt(tenant_id, "sites", request.site_id)
@@ -441,6 +445,10 @@ impl TicketService {
         // PSA audit: validate any foreign id being set so an update cannot
         // re-link this ticket to another tenant's rows. Option fields are
         // only checked when present.
+        self.validate_fk_opt(tenant_id, "ticket_priorities", request.priority_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "ticket_queues", request.queue_id)
+            .await?;
         self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
             .await?;
         self.validate_fk_opt(tenant_id, "sites", request.site_id)
@@ -679,6 +687,10 @@ impl TicketService {
         assigned_to_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<Ticket> {
+        // PSA audit: the assignee must be a user in this tenant so a
+        // request cannot assign a ticket to another tenant's user.
+        self.validate_fk(tenant_id, "users", assigned_to_id).await?;
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE tickets SET assigned_to_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4",
@@ -705,6 +717,11 @@ impl TicketService {
     ) -> AppResult<TicketNote> {
         let note_id = Uuid::new_v4();
 
+        // PSA audit: the note's ticket must belong to this tenant before we
+        // insert against it and bump the ticket's SLA/timestamp columns, so a
+        // cross-tenant ticket_id cannot corrupt another tenant's ticket.
+        self.validate_fk(tenant_id, "tickets", ticket_id).await?;
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
@@ -722,8 +739,9 @@ impl TicketService {
         .await?;
 
         // Update ticket's updated_at
-        sqlx::query("UPDATE tickets SET updated_at = NOW(), last_updated_by_id = $1 WHERE id = $2")
+        sqlx::query("UPDATE tickets SET updated_at = NOW(), last_updated_by_id = $1 WHERE tenant_id = $2 AND id = $3")
             .bind(user_id)
+            .bind(tenant_id)
             .bind(ticket_id)
             .execute(&mut *tx)
             .await?;
@@ -731,8 +749,9 @@ impl TicketService {
         // Record first response if this is a public note and first response hasn't been recorded
         if request.note_type == NoteType::Public {
             sqlx::query(
-                "UPDATE tickets SET first_response_at = COALESCE(first_response_at, NOW()) WHERE id = $1",
+                "UPDATE tickets SET first_response_at = COALESCE(first_response_at, NOW()) WHERE tenant_id = $1 AND id = $2",
             )
+            .bind(tenant_id)
             .bind(ticket_id)
             .execute(&mut *tx)
             .await?;

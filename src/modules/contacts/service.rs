@@ -1,24 +1,54 @@
 //! Contact service implementation
 
+use std::sync::Arc;
+
 use crate::modules::auth::TenantId;
+use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::utils::crypto::{generate_token, hash_password};
+use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// How long a portal setup link remains redeemable. Mirrors the
+/// password-reset redemption window (PMS-136).
+const PORTAL_SETUP_TOKEN_TTL_HOURS: i64 = 72;
+
 /// Contact management service
 #[derive(Clone)]
 pub struct ContactService {
     db: Database,
+    /// Outbound mailer used to deliver portal setup-link emails. Defaults
+    /// to `LogMailer` (dev/tests log the link) unless the router wires the
+    /// shared `Mailer`.
+    mailer: Arc<dyn Mailer>,
+    /// Base URL of the customer-facing SPA. The setup link is
+    /// `{app_url}/portal/set-password?token=...`.
+    app_url: String,
 }
 
 impl ContactService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            mailer: Arc::new(LogMailer),
+            app_url: String::new(),
+        }
+    }
+
+    /// Construct with the shared mailer and SPA base URL so granting
+    /// portal access can email the contact a setup link (PMS-136).
+    pub fn with_mailer(db: Database, mailer: Arc<dyn Mailer>, app_url: String) -> Self {
+        Self {
+            db,
+            mailer,
+            app_url,
+        }
     }
 
     /// Reject a foreign id that does not belong to this tenant, so a request
@@ -713,6 +743,69 @@ impl ContactService {
     // CONTACTS
     // ========================================================================
 
+    /// Mint a single-use portal setup token bound to `contact_id` and
+    /// insert it within the caller's transaction. The emailed token is
+    /// `{contact_id}.{secret}`; only the Argon2 hash of the secret is
+    /// stored (mirrors the password-reset token shape in
+    /// `auth::service`). Returns the full token to email after the
+    /// transaction commits. PMS-136.
+    async fn insert_setup_token(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<String> {
+        let secret = generate_token(64);
+        let token_hash = hash_password(&secret)?;
+        let token = format!("{contact_id}.{secret}");
+        let expires_at = Utc::now() + Duration::hours(PORTAL_SETUP_TOKEN_TTL_HOURS);
+        sqlx::query(
+            r#"
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(conn)
+        .await?;
+        Ok(token)
+    }
+
+    /// Best-effort delivery of the portal setup-link email. Called AFTER
+    /// the grant transaction commits, so a failed send never rolls back
+    /// the flag flip / token row; the token is persisted and the link can
+    /// be resent later. A contact with no email address is skipped (the
+    /// agent owns following up out of band). PMS-136.
+    async fn send_setup_email(&self, contact: &Contact, token: &str) {
+        let Some(ref email) = contact.email else {
+            tracing::warn!(
+                contact_id = %contact.id,
+                "portal access granted but contact has no email; setup link not delivered",
+            );
+            return;
+        };
+        let setup_link = format!(
+            "{}/portal/set-password?token={}",
+            self.app_url.trim_end_matches('/'),
+            token,
+        );
+        match self
+            .mailer
+            .send_welcome(email, &contact.first_name, &setup_link)
+            .await
+        {
+            Ok(()) => tracing::info!(contact_id = %contact.id, "portal setup-link email sent"),
+            Err(e) => tracing::warn!(
+                contact_id = %contact.id,
+                error = ?e,
+                "portal setup email send failed; token persisted but link unreachable",
+            ),
+        }
+    }
+
     /// Create a new contact
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contact(
@@ -765,20 +858,27 @@ impl ContactService {
         .execute(&mut *tx)
         .await?;
 
-        // PMS-19: flip the contact's `is_portal_user` flag so the
-        // upcoming portal-login flow (PMS-26) can treat it as a valid
-        // identity. We deliberately do NOT mint a `portal_password_hash`
-        // here because the password-set step belongs to the customer,
-        // not the agent creating the contact - the portal-session work
-        // will own the setup-link / email-confirmation handshake.
-        if request.create_portal_access {
+        // PMS-19 / PMS-136: flip the contact's `is_portal_user` flag so the
+        // portal-login flow (PMS-26) treats it as a valid identity, and mint
+        // a single-use setup token. We deliberately do NOT mint a
+        // `portal_password_hash` here: the password-set step belongs to the
+        // customer, who redeems the emailed `/portal/set-password` link. The
+        // token row is written inside this transaction so a rollback drops it
+        // with the contact; the email is sent only after commit.
+        let setup_token = if request.create_portal_access {
             sqlx::query(
                 "UPDATE contacts SET is_portal_user = TRUE, updated_at = NOW() WHERE id = $1",
             )
             .bind(contact_id)
             .execute(&mut *tx)
             .await?;
-        }
+            Some(
+                self.insert_setup_token(&mut tx, tenant_id, contact_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
@@ -801,7 +901,12 @@ impl ContactService {
         .await?;
         tx.commit().await?;
 
-        self.get_contact(tenant_id, contact_id).await
+        let contact = self.get_contact(tenant_id, contact_id).await?;
+        // Email the setup link only after the grant transaction committed.
+        if let Some(token) = setup_token {
+            self.send_setup_email(&contact, &token).await;
+        }
+        Ok(contact)
     }
 
     /// Get contact by ID
@@ -1070,7 +1175,15 @@ impl ContactService {
         }
         if request.status.is_some() {
             updates.push(format!("status = ${param_idx}"));
-            // param_idx += 1;
+            param_idx += 1;
+        }
+        // PMS-136: persist the portal-access flag for any explicit value so a
+        // grant (`true`) or revoke (`false`) round-trips. The setup-token mint
+        // + email is gated on the false -> true transition below; flipping the
+        // column here keeps a re-grant idempotent and a revoke effective.
+        if request.is_portal_user.is_some() {
+            updates.push(format!("is_portal_user = ${param_idx}"));
+            // param_idx += 1; // last bound field
         }
 
         let query = format!(
@@ -1135,8 +1248,30 @@ impl ContactService {
         if let Some(status) = request.status {
             q = q.bind(status.as_str());
         }
+        if let Some(is_portal_user) = request.is_portal_user {
+            q = q.bind(is_portal_user);
+        }
 
         q.execute(&mut *tx).await?;
+
+        // PMS-136: a false -> true transition mints a single-use setup token
+        // and (after commit) emails the contact a `/portal/set-password` link.
+        // The prior `is_portal_user` is read off the `before` snapshot taken at
+        // the top of this tx, so re-saving an already-portal contact does not
+        // mint a second token or resend the email.
+        let was_portal_user = before
+            .as_ref()
+            .and_then(|v| v.get("is_portal_user"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let setup_token = if request.is_portal_user == Some(true) && !was_portal_user {
+            Some(
+                self.insert_setup_token(&mut tx, tenant_id, contact_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
@@ -1159,7 +1294,12 @@ impl ContactService {
         .await?;
         tx.commit().await?;
 
-        self.get_contact(tenant_id, contact_id).await
+        let contact = self.get_contact(tenant_id, contact_id).await?;
+        // Email the setup link only after the grant transaction committed.
+        if let Some(token) = setup_token {
+            self.send_setup_email(&contact, &token).await;
+        }
+        Ok(contact)
     }
 
     /// Delete contact

@@ -239,7 +239,9 @@ impl AuthService {
                     access_token: String::new(),
                     refresh_token: String::new(),
                     expires_at: Utc::now(),
-                    user: user.to_current_user(),
+                    // Withhold the user profile until the second factor
+                    // is satisfied: no pre-2FA data leak.
+                    user: None,
                     mfa_required: true,
                 });
             }
@@ -282,7 +284,7 @@ impl AuthService {
             access_token,
             refresh_token,
             expires_at,
-            user: user.to_current_user(),
+            user: Some(user.to_current_user()),
             mfa_required: false,
         })
     }
@@ -409,6 +411,25 @@ impl AuthService {
         }
         self.ensure_tenant_active(user.tenant_id).await?;
 
+        // 3b. Enforce MFA exactly like the password `login()` path. A
+        // verified Google identity is NOT a substitute for the user's
+        // locally-enabled second factor; minting tokens here without it
+        // would silently bypass MFA for any account that links Google.
+        // The Google callback carries no MFA code, so signal
+        // `mfa_required` (with empty tokens) and let the SPA complete the
+        // second factor, mirroring `login()`'s no-code branch.
+        if user.mfa_enabled {
+            return Ok(LoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: Utc::now(),
+                // Omit the user profile until the second factor is satisfied,
+                // mirroring the password `login()` mfa_required branch.
+                user: None,
+                mfa_required: true,
+            });
+        }
+
         // 4. Issue session + tokens identically to the password flow.
         let session_id = self
             .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
@@ -420,7 +441,7 @@ impl AuthService {
             access_token,
             refresh_token,
             expires_at,
-            user: user.to_current_user(),
+            user: Some(user.to_current_user()),
             mfa_required: false,
         })
     }
@@ -1574,6 +1595,7 @@ impl AuthService {
             ON CONFLICT (id) DO UPDATE SET
                 email = EXCLUDED.email,
                 updated_at = NOW()
+            WHERE users.tenant_id = EXCLUDED.tenant_id
             "#,
         )
         .bind(sub)
@@ -1683,7 +1705,12 @@ impl AuthService {
         remember_me: bool,
     ) -> AppResult<Uuid> {
         let session_id = Uuid::new_v4();
-        let token_hash = generate_token(32);
+        // The `user_sessions.token_hash` column must never hold a plaintext
+        // secret. Generate a random token and store only its SHA-256 hex
+        // digest. (The session is keyed and validated by `id` + `tenant_id`;
+        // this column is a defence-in-depth opaque handle, not a credential
+        // returned to the client.)
+        let token_hash = sha256_hex(&generate_token(32));
         let expires_at = if remember_me {
             Utc::now() + Duration::days(30)
         } else {
@@ -2004,6 +2031,20 @@ fn parse_user_bound_token(token: &str) -> Option<(Uuid, &str)> {
     }
     let user_id = Uuid::parse_str(id).ok()?;
     Some((user_id, secret))
+}
+
+/// Lowercase hex SHA-256 of an arbitrary string (avoids storing a plaintext
+/// secret in a `TEXT` column such as `user_sessions.token_hash`).
+#[cfg(feature = "server")]
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Hex SHA-256 of the canonical MFA recovery code form. Mirrors
