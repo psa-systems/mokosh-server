@@ -164,15 +164,25 @@ async fn logout(
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let _ = crate::modules::audit::audit_auth_event(
-        state.auth_service.pool(),
-        user.tenant_id,
-        Some(user.id),
-        crate::modules::audit::AuditAction::Logout,
-        Some(addr.ip().to_string()),
-        ua,
-    )
-    .await;
+    // Out-of-band on its own tenant-scoped tx so the RLS GUC is set; a
+    // log-write failure must not fail the logout. PMS-256.
+    if let Ok(mut tx) = state
+        .auth_service
+        .db()
+        .begin_with_tenant(user.tenant_id)
+        .await
+    {
+        let _ = crate::modules::audit::audit_auth_event(
+            &mut *tx,
+            user.tenant_id,
+            Some(user.id),
+            crate::modules::audit::AuditAction::Logout,
+            Some(addr.ip().to_string()),
+            ua,
+        )
+        .await;
+        let _ = tx.commit().await;
+    }
 
     Ok(())
 }

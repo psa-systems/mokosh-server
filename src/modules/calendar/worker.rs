@@ -62,21 +62,16 @@ impl CalendarReminderWorker {
             // single reminder rather than risking a duplicate; reminders
             // are best-effort, so under-delivery on crash is the safer
             // failure mode than spamming on every retry.
-            let inserted = sqlx::query(
-                r#"INSERT INTO appointment_reminders
-                       (tenant_id, appointment_id, occurrence_start, reminder_minutes)
-                   VALUES ($1, $2, $3, $4)
-                   ON CONFLICT (appointment_id, occurrence_start, reminder_minutes)
-                   DO NOTHING"#,
-            )
-            .bind(c.tenant_id)
-            .bind(c.appointment_id)
-            .bind(c.occurrence_start)
-            .bind(c.reminder_minutes)
-            .execute(self.calendar.pool())
-            .await?
-            .rows_affected();
-            if inserted == 0 {
+            let inserted = self
+                .calendar
+                .claim_reminder(
+                    c.tenant_id,
+                    c.appointment_id,
+                    c.occurrence_start,
+                    c.reminder_minutes,
+                )
+                .await?;
+            if !inserted {
                 continue;
             }
 

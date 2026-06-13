@@ -102,6 +102,7 @@ impl AutomationEngine {
         tenant_id: TenantId,
         trigger: AutomationTrigger,
     ) -> AppResult<Vec<AutomationRule>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, AutomationRuleRow>(
             r#"
             SELECT id, tenant_id, name, description, is_active, trigger_type,
@@ -114,7 +115,7 @@ impl AutomationEngine {
         )
         .bind(tenant_id)
         .bind(trigger.as_str())
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok(rows.into_iter().map(Into::into).collect())
@@ -136,6 +137,7 @@ impl AutomationEngine {
         }
 
         // Get ticket data
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let ticket = sqlx::query_as::<_, TicketDataRow>(
             r#"
             SELECT t.*, s.name as status_name, p.name as priority_name
@@ -147,7 +149,7 @@ impl AutomationEngine {
         )
         .bind(tenant_id)
         .bind(ticket_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
 
         let Some(ticket) = ticket else {
@@ -210,13 +212,15 @@ impl AutomationEngine {
                     if let Some(status_id) = action.params.get("status_id").and_then(|v| v.as_str())
                     {
                         if let Ok(id) = Uuid::parse_str(status_id) {
+                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET status_id = $1, updated_at = NOW() WHERE id = $2",
                             )
                             .bind(id)
                             .bind(ticket_id)
-                            .execute(self.db.pool())
+                            .execute(&mut *tx)
                             .await?;
+                            tx.commit().await?;
                         }
                     }
                 }
@@ -225,39 +229,45 @@ impl AutomationEngine {
                         action.params.get("priority_id").and_then(|v| v.as_str())
                     {
                         if let Ok(id) = Uuid::parse_str(priority_id) {
+                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET priority_id = $1, updated_at = NOW() WHERE id = $2",
                             )
                             .bind(id)
                             .bind(ticket_id)
-                            .execute(self.db.pool())
+                            .execute(&mut *tx)
                             .await?;
+                            tx.commit().await?;
                         }
                     }
                 }
                 "assign_to" => {
                     if let Some(user_id) = action.params.get("user_id").and_then(|v| v.as_str()) {
                         if let Ok(id) = Uuid::parse_str(user_id) {
+                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET assigned_to_id = $1, updated_at = NOW() WHERE id = $2",
                             )
                             .bind(id)
                             .bind(ticket_id)
-                            .execute(self.db.pool())
+                            .execute(&mut *tx)
                             .await?;
+                            tx.commit().await?;
                         }
                     }
                 }
                 "set_queue" => {
                     if let Some(queue_id) = action.params.get("queue_id").and_then(|v| v.as_str()) {
                         if let Ok(id) = Uuid::parse_str(queue_id) {
+                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET queue_id = $1, updated_at = NOW() WHERE id = $2",
                             )
                             .bind(id)
                             .bind(ticket_id)
-                            .execute(self.db.pool())
+                            .execute(&mut *tx)
                             .await?;
+                            tx.commit().await?;
                         }
                     }
                 }
@@ -268,6 +278,7 @@ impl AutomationEngine {
                             .get("note_type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("internal");
+                        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                         sqlx::query(
                             "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type, content, created_by_id) VALUES ($1, $2, $3, $4, $5, $6)",
                         )
@@ -277,8 +288,9 @@ impl AutomationEngine {
                         .bind(note_type)
                         .bind(content)
                         .bind(Uuid::nil()) // System-generated
-                        .execute(self.db.pool())
+                        .execute(&mut *tx)
                         .await?;
+                        tx.commit().await?;
                     }
                 }
                 "send_notification" => {
@@ -392,12 +404,14 @@ impl AutomationEngine {
         }
 
         // Update rule stats
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE ticket_automation_rules SET last_run_at = NOW(), run_count = run_count + 1 WHERE id = $1",
         )
         .bind(rule.id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(())
     }

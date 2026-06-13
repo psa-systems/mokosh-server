@@ -44,11 +44,12 @@ impl BillingService {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(Uuid, String)> =
             sqlx::query_as("SELECT id, name FROM companies WHERE tenant_id = $1 AND id = ANY($2)")
                 .bind(tenant_id)
                 .bind(ids)
-                .fetch_all(self.db.pool())
+                .fetch_all(&mut *tx)
                 .await?;
         Ok(rows.into_iter().collect())
     }
@@ -64,12 +65,13 @@ impl BillingService {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT id, invoice_number FROM invoices WHERE tenant_id = $1 AND id = ANY($2)",
         )
         .bind(tenant_id)
         .bind(ids)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().collect())
     }
@@ -208,8 +210,10 @@ impl BillingService {
             cq = cq.bind(pattern);
         }
 
-        let rows = q.fetch_all(self.db.pool()).await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
+        drop(tx);
         let mut resp: Vec<InvoiceResponse> = rows.into_iter().map(Into::into).collect();
         self.enrich_invoices(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
@@ -228,7 +232,7 @@ impl BillingService {
         request: &CreateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Per-tenant invoice sequence is row-locked by UPDATE
         // RETURNING; concurrent invoice creates serialise on this row
@@ -389,7 +393,7 @@ impl BillingService {
         request: &CreateInvoiceFromTimeEntriesRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // 1. Lock the company's eligible billable entries. The `$3::uuid[]
         //    IS NULL OR id = ANY($3)` guard makes the id filter optional:
@@ -639,6 +643,7 @@ impl BillingService {
         // Candidate contracts: active, recurring (not one_time), already
         // started. `end_date` is checked per-period below (a contract may
         // still be due for a period that began before it expired).
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let contracts = sqlx::query_as::<_, RecurringContractRow>(
             r#"
             SELECT id, company_id, billing_cycle, start_date, end_date
@@ -652,8 +657,9 @@ impl BillingService {
         )
         .bind(tenant_id)
         .bind(today)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        drop(tx);
 
         let mut created = Vec::new();
         for contract in contracts {
@@ -760,7 +766,7 @@ impl BillingService {
         today: NaiveDate,
         ctx: &AuditCtx,
     ) -> AppResult<Option<Uuid>> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Pull this contract's recurring billing items. Mirrors
         // `ContractsService::list_recurring_items` (recurring_service +
@@ -950,9 +956,10 @@ impl BillingService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TaxRateResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tax_rates WHERE tenant_id = $1")
             .bind(tenant_id)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
         let rows = sqlx::query_as::<_, TaxRateRow>(
@@ -967,7 +974,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -981,7 +988,7 @@ impl BillingService {
         request: &UpsertTaxRateRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TaxRateResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
             sqlx::query("UPDATE tax_rates SET is_default = FALSE WHERE tenant_id = $1")
                 .bind(tenant_id)
@@ -1042,7 +1049,7 @@ impl BillingService {
         request: &UpsertTaxRateRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TaxRateResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Snapshot before any mutation (including the default-demote). PMS-117.
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
@@ -1123,7 +1130,7 @@ impl BillingService {
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
         )
@@ -1166,6 +1173,7 @@ impl BillingService {
         tenant_id: TenantId,
         jurisdiction: &str,
     ) -> AppResult<TaxRateResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TaxRateRow>(
             r#"
             SELECT id, name, rate, is_default, is_active
@@ -1176,7 +1184,7 @@ impl BillingService {
         )
         .bind(tenant_id)
         .bind(jurisdiction)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(r) = row {
             return Ok(r.into());
@@ -1190,7 +1198,7 @@ impl BillingService {
             "#,
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("TaxRate".to_string()))?;
         Ok(fallback.into())
@@ -1206,10 +1214,11 @@ impl BillingService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<PaymentGatewayConfigResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM payment_gateway_configs WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, PaymentGatewayRow>(
@@ -1224,7 +1233,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let decrypted: Vec<PaymentGatewayConfigResponse> = rows
@@ -1268,7 +1277,7 @@ impl BillingService {
         // Update when a row for `(tenant_id, provider)` already existed
         // (this is an INSERT .. ON CONFLICT upsert), else Create; the
         // `before` snapshot doubles as the existence check.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
              WHERE tenant_id = $1 AND provider = $2",
@@ -1348,7 +1357,7 @@ impl BillingService {
         // (the unique `(tenant_id, provider)` pair), so read the row id
         // for the audit `entity_id`. No-op when absent (no row -> no
         // audit entry), preserving the original idempotent behaviour.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
             "SELECT id, to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
              WHERE tenant_id = $1 AND provider = $2",
@@ -1440,8 +1449,10 @@ impl BillingService {
             q = q.bind(cid);
             cq = cq.bind(cid);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
+        drop(tx);
         let mut resp: Vec<PaymentResponse> = rows.into_iter().map(Into::into).collect();
         self.enrich_payments(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
@@ -1458,7 +1469,7 @@ impl BillingService {
         request: &CreatePaymentRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         let payment_id = Uuid::new_v4();
         let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
@@ -1591,7 +1602,7 @@ impl BillingService {
         payment_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         let row: Option<(Option<Uuid>, Decimal)> = sqlx::query_as(
             "SELECT invoice_id, amount FROM payments WHERE id = $1 AND tenant_id = $2",
@@ -1695,7 +1706,7 @@ impl BillingService {
             )));
         }
 
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Snapshot before any mutation (line replace + header update). PMS-117.
         let before: Option<serde_json::Value> = sqlx::query_scalar(
@@ -1828,6 +1839,7 @@ impl BillingService {
         tenant_id: TenantId,
         invoice_id: Uuid,
     ) -> AppResult<InvoiceResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, InvoiceRow>(
             r#"
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
@@ -1841,7 +1853,7 @@ impl BillingService {
         )
         .bind(tenant_id)
         .bind(invoice_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Invoice".to_string()))?;
 
@@ -1855,8 +1867,9 @@ impl BillingService {
             "#,
         )
         .bind(invoice_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        drop(tx);
 
         let mut resp: InvoiceResponse = row.into();
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());

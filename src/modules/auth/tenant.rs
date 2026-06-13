@@ -89,6 +89,15 @@ impl std::ops::Deref for TenantId {
     }
 }
 
+/// Unwrap to the raw tenant `Uuid`. Lets `Database::begin_with_tenant` accept a
+/// `TenantId` or a bare `Uuid` uniformly (`impl Into<Uuid>`), so RLS-GUC call
+/// sites pass `tenant_id` unchanged regardless of which type they hold.
+impl From<TenantId> for Uuid {
+    fn from(t: TenantId) -> Uuid {
+        t.0
+    }
+}
+
 impl fmt::Display for TenantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
