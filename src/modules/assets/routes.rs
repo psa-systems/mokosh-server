@@ -168,7 +168,7 @@ async fn delete_asset(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_asset(u.tenant(), id).await
+    s.service.delete_asset(u.tenant(), id, u.id).await
 }
 
 async fn list_asset_relationships(

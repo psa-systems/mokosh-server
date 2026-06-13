@@ -27,6 +27,10 @@ pub struct AuthConfig {
     pub data_encryption_key: SecretString,
     pub data_encryption_key_prev: Option<SecretString>,
     pub data_key_version: u16,
+    /// Explicit version tag for the previous AEAD key. When unset, the
+    /// previous key is assumed to be `data_key_version - 1`; set it when a
+    /// rotation is non-sequential so existing blobs still decrypt (PMS-188).
+    pub data_key_version_prev: Option<u16>,
     pub access_token_ttl: Duration,
     pub refresh_token_ttl: Duration,
     pub refresh_idle_ttl: Duration,
@@ -82,6 +86,12 @@ impl AuthConfig {
             data_encryption_key_prev: opt("MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV")
                 .map(SecretString::from),
             data_key_version: parse_u64("MOKOSH_AUTH_DATA_KEY_VERSION", 1)? as u16,
+            data_key_version_prev: match opt("MOKOSH_AUTH_DATA_KEY_VERSION_PREV") {
+                Some(s) => Some(s.parse::<u16>().map_err(|e| {
+                    ConfigError::InvalidEnv("MOKOSH_AUTH_DATA_KEY_VERSION_PREV", e.to_string())
+                })?),
+                None => None,
+            },
             access_token_ttl: Duration::seconds(
                 parse_u64("MOKOSH_AUTH_ACCESS_TOKEN_TTL", 600)? as i64
             ),
@@ -122,6 +132,7 @@ impl std::fmt::Debug for AuthConfig {
                 &self.data_encryption_key_prev.as_ref().map(|_| "<redacted>"),
             )
             .field("data_key_version", &self.data_key_version)
+            .field("data_key_version_prev", &self.data_key_version_prev)
             .field("access_token_ttl", &self.access_token_ttl)
             .field("refresh_token_ttl", &self.refresh_token_ttl)
             .field("refresh_idle_ttl", &self.refresh_idle_ttl)

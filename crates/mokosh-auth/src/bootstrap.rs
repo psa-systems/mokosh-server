@@ -163,12 +163,16 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
     let dek = Arc::new(EncryptionKeySet::new(
         cfg.data_key_version,
         &dek_current_bytes,
-        // Phase-1 keeps prev under version-1 if version is unspecified; in
-        // practice operators set MOKOSH_AUTH_DATA_KEY_VERSION when they
-        // rotate, and the prev version is `version - 1`.
-        dek_prev_bytes
-            .as_ref()
-            .map(|b| (cfg.data_key_version.saturating_sub(1), b)),
+        // PMS-188: the previous key's version defaults to `current - 1`, but a
+        // non-sequential rotation can leave existing blobs tagged with an
+        // older version. MOKOSH_AUTH_DATA_KEY_VERSION_PREV lets the operator
+        // state the previous version explicitly so those blobs still decrypt.
+        dek_prev_bytes.as_ref().map(|b| {
+            let prev_version = cfg
+                .data_key_version_prev
+                .unwrap_or_else(|| cfg.data_key_version.saturating_sub(1));
+            (prev_version, b)
+        }),
     ));
 
     let public_signup_enabled = std::env::var("MOKOSH_PUBLIC_SIGNUP_ENABLED")

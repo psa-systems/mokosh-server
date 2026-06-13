@@ -118,7 +118,7 @@ pub fn create_api_router(
     let calendar_service =
         CalendarService::with_dispatcher(db.clone(), notifications_service.clone());
     let contracts_service = ContractsService::new(db.clone());
-    let assets_service = AssetsService::new(db.clone());
+    let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
     let kb_service = KbService::new(db.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
     // acceptance), so created invites email the invitee.
