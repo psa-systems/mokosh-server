@@ -533,7 +533,7 @@ impl AuthService {
                    date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at
+                   created_at, updated_at, profile_completed_at
             FROM users
             WHERE tenant_id = $1 AND email = $2
             "#,
@@ -1085,6 +1085,21 @@ impl AuthService {
 
         updates.push("updated_at = NOW()".to_string());
 
+        // Mark profile-completed when this PUT supplies non-empty first AND
+        // last name. COALESCE preserves any prior completion timestamp so a
+        // returning user editing their name on Settings (after onboarding)
+        // doesn't reset the activation clock. This is the SPA's onboarding
+        // signal: `profile_completed = true` on `/api/v1/auth/me` lets the
+        // SPA stop redirecting them to `/onboarding/profile`.
+        let completes_profile = matches!(
+            (request.first_name.as_deref(), request.last_name.as_deref()),
+            (Some(f), Some(l)) if !f.trim().is_empty() && !l.trim().is_empty()
+        );
+        if completes_profile {
+            updates
+                .push("profile_completed_at = COALESCE(profile_completed_at, NOW())".to_string());
+        }
+
         // $1 = user_id, $2 = tenant_id (PMS-4 AC6).
         let query = format!(
             "UPDATE users SET {} WHERE id = $1 AND tenant_id = $2",
@@ -1499,7 +1514,7 @@ impl AuthService {
                    date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at
+                   created_at, updated_at, profile_completed_at
             FROM users
             WHERE {data_where}
             ORDER BY {order_by}
@@ -1581,7 +1596,7 @@ impl AuthService {
                    date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at
+                   created_at, updated_at, profile_completed_at
             FROM users
             WHERE id = $1 AND tenant_id = $2
             "#,
@@ -1698,7 +1713,7 @@ impl AuthService {
                    date_format_string, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at
+                   created_at, updated_at, profile_completed_at
             FROM users
             WHERE tenant_id = $1 AND email = $2
             "#,
@@ -1985,6 +2000,7 @@ struct UserRow {
     settings: serde_json::Value,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+    profile_completed_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[cfg(feature = "server")]
@@ -2014,6 +2030,7 @@ impl From<UserRow> for User {
             settings: row.settings,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            profile_completed_at: row.profile_completed_at,
         }
     }
 }

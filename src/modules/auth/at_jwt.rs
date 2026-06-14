@@ -91,6 +91,12 @@ pub fn current_user_from_at_jwt(v: &VerifiedAtJwt) -> CurrentUser {
         role: v.role,
         timezone: "UTC".to_string(),
         avatar_url: None,
+        // No DB lookup here: at+jwt carries no profile-completion claim,
+        // and this CurrentUser is only the lazy middleware-populated
+        // view. The SPA gates onboarding off `/api/v1/auth/me`, which
+        // hits the DB and returns the authoritative value. Default to
+        // `true` so a stale propagation never traps a real user.
+        profile_completed: true,
         date_format_string: None,
     }
 }
