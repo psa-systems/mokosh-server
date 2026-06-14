@@ -335,6 +335,19 @@ impl MembershipRole {
     pub fn can_manage_members(&self) -> bool {
         matches!(self, Self::Owner | Self::Admin)
     }
+
+    /// Map a platform [`UserRole`] to the org-scoped membership role used
+    /// when an admin-issued invite is accepted. Elevated platform roles
+    /// (Admin/Manager/Finance) map to org `Admin`; regular roles
+    /// (Member/ReadOnly) map to the viewer `Member` role so that
+    /// Member/ReadOnly invites are not silently over-privileged. `Owner`
+    /// is reserved for org founders and never minted from an invite.
+    pub fn from_user_role(role: UserRole) -> Self {
+        match role {
+            UserRole::Admin | UserRole::Manager | UserRole::Finance => Self::Admin,
+            UserRole::Member | UserRole::ReadOnly => Self::Member,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

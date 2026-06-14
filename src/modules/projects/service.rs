@@ -5,6 +5,8 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -27,7 +29,7 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_projects(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &ProjectFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ProjectResponse>, u64)> {
@@ -99,18 +101,20 @@ impl ProjectsService {
             q = q.bind(v);
             cq = cq.bind(v);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_project(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateProjectRequest,
     ) -> AppResult<ProjectResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO projects (
@@ -138,13 +142,15 @@ impl ProjectsService {
         .bind(&request.billing_method)
         .bind(request.hourly_rate)
         .bind(request.is_billable)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get_project(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_project(&self, tenant_id: Uuid, id: Uuid) -> AppResult<ProjectResponse> {
+    pub async fn get_project(&self, tenant_id: TenantId, id: Uuid) -> AppResult<ProjectResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ProjectRow>(
             r#"
             SELECT id, name, description, project_number, company_id, contract_id,
@@ -163,7 +169,7 @@ impl ProjectsService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Project".to_string()))?;
         Ok(row.into())
@@ -172,10 +178,23 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_project(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateProjectRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectResponse> {
+        // Mutation + audit row in one transaction (PMS-184), so the project
+        // Overview's edits are captured in the change-history feed just like
+        // tasks and tickets.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(p) FROM projects p WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
         let affected = sqlx::query(
             r#"
             UPDATE projects SET
@@ -209,26 +228,51 @@ impl ProjectsService {
         .bind(&request.billing_method)
         .bind(request.hourly_rate)
         .bind(request.is_billable)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("Project".to_string()));
         }
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(p) FROM projects p WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
+        // unwrap the TenantId at the boundary.
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "projects",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         self.get_project(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_project(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_project(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM projects WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Project".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -239,16 +283,17 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_project_phases(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         project_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ProjectPhaseResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM project_phases WHERE tenant_id = $1 AND project_id = $2",
         )
         .bind(tenant_id)
         .bind(project_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, PhaseRow>(
@@ -260,7 +305,7 @@ impl ProjectsService {
         .bind(project_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -268,11 +313,12 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_project_phase(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         project_id: Uuid,
         request: &UpsertProjectPhaseRequest,
     ) -> AppResult<ProjectPhaseResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO project_phases (id, tenant_id, project_id, name, description, sort_order, start_date, end_date, status)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
@@ -280,7 +326,8 @@ impl ProjectsService {
         .bind(id).bind(tenant_id).bind(project_id)
         .bind(&request.name).bind(&request.description).bind(request.sort_order)
         .bind(request.start_date).bind(request.end_date).bind(&request.status)
-        .execute(self.db.pool()).await?;
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(ProjectPhaseResponse {
             id,
             project_id,
@@ -296,10 +343,11 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_project_phase(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertProjectPhaseRequest,
     ) -> AppResult<ProjectPhaseResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let project_id: Option<Uuid> = sqlx::query_scalar(
             r#"UPDATE project_phases SET name = $3, description = $4, sort_order = $5,
                    start_date = $6, end_date = $7, status = $8, updated_at = NOW()
@@ -313,8 +361,9 @@ impl ProjectsService {
         .bind(request.start_date)
         .bind(request.end_date)
         .bind(&request.status)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         let Some(project_id) = project_id else {
             return Err(AppError::NotFound("ProjectPhase".to_string()));
         };
@@ -331,16 +380,18 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_project_phase(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_project_phase(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM project_phases WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("ProjectPhase".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -351,13 +402,14 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_task_statuses(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TaskStatusResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM task_statuses WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TaskStatusRow>(
@@ -368,7 +420,7 @@ impl ProjectsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -376,10 +428,11 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_task_status(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertTaskStatusRequest,
     ) -> AppResult<TaskStatusResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO task_statuses (id, tenant_id, name, color, is_completed, sort_order)
                VALUES ($1, $2, $3, $4, $5, $6)"#,
@@ -390,8 +443,9 @@ impl ProjectsService {
         .bind(&request.color)
         .bind(request.is_completed)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(TaskStatusResponse {
             id,
             name: request.name.clone(),
@@ -404,10 +458,11 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_task_status(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertTaskStatusRequest,
     ) -> AppResult<TaskStatusResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE task_statuses SET name = $3, color = $4, is_completed = $5,
                    sort_order = $6, updated_at = NOW()
@@ -419,9 +474,10 @@ impl ProjectsService {
         .bind(&request.color)
         .bind(request.is_completed)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if n == 0 {
             return Err(AppError::NotFound("TaskStatus".to_string()));
         }
@@ -435,16 +491,18 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_task_status(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_task_status(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM task_statuses WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("TaskStatus".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -455,16 +513,17 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_project_tasks(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         project_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TaskResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE tenant_id = $1 AND project_id = $2",
         )
         .bind(tenant_id)
         .bind(project_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, TaskRow>(
@@ -483,7 +542,7 @@ impl ProjectsService {
         .bind(project_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -491,11 +550,12 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_task(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         project_id: Uuid,
         request: &CreateTaskRequest,
     ) -> AppResult<TaskResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO tasks (id, tenant_id, project_id, phase_id, parent_task_id, title,
                                   description, status_id, priority, assigned_to_id,
@@ -516,13 +576,15 @@ impl ProjectsService {
         .bind(request.start_date)
         .bind(request.due_date)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get_task(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_task(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TaskResponse> {
+    pub async fn get_task(&self, tenant_id: TenantId, id: Uuid) -> AppResult<TaskResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
                       priority, assigned_to_id, estimated_hours,
@@ -536,7 +598,7 @@ impl ProjectsService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Task".to_string()))?;
         Ok(row.into())
@@ -545,10 +607,23 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_task(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateTaskRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
+        // Mutation + audit row in one transaction (PMS-184, mirrors the
+        // tickets path): snapshot the row before and after with `to_jsonb`
+        // so the change-history feed can diff which columns moved, and write
+        // the audit entry on the same tx so a rollback drops both.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tasks t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
         // When the new status is completed, stamp completed_at; clearing
         // back to non-completed clears it. Two reads (status flag check)
         // would be more correct but require a join; we instead infer
@@ -588,26 +663,50 @@ impl ProjectsService {
         .bind(request.start_date)
         .bind(request.due_date)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Task".to_string()));
         }
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tasks t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
+        // unwrap the TenantId at the boundary.
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "tasks",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
         self.get_task(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_task(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_task(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM tasks WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Task".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -618,7 +717,7 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_task_dependency(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         task_id: Uuid,
         depends_on: Uuid,
     ) -> AppResult<()> {
@@ -629,6 +728,7 @@ impl ProjectsService {
         }
         // Reject if adding this edge would create a cycle: there must
         // not already be a path depends_on -> ... -> task_id.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let creates_cycle: bool = sqlx::query_scalar(
             r#"
             WITH RECURSIVE chain AS (
@@ -645,7 +745,7 @@ impl ProjectsService {
         .bind(tenant_id)
         .bind(depends_on)
         .bind(task_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if creates_cycle {
             return Err(AppError::Conflict(
@@ -660,23 +760,26 @@ impl ProjectsService {
         .bind(tenant_id)
         .bind(task_id)
         .bind(depends_on)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn remove_task_dependency(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         task_id: Uuid,
         depends_on: Uuid,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "DELETE FROM task_dependencies WHERE tenant_id = $1 AND task_id = $2 AND depends_on_task_id = $3",
         )
         .bind(tenant_id).bind(task_id).bind(depends_on)
-        .execute(self.db.pool()).await?;
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 }

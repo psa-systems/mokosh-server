@@ -35,12 +35,6 @@ pub struct CurrentContact {
     pub last_name: String,
 }
 
-impl CurrentContact {
-    pub fn full_name(&self) -> String {
-        format!("{} {}", self.first_name, self.last_name)
-    }
-}
-
 /// `POST /api/v1/portal/auth/login` request body. `tenant_slug` is
 /// required because `contacts.email` is only unique within a tenant.
 /// A portal hosted at e.g. `portal.acme.example.com` should supply the
@@ -78,6 +72,20 @@ pub struct CreatePortalTicketRequest {
     pub description: Option<String>,
     pub priority_id: Option<Uuid>,
     pub type_id: Option<Uuid>,
+}
+
+/// `POST /api/v1/portal/auth/setup-password` request body. The customer
+/// lands here from the emailed `/portal/set-password?token=...` link
+/// (PMS-136). `token` is the single-use setup token (`{contact_id}.{secret}`);
+/// `password` is the credential they choose. On success the contact's
+/// `portal_password_hash` is set and they can immediately sign in via
+/// `/portal/auth/login`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalSetupPasswordRequest {
+    #[validate(length(min = 1, message = "token is required"))]
+    pub token: String,
+    #[validate(length(min = 8, message = "Password must be at least 8 characters"))]
+    pub password: String,
 }
 
 /// JWT claim shape for portal access tokens. Kept separate from the

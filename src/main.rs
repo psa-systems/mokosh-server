@@ -8,7 +8,15 @@ use tokio::net::TcpListener;
 /// Application configuration loaded from environment
 #[derive(Clone, Debug)]
 pub struct AppConfig {
+    /// Privileged (`mokosh_migrator`, BYPASSRLS) connection string. Runs
+    /// migrations, bootstrap, the cross-tenant workers and the
+    /// explicitly-justified pre-auth / cross-tenant paths.
     pub database_url: String,
+    /// Request-serving (`mokosh_app`, NOSUPERUSER NOBYPASSRLS) connection
+    /// string (PMS-285). Falls back to `database_url` when unset, which
+    /// preserves the pre-split single-role behaviour (RLS does not bite
+    /// because the single role bypasses it).
+    pub app_database_url: String,
     pub jwt_secret: String,
     pub host: String,
     pub port: u16,
@@ -22,7 +30,8 @@ pub struct AppConfig {
     /// All origins permitted to make credentialed CORS requests against
     /// the API. Defaults to `[client_origin]` if `CORS_ORIGIN` is unset.
     /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
-    /// `https://msp.a8n.systems,https://a8n.systems`).
+    /// staging `https://msp.a8n.systems,https://a8n.systems`, prod
+    /// `https://msp.psa.systems,https://psa.systems`).
     pub cors_origins: Vec<String>,
     /// Lowercased exact-email allowlist; only these emails may auto-provision
     /// a super_admin on first Google sign-in (everyone else is rejected).
@@ -47,6 +56,14 @@ impl AppConfig {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
             }),
+            // PMS-285: the request-serving role. Default to DATABASE_URL so a
+            // dev box without the split still boots (RLS stays inert until the
+            // app role is a NOBYPASSRLS one).
+            app_database_url: std::env::var("MOKOSH_APP_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .unwrap_or_else(|_| {
+                    "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
+                }),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -86,14 +103,17 @@ impl AppConfig {
         self.environment == "production"
     }
 
-    #[cfg(feature = "multi-tenant")]
-    pub fn is_multi_tenant(&self) -> bool {
-        true
+    /// Dev/test environments run over plain HTTP, where browsers drop
+    /// `Secure` cookies. Only these opt out of secure cookies; every other
+    /// environment (staging, production, or any unrecognized value) defaults
+    /// to secure, so a misconfigured `ENVIRONMENT` fails safe.
+    pub fn is_dev_or_test(&self) -> bool {
+        matches!(self.environment.as_str(), "development" | "dev" | "test")
     }
 
-    #[cfg(feature = "single-tenant")]
+    // PMS-262: single-tenant mode removed. Multi-tenant is the only mode.
     pub fn is_multi_tenant(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -109,21 +129,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting {}", VersionInfo::current().banner());
 
-    #[cfg(feature = "multi-tenant")]
     tracing::info!("Running in multi-tenant mode");
-
-    #[cfg(feature = "single-tenant")]
-    tracing::info!("Running in single-tenant mode");
 
     let config = AppConfig::from_env().expect("Failed to load configuration");
 
-    let db = Database::new(&config.database_url).await?;
+    let db = Database::new(&config.app_database_url, &config.database_url).await?;
 
+    // A migration failure is fatal: exit non-zero rather than serve a
+    // half-migrated database (PMS-286). Warn-and-continue here once let a
+    // failed verification migration (040) boot a server that never became
+    // healthy - the container went unhealthy and Traefik dropped its router,
+    // so every request 404'd with no hint at the real cause. Fail loud at boot,
+    // consistent with the other startup checks (SMTP/Google/ENCRYPTION_KEY/CORS
+    // all hard-fail). `RUN_MIGRATIONS=false` still skips the step entirely for
+    // operators who manage migrations out of band.
     if config.run_migrations {
-        match db.run_migrations().await {
-            Ok(()) => tracing::info!("Database migrations complete"),
-            Err(e) => tracing::warn!("Failed to run migrations: {}", e),
+        if let Err(e) = db.run_migrations().await {
+            tracing::error!("Failed to run database migrations: {e}");
+            return Err(e.into());
         }
+        tracing::info!("Database migrations complete");
     }
 
     tracing::info!("Database connected");
@@ -136,8 +161,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // be passed into the PSA router as the at+jwt verifier. The PSA
     // middleware then accepts SSO-issued access tokens alongside its
     // own legacy HS256 cookies.
-    let (sso_router, at_jwt) = match try_bootstrap_sso(db.pool().clone()).await {
-        Ok(auth) => {
+    // SAFETY (PMS-285): SSO bootstrap registers OAuth clients and seeds the
+    // mokosh_auth schema (DDL/system rows) before any request is served, so it
+    // runs on the privileged migrator pool, not the NOBYPASSRLS app pool.
+    let (sso_router, at_jwt) = match try_bootstrap_sso(db.migrator_pool().clone()).await {
+        Ok(SsoSetup::Mounted(auth)) => {
             tracing::info!("SSO subsystem mounted (mokosh-auth)");
             let issuer = auth.provider.cfg.issuer.as_str().to_string();
             let verifier = mokosh_server::modules::auth::at_jwt::AtJwtVerifier::new(
@@ -146,14 +174,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             (Some(auth.router()), Some(verifier))
         }
-        Err(e) => {
+        Ok(SsoSetup::NotConfigured) => {
+            // PMS-291: mokosh-auth (mechanism 2) is one of three independent
+            // auth paths. Not mounting it leaves the bunyip-as-OP
+            // Resource-Server path (mechanism 1, OIDC_ISSUER / OIDC_AUDIENCE)
+            // AND the legacy HS256 cookie path (mechanism 3) both active. The
+            // earlier "the server will run with legacy auth only" phrasing was
+            // misleading: it implied a full fallback to mechanism 3, which is
+            // not what happens. Be explicit about what stays on so an operator
+            // grepping logs cannot conclude bunyip auth is also down.
             tracing::warn!(
-                "SSO subsystem not mounted: {e}. The server will run with legacy auth only. \
-                 Set MOKOSH_AUTH_ISSUER, MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH, \
-                 MOKOSH_AUTH_JWT_ACTIVE_KID, MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, \
-                 and MOKOSH_AUTH_DATA_ENCRYPTION_KEY to enable SSO."
+                "mokosh-auth OP (mechanism 2) not configured. The server is still serving the \
+                 bunyip-as-OP Resource-Server path (OIDC_ISSUER/OIDC_AUDIENCE) and the legacy \
+                 HS256 cookie path; only mokosh's own /oauth2/* endpoints are unavailable. \
+                 To enable mechanism 2, set MOKOSH_AUTH_ISSUER, \
+                 MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH, MOKOSH_AUTH_JWT_ACTIVE_KID, \
+                 MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, and MOKOSH_AUTH_DATA_ENCRYPTION_KEY."
             );
             (None, None)
+        }
+        // PMS-289: SSO IS configured (MOKOSH_AUTH_* set) but failed to
+        // bootstrap - invalid config, or migrations / key load failed. Fail
+        // loud and exit non-zero rather than silently downgrade to legacy auth,
+        // which would drop the OIDC / at+jwt verification path with only a WARN.
+        Err(e) => {
+            tracing::error!("SSO is configured but failed to bootstrap: {e}");
+            return Err(e);
         }
     };
 
@@ -168,8 +214,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Browsers drop `Secure` cookies on plain HTTP, so disable the flag
-    // in development. In any non-dev environment, set it.
-    let cookie_secure = config.is_production();
+    // only in dev/test. Everywhere else (staging, production, or an
+    // unrecognized ENVIRONMENT) defaults to secure so the OAuth state
+    // cookie is not exposed over a downgraded connection.
+    let cookie_secure = !config.is_dev_or_test();
 
     // Build the host-crate mailer (SmtpMailer when SMTP_HOST is set,
     // LogMailer otherwise). Hard-fail on misconfiguration so an
@@ -203,10 +251,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // their way past each other so it is safe to run several. The
     // tick interval is intentionally low (5s) so transactional
     // emails (password reset, welcome, ticket-note) feel synchronous
-    // from the operator's perspective.
+    // from the operator's perspective. PMS-198: now runs on the shared
+    // Scheduler (registered below) instead of a raw `tokio::spawn`, so
+    // it gets the same per-tick tracing span and missed-tick-skip
+    // semantics as the other jobs.
     let dispatcher =
         mokosh_server::modules::notifications::DispatcherWorker::new(db.clone(), mailer.clone());
-    tokio::spawn(dispatcher.run_forever(std::time::Duration::from_secs(5), 25));
 
     // RMM device-sync worker. Picks up every active `rmm_connections`
     // row past its `sync_interval_minutes` window, pulls devices via
@@ -214,9 +264,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // creates `assets`, and updates `sync_status` / `last_error`.
     // Tick is 60s so the worker fires at minute granularity; per-
     // connection cadence is enforced by the `sync_interval_minutes`
-    // gate in its query.
+    // gate in its query. PMS-198: migrated onto the shared Scheduler
+    // (registered below) alongside the other jobs.
     let rmm_worker = mokosh_server::modules::rmm::RmmSyncWorker::new(db.clone(), encryption_key);
-    tokio::spawn(rmm_worker.run_forever(std::time::Duration::from_secs(60)));
 
     // Contract lifecycle worker (PMS-64). Sweeps `active` contracts past
     // their `end_date` and renews (auto_renew) or expires them. Contract
@@ -261,6 +311,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
+    // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
+    // now run on the Scheduler too; the intervals match their former raw
+    // `tokio::spawn(run_forever(..))` cadences.
+    scheduler.register(dispatcher, std::time::Duration::from_secs(5));
+    scheduler.register(rmm_worker, std::time::Duration::from_secs(60));
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
     scheduler.register(
         recurring_invoicing_worker,
@@ -320,14 +375,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Try to bootstrap the SSO subsystem. Returns the full `MokoshAuth`
-/// handle so the caller can pull both the router and the key set out of
-/// it. On failure (typically required env vars not set in dev), the
-/// error is surfaced so the caller can fall back to legacy auth only.
-async fn try_bootstrap_sso(
-    pool: sqlx::PgPool,
-) -> Result<mokosh_auth::MokoshAuth, Box<dyn std::error::Error>> {
+/// Outcome of the SSO subsystem setup (PMS-289). Distinguishes "SSO was never
+/// configured" (a legitimate legacy-only deployment) from "SSO is configured
+/// but failed to bootstrap" (a real error). The latter is returned as `Err`
+/// from [`try_bootstrap_sso`] and is fatal at the call site - silently running
+/// legacy-only when SSO was meant to be on is a security-relevant downgrade
+/// (the OIDC / at+jwt verification path just disappears), not a graceful
+/// fallback.
+enum SsoSetup {
+    /// Configured and bootstrapped: mount the router + at+jwt verifier.
+    Mounted(Box<mokosh_auth::MokoshAuth>),
+    /// No `MOKOSH_AUTH_*` env set: the operator did not enable SSO.
+    NotConfigured,
+}
+
+/// The required env vars that signal "SSO is intended". If any is set, SSO is
+/// configured and a bootstrap failure must be fatal; if none is set, SSO is off
+/// and the server runs legacy-only.
+const SSO_REQUIRED_ENV: [&str; 5] = [
+    "MOKOSH_AUTH_ISSUER",
+    "MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH",
+    "MOKOSH_AUTH_JWT_ACTIVE_KID",
+    "MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR",
+    "MOKOSH_AUTH_DATA_ENCRYPTION_KEY",
+];
+
+fn sso_is_configured() -> bool {
+    SSO_REQUIRED_ENV
+        .iter()
+        .any(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false))
+}
+
+/// Bootstrap the SSO subsystem when it is configured. Returns
+/// [`SsoSetup::NotConfigured`] (run legacy-only) when no `MOKOSH_AUTH_*` env is
+/// set, [`SsoSetup::Mounted`] on success, or `Err` (fatal) when SSO IS
+/// configured but `from_env` (partial/invalid config) or `bootstrap`
+/// (migrations, key load) fails - so a misconfigured-but-intended SSO never
+/// silently degrades to legacy auth (PMS-289).
+async fn try_bootstrap_sso(pool: sqlx::PgPool) -> Result<SsoSetup, Box<dyn std::error::Error>> {
+    if !sso_is_configured() {
+        return Ok(SsoSetup::NotConfigured);
+    }
     let auth_cfg = mokosh_auth::AuthConfig::from_env()?;
     let auth = mokosh_auth::bootstrap(auth_cfg, pool).await?;
-    Ok(auth)
+    Ok(SsoSetup::Mounted(Box::new(auth)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PMS-289: the fatal-vs-degrade decision hinges on this intent detector -
+    // none of the MOKOSH_AUTH_* env set means "SSO off, run legacy" (degrade);
+    // any set means "SSO intended" so a later bootstrap failure must be fatal.
+    #[test]
+    fn sso_is_configured_tracks_env_presence() {
+        // Snapshot then clear the SSO env so the assertions are deterministic.
+        let saved: Vec<(&str, Option<String>)> = SSO_REQUIRED_ENV
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in SSO_REQUIRED_ENV {
+            std::env::remove_var(k);
+        }
+
+        assert!(
+            !sso_is_configured(),
+            "no MOKOSH_AUTH_* env => SSO not configured"
+        );
+
+        std::env::set_var("MOKOSH_AUTH_ISSUER", "https://issuer.test");
+        assert!(
+            sso_is_configured(),
+            "any MOKOSH_AUTH_* env set => SSO configured"
+        );
+
+        // Restore the prior environment so sibling tests are unaffected.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
 }

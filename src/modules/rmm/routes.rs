@@ -16,7 +16,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::RmmService;
-use crate::modules::auth::{RequireAdmin, RequireRmm};
+use crate::modules::auth::{RequireAdmin, RequireRmm, TenantId, TenantScoped};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -70,7 +70,7 @@ async fn list_connections(
     _a: RequireAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RmmConnectionResponse>>> {
-    let (items, total) = s.service.list_connections(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_connections(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -94,7 +94,7 @@ async fn create_connection(
             req.provider
         )));
     }
-    Ok(Json(s.service.create_connection(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_connection(u.tenant(), &req).await?))
 }
 
 async fn delete_connection(
@@ -103,7 +103,7 @@ async fn delete_connection(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_connection(u.tenant_id, id).await
+    s.service.delete_connection(u.tenant(), id).await
 }
 
 async fn get_connection(
@@ -112,7 +112,7 @@ async fn get_connection(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RmmConnectionResponse>> {
-    Ok(Json(s.service.get_connection(u.tenant_id, id).await?))
+    Ok(Json(s.service.get_connection(u.tenant(), id).await?))
 }
 
 async fn update_connection(
@@ -124,7 +124,7 @@ async fn update_connection(
 ) -> AppResult<Json<RmmConnectionResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_connection(u.tenant_id, id, &req).await?,
+        s.service.update_connection(u.tenant(), id, &req).await?,
     ))
 }
 
@@ -134,7 +134,7 @@ async fn test_connection(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
-    Ok(Json(s.service.test_connection(u.tenant_id, id).await?))
+    Ok(Json(s.service.test_connection(u.tenant(), id).await?))
 }
 
 #[derive(serde::Deserialize)]
@@ -150,7 +150,7 @@ async fn list_device_mappings(
 ) -> AppResult<Json<PaginatedResponse<RmmDeviceMappingResponse>>> {
     let (items, total) = s
         .service
-        .list_device_mappings(u.tenant_id, q.rmm_connection_id, &pagination)
+        .list_device_mappings(u.tenant(), q.rmm_connection_id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -167,7 +167,7 @@ async fn create_device_mapping(
 ) -> AppResult<Json<RmmDeviceMappingResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_device_mapping(u.tenant_id, &req).await?,
+        s.service.create_device_mapping(u.tenant(), &req).await?,
     ))
 }
 
@@ -177,7 +177,7 @@ async fn delete_device_mapping(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_device_mapping(u.tenant_id, id).await
+    s.service.delete_device_mapping(u.tenant(), id).await
 }
 
 async fn list_alert_rules(
@@ -188,7 +188,7 @@ async fn list_alert_rules(
 ) -> AppResult<Json<PaginatedResponse<RmmAlertRuleResponse>>> {
     let (items, total) = s
         .service
-        .list_alert_rules(u.tenant_id, q.rmm_connection_id, &pagination)
+        .list_alert_rules(u.tenant(), q.rmm_connection_id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -204,7 +204,7 @@ async fn create_alert_rule(
     Json(req): Json<UpsertRmmAlertRuleRequest>,
 ) -> AppResult<Json<RmmAlertRuleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_alert_rule(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_alert_rule(u.tenant(), &req).await?))
 }
 
 async fn delete_alert_rule(
@@ -213,7 +213,7 @@ async fn delete_alert_rule(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_alert_rule(u.tenant_id, id).await
+    s.service.delete_alert_rule(u.tenant(), id).await
 }
 
 /// `POST /api/v1/rmm/alerts` is callable by RMM agents (not internal
@@ -223,27 +223,39 @@ async fn delete_alert_rule(
 async fn ingest_alert(
     State(s): State<RmmRouterState>,
     headers: HeaderMap,
-    Json(req): Json<IngestAlertRequest>,
+    body: axum::body::Bytes,
 ) -> AppResult<Json<serde_json::Value>> {
+    // Parse the raw bytes for field access (the connection id drives the
+    // secret lookup) but keep `body` for the HMAC compare below.
+    let req: IngestAlertRequest =
+        serde_json::from_slice(&body).map_err(|_| AppError::Unauthorized)?;
     req.validate()?;
     let signature = headers
         .get("X-Signature")
         .and_then(|h| h.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
 
-    // The body is parsed twice (axum + our HMAC compare) to avoid a
-    // raw-body extractor; we re-serialise the parsed Json for HMAC.
-    let body = serde_json::to_vec(&req).map_err(|_| AppError::Unauthorized)?;
+    // SAFETY (PMS-139): this is an unauthenticated machine webhook, so there is
+    // no CurrentUser to scope from. The tenant comes from the signed
+    // `X-Tenant-Id` header and is authenticated below by HMAC against that
+    // tenant's per-connection secret (`connection_api_secret`): a wrong tenant
+    // finds no secret and 401s. `from_trusted` is the named escape hatch for
+    // exactly this out-of-band scope.
     let tenant_id = headers
         .get("X-Tenant-Id")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok())
+        .map(TenantId::from_trusted)
         .ok_or(AppError::Unauthorized)?;
     let secret = s
         .service
         .connection_api_secret(tenant_id, req.rmm_connection_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
+    // Verify the HMAC over the ORIGINAL raw bytes (PMS-195). Re-serialising
+    // the parsed JSON reorders fields, drops unknown keys, and normalises
+    // whitespace, so a valid agent signature computed over the wire bytes
+    // would be rejected. Compare against exactly what the agent signed.
     let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes())
         .map_err(|_| AppError::Internal("hmac key invalid".to_string()))?;
     mac.update(&body);

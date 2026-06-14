@@ -10,7 +10,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
-use crate::modules::auth::{RequireAuth, UserRole};
+use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -57,16 +57,9 @@ pub fn tenant_routes(
 /// List all tenants (super admin only)
 async fn list_tenants(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TenantResponse>>> {
-    // Only super admins can list all tenants
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
     let (tenants, total) = state.tenant_service.list_tenants(&pagination).await?;
 
     let response = PaginatedResponse::from_params(
@@ -81,16 +74,10 @@ async fn list_tenants(
 /// Create a new tenant (super admin only)
 async fn create_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
     request.validate()?;
 
     let tenant = state.tenant_service.create_tenant(&request, &ctx).await?;
@@ -109,7 +96,15 @@ async fn get_tenant(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
-    let tenant = state.tenant_service.get_tenant(tenant_id).await?;
+    // SAFETY (PMS-261): this super-admin surface deliberately addresses an
+    // arbitrary path `tenant_id`, not the caller's own claim. The role guard
+    // above is the gate (super-admin, or same-tenant), so `from_trusted` is
+    // sound: a non-super-admin can only reach this with `tenant_id ==
+    // user.tenant_id`.
+    let tenant = state
+        .tenant_service
+        .get_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(Json(tenant.into()))
 }
@@ -129,9 +124,12 @@ async fn update_tenant(
 
     request.validate()?;
 
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
+    // the role guard above; the arbitrary path `tenant_id` is sound to bridge
+    // via `from_trusted` only because of that guard.
     let tenant = state
         .tenant_service
-        .update_tenant(tenant_id, &request, &ctx)
+        .update_tenant(TenantId::from_trusted(tenant_id), &request, &ctx)
         .await?;
 
     Ok(Json(tenant.into()))
@@ -140,16 +138,17 @@ async fn update_tenant(
 /// Suspend tenant (super admin only)
 async fn suspend_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
-    state.tenant_service.suspend_tenant(tenant_id).await?;
+    // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
+    // is the guard); the arbitrary path `tenant_id` is an administrative
+    // target, not the caller's claim, so `from_trusted` is the sanctioned
+    // bridge.
+    state
+        .tenant_service
+        .suspend_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(())
 }
@@ -157,16 +156,16 @@ async fn suspend_tenant(
 /// Activate tenant (super admin only)
 async fn activate_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    _super_admin: RequireSuperAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
-    if user.role != UserRole::SuperAdmin {
-        return Err(AppError::Forbidden(
-            "Super admin access required".to_string(),
-        ));
-    }
-
-    state.tenant_service.activate_tenant(tenant_id).await?;
+    // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
+    // is the guard); arbitrary path `tenant_id` is an administrative target,
+    // bridged via `from_trusted`.
+    state
+        .tenant_service
+        .activate_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(())
 }
@@ -182,7 +181,12 @@ async fn get_tenant_usage(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
-    let usage = state.tenant_service.get_tenant_usage(tenant_id).await?;
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
+    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
+    let usage = state
+        .tenant_service
+        .get_tenant_usage(TenantId::from_trusted(tenant_id))
+        .await?;
 
     Ok(Json(usage))
 }
@@ -203,9 +207,11 @@ async fn get_module_config(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
+    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
     let config = state
         .settings_service
-        .get_module_config(tenant_id, &module)
+        .get_module_config(TenantId::from_trusted(tenant_id), &module)
         .await?;
 
     Ok(Json(config))
@@ -223,9 +229,11 @@ async fn update_module_config(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
 
+    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
+    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
     let config = state
         .settings_service
-        .upsert_module_config(tenant_id, &module, &request)
+        .upsert_module_config(TenantId::from_trusted(tenant_id), &module, &request)
         .await?;
 
     Ok(Json(config))

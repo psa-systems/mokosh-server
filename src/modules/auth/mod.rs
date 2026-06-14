@@ -11,9 +11,9 @@ pub mod google_login;
 #[cfg(feature = "server")]
 pub mod middleware;
 mod models;
-// Resource-Server OIDC verifier scaffold for the bunyip-as-OP cutover.
-// Not yet wired into AuthMiddleware; lands incrementally on
-// `feat/bunyip-op-cutover`. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
+// Resource-Server OIDC verifier for the bunyip-as-OP cutover. Wired into
+// AuthMiddleware via `with_bunyip` in `create_api_router`.
+// See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
 #[cfg(feature = "server")]
 pub mod oidc_rs;
 #[cfg(feature = "server")]
@@ -21,16 +21,19 @@ pub mod rate_limit;
 #[cfg(feature = "server")]
 mod routes;
 mod service;
+pub mod tenant;
 
 #[cfg(feature = "server")]
 pub use middleware::{
     AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,
     RequireAssets, RequireAuth, RequireBilling, RequireCalendar, RequireContracts, RequireFinance,
     RequireKnowledgeBase, RequireManager, RequireModuleEnabled, RequireProjects, RequireReports,
-    RequireRmm, RequireRole, RequireTimeTracking, RoleRequirement, TenantScope,
+    RequireRmm, RequireRole, RequireSuperAdmin, RequireTimeTracking, RoleRequirement,
+    SuperAdminRoles, TenantScope,
 };
 pub use models::*;
 #[cfg(feature = "server")]
 pub use routes::auth_routes;
 #[cfg(feature = "server")]
 pub use service::AuthService;
+pub use tenant::{TenantId, TenantScoped};

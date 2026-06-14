@@ -5,10 +5,12 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+use mokosh_types::tickets::BillingStatus;
 
 #[derive(Clone)]
 pub struct TimeTrackingService {
@@ -27,12 +29,13 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_work_types(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<WorkTypeResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_types WHERE tenant_id = $1")
             .bind(tenant_id)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
         let rows = sqlx::query_as::<_, WorkTypeRow>(
@@ -48,7 +51,7 @@ impl TimeTrackingService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -56,9 +59,10 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_work_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertWorkTypeRequest,
     ) -> AppResult<WorkTypeResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO work_types
@@ -75,8 +79,9 @@ impl TimeTrackingService {
         .bind(request.default_rate)
         .bind(request.is_active)
         .bind(request.sort_order)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(WorkTypeResponse {
             id,
             name: request.name.clone(),
@@ -91,10 +96,11 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_work_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertWorkTypeRequest,
     ) -> AppResult<WorkTypeResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let affected = sqlx::query(
             r#"
             UPDATE work_types SET
@@ -112,12 +118,13 @@ impl TimeTrackingService {
         .bind(request.default_rate)
         .bind(request.is_active)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("WorkType".to_string()));
         }
+        tx.commit().await?;
         Ok(WorkTypeResponse {
             id,
             name: request.name.clone(),
@@ -130,16 +137,18 @@ impl TimeTrackingService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_work_type(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_work_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let affected = sqlx::query("DELETE FROM work_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("WorkType".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -169,7 +178,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_time_entries(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TimeEntryFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimeEntryResponse>, u64)> {
@@ -251,29 +260,30 @@ impl TimeTrackingService {
             q = q.bind(v);
             cq = cq.bind(v);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_entry(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateTimeEntryRequest,
     ) -> AppResult<TimeEntryResponse> {
-        let pool = self.db.pool();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Write-side tenant validation: FKs check existence, not ownership,
         // so a request body could otherwise attach time to another tenant's
         // work type / ticket / company.
-        let defaults = fetch_work_type_defaults(pool, tenant_id, request.work_type_id).await?;
-        assert_company_in_tenant(pool, tenant_id, request.company_id).await?;
+        let defaults = fetch_work_type_defaults(&mut *tx, tenant_id, request.work_type_id).await?;
+        assert_company_in_tenant(&mut *tx, tenant_id, request.company_id).await?;
         if let Some(ticket_id) = request.ticket_id {
-            assert_ticket_in_tenant(pool, tenant_id, ticket_id).await?;
+            assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
 
         let raw = Self::compute_minutes(request)?;
-        let duration = match default_rounding_rule(pool, tenant_id).await? {
+        let duration = match default_rounding_rule(&mut *tx, tenant_id).await? {
             Some(rule) => apply_rounding(raw, &rule),
             None => raw,
         };
@@ -309,13 +319,19 @@ impl TimeTrackingService {
         .bind(hourly_rate)
         .bind(total)
         .bind(request.task_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get_time_entry(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_time_entry(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TimeEntryResponse> {
+    pub async fn get_time_entry(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<TimeEntryResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TimeEntryRow>(
             r#"
             SELECT id, user_id, date, start_time, end_time, duration_minutes,
@@ -328,7 +344,7 @@ impl TimeTrackingService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("TimeEntry".to_string()))?;
         Ok(row.into())
@@ -337,7 +353,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_time_entry(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateTimeEntryRequest,
     ) -> AppResult<TimeEntryResponse> {
@@ -360,6 +376,7 @@ impl TimeTrackingService {
         let hourly_rate = request.hourly_rate.or(current.hourly_rate);
         let total = hourly_rate.map(|r| r * Decimal::from(duration) / Decimal::from(60));
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let affected = sqlx::query(
             r#"
             UPDATE time_entries SET
@@ -393,26 +410,29 @@ impl TimeTrackingService {
         .bind(hourly_rate)
         .bind(total)
         .bind(request.task_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("TimeEntry".to_string()));
         }
+        tx.commit().await?;
         self.get_time_entry(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_time_entry(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_time_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let affected = sqlx::query("DELETE FROM time_entries WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("TimeEntry".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -423,7 +443,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_timesheets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TimesheetFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimesheetSummaryResponse>, u64)> {
@@ -457,7 +477,8 @@ impl TimeTrackingService {
                 CASE
                     WHEN BOOL_OR(approval_status = 'rejected') THEN 'rejected'
                     WHEN BOOL_AND(approval_status = 'approved') THEN 'approved'
-                    ELSE 'pending'
+                    WHEN BOOL_OR(approval_status = 'pending') THEN 'pending'
+                    ELSE 'draft'
                 END AS approval_status
             FROM time_entries
             WHERE {where_clause}
@@ -487,12 +508,13 @@ impl TimeTrackingService {
             q = q.bind(w);
             cq = cq.bind(w);
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -506,7 +528,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn submit_timesheet(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         week_start: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
@@ -516,6 +538,7 @@ impl TimeTrackingService {
         // Move every non-approved entry in the week to 'pending'. An empty or
         // already-approved week is not an error (decision: zeroed-summary
         // everywhere); we just return the current week summary.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             UPDATE time_entries
@@ -532,8 +555,68 @@ impl TimeTrackingService {
         .bind(user_id)
         .bind(anchor)
         .bind(week_end)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+
+        self.week_summary(tenant_id, user_id, anchor).await
+    }
+
+    /// Withdraw a submitted timesheet: move every still-pending entry in the
+    /// week back to 'draft' so the owner can edit and resubmit. Refuses once
+    /// any entry in the week has been approved (PMS-183) - an approved week is
+    /// past the point of withdrawal (it has flipped billable entries to
+    /// ready_to_bill). Owner-only is enforced at the route.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn withdraw_timesheet(
+        &self,
+        tenant_id: TenantId,
+        user_id: Uuid,
+        week_start: NaiveDate,
+    ) -> AppResult<TimesheetSummaryResponse> {
+        let anchor = monday_anchor(week_start);
+        let week_end = anchor + chrono::Duration::days(7);
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let approved_exists: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM time_entries
+                 WHERE tenant_id = $1 AND user_id = $2
+                   AND date >= $3 AND date < $4
+                   AND approval_status = 'approved'
+               )"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(anchor)
+        .bind(week_end)
+        .fetch_one(&mut *tx)
+        .await?;
+        if approved_exists {
+            return Err(AppError::Conflict(
+                "Cannot withdraw an approved timesheet".to_string(),
+            ));
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE time_entries
+            SET approval_status = 'draft',
+                updated_at      = NOW()
+            WHERE tenant_id = $1
+              AND user_id   = $2
+              AND date     >= $3
+              AND date      < $4
+              AND approval_status = 'pending'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(anchor)
+        .bind(week_end)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
 
         self.week_summary(tenant_id, user_id, anchor).await
     }
@@ -544,13 +627,14 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn approve_timesheet(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         approver_id: Uuid,
         user_id: Uuid,
         week_start: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
         let anchor = monday_anchor(week_start);
         let week_end = anchor + chrono::Duration::days(7);
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             UPDATE time_entries
@@ -578,8 +662,9 @@ impl TimeTrackingService {
         .bind(anchor)
         .bind(week_end)
         .bind(approver_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.week_summary(tenant_id, user_id, anchor).await
     }
 
@@ -588,7 +673,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reject_timesheet(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         reviewer_id: Uuid,
         user_id: Uuid,
         week_start: NaiveDate,
@@ -600,6 +685,7 @@ impl TimeTrackingService {
         // No consumer reads time_entries.approved_by_id as an approval flag
         // (verified: only calendar.time_off reads a column of that name), so
         // setting it on a rejection is safe and captures who reviewed.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             UPDATE time_entries
@@ -621,8 +707,9 @@ impl TimeTrackingService {
         .bind(week_end)
         .bind(reason)
         .bind(reviewer_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.week_summary(tenant_id, user_id, anchor).await
     }
 
@@ -631,7 +718,7 @@ impl TimeTrackingService {
     /// on empty weeks (no 404s).
     async fn week_summary(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         anchor: NaiveDate,
     ) -> AppResult<TimesheetSummaryResponse> {
@@ -654,7 +741,7 @@ impl TimeTrackingService {
                 total_minutes: 0,
                 billable_minutes: 0,
                 entry_count: 0,
-                approval_status: "pending".to_string(),
+                approval_status: "draft".to_string(),
             }))
     }
 
@@ -665,7 +752,7 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_active_timers(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ActiveTimerResponse>, u64)> {
@@ -692,32 +779,33 @@ impl TimeTrackingService {
             q = q.bind(user_id.unwrap());
             cq = cq.bind(user_id.unwrap());
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn start_timer(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &StartTimerRequest,
     ) -> AppResult<ActiveTimerResponse> {
         // UNIQUE(user_id) on active_timers means we either upsert or
         // reject. We reject so the user explicitly stops + re-starts;
         // silent replacement loses the prior elapsed time.
-        let pool = self.db.pool();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM active_timers WHERE tenant_id = $1 AND user_id = $2)",
         )
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
         if exists {
             return Err(AppError::Conflict(
@@ -728,13 +816,13 @@ impl TimeTrackingService {
         // Validate any supplied references belong to the tenant before we
         // persist a timer that points at them.
         if let Some(ticket_id) = request.ticket_id {
-            assert_ticket_in_tenant(pool, tenant_id, ticket_id).await?;
+            assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
         if let Some(company_id) = request.company_id {
-            assert_company_in_tenant(pool, tenant_id, company_id).await?;
+            assert_company_in_tenant(&mut *tx, tenant_id, company_id).await?;
         }
         if let Some(work_type_id) = request.work_type_id {
-            fetch_work_type_defaults(pool, tenant_id, work_type_id).await?;
+            fetch_work_type_defaults(&mut *tx, tenant_id, work_type_id).await?;
         }
 
         let id = Uuid::new_v4();
@@ -755,7 +843,7 @@ impl TimeTrackingService {
         .bind(request.company_id)
         .bind(request.work_type_id)
         .bind(&request.notes)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await
         {
             Ok(ts) => ts,
@@ -769,6 +857,7 @@ impl TimeTrackingService {
             }
             Err(e) => return Err(e.into()),
         };
+        tx.commit().await?;
 
         Ok(ActiveTimerResponse {
             id,
@@ -787,10 +876,10 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn stop_timer(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         timer_id: Uuid,
     ) -> AppResult<TimeEntryResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let timer: Option<ActiveTimerRow> = sqlx::query_as(
             "SELECT id, user_id, ticket_id, project_id, company_id, work_type_id, notes, started_at \
              FROM active_timers WHERE tenant_id = $1 AND id = $2",
@@ -826,18 +915,29 @@ impl TimeTrackingService {
         };
         let company_id = match timer.company_id {
             Some(v) => v,
-            None => sqlx::query_scalar::<_, Uuid>(
-                "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
-            )
-            .bind(tenant_id)
-            .bind(timer.ticket_id.unwrap_or(Uuid::nil()))
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "Cannot stop timer without an inferable company_id".to_string(),
+            None => {
+                // With no company on the timer we can only infer one from
+                // an associated ticket. Short-circuit when there is no
+                // ticket either, rather than querying `tickets` by
+                // Uuid::nil() (which never matches and is wasted work).
+                let ticket_id = timer.ticket_id.ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Cannot stop timer without an inferable company_id".to_string(),
+                    )
+                })?;
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
                 )
-            })?,
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Cannot stop timer without an inferable company_id".to_string(),
+                    )
+                })?
+            }
         };
 
         // Derive billing from the resolved, tenant-scoped work type and apply
@@ -897,13 +997,14 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rounding_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimeRoundingRuleResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM time_rounding_rules WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, RoundingRuleRow>(
@@ -918,7 +1019,7 @@ impl TimeTrackingService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -926,11 +1027,11 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rounding_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertTimeRoundingRuleRequest,
     ) -> AppResult<TimeRoundingRuleResponse> {
         Self::validate_rounding_method(&request.rounding_method)?;
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
             sqlx::query("UPDATE time_rounding_rules SET is_default = FALSE WHERE tenant_id = $1")
                 .bind(tenant_id)
@@ -968,12 +1069,12 @@ impl TimeTrackingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rounding_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertTimeRoundingRuleRequest,
     ) -> AppResult<TimeRoundingRuleResponse> {
         Self::validate_rounding_method(&request.rounding_method)?;
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
             sqlx::query(
                 "UPDATE time_rounding_rules SET is_default = FALSE WHERE tenant_id = $1 AND id <> $2",
@@ -1016,17 +1117,19 @@ impl TimeTrackingService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_rounding_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_rounding_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let affected =
             sqlx::query("DELETE FROM time_rounding_rules WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
                 .bind(id)
-                .execute(self.db.pool())
+                .execute(&mut *tx)
                 .await?
                 .rows_affected();
         if affected == 0 {
             return Err(AppError::NotFound("TimeRoundingRule".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1055,7 +1158,7 @@ struct WorkTypeDefaults {
 /// (FKs check existence, not ownership).
 async fn fetch_work_type_defaults<'e, E>(
     exec: E,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     work_type_id: Uuid,
 ) -> AppResult<WorkTypeDefaults>
 where
@@ -1084,7 +1187,7 @@ where
 /// caller can both validate and infer company. `NotFound` cross-tenant.
 async fn assert_ticket_in_tenant<'e, E>(
     exec: E,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     ticket_id: Uuid,
 ) -> AppResult<Uuid>
 where
@@ -1101,7 +1204,7 @@ where
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
 async fn assert_company_in_tenant<'e, E>(
     exec: E,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     company_id: Uuid,
 ) -> AppResult<()>
 where
@@ -1171,7 +1274,10 @@ fn apply_rounding(raw_minutes: i32, rule: &RoundingParams) -> i32 {
 /// Tenant default rounding rule, if one is configured. `None` => identity
 /// (raw minutes, no rounding). Missing-rule = identity is a deliberate M1
 /// choice; tracked as debt, not a silent gap.
-async fn default_rounding_rule<'e, E>(exec: E, tenant_id: Uuid) -> AppResult<Option<RoundingParams>>
+async fn default_rounding_rule<'e, E>(
+    exec: E,
+    tenant_id: TenantId,
+) -> AppResult<Option<RoundingParams>>
 where
     E: sqlx::PgExecutor<'e>,
 {
@@ -1278,10 +1384,18 @@ impl From<TimeEntryRow> for TimeEntryResponse {
             company_id: r.company_id,
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
-            billing_status: r.billing_status.unwrap_or_else(|| "not_billed".to_string()),
+            billing_status: r
+                .billing_status
+                .as_deref()
+                .and_then(BillingStatus::from_str)
+                .unwrap_or_default(),
             hourly_rate: r.hourly_rate,
             total_amount: r.total_amount,
-            approval_status: r.approval_status.unwrap_or_else(|| "pending".to_string()),
+            approval_status: r
+                .approval_status
+                .as_deref()
+                .and_then(ApprovalStatus::from_str)
+                .unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

@@ -80,6 +80,13 @@ async fn ready_returns_503_when_db_pool_closed(pool: PgPool) {
     pool.close().await;
     let app = boot(pool).await;
 
+    // `pool.close()` resolves once the close is requested, but on a
+    // loaded CI runner the pooled connections may not have fully torn
+    // down by the time `boot()` returns. Yield once so the runtime can
+    // run the close-out tasks before we probe, making the subsequent
+    // `SELECT 1` deterministically hit a closed pool.
+    tokio::task::yield_now().await;
+
     let resp = app
         .client
         .get(app.url("/api/v1/ready"))

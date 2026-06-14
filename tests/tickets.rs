@@ -16,23 +16,6 @@
 mod common;
 
 use sqlx::PgPool;
-use uuid::Uuid;
-
-async fn seed_company(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO companies (id, tenant_id, name)
-        VALUES ($1, $2, 'Acme Co')
-        "#,
-    )
-    .bind(id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("seed test company");
-    id
-}
 
 /// Assert a ticket DTO carries its JOINed name/color fields populated from
 /// the database. This is the F3 regression guard: the route layer used to
@@ -58,7 +41,7 @@ fn assert_joined_fields_populated(t: &serde_json::Value, label: &str) {
 #[sqlx::test]
 async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = seed_company(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 
@@ -193,5 +176,105 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
         note_resp.status().is_success(),
         "add note should 2xx, got {}",
         note_resp.status()
+    );
+}
+
+/// PMS-182: editing a ticket's description records a change-history entry,
+/// and the per-record history endpoint exposes it to a normal tenant member
+/// with the changed field surfaced. Also pins that an unknown entity type is
+/// a 404 (the whitelist guard) rather than an empty 200.
+#[sqlx::test]
+async fn ticket_history_records_description_edit(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Printer jammed",
+            "company_id": company_id,
+            "description": "Paper stuck in tray 2.",
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket")
+        .json()
+        .await
+        .expect("create ticket JSON");
+    let ticket_id = created["id"].as_str().expect("ticket id").to_string();
+
+    // Edit the description.
+    let update_status = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "description": "Paper stuck in tray 2 and toner low." }))
+        .send()
+        .await
+        .expect("update ticket")
+        .status();
+    assert!(update_status.is_success(), "PUT description should 2xx");
+
+    // History endpoint must surface the edit, attributing the changed field.
+    let hist: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/audit-log/entity/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get ticket history")
+        .json()
+        .await
+        .expect("history JSON");
+    let entries = hist["data"].as_array().expect("history has data");
+    let edit = entries
+        .iter()
+        .find(|e| {
+            e["action"].as_str() == Some("update")
+                && e["changed_fields"]
+                    .as_array()
+                    .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("description")))
+        })
+        .expect("history must contain the description edit with changed_fields");
+    assert!(
+        edit["timestamp"].as_str().is_some(),
+        "history entry must carry a timestamp"
+    );
+    // PMS-204: the entry must carry the before/after content of the change,
+    // not just the field name.
+    let desc_change = edit["changes"]
+        .as_array()
+        .expect("entry has a changes array")
+        .iter()
+        .find(|c| c["field"].as_str() == Some("description"))
+        .expect("changes must include the description field");
+    assert_eq!(
+        desc_change["old"].as_str(),
+        Some("Paper stuck in tray 2."),
+        "change must carry the old description"
+    );
+    assert_eq!(
+        desc_change["new"].as_str(),
+        Some("Paper stuck in tray 2 and toner low."),
+        "change must carry the new description"
+    );
+
+    // Unknown entity type is rejected by the whitelist, not silently emptied.
+    let bad = app
+        .client
+        .get(app.url(&format!("/api/v1/audit-log/entity/secrets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send bad-entity history");
+    assert_eq!(
+        bad.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "non-whitelisted entity type must 404"
     );
 }

@@ -120,12 +120,31 @@ pub async fn handle_authorize(
             return Err(AuthError::InvalidScope);
         }
 
-        // 4. Authentication. If unauthenticated or `prompt=login`, we
-        //    bail out to NeedsLogin via the outer match, not here.
-        let session = current_session.ok_or(AuthError::LoginRequired)?;
-        if req.prompt.as_deref() == Some("none") && current_session.is_none() {
-            // prompt=none: never interact. We can only succeed if the
-            // user is already authenticated; otherwise spec error.
+        // The authorize endpoint issues an authorization code, so the
+        // client must be allowed to use the authorization_code grant.
+        // The token endpoint enforces this too, but rejecting here avoids
+        // minting a code a client can never redeem.
+        if !client
+            .allowed_grant_types
+            .contains(&mokosh_auth_core::GrantType::AuthorizationCode)
+        {
+            return Err(AuthError::UnauthorizedClient(
+                "client may not use the authorization code grant".into(),
+            ));
+        }
+
+        // 4. Authentication. When unauthenticated, or when the RP forces
+        //    re-auth with `prompt=login`, bail out to LoginRequired; the
+        //    outer match turns that into NeedsLogin (or, for
+        //    `prompt=none`, a spec error redirect).
+        let session = match current_session {
+            Some(s) => s,
+            None => return Err(AuthError::LoginRequired),
+        };
+        if req.prompt.as_deref() == Some("login") {
+            // prompt=login: the RP demands a fresh authentication even
+            // though an OP session exists. Force re-auth rather than
+            // silently reusing the session.
             return Err(AuthError::LoginRequired);
         }
 

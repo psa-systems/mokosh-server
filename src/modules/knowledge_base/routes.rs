@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::KbService;
-use crate::modules::auth::{RequireKnowledgeBase, RequireManager};
+use crate::modules::auth::{RequireKnowledgeBase, RequireManager, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -71,7 +71,7 @@ async fn list_categories(
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbCategoryResponse>>> {
-    let (items, total) = s.service.list_categories(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_categories(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -86,7 +86,7 @@ async fn create_category(
     Json(req): Json<UpsertKbCategoryRequest>,
 ) -> AppResult<Json<KbCategoryResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_category(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_category(u.tenant(), &req).await?))
 }
 
 async fn update_category(
@@ -97,9 +97,7 @@ async fn update_category(
     Json(req): Json<UpsertKbCategoryRequest>,
 ) -> AppResult<Json<KbCategoryResponse>> {
     req.validate()?;
-    Ok(Json(
-        s.service.update_category(u.tenant_id, id, &req).await?,
-    ))
+    Ok(Json(s.service.update_category(u.tenant(), id, &req).await?))
 }
 
 async fn delete_category(
@@ -108,7 +106,7 @@ async fn delete_category(
     _m: RequireManager,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_category(u.tenant_id, id).await
+    s.service.delete_category(u.tenant(), id).await
 }
 
 async fn list_articles(
@@ -118,10 +116,7 @@ async fn list_articles(
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
     f.validate()?;
-    let (items, total) = s
-        .service
-        .list_articles(u.tenant_id, &f, &pagination)
-        .await?;
+    let (items, total) = s.service.list_articles(u.tenant(), &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -132,11 +127,12 @@ async fn list_articles(
 async fn create_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
     Json(req): Json<CreateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_article(u.tenant_id, u.id, &req).await?,
+        s.service.create_article(u.tenant(), u.id, &req).await?,
     ))
 }
 
@@ -145,20 +141,19 @@ async fn get_article(
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleResponse>> {
-    Ok(Json(s.service.get_article(u.tenant_id, id).await?))
+    Ok(Json(s.service.get_article(u.tenant(), id).await?))
 }
 
 async fn update_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service
-            .update_article(u.tenant_id, id, u.id, &req)
-            .await?,
+        s.service.update_article(u.tenant(), id, u.id, &req).await?,
     ))
 }
 
@@ -168,7 +163,7 @@ async fn delete_article(
     _m: RequireManager,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_article(u.tenant_id, id).await
+    s.service.delete_article(u.tenant(), id).await
 }
 
 async fn list_article_versions(
@@ -179,7 +174,7 @@ async fn list_article_versions(
 ) -> AppResult<Json<PaginatedResponse<KbArticleVersionResponse>>> {
     let (items, total) = s
         .service
-        .list_article_versions(u.tenant_id, id, &pagination)
+        .list_article_versions(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -195,7 +190,7 @@ async fn restore_article_version(
 ) -> AppResult<Json<KbArticleResponse>> {
     Ok(Json(
         s.service
-            .restore_article_version(u.tenant_id, id, version_number, u.id)
+            .restore_article_version(u.tenant(), id, version_number, u.id)
             .await?,
     ))
 }
@@ -206,7 +201,7 @@ async fn mark_helpful(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
     Ok(Json(
-        s.service.increment_helpful(u.tenant_id, id, u.id).await?,
+        s.service.increment_helpful(u.tenant(), id, u.id).await?,
     ))
 }
 
@@ -217,7 +212,7 @@ async fn mark_not_helpful(
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
     Ok(Json(
         s.service
-            .increment_not_helpful(u.tenant_id, id, u.id)
+            .increment_not_helpful(u.tenant(), id, u.id)
             .await?,
     ))
 }
@@ -228,6 +223,6 @@ async fn get_article_vote(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
     Ok(Json(
-        s.service.get_article_vote(u.tenant_id, id, u.id).await?,
+        s.service.get_article_vote(u.tenant(), id, u.id).await?,
     ))
 }

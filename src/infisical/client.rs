@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::error::CoreError;
+use crate::utils::error::AppError;
 
 /// Default token expiry margin (refresh 5 minutes before expiry).
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(300);
@@ -58,12 +58,15 @@ impl InfisicalClient {
         base_url: &str,
         client_id: &str,
         client_secret: &str,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, AppError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| {
-                CoreError::ExternalService(format!("Failed to create HTTP client: {}", e))
+                AppError::external_service(
+                    "Infisical",
+                    format!("Failed to create HTTP client: {}", e),
+                )
             })?;
 
         Ok(Self {
@@ -75,7 +78,7 @@ impl InfisicalClient {
         })
     }
 
-    async fn authenticate(&self) -> Result<AuthToken, CoreError> {
+    async fn authenticate(&self) -> Result<AuthToken, AppError> {
         info!("Authenticating with Infisical");
 
         let url = format!("{}/api/v1/auth/universal-auth/login", self.base_url);
@@ -92,20 +95,23 @@ impl InfisicalClient {
             .send()
             .await
             .map_err(|e| {
-                CoreError::ExternalService(format!("Infisical auth request failed: {}", e))
+                AppError::external_service(
+                    "Infisical",
+                    format!("Infisical auth request failed: {}", e),
+                )
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(CoreError::ExternalService(format!(
-                "Infisical authentication failed ({}): {}",
-                status, body
-            )));
+            return Err(AppError::external_service(
+                "Infisical",
+                format!("Infisical authentication failed ({}): {}", status, body),
+            ));
         }
 
         let login: LoginResponse = response.json().await.map_err(|e| {
-            CoreError::ExternalService(format!("Failed to parse auth response: {}", e))
+            AppError::external_service("Infisical", format!("Failed to parse auth response: {}", e))
         })?;
 
         let expires_at = Instant::now() + Duration::from_secs(login.expires_in);
@@ -122,7 +128,7 @@ impl InfisicalClient {
     }
 
     /// Ensure we have a valid token, refreshing if necessary.
-    pub async fn ensure_authenticated(&self) -> Result<String, CoreError> {
+    pub async fn ensure_authenticated(&self) -> Result<String, AppError> {
         {
             let token = self.token.read().await;
             if let Some(ref t) = *token {
@@ -147,22 +153,51 @@ impl InfisicalClient {
         Ok(access_token)
     }
 
-    /// Make an authenticated GET request.
-    pub async fn get(&self, path: &str) -> Result<reqwest::Response, CoreError> {
+    /// Send a request built by `build`, transparently recovering from a
+    /// single 401. `build` is a closure that takes the current bearer
+    /// token and returns a ready-to-send `RequestBuilder`; it may be
+    /// invoked twice (once per attempt), so it must not consume captured
+    /// state. On a first-attempt 401 the cached token is cleared, a fresh
+    /// token is minted via `ensure_authenticated`, and the request is
+    /// replayed once. A second 401 falls through to `check_response`,
+    /// which surfaces it as an authentication error.
+    async fn send_with_retry<F>(&self, build: F) -> Result<reqwest::Response, AppError>
+    where
+        F: Fn(&str) -> reqwest::RequestBuilder,
+    {
         let token = self.ensure_authenticated().await?;
-        let url = format!("{}{}", self.base_url, path);
+        let response = build(&token).send().await.map_err(|e| {
+            AppError::external_service("Infisical", format!("Request failed: {}", e))
+        })?;
 
-        debug!("GET {}", url);
-
-        let response = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| CoreError::ExternalService(format!("Request failed: {}", e)))?;
+        if response.status().as_u16() == 401 {
+            // Token may be expired or revoked. Clear it, re-authenticate,
+            // and retry once before giving up.
+            warn!("Infisical returned 401, clearing token and retrying once");
+            {
+                let mut token = self.token.write().await;
+                *token = None;
+            }
+            let token = self.ensure_authenticated().await?;
+            let response = build(&token).send().await.map_err(|e| {
+                AppError::external_service("Infisical", format!("Request failed: {}", e))
+            })?;
+            return self.check_response(response).await;
+        }
 
         self.check_response(response).await
+    }
+
+    /// Make an authenticated GET request.
+    pub async fn get(&self, path: &str) -> Result<reqwest::Response, AppError> {
+        let url = format!("{}{}", self.base_url, path);
+        debug!("GET {}", url);
+        self.send_with_retry(|token| {
+            self.http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+        })
+        .await
     }
 
     /// Make an authenticated POST request.
@@ -170,22 +205,16 @@ impl InfisicalClient {
         &self,
         path: &str,
         body: &T,
-    ) -> Result<reqwest::Response, CoreError> {
-        let token = self.ensure_authenticated().await?;
+    ) -> Result<reqwest::Response, AppError> {
         let url = format!("{}{}", self.base_url, path);
-
         debug!("POST {}", url);
-
-        let response = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| CoreError::ExternalService(format!("Request failed: {}", e)))?;
-
-        self.check_response(response).await
+        self.send_with_retry(|token| {
+            self.http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(body)
+        })
+        .await
     }
 
     /// Make an authenticated PATCH request.
@@ -193,22 +222,16 @@ impl InfisicalClient {
         &self,
         path: &str,
         body: &T,
-    ) -> Result<reqwest::Response, CoreError> {
-        let token = self.ensure_authenticated().await?;
+    ) -> Result<reqwest::Response, AppError> {
         let url = format!("{}{}", self.base_url, path);
-
         debug!("PATCH {}", url);
-
-        let response = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| CoreError::ExternalService(format!("Request failed: {}", e)))?;
-
-        self.check_response(response).await
+        self.send_with_retry(|token| {
+            self.http
+                .patch(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(body)
+        })
+        .await
     }
 
     /// Make an authenticated DELETE request.
@@ -216,28 +239,22 @@ impl InfisicalClient {
         &self,
         path: &str,
         body: &T,
-    ) -> Result<reqwest::Response, CoreError> {
-        let token = self.ensure_authenticated().await?;
+    ) -> Result<reqwest::Response, AppError> {
         let url = format!("{}{}", self.base_url, path);
-
         debug!("DELETE {}", url);
-
-        let response = self
-            .http
-            .delete(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| CoreError::ExternalService(format!("Request failed: {}", e)))?;
-
-        self.check_response(response).await
+        self.send_with_retry(|token| {
+            self.http
+                .delete(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(body)
+        })
+        .await
     }
 
     async fn check_response(
         &self,
         response: reqwest::Response,
-    ) -> Result<reqwest::Response, CoreError> {
+    ) -> Result<reqwest::Response, AppError> {
         let status = response.status();
 
         if status.is_success() {
@@ -250,26 +267,28 @@ impl InfisicalClient {
                 warn!("Infisical returned 401, clearing token");
                 let mut token = self.token.write().await;
                 *token = None;
-                Err(CoreError::AuthenticationFailed(
+                Err(AppError::external_service(
+                    "Infisical",
                     "Infisical authentication failed".to_string(),
                 ))
             }
-            403 => Err(CoreError::AuthorizationDenied(
+            403 => Err(AppError::external_service(
+                "Infisical",
                 "Infisical access denied: insufficient permissions".to_string(),
             )),
             404 => {
                 let body = response.text().await.unwrap_or_default();
-                Err(CoreError::NotFound(format!(
+                Err(AppError::NotFound(format!(
                     "Infisical resource not found: {}",
                     body
                 )))
             }
             _ => {
                 let body = response.text().await.unwrap_or_default();
-                Err(CoreError::ExternalService(format!(
-                    "Infisical API error ({}): {}",
-                    status, body
-                )))
+                Err(AppError::external_service(
+                    "Infisical",
+                    format!("Infisical API error ({}): {}", status, body),
+                ))
             }
         }
     }

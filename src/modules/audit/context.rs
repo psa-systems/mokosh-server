@@ -10,6 +10,7 @@
 
 use std::net::SocketAddr;
 
+use crate::modules::auth::TenantId;
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use serde_json::Value;
@@ -115,6 +116,12 @@ impl AuditAction {
 /// tenant scope) so the NOT NULL column is always populated even when
 /// the actor is anonymous. Actor / ip / user-agent come from `ctx`.
 ///
+/// PMS-139: `tenant_id` is the typed [`TenantId`], so a swept service hands
+/// its scope straight through. Callers that still hold a bare `Uuid` - the
+/// `auth` and `tickets` modules (not yet swept), the `tenants` create path
+/// (a freshly minted id), and the `audit_auth_event` helper - bridge via
+/// `TenantId::from_trusted(..)`; those bridges disappear as each is swept.
+///
 /// Usage from a service mutation:
 /// ```ignore
 /// let mut tx = self.db.pool().begin().await?;
@@ -128,7 +135,7 @@ impl AuditAction {
 #[allow(clippy::too_many_arguments)]
 pub async fn audit_write<'e, E>(
     exec: E,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     ctx: &AuditCtx,
     action: AuditAction,
     entity_type: &str,
@@ -181,5 +188,18 @@ where
         ip,
         user_agent,
     };
-    audit_write(exec, tenant_id, &ctx, action, "auth", user_id, None, None).await
+    audit_write(
+        exec,
+        // SAFETY (PMS-285): `tenant_id` is the caller's own authenticated tenant,
+        // threaded in by the auth flow recording this event; the audit row is
+        // written under the same scope, so bridging the bare Uuid is sound.
+        TenantId::from_trusted(tenant_id),
+        &ctx,
+        action,
+        "auth",
+        user_id,
+        None,
+        None,
+    )
+    .await
 }

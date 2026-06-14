@@ -1,7 +1,9 @@
 ---
 
-# Validate code on every push and pull request: fmt, clippy, compile,
-# unit tests, integration tests.
+# Fast, database-free gate: fmt, clippy, compile, unit + doc tests. Runs on
+# every push and pull request. The Postgres-backed integration suite lives in
+# a separate workflow (integration.yml) so this gate stays fast and the local
+# `just pre-commit` hook can mirror it one-to-one (PMS-267).
 name: Check
 
 on:
@@ -12,41 +14,10 @@ on:
     branches:
       - main
 
-# sqlx compile-time query checks read the committed `.sqlx/` offline data
-# instead of connecting to a database. Runtime sqlx calls in the
-# integration tests still hit the live Postgres service below.
-env:
-  SQLX_OFFLINE: "true"
-
 jobs:
   check:
-    name: fmt + clippy + compile + tests
+    name: fmt + clippy + compile + unit/doc tests
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
-
-    # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
-    # fresh database per invocation against the URL in DATABASE_URL, so
-    # this single instance fans out to all integration tests.
-    #
-    # The Forgejo Actions runner puts the job container and its service
-    # containers on a shared bridge network; services are reachable from
-    # the job container by their service name on the container-internal
-    # port. localhost would resolve to the job container itself, where
-    # nothing is listening on 5432.
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-
-    env:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
 
     steps:
       - name: Clone the repository
@@ -56,6 +27,15 @@ jobs:
         uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+
+      - name: Migration prefix uniqueness
+        # PMS-198: fail loud when two migrations share a numeric prefix.
+        # sqlx keys its `_sqlx_migrations` ledger on that prefix, so a
+        # cross-branch collision (e.g. two branches both picking 027) makes
+        # the applied version ambiguous. Cheap static check, runs first.
+        shell: nu {0}
+        run: |
+          nu scripts/check-migration-prefixes.nu
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -69,12 +49,8 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
-      - name: Integration tests
-        # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
-        # Each test creates a per-test database AND holds the sqlx-test
-        # maintenance pool; at default per-cpu parallelism on a 16-core
-        # runner the maintenance pool was timing out with PoolTimedOut on
-        # tests/auth.rs (14 tests). 4 in-flight is well within the
-        # postgres default max_connections (100); slight wall-clock cost,
-        # full reliability.
-        run: cargo test --test auth --test contacts --test tenants --test tickets --test notifications --test rmm --test dispatch_stub --test readiness --test scheduler -- --test-threads=4
+      - name: Doc tests
+        # Runs the doctests, including the PMS-139 `compile_fail` guard that
+        # pins "a raw Uuid cannot be passed where a TenantId is required".
+        # `--lib` above does not execute doctests.
+        run: cargo test --doc

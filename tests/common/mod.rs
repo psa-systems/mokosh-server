@@ -21,6 +21,8 @@ use std::sync::Arc;
 use mokosh_server::api::create_api_router;
 use mokosh_server::utils::email::{LogMailer, Mailer};
 use mokosh_server::Database;
+use rust_decimal::Decimal;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -47,12 +49,50 @@ pub struct TestApp {
     /// than drop the field.
     #[allow(dead_code)]
     pub pool: PgPool,
+    /// PMS-285: the unprivileged (`NOBYPASSRLS`) request-serving pool when the
+    /// app was booted via [`boot_rls`]; `None` for the default superuser
+    /// [`boot`]. RLS-exercising suites read this to prove fail-closed behaviour
+    /// through the actual application role (e.g. a no-GUC read returns zero
+    /// rows). `#[allow(dead_code)]` for the same per-binary reason as `pool`.
+    #[allow(dead_code)]
+    pub app_pool: Option<PgPool>,
 }
 
 impl TestApp {
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
+}
+
+/// Seed a company named "Acme Co" under the default tenant; returns its
+/// id. Consolidates the per-file copies that several billing/time/ticket
+/// test binaries used to each define.
+///
+/// `#[allow(dead_code)]` for the same per-binary reason as the other
+/// helpers: each integration-test binary compiles its own copy of
+/// `common::` and not every one seeds a company.
+#[allow(dead_code)]
+pub async fn seed_company(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO companies (id, tenant_id, name)
+        VALUES ($1, $2, 'Acme Co')
+        "#,
+    )
+    .bind(id)
+    .bind(DEFAULT_TENANT_ID)
+    .execute(pool)
+    .await
+    .expect("seed test company");
+    id
+}
+
+/// Parse a decimal string literal into a [`Decimal`] for test fixtures
+/// that bind money columns. Panics on malformed input (test-only).
+#[allow(dead_code)]
+pub fn dec(s: &str) -> Decimal {
+    s.parse().expect("parse Decimal literal")
 }
 
 /// Bring up the API against `pool` on a random localhost port.
@@ -62,6 +102,77 @@ impl TestApp {
 /// `tests/sla.rs`, `tests/contracts.rs`) never boot the HTTP app.
 #[allow(dead_code)]
 pub async fn boot(pool: PgPool) -> TestApp {
+    let db = Database::from_pool(pool.clone());
+    boot_with_db(pool, db, None).await
+}
+
+/// PMS-285: bring up the API with the request-serving connection running as an
+/// unprivileged `NOBYPASSRLS` role, so the HTTP suite exercises Row Level
+/// Security rather than only the app-layer `WHERE tenant_id` filters.
+///
+/// `#[sqlx::test]` provisions a single superuser pool; this builds a SECOND
+/// pool that connects as a freshly created `NOSUPERUSER NOBYPASSRLS` role
+/// (the production `mokosh_app` posture) against the same per-test database,
+/// and wires it as the app pool while the superuser pool stays the migrator
+/// pool. Seed helpers (`seed_*`) keep writing through the returned superuser
+/// `pool`, so test setup is unaffected; only the request path is RLS-bound.
+#[allow(dead_code)]
+pub async fn boot_rls(pool: PgPool) -> TestApp {
+    let app_pool = build_app_role_pool(&pool).await;
+    let db = Database::from_pools(app_pool.clone(), pool.clone());
+    boot_with_db(pool, db, Some(app_pool)).await
+}
+
+/// Create a per-test `NOSUPERUSER NOBYPASSRLS` role, grant it the same
+/// privileges `mokosh_app` gets in production, and return a pool that connects
+/// as it against the same database as `superuser_pool`.
+///
+/// Roles are cluster-global while each `#[sqlx::test]` gets its own database,
+/// so the role name is made unique to avoid cross-test clashes (mirroring
+/// `tests/rls_isolation.rs`). The role owns no objects, so it stays exempt from
+/// neither RLS nor the `tenants`-root carve-out: exactly the production posture.
+#[allow(dead_code)]
+pub async fn build_app_role_pool(superuser_pool: &PgPool) -> PgPool {
+    let role = format!("mokosh_app_test_{}", Uuid::new_v4().simple());
+    let password = "app-role-test-pw";
+
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD '{password}' NOSUPERUSER NOBYPASSRLS"
+    ))
+    .execute(superuser_pool)
+    .await
+    .expect("create unprivileged app role");
+
+    for stmt in [
+        format!("GRANT USAGE ON SCHEMA public TO {role}"),
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"),
+        format!("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {role}"),
+    ] {
+        sqlx::query(&stmt)
+            .execute(superuser_pool)
+            .await
+            .unwrap_or_else(|e| panic!("grant `{stmt}`: {e}"));
+    }
+
+    // Derive the app-role connection from the superuser pool's options so it
+    // targets the SAME per-test database, only swapping the login role.
+    let opts = superuser_pool
+        .connect_options()
+        .as_ref()
+        .clone()
+        .username(&role)
+        .password(password);
+
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(opts)
+        .await
+        .expect("connect app-role pool")
+}
+
+#[allow(dead_code)]
+async fn boot_with_db(pool: PgPool, db: Database, app_pool: Option<PgPool>) -> TestApp {
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
     // sqlx error swallowed by `AppError::Database("Database operation
@@ -74,8 +185,6 @@ pub async fn boot(pool: PgPool) -> TestApp {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error,mokosh_server=info")),
         )
         .try_init();
-
-    let db = Database::from_pool(pool.clone());
 
     // Stub Google OAuth client - tests never drive the Google flow.
     let google_oauth = Arc::new(
@@ -127,6 +236,7 @@ pub async fn boot(pool: PgPool) -> TestApp {
         base: format!("http://{addr}"),
         client,
         pool,
+        app_pool,
     }
 }
 
@@ -165,12 +275,20 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     (user_id, email, password)
 }
 
-/// Seed a non-admin user under the default tenant. Returns
-/// `(user_id, email, plaintext_password)`. Caller picks the email +
-/// role so a single test can stand up several distinct seeded users.
-/// Password is uniform across seeds; tests run against an ephemeral DB.
+/// Seed a non-admin user under `tenant_id`. Returns
+/// `(user_id, email, plaintext_password)`. Caller picks the tenant,
+/// email + role so a single test can stand up several distinct seeded
+/// users (including the same email under two tenants, for the PMS-138
+/// colliding-email scenarios). Password is uniform across seeds; tests
+/// run against an ephemeral DB. Pass [`DEFAULT_TENANT_ID`] for the
+/// common single-tenant case.
 #[allow(dead_code)]
-pub async fn seed_user(pool: &PgPool, email: &str, role: &str) -> (Uuid, String, String) {
+pub async fn seed_user(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    email: &str,
+    role: &str,
+) -> (Uuid, String, String) {
     let password = "test-password-12345".to_string();
     let password_hash =
         mokosh_server::utils::crypto::hash_password(&password).expect("hash seeded user password");
@@ -186,7 +304,7 @@ pub async fn seed_user(pool: &PgPool, email: &str, role: &str) -> (Uuid, String,
         "#,
     )
     .bind(user_id)
-    .bind(DEFAULT_TENANT_ID)
+    .bind(tenant_id)
     .bind(email)
     .bind(&password_hash)
     .bind(role)
@@ -195,6 +313,40 @@ pub async fn seed_user(pool: &PgPool, email: &str, role: &str) -> (Uuid, String,
     .expect("insert seeded user");
 
     (user_id, email.to_string(), password)
+}
+
+/// Seed a user with a caller-chosen `id` and `tenant_id`. Used by the
+/// Bunyip placement tests, where the `users.id` must equal the OIDC `sub`
+/// and the row must start in a specific tenant (e.g. the default tenant)
+/// to exercise the PMS-245 backfill.
+#[allow(dead_code)]
+pub async fn seed_user_in_tenant(
+    pool: &PgPool,
+    id: Uuid,
+    tenant_id: Uuid,
+    email: &str,
+    role: &str,
+) {
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password("test-password-12345").expect("hash password");
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (
+            id, tenant_id, email, password_hash,
+            first_name, last_name, role, status, email_verified_at
+        )
+        VALUES ($1, $2, $3, $4, 'Test', 'User', $5, 'active', NOW())
+        "#,
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(email)
+    .bind(&password_hash)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("insert seeded user in tenant");
 }
 
 /// Seed a fresh tenant + admin so a test can prove tenant isolation.

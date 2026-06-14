@@ -20,7 +20,7 @@ use super::{
     MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse,
     ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
-use crate::modules::auth::middleware::RequireAuth;
+use crate::modules::auth::middleware::{RequireAuth, RequireManager};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -164,15 +164,25 @@ async fn logout(
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let _ = crate::modules::audit::audit_auth_event(
-        state.auth_service.pool(),
-        user.tenant_id,
-        Some(user.id),
-        crate::modules::audit::AuditAction::Logout,
-        Some(addr.ip().to_string()),
-        ua,
-    )
-    .await;
+    // Out-of-band on its own tenant-scoped tx so the RLS GUC is set; a
+    // log-write failure must not fail the logout. PMS-256.
+    if let Ok(mut tx) = state
+        .auth_service
+        .db()
+        .begin_with_tenant(user.tenant_id)
+        .await
+    {
+        let _ = crate::modules::audit::audit_auth_event(
+            &mut *tx,
+            user.tenant_id,
+            Some(user.id),
+            crate::modules::audit::AuditAction::Logout,
+            Some(addr.ip().to_string()),
+            ua,
+        )
+        .await;
+        let _ = tx.commit().await;
+    }
 
     Ok(())
 }
@@ -291,7 +301,7 @@ async fn get_sessions(
 
     let (sessions, total) = state
         .auth_service
-        .get_user_sessions(user.id, current_session_id, &pagination)
+        .get_user_sessions(user.tenant_id, user.id, current_session_id, &pagination)
         .await?;
 
     Ok(Json(PaginatedResponse::from_params(
@@ -412,13 +422,11 @@ async fn revoke_api_key(
 /// closeout for the auth module).
 async fn list_users(
     State(state): State<AuthRouterState>,
-    RequireAuth(user): RequireAuth,
+    manager: RequireManager,
     Query(filter): Query<ListUsersFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<UserResponse>>> {
-    if !user.role.is_admin() && !matches!(user.role, super::UserRole::Manager) {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
-    }
+    let user = manager.0;
     filter.validate()?;
 
     let (users, total) = state

@@ -58,19 +58,6 @@ impl UserRepository for PgUserRepository {
         row.map(User::try_from).transpose()
     }
 
-    async fn list_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<User>, AuthError> {
-        let rows: Vec<UserRow> = sqlx::query_as(&format!(
-            "{SELECT_USER}
-             WHERE tenant_id = $1 AND deleted_at IS NULL
-             ORDER BY created_at DESC"
-        ))
-        .bind(tenant_id.0)
-        .fetch_all(self.pool.pg())
-        .await
-        .map_err(db_err)?;
-        rows.into_iter().map(User::try_from).collect()
-    }
-
     async fn find_by_email_globally(&self, email: &str) -> Result<Vec<User>, AuthError> {
         // LIMIT 2: we only need to distinguish "exactly one match" from
         // "ambiguous" (>= 2). No reason to read more rows than that.
@@ -148,7 +135,13 @@ impl UserRepository for PgUserRepository {
         threshold: i32,
         lock_for: chrono::Duration,
     ) -> Result<mokosh_auth_core::FailedLoginOutcome, AuthError> {
-        let lock_for_secs = lock_for.num_seconds().max(0);
+        // Bind the lockout window as a native PgInterval rather than
+        // concatenating seconds into a string and casting to INTERVAL.
+        let lock_interval = sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: lock_for.num_seconds().max(0).saturating_mul(1_000_000),
+        };
         // Increment + conditionally set locked_until in one statement so
         // parallel failed-logins do not race the threshold check.
         let row: (i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
@@ -156,7 +149,7 @@ impl UserRepository for PgUserRepository {
              SET failed_login_count = failed_login_count + 1,
                  last_failed_login_at = NOW(),
                  locked_until = CASE
-                     WHEN failed_login_count + 1 >= $2 THEN NOW() + ($3 || ' seconds')::INTERVAL
+                     WHEN failed_login_count + 1 >= $2 THEN NOW() + $3
                      ELSE locked_until
                  END,
                  updated_at = NOW()
@@ -165,7 +158,7 @@ impl UserRepository for PgUserRepository {
         )
         .bind(id.0)
         .bind(threshold)
-        .bind(lock_for_secs.to_string())
+        .bind(lock_interval)
         .fetch_one(self.pool.pg())
         .await
         .map_err(db_err)?;

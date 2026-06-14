@@ -15,7 +15,6 @@ use sqlx::PgPool;
 /// Every PMS-17 test starts from "I have a company"; this consolidates
 /// the bearer + POST boilerplate so each test body stays on the actual
 /// behaviour under test.
-#[allow(dead_code)]
 async fn create_company(app: &common::TestApp, token: &str, name: &str) -> String {
     let body = serde_json::json!({ "name": name });
     let resp = app
@@ -39,7 +38,6 @@ async fn create_company(app: &common::TestApp, token: &str, name: &str) -> Strin
 }
 
 /// Helper: create a site through the API and return its id.
-#[allow(dead_code)]
 async fn create_site(
     app: &common::TestApp,
     token: &str,
@@ -611,6 +609,124 @@ async fn create_contact_with_portal_access_flips_flag(pool: PgPool) {
         without_get["is_portal_user"].as_bool(),
         Some(false),
         "omitting create_portal_access should leave is_portal_user=false"
+    );
+}
+
+// ============================================================================
+// PMS-136: granting portal access enqueues a setup-link email + token row
+// ============================================================================
+
+/// Count outstanding (unused, unexpired) setup tokens for a contact.
+async fn setup_token_count(pool: &PgPool, contact_id: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM portal_setup_tokens \
+         WHERE contact_id = $1 AND used_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(uuid::Uuid::parse_str(contact_id).expect("contact uuid"))
+    .fetch_one(pool)
+    .await
+    .expect("count setup tokens")
+}
+
+/// AC2 + AC3 + AC8: `create_portal_access: true` on create and a
+/// `false -> true` `is_portal_user` transition on update each insert exactly
+/// one `portal_setup_tokens` row (the emailed setup link). A re-grant of an
+/// already-portal contact mints no second token, and a plain contact (no
+/// flag) gets none (negative control).
+#[sqlx::test]
+async fn granting_portal_access_mints_setup_token(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    // (1) create_portal_access: true -> one token row.
+    let created = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Portal",
+            "last_name": "User",
+            "email": "portal@acme.example",
+            "create_portal_access": true,
+        }))
+        .send()
+        .await
+        .expect("create portal contact");
+    assert!(created.status().is_success());
+    let created_json: serde_json::Value = created.json().await.expect("created JSON");
+    let portal_id = created_json["id"].as_str().expect("portal id").to_string();
+    assert_eq!(
+        setup_token_count(&pool, &portal_id).await,
+        1,
+        "create_portal_access=true inserts exactly one setup token"
+    );
+
+    // (2) Negative control: a plain contact gets no token.
+    let plain = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Plain",
+            "last_name": "Contact",
+            "email": "plain@acme.example",
+        }))
+        .send()
+        .await
+        .expect("create plain contact");
+    assert!(plain.status().is_success());
+    let plain_json: serde_json::Value = plain.json().await.expect("plain JSON");
+    let plain_id = plain_json["id"].as_str().expect("plain id").to_string();
+    assert_eq!(
+        setup_token_count(&pool, &plain_id).await,
+        0,
+        "omitting create_portal_access mints no token"
+    );
+
+    // (3) update_contact transition false -> true grants + mints a token.
+    let granted = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{plain_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_portal_user": true }))
+        .send()
+        .await
+        .expect("grant via update");
+    assert!(
+        granted.status().is_success(),
+        "update grant should 2xx, got {}",
+        granted.status()
+    );
+    let granted_json: serde_json::Value = granted.json().await.expect("granted JSON");
+    assert_eq!(
+        granted_json["is_portal_user"].as_bool(),
+        Some(true),
+        "update with is_portal_user=true flips the flag"
+    );
+    assert_eq!(
+        setup_token_count(&pool, &plain_id).await,
+        1,
+        "false->true transition mints exactly one setup token"
+    );
+
+    // (4) Re-grant (already true) mints NO second token.
+    let regrant = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{plain_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_portal_user": true }))
+        .send()
+        .await
+        .expect("re-grant via update");
+    assert!(regrant.status().is_success());
+    assert_eq!(
+        setup_token_count(&pool, &plain_id).await,
+        1,
+        "re-saving an already-portal contact does not mint a second token"
     );
 }
 

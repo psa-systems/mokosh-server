@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -17,13 +18,9 @@ pub struct AssetsService {
 }
 
 impl AssetsService {
-    pub fn new(db: Database) -> Self {
-        Self {
-            db,
-            encryption_key: [0u8; 32],
-        }
-    }
-
+    // PMS-188: the zero-key `new()` constructor was removed. Every asset
+    // secret (credential_vault, configuration_item) must be encrypted under
+    // the configured key, so the only constructor takes that key explicitly.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
         Self { db, encryption_key }
     }
@@ -32,13 +29,14 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_types(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetTypeResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM asset_types WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, AssetTypeRow>(
@@ -49,7 +47,7 @@ impl AssetsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -57,10 +55,11 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertAssetTypeRequest,
     ) -> AppResult<AssetTypeResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO asset_types (id, tenant_id, name, icon, parent_type_id, is_active)
                VALUES ($1, $2, $3, $4, $5, $6)"#,
@@ -71,8 +70,9 @@ impl AssetsService {
         .bind(&request.icon)
         .bind(request.parent_type_id)
         .bind(request.is_active)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(AssetTypeResponse {
             id,
             name: request.name.clone(),
@@ -85,10 +85,11 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset_type(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertAssetTypeRequest,
     ) -> AppResult<AssetTypeResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE asset_types SET name = $3, icon = $4, parent_type_id = $5,
                    is_active = $6, updated_at = NOW()
@@ -100,12 +101,13 @@ impl AssetsService {
         .bind(&request.icon)
         .bind(request.parent_type_id)
         .bind(request.is_active)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("AssetType".to_string()));
         }
+        tx.commit().await?;
         Ok(AssetTypeResponse {
             id,
             name: request.name.clone(),
@@ -116,16 +118,18 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset_type(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM asset_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("AssetType".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -133,7 +137,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_assets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &AssetFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetResponse>, u64)> {
@@ -153,6 +157,7 @@ impl AssetsService {
         }
         let where_clause = conditions.join(" AND ");
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let count_query = format!("SELECT COUNT(*) FROM assets WHERE {where_clause}");
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
         if let Some(v) = filter.company_id {
@@ -164,7 +169,7 @@ impl AssetsService {
         if let Some(v) = &filter.status {
             cq = cq.bind(v);
         }
-        let total: i64 = cq.fetch_one(self.db.pool()).await?;
+        let total: i64 = cq.fetch_one(&mut *tx).await?;
 
         let query = format!(
             r#"SELECT id, asset_tag, name, asset_type_id, company_id, site_id, contact_id,
@@ -188,19 +193,19 @@ impl AssetsService {
         q = q
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64);
-        let rows = q.fetch_all(self.db.pool()).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         performer: Uuid,
         request: &CreateAssetRequest,
     ) -> AppResult<AssetResponse> {
         let id = Uuid::new_v4();
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO assets (id, tenant_id, asset_tag, name, asset_type_id, company_id,
                                     site_id, contact_id, status, manufacturer, model, serial_number,
@@ -239,7 +244,8 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_asset(&self, tenant_id: Uuid, id: Uuid) -> AppResult<AssetResponse> {
+    pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, AssetRow>(
             r#"SELECT id, asset_tag, name, asset_type_id, company_id, site_id, contact_id,
                       status, manufacturer, model, serial_number, purchase_date,
@@ -248,7 +254,7 @@ impl AssetsService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
         Ok(row.into())
@@ -257,13 +263,21 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         performer: Uuid,
         request: &UpdateAssetRequest,
     ) -> AppResult<AssetResponse> {
         let prior = self.get_asset(tenant_id, id).await?;
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Snapshot before/after so the audit row records the field-level
+        // before -> after diff, not just the action (PMS-204).
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let n = sqlx::query(
             r#"UPDATE assets SET
                 asset_tag = COALESCE($3, asset_tag),
@@ -303,19 +317,30 @@ impl AssetsService {
         if n == 0 {
             return Err(AppError::NotFound("Asset".to_string()));
         }
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let action = if request.status.is_some() && request.status.as_ref() != Some(&prior.status) {
             "status_changed"
         } else {
             "updated"
         };
+        // Persist the before -> after diff as a JSON array of {field, old, new}
+        // so the asset detail page can show the actual content of the edit.
+        let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
+            .unwrap_or(serde_json::Value::Null);
         sqlx::query(
-            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id)
-               VALUES ($1, $2, $3, $4)"#,
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
+               VALUES ($1, $2, $3, $4, $5)"#,
         )
         .bind(tenant_id)
         .bind(id)
         .bind(action)
         .bind(performer)
+        .bind(changes)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -323,16 +348,36 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        performer: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-188: record the deletion in asset_audit_log before the row is
+        // gone, in the same tx as the delete so a rollback drops both and a
+        // vault deletion is never untraceable. The asset_id FK column is not
+        // declared with ON DELETE, so insert the audit row first.
+        sqlx::query(
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id)
+               VALUES ($1, $2, 'deleted', $3)"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(performer)
+        .execute(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM assets WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Asset".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -340,17 +385,18 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_relationships(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetRelationshipResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM asset_relationships
                WHERE tenant_id = $1 AND (parent_asset_id = $2 OR child_asset_id = $2)"#,
         )
         .bind(tenant_id)
         .bind(asset_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, RelRow>(
@@ -363,7 +409,7 @@ impl AssetsService {
         .bind(asset_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -371,11 +417,12 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_relationship(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         parent_id: Uuid,
         request: &CreateAssetRelationshipRequest,
     ) -> AppResult<AssetRelationshipResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO asset_relationships
                (id, tenant_id, parent_asset_id, child_asset_id, relationship_type)
@@ -386,8 +433,9 @@ impl AssetsService {
         .bind(parent_id)
         .bind(request.child_asset_id)
         .bind(&request.relationship_type)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(AssetRelationshipResponse {
             id,
             parent_asset_id: parent_id,
@@ -397,16 +445,18 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset_relationship(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset_relationship(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM asset_relationships WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("AssetRelationship".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -417,16 +467,17 @@ impl AssetsService {
     /// item via `reveal_configuration_item` (audited).
     pub async fn list_configuration_items(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ConfigurationItemSummary>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM configuration_items WHERE tenant_id = $1 AND asset_id = $2",
         )
         .bind(tenant_id)
         .bind(asset_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, ConfigItemRow>(
@@ -439,7 +490,7 @@ impl AssetsService {
         .bind(asset_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         let items: Vec<ConfigurationItemSummary> = rows
             .into_iter()
@@ -461,17 +512,18 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reveal_configuration_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         performer: Uuid,
     ) -> AppResult<ConfigurationItemResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let r = sqlx::query_as::<_, ConfigItemRow>(
             r#"SELECT id, asset_id, name, category, value_encrypted, notes, created_at
                FROM configuration_items WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("ConfigurationItem".to_string()))?;
         let value = crate::utils::crypto::decrypt(&r.value_encrypted, &self.encryption_key)?;
@@ -482,8 +534,9 @@ impl AssetsService {
         .bind(tenant_id)
         .bind(r.asset_id)
         .bind(performer)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ConfigurationItemResponse {
             id: r.id,
             asset_id: r.asset_id,
@@ -498,12 +551,13 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_configuration_item(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         request: &UpsertConfigurationItemRequest,
     ) -> AppResult<ConfigurationItemResponse> {
         let encrypted = crate::utils::crypto::encrypt(&request.value, &self.encryption_key)?;
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO configuration_items
                (id, tenant_id, asset_id, name, category, value_encrypted, notes)
@@ -516,8 +570,9 @@ impl AssetsService {
         .bind(&request.category)
         .bind(&encrypted)
         .bind(&request.notes)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ConfigurationItemResponse {
             id,
             asset_id,
@@ -530,16 +585,18 @@ impl AssetsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_configuration_item(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_configuration_item(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM configuration_items WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("ConfigurationItem".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -550,16 +607,17 @@ impl AssetsService {
     /// credential via `reveal_credential` (audited).
     pub async fn list_credentials(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<CredentialSummary>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM credential_vault WHERE tenant_id = $1 AND asset_id = $2",
         )
         .bind(tenant_id)
         .bind(asset_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, CredRow>(
@@ -574,7 +632,7 @@ impl AssetsService {
         .bind(asset_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let items: Vec<CredentialSummary> = rows
@@ -599,10 +657,11 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reveal_credential(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         performer: Uuid,
     ) -> AppResult<CredentialResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let r = sqlx::query_as::<_, CredRow>(
             r#"SELECT id, name, company_id, asset_id, credential_type,
                       username_encrypted, password_encrypted, url, notes_encrypted,
@@ -611,7 +670,7 @@ impl AssetsService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Credential".to_string()))?;
 
@@ -628,8 +687,9 @@ impl AssetsService {
         .bind(tenant_id)
         .bind(r.asset_id)
         .bind(performer)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(CredentialResponse {
             id: r.id,
@@ -649,7 +709,7 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_credential(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         performer: Uuid,
         request: &CreateCredentialRequest,
@@ -661,15 +721,15 @@ impl AssetsService {
             Some(n) => Some(crate::utils::crypto::encrypt(n, &self.encryption_key)?),
             None => None,
         };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Fetch company_id from the asset for the credential row.
         let company_id: Option<Uuid> =
             sqlx::query_scalar("SELECT company_id FROM assets WHERE id = $1 AND tenant_id = $2")
                 .bind(asset_id)
                 .bind(tenant_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(&mut *tx)
                 .await?;
         let id = Uuid::new_v4();
-        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"INSERT INTO credential_vault
                (id, tenant_id, name, company_id, asset_id, credential_type,
@@ -711,6 +771,8 @@ impl AssetsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
+        // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
             tenant_id,
@@ -742,14 +804,14 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_credential(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
         // PMS-117 audit: snapshot before deleting, omitting the encrypted
         // secret columns. Mutation + audit row share one transaction so a
         // rollback drops both.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             r#"SELECT to_jsonb(t) - 'username_encrypted' - 'password_encrypted'
                       - 'notes_encrypted'
@@ -768,6 +830,8 @@ impl AssetsService {
         if n == 0 {
             return Err(AppError::NotFound("Credential".to_string()));
         }
+        // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
+        // unwrap the TenantId at the boundary.
         audit_write(
             &mut *tx,
             tenant_id,
@@ -795,16 +859,17 @@ impl AssetsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_audit_log(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         asset_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetAuditLogResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM asset_audit_log WHERE tenant_id = $1 AND asset_id = $2",
         )
         .bind(tenant_id)
         .bind(asset_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, AuditRow>(
@@ -817,7 +882,7 @@ impl AssetsService {
         .bind(asset_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }

@@ -92,9 +92,6 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
         issuer: cfg.issuer.clone(),
         authorization_code_ttl: cfg.authorization_code_ttl,
         op_session_ttl: cfg.op_session_ttl,
-        default_access_token_ttl: cfg.access_token_ttl,
-        default_refresh_token_ttl: cfg.refresh_token_ttl,
-        default_refresh_idle_ttl: cfg.refresh_idle_ttl,
         leeway: Duration::seconds(30),
     };
 
@@ -163,12 +160,16 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
     let dek = Arc::new(EncryptionKeySet::new(
         cfg.data_key_version,
         &dek_current_bytes,
-        // Phase-1 keeps prev under version-1 if version is unspecified; in
-        // practice operators set MOKOSH_AUTH_DATA_KEY_VERSION when they
-        // rotate, and the prev version is `version - 1`.
-        dek_prev_bytes
-            .as_ref()
-            .map(|b| (cfg.data_key_version.saturating_sub(1), b)),
+        // PMS-188: the previous key's version defaults to `current - 1`, but a
+        // non-sequential rotation can leave existing blobs tagged with an
+        // older version. MOKOSH_AUTH_DATA_KEY_VERSION_PREV lets the operator
+        // state the previous version explicitly so those blobs still decrypt.
+        dek_prev_bytes.as_ref().map(|b| {
+            let prev_version = cfg
+                .data_key_version_prev
+                .unwrap_or_else(|| cfg.data_key_version.saturating_sub(1));
+            (prev_version, b)
+        }),
     ));
 
     let public_signup_enabled = std::env::var("MOKOSH_PUBLIC_SIGNUP_ENABLED")
@@ -352,7 +353,10 @@ pub async fn bootstrap(cfg: AuthConfig, pool: sqlx::PgPool) -> Result<MokoshAuth
 /// as dev so cookies are not flagged Secure (which would be ignored by
 /// browsers over plain HTTP anyway).
 fn is_local_issuer(u: &Url) -> bool {
-    matches!(u.host_str(), Some("localhost") | Some("127.0.0.1"))
+    matches!(
+        u.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+    )
 }
 
 /// Decode a hex-encoded 32-byte AES-256 key. The encryption-key env vars

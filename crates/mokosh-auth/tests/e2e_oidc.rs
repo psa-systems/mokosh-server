@@ -121,15 +121,12 @@ async fn make_env(pool: PgPool) -> TestEnv {
         data_encryption_key: secrecy::SecretString::from("0".repeat(64)),
         data_encryption_key_prev: None,
         data_key_version: 1,
+        data_key_version_prev: None,
         access_token_ttl: Duration::seconds(600),
         refresh_token_ttl: Duration::seconds(3600),
         refresh_idle_ttl: Duration::seconds(1800),
         authorization_code_ttl: Duration::seconds(60),
         op_session_ttl: Duration::days(1),
-        require_email_verification: false,
-        allow_signup: false,
-        allow_first_run: true,
-        federation_enabled: false,
     };
 
     let auth = bootstrap(cfg, pool.clone()).await.expect("bootstrap");

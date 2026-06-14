@@ -62,11 +62,32 @@ exist in mokosh's local `users` table):
 ## Required configuration
 
 Set via `e2e/.env` locally (copy from `.env.example`) or Forgejo Actions secrets
-in CI. Required unless noted:
+in CI. Required unless noted.
+
+**Local vs CI naming (PMS-271).** Locally these are the plain `E2E_*` names
+below, holding one environment at a time. In CI the Forgejo Actions secrets hold
+both environments at once, and `.forgejo/workflows/e2e.yml` selects per var and
+exposes the result on the plain `E2E_*` names per run, so `env.ts` and the gate
+scripts only ever read the plain names and stay environment-agnostic. The CI
+secret names follow the **deployment's own variable names** where one exists
+(verified against the mokosh infra repo, `server/{c-01 staging, nc-01
+production}`):
+
+| `E2E_*` var | CI secret(s) | Deployment source |
+| --- | --- | --- |
+| `E2E_OIDC_CLIENT_ID` | `MOKOSH_OIDC_CLIENT_ID` (single, shared) | the mokosh-apps public PKCE client, seeded by `bunyip-api` with the **same id in both envs**, read by the SPA as `MOKOSH_OIDC_CLIENT_ID` |
+| `E2E_OIDC_REDIRECT_URI` | `MOKOSH_APPS_REDIRECT_URIS_STAGING` / `_PRODUCTION` | `bunyip-api` `MOKOSH_APPS_REDIRECT_URIS` (per env: `https://msp.a8n.systems/auth/callback` vs `https://msp.psa.systems/auth/callback`) |
+| `E2E_OP_BASE_URL` | `OIDC_ISSUER_STAGING` / `OIDC_ISSUER_PRODUCTION` | `mokosh-server` `OIDC_ISSUER` (the bunyip OP apex: `https://api.a8n.systems` vs `https://api.psa.systems`) |
+| everything else (`BASE_URL`, `EMAIL`, `PASSWORD`, `TENANT_ID`, `TOTP_SECRET`, `FOREIGN_COMPANY_ID`) | `E2E_STAGING_<NAME>` / `E2E_PRODUCTION_<NAME>` | test-only; no deployment variable to match |
+
+Forgejo must hold both env values at once, so per-env secrets keep a
+`_STAGING`/`_PRODUCTION` suffix on the deployment base name; the shared client id
+needs no suffix. Automatic runs (push, PR) always resolve to staging; production
+is manual-dispatch only (see [CI](#ci)).
 
 | Var | Purpose |
 | --- | --- |
-| `E2E_BASE_URL` | SPA host the auth-ui project navigates to (default `https://msp.a8n.systems`) |
+| `E2E_BASE_URL` | **required** - SPA host the auth-ui project navigates to. No default; set per environment (staging `https://msp.a8n.systems`, prod `https://msp.psa.systems`) |
 | `E2E_API_BASE_URL` | *optional* - API host for `/api/v1`. Defaults to prepending `api.` to `E2E_BASE_URL` (e.g. `msp.a8n.systems` -> `api.msp.a8n.systems`). Set when the deployment uses a different naming scheme |
 | `E2E_OP_BASE_URL` | *optional* - OIDC OP host for `/oauth2/*` + `/.well-known/openid-configuration`. Defaults to `E2E_API_BASE_URL`. On bunyip-as-OP deploys the OP runs on the apex `api.<tld>`, NOT the mokosh API host, so set this explicitly (e.g. `https://api.a8n.systems`) |
 | `E2E_EMAIL` | dedicated E2E account login |
@@ -75,7 +96,7 @@ in CI. Required unless noted:
 | `E2E_OIDC_CLIENT_ID` | public OIDC client id for the token-flow test |
 | `E2E_OIDC_REDIRECT_URI` | redirect_uri registered for that client (no default; must match exactly or the OP returns `invalid_redirect_uri`). Only the `code` is captured, the URL is never loaded |
 | `E2E_TOTP_SECRET` | base32 TOTP secret for the E2E account. Setup generates the second-factor code at runtime; same string you pasted into your authenticator when enrolling 2FA on the account |
-| `E2E_FOREIGN_COMPANY_ID` | *optional* - a company id in **another** tenant; enables the cross-tenant company canary, otherwise that test is skipped |
+| `E2E_FOREIGN_COMPANY_ID` | *optional* - a company id in **another** tenant. The cross-tenant company canary always runs; setting this strengthens it (an existing, foreign-owned company must still 403/404). When unset, `global.setup.ts` falls back to a random, well-formed UUID the E2E tenant cannot own |
 
 ## One-time staging provisioning (manual)
 
@@ -137,8 +158,28 @@ Done once by a human before the suite can pass against a deployment:
    a login screen instead of returning a `code`, register a dedicated E2E client
    whose redirect_uri allows capture-only.
 4. *(optional)* **Foreign company** - note a company id from a different tenant
-   as `E2E_FOREIGN_COMPANY_ID` to enable the cross-tenant leak canary.
-5. Store all of the above as Forgejo Actions secrets for `.forgejo/workflows/e2e.yml`.
+   as `E2E_FOREIGN_COMPANY_ID` to strengthen the cross-tenant leak canary. The
+   canary runs either way: when unset, `global.setup.ts` uses a random,
+   well-formed UUID the E2E tenant cannot own.
+5. Store all of the above as Forgejo Actions secrets for
+   `.forgejo/workflows/e2e.yml` (PMS-271). The secret names follow the table in
+   [Required configuration](#required-configuration): three vars use the
+   deployment's own variable names (`MOKOSH_OIDC_CLIENT_ID`, a single shared
+   value; `MOKOSH_APPS_REDIRECT_URIS_STAGING` / `_PRODUCTION`;
+   `OIDC_ISSUER_STAGING` / `OIDC_ISSUER_PRODUCTION`), and the test-only vars use
+   `E2E_STAGING_<NAME>` / `E2E_PRODUCTION_<NAME>` (e.g. `E2E_STAGING_BASE_URL`,
+   `E2E_PRODUCTION_TOTP_SECRET`). Provision the staging set first, then
+   production; the shared `MOKOSH_OIDC_CLIENT_ID` is set once. The workflow
+   selects per var and exposes the result on the plain `E2E_*` job env per run.
+
+   **Secret-rotation source (record per secret).** So each value can be rotated
+   later, document where it is generated/provisioned, per environment: the
+   Forgejo Actions secret store entry itself; the E2E tenant + account
+   (`*_EMAIL` / `*_PASSWORD` / `*_TENANT_ID`, from steps 1-2 above); the OIDC
+   client registration (`*_OIDC_CLIENT_ID` / `*_OIDC_REDIRECT_URI`, step 3); and
+   the TOTP enrollment (`*_TOTP_SECRET`, step 2). Keep this here or in the team's
+   secret-management runbook so a rotation has a documented source for every
+   value.
 
 ## Test-data policy
 
@@ -199,12 +240,26 @@ npx playwright show-report     # after a run
 single concurrency group (the suite shares one E2E account and the per-email
 login rate limit is 5/min, so parallel runs would collide):
 
-| Trigger | Purpose | Pre-flight gate | Notes |
-| --- | --- | --- | --- |
-| `push` to `main` | Post-merge validation: assert the deployed commit is actually serving on staging | `scripts/wait-for-deploy.mjs` polls `GET /api/v1/version` until staging reports the pushed commit's git hash (poll 15s, 10-min timeout). Walks back to the last build-relevant commit when the merged commit is doc/CI-only | Originally PMS-140 |
-| `pull_request` targeting `main` (incl. `release/*` PRs) | Merge gate: every PR must pass the suite against staging before merge | `scripts/health-check.mjs` GETs `/api/v1/health` (one-shot, 30s timeout). A PR's SHA never deploys to staging so a version-SHA gate would always time out; this checks staging is up and the suite has something to talk to | PMS-141. Add `e2e` to required status checks on main branch protection to make the gate enforceable |
-| `workflow_dispatch` | Manual ad-hoc runs | Treated like `push` (runs the deploy-sync gate) | Use to force a re-run without pushing |
+| Trigger | Environment | Purpose | Pre-flight gate | Notes |
+| --- | --- | --- | --- | --- |
+| `push` to `main` | staging | Post-merge validation: assert the deployed commit is actually serving on staging | `scripts/wait-for-deploy.mjs` polls `GET /api/v1/version` until staging reports the pushed commit's git hash (poll 15s, 10-min timeout). Walks back to the last build-relevant commit when the merged commit is doc/CI-only | Originally PMS-140 |
+| `pull_request` targeting `main` (incl. `release/*` PRs) | staging | Merge gate: every PR must pass the suite against staging before merge | `scripts/health-check.mjs` GETs `/api/v1/health` (one-shot, 30s timeout). A PR's SHA never deploys to staging so a version-SHA gate would always time out; this checks staging is up and the suite has something to talk to | PMS-141. Add `e2e` to required status checks on main branch protection to make the gate enforceable |
+| `workflow_dispatch` | `environment` input (`staging` default / `production`) | Manual ad-hoc runs | `staging`: deploy-sync gate (`wait-for-deploy.mjs`), like `push`. `production`: reachability check (`health-check.mjs`) - the dispatched SHA is unlikely to be what prod serves, so the SHA-polling gate would time out | Production runs ONLY here (PMS-271). The write-heavy suite is never run against prod automatically; a human dispatches and selects it |
 
-Each run installs Node + Chromium, runs the suite against the configured
-staging deployment, and uploads `playwright-report/` + `test-results/` as
-artifacts on failure.
+**Environment secrets (PMS-271).** CI holds staging and production config side
+by side as Forgejo Actions secrets. The job `env:` block selects per var and
+exposes the result on the plain `E2E_*` names via a Forgejo expression
+(`${{ inputs.environment == 'production' && secrets.<PRODUCTION> || secrets.<STAGING> }}`),
+except the shared client id which is a single `secrets.MOKOSH_OIDC_CLIENT_ID`
+with no switch. Secret names match the deployment's own variable names where one
+exists (`MOKOSH_OIDC_CLIENT_ID`, `MOKOSH_APPS_REDIRECT_URIS_*`, `OIDC_ISSUER_*`);
+test-only vars use `E2E_STAGING_*` / `E2E_PRODUCTION_*`. On `push` /
+`pull_request` the `inputs` context is empty, so each expression resolves to its
+staging secret; a manual dispatch lets the operator pick. See the
+[Required configuration](#required-configuration) table for the full mapping and
+[One-time provisioning](#one-time-staging-provisioning-manual) step 5 for
+rotation sources.
+
+Each run installs Node + Chromium, runs the suite against the selected
+deployment, and uploads `playwright-report/` + `test-results/` as artifacts on
+failure.

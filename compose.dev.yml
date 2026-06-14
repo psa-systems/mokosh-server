@@ -74,7 +74,10 @@ services:
       retries: 5
 
   # Prefer Valkey over Redis (required by Infisical). Internal only.
+  # Only Infisical consumes Valkey, so gate it behind the same profile to
+  # keep it from starting when the infisical profile is not selected.
   valkey:
+    profiles: ["infisical"]
     container_name: dev-mokosh-valkey-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/r/valkey/valkey
     image: docker.io/valkey/valkey:8-alpine
@@ -92,7 +95,7 @@ services:
   infisical:
     profiles: ["infisical"]
     container_name: dev-mokosh-infisical-${USER:?USER missing - run via just dev}
-    image: infisical/infisical:latest
+    image: infisical/infisical:v0.161.0
     environment:
       ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
       AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev` (which copies .env.dev to .env)}
@@ -128,6 +131,10 @@ services:
       POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
       POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
       POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
+      # PMS-285: passwords for the split request-serving roles, provisioned by
+      # the entrypoint below so `just dev` boots with RLS active at runtime.
+      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}
+      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:-mokosh_app_dev}
       # Postgres 18 changed the default PGDATA from /var/lib/postgresql/
       # data to /var/lib/postgresql/<major>/docker. We pin it back into
       # the named volume so state survives container recreates regardless
@@ -176,6 +183,29 @@ services:
         psql -U "$$POSTGRES_USER" -h /var/run/postgresql -d "$$POSTGRES_DB" \
             -c "ALTER USER \"$$POSTGRES_USER\" WITH PASSWORD '$$POSTGRES_PASSWORD'" \
             || echo "[entrypoint] ALTER USER failed (socket not trust-mode?); continuing"
+        # PMS-285: provision the split DB roles idempotently. `mokosh_migrator`
+        # (BYPASSRLS) runs migrations/bootstrap; `mokosh_app` (NOBYPASSRLS) is
+        # the request-serving role. CREATE is allowed to fail on an existing
+        # role (|| true), then ALTER reconciles the password/attributes. The
+        # ALTER DEFAULT PRIVILEGES lines make every table the migrator creates
+        # in later migrations auto-grant to mokosh_app, so the order (provision
+        # before the server runs migrations) is what matters, not pre-existing
+        # tables. Peer-trusted via the unix socket, like the ALTER USER above.
+        P="psql -U $$POSTGRES_USER -h /var/run/postgresql -d $$POSTGRES_DB -q"
+        $$P -c "CREATE ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD '$$MOKOSH_MIGRATOR_PASSWORD'" 2>/dev/null || true
+        $$P -c "ALTER ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD '$$MOKOSH_MIGRATOR_PASSWORD'" || echo "[entrypoint] alter mokosh_migrator failed; continuing"
+        $$P -c "CREATE ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '$$MOKOSH_APP_PASSWORD'" 2>/dev/null || true
+        $$P -c "ALTER ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '$$MOKOSH_APP_PASSWORD'" || echo "[entrypoint] alter mokosh_app failed; continuing"
+        $$P -c "GRANT ALL ON SCHEMA public TO mokosh_migrator" || true
+        $$P -c "GRANT CONNECT ON DATABASE \"$$POSTGRES_DB\" TO mokosh_app" || true
+        $$P -c "GRANT USAGE ON SCHEMA public TO mokosh_app" || true
+        $$P -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mokosh_app" || true
+        $$P -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mokosh_app" || true
+        $$P -c "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO mokosh_app" || true
+        $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mokosh_app" || true
+        $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO mokosh_app" || true
+        $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO mokosh_app" || true
+        echo "[entrypoint] mokosh_migrator / mokosh_app roles provisioned"
         wait "$$pg_pid"
 
   # Mailpit captures every outgoing email locally. mokosh-server points
@@ -214,8 +244,15 @@ services:
       ENVIRONMENT: development
       BASE_URL: http://${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}
 
-      # Reach the in-stack postgres by service-DNS name.
-      DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:-postgres}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      # Reach the in-stack postgres by service-DNS name. PMS-285: the split
+      # roles activate RLS at runtime. DATABASE_URL connects as the privileged
+      # `mokosh_migrator` (BYPASSRLS) - it runs migrations + bootstrap + the
+      # cross-tenant workers; MOKOSH_APP_DATABASE_URL connects as the
+      # unprivileged `mokosh_app` (NOBYPASSRLS) used for every request-serving
+      # query, so a forgotten `WHERE tenant_id` filter fail-closes to zero rows.
+      # Both roles are provisioned by the postgres service entrypoint.
+      DATABASE_URL: postgres://mokosh_migrator:${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_APP_DATABASE_URL: postgres://mokosh_app:${MOKOSH_APP_PASSWORD:-mokosh_app_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
 
       # Outbound email. Dev defaults point at the mailpit service
       # alongside this one; messages land in http://localhost:8025.

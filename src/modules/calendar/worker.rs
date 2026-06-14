@@ -21,6 +21,7 @@
 
 use async_trait::async_trait;
 
+use crate::modules::auth::TenantId;
 use crate::scheduler::Job;
 use crate::utils::error::AppResult;
 
@@ -61,21 +62,16 @@ impl CalendarReminderWorker {
             // single reminder rather than risking a duplicate; reminders
             // are best-effort, so under-delivery on crash is the safer
             // failure mode than spamming on every retry.
-            let inserted = sqlx::query(
-                r#"INSERT INTO appointment_reminders
-                       (tenant_id, appointment_id, occurrence_start, reminder_minutes)
-                   VALUES ($1, $2, $3, $4)
-                   ON CONFLICT (appointment_id, occurrence_start, reminder_minutes)
-                   DO NOTHING"#,
-            )
-            .bind(c.tenant_id)
-            .bind(c.appointment_id)
-            .bind(c.occurrence_start)
-            .bind(c.reminder_minutes)
-            .execute(self.calendar.pool())
-            .await?
-            .rows_affected();
-            if inserted == 0 {
+            let inserted = self
+                .calendar
+                .claim_reminder(
+                    c.tenant_id,
+                    c.appointment_id,
+                    c.occurrence_start,
+                    c.reminder_minutes,
+                )
+                .await?;
+            if !inserted {
                 continue;
             }
 
@@ -85,8 +81,22 @@ impl CalendarReminderWorker {
                 "start": c.occurrence_start,
                 "reminder_minutes": c.reminder_minutes,
             });
+            // SAFETY (PMS-261): cross-tenant worker. `c.tenant_id` is projected
+            // straight off the `appointments` row by `due_reminders` (a real
+            // tenant id, not user input), and every per-tenant unit of work
+            // below - `claim_reminder` and `dispatch` - opens its own
+            // `begin_with_tenant(c.tenant_id)` transaction, so each tick sets
+            // `app.current_tenant` to exactly the tenant it is processing and
+            // never runs a per-tenant query with a stale or absent GUC. The
+            // enumeration scan in `due_reminders` is the deliberate
+            // cross-tenant step that drives this loop. `from_trusted` is the
+            // sanctioned bridge for that DB-derived scope.
             if let Err(e) = notifications
-                .dispatch(c.tenant_id, "appointment.reminder", &context)
+                .dispatch(
+                    TenantId::from_trusted(c.tenant_id),
+                    "appointment.reminder",
+                    &context,
+                )
                 .await
             {
                 // Ledger row already committed above, so this reminder is

@@ -62,7 +62,7 @@ ensure-oidc-keys:
 
 # Per-developer Traefik-routed instance for SSO testing.
 #   API:  https://{USER}-mokosh-api.a8n.run
-# Run `just dev-sso` here AND in mokosh-clients to get both ends up.
+# Run `just dev-sso` here AND in mokosh-apps to get both ends up.
 # Each per-developer stack gets its OWN private network,
 # `dev-mokosh-private-${USER}`, matching the name compose.dev.yml
 # assigns. The dev-sso overlay marks that network external (it only
@@ -86,9 +86,9 @@ dev-sso: ensure-env ensure-oidc-keys ensure-private-network
     @echo "  https://{{env('USER')}}-mokosh-api.a8n.run/.well-known/openid-configuration"
     @echo ""
     @echo "Next:"
-    @echo "  1. (cd ../mokosh-clients && just dev-sso)"
-    @echo "  2. just register-client     # registers mokosh-clients-web in oauth_clients"
-    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-clients/.env to the printed UUID"
+    @echo "  1. (cd ../mokosh-apps && just dev-sso)"
+    @echo "  2. just register-client     # registers mokosh-apps-web in oauth_clients"
+    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-apps/.env to the printed UUID"
 
 # Stop the SSO dev stack.
 [doc("Stop the SSO dev stack")]
@@ -106,9 +106,9 @@ dev-sso-down: ensure-env
 [group: 'dev']
 restart: down dev-sso
 
-# Register mokosh-clients as a public OIDC client. Run once after
+# Register mokosh-apps as a public OIDC client. Run once after
 # `just dev-sso` is up. Prints the client_id UUID; copy it into
-# mokosh-clients/.env as MOKOSH_OIDC_CLIENT_ID.
+# mokosh-apps/.env as MOKOSH_OIDC_CLIENT_ID.
 [doc("Register bunyip-web as a public OIDC client (one-shot, idempotent on (name))")]
 register-bunyip-client: ensure-env
     #!/usr/bin/env nu
@@ -134,7 +134,7 @@ register-lets-chat-client: ensure-env
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/default/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
 
-[doc("Register mokosh-clients as a public OIDC client (one-shot, idempotent on (name))")]
+[doc("Register mokosh-apps as a public OIDC client (one-shot, idempotent on (name))")]
 register-client: ensure-env
     #!/usr/bin/env nu
     let user = $env.USER
@@ -164,14 +164,6 @@ down: ensure-env
 dev-down: ensure-env
     docker compose --file {{ compose_file }} down
 
-# Wipe the dev stack: stop, remove volumes, remove .env. Preserves .env.infisical.
-[doc("Wipe Infisical volumes and .env. Preserves .env.infisical.")]
-[group: 'dev']
-dev-clean: ensure-env
-    #!/usr/bin/env nu
-    docker compose --file {{ compose_file }} down --volumes
-    if ('.env' | path exists) { rm .env }
-
 # Bootstrap Infisical for the dev stack (run once after `just dev`).
 [doc("Bootstrap Infisical for the dev stack (run once after `just dev`)")]
 infisical-bootstrap: ensure-env
@@ -191,9 +183,15 @@ infisical-bootstrap: ensure-env
         cargo run --quiet --bin mokosh-bootstrap -- bootstrap-infisical
     }
 
-# Run all checks (compile, clippy, fmt)
+# Run all checks (compile, clippy, fmt, migration prefixes)
 [group: 'check']
-check: check-compile check-clippy check-fmt
+check: check-compile check-clippy check-fmt check-migrations
+
+# Enforce unique migration prefixes (PMS-198). Fails if two migrations
+# share a numeric prefix (sqlx keys its ledger on that prefix).
+[group: 'check']
+check-migrations:
+    nu scripts/check-migration-prefixes.nu
 
 # Check compilation
 [group: 'check']
@@ -219,6 +217,14 @@ fmt:
 [group: 'test']
 test:
     cargo test
+
+# Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
+# this omits `--no-deps`, so the compose `postgres` dependency starts; the
+# `server` dev service already exports a usable DATABASE_URL. PMS-267.
+# Run the Postgres-backed integration suite in the dev compose `server` container.
+[group: 'test']
+test-integration: ensure-env
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --tests -- --test-threads=4
 
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
@@ -259,6 +265,57 @@ migrate-run:
 migrate-create name:
     sqlx migrate add {{ name }}
 
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+
+# Tear down this repo's dev footprint: stop both dev stacks (LAN-IP compose.dev.yml and the SSO overlay compose.dev-sso.yml) with their default network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+[group: 'cleanup']
+dev-clean:
+    #!/usr/bin/env nu
+    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
+    let suffix = $env.USER
+    let vols = [
+        $"dev-mokosh-postgres-data-($suffix)"
+        $"dev-mokosh-infisical-postgres-data-($suffix)"
+        $"dev-mokosh-server-target-($suffix)"
+    ]
+    let existing = docker volume ls --quiet | lines
+    for vol in $vols {
+        if $vol in $existing {
+            docker volume rm $vol
+        }
+    }
+    let paths = [target]
+    for p in $paths {
+        if ($p | path exists) {
+            rm --recursive $p
+            print $"removed ($p)"
+        }
+    }
+    if ('.env' | path exists) {
+        rm .env
+        print "removed .env"
+    }
+    print "dev-clean: done"
+
+# Everything dev-clean does, plus remove the Docker images this repo builds and prune its buildx cache. Run for a from-scratch rebuild.
+[group: 'cleanup']
+dev-clean-all: dev-clean
+    #!/usr/bin/env nu
+    let images = [
+        "mokosh-server:check"
+        "mokosh-server:local"
+    ]
+    for img in $images {
+        let present = (do { ^docker image inspect $img } | complete).exit_code == 0
+        if $present {
+            docker image rm $img
+        }
+    }
+    docker buildx prune --force
+    print "dev-clean-all: done"
+
+# ── Release ──────────────────────────────────────────────────────────────────
+
 # Create a release: bump version, push branch, print PR link
 [group: 'release']
 create-release bump:
@@ -291,7 +348,14 @@ create-release bump:
     let release_branch = $"release/($tag)"
 
     git checkout -b $release_branch
-    open Cargo.toml | update package.version $bare | to toml | collect | save --force Cargo.toml
+    # Targeted version bump: rewrite only the `version = "..."` line so the
+    # Cargo.toml comments and PMS docs survive. Round-tripping the whole file
+    # through `to toml` stripped every comment on each release. Stage through a
+    # tempfile + external mv so we never reach for `save --force`, per the repo
+    # no-force safety policy.
+    let toml_tmp = (mktemp --tmpdir --suffix .toml)
+    open Cargo.toml --raw | str replace --regex '(?m)^version = "[^"]*"' $'version = "($bare)"' | save --append $toml_tmp
+    ^mv $toml_tmp Cargo.toml
     git add Cargo.toml
     git commit --signoff --message $"Release ($tag)"
 
@@ -304,7 +368,7 @@ create-release bump:
         $"Automated release PR for ($tag)."
         ""
         $"After merge, `.forgejo/workflows/create-release.yml` tags and publishes ($tag) to the Generic Packages registry."
-    ] | str join "\n" | save --force $body_file
+    ] | str join "\n" | save --append $body_file
     let fj_result = (^fj --host dev.a8n.run pr create $"Release ($tag)" --body-file $body_file | complete)
     rm $body_file
     if $fj_result.exit_code != 0 {
@@ -335,3 +399,36 @@ create-release bump:
         print $"fj output: ($fj_result.stdout | str trim)"
     }
     print $"After merging, the create-release workflow will tag and release ($tag) automatically."
+
+# ── Hooks ──────────────────────────────────────────────────────────────────
+
+# Install the git pre-commit hook (run once per fresh clone). Writes a stub at .git/hooks/pre-commit that execs `just pre-commit`. Bypass with `git commit --no-verify`.
+[group: 'hooks']
+install-hooks:
+    #!/usr/bin/env nu
+    let hook = ".git/hooks/pre-commit"
+    # Remove first so a leftover symlink from an older install does not get
+    # written through to its target file. `try` swallows the not-found case.
+    try { rm $hook }
+    "#!/usr/bin/env sh\nexec just pre-commit\n" | save $hook
+    ^chmod +x $hook
+    print $"Wrote ($hook) -> just pre-commit"
+
+# Mirrors check.yml one-to-one so a green hook means a green Check run. The
+# Postgres-backed suite is NOT run here; use `just test-integration` (mirrors
+# integration.yml) for that. PMS-267.
+# Run the fast, database-free checks inside the dev compose `server` container.
+[group: 'hooks']
+pre-commit: ensure-env
+    #!/usr/bin/env nu
+    print "\n[pre-commit] cargo fmt --all --check"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo fmt --all --check
+    print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --all-targets -- -D warnings
+    print "\n[pre-commit] cargo check --all-targets"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --all-targets
+    print "\n[pre-commit] unit tests"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --lib
+    print "\n[pre-commit] doc tests"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --doc
+    print "\n[pre-commit] all checks passed"

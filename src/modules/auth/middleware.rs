@@ -2,7 +2,6 @@
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
     middleware::Next,
     response::Response,
 };
@@ -28,6 +27,13 @@ pub struct AuthMiddleware {
     /// JWKS first; on success it JIT-mirrors the (sub, email) into the local
     /// users table. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
     pub bunyip: Option<Arc<BunyipVerifier>>,
+    /// Optional tenant service used by the bunyip path to provision a user's
+    /// personal tenant on self-signup (PMS-244). When unset, the bunyip path
+    /// falls back to the single default tenant.
+    pub tenants: Option<Arc<crate::modules::tenants::TenantService>>,
+    /// Optional invitations service: the bunyip path resolves a pending invite
+    /// for the user's email and places/re-homes them into that tenant (PMS-244).
+    pub invitations: Option<Arc<crate::modules::invitations::InvitationsService>>,
 }
 
 impl AuthMiddleware {
@@ -36,6 +42,8 @@ impl AuthMiddleware {
             auth_service: Arc::new(auth_service),
             at_jwt: None,
             bunyip: None,
+            tenants: None,
+            invitations: None,
         }
     }
 
@@ -50,6 +58,23 @@ impl AuthMiddleware {
     /// once `OIDC_ISSUER` + `OIDC_AUDIENCE` are set; see `oidc_rs::VerifierConfig`.
     pub fn with_bunyip(mut self, verifier: BunyipVerifier) -> Self {
         self.bunyip = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Wire the tenant service so the bunyip path can provision a user's
+    /// personal tenant on self-signup (PMS-244).
+    pub fn with_tenants(mut self, tenants: Arc<crate::modules::tenants::TenantService>) -> Self {
+        self.tenants = Some(tenants);
+        self
+    }
+
+    /// Wire the invitations service so the bunyip path resolves a pending invite
+    /// into a tenant placement on login (PMS-244).
+    pub fn with_invitations(
+        mut self,
+        invitations: Arc<crate::modules::invitations::InvitationsService>,
+    ) -> Self {
+        self.invitations = Some(invitations);
         self
     }
 }
@@ -73,6 +98,8 @@ pub async fn auth_middleware(
                     Ok(claims) => {
                         ensure_user_from_bunyip(
                             &auth_middleware.auth_service,
+                            auth_middleware.tenants.as_ref(),
+                            auth_middleware.invitations.as_ref(),
                             v.as_ref(),
                             token,
                             &claims,
@@ -95,9 +122,13 @@ pub async fn auth_middleware(
                 let user = current_user_from_at_jwt(&verified);
                 AuthState::authenticated(user, tenant_id)
             } else {
-                // 3. Legacy HS256 cookie path.
+                // 3. Legacy HS256 cookie path. Only an `access` token is a
+                // valid Bearer credential; `decode_token` runs
+                // `Validation::default()` and does not assert `typ`, so a
+                // `typ:"refresh"` token would otherwise be accepted here.
+                // Guard it explicitly, mirroring `refresh_token()`.
                 match auth_middleware.auth_service.decode_token(token) {
-                    Ok(claims) => match auth_middleware
+                    Ok(claims) if claims.typ == "access" => match auth_middleware
                         .auth_service
                         .get_user_by_id(claims.tid, claims.sub)
                         .await
@@ -105,7 +136,7 @@ pub async fn auth_middleware(
                         Ok(user) => AuthState::authenticated(user.to_current_user(), claims.tid),
                         Err(_) => AuthState::default(),
                     },
-                    Err(_) => AuthState::default(),
+                    _ => AuthState::default(),
                 }
             }
         }
@@ -124,24 +155,6 @@ fn bearer(req: &Request) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
-}
-
-/// Middleware that requires authentication
-pub async fn require_auth(request: Request, next: Next) -> Result<Response, (StatusCode, String)> {
-    let auth_state = request
-        .extensions()
-        .get::<AuthState>()
-        .cloned()
-        .unwrap_or_default();
-
-    if !auth_state.is_authenticated {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Authentication required".to_string(),
-        ));
-    }
-
-    Ok(next.run(request).await)
 }
 
 /// Extractor for requiring authentication
@@ -186,7 +199,7 @@ where
 ///     scope: TenantScope,
 ///     ...
 /// ) -> AppResult<Json<...>> {
-///     state.ticket_service.list_tickets(scope.tenant_id, ...).await
+///     state.ticket_service.list_ticket_responses(scope.tenant_id, ...).await
 /// }
 /// ```
 ///
@@ -195,7 +208,7 @@ where
 /// take an additional path / query parameter and gate it on role.
 #[derive(Clone, Debug)]
 pub struct TenantScope {
-    pub tenant_id: uuid::Uuid,
+    pub tenant_id: super::tenant::TenantId,
     pub user: CurrentUser,
 }
 
@@ -217,7 +230,7 @@ where
 
         match auth_state.user {
             Some(user) => Ok(TenantScope {
-                tenant_id: user.tenant_id,
+                tenant_id: super::tenant::TenantScoped::tenant(&user),
                 user,
             }),
             None => Err(AppError::Unauthorized),
@@ -273,6 +286,19 @@ impl RoleRequirement for AdminRoles {
     }
 }
 
+/// Super-admin role requirement. The narrowest gate: only the platform
+/// operator role, never a tenant `admin`. Use it for cross-tenant
+/// administrative surfaces (e.g. the `/tenants` CRUD routes) so the
+/// "super admin only" rule lives in the route signature instead of a
+/// hand-rolled `if user.role != UserRole::SuperAdmin` block in every
+/// handler (PMS-198).
+pub struct SuperAdminRoles;
+impl RoleRequirement for SuperAdminRoles {
+    fn allowed_roles() -> &'static [&'static str] {
+        &["super_admin"]
+    }
+}
+
 /// Manager role requirement
 pub struct ManagerRoles;
 impl RoleRequirement for ManagerRoles {
@@ -290,6 +316,7 @@ impl RoleRequirement for FinanceRoles {
 }
 
 /// Helper type aliases for common role requirements
+pub type RequireSuperAdmin = RequireRole<SuperAdminRoles>;
 pub type RequireAdmin = RequireRole<AdminRoles>;
 pub type RequireManager = RequireRole<ManagerRoles>;
 pub type RequireFinance = RequireRole<FinanceRoles>;
@@ -365,7 +392,9 @@ where
                 )
             })?;
 
-        let enabled = settings.is_module_enabled(user.tenant_id, G::NAME).await?;
+        let enabled = settings
+            .is_module_enabled(super::tenant::TenantScoped::tenant(&user), G::NAME)
+            .await?;
         if !enabled {
             return Err(AppError::NotFound(format!("module {}", G::NAME)));
         }
@@ -399,22 +428,6 @@ gated_module!(RmmModule, "rmm_integration", RequireRmm);
 gated_module!(ReportsModule, "reports", RequireReports);
 gated_module!(TimeTrackingModule, "time_tracking", RequireTimeTracking);
 
-/// Get the current user's tenant ID from the request
-pub fn get_tenant_id(request: &Request) -> Option<uuid::Uuid> {
-    request
-        .extensions()
-        .get::<AuthState>()
-        .and_then(|state| state.tenant_id)
-}
-
-/// Get the current user from the request
-pub fn get_current_user(request: &Request) -> Option<CurrentUser> {
-    request
-        .extensions()
-        .get::<AuthState>()
-        .and_then(|state| state.user.clone())
-}
-
 // ── Bunyip RS helper ─────────────────────────────────────────────────────────
 
 /// Resolve a Bunyip-issued at+jwt claim set into an `AuthState`.
@@ -432,33 +445,161 @@ pub fn get_current_user(request: &Request) -> Option<CurrentUser> {
 /// The caller treats `None` as "drop the bunyip path" and falls back to legacy.
 async fn ensure_user_from_bunyip(
     auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
     verifier: &BunyipVerifier,
     bearer: &str,
     claims: &super::oidc_rs::AtClaims,
 ) -> Option<AuthState> {
     let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
 
-    // Resolve the local shadow row, JIT-creating it on first sight. The
-    // bunyip-issued at+jwt does not (yet) carry a tenant claim, so we use the
-    // default bunyip tenant. If multi-tenant claim plumbing lands we revisit
-    // this. PMS-4 AC6 + docs §3.3.
-    let default_tenant = default_bunyip_tenant_id();
-    let mut user = match auth_service.get_user_by_id(default_tenant, sub).await {
+    // PMS-244: orgs live in Mokosh (Bunyip is a personal-subscription IdP with
+    // no org concept), so the tenant is resolved from Mokosh's own membership
+    // state, NOT a token claim. Priority: a pending invite for the user's
+    // verified email wins; else their existing placement; else a brand-new user
+    // gets their own `personal` tenant (self-signup). Email comes from
+    // /oauth2/userinfo (the at+jwt carries no email claim).
+    let info = verifier.userinfo(bearer).await;
+    let email = info.as_ref().and_then(|i| i.email.clone());
+    let email_verified = info
+        .as_ref()
+        .and_then(|i| i.email_verified)
+        .unwrap_or(false);
+
+    place_bunyip_user(
+        auth_service,
+        tenants,
+        invitations,
+        sub,
+        email,
+        email_verified,
+        claims,
+    )
+    .await
+}
+
+/// PMS-249: the testable core of the bunyip login path. Given the verified
+/// `sub` plus the `email` / `email_verified` resolved from userinfo, resolve
+/// which Mokosh tenant the user belongs to (invite > existing placement >
+/// personal self-signup, with the PMS-245 default-tenant backfill), JIT-mirror
+/// the user, accept any consumed invite, reconcile the Bunyip role, and return
+/// the `AuthState`. Split out of [`ensure_user_from_bunyip`] (which owns the
+/// verifier / userinfo call) so this placement logic is integration-testable
+/// without a live OIDC verifier.
+pub async fn place_bunyip_user(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    email: Option<String>,
+    email_verified: bool,
+    claims: &super::oidc_rs::AtClaims,
+) -> Option<AuthState> {
+    let placement = auth_service.find_user_placement(sub).await.ok().flatten();
+    let current = placement.as_ref().map(|(t, _)| *t);
+
+    // An invite to address X is consumed only by a Bunyip user with verified X.
+    let invite = match (invitations, email.as_deref()) {
+        (Some(invs), Some(em)) if email_verified => {
+            invs.newest_pending_for(em).await.ok().flatten()
+        }
+        _ => None,
+    };
+
+    // PMS-245: a non-admin user still parked in the shared default tenant (dumped
+    // there by the pre-PMS-244 funnel) is treated like a fresh user - moved to
+    // their own personal tenant - so nobody stays stuck sharing it.
+    let stuck_in_default = is_stuck_in_default(
+        current,
+        default_bunyip_tenant_id(),
+        placement.as_ref().map(|(_, r)| r.as_str()).unwrap_or(""),
+        invite.is_some(),
+    );
+
+    let target = if let Some(inv) = invite.as_ref() {
+        inv.tenant_id
+    } else if let Some(t) = current.filter(|_| !stuck_in_default) {
+        t
+    } else {
+        // Brand-new user (or one being backfilled off the default tenant), no
+        // invite: provision their own personal tenant.
+        match tenants {
+            Some(svc) => match svc.ensure_personal_tenant(sub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, sub = %sub, "personal tenant provisioning failed");
+                    return None;
+                }
+            },
+            None => default_bunyip_tenant_id(),
+        }
+    };
+
+    // PMS-288: the target tenant may have been provisioned off the PSA path - an
+    // invite into an auth/SSO-created org tenant, or an existing placement in a
+    // manually-created tenant - and so never received `copy_default_config`,
+    // leaving ticket creation (which needs a default ticket status + a sequence
+    // row) to 500. Seed it idempotently now that `target` is resolved. The
+    // personal-tenant branch above already seeded via `ensure_personal_tenant`,
+    // so this is a no-op there. Best-effort: a seed failure is logged, not fatal
+    // to the request (a tenant lacking config still authenticates).
+    if let Some(svc) = tenants {
+        if let Err(e) = svc.ensure_default_config(target).await {
+            tracing::warn!(error = %e, sub = %sub, tenant_id = %target, "default config seed failed");
+        }
+    }
+
+    // Re-home an already-placed user into the target tenant - invite acceptance,
+    // or the PMS-243 backfill out of the legacy default tenant. Idempotent (a
+    // no-op when they are already there); co-mingled data stays put (PMS-243).
+    if let Some(cur) = current {
+        if cur != target {
+            match auth_service
+                .rehome_user_between_tenants(sub, cur, target)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(sub = %sub, tenant_id = %target, "re-homed user into tenant")
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, sub = %sub, "user re-home failed"),
+            }
+        }
+    }
+
+    // Resolve the local shadow row, JIT-creating it on first sight. A brand-new
+    // invited user is seeded with the invite's role.
+    let initial_role = invite
+        .as_ref()
+        .and_then(|i| UserRole::from_str(&i.role))
+        .unwrap_or_default();
+    let mut user = match auth_service.get_user_by_id(target, sub).await {
         Ok(user) => user,
         Err(_) => {
-            // JIT path: fetch email from /oauth2/userinfo and insert.
-            let info = verifier.userinfo(bearer).await;
-            let email = info
-                .as_ref()
-                .and_then(|i| i.email.clone())
-                .unwrap_or_else(|| format!("{sub}@unresolved.invalid"));
+            // Persist the IdP-supplied email on the JIT insert ONLY when the
+            // IdP reports it verified, matching the Google path.
+            // `upsert_user_from_oidc` stamps `email_verified_at = NOW()`, so
+            // writing an unverified address here would falsely mark it
+            // verified and open an auto-link/capture path against the real
+            // owner. An unverified user is still self-signed-up (into their
+            // own isolated personal tenant) under a placeholder address; the
+            // real email is backfilled on a later login once verified.
+            let email_for_insert = match (email.clone(), email_verified) {
+                (Some(em), true) => em,
+                _ => format!("{sub}@unresolved.invalid"),
+            };
             auth_service
-                .upsert_user_from_oidc(sub, default_tenant, &email, UserRole::default())
+                .upsert_user_from_oidc(sub, target, &email_for_insert, initial_role)
                 .await
                 .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
                 .ok()?
         }
     };
+
+    // Mark the invite accepted now the user is placed (best-effort).
+    if let (Some(invs), Some(inv)) = (invitations, invite.as_ref()) {
+        let _ = invs.accept(inv.id, sub).await;
+    }
 
     // PMS-172: Bunyip governs the top role. Translate the `bunyip_role` claim
     // into mokosh's taxonomy. The translated `effective` role is the
@@ -544,9 +685,56 @@ fn default_bunyip_tenant_id() -> uuid::Uuid {
         .unwrap_or_else(|| uuid::Uuid::from_u128(1))
 }
 
+/// PMS-245: whether an already-placed user should be backfilled off the shared
+/// default landing tenant into their own personal tenant. True only for a user
+/// currently in `default_tenant`, with no pending invite, who is not a platform
+/// `super_admin` (those legitimately belong to the infra/default tenant).
+fn is_stuck_in_default(
+    current: Option<uuid::Uuid>,
+    default_tenant: uuid::Uuid,
+    role: &str,
+    has_invite: bool,
+) -> bool {
+    current == Some(default_tenant) && !has_invite && role != "super_admin"
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{effective_role_from_bunyip, UserRole};
+    use super::{
+        default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default, UserRole,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn backfill_only_non_admin_default_tenant_users_without_invite() {
+        let default = default_bunyip_tenant_id();
+        let other = Uuid::from_u128(99);
+
+        // The target case: a technician parked in the default tenant, no invite.
+        assert!(is_stuck_in_default(
+            Some(default),
+            default,
+            "technician",
+            false
+        ));
+        // Exemptions:
+        assert!(
+            !is_stuck_in_default(Some(default), default, "super_admin", false),
+            "super_admins stay in the infra tenant"
+        );
+        assert!(
+            !is_stuck_in_default(Some(default), default, "technician", true),
+            "an invite takes precedence - it decides the tenant"
+        );
+        assert!(
+            !is_stuck_in_default(Some(other), default, "technician", false),
+            "a user already in a real tenant is left alone"
+        );
+        assert!(
+            !is_stuck_in_default(None, default, "", false),
+            "a brand-new user has no current placement to back-fill"
+        );
+    }
 
     #[test]
     fn bunyip_admin_maps_to_super_admin() {

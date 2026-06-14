@@ -30,8 +30,9 @@ function optional(name: string): string | undefined {
 
 // Derive the API host from the SPA host by prepending `api.`. The canonical
 // staging deploy serves the SPA at `msp.a8n.systems` and the API at
-// `api.msp.a8n.systems`. Returns null when the SPA host is already prefixed
-// or the URL cannot be parsed.
+// `api.msp.a8n.systems` (prod: `msp.psa.systems` -> `api.msp.psa.systems`).
+// Returns null when the SPA host is already prefixed or the URL cannot be
+// parsed.
 function deriveApiBase(spaUrl: string): string | null {
   try {
     const u = new URL(spaUrl);
@@ -42,7 +43,10 @@ function deriveApiBase(spaUrl: string): string | null {
   }
 }
 
-const spaBaseURL = optional('E2E_BASE_URL') ?? 'https://msp.a8n.systems';
+// Required: no domain is ever hardcoded as a fallback. The SPA host differs
+// per environment (staging `https://msp.a8n.systems`, prod
+// `https://msp.psa.systems`), so the operator must inject it explicitly.
+const spaBaseURL = required('E2E_BASE_URL');
 const derivedApi = deriveApiBase(spaBaseURL);
 const apiBaseURL = optional('E2E_API_BASE_URL') ?? derivedApi ?? spaBaseURL;
 // The OIDC OP (provider) is a separate host from mokosh-server on
@@ -64,7 +68,7 @@ export const env = {
   apiBaseURL,
   // Where the OIDC OP (authorize / token / userinfo / discovery) lives.
   // On bunyip-as-OP deploys this is a different host from apiBaseURL
-  // (e.g. `api.a8n.systems` rather than `api.msp.a8n.systems`); on
+  // (e.g. `api.<tld>` rather than `api.msp.<tld>`); on
   // mokosh-as-OP it defaults to apiBaseURL.
   opBaseURL,
   get email() {
@@ -102,6 +106,10 @@ export const env = {
 // one-line purpose so the aggregated error message names what each
 // missing value is for, not just which key is empty.
 const REQUIRED: Array<{ name: string; purpose: string }> = [
+  {
+    name: 'E2E_BASE_URL',
+    purpose: 'SPA host the suite navigates to (e.g. https://msp.a8n.systems); no default',
+  },
   { name: 'E2E_EMAIL', purpose: 'login email of the dedicated E2E account' },
   { name: 'E2E_PASSWORD', purpose: 'password for E2E_EMAIL' },
   { name: 'E2E_TENANT_ID', purpose: 'UUID of the dedicated E2E tenant' },

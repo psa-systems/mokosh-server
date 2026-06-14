@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -17,7 +18,10 @@ use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
-use super::{CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse};
+use super::{
+    CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse,
+    PortalSetupPasswordRequest,
+};
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::tickets::{TicketResponse, TicketService};
@@ -52,6 +56,10 @@ pub fn portal_routes(
     Router::new()
         // Public: login. No auth required to call this.
         .route("/auth/login", post(login))
+        // Public: redeem a setup token to set the initial portal password
+        // (PMS-136). No auth: the customer is not yet a logged-in contact;
+        // the single-use token IS the credential proving they own the link.
+        .route("/auth/setup-password", post(setup_password))
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
         .route("/auth/me", get(me))
@@ -80,6 +88,21 @@ async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<Cur
     Ok(Json(contact))
 }
 
+/// Redeem a setup token and set the contact's portal password (PMS-136).
+/// Returns 204 on success; the service maps a replayed token to 410 and an
+/// expired/invalid one to 400.
+async fn setup_password(
+    State(state): State<PortalRouterState>,
+    Json(request): Json<PortalSetupPasswordRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    state
+        .service
+        .setup_password(&request.token, &request.password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_invoices(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
@@ -93,9 +116,18 @@ async fn list_invoices(
         company_id: Some(contact.company_id),
         ..Default::default()
     };
+    // SAFETY (PMS-285): `contact.tenant_id` is a verified claim from the portal
+    // JWT (`RequirePortalAuth`), i.e. the caller's own authenticated tenant.
+    // Portal runs on contact sessions, not `CurrentUser`, so it cannot use the
+    // `TenantScoped` extractor; `from_trusted` is the sanctioned bridge (see the
+    // KB feed note below for the full rationale).
     let (items, total) = state
         .billing
-        .list_invoices(contact.tenant_id, &filter, &pagination)
+        .list_invoices(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            &filter,
+            &pagination,
+        )
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -113,9 +145,16 @@ async fn get_invoice(
     // in code: an invoice belonging to another company in the same
     // tenant returns 404 (not 403) so the portal never confirms the
     // existence of another company's invoice.
+    // SAFETY (PMS-285): `contact.tenant_id` is a verified portal-JWT claim
+    // (`RequirePortalAuth`), the caller's own authenticated tenant; portal
+    // cannot use `TenantScoped`, so `from_trusted` is the sanctioned bridge
+    // (see KB feed note below). The company scope is enforced in code afterward.
     let invoice = state
         .billing
-        .get_invoice(contact.tenant_id, invoice_id)
+        .get_invoice(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            invoice_id,
+        )
         .await?;
     if invoice.company_id != contact.company_id {
         return Err(crate::utils::error::AppError::NotFound(
@@ -136,9 +175,18 @@ async fn list_kb(
     // `company_ids`. The company scope comes from the authenticated
     // contact's JWT claim (`CurrentContact.company_id`), populated by
     // `portal_auth_middleware`, so a client cannot widen it.
+    // SAFETY (PMS-139): `contact.tenant_id` is a verified claim from the
+    // portal JWT (`RequirePortalAuth`), not user input. Portal runs on
+    // contact sessions rather than `CurrentUser`, so it cannot use the
+    // `TenantScoped` extractor; `from_trusted` is the sanctioned bridge
+    // until the portal surface gets its own scoping pass.
     let (items, total) = state
         .kb
-        .list_portal_articles_for_company(contact.tenant_id, contact.company_id, &pagination)
+        .list_portal_articles_for_company(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.company_id,
+            &pagination,
+        )
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -152,9 +200,19 @@ async fn get_ticket(
     RequirePortalAuth(contact): RequirePortalAuth,
     Path(ticket_id): Path<Uuid>,
 ) -> AppResult<Json<TicketResponse>> {
+    // SAFETY (PMS-261): `contact.tenant_id` and `contact.company_id` are
+    // verified claims from the portal JWT (`RequirePortalAuth`), not user
+    // input. Portal runs on contact sessions rather than `CurrentUser`, so it
+    // cannot use the `TenantScoped` extractor; `from_trusted` is the sanctioned
+    // bridge. `get_portal_ticket` scopes by both tenant and company, so a
+    // contact can only read its own company's ticket within its own tenant.
     let resp = state
         .tickets
-        .get_portal_ticket(contact.tenant_id, contact.company_id, ticket_id)
+        .get_portal_ticket(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.company_id,
+            ticket_id,
+        )
         .await?;
     Ok(Json(resp))
 }
@@ -164,9 +222,17 @@ async fn list_tickets(
     RequirePortalAuth(contact): RequirePortalAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
+    // SAFETY (PMS-261): verified contact-JWT claims (`RequirePortalAuth`), not
+    // user input; portal cannot use `TenantScoped`. `list_portal_tickets`
+    // scopes by both tenant and company, so the feed is confined to the
+    // contact's own company within its own tenant.
     let (tickets, total) = state
         .tickets
-        .list_portal_tickets(contact.tenant_id, contact.company_id, &pagination)
+        .list_portal_tickets(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.company_id,
+            &pagination,
+        )
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         tickets,
@@ -181,10 +247,14 @@ async fn create_ticket(
     Json(request): Json<CreatePortalTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
     request.validate()?;
+    // SAFETY (PMS-261): verified contact-JWT claims (`RequirePortalAuth`), not
+    // user input; portal cannot use `TenantScoped`. `create_portal_ticket`
+    // writes under `contact.tenant_id` / `contact.company_id`, so a contact can
+    // only create a ticket inside its own company and tenant.
     let resp = state
         .tickets
         .create_portal_ticket(
-            contact.tenant_id,
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
             contact.company_id,
             contact.id,
             request.title,

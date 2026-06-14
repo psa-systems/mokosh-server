@@ -5,16 +5,62 @@ use std::time::Duration;
 
 use crate::utils::error::{AppError, AppResult};
 
-/// Database connection pool wrapper
+/// Database connection pool wrapper.
+///
+/// PMS-285: the application runs two connections with different RLS
+/// postures so the request-serving connection can no longer bypass the
+/// fail-closed `tenant_isolation` policy:
+///
+/// - `app_pool` connects as the unprivileged `mokosh_app`
+///   (`NOSUPERUSER NOBYPASSRLS`) role. Every request-serving query runs
+///   here, so a forgotten `WHERE tenant_id` filter is backstopped by RLS:
+///   with no `app.current_tenant` GUC set it returns zero rows. `pool()`
+///   and `begin_with_tenant` both hand out this connection.
+/// - `migrator_pool` connects as the privileged `mokosh_migrator`
+///   (`BYPASSRLS`) role that owns the schema. Migrations, bootstrap, the
+///   background workers (which sweep across every tenant), and the few
+///   legitimately cross-tenant / pre-auth paths run here, each with an
+///   explicit `// SAFETY:` note at the call site.
+///
+/// In dev/CI without the role split, both fields point at the same pool
+/// (`from_pool`, or `new` when `MOKOSH_APP_DATABASE_URL` is unset), which
+/// preserves the pre-split behaviour. RLS only bites once `app_pool`
+/// connects as a NOBYPASSRLS role.
 #[derive(Clone)]
 pub struct Database {
-    pool: PgPool,
+    app_pool: PgPool,
+    migrator_pool: PgPool,
 }
 
 impl Database {
-    /// Create a new database connection pool
-    pub async fn new(database_url: &str) -> AppResult<Self> {
-        let pool = PgPoolOptions::new()
+    /// Create the two connection pools.
+    ///
+    /// `app_url` is the request-serving connection string (role
+    /// `mokosh_app`, NOBYPASSRLS). `migrator_url` is the privileged
+    /// connection string (role `mokosh_migrator`, BYPASSRLS) used for
+    /// migrations, bootstrap, workers and cross-tenant paths. Pass the
+    /// same URL for both to run without the role split (RLS then does not
+    /// bite because the single role bypasses it).
+    pub async fn new(app_url: &str, migrator_url: &str) -> AppResult<Self> {
+        let migrator_pool = Self::connect(migrator_url, "migrator").await?;
+        // When the two URLs are identical, reuse the single pool rather
+        // than opening a second identical one.
+        let app_pool = if app_url == migrator_url {
+            migrator_pool.clone()
+        } else {
+            Self::connect(app_url, "app").await?
+        };
+
+        tracing::info!("Connected to database (app + migrator pools)");
+
+        Ok(Self {
+            app_pool,
+            migrator_pool,
+        })
+    }
+
+    async fn connect(database_url: &str, label: &str) -> AppResult<PgPool> {
+        PgPoolOptions::new()
             .max_connections(20)
             .min_connections(2)
             .acquire_timeout(Duration::from_secs(30))
@@ -22,26 +68,54 @@ impl Database {
             .max_lifetime(Duration::from_secs(1800))
             .connect(database_url)
             .await
-            .map_err(|e| AppError::Database(format!("Failed to connect to database: {}", e)))?;
-
-        tracing::info!("Connected to database");
-
-        Ok(Self { pool })
+            .map_err(|e| {
+                AppError::Database(format!("Failed to connect to database ({label}): {e}"))
+            })
     }
 
-    /// Wrap an existing `PgPool`. Used by the integration-test harness
-    /// (`tests/common/`) where `#[sqlx::test]` provisions the pool against
-    /// a per-test database.
+    /// Wrap an existing `PgPool` as BOTH pools. Used by the integration-test
+    /// harness (`tests/common/`) where `#[sqlx::test]` provisions a single
+    /// superuser pool against a per-test database; without the role split
+    /// the app and migrator connections coincide and RLS does not bite.
+    /// Suites that exercise RLS through the app role build the app pool
+    /// separately via [`Self::from_pools`].
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            app_pool: pool.clone(),
+            migrator_pool: pool,
+        }
     }
 
-    /// Get a reference to the connection pool
+    /// Wrap two distinct pools. Used by the RLS-exercising integration
+    /// harness, which builds `app_pool` connecting as the unprivileged
+    /// `mokosh_app` role and passes the `#[sqlx::test]` superuser pool as
+    /// `migrator_pool`.
+    pub fn from_pools(app_pool: PgPool, migrator_pool: PgPool) -> Self {
+        Self {
+            app_pool,
+            migrator_pool,
+        }
+    }
+
+    /// Get a reference to the request-serving (`mokosh_app`, NOBYPASSRLS)
+    /// connection pool. Serving queries must either set the
+    /// `app.current_tenant` GUC (via [`Self::begin_with_tenant`]) or accept
+    /// that RLS fail-closes them to zero rows.
     pub fn pool(&self) -> &PgPool {
-        &self.pool
+        &self.app_pool
     }
 
-    /// Run database migrations.
+    /// Get a reference to the privileged (`mokosh_migrator`, BYPASSRLS)
+    /// connection pool. Reserved for migrations, bootstrap, the
+    /// cross-tenant background workers, and the explicitly-justified
+    /// pre-auth / cross-tenant / system-shared paths. Every call site must
+    /// carry a `// SAFETY:` note explaining why it legitimately bypasses
+    /// per-tenant RLS.
+    pub fn migrator_pool(&self) -> &PgPool {
+        &self.migrator_pool
+    }
+
+    /// Run database migrations on the privileged migrator pool.
     ///
     /// `set_ignore_missing(true)` is required because mokosh-auth's
     /// migrations share the same `_sqlx_migrations` table. Without it,
@@ -53,7 +127,7 @@ impl Database {
         let mut migrator = sqlx::migrate!("./migrations");
         migrator.set_ignore_missing(true);
         migrator
-            .run(&self.pool)
+            .run(&self.migrator_pool)
             .await
             .map_err(|e| AppError::Database(format!("Migration failed: {}", e)))?;
 
@@ -61,10 +135,10 @@ impl Database {
         Ok(())
     }
 
-    /// Health check for the database
+    /// Health check for the database (request-serving pool).
     pub async fn health_check(&self) -> AppResult<()> {
         sqlx::query("SELECT 1")
-            .execute(&self.pool)
+            .execute(&self.app_pool)
             .await
             .map_err(|e| AppError::Database(format!("Health check failed: {}", e)))?;
 
@@ -80,18 +154,23 @@ impl Database {
     /// connection. The value is bound as a parameter (not interpolated) so
     /// there is no SQL-injection surface even though tenant_id is a Uuid.
     ///
-    /// The policy is currently fail-open (it reduces to `tenant_id = tenant_id`
-    /// when the GUC is unset), so queries that have not yet been migrated onto
-    /// this helper keep working against their explicit `WHERE tenant_id = $1`
-    /// filters. Queries run through a transaction from this helper get real
-    /// row-level isolation. Follow-up: migrate the remaining read paths, then
-    /// flip the policy fail-closed (the migration role needs BYPASSRLS).
+    /// The policy is fail-closed as of migration `038_rls_fail_closed.sql`: an
+    /// unset GUC matches no rows and a write whose `tenant_id` does not equal
+    /// the GUC is rejected (WITH CHECK), with `FORCE ROW LEVEL SECURITY` so the
+    /// owner is not exempt. This bites only for connections whose role lacks
+    /// BYPASSRLS. As of PMS-285 the request-serving connection (`app_pool`)
+    /// runs as the unprivileged `mokosh_app` (NOBYPASSRLS) role, so a serving
+    /// query that does NOT go through this helper fail-closes to zero rows.
+    /// Transactions opened here set the tenant GUC and so satisfy the policy.
+    /// Genuinely cross-tenant / pre-auth paths instead run on
+    /// [`Self::migrator_pool`] with an explicit `// SAFETY:` note.
     #[cfg(feature = "multi-tenant")]
     pub async fn begin_with_tenant(
         &self,
-        tenant_id: uuid::Uuid,
+        tenant_id: impl Into<uuid::Uuid>,
     ) -> AppResult<TenantTransaction<'_>> {
-        let mut tx = self.pool.begin().await?;
+        let tenant_id = tenant_id.into();
+        let mut tx = self.app_pool.begin().await?;
 
         sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
             .bind(tenant_id.to_string())
@@ -126,9 +205,15 @@ impl<'a> TenantTransaction<'a> {
     }
 }
 
+// Deref to the underlying `PgConnection` (one level deeper than the wrapped
+// `Transaction`) so the standard sqlx idiom `.execute(&mut *tx)` yields a
+// `&mut PgConnection` - exactly as it does for a plain `sqlx::Transaction`.
+// sqlx 0.8 does not implement `Executor` for `&mut Transaction`, so deref-ing
+// only to `Transaction` would make `&mut *tx` fail to compile at every call
+// site. `commit`/`rollback`/`tenant_id` stay as inherent methods above.
 #[cfg(feature = "multi-tenant")]
 impl<'a> std::ops::Deref for TenantTransaction<'a> {
-    type Target = sqlx::Transaction<'a, sqlx::Postgres>;
+    type Target = sqlx::PgConnection;
 
     fn deref(&self) -> &Self::Target {
         &self.tx
