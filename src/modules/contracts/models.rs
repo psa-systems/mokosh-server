@@ -42,6 +42,7 @@ pub struct CreateContractRequest {
     #[validate(length(min = 1, max = 255))]
     pub name: String,
     pub company_id: Uuid,
+    #[validate(custom(function = crate::utils::validation::validate_contract_type))]
     pub contract_type: String,
     #[serde(default = "default_draft")]
     pub status: String,

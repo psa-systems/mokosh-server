@@ -80,6 +80,40 @@ pub fn validate_cron(expr: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Contract types accepted by the `contracts.contract_type` CHECK
+/// constraint (migration `009_contracts.sql`). Kept in sync with the DB
+/// so a request carrying an out-of-set value is rejected with a 422 at
+/// the request layer instead of hitting the constraint and surfacing as a
+/// 500 DATABASE_ERROR (PMS-299).
+pub const CONTRACT_TYPES: [&str; 5] = [
+    "managed_services",
+    "block_hours",
+    "time_and_materials",
+    "fixed_price",
+    "warranty",
+];
+
+/// Validate a contract type against the set the DB CHECK constraint
+/// allows. The `contract_type` field deserializes as a free `String`, so
+/// values such as `recurring` or `retainer` pass deserialization but
+/// violate the DB constraint; rejecting them here turns an unhandled 500
+/// into a clear 422 (PMS-299).
+pub fn validate_contract_type(value: &str) -> Result<(), ValidationError> {
+    if CONTRACT_TYPES.contains(&value) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_contract_type");
+        error.message = Some(
+            format!(
+                "contract_type must be one of: {}",
+                CONTRACT_TYPES.join(", ")
+            )
+            .into(),
+        );
+        Err(error)
+    }
+}
+
 /// Generate a slug from a string
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
@@ -156,6 +190,20 @@ mod tests {
         assert!(validate_password_strength("Str0ng@Pass!").is_ok());
         assert!(validate_password_strength("weak").is_err());
         assert!(validate_password_strength("NoNumber!").is_err());
+    }
+
+    #[test]
+    fn test_validate_contract_type() {
+        // PMS-299: only the DB CHECK set is accepted.
+        assert!(validate_contract_type("managed_services").is_ok());
+        assert!(validate_contract_type("block_hours").is_ok());
+        assert!(validate_contract_type("time_and_materials").is_ok());
+        assert!(validate_contract_type("fixed_price").is_ok());
+        assert!(validate_contract_type("warranty").is_ok());
+        // Values that passed deserialization but caused a 500 before.
+        assert!(validate_contract_type("recurring").is_err());
+        assert!(validate_contract_type("retainer").is_err());
+        assert!(validate_contract_type("").is_err());
     }
 
     #[test]

@@ -275,7 +275,15 @@ pub fn create_api_router(
         // extensions. The extractor reads
         // `parts.extensions.get::<Arc<SettingsService>>()` and short-
         // circuits with 404 when the gated module is disabled.
-        .layer(axum::Extension(settings_service));
+        .layer(axum::Extension(settings_service))
+        // PMS-298: outermost layer so every 4xx (including extractor
+        // rejections such as a JSON body that fails to deserialize) is
+        // returned as the standard `{error:{code,message}}` envelope instead
+        // of raw axum/serde plaintext. JSON responses (every `AppError`) pass
+        // through untouched.
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
 
     // Build portal API routes. Portal identity is the contacts row,
     // so this surface runs its own auth middleware (mounted inside
@@ -291,6 +299,10 @@ pub fn create_api_router(
             portal_ticket_service,
             portal_kb_service,
             portal_billing_service,
+        ))
+        // PMS-298: same envelope normalization for the portal surface.
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
         ));
 
     // CORS: SPA at msp.<tld> talks to api.msp.<tld> from a different origin,
