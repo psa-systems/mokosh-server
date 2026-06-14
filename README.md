@@ -85,6 +85,9 @@ just check-compile
 just check-fmt
 just fmt
 just test
+just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
+just install-hooks         # install git pre-commit hook -> runs `just pre-commit`
+just pre-commit            # fast, DB-free checks (mirrors CI check.yml)
 just build                 # cargo build --release --bins
 just check-docker          # build the OCI image's builder stage only (validation)
 just build-docker          # build the production OCI image (oci-build/Dockerfile)

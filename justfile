@@ -218,6 +218,14 @@ fmt:
 test:
     cargo test
 
+# Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
+# this omits `--no-deps`, so the compose `postgres` dependency starts; the
+# `server` dev service already exports a usable DATABASE_URL. PMS-267.
+# Run the Postgres-backed integration suite in the dev compose `server` container.
+[group: 'test']
+test-integration: ensure-env
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --tests -- --test-threads=4
+
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
 [group: 'test']
@@ -406,7 +414,10 @@ install-hooks:
     ^chmod +x $hook
     print $"Wrote ($hook) -> just pre-commit"
 
-# Run the same checks as .forgejo/workflows/check.yml inside the dev compose `server` container.
+# Mirrors check.yml one-to-one so a green hook means a green Check run. The
+# Postgres-backed suite is NOT run here; use `just test-integration` (mirrors
+# integration.yml) for that. PMS-267.
+# Run the fast, database-free checks inside the dev compose `server` container.
 [group: 'hooks']
 pre-commit: ensure-env
     #!/usr/bin/env nu
@@ -420,6 +431,4 @@ pre-commit: ensure-env
     ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --lib
     print "\n[pre-commit] doc tests"
     ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --doc
-    print "\n[pre-commit] integration tests"
-    ^docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --test auth --test contacts --test tenants --test tickets --test notifications --test rmm --test dispatch_stub --test readiness --test scheduler -- --test-threads=4
     print "\n[pre-commit] all checks passed"

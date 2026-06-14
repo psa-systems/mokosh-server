@@ -1,7 +1,9 @@
 ---
 
-# Validate code on every push and pull request: fmt, clippy, compile,
-# unit tests, integration tests.
+# Fast, database-free gate: fmt, clippy, compile, unit + doc tests. Runs on
+# every push and pull request. The Postgres-backed integration suite lives in
+# a separate workflow (integration.yml) so this gate stays fast and the local
+# `just pre-commit` hook can mirror it one-to-one (PMS-267).
 name: Check
 
 on:
@@ -14,33 +16,8 @@ on:
 
 jobs:
   check:
-    name: fmt + clippy + compile + tests
+    name: fmt + clippy + compile + unit/doc tests
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
-
-    # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
-    # fresh database per invocation against the URL in DATABASE_URL, so
-    # this single instance fans out to all integration tests.
-    #
-    # The Forgejo Actions runner puts the job container and its service
-    # containers on a shared bridge network; services are reachable from
-    # the job container by their service name on the container-internal
-    # port. localhost would resolve to the job container itself, where
-    # nothing is listening on 5432.
-    services:
-      postgres:
-        image: postgres:18.2-alpine3.23
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-
-    env:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
 
     steps:
       - name: Clone the repository
@@ -77,18 +54,3 @@ jobs:
         # pins "a raw Uuid cannot be passed where a TenantId is required".
         # `--lib` above does not execute doctests.
         run: cargo test --doc
-
-      - name: Integration tests
-        # cargo test --tests runs every integration suite (all `tests/*.rs`
-        # binaries) plus the lib unit tests, so new suites are picked up
-        # automatically instead of via a hand-maintained --test allowlist
-        # that silently dropped 13 of 22 suites from CI.
-        #
-        # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
-        # Each test creates a per-test database AND holds the sqlx-test
-        # maintenance pool; at default per-cpu parallelism on a 16-core
-        # runner the maintenance pool was timing out with PoolTimedOut on
-        # tests/auth.rs (14 tests). 4 in-flight is well within the
-        # postgres default max_connections (100); slight wall-clock cost,
-        # full reliability.
-        run: cargo test --tests -- --test-threads=4
