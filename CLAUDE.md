@@ -21,6 +21,9 @@ just check-clippy          # cargo clippy --all-targets
 just check-fmt             # cargo fmt --all --check
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
+just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
+just install-hooks         # install the git pre-commit hook -> runs `just pre-commit`
+just pre-commit            # fast, DB-free fmt/clippy/compile/unit/doc checks (mirrors CI check.yml)
 just build                 # cargo build --release --bins
 just migrate-run           # sqlx migrate run against $DATABASE_URL
 just migrate-create <name> # new migration in migrations/
