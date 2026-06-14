@@ -269,7 +269,7 @@ migrate-create name:
 
 # Tear down this repo's dev footprint: stop both dev stacks (LAN-IP compose.dev.yml and the SSO overlay compose.dev-sso.yml) with their default network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
 [group: 'cleanup']
-dev-clean:
+dev-clean: ensure-env
     #!/usr/bin/env nu
     docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
     let suffix = $env.USER
