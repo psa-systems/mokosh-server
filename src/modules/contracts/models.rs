@@ -37,6 +37,7 @@ pub struct ContractFilter {
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[validate(schema(function = validate_contract_date_range))]
 pub struct CreateContractRequest {
     pub contract_number: Option<String>,
     #[validate(length(min = 1, max = 255))]
@@ -64,6 +65,23 @@ fn default_draft() -> String {
 }
 fn default_monthly() -> String {
     "monthly".into()
+}
+
+/// Cross-field check: a contract may not end before it starts (PMS-306). An
+/// inverted range (`end_date < start_date`) was previously accepted and
+/// persisted; reject it with a 422 at the request layer. A `None` `end_date`
+/// (open-ended contract) is always valid.
+fn validate_contract_date_range(
+    req: &CreateContractRequest,
+) -> Result<(), validator::ValidationError> {
+    if let Some(end) = req.end_date {
+        if end < req.start_date {
+            let mut error = validator::ValidationError::new("invalid_date_range");
+            error.message = Some("end_date must be on or after start_date".into());
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -166,6 +184,59 @@ pub struct UpsertRateCardItemRequest {
     pub hourly_rate: Decimal,
     pub after_hours_rate: Option<Decimal>,
     pub emergency_rate: Option<Decimal>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn base_request(start: NaiveDate, end: Option<NaiveDate>) -> CreateContractRequest {
+        CreateContractRequest {
+            contract_number: None,
+            name: "Test Contract".into(),
+            company_id: Uuid::new_v4(),
+            contract_type: "managed_services".into(),
+            status: default_draft(),
+            start_date: start,
+            end_date: end,
+            auto_renew: false,
+            billing_cycle: default_monthly(),
+            billing_amount: None,
+            sla_id: None,
+            signed_date: None,
+            signed_by_contact_id: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn rejects_inverted_contract_date_range() {
+        // PMS-306: end before start must fail validation.
+        let req = base_request(
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+        );
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_valid_and_open_ended_contract_ranges() {
+        let ok = base_request(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            Some(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+        );
+        assert!(ok.validate().is_ok());
+        // Equal dates are allowed (single-day contract).
+        let same = base_request(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+        );
+        assert!(same.validate().is_ok());
+        // Open-ended contract (no end date) is allowed.
+        let open = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
+        assert!(open.validate().is_ok());
+    }
 }
 
 /// Outcome of [`ContractsService::consume_hours`].
