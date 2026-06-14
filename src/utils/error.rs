@@ -117,8 +117,10 @@ impl AppError {
 
     /// Create a validation error for a single field
     pub fn validation_field(field: impl Into<String>, message: impl Into<String>) -> Self {
+        // The `Validation` Display prefixes "Validation failed: ", so this
+        // message must not repeat that phrase (PMS-298).
         Self::Validation {
-            message: "Validation failed".to_string(),
+            message: "one or more fields are invalid".to_string(),
             errors: vec![FieldError::new(field, message, "invalid")],
         }
     }
@@ -236,6 +238,9 @@ impl From<AppError> for ErrorResponse {
 
 // Server-side conversions
 #[cfg(feature = "server")]
+pub use server_impl::normalize_error_envelope;
+
+#[cfg(feature = "server")]
 mod server_impl {
     use super::*;
     use axum::http::StatusCode;
@@ -251,6 +256,77 @@ mod server_impl {
 
             (status, Json(body)).into_response()
         }
+    }
+
+    /// Map an extractor-rejection status to the canonical `{error:{code,message}}`
+    /// envelope. The original rejection body (raw axum/serde plaintext) is
+    /// discarded so internal serde detail, field names, and line/column offsets
+    /// never leak (PMS-298).
+    fn envelope_for_rejection(status: StatusCode) -> ErrorResponse {
+        let (code, message) = match status {
+            StatusCode::BAD_REQUEST => (
+                "BAD_REQUEST",
+                "The request was malformed or could not be read.",
+            ),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+                "UNSUPPORTED_MEDIA_TYPE",
+                "Content-Type must be application/json.",
+            ),
+            StatusCode::PAYLOAD_TOO_LARGE => {
+                ("PAYLOAD_TOO_LARGE", "The request body is too large.")
+            }
+            StatusCode::LENGTH_REQUIRED => {
+                ("LENGTH_REQUIRED", "A Content-Length header is required.")
+            }
+            // axum returns 422 when a JSON body fails to deserialize into the
+            // target type (missing field, wrong type, unknown enum variant).
+            StatusCode::UNPROCESSABLE_ENTITY => (
+                "BAD_REQUEST",
+                "The request body did not match the expected format.",
+            ),
+            StatusCode::METHOD_NOT_ALLOWED => (
+                "METHOD_NOT_ALLOWED",
+                "This method is not allowed for this resource.",
+            ),
+            _ => ("BAD_REQUEST", "The request could not be processed."),
+        };
+        ErrorResponse {
+            error: ErrorDetail {
+                code: code.to_string(),
+                message: message.to_string(),
+                errors: None,
+            },
+        }
+    }
+
+    /// Axum middleware that rewrites raw extractor-rejection responses (which
+    /// arrive as `text/plain`) into the standard JSON error envelope so every
+    /// 4xx the API surface emits shares the `{error:{code,message}}` shape and
+    /// no raw "Failed to deserialize the JSON body..." plaintext is ever
+    /// returned to a client (PMS-298). Responses that are already JSON (every
+    /// `AppError`, including structured validation errors) pass through
+    /// untouched.
+    pub async fn normalize_error_envelope(
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> Response {
+        let response = next.run(request).await;
+        let status = response.status();
+        if !status.is_client_error() {
+            return response;
+        }
+        let is_json = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("application/json"))
+            .unwrap_or(false);
+        if is_json {
+            return response;
+        }
+        // Non-JSON 4xx: an extractor rejection (or similar) leaked through.
+        // Replace it with the canonical envelope, discarding the raw body.
+        (status, Json(envelope_for_rejection(status))).into_response()
     }
 
     impl From<sqlx::Error> for AppError {
@@ -315,6 +391,77 @@ mod server_impl {
     }
 }
 
+/// Render a `serde_json::Value` constraint bound (min/max/equal) as a plain
+/// number string. `validator` stores these params as JSON numbers (often
+/// `f64`), so an integer bound like `255` would otherwise print as `255.0`.
+fn format_bound(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(u) = n.as_u64() {
+                u.to_string()
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 {
+                    (f as i64).to_string()
+                } else {
+                    f.to_string()
+                }
+            } else {
+                n.to_string()
+            }
+        }
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Build a human-readable message for a single `validator` field error.
+///
+/// `validator` leaves `message` as `None` unless the field carries an explicit
+/// `message = "..."` attribute, which is why the raw conversion previously
+/// emitted an empty per-field `message` (PMS-298). When no explicit message is
+/// present we synthesise one from the failing constraint's code and params so
+/// the response states what was wrong and includes the constraint bound (e.g.
+/// the max length).
+fn humanize_field_error(error: &validator::ValidationError) -> String {
+    if let Some(message) = &error.message {
+        return message.to_string();
+    }
+
+    let bound = |key: &str| error.params.get(key).map(format_bound);
+    let (min, max, equal) = (bound("min"), bound("max"), bound("equal"));
+
+    match error.code.as_ref() {
+        "length" => match (equal, min, max) {
+            (Some(equal), _, _) => format!("must be exactly {equal} characters"),
+            (_, Some(min), Some(max)) => {
+                format!("must be between {min} and {max} characters")
+            }
+            (_, Some(min), None) => format!("must be at least {min} characters"),
+            (_, None, Some(max)) => format!("must be at most {max} characters"),
+            _ => "has an invalid length".to_string(),
+        },
+        "range" => match (min, max) {
+            (Some(min), Some(max)) => format!("must be between {min} and {max}"),
+            (Some(min), None) => format!("must be at least {min}"),
+            (None, Some(max)) => format!("must be at most {max}"),
+            _ => "is out of range".to_string(),
+        },
+        "email" => "must be a valid email address".to_string(),
+        "url" => "must be a valid URL".to_string(),
+        "required" | "required_nested" => "is required".to_string(),
+        "must_match" => "does not match the expected value".to_string(),
+        "contains" => "is missing required content".to_string(),
+        "does_not_contain" => "contains a disallowed value".to_string(),
+        "regex" => "is not in the expected format".to_string(),
+        "credit_card" => "must be a valid credit card number".to_string(),
+        "phone" => "must be a valid phone number".to_string(),
+        "non_control_character" => "must not contain control characters".to_string(),
+        other => format!("failed the '{other}' validation"),
+    }
+}
+
 impl From<validator::ValidationErrors> for AppError {
     fn from(errors: validator::ValidationErrors) -> Self {
         let field_errors: Vec<FieldError> = errors
@@ -324,15 +471,18 @@ impl From<validator::ValidationErrors> for AppError {
                 errs.iter().map(|e| {
                     FieldError::new(
                         field.to_string(),
-                        e.message.clone().unwrap_or_default().to_string(),
+                        humanize_field_error(e),
                         e.code.to_string(),
                     )
                 })
             })
             .collect();
 
+        // The `Validation` Display already prefixes "Validation failed: ", so
+        // the message here must not repeat it (PMS-298: the old "Validation
+        // failed" value produced "Validation failed: Validation failed").
         Self::Validation {
-            message: "Validation failed".to_string(),
+            message: "one or more fields are invalid".to_string(),
             errors: field_errors,
         }
     }
@@ -418,13 +568,87 @@ mod tests {
 
         match error {
             AppError::Validation { message, errors } => {
-                assert_eq!(message, "Validation failed");
+                // No longer the literal "Validation failed": the Display impl
+                // prefixes that phrase, so storing it here doubled it (PMS-298).
+                assert_eq!(message, "one or more fields are invalid");
                 assert_eq!(errors.len(), 1);
                 assert_eq!(errors[0].field, "username");
                 assert_eq!(errors[0].message, "Username is required");
             }
             _ => panic!("Expected Validation error"),
         }
+    }
+
+    #[test]
+    fn test_validation_message_not_doubled() {
+        // PMS-298: the top-level message must not read "Validation failed:
+        // Validation failed".
+        let error = AppError::validation_field("username", "Username is required");
+        assert_eq!(
+            error.to_string(),
+            "Validation failed: one or more fields are invalid"
+        );
+    }
+
+    #[test]
+    fn test_humanize_length_includes_bound() {
+        // PMS-298: a `length(max = 255)` failure with no explicit message must
+        // produce a non-empty, human-readable message that names the bound.
+        let mut err = validator::ValidationError::new("length");
+        err.add_param("max".into(), &255u64);
+        let message = humanize_field_error(&err);
+        assert!(message.contains("255"), "message was {message:?}");
+        assert!(message.contains("at most"), "message was {message:?}");
+        assert!(!message.is_empty());
+    }
+
+    #[test]
+    fn test_humanize_respects_explicit_message() {
+        let mut err = validator::ValidationError::new("length");
+        err.message = Some("Name is too long".into());
+        assert_eq!(humanize_field_error(&err), "Name is too long");
+    }
+
+    #[test]
+    fn test_validation_errors_conversion_populates_messages() {
+        // Round-trip a real `validator` failure (length max on `name`) and
+        // confirm the per-field message is non-empty (PMS-298).
+        use validator::Validate;
+
+        #[derive(Validate)]
+        struct Demo {
+            #[validate(length(max = 3))]
+            name: String,
+        }
+
+        let errs = Demo {
+            name: "too long".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+
+        let app_error = AppError::from(errs);
+        match app_error {
+            AppError::Validation { message, errors } => {
+                assert_eq!(message, "one or more fields are invalid");
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].field, "name");
+                assert_eq!(errors[0].code, "length");
+                assert!(!errors[0].message.is_empty(), "per-field message was empty");
+                assert!(
+                    errors[0].message.contains('3'),
+                    "bound missing: {:?}",
+                    errors[0].message
+                );
+            }
+            other => panic!("Expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_format_bound_trims_trailing_zero() {
+        let value = serde_json::json!(255.0);
+        assert_eq!(format_bound(&value), "255");
     }
 
     #[test]
