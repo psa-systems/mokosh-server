@@ -16,13 +16,14 @@ use tower_http::{
 
 use crate::db::Database;
 use crate::modules::assets::{assets_routes, AssetsService};
-use crate::modules::audit::{audit_log_middleware, audit_routes, AuditService};
+use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
+use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
@@ -36,16 +37,7 @@ use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::version::VersionInfo;
-
-/// Application state shared across all routes. Not constructed yet - the
-/// router threads individual services directly; kept as the intended
-/// shared-state type for handlers that adopt it later.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Database,
-    pub jwt_secret: String,
-}
+use crate::version_check::version_check;
 
 /// Create the main API router with all routes.
 ///
@@ -95,7 +87,12 @@ pub fn create_api_router(
     );
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
-    let contact_service = ContactService::new(db.clone());
+    // PMS-136: ContactService emails a `/portal/set-password` setup link when
+    // an agent grants portal access, so it holds the shared mailer + the SPA
+    // origin (the link base). `mailer` is cloned here because TicketService
+    // also takes it below.
+    let contact_service =
+        ContactService::with_mailer(db.clone(), mailer.clone(), client_origin.clone());
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer, notifications_service.clone());
     // PMS-157: first-visit demo seeding. Holds its own clones of the
@@ -116,8 +113,12 @@ pub fn create_api_router(
     let calendar_service =
         CalendarService::with_dispatcher(db.clone(), notifications_service.clone());
     let contracts_service = ContractsService::new(db.clone());
-    let assets_service = AssetsService::new(db.clone());
+    let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
     let kb_service = KbService::new(db.clone());
+    // PMS-246: the SPA origin is the invite accept-link base (login-driven
+    // acceptance), so created invites email the invitee.
+    let invitations_service =
+        Arc::new(InvitationsService::new(db.clone()).with_app_url(client_origin.clone()));
     let reports_service = ReportsService::new(db.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
@@ -141,6 +142,14 @@ pub fn create_api_router(
     }
     if let Some(v) = bunyip_verifier {
         auth_middleware = auth_middleware.with_bunyip(v);
+        // PMS-244: the bunyip path resolves the user's tenant from Mokosh's own
+        // membership - a pending invite, else existing placement, else a
+        // provisioned personal tenant. Its own cheap pool-backed tenant handle
+        // (the router's `tenant_service` is moved into `tenant_routes`); the
+        // invitations Arc is shared with `invitations_routes`.
+        auth_middleware = auth_middleware
+            .with_tenants(std::sync::Arc::new(TenantService::new(db.clone())))
+            .with_invitations(invitations_service.clone());
     }
 
     // Build API v1 routes
@@ -161,13 +170,18 @@ pub fn create_api_router(
         )
         // Build / version info (public, used for diagnostics)
         .route("/version", get(version_info))
+        // Self-hosted update check (PMS-238). Opt-in via
+        // `MOKOSH_UPDATE_CHECK_URL`; compares the running build against the
+        // latest published release and reports whether an upgrade is
+        // available. Disabled (no outbound request) when the env var is unset.
+        .route("/version/check", get(version_check))
         // Auth routes
         .nest(
             "/auth",
             auth_routes(
                 auth_service,
                 google_oauth,
-                client_origin,
+                client_origin.clone(),
                 jwt_secret.clone(),
                 cookie_secure,
             ),
@@ -220,6 +234,8 @@ pub fn create_api_router(
         .merge(assets_routes(assets_service))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // Org membership invitations (PMS-244): admin-only, tenant-scoped.
+        .merge(invitations_routes(invitations_service))
         // Notifications: channels + templates + prefs + inbox + rules
         // + dispatcher. PMS-86.
         .merge(notifications_routes(notifications_service))
@@ -230,16 +246,15 @@ pub fn create_api_router(
         // Settings: tenant settings + module configs. PMS-114.
         .merge(settings_routes(settings_service.clone()))
         // Audit log read. PMS-118.
-        .merge(audit_routes(audit_service.clone()))
-        // Audit log middleware. PMS-119. Fires per-request after
-        // auth_middleware has populated AuthState; only logs successful
-        // mutating requests.
-        .layer(middleware::from_fn_with_state(
-            crate::modules::audit::middleware::AuditMiddlewareState {
-                service: std::sync::Arc::new(audit_service),
-            },
-            audit_log_middleware,
-        ))
+        .merge(audit_routes(audit_service))
+        // PMS-275: the coarse per-request audit middleware (PMS-119) was
+        // removed. It ran post-response with only the HTTP method + URL, so it
+        // could never populate `entity_id` or the old/new value payload, and
+        // because this router is nested under `/api/v1` the path it saw was
+        // already prefix-stripped, leaving every row tagged entity_type
+        // "unknown". The in-transaction `audit_write` path (PMS-117) is the
+        // sole audit writer and records the entity type, record id, and
+        // before/after snapshots that the audit trail needs.
         // First-visit demo seeding (PMS-157). Added before the auth layer
         // so it runs *inner* of it: auth populates AuthState, then this
         // reads the resolved tenant/user and seeds a new account's demo
@@ -260,7 +275,15 @@ pub fn create_api_router(
         // extensions. The extractor reads
         // `parts.extensions.get::<Arc<SettingsService>>()` and short-
         // circuits with 404 when the gated module is disabled.
-        .layer(axum::Extension(settings_service));
+        .layer(axum::Extension(settings_service))
+        // PMS-298: outermost layer so every 4xx (including extractor
+        // rejections such as a JSON body that fails to deserialize) is
+        // returned as the standard `{error:{code,message}}` envelope instead
+        // of raw axum/serde plaintext. JSON responses (every `AppError`) pass
+        // through untouched.
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
 
     // Build portal API routes. Portal identity is the contacts row,
     // so this surface runs its own auth middleware (mounted inside
@@ -276,6 +299,10 @@ pub fn create_api_router(
             portal_ticket_service,
             portal_kb_service,
             portal_billing_service,
+        ))
+        // PMS-298: same envelope normalization for the portal surface.
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
         ));
 
     // CORS: SPA at msp.<tld> talks to api.msp.<tld> from a different origin,
@@ -303,7 +330,9 @@ pub fn create_api_router(
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/portal", portal_api)
-        .fallback(get(not_a_frontend))
+        .fallback(get(move |headers| {
+            not_a_frontend(headers, client_origin.clone())
+        }))
         // Apply global middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
@@ -314,8 +343,12 @@ pub fn create_api_router(
 /// "this is an API endpoint" page so direct browser visits to
 /// `api.msp.<tld>` are friendly instead of leaking 404 internals. The
 /// link points at the Bunyip SaaS shell on the matching apex; if the
-/// host can't be parsed, falls back to the staging URL.
-async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
+/// host can't be parsed, falls back to `fallback_origin` (the env-injected
+/// `CLIENT_ORIGIN`). No domain is ever hardcoded here.
+async fn not_a_frontend(
+    headers: axum::http::HeaderMap,
+    fallback_origin: String,
+) -> impl IntoResponse {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -323,7 +356,7 @@ async fn not_a_frontend(headers: axum::http::HeaderMap) -> impl IntoResponse {
     let hub_link = host
         .strip_prefix("api.msp.")
         .map(|tld| format!("https://{tld}"))
-        .unwrap_or_else(|| "https://a8n.systems".to_string());
+        .unwrap_or(fallback_origin);
     let body = format!(
         "<!doctype html>\n\
          <html lang=\"en\">\n\
@@ -506,80 +539,4 @@ async fn probe_infisical() -> Result<bool, String> {
 /// to confirm exactly which revision a running server was built from.
 async fn version_info() -> Json<VersionInfo> {
     Json(VersionInfo::current())
-}
-
-/// Metadata describing a placeholder module surface. Used to render a
-/// self-documenting 501 body (F12 / PMS-125) so an integrator hitting
-/// an unimplemented endpoint learns the module name, the YouTrack
-/// issue tracking the implementation, and the planned endpoint shape
-/// without having to grep the source.
-///
-/// `dispatch` (PMS-58) was the last live caller; it now has a real
-/// router. The helper is kept (not deleted) because the same
-/// self-documenting-501 pattern is the agreed shape for the remaining
-/// placeholder modules - the next module to graduate re-wires it the
-/// same way `dispatch` did. `#[allow(dead_code)]` until then.
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-struct StubModule {
-    /// Module slug as it appears in the URL (e.g. `dispatch`).
-    name: &'static str,
-    /// YouTrack key tracking the implementation (e.g. `PMS-58`).
-    tracking_issue: &'static str,
-    /// One-line description of the module's purpose.
-    summary: &'static str,
-    /// Planned endpoints as `(method, path, summary)`.
-    planned_endpoints: &'static [(&'static str, &'static str, &'static str)],
-}
-
-/// Build a router that responds with a self-documenting 501 for every
-/// request under the module's mount point. Replaces the previous
-/// generic `Not implemented yet` body (audit F12 / PMS-125). The
-/// catch-all route uses Axum's `{*rest}` wildcard so sub-paths under
-/// the module also surface the same payload instead of falling
-/// through to a 404.
-///
-/// Retained for the remaining placeholder modules; see [`StubModule`].
-#[allow(dead_code)]
-fn module_stub_routes(meta: StubModule) -> Router {
-    Router::new()
-        .route("/", get(stub_handler))
-        .route("/{*rest}", get(stub_handler))
-        .with_state(meta)
-}
-
-#[allow(dead_code)]
-async fn stub_handler(
-    axum::extract::State(meta): axum::extract::State<StubModule>,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> impl IntoResponse {
-    let endpoints: Vec<serde_json::Value> = meta
-        .planned_endpoints
-        .iter()
-        .map(|(method, path, summary)| {
-            serde_json::json!({
-                "method": method,
-                "path": path,
-                "summary": summary,
-            })
-        })
-        .collect();
-    let body = serde_json::json!({
-        "error": "not_implemented",
-        "module": meta.name,
-        "path": uri.path(),
-        "summary": meta.summary,
-        "tracking_issue": meta.tracking_issue,
-        "tracking_url": format!(
-            "https://niceguyit.myjetbrains.com/youtrack/issue/{}",
-            meta.tracking_issue
-        ),
-        "planned_endpoints": endpoints,
-        "docs": "dev-docs/codebase-state.md",
-    });
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
 }

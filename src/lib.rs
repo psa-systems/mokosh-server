@@ -4,12 +4,12 @@
 
 pub mod api;
 pub mod db;
-pub mod error;
 pub mod infisical;
 pub mod modules;
 pub mod scheduler;
 pub mod utils;
 pub mod version;
+pub mod version_check;
 
 pub use db::Database;
 pub use modules::auth::{AuthState, CurrentUser};

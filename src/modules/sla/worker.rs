@@ -34,6 +34,7 @@
 //! tickets with no assignee are skipped (nobody to notify). The spawn
 //! site is `src/main.rs`.
 
+use crate::modules::auth::TenantId;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
@@ -94,6 +95,16 @@ impl SlaSweepWorker {
         // not resolved, not closed, and the current status is not a
         // closed status. first_response_at is read so a ticket that
         // already got its first response skips that milestone.
+        //
+        // PMS-261: this is the worker's deliberate cross-tenant enumeration -
+        // it projects `tenant_id` off every tenant's open `tickets` to build
+        // the per-tenant work list, so it runs on the bare pool with NO
+        // `app.current_tenant` GUC by design. Sound only because the worker
+        // connects as the BYPASSRLS (migration) role; the per-tenant work below
+        // (`claim_sla_notification`, `dispatch`) each sets the GUC via
+        // `begin_with_tenant`. When the app moves to an unprivileged
+        // NOBYPASSRLS role (parent PMS-255), this scan must move to a
+        // BYPASSRLS-scoped path.
         let rows = sqlx::query_as::<_, TicketRow>(
             r#"SELECT t.id, t.tenant_id, t.assigned_to_id, t.created_at,
                       t.first_response_due, t.first_response_at, t.resolution_due
@@ -158,17 +169,10 @@ impl SlaSweepWorker {
                 // the cost is that a dispatch failure leaves the ledger
                 // row in place (the milestone is not retried), which is
                 // acceptable for an at-risk/breach heads-up.
-                let claimed = sqlx::query(
-                    r#"INSERT INTO sla_notifications (tenant_id, ticket_id, kind)
-                       VALUES ($1, $2, $3)
-                       ON CONFLICT (ticket_id, kind) DO NOTHING"#,
-                )
-                .bind(t.tenant_id)
-                .bind(t.id)
-                .bind(kind)
-                .execute(pool)
-                .await?
-                .rows_affected();
+                let claimed = self
+                    .service
+                    .claim_sla_notification(t.tenant_id, t.id, kind)
+                    .await?;
                 if claimed == 0 {
                     continue;
                 }
@@ -179,8 +183,16 @@ impl SlaSweepWorker {
                     "kind": kind,
                     "due": due.to_rfc3339(),
                 });
+                // SAFETY (PMS-261): `t.tenant_id` is projected off the
+                // `tickets` row by the cross-tenant scan above (a real tenant
+                // id, not user input). `claim_sla_notification` and the
+                // `dispatch` below each open their own
+                // `begin_with_tenant(t.tenant_id)` transaction, so the GUC is
+                // set to exactly the tenant being processed for every
+                // per-tenant query. `from_trusted` is the sanctioned bridge for
+                // this DB-derived worker scope.
                 match notifications
-                    .dispatch(t.tenant_id, event_type, &context)
+                    .dispatch(TenantId::from_trusted(t.tenant_id), event_type, &context)
                     .await
                 {
                     Ok(n) => {

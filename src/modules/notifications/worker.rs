@@ -24,12 +24,13 @@
 //! built).
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use async_trait::async_trait;
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::scheduler::Job;
 use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
 
@@ -37,6 +38,11 @@ use crate::utils::error::{AppError, AppResult};
 /// `attempt_count - 1`. After the array is exhausted the row is marked
 /// `failed`.
 const BACKOFF_SECS: &[i64] = &[60, 300, 1800, 7200, 21600];
+
+/// Rows drained per scheduler tick. Was the `batch_size` argument to the
+/// old `run_forever`; now a constant since the [`Job`] trait owns the tick
+/// loop and carries no per-tick parameters (PMS-198).
+const TICK_BATCH_SIZE: i64 = 25;
 
 /// Outcome of a single dispatcher tick.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -60,37 +66,17 @@ impl DispatcherWorker {
         Self { db, mailer }
     }
 
-    /// Long-running loop: tick every `interval`. Logs errors and keeps
-    /// going - one bad tick should not kill the worker.
-    #[tracing::instrument(skip_all)]
-    pub async fn run_forever(self, interval: Duration, batch_size: i64) {
-        tracing::info!(
-            interval_secs = interval.as_secs(),
-            batch_size,
-            "notifications dispatcher worker started",
-        );
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            match self.run_tick(batch_size).await {
-                Ok(stats) if stats.examined > 0 => {
-                    tracing::debug!(?stats, "dispatcher tick");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = ?e, "dispatcher tick failed; will retry on next interval");
-                }
-            }
-        }
-    }
-
     /// Process up to `limit` pending notifications in a single
     /// transaction. Exposed publicly so the integration test can drive
     /// the worker deterministically (no sleep, no spawn).
     #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self, limit: i64) -> AppResult<TickStats> {
-        let mut tx = self.db.pool().begin().await?;
+        // SAFETY (PMS-285): the dispatcher drains pending `notifications` across
+        // EVERY tenant in one `FOR UPDATE SKIP LOCKED` batch (the worker owns the
+        // cadence), so it cannot set a single tenant GUC and runs on the migrator
+        // (BYPASSRLS) pool. Each row carries its own `tenant_id` for the delivery
+        // / status-update work that follows.
+        let mut tx = self.db.migrator_pool().begin().await?;
 
         let rows = sqlx::query(
             r#"
@@ -273,14 +259,30 @@ impl DispatcherWorker {
     }
 
     async fn lookup_user_email(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<Option<String>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT email FROM users WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
                 .bind(user_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| AppError::Database(format!("lookup_user_email: {e}")))?;
         Ok(row.map(|(e,)| e))
+    }
+}
+
+#[async_trait]
+impl Job for DispatcherWorker {
+    fn name(&self) -> &'static str {
+        "notifications_dispatcher"
+    }
+
+    async fn run(&self) -> AppResult<()> {
+        let stats = self.run_tick(TICK_BATCH_SIZE).await?;
+        if stats.examined > 0 {
+            tracing::debug!(?stats, "dispatcher tick");
+        }
+        Ok(())
     }
 }
 

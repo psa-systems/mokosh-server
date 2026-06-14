@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::BillingService;
-use crate::modules::auth::{RequireBilling, RequireFinance};
+use crate::modules::auth::{RequireBilling, RequireFinance, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -64,7 +64,7 @@ async fn list_tax_rates(
 ) -> AppResult<Json<PaginatedResponse<TaxRateResponse>>> {
     let (rates, total) = state
         .service
-        .list_tax_rates(user.tenant_id, &pagination)
+        .list_tax_rates(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         rates,
@@ -83,7 +83,7 @@ async fn create_tax_rate(
     request.validate()?;
     let r = state
         .service
-        .create_tax_rate(user.tenant_id, &request, &ctx)
+        .create_tax_rate(user.tenant(), &request, &ctx)
         .await?;
     Ok(Json(r))
 }
@@ -99,7 +99,7 @@ async fn update_tax_rate(
     request.validate()?;
     let r = state
         .service
-        .update_tax_rate(user.tenant_id, id, &request, &ctx)
+        .update_tax_rate(user.tenant(), id, &request, &ctx)
         .await?;
     Ok(Json(r))
 }
@@ -113,7 +113,7 @@ async fn delete_tax_rate(
 ) -> AppResult<()> {
     state
         .service
-        .delete_tax_rate(user.tenant_id, id, &ctx)
+        .delete_tax_rate(user.tenant(), id, &ctx)
         .await?;
     Ok(())
 }
@@ -130,7 +130,7 @@ async fn lookup_tax_rate(
 ) -> AppResult<Json<TaxRateResponse>> {
     let r = state
         .service
-        .lookup_tax_rate(user.tenant_id, &q.name)
+        .lookup_tax_rate(user.tenant(), &q.name)
         .await?;
     Ok(Json(r))
 }
@@ -143,7 +143,7 @@ async fn list_payment_gateways(
 ) -> AppResult<Json<PaginatedResponse<PaymentGatewayConfigResponse>>> {
     let (gateways, total) = state
         .service
-        .list_payment_gateways(user.tenant_id, &pagination)
+        .list_payment_gateways(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         gateways,
@@ -162,7 +162,7 @@ async fn upsert_payment_gateway(
     request.validate()?;
     let g = state
         .service
-        .upsert_payment_gateway(user.tenant_id, &request, &ctx)
+        .upsert_payment_gateway(user.tenant(), &request, &ctx)
         .await?;
     Ok(Json(g))
 }
@@ -179,7 +179,7 @@ async fn delete_payment_gateway(
     })?;
     state
         .service
-        .delete_payment_gateway(user.tenant_id, provider, &ctx)
+        .delete_payment_gateway(user.tenant(), provider, &ctx)
         .await?;
     Ok(())
 }
@@ -194,7 +194,7 @@ async fn list_payments(
     filter.validate()?;
     let (payments, total) = state
         .service
-        .list_payments(user.tenant_id, &filter, &pagination)
+        .list_payments(user.tenant(), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         payments,
@@ -213,7 +213,7 @@ async fn create_payment(
     request.validate()?;
     let p = state
         .service
-        .create_payment(user.tenant_id, &request, &ctx)
+        .create_payment(user.tenant(), &request, &ctx)
         .await?;
     Ok(Json(p))
 }
@@ -227,7 +227,7 @@ async fn delete_payment(
 ) -> AppResult<()> {
     state
         .service
-        .delete_payment(user.tenant_id, payment_id, &ctx)
+        .delete_payment(user.tenant(), payment_id, &ctx)
         .await?;
     Ok(())
 }
@@ -243,7 +243,7 @@ async fn update_invoice(
     request.validate()?;
     let inv = state
         .service
-        .update_invoice(user.tenant_id, invoice_id, &request, &ctx)
+        .update_invoice(user.tenant(), invoice_id, &request, &ctx)
         .await?;
     Ok(Json(inv))
 }
@@ -258,7 +258,7 @@ async fn create_invoice(
     request.validate()?;
     let inv = state
         .service
-        .create_invoice(user.tenant_id, &request, &ctx)
+        .create_invoice(user.tenant(), &request, &ctx)
         .await?;
     Ok(Json(inv))
 }
@@ -277,7 +277,7 @@ async fn create_invoice_from_time_entries(
     request.validate()?;
     let inv = state
         .service
-        .create_invoice_from_time_entries(user.tenant_id, &request, &ctx)
+        .create_invoice_from_time_entries(user.tenant(), &request, &ctx)
         .await?;
     Ok(Json(inv))
 }
@@ -288,10 +288,7 @@ async fn get_invoice(
     _finance: RequireFinance,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
-    let inv = state
-        .service
-        .get_invoice(user.tenant_id, invoice_id)
-        .await?;
+    let inv = state.service.get_invoice(user.tenant(), invoice_id).await?;
     Ok(Json(inv))
 }
 
@@ -305,7 +302,7 @@ async fn list_invoices(
     filter.validate()?;
     let (invoices, total) = state
         .service
-        .list_invoices(user.tenant_id, &filter, &pagination)
+        .list_invoices(user.tenant(), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         invoices,

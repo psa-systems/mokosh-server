@@ -1,5 +1,6 @@
 //! Knowledge base service.
 
+use crate::modules::auth::TenantId;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -22,13 +23,14 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_categories(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbCategoryResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM kb_categories WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, CatRow>(
@@ -40,7 +42,7 @@ impl KbService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -48,17 +50,18 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_category(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertKbCategoryRequest,
     ) -> AppResult<KbCategoryResponse> {
         // Per-tenant unique slug (enforced at the app layer; the
         // `uq_kb_categories_tenant_slug` constraint is the DB backstop).
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let dup: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM kb_categories WHERE tenant_id = $1 AND slug = $2)",
         )
         .bind(tenant_id)
         .bind(&request.slug)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if dup {
             return Err(AppError::Conflict(format!(
@@ -80,8 +83,9 @@ impl KbService {
         .bind(&request.slug)
         .bind(&request.visibility)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(KbCategoryResponse {
             id,
             name: request.name.clone(),
@@ -96,10 +100,11 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_category(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertKbCategoryRequest,
     ) -> AppResult<KbCategoryResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_categories SET
                   name = $3, description = $4, parent_id = $5, slug = $6,
@@ -114,12 +119,13 @@ impl KbService {
         .bind(&request.slug)
         .bind(&request.visibility)
         .bind(request.sort_order)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("KbCategory".to_string()));
         }
+        tx.commit().await?;
         Ok(KbCategoryResponse {
             id,
             name: request.name.clone(),
@@ -132,16 +138,18 @@ impl KbService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_category(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_category(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM kb_categories WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("KbCategory".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -149,7 +157,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_articles(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &KbArticleFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
@@ -223,30 +231,32 @@ impl KbService {
             q = q.bind(v.clone());
             cq = cq.bind(v.clone());
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_article(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         author_id: Uuid,
         request: &CreateKbArticleRequest,
     ) -> AppResult<KbArticleResponse> {
         // Per-tenant unique slug (app-layer check; the
         // `uq_kb_articles_tenant_slug` constraint is the DB backstop).
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let dup: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE tenant_id = $1 AND slug = $2)",
         )
         .bind(tenant_id)
         .bind(&request.slug)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if dup {
             return Err(AppError::Conflict(format!(
@@ -255,7 +265,6 @@ impl KbService {
             )));
         }
         let id = Uuid::new_v4();
-        let mut tx = self.db.pool().begin().await?;
         // Stamp published_at when the article is created already
         // published; leave NULL for draft / archived. `NOW()` is applied
         // in SQL only when status = 'published'.
@@ -294,11 +303,26 @@ impl KbService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.get_article(tenant_id, id).await
+        self.get_article_inner(tenant_id, id, false).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_article(&self, tenant_id: Uuid, id: Uuid) -> AppResult<KbArticleResponse> {
+    pub async fn get_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<KbArticleResponse> {
+        // Public reads count as a view.
+        self.get_article_inner(tenant_id, id, true).await
+    }
+
+    /// Fetch an article, bumping `view_count` only when `bump_view` is
+    /// true. Internal refetches after create/update pass `false` so the
+    /// write path does not inflate the counter (PMS-195: a single
+    /// create-then-return or update-then-return previously double-counted).
+    async fn get_article_inner(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        bump_view: bool,
+    ) -> AppResult<KbArticleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
                       author_id, view_count, helpful_count, not_helpful_count,
@@ -307,27 +331,30 @@ impl KbService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("KbArticle".to_string()))?;
-        // Increment view count on read; fire-and-forget if the bump fails.
-        let _ = sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
-            .bind(id)
-            .execute(self.db.pool())
-            .await;
+        if bump_view {
+            // Increment view count on read; fire-and-forget if the bump fails.
+            let _ = sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await;
+        }
+        tx.commit().await?;
         Ok(row.into())
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_article(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         editor: Uuid,
         request: &UpdateKbArticleRequest,
     ) -> AppResult<KbArticleResponse> {
-        let prior = self.get_article(tenant_id, id).await?;
-        let mut tx = self.db.pool().begin().await?;
+        let prior = self.get_article_inner(tenant_id, id, false).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
                 title = COALESCE($3, title),
@@ -381,7 +408,7 @@ impl KbService {
             .await?;
         }
         tx.commit().await?;
-        self.get_article(tenant_id, id).await
+        self.get_article_inner(tenant_id, id, false).await
     }
 
     /// Append a new monotonic version row for `article_id` inside an open
@@ -389,7 +416,7 @@ impl KbService {
     /// `restore_article_version` (snapshot-on-restore) so the
     /// `MAX(version_number) + 1` numbering stays in one place.
     async fn snapshot_version(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &mut sqlx::PgConnection,
         article_id: Uuid,
         title: &str,
         content: &str,
@@ -399,7 +426,7 @@ impl KbService {
             "SELECT COALESCE(MAX(version_number), 0) + 1 FROM kb_article_versions WHERE article_id = $1",
         )
         .bind(article_id)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
             r#"INSERT INTO kb_article_versions
@@ -411,7 +438,7 @@ impl KbService {
         .bind(title)
         .bind(content)
         .bind(editor)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
         Ok(next)
     }
@@ -424,18 +451,19 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn restore_article_version(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         version_number: i32,
         editor: Uuid,
     ) -> AppResult<KbArticleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Confirm the article is in this tenant before touching versions.
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
         )
         .bind(article_id)
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if !exists {
             return Err(AppError::NotFound("KbArticle".to_string()));
@@ -447,13 +475,12 @@ impl KbService {
         )
         .bind(article_id)
         .bind(version_number)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((title, content)) = snapshot else {
             return Err(AppError::NotFound("KbArticleVersion".to_string()));
         };
 
-        let mut tx = self.db.pool().begin().await?;
         sqlx::query(
             r#"UPDATE kb_articles
                SET title = $3, content = $4, updated_at = NOW()
@@ -469,7 +496,7 @@ impl KbService {
         // on top of it (monotonic numbering preserved).
         Self::snapshot_version(&mut tx, article_id, &title, &content, editor).await?;
         tx.commit().await?;
-        self.get_article(tenant_id, article_id).await
+        self.get_article_inner(tenant_id, article_id, false).await
     }
 
     /// Record a `helpful` vote for `user_id` on a tenant-scoped article.
@@ -480,7 +507,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn increment_helpful(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
@@ -492,7 +519,7 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn increment_not_helpful(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
@@ -524,12 +551,12 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn record_vote(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         user_id: Uuid,
         vote: &str,
     ) -> AppResult<KbArticleFeedbackResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Tenant-scoped existence check: 404 if the article is missing or
         // belongs to another tenant.
@@ -622,10 +649,11 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_article_vote(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<KbArticleFeedbackResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(Uuid, Option<i32>, Option<i32>)> = sqlx::query_as(
             r#"SELECT id, helpful_count, not_helpful_count
                FROM kb_articles
@@ -633,7 +661,7 @@ impl KbService {
         )
         .bind(tenant_id)
         .bind(article_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((id, helpful, not_helpful)) = row else {
             return Err(AppError::NotFound("KbArticle".to_string()));
@@ -644,7 +672,7 @@ impl KbService {
         )
         .bind(article_id)
         .bind(user_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
 
         Ok(KbArticleFeedbackResponse {
@@ -656,33 +684,36 @@ impl KbService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_article(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM kb_articles WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("KbArticle".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_article_versions(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         article_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleVersionResponse>, u64)> {
         // Verify article belongs to tenant.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
         )
         .bind(article_id)
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if !exists {
             return Err(AppError::NotFound("KbArticle".to_string()));
@@ -690,7 +721,7 @@ impl KbService {
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM kb_article_versions WHERE article_id = $1")
                 .bind(article_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
         let rows = sqlx::query_as::<_, VersionRow>(
             r#"SELECT id, article_id, version_number, title, content, edited_by_id, created_at
@@ -701,7 +732,7 @@ impl KbService {
         .bind(article_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -718,10 +749,11 @@ impl KbService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
     pub async fn list_portal_articles_for_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM kb_articles
                WHERE tenant_id = $1 AND status = 'published'
@@ -732,7 +764,7 @@ impl KbService {
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, ArticleRow>(
@@ -752,7 +784,7 @@ impl KbService {
         .bind(company_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }

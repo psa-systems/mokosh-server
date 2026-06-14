@@ -1,8 +1,9 @@
 import { expect, test as setup, type Response as PwResponse } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { dirname } from 'node:path';
-import { OP_STORAGE_STATE_FILE, TOKEN_FILE } from '../lib/auth-state';
+import { FOREIGN_COMPANY_FILE, OP_STORAGE_STATE_FILE, TOKEN_FILE } from '../lib/auth-state';
 import { env } from '../lib/env';
 import { loginViaSpa } from '../lib/login';
 
@@ -190,6 +191,22 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   mkdirSync(dirname(TOKEN_FILE), { recursive: true });
   writeFileSync(TOKEN_FILE, token!);
 
+  // Persist the cross-tenant company canary fixture so contacts.spec.ts runs
+  // unconditionally instead of skipping. When the operator pinned a real
+  // foreign-tenant company id via E2E_FOREIGN_COMPANY_ID, use it (the
+  // strongest form of the canary: an existing, foreign-owned company must
+  // still 403/404). Otherwise fall back to a random, well-formed UUID the
+  // E2E tenant cannot own - mirroring the foreign-tenant canary in the same
+  // spec: the company route must never return 200/5xx for an id the caller
+  // does not own.
+  const foreignCompanyId = env.foreignCompanyId ?? randomUUID();
+  writeFileSync(FOREIGN_COMPANY_FILE, foreignCompanyId);
+  console.log(
+    `[setup] persisted foreign-company canary id (${
+      env.foreignCompanyId ? 'operator-pinned' : 'random non-owned UUID'
+    }) to ${FOREIGN_COMPANY_FILE}`,
+  );
+
   // Persist the OP session cookies so the OIDC token-flow test
   // (`tests/oidc.spec.ts`) can replay them via `request.newContext({
   // storageState })`. Bunyip's `/oauth2/authorize` gates code minting on
@@ -199,7 +216,7 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   //
   // Filter to the OP host and its parent domain. Cookies on bunyip-as-OP
   // deploys are split: the OP-session cookie lives on the OP host
-  // (e.g. `api.a8n.systems`) while the hub access/refresh cookies live
+  // (e.g. `api.msp.a8n.systems`) while the hub access/refresh cookies live
   // on the apex (`a8n.systems`). Including both covers the authorize
   // path completely without sweeping in unrelated cookies (font CDNs,
   // analytics, etc.) that would just bloat the file. Normalise

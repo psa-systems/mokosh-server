@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::SlaService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -68,7 +68,7 @@ async fn list_policies(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SlaPolicyResponse>>> {
-    let (items, total) = s.service.list_policies(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_policies(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -83,7 +83,7 @@ async fn create_policy(
     Json(req): Json<UpsertSlaPolicyRequest>,
 ) -> AppResult<Json<SlaPolicyResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_policy(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_policy(u.tenant(), &req).await?))
 }
 
 async fn get_policy(
@@ -91,7 +91,7 @@ async fn get_policy(
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<SlaPolicyResponse>> {
-    Ok(Json(s.service.get_policy(u.tenant_id, id).await?))
+    Ok(Json(s.service.get_policy(u.tenant(), id).await?))
 }
 
 async fn update_policy(
@@ -102,7 +102,7 @@ async fn update_policy(
     Json(req): Json<UpsertSlaPolicyRequest>,
 ) -> AppResult<Json<SlaPolicyResponse>> {
     req.validate()?;
-    Ok(Json(s.service.update_policy(u.tenant_id, id, &req).await?))
+    Ok(Json(s.service.update_policy(u.tenant(), id, &req).await?))
 }
 
 async fn delete_policy(
@@ -111,7 +111,7 @@ async fn delete_policy(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_policy(u.tenant_id, id).await
+    s.service.delete_policy(u.tenant(), id).await
 }
 
 async fn list_targets(
@@ -120,7 +120,7 @@ async fn list_targets(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SlaTargetResponse>>> {
-    let (items, total) = s.service.list_targets(u.tenant_id, id, &pagination).await?;
+    let (items, total) = s.service.list_targets(u.tenant(), id, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -136,7 +136,7 @@ async fn upsert_target(
     Json(req): Json<UpsertSlaTargetRequest>,
 ) -> AppResult<Json<SlaTargetResponse>> {
     req.validate()?;
-    Ok(Json(s.service.upsert_target(u.tenant_id, id, &req).await?))
+    Ok(Json(s.service.upsert_target(u.tenant(), id, &req).await?))
 }
 
 async fn delete_target(
@@ -145,7 +145,7 @@ async fn delete_target(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_target(u.tenant_id, id).await
+    s.service.delete_target(u.tenant(), id).await
 }
 
 async fn list_business_hours(
@@ -155,7 +155,7 @@ async fn list_business_hours(
 ) -> AppResult<Json<PaginatedResponse<BusinessHoursResponse>>> {
     let (items, total) = s
         .service
-        .list_business_hours(u.tenant_id, &pagination)
+        .list_business_hours(u.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -172,7 +172,7 @@ async fn create_business_hours(
 ) -> AppResult<Json<BusinessHoursResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_business_hours(u.tenant_id, &req).await?,
+        s.service.create_business_hours(u.tenant(), &req).await?,
     ))
 }
 
@@ -186,7 +186,7 @@ async fn update_business_hours(
     req.validate()?;
     Ok(Json(
         s.service
-            .update_business_hours(u.tenant_id, id, &req)
+            .update_business_hours(u.tenant(), id, &req)
             .await?,
     ))
 }
@@ -197,7 +197,7 @@ async fn delete_business_hours(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_business_hours(u.tenant_id, id).await
+    s.service.delete_business_hours(u.tenant(), id).await
 }
 
 async fn list_holiday_calendars(
@@ -207,7 +207,7 @@ async fn list_holiday_calendars(
 ) -> AppResult<Json<PaginatedResponse<HolidayCalendarResponse>>> {
     let (items, total) = s
         .service
-        .list_holiday_calendars(u.tenant_id, &pagination)
+        .list_holiday_calendars(u.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -224,7 +224,7 @@ async fn create_holiday_calendar(
 ) -> AppResult<Json<HolidayCalendarResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_holiday_calendar(u.tenant_id, &req).await?,
+        s.service.create_holiday_calendar(u.tenant(), &req).await?,
     ))
 }
 
@@ -238,7 +238,7 @@ async fn update_holiday_calendar(
     req.validate()?;
     Ok(Json(
         s.service
-            .update_holiday_calendar(u.tenant_id, id, &req)
+            .update_holiday_calendar(u.tenant(), id, &req)
             .await?,
     ))
 }
@@ -249,7 +249,7 @@ async fn delete_holiday_calendar(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_holiday_calendar(u.tenant_id, id).await
+    s.service.delete_holiday_calendar(u.tenant(), id).await
 }
 
 async fn evaluate_for_ticket(
@@ -258,5 +258,5 @@ async fn evaluate_for_ticket(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.evaluate_for_ticket(u.tenant_id, id).await
+    s.service.evaluate_for_ticket(u.tenant(), id).await
 }

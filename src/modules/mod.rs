@@ -10,6 +10,7 @@ pub mod billing;
 pub mod calendar;
 pub mod contacts;
 pub mod contracts;
+pub mod invitations;
 pub mod knowledge_base;
 pub mod notifications;
 pub mod portal;

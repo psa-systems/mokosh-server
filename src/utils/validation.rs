@@ -72,41 +72,6 @@ pub fn validate_password_strength(password: &str) -> Result<(), ValidationError>
     }
 }
 
-/// Validate a hex color code
-pub fn validate_hex_color(color: &str) -> Result<(), ValidationError> {
-    let color = color.strip_prefix('#').unwrap_or(color);
-
-    if (color.len() == 3 || color.len() == 6) && color.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(ValidationError::new("invalid_color"))
-    }
-}
-
-/// Validate a timezone string
-pub fn validate_timezone(tz: &str) -> Result<(), ValidationError> {
-    // Common timezone validation - could use chrono-tz for full validation
-    if tz.is_empty() {
-        return Err(ValidationError::new("empty_timezone"));
-    }
-
-    // Check for IANA timezone format (e.g., "America/New_York")
-    if tz.contains('/') && tz.len() >= 5 {
-        return Ok(());
-    }
-
-    // Check for offset format (e.g., "UTC", "+05:00", "-08:00")
-    if tz == "UTC" || tz == "GMT" {
-        return Ok(());
-    }
-
-    if (tz.starts_with('+') || tz.starts_with('-')) && tz.len() == 6 && tz.contains(':') {
-        return Ok(());
-    }
-
-    Err(ValidationError::new("invalid_timezone"))
-}
-
 /// Validate a CRON expression
 pub fn validate_cron(expr: &str) -> Result<(), ValidationError> {
     match cron::Schedule::try_from(expr) {
@@ -115,20 +80,37 @@ pub fn validate_cron(expr: &str) -> Result<(), ValidationError> {
     }
 }
 
-/// Validate that a string is not empty after trimming
-pub fn validate_not_blank(s: &str) -> Result<(), ValidationError> {
-    if s.trim().is_empty() {
-        Err(ValidationError::new("blank"))
-    } else {
-        Ok(())
-    }
-}
+/// Contract types accepted by the `contracts.contract_type` CHECK
+/// constraint (migration `009_contracts.sql`). Kept in sync with the DB
+/// so a request carrying an out-of-set value is rejected with a 422 at
+/// the request layer instead of hitting the constraint and surfacing as a
+/// 500 DATABASE_ERROR (PMS-299).
+pub const CONTRACT_TYPES: [&str; 5] = [
+    "managed_services",
+    "block_hours",
+    "time_and_materials",
+    "fixed_price",
+    "warranty",
+];
 
-/// Validate a UUID string
-pub fn validate_uuid(s: &str) -> Result<(), ValidationError> {
-    match uuid::Uuid::parse_str(s) {
-        Ok(_) => Ok(()),
-        Err(_) => Err(ValidationError::new("invalid_uuid")),
+/// Validate a contract type against the set the DB CHECK constraint
+/// allows. The `contract_type` field deserializes as a free `String`, so
+/// values such as `recurring` or `retainer` pass deserialization but
+/// violate the DB constraint; rejecting them here turns an unhandled 500
+/// into a clear 422 (PMS-299).
+pub fn validate_contract_type(value: &str) -> Result<(), ValidationError> {
+    if CONTRACT_TYPES.contains(&value) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_contract_type");
+        error.message = Some(
+            format!(
+                "contract_type must be one of: {}",
+                CONTRACT_TYPES.join(", ")
+            )
+            .into(),
+        );
+        Err(error)
     }
 }
 
@@ -154,13 +136,25 @@ pub fn sanitize_html(html: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// Truncate a string to a maximum length, adding ellipsis if needed
+/// Truncate a string to a maximum length, adding ellipsis if needed.
+///
+/// `max_len` is a byte budget. Slicing at an arbitrary byte index panics when
+/// it lands inside a multi-byte UTF-8 sequence, so the cut point is snapped
+/// back to the nearest char boundary via `char_indices` before slicing.
 pub fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        return s.to_string();
     }
+    // Reserve 3 bytes for the "..." suffix, then find the last char boundary
+    // at or before that byte budget so the slice never splits a code point.
+    let budget = max_len.saturating_sub(3);
+    let cut = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= budget)
+        .last()
+        .unwrap_or(0);
+    format!("{}...", &s[..cut])
 }
 
 #[cfg(test)]
@@ -199,6 +193,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_contract_type() {
+        // PMS-299: only the DB CHECK set is accepted.
+        assert!(validate_contract_type("managed_services").is_ok());
+        assert!(validate_contract_type("block_hours").is_ok());
+        assert!(validate_contract_type("time_and_materials").is_ok());
+        assert!(validate_contract_type("fixed_price").is_ok());
+        assert!(validate_contract_type("warranty").is_ok());
+        // Values that passed deserialization but caused a 500 before.
+        assert!(validate_contract_type("recurring").is_err());
+        assert!(validate_contract_type("retainer").is_err());
+        assert!(validate_contract_type("").is_err());
+    }
+
+    #[test]
     fn test_slugify() {
         assert_eq!(slugify("Hello World!"), "hello-world");
         assert_eq!(slugify("  Multiple   Spaces  "), "multiple-spaces");
@@ -215,5 +223,16 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("Hello", 10), "Hello");
         assert_eq!(truncate("Hello World", 8), "Hello...");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_no_panic() {
+        // PMS-196: 'ñ' is two bytes, so an odd byte budget lands inside a code
+        // point. The old byte-slice (`&s[..n]`) panicked here.
+        // "ñññññ" is 10 bytes / 5 chars; budget 5 snaps back to byte 4.
+        let s = "ñññññ";
+        assert_eq!(truncate(s, 8), "ññ...");
+        // 4-byte code points (emoji) must also be safe.
+        assert_eq!(truncate("😀😀😀", 8), "😀...");
     }
 }

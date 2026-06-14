@@ -37,6 +37,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 export const TOKEN_FILE = resolve(here, '..', '.auth', 'token.txt');
 export const OP_STORAGE_STATE_FILE = resolve(here, '..', '.auth', 'op-state.json');
+// Cross-tenant company canary fixture. setup writes the company id the
+// `cross-tenant isolation` test in contacts.spec.ts reads: a real
+// foreign-tenant company id when the operator pinned E2E_FOREIGN_COMPANY_ID,
+// otherwise a random, well-formed UUID the E2E tenant cannot own.
+export const FOREIGN_COMPANY_FILE = resolve(here, '..', '.auth', 'foreign-company.txt');
 
 export function readToken(): string {
   if (!existsSync(TOKEN_FILE)) {
@@ -70,6 +75,23 @@ export interface OpStorageState {
     sameSite: 'Strict' | 'Lax' | 'None';
   }>;
   origins: never[];
+}
+
+export function readForeignCompanyId(): string {
+  if (!existsSync(FOREIGN_COMPANY_FILE)) {
+    throw new Error(
+      `Missing ${FOREIGN_COMPANY_FILE}. The setup project must run before tests ` +
+        `that read the foreign-company canary; check that this project declares ` +
+        `dependencies: ['setup'].`,
+    );
+  }
+  const id = readFileSync(FOREIGN_COMPANY_FILE, 'utf-8').trim();
+  if (!id) {
+    throw new Error(
+      `Empty foreign company id in ${FOREIGN_COMPANY_FILE}; setup probably failed`,
+    );
+  }
+  return id;
 }
 
 export function readOpStorageState(): OpStorageState {

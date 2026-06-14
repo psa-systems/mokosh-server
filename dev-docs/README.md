@@ -14,6 +14,7 @@ documentation in
 | [`quickstart.md`](quickstart.md) | Get a fresh clone running on a Linux host. Covers user-level toolchain install, seeding the gitignored `.env.dev`, the Infisical bootstrap, and known footguns. |
 | [`codebase-state.md`](codebase-state.md) | What is implemented in `mokosh-server` today: real modules, route catalog, placeholders, cross-cutting issues, and proposed fixes (`F1..F14`). |
 | [`client-server-integration.md`](client-server-integration.md) | How `mokosh-server` and `mokosh-clients` fit together. Section-by-section gap table, shared-DTO pattern, and the recommended order in which to land server modules so the client can wire them. |
+| [`architecture-seams.md`](architecture-seams.md) | Duplicated subsystems that intentionally still coexist (dual auth surfaces, dual billing subsystems) and the canonical-store decisions for the subscription-state and dual-users schema divergences (PMS-198). Read before touching auth, billing, or the `tenants`/`users` tables. |
 
 ## Recommended reading order
 

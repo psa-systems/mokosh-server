@@ -16,6 +16,10 @@ use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use mokosh_server::modules::auth::AuthService;
+use mokosh_server::utils::pagination::PaginationParams;
+use mokosh_server::Database;
+
 #[sqlx::test]
 async fn login_then_me_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -60,7 +64,7 @@ async fn list_users_pagination_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     for i in 0..14 {
         let e = format!("tech-{i:02}@example.com");
-        common::seed_user(&pool, &e, "technician").await;
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, &e, "technician").await;
     }
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
@@ -90,11 +94,11 @@ async fn list_users_filter_by_role_and_q(pool: PgPool) {
     let (_admin_id, admin_email, password) = common::seed_admin(&pool).await;
     for i in 0..3 {
         let e = format!("pms4test-tech-{i}@example.com");
-        common::seed_user(&pool, &e, "technician").await;
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, &e, "technician").await;
     }
     for i in 0..2 {
         let e = format!("pms4test-mgr-{i}@example.com");
-        common::seed_user(&pool, &e, "manager").await;
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, &e, "manager").await;
     }
     let app = common::boot(pool).await;
     let token = common::login(&app, &admin_email, &password).await;
@@ -152,8 +156,13 @@ async fn list_users_filter_validation_rejects_oversize_q(pool: PgPool) {
 /// admin/manager gate pin.
 #[sqlx::test]
 async fn list_users_requires_admin(pool: PgPool) {
-    let (_uid, email, password) =
-        common::seed_user(&pool, "techguy@example.com", "technician").await;
+    let (_uid, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "techguy@example.com",
+        "technician",
+    )
+    .await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &password).await;
 
@@ -195,8 +204,11 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
         .expect("mfa setup JSON");
     let secret_b32 = setup["secret"].as_str().expect("secret in mfa setup");
     let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32).expect("decode mfa secret");
-    let code_now = mokosh_auth_crypto::totp::code_at(&secret, Utc::now());
 
+    // Compute the TOTP code immediately before sending (no awaits between
+    // here and `.send()`) so the 30-second step cannot roll over in the
+    // gap and push the code outside the server's +-1 step verify window.
+    let code_now = mokosh_auth_crypto::totp::code_at(&secret, Utc::now());
     let enable_resp = app
         .client
         .post(app.url("/api/v1/auth/me/mfa/enable"))
@@ -483,41 +495,6 @@ async fn tenant_isolation_get_user_by_id_returns_404(pool: PgPool) {
 // PMS-138: subdomain-driven `LoginRequest::tenant_id` hint
 // ============================================================================
 
-/// Insert a user under an arbitrary `(tenant_id, email)` with a known
-/// password. Used by the PMS-138 tests to set up the multi-tenant
-/// colliding-email scenario that the seeded helpers can't express on
-/// their own (they hard-code the default tenant or generate a unique
-/// per-tenant email).
-async fn insert_user_in_tenant(
-    pool: &PgPool,
-    tenant_id: Uuid,
-    email: &str,
-    password: &str,
-    role: &str,
-) -> Uuid {
-    let password_hash = mokosh_server::utils::crypto::hash_password(password)
-        .expect("hash PMS-138 colliding user password");
-    let user_id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO users (
-            id, tenant_id, email, password_hash,
-            first_name, last_name, role, status, email_verified_at
-        )
-        VALUES ($1, $2, $3, $4, 'Colliding', 'User', $5, 'active', NOW())
-        "#,
-    )
-    .bind(user_id)
-    .bind(tenant_id)
-    .bind(email)
-    .bind(&password_hash)
-    .bind(role)
-    .execute(pool)
-    .await
-    .expect("insert PMS-138 colliding user");
-    user_id
-}
-
 /// PMS-138 multi-tenant resolution: with the same email under two
 /// tenants the `tenant_id` hint must steer the lookup to the user in
 /// the named tenant. Pre-PMS-138 the email-only lookup returned the
@@ -525,21 +502,14 @@ async fn insert_user_in_tenant(
 #[sqlx::test]
 async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
     let colliding_email = "colliding@example.com";
-    let password_a = "password-tenant-a";
-    let password_b = "password-tenant-b";
 
-    let user_a_id = insert_user_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        colliding_email,
-        password_a,
-        "admin",
-    )
-    .await;
+    // Same email under two tenants, same uniform seed password. The
+    // `tenant_id` hint (not the password) is what must disambiguate.
+    let (user_a_id, _, password) =
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, colliding_email, "admin").await;
     let (tenant_b_id, _admin_b_id, _admin_b_email, _admin_b_password) =
         common::seed_tenant_with_admin(&pool, "pms138-tenant-b").await;
-    let user_b_id =
-        insert_user_in_tenant(&pool, tenant_b_id, colliding_email, password_b, "admin").await;
+    let (user_b_id, _, _) = common::seed_user(&pool, tenant_b_id, colliding_email, "admin").await;
 
     let app = common::boot(pool).await;
 
@@ -549,7 +519,7 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
         .post(app.url("/api/v1/auth/login"))
         .json(&serde_json::json!({
             "email": colliding_email,
-            "password": password_b,
+            "password": password,
             "tenant_id": tenant_b_id,
         }))
         .send()
@@ -578,7 +548,7 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
         .post(app.url("/api/v1/auth/login"))
         .json(&serde_json::json!({
             "email": colliding_email,
-            "password": password_a,
+            "password": password,
             "tenant_id": common::DEFAULT_TENANT_ID,
         }))
         .send()
@@ -663,24 +633,11 @@ async fn login_wrong_tenant_hint_returns_401(pool: PgPool) {
 #[sqlx::test]
 async fn forgot_password_with_tenant_hint_targets_correct_user(pool: PgPool) {
     let colliding_email = "colliding@example.com";
-    let _user_a_id = insert_user_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        colliding_email,
-        "password-tenant-a",
-        "admin",
-    )
-    .await;
+    let (_user_a_id, _, _) =
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, colliding_email, "admin").await;
     let (tenant_b_id, _admin_b_id, _admin_b_email, _admin_b_password) =
         common::seed_tenant_with_admin(&pool, "pms138-tenant-b-forgot").await;
-    let user_b_id = insert_user_in_tenant(
-        &pool,
-        tenant_b_id,
-        colliding_email,
-        "password-tenant-b",
-        "admin",
-    )
-    .await;
+    let (user_b_id, _, _) = common::seed_user(&pool, tenant_b_id, colliding_email, "admin").await;
 
     let app = common::boot(pool).await;
 
@@ -725,4 +682,170 @@ async fn forgot_password_with_tenant_hint_targets_correct_user(pool: PgPool) {
         default_tenant_token_count, 0,
         "no reset token should have been issued for the default-tenant collider"
     );
+}
+
+// ============================================================================
+// PMS-260: cross-tenant leak fixes in the auth session methods
+// ============================================================================
+
+/// Insert an active (`expires_at` in the future) session row directly, so a
+/// test can stand up the leak scenario the seed helpers cannot express: the
+/// same `user_id` carrying sessions under more than one tenant. The
+/// `user_sessions.tenant_id` / `user_id` FKs are independent (no composite
+/// constraint), so a session can legally reference a tenant other than the
+/// user's home tenant - which is exactly the leak PMS-260 closes.
+fn build_pagination() -> PaginationParams {
+    PaginationParams {
+        page: 1,
+        per_page: 25,
+        sort: None,
+        sort_dir: "desc".to_string(),
+    }
+}
+
+async fn insert_active_session(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    token_hash: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO user_sessions (id, tenant_id, user_id, token_hash, expires_at)
+        VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour')
+        "#,
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(token_hash)
+    .execute(pool)
+    .await
+    .expect("insert active session");
+    id
+}
+
+/// PMS-260: `get_user_sessions` must bind `tenant_id` so a `user_id` that
+/// carries sessions under two tenants only ever enumerates the caller's-tenant
+/// sessions. Pre-fix the `WHERE user_id = $1`-only query returned both rows.
+#[sqlx::test]
+async fn get_user_sessions_is_tenant_scoped(pool: PgPool) {
+    let (user_id, _email, _password) = common::seed_admin(&pool).await;
+    let (tenant_b_id, _b_uid, _b_email, _b_password) =
+        common::seed_tenant_with_admin(&pool, "pms260-sessions-b").await;
+
+    // Same user_id, two tenants: one session in the caller's (default) tenant,
+    // one planted under tenant B.
+    let session_a =
+        insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
+    let _session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
+
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    let (sessions, total) = auth
+        .get_user_sessions(
+            common::DEFAULT_TENANT_ID,
+            user_id,
+            Uuid::nil(),
+            &build_pagination(),
+        )
+        .await
+        .expect("get_user_sessions");
+
+    assert_eq!(total, 1, "only the caller's-tenant session is counted");
+    assert_eq!(sessions.len(), 1, "only the caller's-tenant session listed");
+    assert_eq!(
+        sessions[0].id, session_a,
+        "the listed session is the one in the caller's tenant, not tenant B's"
+    );
+}
+
+/// PMS-260: `logout_all` must bind `tenant_id` so it cannot delete sessions a
+/// user holds under a different tenant. Pre-fix the `WHERE user_id = $1`-only
+/// DELETE wiped both rows.
+#[sqlx::test]
+async fn logout_all_is_tenant_scoped(pool: PgPool) {
+    let (user_id, _email, _password) = common::seed_admin(&pool).await;
+    let (tenant_b_id, _b_uid, _b_email, _b_password) =
+        common::seed_tenant_with_admin(&pool, "pms260-logout-b").await;
+
+    insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
+    let session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
+
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    auth.logout_all(common::DEFAULT_TENANT_ID, user_id)
+        .await
+        .expect("logout_all");
+
+    let remaining: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT id, tenant_id FROM user_sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(&pool)
+            .await
+            .expect("read remaining sessions");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the caller's-tenant session is deleted; tenant B's survives"
+    );
+    assert_eq!(
+        remaining[0].0, session_b,
+        "tenant B's session is the survivor"
+    );
+    assert_eq!(
+        remaining[0].1, tenant_b_id,
+        "survivor is scoped to tenant B"
+    );
+}
+
+/// PMS-260: the two intentionally-cross-tenant login helpers
+/// (`auth::find_user_placement`, `invitations::newest_pending_for`) read across
+/// tenants by design and are only safe because the sole caller is the
+/// pre-session bunyip login/placement path (`middleware::place_bunyip_user`).
+/// This guard pins that invariant: no HTTP route handler (`*/routes.rs`) may
+/// reference them, where an authenticated caller could probe other tenants.
+#[test]
+fn routes_do_not_reach_global_login_helpers() {
+    const FORBIDDEN: [&str; 2] = ["find_user_placement", "newest_pending_for"];
+
+    let modules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules");
+
+    fn collect_routes(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir under src/modules") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_routes(&path, out);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("routes.rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut route_files = Vec::new();
+    collect_routes(&modules_dir, &mut route_files);
+    assert!(
+        !route_files.is_empty(),
+        "expected at least one routes.rs under src/modules"
+    );
+
+    for file in &route_files {
+        let src = std::fs::read_to_string(file).expect("read routes.rs");
+        for needle in FORBIDDEN {
+            assert!(
+                !src.contains(needle),
+                "{} references `{}`: a request handler must never call the \
+                 cross-tenant login helper (PMS-260)",
+                file.display(),
+                needle
+            );
+        }
+    }
 }

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::errors::HttpError;
 use crate::extractors::BearerUser;
+use crate::handlers::shared::require_admin;
 use crate::router::AuthHttpState;
 
 #[derive(Debug, Deserialize)]
@@ -54,16 +55,6 @@ pub struct ListResponse {
     pub entries: Vec<AuditView>,
     pub limit: i64,
     pub offset: i64,
-}
-
-fn require_admin(role: mokosh_auth_core::UserRole) -> Result<(), HttpError> {
-    if matches!(role, mokosh_auth_core::UserRole::Admin) {
-        Ok(())
-    } else {
-        Err(HttpError(AuthError::Forbidden(
-            "admin role required".into(),
-        )))
-    }
 }
 
 fn build_filter(params: &ListParams, limit_cap: i64) -> AuditListFilter {

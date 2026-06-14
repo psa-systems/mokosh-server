@@ -21,16 +21,16 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{Duration, Utc};
 use mokosh_auth_core::{
-    AuditEvent, AuthError, MembershipStatus, NewMembership, NewSignupToken, NewUser, UserId,
-    UserRole, UserStatus,
+    AuditEvent, AuthError, MembershipStatus, NewMembership, NewSignupToken, NewUser, UserRole,
+    UserStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::errors::HttpError;
+use crate::handlers::shared::{looks_like_email, token_hash_prefix};
 use crate::router::AuthHttpState;
 
 const SIGNUP_TOKEN_TTL_HOURS: i64 = 24;
@@ -71,28 +71,6 @@ pub struct CompleteResponse {
     /// having the value here keeps the redirect logic out of every
     /// handler that creates a user.
     pub redirect_to: String,
-}
-
-fn looks_like_email(s: &str) -> bool {
-    let s = s.trim();
-    let mut at = s.split('@');
-    match (at.next(), at.next(), at.next()) {
-        (Some(local), Some(domain), None) => {
-            !local.is_empty()
-                && !s.chars().any(char::is_whitespace)
-                && domain.contains('.')
-                && !domain.starts_with('.')
-                && !domain.ends_with('.')
-        }
-        _ => false,
-    }
-}
-
-fn token_hash_prefix(token: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(token.as_bytes());
-    let bytes = h.finalize();
-    bytes[..4].iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn signup_not_found() -> Response {
@@ -385,8 +363,3 @@ pub async fn complete(
     )
         .into_response())
 }
-
-// Suppresses the unused-import warning on the bin target where
-// SignupTokenRepository is reachable through Arc<dyn ...>.
-#[allow(dead_code)]
-fn _enforce_user_id_used(_id: UserId) {}

@@ -31,8 +31,6 @@ struct StateClaims {
 
 #[derive(Debug, Error)]
 pub enum StateCookieError {
-    #[error("missing state cookie")]
-    Missing,
     #[error("invalid state cookie: {0}")]
     Invalid(String),
 }

@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::AssetsService;
-use crate::modules::auth::{RequireAdmin, RequireAssets};
+use crate::modules::auth::{RequireAdmin, RequireAssets, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -78,7 +78,7 @@ async fn list_asset_types(
     RequireAssets { user: u, .. }: RequireAssets,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetTypeResponse>>> {
-    let (items, total) = s.service.list_asset_types(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_asset_types(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -93,7 +93,7 @@ async fn create_asset_type(
     Json(req): Json<UpsertAssetTypeRequest>,
 ) -> AppResult<Json<AssetTypeResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_asset_type(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_asset_type(u.tenant(), &req).await?))
 }
 
 async fn update_asset_type(
@@ -105,7 +105,7 @@ async fn update_asset_type(
 ) -> AppResult<Json<AssetTypeResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_asset_type(u.tenant_id, id, &req).await?,
+        s.service.update_asset_type(u.tenant(), id, &req).await?,
     ))
 }
 
@@ -115,7 +115,7 @@ async fn delete_asset_type(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_asset_type(u.tenant_id, id).await
+    s.service.delete_asset_type(u.tenant(), id).await
 }
 
 async fn list_assets(
@@ -125,7 +125,7 @@ async fn list_assets(
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetResponse>>> {
     f.validate()?;
-    let (items, total) = s.service.list_assets(u.tenant_id, &f, &pagination).await?;
+    let (items, total) = s.service.list_assets(u.tenant(), &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -139,7 +139,7 @@ async fn create_asset(
     Json(req): Json<CreateAssetRequest>,
 ) -> AppResult<Json<AssetResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_asset(u.tenant_id, u.id, &req).await?))
+    Ok(Json(s.service.create_asset(u.tenant(), u.id, &req).await?))
 }
 
 async fn get_asset(
@@ -147,7 +147,7 @@ async fn get_asset(
     RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<AssetResponse>> {
-    Ok(Json(s.service.get_asset(u.tenant_id, id).await?))
+    Ok(Json(s.service.get_asset(u.tenant(), id).await?))
 }
 
 async fn update_asset(
@@ -158,7 +158,7 @@ async fn update_asset(
 ) -> AppResult<Json<AssetResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_asset(u.tenant_id, id, u.id, &req).await?,
+        s.service.update_asset(u.tenant(), id, u.id, &req).await?,
     ))
 }
 
@@ -168,7 +168,7 @@ async fn delete_asset(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_asset(u.tenant_id, id).await
+    s.service.delete_asset(u.tenant(), id, u.id).await
 }
 
 async fn list_asset_relationships(
@@ -179,7 +179,7 @@ async fn list_asset_relationships(
 ) -> AppResult<Json<PaginatedResponse<AssetRelationshipResponse>>> {
     let (items, total) = s
         .service
-        .list_asset_relationships(u.tenant_id, id, &pagination)
+        .list_asset_relationships(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -197,7 +197,7 @@ async fn create_asset_relationship(
     req.validate()?;
     Ok(Json(
         s.service
-            .create_asset_relationship(u.tenant_id, id, &req)
+            .create_asset_relationship(u.tenant(), id, &req)
             .await?,
     ))
 }
@@ -207,7 +207,7 @@ async fn delete_asset_relationship(
     RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_asset_relationship(u.tenant_id, id).await
+    s.service.delete_asset_relationship(u.tenant(), id).await
 }
 
 async fn list_configuration_items(
@@ -218,7 +218,7 @@ async fn list_configuration_items(
 ) -> AppResult<Json<PaginatedResponse<ConfigurationItemSummary>>> {
     let (items, total) = s
         .service
-        .list_configuration_items(u.tenant_id, id, &pagination)
+        .list_configuration_items(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -235,7 +235,7 @@ async fn reveal_configuration_item(
 ) -> AppResult<Json<ConfigurationItemResponse>> {
     Ok(Json(
         s.service
-            .reveal_configuration_item(u.tenant_id, id, u.id)
+            .reveal_configuration_item(u.tenant(), id, u.id)
             .await?,
     ))
 }
@@ -249,7 +249,7 @@ async fn create_configuration_item(
     req.validate()?;
     Ok(Json(
         s.service
-            .upsert_configuration_item(u.tenant_id, id, &req)
+            .upsert_configuration_item(u.tenant(), id, &req)
             .await?,
     ))
 }
@@ -259,7 +259,7 @@ async fn delete_configuration_item(
     RequireAssets { user: u, .. }: RequireAssets,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_configuration_item(u.tenant_id, id).await
+    s.service.delete_configuration_item(u.tenant(), id).await
 }
 
 async fn list_credentials(
@@ -270,7 +270,7 @@ async fn list_credentials(
 ) -> AppResult<Json<PaginatedResponse<CredentialSummary>>> {
     let (items, total) = s
         .service
-        .list_credentials(u.tenant_id, id, &pagination)
+        .list_credentials(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -286,7 +286,7 @@ async fn reveal_credential(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<CredentialResponse>> {
     Ok(Json(
-        s.service.reveal_credential(u.tenant_id, id, u.id).await?,
+        s.service.reveal_credential(u.tenant(), id, u.id).await?,
     ))
 }
 
@@ -300,7 +300,7 @@ async fn create_credential(
     req.validate()?;
     Ok(Json(
         s.service
-            .create_credential(u.tenant_id, id, u.id, &req, &ctx)
+            .create_credential(u.tenant(), id, u.id, &req, &ctx)
             .await?,
     ))
 }
@@ -311,7 +311,7 @@ async fn delete_credential(
     ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_credential(u.tenant_id, id, &ctx).await
+    s.service.delete_credential(u.tenant(), id, &ctx).await
 }
 
 async fn list_asset_audit_log(
@@ -323,7 +323,7 @@ async fn list_asset_audit_log(
 ) -> AppResult<Json<PaginatedResponse<AssetAuditLogResponse>>> {
     let (items, total) = s
         .service
-        .list_asset_audit_log(u.tenant_id, id, &pagination)
+        .list_asset_audit_log(u.tenant(), id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,

@@ -334,6 +334,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-metadata"
+version = "0.1.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1194,6 +1198,7 @@ dependencies = [
 name = "google-oauth-flow"
 version = "0.1.0"
 dependencies = [
+ "build-metadata",
  "oauth2",
  "reqwest",
  "serde",
@@ -2054,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "mokosh-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2062,6 +2067,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "build-metadata",
  "chrono",
  "chrono-tz 0.9.0",
  "constant_time_eq",

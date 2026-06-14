@@ -1,5 +1,6 @@
 //! Ticket service implementation
 
+use crate::modules::auth::TenantId;
 use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -73,13 +74,19 @@ impl TicketService {
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: Uuid, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(
+        &self,
+        tenant_id: TenantId,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
         .bind(tenant_id)
         .bind(id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if exists {
             Ok(())
@@ -92,7 +99,7 @@ impl TicketService {
 
     async fn validate_fk_opt(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         table: &'static str,
         id: Option<Uuid>,
     ) -> AppResult<()> {
@@ -103,7 +110,8 @@ impl TicketService {
     }
 
     /// Generate next ticket number for tenant
-    async fn next_ticket_number(&self, tenant_id: Uuid) -> AppResult<String> {
+    async fn next_ticket_number(&self, tenant_id: TenantId) -> AppResult<String> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, (i32,)>(
             r#"
             UPDATE ticket_sequences
@@ -113,8 +121,9 @@ impl TicketService {
             "#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(format!("T{:06}", row.0))
     }
@@ -123,7 +132,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &CreateTicketRequest,
         ctx: &AuditCtx,
@@ -132,11 +141,12 @@ impl TicketService {
         let ticket_number = self.next_ticket_number(tenant_id).await?;
 
         // Get default status
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let default_status_id: Uuid = sqlx::query_scalar(
             "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| {
             AppError::Configuration("No default ticket status configured".to_string())
@@ -149,7 +159,7 @@ impl TicketService {
                 "SELECT id FROM ticket_priorities WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
             )
             .bind(tenant_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::Configuration("No default priority configured".to_string()))?,
         };
@@ -161,15 +171,20 @@ impl TicketService {
                 "SELECT id FROM ticket_queues WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
             )
             .bind(tenant_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::Configuration("No default queue configured".to_string()))?,
         };
+        drop(tx);
 
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked, so a request cannot point a
         // ticket at another tenant's company/contact/site/etc.
         self.validate_fk(tenant_id, "companies", request.company_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "ticket_types", request.type_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "ticket_categories", request.category_id)
             .await?;
         self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
             .await?;
@@ -189,7 +204,7 @@ impl TicketService {
         // Insert + audit row in one transaction: capture the new row
         // with Postgres to_jsonb and write the audit entry on the same
         // tx so a rollback drops both. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO tickets (
@@ -274,7 +289,8 @@ impl TicketService {
 
     /// Get ticket by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_ticket(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<Ticket> {
+    pub async fn get_ticket(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<Ticket> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketRow>(
             r#"
             SELECT id, tenant_id, ticket_number, title, description,
@@ -292,7 +308,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(ticket_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
 
@@ -303,9 +319,10 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_by_number(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_number: &str,
     ) -> AppResult<Ticket> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketRow>(
             r#"
             SELECT id, tenant_id, ticket_number, title, description,
@@ -323,7 +340,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(ticket_number)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
 
@@ -331,87 +348,29 @@ impl TicketService {
     }
 
     /// List tickets with filters
-    // See update_company in contacts/service.rs for the dynamic-filter
-    // pattern: the trailing `param_idx += 1` keeps the next added
-    // condition one line of diff away.
-    #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tickets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Ticket>, u64)> {
         let offset = pagination.offset() as i32;
         let limit = pagination.limit() as i32;
 
-        // Parallel WHERE clauses so the data and count queries each get
-        // correctly numbered placeholders. data has $1 tenant + $2 limit
-        // + $3 offset → filter binds at $4+; count has $1 tenant only →
-        // filter binds at $2+. Sharing one WHERE string between them
-        // would misalign count_query's bind sequence and trigger
-        // postgres 42P18 ("could not determine data type of parameter").
-        let mut data_conds = vec!["t.tenant_id = $1".to_string()];
-        let mut count_conds = vec!["t.tenant_id = $1".to_string()];
-        let mut data_idx = 4;
-        let mut count_idx = 2;
-
-        if filter.q.is_some() {
-            data_conds.push(format!(
-                "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-                idx = data_idx
-            ));
-            count_conds.push(format!(
-                "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-                idx = count_idx
-            ));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.status_id.is_some() {
-            data_conds.push(format!("t.status_id = ${data_idx}"));
-            count_conds.push(format!("t.status_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.priority_id.is_some() {
-            data_conds.push(format!("t.priority_id = ${data_idx}"));
-            count_conds.push(format!("t.priority_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.queue_id.is_some() {
-            data_conds.push(format!("t.queue_id = ${data_idx}"));
-            count_conds.push(format!("t.queue_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.company_id.is_some() {
-            data_conds.push(format!("t.company_id = ${data_idx}"));
-            count_conds.push(format!("t.company_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.assigned_to_id.is_some() {
-            data_conds.push(format!("t.assigned_to_id = ${data_idx}"));
-            count_conds.push(format!("t.assigned_to_id = ${count_idx}"));
-        }
-        if filter.is_unassigned == Some(true) {
-            data_conds.push("t.assigned_to_id IS NULL".to_string());
-            count_conds.push("t.assigned_to_id IS NULL".to_string());
-        }
-        if filter.is_overdue == Some(true) {
-            data_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
-            count_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
-        }
-        if filter.is_open == Some(true) {
-            let frag = "NOT EXISTS (SELECT 1 FROM ticket_statuses s WHERE s.id = t.status_id AND s.is_closed = TRUE)".to_string();
-            data_conds.push(frag.clone());
-            count_conds.push(frag);
-        }
-
-        let data_where = data_conds.join(" AND ");
-        let count_where = count_conds.join(" AND ");
+        // Shared filter builder so the data/count placeholder numbering
+        // cannot diverge between this and `list_ticket_responses`
+        // (PMS-197). `list_tickets` has no `ticket_statuses` JOIN, so its
+        // `is_open` test is a correlated `NOT EXISTS`.
+        let TicketFilterSql {
+            data_where,
+            count_where,
+            binds,
+        } = build_ticket_filter_sql(
+            filter,
+            "NOT EXISTS (SELECT 1 FROM ticket_statuses s \
+             WHERE s.id = t.status_id AND s.is_closed = TRUE)",
+        );
         let order_by = pagination.order_by(
             "t.created_at",
             &["created_at", "updated_at", "sla_due_date", "priority_id"],
@@ -445,34 +404,25 @@ impl TicketService {
 
         let mut count_builder = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
 
-        if let Some(ref q) = filter.q {
-            let search = format!("%{}%", q);
-            query_builder = query_builder.bind(search.clone());
-            count_builder = count_builder.bind(search);
-        }
-        if let Some(ref status_id) = filter.status_id {
-            query_builder = query_builder.bind(status_id);
-            count_builder = count_builder.bind(status_id);
-        }
-        if let Some(ref priority_id) = filter.priority_id {
-            query_builder = query_builder.bind(priority_id);
-            count_builder = count_builder.bind(priority_id);
-        }
-        if let Some(ref queue_id) = filter.queue_id {
-            query_builder = query_builder.bind(queue_id);
-            count_builder = count_builder.bind(queue_id);
-        }
-        if let Some(ref company_id) = filter.company_id {
-            query_builder = query_builder.bind(company_id);
-            count_builder = count_builder.bind(company_id);
-        }
-        if let Some(ref assigned_to_id) = filter.assigned_to_id {
-            query_builder = query_builder.bind(assigned_to_id);
-            count_builder = count_builder.bind(assigned_to_id);
+        // Bind the filter values in the SAME order both queries number
+        // them; `build_ticket_filter_sql` is the single source of truth
+        // for that order.
+        for b in &binds {
+            match b {
+                TicketFilterBind::Text(s) => {
+                    query_builder = query_builder.bind(s.clone());
+                    count_builder = count_builder.bind(s.clone());
+                }
+                TicketFilterBind::Id(id) => {
+                    query_builder = query_builder.bind(*id);
+                    count_builder = count_builder.bind(*id);
+                }
+            }
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -481,7 +431,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         user_id: Uuid,
         request: &UpdateTicketRequest,
@@ -495,6 +445,10 @@ impl TicketService {
         // PSA audit: validate any foreign id being set so an update cannot
         // re-link this ticket to another tenant's rows. Option fields are
         // only checked when present.
+        self.validate_fk_opt(tenant_id, "ticket_priorities", request.priority_id)
+            .await?;
+        self.validate_fk_opt(tenant_id, "ticket_queues", request.queue_id)
+            .await?;
         self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
             .await?;
         self.validate_fk_opt(tenant_id, "sites", request.site_id)
@@ -514,7 +468,7 @@ impl TicketService {
         // before and after (Postgres to_jsonb captures exact stored
         // state) and write the audit entry on the same tx so a rollback
         // drops both. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
         )
@@ -669,7 +623,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -678,7 +632,7 @@ impl TicketService {
 
         // Mutation + audit row in one transaction. DELETE: snapshot before,
         // old = before, after = None. PMS-117 audit convention.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
         )
@@ -728,11 +682,16 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn assign_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         assigned_to_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<Ticket> {
+        // PSA audit: the assignee must be a user in this tenant so a
+        // request cannot assign a ticket to another tenant's user.
+        self.validate_fk(tenant_id, "users", assigned_to_id).await?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE tickets SET assigned_to_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4",
         )
@@ -740,8 +699,9 @@ impl TicketService {
         .bind(user_id)
         .bind(tenant_id)
         .bind(ticket_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         self.get_ticket(tenant_id, ticket_id).await
     }
@@ -750,13 +710,19 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_note(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         user_id: Uuid,
         request: &CreateNoteRequest,
     ) -> AppResult<TicketNote> {
         let note_id = Uuid::new_v4();
 
+        // PSA audit: the note's ticket must belong to this tenant before we
+        // insert against it and bump the ticket's SLA/timestamp columns, so a
+        // cross-tenant ticket_id cannot corrupt another tenant's ticket.
+        self.validate_fk(tenant_id, "tickets", ticket_id).await?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type, content, created_by_id)
@@ -769,25 +735,28 @@ impl TicketService {
         .bind(request.note_type.as_str())
         .bind(&request.content)
         .bind(user_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Update ticket's updated_at
-        sqlx::query("UPDATE tickets SET updated_at = NOW(), last_updated_by_id = $1 WHERE id = $2")
+        sqlx::query("UPDATE tickets SET updated_at = NOW(), last_updated_by_id = $1 WHERE tenant_id = $2 AND id = $3")
             .bind(user_id)
+            .bind(tenant_id)
             .bind(ticket_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
 
         // Record first response if this is a public note and first response hasn't been recorded
         if request.note_type == NoteType::Public {
             sqlx::query(
-                "UPDATE tickets SET first_response_at = COALESCE(first_response_at, NOW()) WHERE id = $1",
+                "UPDATE tickets SET first_response_at = COALESCE(first_response_at, NOW()) WHERE tenant_id = $1 AND id = $2",
             )
+            .bind(tenant_id)
             .bind(ticket_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
 
         // PMS-15: customer notification on public notes. Internal notes
         // never leave the building no matter what `send_email` says.
@@ -809,12 +778,19 @@ impl TicketService {
     /// and visible to the agent.
     async fn send_note_email(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         note_id: Uuid,
         content: &str,
     ) {
         // One round-trip fetches ticket-number/title + contact email.
+        let mut tx = match self.db.begin_with_tenant(tenant_id).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(?e, %ticket_id, "open tenant tx for note email failed");
+                return;
+            }
+        };
         let row: Option<(String, String, Option<String>)> = match sqlx::query_as(
             r#"
             SELECT t.ticket_number, t.title, ct.email
@@ -825,7 +801,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(ticket_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await
         {
             Ok(r) => r,
@@ -834,6 +810,10 @@ impl TicketService {
                 return;
             }
         };
+        // Close the read tx before the network send so it isn't held
+        // across the dispatch/mailer await; the post-send mark-sent
+        // write opens its own tenant tx.
+        drop(tx);
 
         let Some((ticket_number, title, Some(email))) = row else {
             tracing::debug!(
@@ -874,13 +854,17 @@ impl TicketService {
 
         match send_result {
             Ok(()) => {
-                if let Err(e) = sqlx::query(
-                    "UPDATE ticket_notes SET is_email_sent = TRUE, email_sent_at = NOW() WHERE id = $1",
-                )
-                .bind(note_id)
-                .execute(self.db.pool())
-                .await
-                {
+                let mark_sent = async {
+                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                    sqlx::query(
+                        "UPDATE ticket_notes SET is_email_sent = TRUE, email_sent_at = NOW() WHERE id = $1",
+                    )
+                    .bind(note_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await
+                };
+                if let Err(e) = mark_sent.await {
                     tracing::warn!(?e, %note_id, "mark is_email_sent failed");
                 } else {
                     tracing::info!(%note_id, "ticket note email queued");
@@ -892,7 +876,8 @@ impl TicketService {
 
     /// Get note by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_note(&self, tenant_id: Uuid, note_id: Uuid) -> AppResult<TicketNote> {
+    pub async fn get_note(&self, tenant_id: TenantId, note_id: Uuid) -> AppResult<TicketNote> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketNoteRow>(
             r#"
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
@@ -905,7 +890,7 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(note_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Note".to_string()))?;
 
@@ -916,16 +901,17 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_notes(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketNote>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM ticket_notes WHERE tenant_id = $1 AND ticket_id = $2",
         )
         .bind(tenant_id)
         .bind(ticket_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, TicketNoteRow>(
@@ -944,14 +930,14 @@ impl TicketService {
         .bind(ticket_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Calculate SLA due dates for a ticket
-    async fn calculate_sla_dates(&self, tenant_id: Uuid, ticket_id: Uuid) -> AppResult<()> {
+    async fn calculate_sla_dates(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<()> {
         // Get ticket details
         let ticket = self.get_ticket(tenant_id, ticket_id).await?;
 
@@ -960,11 +946,12 @@ impl TicketService {
             Some(id) => id,
             None => {
                 // Try to get default SLA
+                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let default: Option<Uuid> = sqlx::query_scalar(
                     "SELECT id FROM sla_policies WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
                 )
                 .bind(tenant_id)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(&mut *tx)
                 .await?;
 
                 match default {
@@ -980,6 +967,10 @@ impl TicketService {
         // harness in `tests/tickets.rs` surfaced this as
         // `ColumnDecode { ... Rust type Option<f64> is not compatible
         // with SQL type NUMERIC }`).
+        // `sla_targets` has no `tenant_id` column but is RLS-covered via a parent
+        // join to `sla_policies` (migration 041), so the read needs the tenant
+        // GUC set; run it through a tenant-scoped transaction.
+        let mut sla_tx = self.db.begin_with_tenant(tenant_id).await?;
         let targets = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
             r#"
             SELECT first_response_hours::float8, resolution_hours::float8
@@ -989,8 +980,9 @@ impl TicketService {
         )
         .bind(sla_id)
         .bind(ticket.priority_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *sla_tx)
         .await?;
+        drop(sla_tx);
 
         if let Some((first_response_hours, resolution_hours)) = targets {
             let now = Utc::now();
@@ -1000,6 +992,7 @@ impl TicketService {
             let sla_due_date =
                 resolution_hours.map(|h| now + chrono::Duration::minutes((h * 60.0) as i64));
 
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query(
                 "UPDATE tickets SET sla_id = $1, first_response_due = $2, sla_due_date = $3, resolution_due = $3 WHERE id = $4",
             )
@@ -1007,8 +1000,9 @@ impl TicketService {
             .bind(first_response_due)
             .bind(sla_due_date)
             .bind(ticket_id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
         }
 
         Ok(())
@@ -1018,13 +1012,14 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_statuses(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketStatus>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TicketStatusRow>(
@@ -1039,7 +1034,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1049,13 +1044,14 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_priorities(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketPriority>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ticket_priorities WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TicketPriorityRow>(
@@ -1070,7 +1066,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1080,13 +1076,14 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_queues(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketQueue>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ticket_queues WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TicketQueueRow>(
@@ -1101,7 +1098,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1111,14 +1108,15 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_types(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketType>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM ticket_types WHERE tenant_id = $1 AND is_active = TRUE",
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, TicketTypeRow>(
@@ -1133,7 +1131,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1149,7 +1147,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_portal_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         contact_id: Uuid,
         title: String,
@@ -1157,6 +1155,7 @@ impl TicketService {
         priority_id: Option<Uuid>,
         type_id: Option<Uuid>,
     ) -> AppResult<TicketResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let default_creator: Option<Uuid> = sqlx::query_scalar(
             r#"
             SELECT id FROM users
@@ -1167,8 +1166,9 @@ impl TicketService {
             "#,
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
+        drop(tx);
 
         let Some(creator) = default_creator else {
             return Err(AppError::Configuration(
@@ -1203,7 +1203,12 @@ impl TicketService {
         // Portal flow has no AuditCtx extractor (portal auth identity is a
         // `contacts` row, not a `users` row); attribute to the system actor.
         let ticket = self
-            .create_ticket(tenant_id, creator, &request, &AuditCtx::system(tenant_id))
+            .create_ticket(
+                tenant_id,
+                creator,
+                &request,
+                &AuditCtx::system(tenant_id.get()),
+            )
             .await?;
         self.get_ticket_response(tenant_id, ticket.id).await
     }
@@ -1216,7 +1221,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_portal_tickets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketResponse>, u64)> {
@@ -1234,7 +1239,7 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_portal_ticket(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         ticket_id: Uuid,
     ) -> AppResult<TicketResponse> {
@@ -1253,100 +1258,44 @@ impl TicketService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_response(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ticket_id: Uuid,
     ) -> AppResult<TicketResponse> {
         let sql = format!(
             "{} WHERE t.tenant_id = $1 AND t.id = $2",
             TICKET_RESPONSE_SELECT
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TicketResponseRow>(&sql)
             .bind(tenant_id)
             .bind(ticket_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
         Ok(row.into())
     }
 
-    /// List fully-joined ticket responses + total. Mirrors the filter
-    /// semantics of [`TicketService::list_tickets`] but produces
-    /// response DTOs directly. Audit F3.
+    /// List fully-joined ticket responses + total, applying the ticket
+    /// filter semantics and producing response DTOs directly. Audit F3.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_ticket_responses(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketResponse>, u64)> {
         let offset = pagination.offset() as i32;
         let limit = pagination.limit() as i32;
 
-        // Two parallel WHERE clauses: data_query has $1 tenant + $2 limit
-        // + $3 offset, so filter binds start at $4. count_query has $1
-        // tenant only, so filter binds start at $2. Sharing one WHERE
-        // string between them would leave the count_query's bind sequence
-        // misaligned with the placeholders and trigger postgres 42P18
-        // ("could not determine data type of parameter").
-        let mut data_conds = vec!["t.tenant_id = $1".to_string()];
-        let mut count_conds = vec!["t.tenant_id = $1".to_string()];
-        let mut data_idx = 4;
-        let mut count_idx = 2;
-        if filter.q.is_some() {
-            data_conds.push(format!(
-                "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-                idx = data_idx
-            ));
-            count_conds.push(format!(
-                "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-                idx = count_idx
-            ));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.status_id.is_some() {
-            data_conds.push(format!("t.status_id = ${data_idx}"));
-            count_conds.push(format!("t.status_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.priority_id.is_some() {
-            data_conds.push(format!("t.priority_id = ${data_idx}"));
-            count_conds.push(format!("t.priority_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.queue_id.is_some() {
-            data_conds.push(format!("t.queue_id = ${data_idx}"));
-            count_conds.push(format!("t.queue_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.company_id.is_some() {
-            data_conds.push(format!("t.company_id = ${data_idx}"));
-            count_conds.push(format!("t.company_id = ${count_idx}"));
-            data_idx += 1;
-            count_idx += 1;
-        }
-        if filter.assigned_to_id.is_some() {
-            data_conds.push(format!("t.assigned_to_id = ${data_idx}"));
-            count_conds.push(format!("t.assigned_to_id = ${count_idx}"));
-        }
-        if filter.is_unassigned == Some(true) {
-            data_conds.push("t.assigned_to_id IS NULL".to_string());
-            count_conds.push("t.assigned_to_id IS NULL".to_string());
-        }
-        if filter.is_overdue == Some(true) {
-            data_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
-            count_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
-        }
-        if filter.is_open == Some(true) {
-            data_conds.push("ts.is_closed = FALSE".to_string());
-            count_conds.push("ts.is_closed = FALSE".to_string());
-        }
-
-        let data_where = data_conds.join(" AND ");
-        let count_where = count_conds.join(" AND ");
+        // Shared filter builder so the data/count placeholder numbering
+        // cannot diverge between this and `list_tickets` (PMS-197). This
+        // method already INNER JOINs `ticket_statuses ts`, so its
+        // `is_open` test reads `ts.is_closed` directly.
+        let TicketFilterSql {
+            data_where,
+            count_where,
+            binds,
+        } = build_ticket_filter_sql(filter, "ts.is_closed = FALSE");
         let order_by = pagination.order_by(
             "t.created_at",
             &["created_at", "updated_at", "sla_due_date", "priority_id"],
@@ -1365,36 +1314,142 @@ impl TicketService {
             .bind(offset);
         let mut count_builder = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
 
-        if let Some(ref q) = filter.q {
-            let search = format!("%{}%", q);
-            query_builder = query_builder.bind(search.clone());
-            count_builder = count_builder.bind(search);
-        }
-        if let Some(ref status_id) = filter.status_id {
-            query_builder = query_builder.bind(status_id);
-            count_builder = count_builder.bind(status_id);
-        }
-        if let Some(ref priority_id) = filter.priority_id {
-            query_builder = query_builder.bind(priority_id);
-            count_builder = count_builder.bind(priority_id);
-        }
-        if let Some(ref queue_id) = filter.queue_id {
-            query_builder = query_builder.bind(queue_id);
-            count_builder = count_builder.bind(queue_id);
-        }
-        if let Some(ref company_id) = filter.company_id {
-            query_builder = query_builder.bind(company_id);
-            count_builder = count_builder.bind(company_id);
-        }
-        if let Some(ref assigned_to_id) = filter.assigned_to_id {
-            query_builder = query_builder.bind(assigned_to_id);
-            count_builder = count_builder.bind(assigned_to_id);
+        // Bind the filter values in the SAME order both queries number
+        // them; `build_ticket_filter_sql` is the single source of truth
+        // for that order.
+        for b in &binds {
+            match b {
+                TicketFilterBind::Text(s) => {
+                    query_builder = query_builder.bind(s.clone());
+                    count_builder = count_builder.bind(s.clone());
+                }
+                TicketFilterBind::Id(id) => {
+                    query_builder = query_builder.bind(*id);
+                    count_builder = count_builder.bind(*id);
+                }
+            }
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+}
+
+/// One filter value, bound to both the data and count query in the
+/// order [`build_ticket_filter_sql`] emits them.
+enum TicketFilterBind {
+    Text(String),
+    Id(Uuid),
+}
+
+/// WHERE fragments + ordered binds for the shared ticket filter set.
+///
+/// The data query carries `$1` tenant + `$2` limit + `$3` offset, so its
+/// filter placeholders start at `$4`; the count query carries `$1`
+/// tenant only, so its filter placeholders start at `$2`. `binds` lists
+/// the values in the single order both queries bind them.
+struct TicketFilterSql {
+    data_where: String,
+    count_where: String,
+    binds: Vec<TicketFilterBind>,
+}
+
+/// Build the shared ticket filter clauses for `list_tickets` and
+/// `list_ticket_responses` (PMS-197). Both methods share this exact
+/// filter taxonomy; constructing the WHERE strings and the ordered bind
+/// list in one place is what keeps the data/count placeholder numbering
+/// from drifting apart between the two callers.
+///
+/// `is_open_fragment` is the only SQL that differs between callers:
+/// `list_tickets` has no status JOIN and passes a correlated
+/// `NOT EXISTS`, while `list_ticket_responses` already INNER JOINs
+/// `ticket_statuses ts` and passes `ts.is_closed = FALSE`.
+///
+/// Invariant: every placeholder-bearing condition pushes to
+/// `data_conds`, `count_conds`, AND `binds` together, and advances both
+/// indices in lockstep. `#[allow(unused_assignments)]` because the final
+/// increment after the last placeholder filter (`assigned_to_id`) is not
+/// read today; it is kept so a future placeholder filter added below
+/// stays correctly numbered (the previously-missing increment was the
+/// latent bug PMS-197 called out).
+#[allow(unused_assignments)]
+fn build_ticket_filter_sql(filter: &TicketFilter, is_open_fragment: &str) -> TicketFilterSql {
+    let mut data_conds = vec!["t.tenant_id = $1".to_string()];
+    let mut count_conds = vec!["t.tenant_id = $1".to_string()];
+    let mut data_idx = 4;
+    let mut count_idx = 2;
+    let mut binds = Vec::new();
+
+    if let Some(q) = &filter.q {
+        data_conds.push(format!(
+            "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
+            idx = data_idx
+        ));
+        count_conds.push(format!(
+            "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
+            idx = count_idx
+        ));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Text(format!("%{q}%")));
+    }
+    if let Some(status_id) = filter.status_id {
+        data_conds.push(format!("t.status_id = ${data_idx}"));
+        count_conds.push(format!("t.status_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(status_id));
+    }
+    if let Some(priority_id) = filter.priority_id {
+        data_conds.push(format!("t.priority_id = ${data_idx}"));
+        count_conds.push(format!("t.priority_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(priority_id));
+    }
+    if let Some(queue_id) = filter.queue_id {
+        data_conds.push(format!("t.queue_id = ${data_idx}"));
+        count_conds.push(format!("t.queue_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(queue_id));
+    }
+    if let Some(company_id) = filter.company_id {
+        data_conds.push(format!("t.company_id = ${data_idx}"));
+        count_conds.push(format!("t.company_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(company_id));
+    }
+    if let Some(assigned_to_id) = filter.assigned_to_id {
+        data_conds.push(format!("t.assigned_to_id = ${data_idx}"));
+        count_conds.push(format!("t.assigned_to_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(assigned_to_id));
+    }
+    // The remaining conditions are literal SQL (no placeholders, no
+    // binds), so they do not touch the indices.
+    if filter.is_unassigned == Some(true) {
+        data_conds.push("t.assigned_to_id IS NULL".to_string());
+        count_conds.push("t.assigned_to_id IS NULL".to_string());
+    }
+    if filter.is_overdue == Some(true) {
+        data_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
+        count_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
+    }
+    if filter.is_open == Some(true) {
+        data_conds.push(is_open_fragment.to_string());
+        count_conds.push(is_open_fragment.to_string());
+    }
+
+    TicketFilterSql {
+        data_where: data_conds.join(" AND "),
+        count_where: count_conds.join(" AND "),
+        binds,
     }
 }
 
@@ -1568,24 +1623,10 @@ struct TicketResponseRow {
 
 impl From<TicketResponseRow> for TicketResponse {
     fn from(r: TicketResponseRow) -> Self {
-        // Local mirror of [`Ticket::sla_status`] — kept here because
-        // the joined row already carries everything needed, and pulling
-        // the rest of the Ticket struct just to call the method would
-        // double the bookkeeping.
-        let sla_status = if r.closed_at.is_some() {
-            SlaStatus::NotApplicable
-        } else if let Some(due) = r.sla_due_date {
-            let now = Utc::now();
-            if now > due {
-                SlaStatus::Breached
-            } else if (due - now).num_hours() < 2 {
-                SlaStatus::Warning
-            } else {
-                SlaStatus::OnTrack
-            }
-        } else {
-            SlaStatus::NotApplicable
-        };
+        // The joined row already carries everything `compute_sla_status`
+        // needs, so reuse the shared helper instead of rebuilding a full
+        // Ticket just to call its method.
+        let sla_status = compute_sla_status(r.closed_at, r.sla_due_date);
 
         TicketResponse {
             id: r.id,

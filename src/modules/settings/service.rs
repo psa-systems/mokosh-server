@@ -1,5 +1,6 @@
 //! Settings service.
 
+use crate::modules::auth::TenantId;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -22,13 +23,14 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tenant_settings(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TenantSettingResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM tenant_settings WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, SettingRow>(
@@ -40,36 +42,28 @@ impl SettingsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// Upsert a single tenant setting from a request DTO. PMS-198: this
+    /// is a thin wrapper over [`put_setting`](Self::put_setting), the
+    /// single canonical `INSERT ... ON CONFLICT` for `tenant_settings`,
+    /// so the SQL is not duplicated across the two call sites.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_tenant_setting(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertTenantSettingRequest,
     ) -> AppResult<TenantSettingResponse> {
-        let id: Uuid = sqlx::query_scalar(
-            r#"INSERT INTO tenant_settings (tenant_id, category, key, value)
-               VALUES ($1, $2, $3, $4)
-               ON CONFLICT (tenant_id, category, key) DO UPDATE SET
-                 value = EXCLUDED.value, updated_at = NOW()
-               RETURNING id"#,
+        self.put_setting(
+            tenant_id,
+            &request.category,
+            &request.key,
+            request.value.clone(),
         )
-        .bind(tenant_id)
-        .bind(&request.category)
-        .bind(&request.key)
-        .bind(&request.value)
-        .fetch_one(self.db.pool())
-        .await?;
-        Ok(TenantSettingResponse {
-            id,
-            category: request.category.clone(),
-            key: request.key.clone(),
-            value: request.value.clone(),
-        })
+        .await
     }
 
     // Category- and key-scoped tenant_settings access (PMS-113 AC1) ----------
@@ -81,9 +75,10 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_settings_by_category(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
     ) -> AppResult<Vec<TenantSettingResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, SettingRow>(
             r#"SELECT id, category, key, value FROM tenant_settings
                WHERE tenant_id = $1 AND category = $2
@@ -91,7 +86,7 @@ impl SettingsService {
         )
         .bind(tenant_id)
         .bind(category)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -99,10 +94,11 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_setting(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
         key: &str,
     ) -> AppResult<TenantSettingResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, SettingRow>(
             r#"SELECT id, category, key, value FROM tenant_settings
                WHERE tenant_id = $1 AND category = $2 AND key = $3"#,
@@ -110,7 +106,7 @@ impl SettingsService {
         .bind(tenant_id)
         .bind(category)
         .bind(key)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("TenantSetting".to_string()))?;
         Ok(row.into())
@@ -121,11 +117,12 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn put_setting(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
         key: &str,
         value: serde_json::Value,
     ) -> AppResult<TenantSettingResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO tenant_settings (tenant_id, category, key, value)
                VALUES ($1, $2, $3, $4)
@@ -137,8 +134,9 @@ impl SettingsService {
         .bind(category)
         .bind(key)
         .bind(&value)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(TenantSettingResponse {
             id,
             category: category.to_string(),
@@ -150,19 +148,21 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_setting_by_key(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         category: &str,
         key: &str,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             "DELETE FROM tenant_settings WHERE tenant_id = $1 AND category = $2 AND key = $3",
         )
         .bind(tenant_id)
         .bind(category)
         .bind(key)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if n == 0 {
             return Err(AppError::NotFound("TenantSetting".to_string()));
         }
@@ -177,13 +177,14 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_module_configs(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ModuleConfigResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM module_config WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, ModCfgRow>(
@@ -195,7 +196,7 @@ impl SettingsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -208,16 +209,17 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_module_config(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         module: &str,
     ) -> AppResult<ModuleConfigResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ModCfgRow>(
             r#"SELECT id, module_name, is_enabled, config FROM module_config
                WHERE tenant_id = $1 AND module_name = $2"#,
         )
         .bind(tenant_id)
         .bind(module)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         Ok(row
             .map(Into::into)
@@ -227,14 +229,15 @@ impl SettingsService {
     /// Read just the `is_enabled` flag, fast path used by
     /// `RequireModuleEnabled` (PMS-113 AC3). Missing row -> `false`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn is_module_enabled(&self, tenant_id: Uuid, module: &str) -> AppResult<bool> {
+    pub async fn is_module_enabled(&self, tenant_id: TenantId, module: &str) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let enabled: Option<bool> = sqlx::query_scalar(
             r#"SELECT COALESCE(is_enabled, FALSE) FROM module_config
                WHERE tenant_id = $1 AND module_name = $2"#,
         )
         .bind(tenant_id)
         .bind(module)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         Ok(enabled.unwrap_or(false))
     }
@@ -242,10 +245,11 @@ impl SettingsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_module_config(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         module: &str,
         request: &UpsertModuleConfigRequest,
     ) -> AppResult<ModuleConfigResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO module_config (tenant_id, module_name, is_enabled, config)
                VALUES ($1, $2, $3, $4)
@@ -259,8 +263,9 @@ impl SettingsService {
         .bind(module)
         .bind(request.is_enabled)
         .bind(&request.config)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ModuleConfigResponse {
             id: Some(id),
             module_name: module.to_string(),

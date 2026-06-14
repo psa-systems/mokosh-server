@@ -5,6 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::TenantId;
 use crate::modules::notifications::render_template;
 use crate::modules::tickets::{CreateTicketRequest, TicketService, TicketSource};
 use crate::utils::error::{AppError, AppResult};
@@ -16,13 +17,11 @@ use super::models::*;
 pub struct RmmService {
     db: Database,
     encryption_key: [u8; 32],
-    /// When `Some`, alert ingest creates tickets through `TicketService`
-    /// (validation, automation engine, audit log, notifications
-    /// dispatch). When `None`, ingest falls back to a direct `INSERT
-    /// INTO tickets ...` so legacy test fixtures that build the service
-    /// without the full router keep compiling. The server always passes
-    /// `Some` via [`Self::with_dependencies`].
-    tickets: Option<Arc<TicketService>>,
+    /// Alert ingest creates tickets through `TicketService` (validation,
+    /// automation engine, audit log, notifications dispatch). There is no
+    /// direct-`INSERT` fallback: every RMM-originated ticket goes through
+    /// the canonical creation path (PMS-195).
+    tickets: Arc<TicketService>,
 }
 
 impl RmmService {
@@ -37,18 +36,10 @@ impl RmmService {
     /// the at-rest encryption a no-op for any caller that forgot to
     /// pass the key (see PMS-103, mirroring the PMS-92 fix on
     /// `NotificationsService`).
-    pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        Self {
-            db,
-            encryption_key,
-            tickets: None,
-        }
-    }
-
-    /// Like [`Self::with_encryption_key`] but additionally wires
-    /// `TicketService` so RMM-originated tickets go through the
-    /// canonical creation path (validation + automation + audit +
-    /// notifications). The server uses this constructor in
+    ///
+    /// Wires the `TicketService` dependency so RMM-originated tickets go
+    /// through the canonical creation path (validation + automation +
+    /// audit + notifications). The server uses this constructor in
     /// `create_api_router`.
     pub fn with_dependencies(
         db: Database,
@@ -58,7 +49,7 @@ impl RmmService {
         Self {
             db,
             encryption_key,
-            tickets: Some(Arc::new(tickets)),
+            tickets: Arc::new(tickets),
         }
     }
 
@@ -66,13 +57,14 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_connections(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RmmConnectionResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM rmm_connections WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, ConnRow>(
@@ -85,7 +77,7 @@ impl RmmService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -93,7 +85,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_connection(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateRmmConnectionRequest,
     ) -> AppResult<RmmConnectionResponse> {
         let key_enc = crate::utils::crypto::encrypt(&request.api_key, &self.encryption_key)?;
@@ -102,6 +94,7 @@ impl RmmService {
             None => None,
         };
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO rmm_connections
                (id, tenant_id, name, provider, api_url, api_key_encrypted,
@@ -117,8 +110,9 @@ impl RmmService {
         .bind(&secret_enc)
         .bind(request.is_active)
         .bind(request.sync_interval_minutes)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(RmmConnectionResponse {
             id,
             name: request.name.clone(),
@@ -138,9 +132,10 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_connection(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
     ) -> AppResult<RmmConnectionResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConnRow> = sqlx::query_as(
             r#"SELECT id, name, provider, api_url, is_active, sync_interval_minutes,
                       last_sync_at, sync_status, last_error, created_at
@@ -148,7 +143,7 @@ impl RmmService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
             .ok_or_else(|| AppError::NotFound("RmmConnection".to_string()))
@@ -163,7 +158,7 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_connection(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateRmmConnectionRequest,
     ) -> AppResult<RmmConnectionResponse> {
@@ -175,6 +170,7 @@ impl RmmService {
             Some(s) => Some(crate::utils::crypto::encrypt(s, &self.encryption_key)?),
             None => None,
         };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE rmm_connections SET
                  name = COALESCE($1, name),
@@ -194,26 +190,29 @@ impl RmmService {
         .bind(request.sync_interval_minutes)
         .bind(tenant_id)
         .bind(id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("RmmConnection".to_string()));
         }
+        tx.commit().await?;
         self.get_connection(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_connection(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_connection(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM rmm_connections WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("RmmConnection".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -221,10 +220,16 @@ impl RmmService {
     /// v1 just decrypts the credentials and HEADs the api_url to confirm
     /// reachability; per-provider auth check is the next commit.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn test_connection(&self, tenant_id: Uuid, id: Uuid) -> AppResult<serde_json::Value> {
+    pub async fn test_connection(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<serde_json::Value> {
+        let mut read_tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT api_url, api_key_encrypted FROM rmm_connections WHERE tenant_id = $1 AND id = $2",
-        ).bind(tenant_id).bind(id).fetch_optional(self.db.pool()).await?;
+        ).bind(tenant_id).bind(id).fetch_optional(&mut *read_tx).await?;
+        drop(read_tx);
         let Some((url, key_enc)) = row else {
             return Err(AppError::NotFound("RmmConnection".to_string()));
         };
@@ -248,6 +253,7 @@ impl RmmService {
         } else {
             "failed"
         };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE rmm_connections SET sync_status = $3, last_sync_at = NOW(), updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
@@ -255,8 +261,9 @@ impl RmmService {
         .bind(tenant_id)
         .bind(id)
         .bind(last_sync_status)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(summary)
     }
 
@@ -264,64 +271,55 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_device_mappings(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         connection_id: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RmmDeviceMappingResponse>, u64)> {
-        let (total, rows) = if let Some(cid) = connection_id {
-            let total: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = $1 AND rmm_connection_id = $2",
-            )
-            .bind(tenant_id)
-            .bind(cid)
-            .fetch_one(self.db.pool())
+        // PMS-198: the optional `connection_id` filter is appended
+        // dynamically instead of duplicating the whole query in an
+        // if/else. Both the COUNT and the page SELECT share the same
+        // base predicate plus the conditional `AND rmm_connection_id`.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let mut count_qb =
+            sqlx::QueryBuilder::new("SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = ");
+        count_qb.push_bind(tenant_id);
+        if let Some(cid) = connection_id {
+            count_qb.push(" AND rmm_connection_id = ");
+            count_qb.push_bind(cid);
+        }
+        let total: i64 = count_qb.build_query_scalar().fetch_one(&mut *tx).await?;
+
+        let mut rows_qb = sqlx::QueryBuilder::new(
+            r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
+                      device_name, last_seen, sync_status
+               FROM rmm_device_mappings WHERE tenant_id = "#,
+        );
+        rows_qb.push_bind(tenant_id);
+        if let Some(cid) = connection_id {
+            rows_qb.push(" AND rmm_connection_id = ");
+            rows_qb.push_bind(cid);
+        }
+        rows_qb.push(" ORDER BY device_name LIMIT ");
+        rows_qb.push_bind(pagination.limit() as i64);
+        rows_qb.push(" OFFSET ");
+        rows_qb.push_bind(pagination.offset() as i64);
+        let rows = rows_qb
+            .build_query_as::<DevMapRow>()
+            .fetch_all(&mut *tx)
             .await?;
 
-            let rows = sqlx::query_as::<_, DevMapRow>(
-                r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
-                          device_name, last_seen, sync_status
-                   FROM rmm_device_mappings WHERE tenant_id = $1 AND rmm_connection_id = $2
-                   ORDER BY device_name
-                   LIMIT $3 OFFSET $4"#,
-            )
-            .bind(tenant_id)
-            .bind(cid)
-            .bind(pagination.limit() as i64)
-            .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
-            .await?;
-            (total, rows)
-        } else {
-            let total: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM rmm_device_mappings WHERE tenant_id = $1")
-                    .bind(tenant_id)
-                    .fetch_one(self.db.pool())
-                    .await?;
-
-            let rows = sqlx::query_as::<_, DevMapRow>(
-                r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
-                          device_name, last_seen, sync_status
-                   FROM rmm_device_mappings WHERE tenant_id = $1
-                   ORDER BY device_name
-                   LIMIT $2 OFFSET $3"#,
-            )
-            .bind(tenant_id)
-            .bind(pagination.limit() as i64)
-            .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
-            .await?;
-            (total, rows)
-        };
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_device_mapping(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateRmmDeviceMappingRequest,
     ) -> AppResult<RmmDeviceMappingResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO rmm_device_mappings
                (id, tenant_id, rmm_connection_id, rmm_device_id, asset_id, company_id, device_name)
@@ -334,8 +332,9 @@ impl RmmService {
         .bind(request.asset_id)
         .bind(request.company_id)
         .bind(&request.device_name)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(RmmDeviceMappingResponse {
             id,
             rmm_connection_id: request.rmm_connection_id,
@@ -349,16 +348,18 @@ impl RmmService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_device_mapping(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_device_mapping(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM rmm_device_mappings WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("RmmDeviceMapping".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -366,17 +367,18 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_alert_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         connection_id: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<RmmAlertRuleResponse>, u64)> {
         let (total, rows) = if let Some(cid) = connection_id {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             let total: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM rmm_alert_rules WHERE tenant_id = $1 AND rmm_connection_id = $2",
             )
             .bind(tenant_id)
             .bind(cid)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
             let rows = sqlx::query_as::<_, AlertRuleRow>(
@@ -390,14 +392,15 @@ impl RmmService {
             .bind(cid)
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?;
             (total, rows)
         } else {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             let total: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM rmm_alert_rules WHERE tenant_id = $1")
                     .bind(tenant_id)
-                    .fetch_one(self.db.pool())
+                    .fetch_one(&mut *tx)
                     .await?;
 
             let rows = sqlx::query_as::<_, AlertRuleRow>(
@@ -410,7 +413,7 @@ impl RmmService {
             .bind(tenant_id)
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?;
             (total, rows)
         };
@@ -420,10 +423,11 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_alert_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertRmmAlertRuleRequest,
     ) -> AppResult<RmmAlertRuleResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO rmm_alert_rules
                (id, tenant_id, rmm_connection_id, name, alert_type, auto_create_ticket,
@@ -440,8 +444,9 @@ impl RmmService {
         .bind(request.queue_id)
         .bind(&request.ticket_template)
         .bind(request.is_active)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(RmmAlertRuleResponse {
             id,
             rmm_connection_id: request.rmm_connection_id,
@@ -455,16 +460,18 @@ impl RmmService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_alert_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_alert_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM rmm_alert_rules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("RmmAlertRule".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -485,9 +492,10 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn ingest_alert(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &IngestAlertRequest,
     ) -> AppResult<u64> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rules: Vec<AlertRuleRow> = sqlx::query_as(
             r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
                       assign_to_id, queue_id, is_active, ticket_template, suppression_rules
@@ -499,7 +507,7 @@ impl RmmService {
         .bind(tenant_id)
         .bind(request.rmm_connection_id)
         .bind(&request.alert_type)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let mapping_company: Option<Uuid> = sqlx::query_scalar(
@@ -510,8 +518,9 @@ impl RmmService {
         .bind(tenant_id)
         .bind(request.rmm_connection_id)
         .bind(&request.rmm_device_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
+        drop(tx);
 
         let context = serde_json::json!({
             "title": request.title,
@@ -549,6 +558,7 @@ impl RmmService {
             // exists within the dedupe window. Closed tickets are
             // re-eligible so a recurring problem can re-open a ticket.
             if let Some(window) = dedupe_window_minutes(rule.suppression_rules.as_ref()) {
+                let mut dedupe_tx = self.db.begin_with_tenant(tenant_id).await?;
                 let dup: Option<Uuid> = sqlx::query_scalar(
                     r#"SELECT t.id
                        FROM tickets t
@@ -563,8 +573,9 @@ impl RmmService {
                 .bind(company_id)
                 .bind(&title)
                 .bind(window)
-                .fetch_optional(self.db.pool())
+                .fetch_optional(&mut *dedupe_tx)
                 .await?;
+                drop(dedupe_tx);
                 if dup.is_some() {
                     tracing::debug!(
                         rule = %rule.name,
@@ -575,135 +586,59 @@ impl RmmService {
                 }
             }
 
-            match &self.tickets {
-                Some(svc) => {
-                    let Some(default_creator) = self.default_creator(tenant_id).await? else {
-                        continue;
-                    };
-                    let req = CreateTicketRequest {
-                        title: title.clone(),
-                        description: Some(description.clone()),
-                        priority_id: None,
-                        type_id: None,
-                        category_id: None,
-                        queue_id: rule.queue_id,
-                        source: TicketSource::Rmm,
-                        company_id,
-                        contact_id: None,
-                        site_id: None,
-                        assigned_to_id: rule.assign_to_id,
-                        team_id: None,
-                        contract_id: None,
-                        sla_id: None,
-                        scheduled_start: None,
-                        scheduled_end: None,
-                        estimated_hours: None,
-                        is_billable: false,
-                        asset_id: None,
-                        custom_fields: serde_json::json!({}),
-                        tags: vec![],
-                    };
-                    // RMM ingest is a background path (no AuditCtx extractor);
-                    // attribute the auto-created ticket to the system actor.
-                    svc.create_ticket(
-                        tenant_id,
-                        default_creator,
-                        &req,
-                        &crate::modules::audit::AuditCtx::system(tenant_id),
-                    )
-                    .await?;
-                }
-                None => {
-                    self.legacy_insert_ticket(tenant_id, &rule, company_id, &title, &description)
-                        .await?;
-                }
-            }
+            let Some(default_creator) = self.default_creator(tenant_id).await? else {
+                continue;
+            };
+            let req = CreateTicketRequest {
+                title: title.clone(),
+                description: Some(description.clone()),
+                priority_id: None,
+                type_id: None,
+                category_id: None,
+                queue_id: rule.queue_id,
+                source: TicketSource::Rmm,
+                company_id,
+                contact_id: None,
+                site_id: None,
+                assigned_to_id: rule.assign_to_id,
+                team_id: None,
+                contract_id: None,
+                sla_id: None,
+                scheduled_start: None,
+                scheduled_end: None,
+                estimated_hours: None,
+                is_billable: false,
+                asset_id: None,
+                custom_fields: serde_json::json!({}),
+                tags: vec![],
+            };
+            // RMM ingest is a background path (no AuditCtx extractor);
+            // attribute the auto-created ticket to the system actor.
+            // `TicketService` is on `TenantId`, so the scope flows
+            // straight through; `AuditCtx::system` is still a `Uuid`
+            // context bag, so unwrap only there.
+            self.tickets
+                .create_ticket(
+                    tenant_id,
+                    default_creator,
+                    &req,
+                    &crate::modules::audit::AuditCtx::system(tenant_id.get()),
+                )
+                .await?;
             created += 1;
         }
         Ok(created)
     }
 
-    /// Legacy direct-SQL ticket insert preserved for the
-    /// `tickets = None` fallback (old test fixtures that build
-    /// `RmmService::with_encryption_key` without the router's
-    /// `with_dependencies`). The router always passes the dispatcher
-    /// path; new call sites should not extend this.
-    async fn legacy_insert_ticket(
-        &self,
-        tenant_id: Uuid,
-        rule: &AlertRuleRow,
-        company_id: Uuid,
-        title: &str,
-        description: &str,
-    ) -> AppResult<()> {
-        let default_status: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-        )
-        .bind(tenant_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        let default_priority: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM ticket_priorities WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-        )
-        .bind(tenant_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        let queue_id: Option<Uuid> = match rule.queue_id {
-            Some(q) => Some(q),
-            None => sqlx::query_scalar(
-                "SELECT id FROM ticket_queues WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-            )
-            .bind(tenant_id)
-            .fetch_optional(self.db.pool())
-            .await?,
-        };
-        let Some(default_creator) = self.default_creator(tenant_id).await? else {
-            return Ok(());
-        };
-        let (Some(status_id), Some(priority_id), Some(queue_id)) =
-            (default_status, default_priority, queue_id)
-        else {
-            return Ok(());
-        };
-        let ticket_number: i32 = sqlx::query_scalar(
-            r#"UPDATE ticket_sequences SET last_number = last_number + 1
-               WHERE tenant_id = $1 RETURNING last_number"#,
-        )
-        .bind(tenant_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        let id = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO tickets (
-                id, tenant_id, ticket_number, title, description, status_id,
-                priority_id, queue_id, source, company_id, assigned_to_id,
-                is_billable, created_by_id
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'rmm',$9,$10,FALSE,$11)"#,
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(format!("T{:06}", ticket_number))
-        .bind(title)
-        .bind(description)
-        .bind(status_id)
-        .bind(priority_id)
-        .bind(queue_id)
-        .bind(company_id)
-        .bind(rule.assign_to_id)
-        .bind(default_creator)
-        .execute(self.db.pool())
-        .await?;
-        Ok(())
-    }
-
-    async fn default_creator(&self, tenant_id: Uuid) -> AppResult<Option<Uuid>> {
+    async fn default_creator(&self, tenant_id: TenantId) -> AppResult<Option<Uuid>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         Ok(sqlx::query_scalar(
             r#"SELECT id FROM users WHERE tenant_id = $1 AND status = 'active'
                  AND role IN ('super_admin', 'admin', 'manager')
                ORDER BY created_at LIMIT 1"#,
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?)
     }
 
@@ -713,15 +648,16 @@ impl RmmService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn connection_api_secret(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         connection_id: Uuid,
     ) -> AppResult<Option<String>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<Option<String>> = sqlx::query_scalar(
             "SELECT api_secret_encrypted FROM rmm_connections WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
         .bind(connection_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(enc) = row.flatten() else {
             return Ok(None);

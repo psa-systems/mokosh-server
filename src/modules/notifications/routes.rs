@@ -12,7 +12,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::NotificationsService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -70,7 +70,7 @@ async fn list_channels(
     _a: RequireAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationChannelResponse>>> {
-    let (items, total) = s.service.list_channels(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_channels(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -85,7 +85,7 @@ async fn create_channel(
     Json(req): Json<UpsertNotificationChannelRequest>,
 ) -> AppResult<Json<NotificationChannelResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_channel(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_channel(u.tenant(), &req).await?))
 }
 
 async fn delete_channel(
@@ -94,7 +94,7 @@ async fn delete_channel(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_channel(u.tenant_id, id).await
+    s.service.delete_channel(u.tenant(), id).await
 }
 
 async fn list_templates(
@@ -102,7 +102,7 @@ async fn list_templates(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationTemplateResponse>>> {
-    let (items, total) = s.service.list_templates(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_templates(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -117,7 +117,7 @@ async fn create_template(
     Json(req): Json<UpsertNotificationTemplateRequest>,
 ) -> AppResult<Json<NotificationTemplateResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_template(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_template(u.tenant(), &req).await?))
 }
 
 async fn delete_template(
@@ -126,7 +126,7 @@ async fn delete_template(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_template(u.tenant_id, id).await
+    s.service.delete_template(u.tenant(), id).await
 }
 
 async fn list_user_prefs(
@@ -136,7 +136,7 @@ async fn list_user_prefs(
 ) -> AppResult<Json<PaginatedResponse<UserNotificationPreferenceResponse>>> {
     let (items, total) = s
         .service
-        .list_user_preferences(u.tenant_id, u.id, &pagination)
+        .list_user_preferences(u.tenant(), u.id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -153,7 +153,7 @@ async fn upsert_user_pref(
     req.validate()?;
     Ok(Json(
         s.service
-            .upsert_user_preference(u.tenant_id, u.id, &req)
+            .upsert_user_preference(u.tenant(), u.id, &req)
             .await?,
     ))
 }
@@ -163,7 +163,7 @@ async fn list_inbox(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationInboxItemResponse>>> {
-    let (items, total) = s.service.list_inbox(u.tenant_id, u.id, &pagination).await?;
+    let (items, total) = s.service.list_inbox(u.tenant(), u.id, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -176,7 +176,7 @@ async fn mark_read(
     RequireAuth(u): RequireAuth,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.mark_read(u.tenant_id, u.id, id).await
+    s.service.mark_read(u.tenant(), u.id, id).await
 }
 
 async fn list_rules(
@@ -184,7 +184,7 @@ async fn list_rules(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationRuleResponse>>> {
-    let (items, total) = s.service.list_rules(u.tenant_id, &pagination).await?;
+    let (items, total) = s.service.list_rules(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -199,7 +199,7 @@ async fn create_rule(
     Json(req): Json<UpsertNotificationRuleRequest>,
 ) -> AppResult<Json<NotificationRuleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_rule(u.tenant_id, &req).await?))
+    Ok(Json(s.service.create_rule(u.tenant(), &req).await?))
 }
 
 async fn delete_rule(
@@ -208,7 +208,7 @@ async fn delete_rule(
     _a: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_rule(u.tenant_id, id).await
+    s.service.delete_rule(u.tenant(), id).await
 }
 
 async fn dispatch_event(
@@ -220,7 +220,7 @@ async fn dispatch_event(
     req.validate()?;
     let count = s
         .service
-        .dispatch(u.tenant_id, &req.event_type, &req.context)
+        .dispatch(u.tenant(), &req.event_type, &req.context)
         .await?;
     Ok(Json(serde_json::json!({"fanout": count})))
 }

@@ -2,6 +2,7 @@
 //! (plus an optional notifications dispatcher used by the reminder
 //! worker, mirroring `AuthService::with_dispatcher`).
 
+use crate::modules::auth::TenantId;
 use chrono::{DateTime, Datelike, Utc};
 use uuid::Uuid;
 
@@ -59,22 +60,54 @@ impl CalendarService {
         self.notifications.as_ref()
     }
 
-    /// Connection-pool accessor for the reminder worker, which writes the
-    /// `appointment_reminders` dedupe ledger directly.
-    pub(crate) fn pool(&self) -> &sqlx::PgPool {
-        self.db.pool()
+    /// Claim an `(appointment, occurrence, offset)` reminder slot in the
+    /// dedupe ledger for the reminder worker. Runs inside a tenant-scoped
+    /// transaction so the RLS `app.current_tenant` GUC is set (PMS-256).
+    /// Returns `true` if this call won the uniqueness race (the row was
+    /// inserted), `false` if a prior tick or sibling replica already
+    /// claimed it.
+    pub(crate) async fn claim_reminder(
+        &self,
+        tenant_id: Uuid,
+        appointment_id: Uuid,
+        occurrence_start: DateTime<Utc>,
+        reminder_minutes: i32,
+    ) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let inserted = sqlx::query(
+            r#"INSERT INTO appointment_reminders
+                   (tenant_id, appointment_id, occurrence_start, reminder_minutes)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (appointment_id, occurrence_start, reminder_minutes)
+               DO NOTHING"#,
+        )
+        .bind(tenant_id)
+        .bind(appointment_id)
+        .bind(occurrence_start)
+        .bind(reminder_minutes)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(inserted > 0)
     }
 
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: Uuid, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(
+        &self,
+        tenant_id: TenantId,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
         .bind(tenant_id)
         .bind(id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if exists {
             Ok(())
@@ -87,7 +120,7 @@ impl CalendarService {
 
     async fn validate_fk_opt(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         table: &'static str,
         id: Option<Uuid>,
     ) -> AppResult<()> {
@@ -104,7 +137,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_appointments(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &AppointmentFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AppointmentResponse>, u64)> {
@@ -180,12 +213,13 @@ impl CalendarService {
             q = q.bind(v);
             cq = cq.bind(v);
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -204,7 +238,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn appointments_in_range(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         assigned_to_id: Option<Uuid>,
@@ -237,11 +271,12 @@ impl CalendarService {
                FROM appointments WHERE {where_clause}
                ORDER BY start_time"#
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let mut q = sqlx::query_as::<_, AppointmentRow>(&plain_query).bind(tenant_id);
         if let Some(v) = assigned_to_id {
             q = q.bind(v);
         }
-        let plain_rows = q.bind(from).bind(to).fetch_all(self.db.pool()).await?;
+        let plain_rows = q.bind(from).bind(to).fetch_all(&mut *tx).await?;
 
         // Recurring masters: no time filter (the rule decides which
         // occurrences land in the window).
@@ -266,7 +301,7 @@ impl CalendarService {
         if let Some(v) = assigned_to_id {
             rq = rq.bind(v);
         }
-        let recurring_rows = rq.fetch_all(self.db.pool()).await?;
+        let recurring_rows = rq.fetch_all(&mut *tx).await?;
 
         let mut out: Vec<AppointmentResponse> = plain_rows.into_iter().map(Into::into).collect();
         for row in recurring_rows {
@@ -296,13 +331,21 @@ impl CalendarService {
     /// dispatch; this method only computes which reminders are due.
     #[tracing::instrument(skip_all)]
     pub async fn due_reminders(&self, now: DateTime<Utc>) -> AppResult<Vec<ReminderCandidate>> {
+        // PMS-261: these two reads are the worker's deliberate cross-tenant
+        // enumeration - they project `tenant_id` off every tenant's
+        // `appointments` rows to build the per-tenant work list, so they run with
+        // NO `app.current_tenant` GUC by design. SAFETY (PMS-285): this is the
+        // BYPASSRLS-scoped path that comment foresaw - the cross-tenant
+        // enumeration now runs explicitly on the migrator pool, while the
+        // per-tenant work the worker then performs (`claim_reminder`, `dispatch`)
+        // each sets the GUC via `begin_with_tenant`.
         // Largest configured offset across the whole table bounds the
         // expansion window. NULL (no appointment has reminders) => no work.
         let max_offset_min: Option<i32> = sqlx::query_scalar(
             r#"SELECT MAX(m) FROM appointments a, unnest(a.reminder_minutes) AS m
                WHERE a.reminder_minutes IS NOT NULL"#,
         )
-        .fetch_one(self.db.pool())
+        .fetch_one(self.db.migrator_pool())
         .await?;
         let Some(max_offset_min) = max_offset_min else {
             return Ok(Vec::new());
@@ -329,7 +372,9 @@ impl CalendarService {
         )
         .bind(now)
         .bind(window_end)
-        .fetch_all(self.db.pool())
+        // SAFETY (PMS-285): cross-tenant reminder enumeration; migrator pool
+        // (see the `max_offset_min` note above).
+        .fetch_all(self.db.migrator_pool())
         .await?;
 
         let mut out: Vec<ReminderCandidate> = Vec::new();
@@ -378,7 +423,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_appointment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
         if request.end_time <= request.start_time {
@@ -403,6 +448,7 @@ impl CalendarService {
         self.validate_fk_opt(tenant_id, "tasks", request.task_id)
             .await?;
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO appointments (
                 id, tenant_id, title, description, appointment_type, ticket_id, project_id,
@@ -428,17 +474,19 @@ impl CalendarService {
         .bind(&request.timezone)
         .bind(&request.location)
         .bind(&request.recurrence_rule)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get_appointment(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_appointment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
     ) -> AppResult<AppointmentResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, AppointmentRow>(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
@@ -449,7 +497,7 @@ impl CalendarService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Appointment".to_string()))?;
         Ok(row.into())
@@ -458,7 +506,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_appointment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpdateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
@@ -466,6 +514,7 @@ impl CalendarService {
         // re-link this appointment to another tenant's user.
         self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
             .await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE appointments SET
                 title = COALESCE($3, title),
@@ -493,26 +542,29 @@ impl CalendarService {
         .bind(&request.timezone)
         .bind(&request.status)
         .bind(&request.location)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Appointment".to_string()));
         }
+        tx.commit().await?;
         self.get_appointment(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_appointment(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_appointment(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM appointments WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Appointment".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -523,16 +575,17 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_availability(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<UserAvailabilityResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM user_availability WHERE tenant_id = $1 AND user_id = $2",
         )
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, AvailRow>(
@@ -545,7 +598,7 @@ impl CalendarService {
         .bind(user_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -557,12 +610,12 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn replace_user_availability(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &ReplaceAvailabilityRequest,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<UserAvailabilityResponse>, u64)> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query("DELETE FROM user_availability WHERE tenant_id = $1 AND user_id = $2")
             .bind(tenant_id)
             .bind(user_id)
@@ -601,7 +654,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_time_off(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &TimeOffFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimeOffResponse>, u64)> {
@@ -651,19 +704,20 @@ impl CalendarService {
             q = q.bind(v);
             cq = cq.bind(v);
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_off(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateTimeOffRequest,
     ) -> AppResult<TimeOffResponse> {
         if request.end_date < request.start_date {
@@ -672,6 +726,7 @@ impl CalendarService {
             ));
         }
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO time_off (id, tenant_id, user_id, start_date, end_date, type, notes)
                VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
@@ -683,17 +738,19 @@ impl CalendarService {
         .bind(request.end_date)
         .bind(&request.kind)
         .bind(&request.notes)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get_time_off(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_time_off(&self, tenant_id: Uuid, id: Uuid) -> AppResult<TimeOffResponse> {
+    pub async fn get_time_off(&self, tenant_id: TenantId, id: Uuid) -> AppResult<TimeOffResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TimeOffRow>(
             r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
                FROM time_off WHERE tenant_id = $1 AND id = $2"#,
-        ).bind(tenant_id).bind(id).fetch_optional(self.db.pool()).await?
+        ).bind(tenant_id).bind(id).fetch_optional(&mut *tx).await?
         .ok_or_else(|| AppError::NotFound("TimeOff".to_string()))?;
         Ok(row.into())
     }
@@ -701,7 +758,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn approve_time_off(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         approver_id: Uuid,
         status: &str,
@@ -711,6 +768,7 @@ impl CalendarService {
                 "status must be approved | rejected; got {status:?}"
             )));
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE time_off SET status = $3, approved_by_id = $4, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
@@ -719,26 +777,29 @@ impl CalendarService {
         .bind(id)
         .bind(status)
         .bind(approver_id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("TimeOff".to_string()));
         }
+        tx.commit().await?;
         self.get_time_off(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_time_off(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_time_off(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM time_off WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("TimeOff".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -749,13 +810,14 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_on_call_schedules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<OnCallScheduleResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM on_call_schedules WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, OnCallRow>(
@@ -767,7 +829,7 @@ impl CalendarService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -775,10 +837,11 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_on_call_schedule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertOnCallScheduleRequest,
     ) -> AppResult<OnCallScheduleResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO on_call_schedules
                (id, tenant_id, name, team_id, rotation_type, rotation_config, is_active)
@@ -791,8 +854,9 @@ impl CalendarService {
         .bind(&request.rotation_type)
         .bind(&request.rotation_config)
         .bind(request.is_active)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(OnCallScheduleResponse {
             id,
             name: request.name.clone(),
@@ -806,10 +870,11 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_on_call_schedule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertOnCallScheduleRequest,
     ) -> AppResult<OnCallScheduleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE on_call_schedules SET
                   name = $3, team_id = $4, rotation_type = $5,
@@ -823,12 +888,13 @@ impl CalendarService {
         .bind(&request.rotation_type)
         .bind(&request.rotation_config)
         .bind(request.is_active)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("OnCallSchedule".to_string()));
         }
+        tx.commit().await?;
         Ok(OnCallScheduleResponse {
             id,
             name: request.name.clone(),
@@ -840,16 +906,18 @@ impl CalendarService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_on_call_schedule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_on_call_schedule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM on_call_schedules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("OnCallSchedule".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -858,13 +926,14 @@ impl CalendarService {
     /// daily / custom rotation math arrives in a follow-up. Returns
     /// one entry per active schedule.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn on_call_now(&self, tenant_id: Uuid) -> AppResult<Vec<OnCallNowResponse>> {
+    pub async fn on_call_now(&self, tenant_id: TenantId) -> AppResult<Vec<OnCallNowResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, OnCallRow>(
             r#"SELECT id, name, team_id, rotation_type, rotation_config, is_active
                FROM on_call_schedules WHERE tenant_id = $1 AND is_active = TRUE"#,
         )
         .bind(tenant_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
@@ -875,9 +944,8 @@ impl CalendarService {
                 .cloned()
                 .unwrap_or_default();
             let on_call_user_id = match (users.first(), r.rotation_type.as_str(), Utc::now()) {
-                (Some(v), "weekly", now) => {
+                (Some(_), "weekly", now) => {
                     // weekly: index = ISO week mod len(users).
-                    let _ = v;
                     let week = now.iso_week().week() as usize;
                     let len = users.len();
                     if len == 0 {
@@ -888,8 +956,7 @@ impl CalendarService {
                             .and_then(|s| Uuid::parse_str(s).ok())
                     }
                 }
-                (Some(v), "daily", now) => {
-                    let _ = v;
+                (Some(_), "daily", now) => {
                     let day = now.ordinal() as usize;
                     let len = users.len();
                     if len == 0 {
@@ -930,7 +997,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch_view(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         assigned_to_id: Option<Uuid>,
@@ -940,6 +1007,7 @@ impl CalendarService {
             .await?;
 
         // Availability: optionally scoped to one technician.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let avail_rows = if let Some(uid) = assigned_to_id {
             sqlx::query_as::<_, AvailRow>(
                 r#"SELECT id, user_id, day_of_week, start_time, end_time, is_available
@@ -948,7 +1016,7 @@ impl CalendarService {
             )
             .bind(tenant_id)
             .bind(uid)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?
         } else {
             sqlx::query_as::<_, AvailRow>(
@@ -957,7 +1025,7 @@ impl CalendarService {
                    ORDER BY user_id, day_of_week, start_time"#,
             )
             .bind(tenant_id)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?
         };
         let availability: Vec<UserAvailabilityResponse> =
@@ -981,7 +1049,7 @@ impl CalendarService {
             .bind(from_date)
             .bind(to_date)
             .bind(uid)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?
         } else {
             sqlx::query_as::<_, TimeOffRow>(
@@ -994,10 +1062,12 @@ impl CalendarService {
             .bind(tenant_id)
             .bind(from_date)
             .bind(to_date)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *tx)
             .await?
         };
         let time_off: Vec<TimeOffResponse> = time_off_rows.into_iter().map(Into::into).collect();
+        // Drop the read tx before on_call_now opens its own.
+        drop(tx);
 
         let on_call = self.on_call_now(tenant_id).await?;
 

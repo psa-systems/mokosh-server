@@ -1,35 +1,72 @@
 //! Contact service implementation
 
+use std::sync::Arc;
+
+use crate::modules::auth::TenantId;
+use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::utils::crypto::{generate_token, hash_password};
+use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// How long a portal setup link remains redeemable. Mirrors the
+/// password-reset redemption window (PMS-136).
+const PORTAL_SETUP_TOKEN_TTL_HOURS: i64 = 72;
+
 /// Contact management service
 #[derive(Clone)]
 pub struct ContactService {
     db: Database,
+    /// Outbound mailer used to deliver portal setup-link emails. Defaults
+    /// to `LogMailer` (dev/tests log the link) unless the router wires the
+    /// shared `Mailer`.
+    mailer: Arc<dyn Mailer>,
+    /// Base URL of the customer-facing SPA. The setup link is
+    /// `{app_url}/portal/set-password?token=...`.
+    app_url: String,
 }
 
 impl ContactService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            mailer: Arc::new(LogMailer),
+            app_url: String::new(),
+        }
+    }
+
+    /// Construct with the shared mailer and SPA base URL so granting
+    /// portal access can email the contact a setup link (PMS-136).
+    pub fn with_mailer(db: Database, mailer: Arc<dyn Mailer>, app_url: String) -> Self {
+        Self {
+            db,
+            mailer,
+            app_url,
+        }
     }
 
     /// Reject a foreign id that does not belong to this tenant, so a request
     /// body cannot link a row to another tenant's data. `table` is a
     /// compile-time constant, never user input.
-    async fn validate_fk(&self, tenant_id: Uuid, table: &'static str, id: Uuid) -> AppResult<()> {
+    async fn validate_fk(
+        &self,
+        tenant_id: TenantId,
+        table: &'static str,
+        id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = $2)"
         ))
         .bind(tenant_id)
         .bind(id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if exists {
             Ok(())
@@ -42,7 +79,7 @@ impl ContactService {
 
     async fn validate_fk_opt(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         table: &'static str,
         id: Option<Uuid>,
     ) -> AppResult<()> {
@@ -60,7 +97,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateCompanyRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Company> {
@@ -80,7 +117,7 @@ impl ContactService {
         // Mutation + audit row in one transaction so a rollback drops
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO companies (
@@ -168,13 +205,14 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn enrich_companies(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         mut responses: Vec<CompanyResponse>,
     ) -> AppResult<Vec<CompanyResponse>> {
         if responses.is_empty() {
             return Ok(responses);
         }
         let ids: Vec<Uuid> = responses.iter().map(|r| r.id).collect();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, CompanyRollupRow>(
             r#"
             SELECT
@@ -201,7 +239,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(&ids)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         let mut by_id: std::collections::HashMap<Uuid, CompanyRollupRow> =
             rows.into_iter().map(|r| (r.company_id, r)).collect();
@@ -217,7 +255,8 @@ impl ContactService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_company(&self, tenant_id: Uuid, company_id: Uuid) -> AppResult<Company> {
+    pub async fn get_company(&self, tenant_id: TenantId, company_id: Uuid) -> AppResult<Company> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, CompanyRow>(
             r#"
             SELECT id, tenant_id, name, parent_company_id, company_type, status,
@@ -236,7 +275,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Company".to_string()))?;
 
@@ -247,7 +286,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_companies(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &CompanyFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Company>, u64)> {
@@ -339,8 +378,9 @@ impl ContactService {
             count_builder = count_builder.bind(am_id);
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -354,7 +394,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         request: &UpdateCompanyRequest,
         ctx: &AuditCtx,
@@ -587,7 +627,7 @@ impl ContactService {
         // before and after (Postgres to_jsonb captures exact stored
         // state) and write the audit entry on the same tx so a rollback
         // drops both. PMS-117 AC1.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
         )
@@ -626,17 +666,23 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_company(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
+        // Mutation + audit row in one transaction. DELETE: snapshot
+        // before, old = before, after = None. PMS-117. The pre-flight
+        // ticket guard runs inside the same tenant-scoped tx so the RLS
+        // GUC is set for it too.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
         // Check for related records
         let ticket_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND company_id = $2",
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         if ticket_count > 0 {
@@ -645,9 +691,6 @@ impl ContactService {
             ));
         }
 
-        // Mutation + audit row in one transaction. DELETE: snapshot
-        // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
         )
@@ -700,11 +743,74 @@ impl ContactService {
     // CONTACTS
     // ========================================================================
 
+    /// Mint a single-use portal setup token bound to `contact_id` and
+    /// insert it within the caller's transaction. The emailed token is
+    /// `{contact_id}.{secret}`; only the Argon2 hash of the secret is
+    /// stored (mirrors the password-reset token shape in
+    /// `auth::service`). Returns the full token to email after the
+    /// transaction commits. PMS-136.
+    async fn insert_setup_token(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<String> {
+        let secret = generate_token(64);
+        let token_hash = hash_password(&secret)?;
+        let token = format!("{contact_id}.{secret}");
+        let expires_at = Utc::now() + Duration::hours(PORTAL_SETUP_TOKEN_TTL_HOURS);
+        sqlx::query(
+            r#"
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(conn)
+        .await?;
+        Ok(token)
+    }
+
+    /// Best-effort delivery of the portal setup-link email. Called AFTER
+    /// the grant transaction commits, so a failed send never rolls back
+    /// the flag flip / token row; the token is persisted and the link can
+    /// be resent later. A contact with no email address is skipped (the
+    /// agent owns following up out of band). PMS-136.
+    async fn send_setup_email(&self, contact: &Contact, token: &str) {
+        let Some(ref email) = contact.email else {
+            tracing::warn!(
+                contact_id = %contact.id,
+                "portal access granted but contact has no email; setup link not delivered",
+            );
+            return;
+        };
+        let setup_link = format!(
+            "{}/portal/set-password?token={}",
+            self.app_url.trim_end_matches('/'),
+            token,
+        );
+        match self
+            .mailer
+            .send_welcome(email, &contact.first_name, &setup_link)
+            .await
+        {
+            Ok(()) => tracing::info!(contact_id = %contact.id, "portal setup-link email sent"),
+            Err(e) => tracing::warn!(
+                contact_id = %contact.id,
+                error = ?e,
+                "portal setup email send failed; token persisted but link unreachable",
+            ),
+        }
+    }
+
     /// Create a new contact
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contact(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateContactRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Contact> {
@@ -720,7 +826,7 @@ impl ContactService {
         // Mutation + audit row in one transaction so a rollback drops
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO contacts (
@@ -752,20 +858,27 @@ impl ContactService {
         .execute(&mut *tx)
         .await?;
 
-        // PMS-19: flip the contact's `is_portal_user` flag so the
-        // upcoming portal-login flow (PMS-26) can treat it as a valid
-        // identity. We deliberately do NOT mint a `portal_password_hash`
-        // here because the password-set step belongs to the customer,
-        // not the agent creating the contact - the portal-session work
-        // will own the setup-link / email-confirmation handshake.
-        if request.create_portal_access {
+        // PMS-19 / PMS-136: flip the contact's `is_portal_user` flag so the
+        // portal-login flow (PMS-26) treats it as a valid identity, and mint
+        // a single-use setup token. We deliberately do NOT mint a
+        // `portal_password_hash` here: the password-set step belongs to the
+        // customer, who redeems the emailed `/portal/set-password` link. The
+        // token row is written inside this transaction so a rollback drops it
+        // with the contact; the email is sent only after commit.
+        let setup_token = if request.create_portal_access {
             sqlx::query(
                 "UPDATE contacts SET is_portal_user = TRUE, updated_at = NOW() WHERE id = $1",
             )
             .bind(contact_id)
             .execute(&mut *tx)
             .await?;
-        }
+            Some(
+                self.insert_setup_token(&mut tx, tenant_id, contact_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
@@ -788,12 +901,18 @@ impl ContactService {
         .await?;
         tx.commit().await?;
 
-        self.get_contact(tenant_id, contact_id).await
+        let contact = self.get_contact(tenant_id, contact_id).await?;
+        // Email the setup link only after the grant transaction committed.
+        if let Some(token) = setup_token {
+            self.send_setup_email(&contact, &token).await;
+        }
+        Ok(contact)
     }
 
     /// Get contact by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_contact(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<Contact> {
+    pub async fn get_contact(&self, tenant_id: TenantId, contact_id: Uuid) -> AppResult<Contact> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ContactRow>(
             r#"
             SELECT id, tenant_id, company_id, first_name, last_name, email,
@@ -807,7 +926,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(contact_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Contact".to_string()))?;
 
@@ -818,7 +937,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contacts(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &ContactFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Contact>, u64)> {
@@ -911,8 +1030,9 @@ impl ContactService {
             count_builder = count_builder.bind(status.as_str());
         }
 
-        let rows = query_builder.fetch_all(self.db.pool()).await?;
-        let total = count_builder.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let total = count_builder.fetch_one(&mut *tx).await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -921,16 +1041,17 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_contacts(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Contact>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM contacts WHERE tenant_id = $1 AND company_id = $2",
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, ContactRow>(
@@ -950,7 +1071,7 @@ impl ContactService {
         .bind(company_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -960,7 +1081,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contact(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contact_id: Uuid,
         request: &UpdateContactRequest,
         ctx: &AuditCtx,
@@ -969,7 +1090,7 @@ impl ContactService {
 
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
         )
@@ -1054,7 +1175,15 @@ impl ContactService {
         }
         if request.status.is_some() {
             updates.push(format!("status = ${param_idx}"));
-            // param_idx += 1;
+            param_idx += 1;
+        }
+        // PMS-136: persist the portal-access flag for any explicit value so a
+        // grant (`true`) or revoke (`false`) round-trips. The setup-token mint
+        // + email is gated on the false -> true transition below; flipping the
+        // column here keeps a re-grant idempotent and a revoke effective.
+        if request.is_portal_user.is_some() {
+            updates.push(format!("is_portal_user = ${param_idx}"));
+            // param_idx += 1; // last bound field
         }
 
         let query = format!(
@@ -1119,8 +1248,30 @@ impl ContactService {
         if let Some(status) = request.status {
             q = q.bind(status.as_str());
         }
+        if let Some(is_portal_user) = request.is_portal_user {
+            q = q.bind(is_portal_user);
+        }
 
         q.execute(&mut *tx).await?;
+
+        // PMS-136: a false -> true transition mints a single-use setup token
+        // and (after commit) emails the contact a `/portal/set-password` link.
+        // The prior `is_portal_user` is read off the `before` snapshot taken at
+        // the top of this tx, so re-saving an already-portal contact does not
+        // mint a second token or resend the email.
+        let was_portal_user = before
+            .as_ref()
+            .and_then(|v| v.get("is_portal_user"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let setup_token = if request.is_portal_user == Some(true) && !was_portal_user {
+            Some(
+                self.insert_setup_token(&mut tx, tenant_id, contact_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
@@ -1143,20 +1294,25 @@ impl ContactService {
         .await?;
         tx.commit().await?;
 
-        self.get_contact(tenant_id, contact_id).await
+        let contact = self.get_contact(tenant_id, contact_id).await?;
+        // Email the setup link only after the grant transaction committed.
+        if let Some(token) = setup_token {
+            self.send_setup_email(&contact, &token).await;
+        }
+        Ok(contact)
     }
 
     /// Delete contact
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contact(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contact_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",
         )
@@ -1195,7 +1351,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_site(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateSiteRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Site> {
@@ -1211,7 +1367,7 @@ impl ContactService {
         // Mutation + audit row in one transaction so a rollback drops
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // If this is marked as primary, unmark other sites
         if request.is_primary {
@@ -1282,7 +1438,7 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_site(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         site_id: Uuid,
         request: &UpdateSiteRequest,
         ctx: &AuditCtx,
@@ -1293,7 +1449,7 @@ impl ContactService {
 
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -1429,7 +1585,8 @@ impl ContactService {
 
     /// Get site by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_site(&self, tenant_id: Uuid, site_id: Uuid) -> AppResult<Site> {
+    pub async fn get_site(&self, tenant_id: TenantId, site_id: Uuid) -> AppResult<Site> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, SiteRow>(
             r#"
             SELECT id, tenant_id, company_id, name,
@@ -1442,7 +1599,7 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(site_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Site".to_string()))?;
 
@@ -1453,16 +1610,17 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_sites(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Site>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sites WHERE tenant_id = $1 AND company_id = $2",
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, SiteRow>(
@@ -1481,7 +1639,7 @@ impl ContactService {
         .bind(company_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
@@ -1491,13 +1649,13 @@ impl ContactService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_site(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         site_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(s) FROM sites s WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -1681,14 +1839,21 @@ impl From<ContactRow> for Contact {
             contact_type: ContactType::from_str(&row.contact_type).unwrap_or_default(),
             is_portal_user: row.is_portal_user,
             portal_user_id: row.portal_user_id,
-            preferred_contact_method: PreferredContactMethod::Email,
+            // PMS-195: honor the stored value instead of hardcoding Email.
+            // Unknown values fall back to the enum default (Email), matching
+            // the `contact_type` / `status` `unwrap_or_default()` pattern.
+            preferred_contact_method: match row.preferred_contact_method.as_str() {
+                "phone" => PreferredContactMethod::Phone,
+                "mobile" => PreferredContactMethod::Mobile,
+                _ => PreferredContactMethod::Email,
+            },
             timezone: row.timezone,
             locale: row.locale,
             custom_fields: row.custom_fields,
             tags: row.tags,
             notes: row.notes,
             avatar_url: row.avatar_url,
-            status: row.status.parse::<ContactStatus>().unwrap_or_default(),
+            status: ContactStatus::from_str(&row.status).unwrap_or_default(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }

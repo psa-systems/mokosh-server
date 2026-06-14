@@ -7,6 +7,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::TenantId;
 use crate::utils::error::AppResult;
 
 #[derive(Clone)]
@@ -19,15 +20,23 @@ impl ReportsService {
         Self { db }
     }
 
-    /// Connection pool, for the custom-report builder which constructs its
-    /// own dynamic (but fully whitelisted) query. See `super::custom`.
-    pub fn pool(&self) -> &sqlx::PgPool {
-        self.db.pool()
+    /// Run a whitelisted custom report inside a tenant-scoped transaction
+    /// so the dynamic (but fully whitelisted) query carries the RLS
+    /// `app.current_tenant` GUC (PMS-256). Read-only: the tx is dropped
+    /// (rolled back) after the SELECT. See `super::custom`.
+    pub async fn run_custom(
+        &self,
+        tenant_id: TenantId,
+        spec: &super::custom::CustomSpec,
+    ) -> AppResult<super::custom::CustomReportResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        super::custom::run(&mut *tx, tenant_id, spec).await
     }
 
     // PMS-95 dashboard --------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn dashboard(&self, tenant_id: Uuid) -> AppResult<DashboardResponse> {
+    pub async fn dashboard(&self, tenant_id: TenantId) -> AppResult<DashboardResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let open_by_priority: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT tp.name, COUNT(*)::bigint
                FROM tickets t
@@ -37,7 +46,7 @@ impl ReportsService {
                GROUP BY tp.name ORDER BY tp.name"#,
         )
         .bind(tenant_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let sla_warnings: i64 = sqlx::query_scalar(
@@ -46,7 +55,7 @@ impl ReportsService {
                  AND sla_due_date > NOW() AND closed_at IS NULL"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let sla_breached: i64 = sqlx::query_scalar(
@@ -54,7 +63,7 @@ impl ReportsService {
                WHERE tenant_id = $1 AND sla_due_date < NOW() AND closed_at IS NULL"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let trend: Vec<(NaiveDate, i64)> = sqlx::query_as(
@@ -64,7 +73,7 @@ impl ReportsService {
                GROUP BY d ORDER BY d"#,
         )
         .bind(tenant_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok(DashboardResponse {
@@ -85,7 +94,7 @@ impl ReportsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn tickets(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: Option<NaiveDate>,
         to: Option<NaiveDate>,
     ) -> AppResult<TicketsReportResponse> {
@@ -93,6 +102,7 @@ impl ReportsService {
             from.unwrap_or_else(|| chrono::Utc::now().date_naive() - chrono::Duration::days(30)),
             to.unwrap_or_else(|| chrono::Utc::now().date_naive()),
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let opened: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT ts.name, COUNT(*)::bigint
                FROM tickets t INNER JOIN ticket_statuses ts ON t.status_id = ts.id
@@ -102,7 +112,7 @@ impl ReportsService {
         .bind(tenant_id)
         .bind(from)
         .bind(to)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         let closed: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*)::bigint FROM tickets
@@ -111,7 +121,7 @@ impl ReportsService {
         .bind(tenant_id)
         .bind(from)
         .bind(to)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         let by_assignee: Vec<(Option<Uuid>, i64)> = sqlx::query_as(
             r#"SELECT assigned_to_id, COUNT(*)::bigint FROM tickets
@@ -121,7 +131,7 @@ impl ReportsService {
         .bind(tenant_id)
         .bind(from)
         .bind(to)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok(TicketsReportResponse {
             from,
@@ -148,7 +158,7 @@ impl ReportsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn time(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         from: Option<NaiveDate>,
         to: Option<NaiveDate>,
     ) -> AppResult<TimeReportResponse> {
@@ -156,6 +166,7 @@ impl ReportsService {
             from.unwrap_or_else(|| chrono::Utc::now().date_naive() - chrono::Duration::days(30)),
             to.unwrap_or_else(|| chrono::Utc::now().date_naive()),
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let by_user: Vec<(Uuid, i64)> = sqlx::query_as(
             r#"SELECT user_id, SUM(duration_minutes)::bigint FROM time_entries
                WHERE tenant_id = $1 AND date BETWEEN $2 AND $3
@@ -164,7 +175,7 @@ impl ReportsService {
         .bind(tenant_id)
         .bind(from)
         .bind(to)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         let by_work_type: Vec<(Uuid, i64)> = sqlx::query_as(
             r#"SELECT work_type_id, SUM(duration_minutes)::bigint FROM time_entries
@@ -174,7 +185,7 @@ impl ReportsService {
         .bind(tenant_id)
         .bind(from)
         .bind(to)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok(TimeReportResponse {
             from,
@@ -194,9 +205,10 @@ impl ReportsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn billing(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         company_id: Option<Uuid>,
     ) -> AppResult<BillingReportResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let totals: Option<(Decimal, Decimal, Decimal)> = if let Some(c) = company_id {
             sqlx::query_as(
                 r#"SELECT COALESCE(SUM(total), 0), COALESCE(SUM(amount_paid), 0),
@@ -205,7 +217,7 @@ impl ReportsService {
             )
             .bind(tenant_id)
             .bind(c)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
         } else {
             sqlx::query_as(
@@ -214,7 +226,7 @@ impl ReportsService {
                    FROM invoices WHERE tenant_id = $1"#,
             )
             .bind(tenant_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
         };
         let (invoiced, paid, outstanding) =
@@ -237,7 +249,7 @@ impl ReportsService {
         )
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         Ok(BillingReportResponse {
@@ -257,14 +269,15 @@ impl ReportsService {
     /// overdue projects. Powers the SPA project-status / budget-tracking /
     /// milestone-tracking report types.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn projects(&self, tenant_id: Uuid) -> AppResult<ProjectsReportResponse> {
+    pub async fn projects(&self, tenant_id: TenantId) -> AppResult<ProjectsReportResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let by_status: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT status, COUNT(*)::bigint
                FROM projects WHERE tenant_id = $1
                GROUP BY status ORDER BY status"#,
         )
         .bind(tenant_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let (budget_hours, budget_amount): (Decimal, Decimal) = sqlx::query_as(
@@ -272,7 +285,7 @@ impl ReportsService {
                FROM projects WHERE tenant_id = $1"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         // Actuals: only time entries that belong to a project count toward a
@@ -285,7 +298,7 @@ impl ReportsService {
                WHERE tenant_id = $1 AND project_id IS NOT NULL"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         let actual_hours = Decimal::from(actual_minutes) / Decimal::from(60);
 
@@ -297,7 +310,7 @@ impl ReportsService {
                WHERE t.tenant_id = $1"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let overdue: i64 = sqlx::query_scalar(
@@ -306,7 +319,7 @@ impl ReportsService {
                  AND status NOT IN ('completed', 'cancelled')"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         Ok(ProjectsReportResponse {
@@ -329,20 +342,21 @@ impl ReportsService {
     /// status, warranties expiring soon, and contract renewals. Powers the
     /// SPA client-summary / asset-inventory / contract-renewals report types.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn clients(&self, tenant_id: Uuid) -> AppResult<ClientsReportResponse> {
+    pub async fn clients(&self, tenant_id: TenantId) -> AppResult<ClientsReportResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let (companies_total, companies_active): (i64, i64) = sqlx::query_as(
             r#"SELECT COUNT(*)::bigint,
                       COUNT(*) FILTER (WHERE status = 'active')::bigint
                FROM companies WHERE tenant_id = $1"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let assets_total: i64 =
             sqlx::query_scalar(r#"SELECT COUNT(*)::bigint FROM assets WHERE tenant_id = $1"#)
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let by_type: Vec<(String, i64)> = sqlx::query_as(
@@ -352,7 +366,7 @@ impl ReportsService {
                GROUP BY at.name ORDER BY at.name"#,
         )
         .bind(tenant_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let by_status: Vec<(String, i64)> = sqlx::query_as(
@@ -361,7 +375,7 @@ impl ReportsService {
                GROUP BY status ORDER BY status"#,
         )
         .bind(tenant_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let warranty_expiring_90d: i64 = sqlx::query_scalar(
@@ -370,7 +384,7 @@ impl ReportsService {
                  AND warranty_expiry BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let (contracts_active, contracts_renewing_90d): (i64, i64) = sqlx::query_as(
@@ -383,7 +397,7 @@ impl ReportsService {
                FROM contracts WHERE tenant_id = $1"#,
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         Ok(ClientsReportResponse {

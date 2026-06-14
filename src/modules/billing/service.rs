@@ -1,5 +1,6 @@
 //! Billing service. Endpoints land incrementally across PMS-33.
 
+use crate::modules::auth::TenantId;
 use chrono::{DateTime, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -37,17 +38,18 @@ impl BillingService {
     /// input short-circuits to an empty map.
     async fn company_name_map(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ids: &[Uuid],
     ) -> AppResult<std::collections::HashMap<Uuid, String>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(Uuid, String)> =
             sqlx::query_as("SELECT id, name FROM companies WHERE tenant_id = $1 AND id = ANY($2)")
                 .bind(tenant_id)
                 .bind(ids)
-                .fetch_all(self.db.pool())
+                .fetch_all(&mut *tx)
                 .await?;
         Ok(rows.into_iter().collect())
     }
@@ -57,26 +59,73 @@ impl BillingService {
     /// instead of the invoice UUID.
     async fn invoice_number_map(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         ids: &[Uuid],
     ) -> AppResult<std::collections::HashMap<Uuid, String>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT id, invoice_number FROM invoices WHERE tenant_id = $1 AND id = ANY($2)",
         )
         .bind(tenant_id)
         .bind(ids)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Allocate the next gapless, per-tenant invoice number inside the
+    /// caller's transaction (PMS-194).
+    ///
+    /// Atomically bumps `invoice_sequences.last_number` (the row-lock
+    /// serialises concurrent invoice creates so numbers stay dense and
+    /// unique); seeds the sequence row on the tenant's first invoice. The
+    /// bump lives in the caller's `tx`, so a rollback restores the
+    /// sequence value too and numbers stay gapless. Shared by every
+    /// invoice-creating path (`create_invoice`,
+    /// `create_invoice_from_time_entries`, and the recurring-billing run)
+    /// so the seed-or-bump logic lives in one place.
+    async fn next_invoice_number(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+    ) -> AppResult<String> {
+        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
+            r#"
+            UPDATE invoice_sequences
+            SET last_number = last_number + 1
+            WHERE tenant_id = $1
+            RETURNING last_number, prefix
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (next_number, prefix) = match seq_row {
+            Some(v) => v,
+            None => {
+                // First invoice for this tenant: seed the sequence row.
+                sqlx::query(
+                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
+                )
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+                (1, Some("INV-".to_string()))
+            }
+        };
+        Ok(format!(
+            "{}{:06}",
+            prefix.unwrap_or_else(|| "INV-".to_string()),
+            next_number
+        ))
     }
 
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         resp: &mut [InvoiceResponse],
     ) -> AppResult<()> {
         let ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
@@ -91,7 +140,7 @@ impl BillingService {
     /// responses (PMS-186).
     async fn enrich_payments(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         resp: &mut [PaymentResponse],
     ) -> AppResult<()> {
         let company_ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
@@ -119,7 +168,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_invoices(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &InvoiceFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<InvoiceResponse>, u64)> {
@@ -207,8 +256,10 @@ impl BillingService {
             cq = cq.bind(pattern);
         }
 
-        let rows = q.fetch_all(self.db.pool()).await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
+        drop(tx);
         let mut resp: Vec<InvoiceResponse> = rows.into_iter().map(Into::into).collect();
         self.enrich_invoices(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
@@ -223,44 +274,16 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        // Per-tenant invoice sequence is row-locked by UPDATE
-        // RETURNING; concurrent invoice creates serialise on this row
-        // so numbers are dense and unique.
-        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
-            r#"
-            UPDATE invoice_sequences
-            SET last_number = last_number + 1
-            WHERE tenant_id = $1
-            RETURNING last_number, prefix
-            "#,
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (next_number, prefix) = match seq_row {
-            Some(v) => v,
-            None => {
-                // First invoice for this tenant: seed the sequence row.
-                sqlx::query(
-                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
-                )
-                .bind(tenant_id)
-                .execute(&mut *tx)
-                .await?;
-                (1, Some("INV-".to_string()))
-            }
-        };
-        let invoice_number = format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
-        );
+        // Per-tenant invoice sequence is row-locked by the shared helper;
+        // concurrent invoice creates serialise on this row so numbers are
+        // dense and unique.
+        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
         // Compute totals from the supplied lines. Tax / discount are
         // optional - default to 0.
@@ -384,11 +407,11 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice_from_time_entries(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreateInvoiceFromTimeEntriesRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // 1. Lock the company's eligible billable entries. The `$3::uuid[]
         //    IS NULL OR id = ANY($3)` guard makes the id filter optional:
@@ -422,34 +445,7 @@ impl BillingService {
 
         // 2. Allocate a gapless invoice number (same row-lock as
         //    `create_invoice`). Concurrent creates serialise on this row.
-        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
-            r#"
-            UPDATE invoice_sequences
-            SET last_number = last_number + 1
-            WHERE tenant_id = $1
-            RETURNING last_number, prefix
-            "#,
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (next_number, prefix) = match seq_row {
-            Some(v) => v,
-            None => {
-                sqlx::query(
-                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
-                )
-                .bind(tenant_id)
-                .execute(&mut *tx)
-                .await?;
-                (1, Some("INV-".to_string()))
-            }
-        };
-        let invoice_number = format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
-        );
+        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
         // 3. Build one line per entry, accumulating the subtotal. The
         //    sixty-minute divisor is a Decimal so quantity keeps its
@@ -629,7 +625,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn generate_due_recurring_invoices(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         now: DateTime<Utc>,
         ctx: &AuditCtx,
     ) -> AppResult<Vec<Uuid>> {
@@ -638,6 +634,7 @@ impl BillingService {
         // Candidate contracts: active, recurring (not one_time), already
         // started. `end_date` is checked per-period below (a contract may
         // still be due for a period that began before it expired).
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let contracts = sqlx::query_as::<_, RecurringContractRow>(
             r#"
             SELECT id, company_id, billing_cycle, start_date, end_date
@@ -651,8 +648,9 @@ impl BillingService {
         )
         .bind(tenant_id)
         .bind(today)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        drop(tx);
 
         let mut created = Vec::new();
         for contract in contracts {
@@ -712,15 +710,23 @@ impl BillingService {
         &self,
         now: DateTime<Utc>,
     ) -> AppResult<u64> {
+        // SAFETY (PMS-285): the recurring-invoicing worker enumerates EVERY
+        // tenant to draft due invoices (the worker owns the cadence), reading the
+        // RLS-exempt `tenants` root across all tenants. Migrator pool; the
+        // per-tenant invoice generation it dispatches below sets each tenant GUC.
         let tenant_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tenants")
-            .fetch_all(self.db.pool())
+            .fetch_all(self.db.migrator_pool())
             .await?;
 
         let mut total = 0u64;
         for tenant_id in tenant_ids {
+            // SAFETY (PMS-139): cross-tenant sweep driven by the billing worker.
+            // `tenant_id` is read straight off the `tenants` table (a real
+            // tenant id, not user input), so it bridges into the tenant-scoped
+            // path through `from_trusted`.
             let ctx = AuditCtx::system(tenant_id);
             match self
-                .generate_due_recurring_invoices(tenant_id, now, &ctx)
+                .generate_due_recurring_invoices(TenantId::from_trusted(tenant_id), now, &ctx)
                 .await
             {
                 Ok(ids) => total += ids.len() as u64,
@@ -747,7 +753,7 @@ impl BillingService {
     #[allow(clippy::too_many_arguments)]
     async fn generate_one_recurring_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         contract_id: Uuid,
         company_id: Uuid,
         period_start: NaiveDate,
@@ -755,7 +761,7 @@ impl BillingService {
         today: NaiveDate,
         ctx: &AuditCtx,
     ) -> AppResult<Option<Uuid>> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Pull this contract's recurring billing items. Mirrors
         // `ContractsService::list_recurring_items` (recurring_service +
@@ -806,34 +812,7 @@ impl BillingService {
         // ledger insert below conflicts and we roll back; the rollback
         // restores the sequence value too (the UPDATE is part of this tx),
         // so numbers stay gapless.
-        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
-            r#"
-            UPDATE invoice_sequences
-            SET last_number = last_number + 1
-            WHERE tenant_id = $1
-            RETURNING last_number, prefix
-            "#,
-        )
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (next_number, prefix) = match seq_row {
-            Some(v) => v,
-            None => {
-                sqlx::query(
-                    "INSERT INTO invoice_sequences (tenant_id, last_number) VALUES ($1, 1)",
-                )
-                .bind(tenant_id)
-                .execute(&mut *tx)
-                .await?;
-                (1, Some("INV-".to_string()))
-            }
-        };
-        let invoice_number = format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
-        );
+        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
         sqlx::query(
             r#"
@@ -942,12 +921,13 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tax_rates(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TaxRateResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tax_rates WHERE tenant_id = $1")
             .bind(tenant_id)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
         let rows = sqlx::query_as::<_, TaxRateRow>(
@@ -962,7 +942,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -972,11 +952,11 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertTaxRateRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TaxRateResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
             sqlx::query("UPDATE tax_rates SET is_default = FALSE WHERE tenant_id = $1")
                 .bind(tenant_id)
@@ -1032,12 +1012,12 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         request: &UpsertTaxRateRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TaxRateResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Snapshot before any mutation (including the default-demote). PMS-117.
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
@@ -1112,13 +1092,13 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
         // Mutation + audit row in one transaction. DELETE: snapshot
         // before, old = before, after = None. PMS-117.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tax_rates t WHERE tenant_id = $1 AND id = $2",
         )
@@ -1158,9 +1138,10 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn lookup_tax_rate(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         jurisdiction: &str,
     ) -> AppResult<TaxRateResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TaxRateRow>(
             r#"
             SELECT id, name, rate, is_default, is_active
@@ -1171,7 +1152,7 @@ impl BillingService {
         )
         .bind(tenant_id)
         .bind(jurisdiction)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(r) = row {
             return Ok(r.into());
@@ -1185,7 +1166,7 @@ impl BillingService {
             "#,
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("TaxRate".to_string()))?;
         Ok(fallback.into())
@@ -1198,13 +1179,14 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payment_gateways(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<PaymentGatewayConfigResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM payment_gateway_configs WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, PaymentGatewayRow>(
@@ -1219,7 +1201,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
 
         let decrypted: Vec<PaymentGatewayConfigResponse> = rows
@@ -1249,7 +1231,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_payment_gateway(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertPaymentGatewayConfigRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentGatewayConfigResponse> {
@@ -1263,7 +1245,7 @@ impl BillingService {
         // Update when a row for `(tenant_id, provider)` already existed
         // (this is an INSERT .. ON CONFLICT upsert), else Create; the
         // `before` snapshot doubles as the existence check.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
              WHERE tenant_id = $1 AND provider = $2",
@@ -1333,7 +1315,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment_gateway(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         provider: GatewayProvider,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
@@ -1343,7 +1325,7 @@ impl BillingService {
         // (the unique `(tenant_id, provider)` pair), so read the row id
         // for the audit `entity_id`. No-op when absent (no row -> no
         // audit entry), preserving the original idempotent behaviour.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
             "SELECT id, to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
              WHERE tenant_id = $1 AND provider = $2",
@@ -1381,7 +1363,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payments(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         filter: &PaymentFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<PaymentResponse>, u64)> {
@@ -1435,8 +1417,10 @@ impl BillingService {
             q = q.bind(cid);
             cq = cq.bind(cid);
         }
-        let rows = q.fetch_all(self.db.pool()).await?;
-        let total = cq.fetch_one(self.db.pool()).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
+        drop(tx);
         let mut resp: Vec<PaymentResponse> = rows.into_iter().map(Into::into).collect();
         self.enrich_payments(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
@@ -1449,11 +1433,11 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_payment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &CreatePaymentRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentResponse> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         let payment_id = Uuid::new_v4();
         let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
@@ -1491,6 +1475,17 @@ impl BillingService {
             let Some((total, prior_paid)) = current else {
                 return Err(AppError::NotFound("Invoice".to_string()));
             };
+            // Reject overpayment so `balance_due` never goes negative
+            // (PMS-194). The remaining balance is `total - prior_paid`; a
+            // payment larger than that is a data-integrity error, not a
+            // valid partial/full payment.
+            let remaining = total - prior_paid;
+            if request.amount > remaining {
+                return Err(AppError::BadRequest(format!(
+                    "payment amount {} exceeds invoice balance due {}",
+                    request.amount, remaining
+                )));
+            }
             let new_paid = prior_paid + request.amount;
             let new_balance = total - new_paid;
             let new_status = if new_balance <= Decimal::ZERO {
@@ -1559,7 +1554,7 @@ impl BillingService {
         };
         Ok(PaymentResponse {
             id: payment_id,
-            tenant_id,
+            tenant_id: tenant_id.get(),
             invoice_id: request.invoice_id,
             invoice_number,
             company_id: request.company_id,
@@ -1582,11 +1577,11 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         payment_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         let row: Option<(Option<Uuid>, Decimal)> = sqlx::query_as(
             "SELECT invoice_id, amount FROM payments WHERE id = $1 AND tenant_id = $2",
@@ -1677,7 +1672,7 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         invoice_id: Uuid,
         request: &UpdateInvoiceRequest,
         ctx: &AuditCtx,
@@ -1690,7 +1685,7 @@ impl BillingService {
             )));
         }
 
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Snapshot before any mutation (line replace + header update). PMS-117.
         let before: Option<serde_json::Value> = sqlx::query_scalar(
@@ -1820,9 +1815,10 @@ impl BillingService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_invoice(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         invoice_id: Uuid,
     ) -> AppResult<InvoiceResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, InvoiceRow>(
             r#"
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
@@ -1836,7 +1832,7 @@ impl BillingService {
         )
         .bind(tenant_id)
         .bind(invoice_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Invoice".to_string()))?;
 
@@ -1850,8 +1846,9 @@ impl BillingService {
             "#,
         )
         .bind(invoice_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        drop(tx);
 
         let mut resp: InvoiceResponse = row.into();
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
@@ -2112,6 +2109,3 @@ impl From<InvoiceRow> for InvoiceResponse {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _force_use(_: &AppError) {}

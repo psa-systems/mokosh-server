@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::custom;
 use super::service::*;
-use crate::modules::auth::{RequireManager, RequireReports};
+use crate::modules::auth::{RequireManager, RequireReports, TenantScoped};
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -134,7 +134,7 @@ async fn dashboard(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
 ) -> AppResult<Json<DashboardResponse>> {
-    Ok(Json(s.service.dashboard(u.tenant_id).await?))
+    Ok(Json(s.service.dashboard(u.tenant()).await?))
 }
 
 async fn tickets_report(
@@ -142,7 +142,7 @@ async fn tickets_report(
     RequireReports { user: u, .. }: RequireReports,
     Query(q): Query<DateRange>,
 ) -> AppResult<Json<TicketsReportResponse>> {
-    Ok(Json(s.service.tickets(u.tenant_id, q.from, q.to).await?))
+    Ok(Json(s.service.tickets(u.tenant(), q.from, q.to).await?))
 }
 
 async fn time_report(
@@ -150,7 +150,7 @@ async fn time_report(
     RequireReports { user: u, .. }: RequireReports,
     Query(q): Query<DateRange>,
 ) -> AppResult<Json<TimeReportResponse>> {
-    Ok(Json(s.service.time(u.tenant_id, q.from, q.to).await?))
+    Ok(Json(s.service.time(u.tenant(), q.from, q.to).await?))
 }
 
 #[derive(Deserialize)]
@@ -164,21 +164,21 @@ async fn billing_report(
     _m: RequireManager,
     Query(q): Query<BillingQ>,
 ) -> AppResult<Json<BillingReportResponse>> {
-    Ok(Json(s.service.billing(u.tenant_id, q.company_id).await?))
+    Ok(Json(s.service.billing(u.tenant(), q.company_id).await?))
 }
 
 async fn projects_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
 ) -> AppResult<Json<ProjectsReportResponse>> {
-    Ok(Json(s.service.projects(u.tenant_id).await?))
+    Ok(Json(s.service.projects(u.tenant()).await?))
 }
 
 async fn clients_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
 ) -> AppResult<Json<ClientsReportResponse>> {
-    Ok(Json(s.service.clients(u.tenant_id).await?))
+    Ok(Json(s.service.clients(u.tenant()).await?))
 }
 
 /// Catalog the custom-report builder draws from (PMS-180): sources and
@@ -196,7 +196,7 @@ async fn custom_run(
     RequireReports { user: u, .. }: RequireReports,
     Json(spec): Json<custom::CustomSpec>,
 ) -> AppResult<Response> {
-    let report = custom::run(s.service.pool(), u.tenant_id, &spec).await?;
+    let report = s.service.run_custom(u.tenant(), &spec).await?;
     if spec.format.as_deref() == Some("csv") {
         let csv = custom::to_csv(&report);
         return Ok((
@@ -239,12 +239,12 @@ async fn export_report(
         )));
     }
     let csv = match report.as_str() {
-        "dashboard" => csv_for_dashboard(&s.service.dashboard(u.tenant_id).await?),
-        "tickets" => csv_for_tickets(&s.service.tickets(u.tenant_id, q.from, q.to).await?),
-        "time" => csv_for_time(&s.service.time(u.tenant_id, q.from, q.to).await?),
-        "billing" => csv_for_billing(&s.service.billing(u.tenant_id, q.company_id).await?),
-        "projects" => csv_for_projects(&s.service.projects(u.tenant_id).await?),
-        "clients" => csv_for_clients(&s.service.clients(u.tenant_id).await?),
+        "dashboard" => csv_for_dashboard(&s.service.dashboard(u.tenant()).await?),
+        "tickets" => csv_for_tickets(&s.service.tickets(u.tenant(), q.from, q.to).await?),
+        "time" => csv_for_time(&s.service.time(u.tenant(), q.from, q.to).await?),
+        "billing" => csv_for_billing(&s.service.billing(u.tenant(), q.company_id).await?),
+        "projects" => csv_for_projects(&s.service.projects(u.tenant()).await?),
+        "clients" => csv_for_clients(&s.service.clients(u.tenant()).await?),
         other => return Err(AppError::NotFound(format!("report {other:?}"))),
     };
     Ok((

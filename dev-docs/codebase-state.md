@@ -57,7 +57,7 @@ nested router for /api/v1/<group>                     <- src/api/router.rs:35-99
 RequireAuth / RequireRole extractor pulls CurrentUser
    |
    v
-Service method (always takes tenant_id: Uuid)         <- src/modules/<module>/service.rs
+Service method (takes tenant_id: TenantId, PMS-139)   <- src/modules/<module>/service.rs
    |
    v
 sqlx query against PostgreSQL
@@ -69,14 +69,24 @@ Notable layer details:
   like `/auth/login`). It sets an `AuthState::default()` for missing
   / invalid tokens; route handlers opt into auth via the
   `RequireAuth` extractor.
-- **Multi-tenancy is enforced ad-hoc.** Every service method accepts
-  `tenant_id: Uuid`; there is no middleware-level scoping. A new
-  handler that forgets to pass `user.tenant_id` becomes a
-  cross-tenant data leak. See
+- **Multi-tenancy is enforced by the type system (PMS-139).** Service
+  methods take a `tenant_id: TenantId` newtype that can only be
+  produced from an authenticated claim via `CurrentUser::tenant()`, so
+  a handler that forgets to pass the scope no longer compiles. See
   [Cross-cutting issues](#cross-cutting-issues) #8.
-- **Tenant feature flag** (`multi-tenant` / `single-tenant`,
-  default `multi-tenant`) is currently inert at the routing layer:
-  the same routes are exposed in either mode.
+- **Tenant feature flag** (`multi-tenant`, default-on). PMS-262
+  removed the `single-tenant` counterpart (and its shared
+  `default_tenant_id()` / `Default for TenantContext`): multi-tenant
+  is now the only mode and there is no shared-data fallback. The
+  `/tenants` CRUD routes are still gated on `multi-tenant`.
+- **Default tenant disposition** (`Uuid::from_u128(1)`, a.k.a.
+  `OIDC_DEFAULT_TENANT_ID`): INFRA-ONLY. The only legitimate residents
+  are platform `super_admin`s. Every non-admin who was historically
+  parked there is backfilled into their own personal tenant on next
+  Bunyip login (`place_bunyip_user` / `is_stuck_in_default`,
+  `src/modules/auth/middleware.rs`), so no normal user shares data in
+  it. Enforced end-to-end by the `tests/bunyip_login.rs` placement
+  tests (PMS-262, PMS-245).
 
 ## Per-module status
 
@@ -324,10 +334,41 @@ the infrastructure or shared-helper layer.
 7. **`utils/pagination.rs` exists but is bypassed.** `auth::list_users`
    constructs a `PaginatedResponse` of `vec![]`; `tenants` and
    `contacts` build inline pagination SQL.
-8. **Multi-tenancy enforced ad-hoc.** Every service method takes a
-   `tenant_id: Uuid`. No middleware-level tenant scoping. A future
-   handler that forgets to pass `user.tenant_id` becomes a
-   cross-tenant data leak.
+8. **Multi-tenancy: typed scoping rollout DONE (PMS-139).** A `TenantId`
+   newtype ([`auth/tenant.rs`](../src/modules/auth/tenant.rs)) whose only
+   in-crate constructor is `pub(crate)` and is reached solely via
+   `CurrentUser::tenant()` (the `TenantScoped` trait), so a `TenantId` always
+   traces back to an authenticated claim. Service methods that take
+   `tenant_id: TenantId` can no longer be called with a bare `Uuid` (pinned by
+   a `compile_fail` doctest on `TenantId`). **All request-scoped modules are
+   migrated:** `reports` (the reference pattern - handlers use `u.tenant()`,
+   service takes `TenantId`), `rmm`, `time_tracking`, `assets`, `projects`,
+   `calendar`, `sla`, `contracts`, `knowledge_base`, `tenants`, `settings`,
+   `contacts`, `billing`, plus all three cross-module hubs - `audit`
+   (`audit_write` + `AuditService`), `notifications` (`dispatch`), and `tickets`
+   (`TicketService`). Handlers derive the scope via `u.tenant()`; a new handler
+   that forgets to pass it no longer compiles.
+
+   The remaining `from_trusted` escape-hatch sites are all deliberate, each with
+   a `// SAFETY:`/`// PMS-139:` note: the RMM ingest webhook (unauthenticated
+   machine HMAC), the `tenants` super-admin handlers (they address an arbitrary
+   path tenant, not the caller's claim, after a role guard), the portal feeds
+   (KB / invoices / tickets - portal runs on contact sessions, not
+   `CurrentUser`), the demo `seed`er and the `tenants` create path (trusted
+   system actors seeding a claimed-or-minted id), the cross-tenant workers
+   (calendar reminder, sla sweep, billing recurring sweep - they read tenant ids
+   off DB-projected rows), and the `auth` module + `audit_auth_event` helper
+   (the login/session path, which works off the raw JWT claim). The
+   cross-tenant dispatcher/sweep workers stay `Uuid`-internal structs.
+
+   The only surviving `tenant_id.get()` calls (6) are genuine `Uuid` boundaries,
+   not transitional: the `PaymentResponse` / `TenantUsage` DTO fields and the
+   `tenants` update `entity_id` carry a plain `Uuid`; `AuditCtx::system` is a
+   `Uuid` context bag (the request-extractor DTO, tolerant of
+   unauthenticated/system callers); and the ticket-automation webhook payload
+   serialises the tenant as a `Uuid`. `tenants::copy_default_config` keeps its
+   `Uuid` (it copies from a hardcoded default tenant into a freshly minted one -
+   neither is a claim). This item is resolved.
 9. **`validator::Validate` coverage is uneven.** `Create*Request`
    and `Update*Request` types are validated. `*Filter` query types
    (`TicketFilter`, `CompanyFilter`, `ContactFilter`) are not.

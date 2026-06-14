@@ -1,5 +1,6 @@
 //! Tenant service implementation
 
+use crate::modules::auth::TenantId;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
@@ -9,6 +10,26 @@ use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::slugify;
 
 use super::models::*;
+
+/// Resolve the tenant whose migration-`023` seed rows are copied into every
+/// freshly provisioned tenant (see `copy_default_config`).
+///
+/// PMS-196: this used to be a hardcoded magic UUID parsed with `unwrap()`,
+/// which panics the tenant-provisioning path on any malformed value. The
+/// source is now read from `MOKOSH_SEED_TENANT_ID` (so a deployment can point
+/// the seed at a different template tenant) and parsed fallibly. When the env
+/// var is unset it falls back to the seed tenant created by migration 023,
+/// `Uuid::from_u128(1)` (== `00000000-0000-0000-0000-000000000001`), the same
+/// constant `auth::bootstrap` uses. A malformed env value is a configuration
+/// error, not a panic.
+fn seed_source_tenant_id() -> AppResult<Uuid> {
+    match std::env::var("MOKOSH_SEED_TENANT_ID") {
+        Ok(raw) => Uuid::parse_str(raw.trim()).map_err(|e| {
+            AppError::Configuration(format!("MOKOSH_SEED_TENANT_ID is not a valid UUID: {e}"))
+        }),
+        Err(_) => Ok(Uuid::from_u128(1)),
+    }
+}
 
 /// Tenant management service
 #[derive(Clone)]
@@ -31,11 +52,13 @@ impl TenantService {
         let tenant_id = Uuid::new_v4();
         let slug = slugify(&request.slug);
 
-        // Check if slug is unique
+        // SAFETY (PMS-285): create_tenant is a super-admin, cross-tenant handler.
+        // This uniqueness probe scans `tenants` (the RLS-exempt isolation root)
+        // across every tenant, so it runs on the privileged migrator pool.
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants WHERE slug = $1)")
                 .bind(&slug)
-                .fetch_one(self.db.pool())
+                .fetch_one(self.db.migrator_pool())
                 .await?;
 
         if exists {
@@ -49,13 +72,20 @@ impl TenantService {
         // seed rows, snapshot the new tenant with Postgres to_jsonb, and write
         // the audit entry on the same tx so a rollback drops both. PMS-117 AC1.
         // The tenant is its own audit scope, so tenant_id == entity_id here.
-        let mut tx = self.db.pool().begin().await?;
+        // The block writes tenant-scoped tables (users, sequences, audit_log)
+        // under the new tenant, so route through the tenant GUC tx so the RLS
+        // WITH CHECK policies see app.current_tenant. PMS-256.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         sqlx::query(
+            // `kind = 'org'` is set explicitly: migration 019_tenant_kind dropped
+            // the column default, so every caller must supply it. This is the
+            // admin/multi-user org-create path (self-signup uses kind='personal');
+            // omitting it inserts NULL and violates the NOT NULL constraint (PMS-287).
             r#"
-            INSERT INTO tenants (id, name, slug, status, billing_email, billing_contact_name,
+            INSERT INTO tenants (id, name, slug, status, kind, billing_email, billing_contact_name,
                                  subscription_plan, subscription_status, trial_ends_at)
-            VALUES ($1, $2, $3, 'active', $4, $5, $6, 'trialing', $7)
+            VALUES ($1, $2, $3, 'active', 'org', $4, $5, $6, 'trialing', $7)
             "#,
         )
         .bind(tenant_id)
@@ -105,9 +135,14 @@ impl TenantService {
                 .fetch_optional(&mut *tx)
                 .await?;
 
+        // SAFETY (PMS-261): `tenant_id` is freshly minted for the tenant being
+        // created (not a caller-supplied claim) and the whole block runs inside
+        // `begin_with_tenant(tenant_id)` (see the GUC note above), so the audit
+        // row is written under that tenant's GUC. `from_trusted` bridges the
+        // minted `Uuid` into the typed scope `audit_write` requires.
         audit_write(
             &mut *tx,
-            tenant_id,
+            TenantId::from_trusted(tenant_id),
             ctx,
             AuditAction::Create,
             "tenants",
@@ -121,12 +156,155 @@ impl TenantService {
         // Copy default configuration from default tenant
         self.copy_default_config(tenant_id).await?;
 
-        self.get_tenant(tenant_id).await
+        // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
+        // is the same minted id, bridged via `from_trusted`.
+        self.get_tenant(TenantId::from_trusted(tenant_id)).await
+    }
+
+    /// Idempotently seed the PSA per-tenant lookup/config set (ticket statuses,
+    /// priorities, queues, types, categories, work types, task statuses, asset
+    /// types, rounding rules, business hours, ...) into `tenant_id`, copying it
+    /// from the default tenant. A no-op when the tenant is already seeded (the
+    /// presence guard in `copy_default_config`).
+    ///
+    /// PMS-288: `create_tenant` and `ensure_personal_tenant` seed at creation,
+    /// but a user can be placed into a tenant provisioned off the PSA path (an
+    /// invite into an auth/SSO-created org tenant, or a manually-created tenant)
+    /// that never received this set, so ticket creation - which requires a
+    /// default `ticket_statuses` row AND a `ticket_sequences` row
+    /// (`tickets/service.rs`) - 500s. The placement path calls this so any
+    /// tenant a user actually lands in is seeded.
+    pub async fn ensure_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
+        // This runs on the per-request bunyip auth path (place_bunyip_user), so
+        // the already-seeded common case must stay cheap: a couple of
+        // `SELECT EXISTS` and no write transaction. The sequence step is guarded
+        // here; the lookup step is guarded inside `copy_default_config`.
+        //
+        // Per-tenant sequences power ticket_number / invoice_number generation.
+        // They are not part of `copy_default_config` (create_tenant seeds them
+        // separately), so seed them here too - under the tenant GUC, since the
+        // sequence tables are RLS-protected (mirrors create_tenant). The inserts
+        // keep `ON CONFLICT DO NOTHING` so a concurrent first-request race stays
+        // idempotent even though the cheap guard let both callers through.
+        let has_sequences: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ticket_sequences WHERE tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if !has_sequences {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                "INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)
+                 ON CONFLICT (tenant_id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')
+                 ON CONFLICT (tenant_id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+
+        // Lookup/config set (ticket statuses/priorities/queues/types/...).
+        // Idempotent: copy_default_config early-returns when already seeded.
+        self.copy_default_config(tenant_id).await
+    }
+
+    /// Find-or-provision the `personal` tenant owned by `owner_id` (PMS-244).
+    /// A brand-new SSO user with no invite lands here: their own one-person org.
+    ///
+    /// Idempotent and race-safe: the partial unique index on
+    /// `tenants.personal_owner_id` makes concurrent first-logins converge on one
+    /// tenant (the `ON CONFLICT` loser re-reads the winner). The tenant gets the
+    /// same sequences + default config (`copy_default_config`) a normally
+    /// created tenant does, so it works out of the box; the owning user is
+    /// JIT-mirrored separately.
+    #[tracing::instrument(skip_all, fields(owner_id = %owner_id))]
+    pub async fn ensure_personal_tenant(&self, owner_id: Uuid) -> AppResult<Uuid> {
+        if let Some(id) = self.personal_tenant_for_owner(owner_id).await? {
+            return Ok(id);
+        }
+
+        let tenant_id = Uuid::new_v4();
+        // A uuid-derived slug guarantees uniqueness without a human display name
+        // (personal tenants are auto-provisioned; the owner can rename later).
+        let slug = slugify(&format!(
+            "personal-{}",
+            &tenant_id.simple().to_string()[..12]
+        ));
+
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            r#"INSERT INTO tenants (id, name, slug, kind, status, subscription_status, personal_owner_id)
+               VALUES ($1, $2, $3, 'personal', 'active', 'active', $4)
+               ON CONFLICT (personal_owner_id) WHERE personal_owner_id IS NOT NULL DO NOTHING
+               RETURNING id"#,
+        )
+        .bind(tenant_id)
+        .bind("My workspace")
+        .bind(&slug)
+        .bind(owner_id)
+        // SAFETY (PMS-285): personal-tenant provisioning runs on the pre-session
+        // bunyip placement path before the owner has any tenant context. It
+        // writes the RLS-exempt `tenants` root row, so it uses the migrator pool;
+        // the new tenant's own RLS-covered sequence rows are seeded under its GUC
+        // in the `begin_with_tenant` block below.
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        match inserted {
+            Some(id) => {
+                // Seed the new tenant's RLS-protected sequence rows under its
+                // own tenant GUC so the WITH CHECK policies pass. The earlier
+                // INSERT into `tenants` stays on the pool because RLS is not
+                // enabled on that table. PMS-256.
+                let mut tx = self.db.begin_with_tenant(id).await?;
+                sqlx::query("INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                self.copy_default_config(id).await?;
+                tracing::info!(tenant_id = %id, owner_id = %owner_id, "provisioned personal tenant");
+                Ok(id)
+            }
+            // Lost the insert race: another request provisioned it concurrently.
+            None => self
+                .personal_tenant_for_owner(owner_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal("personal tenant missing after insert conflict".to_string())
+                }),
+        }
+    }
+
+    /// The `personal` tenant id owned by `owner_id`, if one exists yet.
+    async fn personal_tenant_for_owner(&self, owner_id: Uuid) -> AppResult<Option<Uuid>> {
+        // SAFETY (PMS-285): resolves a personal tenant by its `personal_owner_id`
+        // on the pre-session provisioning path, a cross-tenant lookup of the
+        // RLS-exempt `tenants` root with no owner GUC available. Migrator pool.
+        Ok(
+            sqlx::query_scalar("SELECT id FROM tenants WHERE personal_owner_id = $1")
+                .bind(owner_id)
+                .fetch_optional(self.db.migrator_pool())
+                .await?,
+        )
     }
 
     /// Get tenant by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_tenant(&self, tenant_id: Uuid) -> AppResult<Tenant> {
+    pub async fn get_tenant(&self, tenant_id: TenantId) -> AppResult<Tenant> {
         let row = sqlx::query_as::<_, TenantRow>(
             r#"
             SELECT id, name, slug, status, settings, branding, billing_email,
@@ -137,26 +315,10 @@ impl TenantService {
             "#,
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
-
-        Ok(row.into())
-    }
-
-    /// Get tenant by slug
-    #[tracing::instrument(skip_all)]
-    pub async fn get_tenant_by_slug(&self, slug: &str) -> AppResult<Tenant> {
-        let row = sqlx::query_as::<_, TenantRow>(
-            r#"
-            SELECT id, name, slug, status, settings, branding, billing_email,
-                   billing_contact_name, subscription_plan, subscription_status,
-                   trial_ends_at, created_at, updated_at
-            FROM tenants
-            WHERE slug = $1
-            "#,
-        )
-        .bind(slug)
+        // The `tenants` table is the RLS-exempt isolation root (migration 038
+        // skips it), so this single-row read is safe on the app pool; the route
+        // handler enforces that a non-super-admin caller may only read its own
+        // tenant id (the `cross_user_tenant_endpoint_denied` regression pins it).
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
@@ -170,8 +332,11 @@ impl TenantService {
         &self,
         pagination: &crate::utils::pagination::PaginationParams,
     ) -> AppResult<(Vec<Tenant>, u64)> {
+        // SAFETY (PMS-285): list_tenants is a super-admin, cross-tenant handler
+        // (the route gates it on super_admin) that enumerates every tenant in the
+        // RLS-exempt `tenants` root. It runs on the privileged migrator pool.
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
-            .fetch_one(self.db.pool())
+            .fetch_one(self.db.migrator_pool())
             .await?;
 
         let rows = sqlx::query_as::<_, TenantRow>(
@@ -186,17 +351,18 @@ impl TenantService {
         )
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.migrator_pool())
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Update tenant
+    #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tenant(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpdateTenantRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Tenant> {
@@ -221,7 +387,12 @@ impl TenantService {
         }
         if request.branding.is_some() {
             query.push_str(&format!(", branding = ${}", param_idx));
-            // param_idx += 1;
+            // Invariant: every conditional SET advances `param_idx` so the
+            // next field added below is numbered correctly. `branding` is
+            // the last field today, so this increment is currently unread
+            // (`#[allow(unused_assignments)]` on the fn); keep it so the
+            // pattern stays copy-paste safe (PMS-197).
+            param_idx += 1;
         }
 
         query.push_str(" WHERE id = $1");
@@ -249,7 +420,10 @@ impl TenantService {
         // audit entry on the same tx so a rollback drops both. PMS-117 AC1. The
         // tenant is its own audit scope (tenant_id == entity_id) and the
         // `tenants` table is keyed by `id` alone (no `tenant_id` column).
-        let mut tx = self.db.pool().begin().await?;
+        // The audit_log write at the end of this tx IS RLS-protected, so route
+        // the block through the tenant GUC tx so its WITH CHECK policy passes.
+        // PMS-256.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(t) FROM tenants t WHERE id = $1")
                 .bind(tenant_id)
@@ -270,7 +444,7 @@ impl TenantService {
             ctx,
             AuditAction::Update,
             "tenants",
-            Some(tenant_id),
+            Some(tenant_id.get()),
             before,
             after,
         )
@@ -282,10 +456,12 @@ impl TenantService {
 
     /// Suspend tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn suspend_tenant(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub async fn suspend_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
+        // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
+        // RLS-exempt `tenants` root row by id. Migrator pool.
         sqlx::query("UPDATE tenants SET status = 'suspended', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
-            .execute(self.db.pool())
+            .execute(self.db.migrator_pool())
             .await?;
 
         Ok(())
@@ -293,10 +469,12 @@ impl TenantService {
 
     /// Activate tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn activate_tenant(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub async fn activate_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
+        // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
+        // RLS-exempt `tenants` root row by id. Migrator pool.
         sqlx::query("UPDATE tenants SET status = 'active', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
-            .execute(self.db.pool())
+            .execute(self.db.migrator_pool())
             .await?;
 
         Ok(())
@@ -304,45 +482,50 @@ impl TenantService {
 
     /// Get tenant usage statistics
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_tenant_usage(&self, tenant_id: Uuid) -> AppResult<TenantUsage> {
+    pub async fn get_tenant_usage(&self, tenant_id: TenantId) -> AppResult<TenantUsage> {
+        // All counts read RLS-protected per-tenant tables filtered by
+        // tenant_id = $1, so run them on one shared tenant GUC tx so the RLS
+        // USING policies see app.current_tenant. Reads need no commit. PMS-256.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
             .bind(tenant_id)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
         let company_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM companies WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let contact_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM contacts WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let ticket_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let asset_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let storage_bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(file_size), 0) FROM files WHERE tenant_id = $1",
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         Ok(TenantUsage {
-            tenant_id,
+            tenant_id: tenant_id.get(),
             user_count,
             company_count,
             contact_count,
@@ -360,11 +543,62 @@ impl TenantService {
     // so there is one canonical writer for `module_config`. The
     // duplicate methods were removed.
 
-    /// Copy default configuration from default tenant
+    /// Seed a freshly provisioned tenant with the full default set of
+    /// user-editable lookup / configuration rows, scoped to that tenant.
+    ///
+    /// PMS-259: under the personal-tenant-per-user isolation model
+    /// (`dev-docs/rls-per-user-isolation.md`) lookup tables are editable, so
+    /// every user owns their own copies; a fresh tenant must not start with
+    /// empty status / priority / type / work-type lists. The rows are copied
+    /// from the migration-`023` seed held by the default tenant
+    /// (`00000000-0000-0000-0000-000000000001`) and re-scoped to
+    /// `new_tenant_id`. Foreign keys between lookups (sla_policies ->
+    /// business_hours, sla_targets -> sla_policies / ticket_priorities,
+    /// rate_card_items -> rate_cards / work_types, child categories ->
+    /// parents) are re-linked to the new tenant's freshly copied rows by name.
+    ///
+    /// Idempotent: if the tenant already holds lookup rows the whole seed is
+    /// skipped, so a re-run (or a retried provisioning) never double-seeds.
+    /// The copy runs in one transaction so a fresh tenant is either fully
+    /// seeded or not at all.
     async fn copy_default_config(&self, new_tenant_id: Uuid) -> AppResult<()> {
-        let default_tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let default_tenant = seed_source_tenant_id()?;
 
-        // Copy ticket statuses
+        // SAFETY (PMS-285): this seed is intrinsically cross-tenant - it READS
+        // the default tenant's lookup rows and WRITES copies re-scoped to
+        // `new_tenant_id`. No single `app.current_tenant` GUC can satisfy both
+        // sides (a GUC of `new_tenant_id` would RLS-hide the default-tenant
+        // source rows; a GUC of the default tenant would reject the WITH CHECK on
+        // the new-tenant inserts). It is provisioning, run before the owner has a
+        // session, so it uses the privileged migrator (BYPASSRLS) pool.
+        let mut tx = self.db.migrator_pool().begin().await?;
+
+        // Idempotency guard: ticket_statuses is seeded for every tenant, so its
+        // presence means this tenant was already seeded. Skip rather than
+        // duplicate (AC: "skip when the tenant already has rows").
+        let already_seeded: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ticket_statuses WHERE tenant_id = $1)")
+                .bind(new_tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if already_seeded {
+            return Ok(());
+        }
+
+        // Business hours first: sla_policies references it.
+        sqlx::query(
+            r#"
+            INSERT INTO business_hours (tenant_id, name, timezone, schedule, is_default)
+            SELECT $1, name, timezone, schedule, is_default
+            FROM business_hours WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Ticket statuses
         sqlx::query(
             r#"
             INSERT INTO ticket_statuses (tenant_id, name, color, is_closed, is_default, sort_order)
@@ -374,10 +608,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy ticket priorities
+        // Ticket priorities (sla_targets re-links to these by name)
         sqlx::query(
             r#"
             INSERT INTO ticket_priorities (tenant_id, name, color, icon, sla_multiplier, sort_order, is_default)
@@ -387,10 +621,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy ticket types
+        // Ticket types
         sqlx::query(
             r#"
             INSERT INTO ticket_types (tenant_id, name, description, icon, sort_order)
@@ -400,10 +634,52 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy work types
+        // Ticket categories: parents first, then children re-linked to the new
+        // tenant's parents by name (parent_id references the same table).
+        sqlx::query(
+            r#"
+            INSERT INTO ticket_categories (tenant_id, parent_id, name, description, sort_order)
+            SELECT $1, NULL, name, description, sort_order
+            FROM ticket_categories WHERE tenant_id = $2 AND parent_id IS NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO ticket_categories (tenant_id, parent_id, name, description, sort_order)
+            SELECT $1, np.id, c.name, c.description, c.sort_order
+            FROM ticket_categories c
+            JOIN ticket_categories dp ON dp.id = c.parent_id AND dp.tenant_id = $2
+            JOIN ticket_categories np ON np.tenant_id = $1 AND np.name = dp.name AND np.parent_id IS NULL
+            WHERE c.tenant_id = $2 AND c.parent_id IS NOT NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Ticket queues (team / sla links are tenant-specific and stay NULL,
+        // matching the migration-023 seed)
+        sqlx::query(
+            r#"
+            INSERT INTO ticket_queues (tenant_id, name, description, color, is_default, sort_order)
+            SELECT $1, name, description, color, is_default, sort_order
+            FROM ticket_queues WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Work types (rate_card_items re-links to these by name)
         sqlx::query(
             r#"
             INSERT INTO work_types (tenant_id, name, description, default_billable, default_rate, sort_order)
@@ -413,10 +689,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy task statuses
+        // Task statuses
         sqlx::query(
             r#"
             INSERT INTO task_statuses (tenant_id, name, color, is_completed, sort_order)
@@ -426,10 +702,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy asset types
+        // Asset types (top-level only, matching prior behaviour)
         sqlx::query(
             r#"
             INSERT INTO asset_types (tenant_id, name, icon, custom_fields_schema)
@@ -439,10 +715,124 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
-        // Copy module config
+        // Time rounding rules
+        sqlx::query(
+            r#"
+            INSERT INTO time_rounding_rules (tenant_id, name, increment_minutes, rounding_method, minimum_minutes, is_default)
+            SELECT $1, name, increment_minutes, rounding_method, minimum_minutes, is_default
+            FROM time_rounding_rules WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Tax rates
+        sqlx::query(
+            r#"
+            INSERT INTO tax_rates (tenant_id, name, rate, is_default, is_active)
+            SELECT $1, name, rate, is_default, is_active
+            FROM tax_rates WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // KB categories: parents first, then children re-linked by name.
+        sqlx::query(
+            r#"
+            INSERT INTO kb_categories (tenant_id, parent_id, name, description, slug, visibility, sort_order)
+            SELECT $1, NULL, name, description, slug, visibility, sort_order
+            FROM kb_categories WHERE tenant_id = $2 AND parent_id IS NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO kb_categories (tenant_id, parent_id, name, description, slug, visibility, sort_order)
+            SELECT $1, np.id, c.name, c.description, c.slug, c.visibility, c.sort_order
+            FROM kb_categories c
+            JOIN kb_categories dp ON dp.id = c.parent_id AND dp.tenant_id = $2
+            JOIN kb_categories np ON np.tenant_id = $1 AND np.name = dp.name AND np.parent_id IS NULL
+            WHERE c.tenant_id = $2 AND c.parent_id IS NOT NULL
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Rate cards, then their items re-linked to the new tenant's rate cards
+        // and work types by name.
+        sqlx::query(
+            r#"
+            INSERT INTO rate_cards (tenant_id, name, description, is_default)
+            SELECT $1, name, description, is_default
+            FROM rate_cards WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO rate_card_items (rate_card_id, work_type_id, hourly_rate, after_hours_rate, emergency_rate)
+            SELECT nrc.id, nwt.id, i.hourly_rate, i.after_hours_rate, i.emergency_rate
+            FROM rate_card_items i
+            JOIN rate_cards drc ON drc.id = i.rate_card_id AND drc.tenant_id = $2
+            JOIN rate_cards nrc ON nrc.tenant_id = $1 AND nrc.name = drc.name
+            JOIN work_types dwt ON dwt.id = i.work_type_id AND dwt.tenant_id = $2
+            JOIN work_types nwt ON nwt.tenant_id = $1 AND nwt.name = dwt.name
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // SLA policies (business_hours re-linked by name), then targets
+        // (sla_policies + ticket_priorities re-linked by name).
+        sqlx::query(
+            r#"
+            INSERT INTO sla_policies (tenant_id, name, description, business_hours_id, is_default)
+            SELECT $1, p.name, p.description, nbh.id, p.is_default
+            FROM sla_policies p
+            LEFT JOIN business_hours dbh ON dbh.id = p.business_hours_id AND dbh.tenant_id = $2
+            LEFT JOIN business_hours nbh ON nbh.tenant_id = $1 AND nbh.name = dbh.name
+            WHERE p.tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO sla_targets (sla_policy_id, priority_id, first_response_hours, resolution_hours, operational_hours)
+            SELECT np.id, npr.id, t.first_response_hours, t.resolution_hours, t.operational_hours
+            FROM sla_targets t
+            JOIN sla_policies dp ON dp.id = t.sla_policy_id AND dp.tenant_id = $2
+            JOIN sla_policies np ON np.tenant_id = $1 AND np.name = dp.name
+            JOIN ticket_priorities dpr ON dpr.id = t.priority_id AND dpr.tenant_id = $2
+            JOIN ticket_priorities npr ON npr.tenant_id = $1 AND npr.name = dpr.name
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // Module config
         sqlx::query(
             r#"
             INSERT INTO module_config (tenant_id, module_name, is_enabled, config)
@@ -452,7 +842,7 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Copy the in-app notification templates + rules the background
@@ -473,7 +863,7 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         // Copy each default-tenant rule, re-linking template_id to the new
@@ -498,9 +888,10 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 }

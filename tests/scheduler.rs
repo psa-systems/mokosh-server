@@ -61,7 +61,7 @@ async fn advance_virtual_time(total: Duration, step: Duration) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn registered_job_ticks_at_interval() {
     tokio::time::pause();
     let counter = Arc::new(AtomicUsize::new(0));
@@ -79,7 +79,7 @@ async fn registered_job_ticks_at_interval() {
     // `tokio::time::interval` fires immediately on the first tick,
     // then every 50ms. Drive ~250ms of virtual time so the loop
     // gets at least 3 ticks - we assert >= 3 (not =6) because the
-    // multi-threaded runtime + virtual clock can still interleave a
+    // current_thread runtime + virtual clock can still interleave a
     // step-sized sleep before the spawned task observes the timer
     // edge, which is acceptable as long as the loop is actually
     // alive.
@@ -91,7 +91,7 @@ async fn registered_job_ticks_at_interval() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn tick_errors_do_not_kill_the_loop() {
     tokio::time::pause();
     let counter = Arc::new(AtomicUsize::new(0));

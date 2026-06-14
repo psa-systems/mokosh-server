@@ -13,7 +13,7 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::TimeTrackingService;
-use crate::modules::auth::{RequireAdmin, RequireManager, RequireTimeTracking};
+use crate::modules::auth::{RequireAdmin, RequireManager, RequireTimeTracking, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -51,6 +51,10 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
             post(submit_timesheet),
         )
         .route(
+            "/timesheets/{user_id}/{week_start}/withdraw",
+            post(withdraw_timesheet),
+        )
+        .route(
             "/timesheets/{user_id}/{week_start}/approve",
             post(approve_timesheet),
         )
@@ -85,7 +89,7 @@ async fn list_work_types(
 ) -> AppResult<Json<PaginatedResponse<WorkTypeResponse>>> {
     let (items, total) = state
         .service
-        .list_work_types(user.tenant_id, &pagination)
+        .list_work_types(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -104,7 +108,7 @@ async fn create_work_type(
     Ok(Json(
         state
             .service
-            .create_work_type(user.tenant_id, &request)
+            .create_work_type(user.tenant(), &request)
             .await?,
     ))
 }
@@ -120,7 +124,7 @@ async fn update_work_type(
     Ok(Json(
         state
             .service
-            .update_work_type(user.tenant_id, id, &request)
+            .update_work_type(user.tenant(), id, &request)
             .await?,
     ))
 }
@@ -131,7 +135,7 @@ async fn delete_work_type(
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    state.service.delete_work_type(user.tenant_id, id).await
+    state.service.delete_work_type(user.tenant(), id).await
 }
 
 // ============================================================================
@@ -147,7 +151,7 @@ async fn list_time_entries(
     filter.validate()?;
     let (items, total) = state
         .service
-        .list_time_entries(user.tenant_id, &filter, &pagination)
+        .list_time_entries(user.tenant(), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -169,7 +173,7 @@ async fn create_time_entry(
     Ok(Json(
         state
             .service
-            .create_time_entry(user.tenant_id, &request)
+            .create_time_entry(user.tenant(), &request)
             .await?,
     ))
 }
@@ -179,9 +183,7 @@ async fn get_time_entry(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeEntryResponse>> {
-    Ok(Json(
-        state.service.get_time_entry(user.tenant_id, id).await?,
-    ))
+    Ok(Json(state.service.get_time_entry(user.tenant(), id).await?))
 }
 
 async fn update_time_entry(
@@ -194,7 +196,7 @@ async fn update_time_entry(
     Ok(Json(
         state
             .service
-            .update_time_entry(user.tenant_id, id, &request)
+            .update_time_entry(user.tenant(), id, &request)
             .await?,
     ))
 }
@@ -204,7 +206,7 @@ async fn delete_time_entry(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    state.service.delete_time_entry(user.tenant_id, id).await
+    state.service.delete_time_entry(user.tenant(), id).await
 }
 
 // ============================================================================
@@ -220,7 +222,7 @@ async fn list_timesheets(
     filter.validate()?;
     let (items, total) = state
         .service
-        .list_timesheets(user.tenant_id, &filter, &pagination)
+        .list_timesheets(user.tenant(), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -242,7 +244,25 @@ async fn submit_timesheet(
     Ok(Json(
         state
             .service
-            .submit_timesheet(user.tenant_id, user_id, week_start)
+            .submit_timesheet(user.tenant(), user_id, week_start)
+            .await?,
+    ))
+}
+
+async fn withdraw_timesheet(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
+) -> AppResult<Json<TimesheetSummaryResponse>> {
+    if !user.role.is_admin() && user_id != user.id {
+        return Err(crate::utils::error::AppError::Forbidden(
+            "Cannot withdraw another user's timesheet".to_string(),
+        ));
+    }
+    Ok(Json(
+        state
+            .service
+            .withdraw_timesheet(user.tenant(), user_id, week_start)
             .await?,
     ))
 }
@@ -256,7 +276,7 @@ async fn approve_timesheet(
     Ok(Json(
         state
             .service
-            .approve_timesheet(user.tenant_id, user.id, user_id, week_start)
+            .approve_timesheet(user.tenant(), user.id, user_id, week_start)
             .await?,
     ))
 }
@@ -272,13 +292,7 @@ async fn reject_timesheet(
     Ok(Json(
         state
             .service
-            .reject_timesheet(
-                user.tenant_id,
-                user.id,
-                user_id,
-                week_start,
-                &request.reason,
-            )
+            .reject_timesheet(user.tenant(), user.id, user_id, week_start, &request.reason)
             .await?,
     ))
 }
@@ -306,7 +320,7 @@ async fn list_active_timers(
     };
     let (items, total) = state
         .service
-        .list_active_timers(user.tenant_id, user_filter, &pagination)
+        .list_active_timers(user.tenant(), user_filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -324,7 +338,7 @@ async fn start_timer(
     Ok(Json(
         state
             .service
-            .start_timer(user.tenant_id, user.id, &request)
+            .start_timer(user.tenant(), user.id, &request)
             .await?,
     ))
 }
@@ -334,7 +348,7 @@ async fn stop_timer(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeEntryResponse>> {
-    Ok(Json(state.service.stop_timer(user.tenant_id, id).await?))
+    Ok(Json(state.service.stop_timer(user.tenant(), id).await?))
 }
 
 // ============================================================================
@@ -348,7 +362,7 @@ async fn list_rounding_rules(
 ) -> AppResult<Json<PaginatedResponse<TimeRoundingRuleResponse>>> {
     let (items, total) = state
         .service
-        .list_rounding_rules(user.tenant_id, &pagination)
+        .list_rounding_rules(user.tenant(), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -367,7 +381,7 @@ async fn create_rounding_rule(
     Ok(Json(
         state
             .service
-            .create_rounding_rule(user.tenant_id, &request)
+            .create_rounding_rule(user.tenant(), &request)
             .await?,
     ))
 }
@@ -383,7 +397,7 @@ async fn update_rounding_rule(
     Ok(Json(
         state
             .service
-            .update_rounding_rule(user.tenant_id, id, &request)
+            .update_rounding_rule(user.tenant(), id, &request)
             .await?,
     ))
 }
@@ -394,5 +408,5 @@ async fn delete_rounding_rule(
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    state.service.delete_rounding_rule(user.tenant_id, id).await
+    state.service.delete_rounding_rule(user.tenant(), id).await
 }

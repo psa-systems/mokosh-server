@@ -8,6 +8,9 @@
 //! are wired by the `notification_dispatcher` worker once it lands; the
 //! row's `status = pending` is the queue marker.
 
+use std::collections::HashMap;
+
+use crate::modules::auth::TenantId;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -42,13 +45,14 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_channels(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationChannelResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM notification_channels WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, ChannelRow>(
@@ -60,7 +64,7 @@ impl NotificationsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         let items = rows
             .into_iter()
@@ -85,13 +89,14 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_channel(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertNotificationChannelRequest,
     ) -> AppResult<NotificationChannelResponse> {
         let plain = serde_json::to_string(&request.config)
             .map_err(|e| AppError::BadRequest(format!("config serialise: {e}")))?;
         let encrypted = crate::utils::crypto::encrypt(&plain, &self.encryption_key)?;
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO notification_channels
                (id, tenant_id, channel_type, name, config_encrypted, is_active, is_default)
@@ -104,8 +109,9 @@ impl NotificationsService {
         .bind(&encrypted)
         .bind(request.is_active)
         .bind(request.is_default)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(NotificationChannelResponse {
             id,
             channel_type: request.channel_type.clone(),
@@ -117,16 +123,18 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_channel(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_channel(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM notification_channels WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("NotificationChannel".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -134,13 +142,14 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_templates(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationTemplateResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM notification_templates WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, TemplateRow>(
@@ -152,7 +161,7 @@ impl NotificationsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -160,10 +169,11 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_template(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertNotificationTemplateRequest,
     ) -> AppResult<NotificationTemplateResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO notification_templates
                (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
@@ -172,7 +182,8 @@ impl NotificationsService {
         .bind(id).bind(tenant_id)
         .bind(&request.name).bind(&request.event_type).bind(&request.channel_type)
         .bind(&request.subject).bind(&request.body_text).bind(&request.body_html).bind(request.is_active)
-        .execute(self.db.pool()).await?;
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(NotificationTemplateResponse {
             id,
             name: request.name.clone(),
@@ -186,16 +197,18 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_template(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_template(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM notification_templates WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("NotificationTemplate".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -203,16 +216,17 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_user_preferences(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<UserNotificationPreferenceResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM user_notification_preferences WHERE tenant_id = $1 AND user_id = $2",
         )
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, PrefRow>(
@@ -226,7 +240,7 @@ impl NotificationsService {
         .bind(user_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -234,10 +248,11 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_user_preference(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         request: &UpsertUserNotificationPreferenceRequest,
     ) -> AppResult<UserNotificationPreferenceResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO user_notification_preferences
                (tenant_id, user_id, event_type, channel_types, is_enabled)
@@ -253,8 +268,9 @@ impl NotificationsService {
         .bind(&request.event_type)
         .bind(&request.channel_types)
         .bind(request.is_enabled)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(UserNotificationPreferenceResponse {
             id,
             user_id,
@@ -268,17 +284,18 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_inbox(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         user_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationInboxItemResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM notifications
                WHERE tenant_id = $1 AND user_id = $2 AND channel_type = 'in_app'"#,
         )
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
 
         let rows = sqlx::query_as::<_, InboxRow>(
@@ -292,22 +309,28 @@ impl NotificationsService {
         .bind(user_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn mark_read(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
-        sqlx::query(
+    pub async fn mark_read(&self, tenant_id: TenantId, user_id: Uuid, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query(
             r#"UPDATE notifications SET read_at = NOW()
                WHERE tenant_id = $1 AND user_id = $2 AND id = $3"#,
         )
         .bind(tenant_id)
         .bind(user_id)
         .bind(id)
-        .execute(self.db.pool())
-        .await?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Notification".to_string()));
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -315,13 +338,14 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rules(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationRuleResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM notification_rules WHERE tenant_id = $1")
                 .bind(tenant_id)
-                .fetch_one(self.db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
 
         let rows = sqlx::query_as::<_, RuleRow>(
@@ -333,7 +357,7 @@ impl NotificationsService {
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
@@ -341,10 +365,11 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rule(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         request: &UpsertNotificationRuleRequest,
     ) -> AppResult<NotificationRuleResponse> {
         let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO notification_rules
                (id, tenant_id, name, event_type, conditions, channels, recipients,
@@ -360,8 +385,9 @@ impl NotificationsService {
         .bind(&request.recipients)
         .bind(request.template_id)
         .bind(request.is_active)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(NotificationRuleResponse {
             id,
             name: request.name.clone(),
@@ -375,16 +401,18 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_rule(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+    pub async fn delete_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM notification_rules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("NotificationRule".to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -413,19 +441,22 @@ impl NotificationsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch(
         &self,
-        tenant_id: Uuid,
+        tenant_id: TenantId,
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<u64> {
-        let rules = sqlx::query_as::<_, RuleRow>(
-            r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
-               FROM notification_rules
-               WHERE tenant_id = $1 AND event_type = $2 AND is_active = TRUE"#,
-        )
-        .bind(tenant_id)
-        .bind(event_type)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rules = {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query_as::<_, RuleRow>(
+                r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
+                   FROM notification_rules
+                   WHERE tenant_id = $1 AND event_type = $2 AND is_active = TRUE"#,
+            )
+            .bind(tenant_id)
+            .bind(event_type)
+            .fetch_all(&mut *tx)
+            .await?
+        };
 
         let ctx_user_id: Option<Uuid> = context
             .get("recipient_user_id")
@@ -438,11 +469,25 @@ impl NotificationsService {
 
         let mut fanout = 0u64;
         for rule in rules {
+            // PMS-261: scope the template lookup through `begin_with_tenant`
+            // so the RLS GUC is set. `notification_templates` carries a
+            // `tenant_id` and is covered by the fail-closed policy (migration
+            // 038); the previous bare `self.db.pool()` read ran with NO GUC,
+            // which under an unprivileged (NOBYPASSRLS) connection matches zero
+            // rows and would silently drop the template, falling back to the
+            // default subject/body. The `template_id` came off this tenant's
+            // own rule, so the row lives under this same tenant.
             let template = match rule.template_id {
-                Some(tid) => sqlx::query_as::<_, TemplateRow>(
-                    "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
-                     FROM notification_templates WHERE id = $1",
-                ).bind(tid).fetch_optional(self.db.pool()).await?,
+                Some(tid) => {
+                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                    sqlx::query_as::<_, TemplateRow>(
+                        "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
+                         FROM notification_templates WHERE id = $1",
+                    )
+                    .bind(tid)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
                 None => None,
             };
 
@@ -477,6 +522,13 @@ impl NotificationsService {
                 }
             }
 
+            // PMS-195: batch-load every recipient's preference row up front
+            // instead of querying once per (channel, user) pair inside the
+            // nested loop below (was N+1).
+            let prefs = self
+                .load_user_preferences(tenant_id, &user_ids, event_type)
+                .await?;
+
             for channel in &rule.channels {
                 let raw_subject = template
                     .as_ref()
@@ -492,12 +544,10 @@ impl NotificationsService {
                 // Fan out to each user_id, honoring user preferences for
                 // this (event_type, channel) pair.
                 for user_id in &user_ids {
-                    if !self
-                        .user_accepts_channel(tenant_id, *user_id, event_type, channel)
-                        .await?
-                    {
+                    if !accepts_channel(prefs.get(user_id), channel) {
                         continue;
                     }
+                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                     sqlx::query(
                         r#"INSERT INTO notifications
                            (tenant_id, user_id, channel_type, template_id, subject, body, status)
@@ -509,8 +559,9 @@ impl NotificationsService {
                     .bind(template.as_ref().map(|t| t.id))
                     .bind(&subject)
                     .bind(&body)
-                    .execute(self.db.pool())
+                    .execute(&mut *tx)
                     .await?;
+                    tx.commit().await?;
                     fanout += 1;
                 }
                 // Fan out to standalone email-style recipients (no user
@@ -519,6 +570,7 @@ impl NotificationsService {
                 // on that channel.
                 if channel != "in_app" {
                     for addr in &emails {
+                        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                         sqlx::query(
                             r#"INSERT INTO notifications
                                (tenant_id, channel_type, template_id, recipient, subject, body, status)
@@ -530,8 +582,9 @@ impl NotificationsService {
                         .bind(addr)
                         .bind(&subject)
                         .bind(&body)
-                        .execute(self.db.pool())
+                        .execute(&mut *tx)
                         .await?;
+                        tx.commit().await?;
                         fanout += 1;
                     }
                 }
@@ -540,36 +593,50 @@ impl NotificationsService {
         Ok(fanout)
     }
 
-    /// Return true if `user_id` should receive `channel` for
-    /// `event_type`. Absent prefs row = accept (project default). Row
-    /// with `is_enabled = false` = reject. Row with `is_enabled = true`
-    /// = accept only if `channel_types` contains the channel.
-    async fn user_accepts_channel(
+    /// Batch-load the `user_notification_preferences` rows for every
+    /// recipient in one query (PMS-195), keyed by `user_id`. A user with
+    /// no row is simply absent from the map (treated as accept-all by
+    /// [`accepts_channel`]).
+    async fn load_user_preferences(
         &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
+        tenant_id: TenantId,
+        user_ids: &[Uuid],
         event_type: &str,
-        channel: &str,
-    ) -> AppResult<bool> {
-        let row: Option<(Option<bool>, Vec<String>)> = sqlx::query_as(
-            r#"SELECT is_enabled, channel_types
+    ) -> AppResult<HashMap<Uuid, (Option<bool>, Vec<String>)>> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, Option<bool>, Vec<String>)> = sqlx::query_as(
+            r#"SELECT user_id, is_enabled, channel_types
                FROM user_notification_preferences
-               WHERE tenant_id = $1 AND user_id = $2 AND event_type = $3"#,
+               WHERE tenant_id = $1 AND user_id = ANY($2) AND event_type = $3"#,
         )
         .bind(tenant_id)
-        .bind(user_id)
+        .bind(user_ids)
         .bind(event_type)
-        .fetch_optional(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(uid, enabled, channels)| (uid, (enabled, channels)))
+            .collect())
+    }
+}
 
-        match row {
-            None => Ok(true),
-            Some((enabled, channels)) => {
-                if !enabled.unwrap_or(true) {
-                    return Ok(false);
-                }
-                Ok(channels.iter().any(|c| c == channel))
+/// Decide whether a recipient should receive `channel`, given their
+/// preference row (or `None` if they have no row). Absent row = accept
+/// (project default). Row with `is_enabled = false` = reject. Row with
+/// `is_enabled = true` = accept only if `channel_types` contains the
+/// channel.
+fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) -> bool {
+    match pref {
+        None => true,
+        Some((enabled, channels)) => {
+            if !enabled.unwrap_or(true) {
+                return false;
             }
+            channels.iter().any(|c| c == channel)
         }
     }
 }

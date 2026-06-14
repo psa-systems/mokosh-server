@@ -97,6 +97,7 @@ pub fn current_user_from_at_jwt(v: &VerifiedAtJwt) -> CurrentUser {
         // hits the DB and returns the authoritative value. Default to
         // `true` so a stale propagation never traps a real user.
         profile_completed: true,
+        date_format_string: None,
     }
 }
 
@@ -120,6 +121,7 @@ fn parse_mokosh_role(s: Option<&str>) -> UserRole {
     // role) so a token without `mokosh_role` cannot quietly become an
     // admin.
     match s.unwrap_or("") {
+        "super_admin" => UserRole::SuperAdmin,
         "admin" => UserRole::Admin,
         "manager" => UserRole::Manager,
         "finance" => UserRole::Finance,

@@ -8,7 +8,7 @@
 
 use chrono::Duration;
 use mokosh_auth_core::{
-    AuditEvent, AuthError, OpSession, OpSessionRepository, TenantId, User, UserRepository,
+    AuditEvent, AuthError, Clock, OpSession, OpSessionRepository, TenantId, User, UserRepository,
     UserStatus,
 };
 use mokosh_auth_crypto::password::verify_password;
@@ -224,10 +224,7 @@ impl LocalAuth {
 
         let _ = self
             .users
-            .update_last_login(
-                user.id,
-                mokosh_auth_core::time::SystemClock.now_or_default(),
-            )
+            .update_last_login(user.id, mokosh_auth_core::time::SystemClock.now())
             .await;
         let _ = self
             .audit
@@ -256,7 +253,6 @@ impl LocalAuth {
         &self,
         req: LocalLoginRequest,
         ip: Option<std::net::IpAddr>,
-        _user_agent: Option<&str>,
     ) -> Result<LocalVerifyOk, AuthError> {
         const DUMMY_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXkxMjM0NTY3OA$\
              SGEgaGEgdGhpcyBpcyBub3QgcmVhbCBoYXNoIGxlbmd0aA";
@@ -267,6 +263,19 @@ impl LocalAuth {
                 let mut matches = self.users.find_by_email_globally(&req.email).await?;
                 if matches.len() >= 2 {
                     let _ = verify_password(&req.password, DUMMY_HASH);
+                    let _ = self
+                        .audit
+                        .record(
+                            None,
+                            None,
+                            ip,
+                            AuditEvent::LoginFailed {
+                                email: req.email.clone(),
+                                ip: ip.map(|i| i.to_string()),
+                                reason: "ambiguous email across tenants".into(),
+                            },
+                        )
+                        .await;
                     return Err(AuthError::AccessDenied("invalid credentials".into()));
                 }
                 matches.pop()
@@ -276,11 +285,37 @@ impl LocalAuth {
             Some(u) => u,
             None => {
                 let _ = verify_password(&req.password, DUMMY_HASH);
+                let _ = self
+                    .audit
+                    .record(
+                        req.tenant_id.map(TenantId),
+                        None,
+                        ip,
+                        AuditEvent::LoginFailed {
+                            email: req.email.clone(),
+                            ip: ip.map(|i| i.to_string()),
+                            reason: "no such user".into(),
+                        },
+                    )
+                    .await;
                 return Err(AuthError::AccessDenied("invalid credentials".into()));
             }
         };
         if !matches!(user.status, mokosh_auth_core::UserStatus::Active) {
             let _ = verify_password(&req.password, DUMMY_HASH);
+            let _ = self
+                .audit
+                .record(
+                    Some(user.tenant_id),
+                    Some(user.id),
+                    ip,
+                    AuditEvent::LoginFailed {
+                        email: req.email.clone(),
+                        ip: ip.map(|i| i.to_string()),
+                        reason: format!("status={}", user.status.as_str()),
+                    },
+                )
+                .await;
             return Err(AuthError::AccessDenied("invalid credentials".into()));
         }
         let stored_hash = match user.password_hash.as_deref() {
@@ -388,10 +423,7 @@ impl LocalAuth {
         // and created_at. Cleanup-other-rows is no longer needed here.
         let _ = self
             .users
-            .update_last_login(
-                user.id,
-                mokosh_auth_core::time::SystemClock.now_or_default(),
-            )
+            .update_last_login(user.id, mokosh_auth_core::time::SystemClock.now())
             .await;
         let _ = self
             .audit
@@ -407,17 +439,5 @@ impl LocalAuth {
             )
             .await;
         Ok(session)
-    }
-}
-
-// Helper trait so the storage layer doesn't have to depend on `chrono`'s
-// Utc::now in an ad-hoc place.
-trait NowOrDefault {
-    fn now_or_default(&self) -> chrono::DateTime<chrono::Utc>;
-}
-impl NowOrDefault for mokosh_auth_core::time::SystemClock {
-    fn now_or_default(&self) -> chrono::DateTime<chrono::Utc> {
-        use mokosh_auth_core::Clock;
-        self.now()
     }
 }

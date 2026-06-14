@@ -22,7 +22,13 @@ function deriveApiBase(spaUrl) {
   }
 }
 
-const spaBaseURL = pick(process.env.E2E_BASE_URL, 'https://msp.a8n.systems');
+// Required: no domain is hardcoded as a fallback. Inject the per-environment
+// SPA host (staging `https://msp.a8n.systems`, prod `https://msp.psa.systems`).
+const spaBaseURL = pick(process.env.E2E_BASE_URL);
+if (!spaBaseURL) {
+  console.error('E2E_BASE_URL is unset; set it to the SPA host (see e2e/README.md). Aborting.');
+  process.exit(1);
+}
 const apiBaseURL = pick(
   process.env.E2E_API_BASE_URL,
   deriveApiBase(spaBaseURL),
