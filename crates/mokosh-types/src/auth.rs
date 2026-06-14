@@ -254,7 +254,7 @@ pub struct User {
     /// onboarding screen. NULL = needs onboarding; set on first
     /// successful `PUT /api/v1/auth/me` whose body includes non-empty
     /// `first_name` and `last_name`. See migration
-    /// `033_users_profile_completed_at.sql`.
+    /// `046_users_profile_completed_at.sql`.
     pub profile_completed_at: Option<DateTime<Utc>>,
 }
 
