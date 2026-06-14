@@ -159,6 +159,10 @@ pub struct CreateInvoiceLineRequest {
     pub line_type: InvoiceLineType,
     #[validate(length(min = 1, max = 1000))]
     pub description: String,
+    /// `quantity` and `unit_price` are intentionally signed (PMS-306): a
+    /// discount or credit line carries a negative value, so a non-negative
+    /// constraint would reject legitimate adjustments. Sign is allowed by
+    /// design; only the column magnitude matters at the DB layer.
     pub quantity: Decimal,
     pub unit_price: Decimal,
     pub ticket_id: Option<Uuid>,
@@ -168,6 +172,7 @@ pub struct CreateInvoiceLineRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[validate(schema(function = validate_invoice_date_range))]
 pub struct CreateInvoiceRequest {
     pub company_id: Uuid,
     pub billing_contact_id: Option<Uuid>,
@@ -184,6 +189,20 @@ pub struct CreateInvoiceRequest {
     pub po_number: Option<String>,
     #[validate(length(min = 1, message = "At least one line item is required"))]
     pub lines: Vec<CreateInvoiceLineRequest>,
+}
+
+/// Cross-field check: an invoice's `due_date` may not fall before its
+/// `invoice_date` (PMS-306). The inverted range was previously accepted;
+/// reject it with a 422 instead of persisting a due-before-issue invoice.
+fn validate_invoice_date_range(
+    req: &CreateInvoiceRequest,
+) -> Result<(), validator::ValidationError> {
+    if req.due_date < req.invoice_date {
+        let mut error = validator::ValidationError::new("invalid_date_range");
+        error.message = Some("due_date must be on or after invoice_date".into());
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// PMS-33 core: generate an invoice from a company's billable time
@@ -293,6 +312,12 @@ pub struct CreatePaymentRequest {
     pub invoice_id: Option<Uuid>,
     pub company_id: Uuid,
     pub payment_date: NaiveDate,
+    /// Payment amount. Bounded to the `DECIMAL(12, 2)` column magnitude so an
+    /// oversized value returns a 422 rather than overflowing the column and
+    /// surfacing as a 500 (PMS-306). The sign is intentionally NOT constrained:
+    /// negative amounts represent refunds / reversals and are allowed by
+    /// design, so only the magnitude is validated here.
+    #[validate(custom(function = crate::utils::validation::validate_money_amount))]
     pub amount: Decimal,
     pub payment_method: PaymentMethod,
     pub reference_number: Option<String>,
@@ -385,4 +410,96 @@ pub struct UpsertTaxRateRequest {
     pub is_default: bool,
     #[serde(default = "default_true")]
     pub is_active: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use std::str::FromStr;
+
+    fn one_line() -> CreateInvoiceLineRequest {
+        CreateInvoiceLineRequest {
+            line_type: InvoiceLineType::Service,
+            description: "Work".into(),
+            quantity: Decimal::from(1),
+            unit_price: Decimal::from(100),
+            ticket_id: None,
+            project_id: None,
+            sort_order: 0,
+        }
+    }
+
+    fn invoice(invoice_date: NaiveDate, due_date: NaiveDate) -> CreateInvoiceRequest {
+        CreateInvoiceRequest {
+            company_id: Uuid::new_v4(),
+            billing_contact_id: None,
+            contract_id: None,
+            invoice_date,
+            due_date,
+            payment_terms: None,
+            tax_amount: None,
+            discount_amount: None,
+            currency: None,
+            notes: None,
+            po_number: None,
+            lines: vec![one_line()],
+        }
+    }
+
+    fn payment(amount: Decimal) -> CreatePaymentRequest {
+        CreatePaymentRequest {
+            invoice_id: None,
+            company_id: Uuid::new_v4(),
+            payment_date: NaiveDate::from_ymd_opt(2026, 6, 14).unwrap(),
+            amount,
+            payment_method: PaymentMethod::Check,
+            reference_number: None,
+            gateway_transaction_id: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn rejects_due_before_invoice_date() {
+        // PMS-306: due_date before invoice_date must fail.
+        let req = invoice(
+            NaiveDate::from_ymd_opt(2026, 6, 14).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        );
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_valid_invoice_date_range() {
+        let req = invoice(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+        );
+        assert!(req.validate().is_ok());
+        // Same-day (due == issue) is allowed.
+        let same = invoice(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        );
+        assert!(same.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_payment_amount() {
+        // PMS-306: 1e15 overflows DECIMAL(12, 2); must be a 422, not a 500.
+        let req = payment(Decimal::from_str("1000000000000000").unwrap());
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_in_range_and_signed_payment_amount() {
+        assert!(payment(Decimal::from_str("9999999999.99").unwrap())
+            .validate()
+            .is_ok());
+        // Negative amounts (refunds) are intentionally allowed.
+        assert!(payment(Decimal::from_str("-250.00").unwrap())
+            .validate()
+            .is_ok());
+    }
 }

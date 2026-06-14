@@ -1,6 +1,7 @@
 //! Custom validation utilities
 
 use regex::Regex;
+use rust_decimal::Decimal;
 use std::sync::LazyLock;
 use validator::ValidationError;
 
@@ -114,6 +115,35 @@ pub fn validate_contract_type(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Exclusive upper bound on the magnitude of a money amount stored in a
+/// `DECIMAL(12, 2)` column: 10 integer digits, so values must satisfy
+/// `|amount| < 10_000_000_000`. The bound is exclusive because the largest
+/// value the column can hold is `9_999_999_999.99`.
+const MONEY_AMOUNT_MAX_EXCLUSIVE: i64 = 10_000_000_000;
+
+/// Validate that a money amount fits the `DECIMAL(12, 2)` columns used for
+/// invoice / payment money fields. Without this bound an oversized amount
+/// (e.g. `1e15`) reaches Postgres and triggers a numeric field overflow that
+/// surfaces as a 500 `DATABASE_ERROR` instead of a clear 422 (PMS-306, same
+/// class as PMS-297). The check is on the absolute value so signed amounts
+/// (refunds, credits) are bounded symmetrically; the sign itself is allowed
+/// (see the field-level docs on `CreatePaymentRequest::amount`).
+pub fn validate_money_amount(value: &Decimal) -> Result<(), ValidationError> {
+    if value.abs() < Decimal::from(MONEY_AMOUNT_MAX_EXCLUSIVE) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("amount_out_of_range");
+        error.message = Some(
+            format!(
+                "amount magnitude must be less than {MONEY_AMOUNT_MAX_EXCLUSIVE} \
+                 (the DECIMAL(12, 2) column limit)"
+            )
+            .into(),
+        );
+        Err(error)
+    }
+}
+
 /// Generate a slug from a string
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
@@ -204,6 +234,20 @@ mod tests {
         assert!(validate_contract_type("recurring").is_err());
         assert!(validate_contract_type("retainer").is_err());
         assert!(validate_contract_type("").is_err());
+    }
+
+    #[test]
+    fn test_validate_money_amount() {
+        use std::str::FromStr;
+        // In-range values, including the column maximum and signed amounts.
+        assert!(validate_money_amount(&Decimal::from_str("0").unwrap()).is_ok());
+        assert!(validate_money_amount(&Decimal::from_str("9999999999.99").unwrap()).is_ok());
+        assert!(validate_money_amount(&Decimal::from_str("-9999999999.99").unwrap()).is_ok());
+        // PMS-306: oversized amount (e.g. 1e15) must be rejected here instead
+        // of overflowing the column and surfacing as a 500.
+        assert!(validate_money_amount(&Decimal::from_str("10000000000").unwrap()).is_err());
+        assert!(validate_money_amount(&Decimal::from_str("1000000000000000").unwrap()).is_err());
+        assert!(validate_money_amount(&Decimal::from_str("-1000000000000000").unwrap()).is_err());
     }
 
     #[test]
