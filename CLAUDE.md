@@ -83,12 +83,15 @@ compose.dev-sso.yml     Traefik overlay for per-developer SSO
 dev-docs/               codebase-state.md is the authoritative module/route catalog
 ```
 
-### Auth: two systems coexist
+### Auth: three independent mechanisms (PMS-291)
 
-1. **Legacy HS256 auth** (`src/modules/auth/`): JWT in cookie, Argon2 password hashing, session rows in `user_sessions`. Used by the original PSA endpoints. `AuthMiddleware` decodes the cookie into an `AuthState`. Routes opt in via `RequireAuth` / `RequireRole` / `RequireAdmin` / `RequireManager` / `RequireFinance` extractors.
-2. **SSO / OIDC subsystem** (`crates/mokosh-auth*`): full OIDC IdP with EdDSA `at+jwt` access tokens, OAuth client registry, federation, recovery codes, TOTP, trusted devices. `crates/mokosh-auth` is the umbrella crate that re-exports the others and exposes `bootstrap(AuthConfig, PgPool) -> MokoshAuth`. `main.rs` calls `try_bootstrap_sso`; on success the SSO router is merged into the PSA router AND its key set is passed to `AuthMiddleware::with_at_jwt(...)` so the same middleware accepts either token type. On failure (env vars missing) the server runs legacy-only.
+The server accepts up to three independent auth paths in parallel; failing to mount one does NOT disable the others:
 
-SSO requires: `MOKOSH_AUTH_ISSUER`, `MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH`, `MOKOSH_AUTH_JWT_ACTIVE_KID`, `MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR`, `MOKOSH_AUTH_DATA_ENCRYPTION_KEY`.
+1. **Bunyip-as-OP Resource-Server** (`src/modules/auth/oidc_rs.rs`): mokosh verifies bunyip-issued `at+jwt` Bearer tokens against bunyip's JWKS. Configured by `OIDC_ISSUER` + `OIDC_AUDIENCE`. This is the path the mokosh-apps SPA and the E2E suite actually use; tokens come from `api.<tld>` = bunyip.
+2. **mokosh-auth (mokosh's own OIDC OP)** (`crates/mokosh-auth*`): a full second IdP run by mokosh itself - EdDSA `at+jwt`, OAuth client registry, federation, recovery codes, TOTP, trusted devices. `crates/mokosh-auth` is the umbrella crate; `main.rs` calls `try_bootstrap_sso`. On success the SSO router is merged into the PSA router AND its key set is passed to `AuthMiddleware::with_at_jwt(...)`. Requires: `MOKOSH_AUTH_ISSUER`, `MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH`, `MOKOSH_AUTH_JWT_ACTIVE_KID`, `MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR`, `MOKOSH_AUTH_DATA_ENCRYPTION_KEY`. The Ed25519 keypair (`<kid>.pem` + `<kid>.pub.pem`) must already exist in the configured `MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH` / `MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR` BEFORE first start; PMS-289 makes a missing key set a fatal boot error rather than a silent WARN.
+3. **Legacy HS256 cookie auth** (`src/modules/auth/`): JWT in cookie, Argon2 password hashing, session rows in `user_sessions`. Used by the original PSA endpoints. `AuthMiddleware` decodes the cookie into an `AuthState`. Routes opt in via `RequireAuth` / `RequireRole` / `RequireAdmin` / `RequireManager` / `RequireFinance` extractors.
+
+**Posture decision (PMS-291)**: c-01 (staging) and nc-01 (production) currently run **all three** (interim path B from PMS-292 - keys provisioned, mechanism 2 mounted). The end-state is to drop mechanism 2 entirely (bunyip-as-OP only); tracked in PMS-295 as a follow-up. Until that lands, removing `MOKOSH_AUTH_*` from the env is a viable rollback only if the keys are also removed from `MOKOSH_AUTH_JWT_*` paths.
 
 Auth workspace crates:
 
