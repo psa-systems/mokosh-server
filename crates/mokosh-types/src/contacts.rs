@@ -8,7 +8,66 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use validator::Validate;
+use validator::{Validate, ValidationError};
+
+// ============================================================================
+// REQUEST-LAYER VALIDATORS (PMS-297)
+// ============================================================================
+//
+// Bad input that passes the application layer used to reach Postgres, fail
+// there, and surface as HTTP 500 `DATABASE_ERROR`. Reject it at the
+// request-model layer so it never reaches the DB and returns a 422 instead.
+
+/// Reject strings containing a NUL byte (U+0000). Postgres `text`/`varchar`
+/// columns cannot store NUL: such input fails at the DB layer and surfaces as
+/// a 500. Reject it here as a field validation error (422) instead.
+fn validate_text_no_nul(value: &str) -> Result<(), ValidationError> {
+    if value.contains('\0') {
+        Err(ValidationError::new("nul_byte"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Reject NUL bytes in any element of a string collection (e.g. `tags`).
+fn validate_strings_no_nul(values: &[String]) -> Result<(), ValidationError> {
+    if values.iter().any(|v| v.contains('\0')) {
+        Err(ValidationError::new("nul_byte"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate a company name: not whitespace-only and free of control
+/// characters (which includes NUL). Length bounds stay on the `length`
+/// validator. A bare `" "` passes `length(min = 1)` but is not a real name.
+fn validate_company_name(value: &str) -> Result<(), ValidationError> {
+    if value.trim().is_empty() {
+        return Err(ValidationError::new("blank"));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(ValidationError::new("control_chars"));
+    }
+    Ok(())
+}
+
+/// Validate a website as an http(s) URL. An empty string is treated as "no
+/// value" and accepted; any other value must use an `http`/`https` scheme and
+/// carry a host. The scheme allowlist blocks `javascript:`/`data:` URLs that
+/// would otherwise drive stored XSS in the SPA (MAPPS-149).
+fn validate_website(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let lower = value.to_ascii_lowercase();
+    let host = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    match host {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => Ok(()),
+        _ => Err(ValidationError::new("invalid_url")),
+    }
+}
 
 // ============================================================================
 // COMPANY TYPES
@@ -76,13 +135,19 @@ impl CompanyStatus {
 }
 
 /// Address structure
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Validate)]
 pub struct Address {
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub line1: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub line2: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub city: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub state: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub postal_code: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub country: Option<String>,
 }
 
@@ -160,30 +225,41 @@ pub struct Company {
 /// Create company request
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateCompanyRequest {
-    #[validate(length(min = 1, max = 255))]
+    #[validate(length(min = 1, max = 255), custom(function = "validate_company_name"))]
     pub name: String,
     pub parent_company_id: Option<Uuid>,
     #[serde(default)]
     pub company_type: CompanyType,
     #[serde(default)]
     pub status: CompanyStatus,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub industry: Option<String>,
+    #[validate(length(max = 255), custom(function = "validate_website"))]
     pub website: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub phone: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub fax: Option<String>,
+    #[validate(nested)]
     pub address: Option<Address>,
+    #[validate(nested)]
     pub billing_address: Option<Address>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub tax_id: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub account_number: Option<String>,
     pub account_manager_id: Option<Uuid>,
     pub sla_id: Option<Uuid>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub payment_terms: Option<String>,
     #[serde(default)]
     pub tax_exempt: bool,
     #[serde(default)]
     pub custom_fields: serde_json::Value,
     #[serde(default)]
+    #[validate(custom(function = "validate_strings_no_nul"))]
     pub tags: Vec<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub notes: Option<String>,
     #[serde(default = "crate::default_true")]
     pub portal_enabled: bool,
@@ -192,28 +268,39 @@ pub struct CreateCompanyRequest {
 /// Update company request
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateCompanyRequest {
-    #[validate(length(min = 1, max = 255))]
+    #[validate(length(min = 1, max = 255), custom(function = "validate_company_name"))]
     pub name: Option<String>,
     pub parent_company_id: Option<Uuid>,
     pub company_type: Option<CompanyType>,
     pub status: Option<CompanyStatus>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub industry: Option<String>,
+    #[validate(length(max = 255), custom(function = "validate_website"))]
     pub website: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub phone: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub fax: Option<String>,
+    #[validate(nested)]
     pub address: Option<Address>,
+    #[validate(nested)]
     pub billing_address: Option<Address>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub tax_id: Option<String>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub account_number: Option<String>,
     pub default_billing_contact_id: Option<Uuid>,
     pub default_technical_contact_id: Option<Uuid>,
     pub account_manager_id: Option<Uuid>,
     pub sla_id: Option<Uuid>,
     pub default_contract_id: Option<Uuid>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub payment_terms: Option<String>,
     pub tax_exempt: Option<bool>,
     pub custom_fields: Option<serde_json::Value>,
+    #[validate(custom(function = "validate_strings_no_nul"))]
     pub tags: Option<Vec<String>>,
+    #[validate(custom(function = "validate_text_no_nul"))]
     pub notes: Option<String>,
     pub portal_enabled: Option<bool>,
 }
@@ -634,4 +721,118 @@ pub struct ContactFilter {
     pub is_portal_user: Option<bool>,
     #[validate(length(max = 500))]
     pub tags: Option<String>,
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid `CreateCompanyRequest` from JSON, merging in the
+    /// supplied overrides so each test only states the field it exercises.
+    fn create_req(overrides: serde_json::Value) -> CreateCompanyRequest {
+        let mut body = serde_json::json!({ "name": "Acme Corp" });
+        if let serde_json::Value::Object(extra) = overrides {
+            for (k, v) in extra {
+                body[k] = v;
+            }
+        }
+        serde_json::from_value(body).expect("request deserializes")
+    }
+
+    #[test]
+    fn minimal_request_is_valid() {
+        assert!(create_req(serde_json::json!({})).validate().is_ok());
+    }
+
+    #[test]
+    fn overlong_website_rejected() {
+        let req = create_req(serde_json::json!({ "website": "h".repeat(5000) }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn nul_byte_in_name_rejected() {
+        let req = create_req(serde_json::json!({ "name": "Ac\u{0}me" }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn control_chars_in_name_rejected() {
+        let req = create_req(serde_json::json!({ "name": "Acme\u{1}\u{2}" }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn whitespace_only_name_rejected() {
+        let req = create_req(serde_json::json!({ "name": "   " }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn nul_byte_in_other_text_field_rejected() {
+        let req = create_req(serde_json::json!({ "industry": "Tech\u{0}" }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn nul_byte_in_nested_address_rejected() {
+        let req = create_req(serde_json::json!({ "address": { "city": "Town\u{0}" } }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn nul_byte_in_tag_rejected() {
+        let req = create_req(serde_json::json!({ "tags": ["good", "bad\u{0}"] }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn javascript_scheme_website_rejected() {
+        let req = create_req(serde_json::json!({ "website": "javascript:alert(1)" }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn data_scheme_website_rejected() {
+        let req = create_req(serde_json::json!({ "website": "data:text/html,<script>" }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn non_url_website_rejected() {
+        let req = create_req(serde_json::json!({ "website": "not a url" }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn http_and_https_websites_accepted() {
+        assert!(
+            create_req(serde_json::json!({ "website": "http://example.com" }))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            create_req(serde_json::json!({ "website": "https://example.com/about" }))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_website_accepted() {
+        let req = create_req(serde_json::json!({ "website": "" }));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn update_request_applies_same_validation() {
+        let req: UpdateCompanyRequest =
+            serde_json::from_value(serde_json::json!({ "website": "javascript:alert(1)" }))
+                .expect("request deserializes");
+        assert!(req.validate().is_err());
+    }
 }
