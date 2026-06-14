@@ -175,11 +175,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (Some(auth.router()), Some(verifier))
         }
         Ok(SsoSetup::NotConfigured) => {
+            // PMS-291: mokosh-auth (mechanism 2) is one of three independent
+            // auth paths. Not mounting it leaves the bunyip-as-OP
+            // Resource-Server path (mechanism 1, OIDC_ISSUER / OIDC_AUDIENCE)
+            // AND the legacy HS256 cookie path (mechanism 3) both active. The
+            // earlier "the server will run with legacy auth only" phrasing was
+            // misleading: it implied a full fallback to mechanism 3, which is
+            // not what happens. Be explicit about what stays on so an operator
+            // grepping logs cannot conclude bunyip auth is also down.
             tracing::warn!(
-                "SSO subsystem not configured; the server will run with legacy auth only. \
-                 Set MOKOSH_AUTH_ISSUER, MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH, \
-                 MOKOSH_AUTH_JWT_ACTIVE_KID, MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, \
-                 and MOKOSH_AUTH_DATA_ENCRYPTION_KEY to enable SSO."
+                "mokosh-auth OP (mechanism 2) not configured. The server is still serving the \
+                 bunyip-as-OP Resource-Server path (OIDC_ISSUER/OIDC_AUDIENCE) and the legacy \
+                 HS256 cookie path; only mokosh's own /oauth2/* endpoints are unavailable. \
+                 To enable mechanism 2, set MOKOSH_AUTH_ISSUER, \
+                 MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH, MOKOSH_AUTH_JWT_ACTIVE_KID, \
+                 MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR, and MOKOSH_AUTH_DATA_ENCRYPTION_KEY."
             );
             (None, None)
         }
