@@ -193,6 +193,46 @@ pub fn validate_budget_hours(value: &Decimal) -> Result<(), ValidationError> {
     validate_budget(value, BUDGET_HOURS_MAX_EXCLUSIVE, "DECIMAL(10, 2)")
 }
 
+/// Exclusive upper bound on the magnitude of an SLA target *hours* value stored
+/// in a `DECIMAL(10, 2)` column (largest holdable value `99_999_999.99`).
+const SLA_HOURS_MAX_EXCLUSIVE: i64 = 100_000_000;
+
+/// Validate an SLA target hours value (`first_response_hours` /
+/// `resolution_hours`) against its `DECIMAL(10, 2)` column (PMS-338).
+///
+/// SLA targets previously accepted negative, zero, and over-precise hours at
+/// every layer. We require a strictly-positive value: a blank/`None` field
+/// already means "no target", so a stored target of `0` (an instantaneous
+/// deadline) is never the intent and is rejected. More than two decimal places
+/// would be silently rounded by the column, and an oversized magnitude would
+/// overflow it and surface as a 500 instead of a clear 422 (same class as
+/// PMS-324). Applied per field via `#[validate(custom(...))]`; on an
+/// `Option<Decimal>` the validator runs on the inner value and skips `None`.
+pub fn validate_sla_target_hours(value: &Decimal) -> Result<(), ValidationError> {
+    if !value.is_sign_positive() || value.is_zero() {
+        let mut error = ValidationError::new("sla_hours_not_positive");
+        error.message = Some("SLA target hours must be greater than 0".into());
+        return Err(error);
+    }
+    if value.scale() > 2 {
+        let mut error = ValidationError::new("sla_hours_scale");
+        error.message = Some("SLA target hours must have at most 2 decimal places".into());
+        return Err(error);
+    }
+    if *value >= Decimal::from(SLA_HOURS_MAX_EXCLUSIVE) {
+        let mut error = ValidationError::new("sla_hours_out_of_range");
+        error.message = Some(
+            format!(
+                "SLA target hours must be less than {SLA_HOURS_MAX_EXCLUSIVE} \
+                 (the DECIMAL(10, 2) column limit)"
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Generate a slug from a string
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
@@ -318,6 +358,23 @@ mod tests {
         assert!(validate_budget_hours(&Decimal::from_str("100000000").unwrap()).is_err());
         // A value that fits hours' bigger sibling but overflows hours' DECIMAL(10, 2).
         assert!(validate_budget_amount(&Decimal::from_str("99999999.99").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sla_target_hours() {
+        use std::str::FromStr;
+        // Valid: strictly-positive, at most 2 dp, within the column range.
+        assert!(validate_sla_target_hours(&Decimal::from_str("4").unwrap()).is_ok());
+        assert!(validate_sla_target_hours(&Decimal::from_str("0.25").unwrap()).is_ok());
+        assert!(validate_sla_target_hours(&Decimal::from_str("99999999.99").unwrap()).is_ok());
+        // Zero rejected: blank/None already means "no target" (PMS-338).
+        assert!(validate_sla_target_hours(&Decimal::from_str("0").unwrap()).is_err());
+        // Negative rejected.
+        assert!(validate_sla_target_hours(&Decimal::from_str("-1").unwrap()).is_err());
+        // More than 2 decimal places rejected (would be silently rounded).
+        assert!(validate_sla_target_hours(&Decimal::from_str("1.001").unwrap()).is_err());
+        // Out of range for DECIMAL(10, 2) (would overflow -> 500).
+        assert!(validate_sla_target_hours(&Decimal::from_str("100000000").unwrap()).is_err());
     }
 
     #[test]
