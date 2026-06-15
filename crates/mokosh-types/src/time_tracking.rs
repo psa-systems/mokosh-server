@@ -102,6 +102,13 @@ pub struct TimeEntryResponse {
     pub approval_status: ApprovalStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Joined work-item names (PMS-332), so the client renders the Work Item
+    /// column without per-row lookups. Each is null when the entry has no link
+    /// of that kind, or when the linked row is not visible (e.g. RLS-scoped).
+    pub ticket_number: Option<String>,
+    pub ticket_title: Option<String>,
+    pub project_name: Option<String>,
+    pub task_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]

@@ -190,12 +190,16 @@ impl TimeTrackingService {
         // OWN placeholder numbering. Sharing one where_clause made the count
         // query reference an unbound $4 and 500 on any filter. Mirrors
         // billing::list_invoices.
-        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        // The data query joins tickets/projects/tasks (which also carry
+        // tenant_id), so its predicates must be qualified with the `te` alias
+        // to avoid ambiguous-column errors. The count query has no join, so it
+        // stays on bare time_entries columns.
+        let mut data_conds = vec!["te.tenant_id = $1".to_string()];
         let mut count_conds = vec!["tenant_id = $1".to_string()];
         let mut data_idx = 4;
         let mut count_idx = 2;
         let mut push_filter = |col: &str, op: &str| {
-            data_conds.push(format!("{col} {op} ${data_idx}"));
+            data_conds.push(format!("te.{col} {op} ${data_idx}"));
             count_conds.push(format!("{col} {op} ${count_idx}"));
             data_idx += 1;
             count_idx += 1;
@@ -221,14 +225,23 @@ impl TimeTrackingService {
         // default_field must be a bare column - embedding "DESC" here yielded
         // "ORDER BY date DESC, start_time DESC DESC" and 500'd every list call
         // (PMS-145). Default direction is already DESC (newest first).
+        // Every allowed sort field lives on time_entries; qualify it with the
+        // `te` alias so a `created_at` sort is not ambiguous against the joined
+        // tables (each of which also has a created_at).
         let order_by = pagination.order_by("date", &["date", "duration_minutes", "created_at"]);
+        let order_by = format!("te.{order_by}");
         let query = format!(
             r#"
-            SELECT id, user_id, date, start_time, end_time, duration_minutes,
-                   work_type_id, ticket_id, project_id, task_id, company_id, notes,
-                   is_billable, billing_status, hourly_rate, total_amount,
-                   approval_status, created_at, updated_at
-            FROM time_entries
+            SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
+                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
+                   te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
+                   te.approval_status, te.created_at, te.updated_at,
+                   tk.ticket_number, tk.title AS ticket_title,
+                   pr.name AS project_name, ta.title AS task_title
+            FROM time_entries te
+            LEFT JOIN tickets  tk ON tk.id = te.ticket_id
+            LEFT JOIN projects pr ON pr.id = te.project_id
+            LEFT JOIN tasks    ta ON ta.id = te.task_id
             WHERE {data_where}
             ORDER BY {order_by}
             LIMIT $2 OFFSET $3
@@ -334,12 +347,17 @@ impl TimeTrackingService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TimeEntryRow>(
             r#"
-            SELECT id, user_id, date, start_time, end_time, duration_minutes,
-                   work_type_id, ticket_id, project_id, task_id, company_id, notes,
-                   is_billable, billing_status, hourly_rate, total_amount,
-                   approval_status, created_at, updated_at
-            FROM time_entries
-            WHERE tenant_id = $1 AND id = $2
+            SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
+                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
+                   te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
+                   te.approval_status, te.created_at, te.updated_at,
+                   tk.ticket_number, tk.title AS ticket_title,
+                   pr.name AS project_name, ta.title AS task_title
+            FROM time_entries te
+            LEFT JOIN tickets  tk ON tk.id = te.ticket_id
+            LEFT JOIN projects pr ON pr.id = te.project_id
+            LEFT JOIN tasks    ta ON ta.id = te.task_id
+            WHERE te.tenant_id = $1 AND te.id = $2
             "#,
         )
         .bind(tenant_id)
@@ -1368,6 +1386,10 @@ struct TimeEntryRow {
     approval_status: Option<String>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+    ticket_number: Option<String>,
+    ticket_title: Option<String>,
+    project_name: Option<String>,
+    task_title: Option<String>,
 }
 
 impl From<TimeEntryRow> for TimeEntryResponse {
@@ -1400,6 +1422,10 @@ impl From<TimeEntryRow> for TimeEntryResponse {
                 .unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
+            ticket_number: r.ticket_number,
+            ticket_title: r.ticket_title,
+            project_name: r.project_name,
+            task_title: r.task_title,
         }
     }
 }
