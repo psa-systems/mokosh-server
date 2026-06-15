@@ -584,3 +584,203 @@ async fn non_owner_cannot_edit_or_delete_time_entry(pool: PgPool) {
         admin_delete.status()
     );
 }
+
+/// PMS-332: the time-entry response carries joined work-item names. A
+/// ticket-linked entry returns ticket_number + ticket_title (null project/
+/// task); a project+task entry returns project_name + task_title (null
+/// ticket). Exercised over HTTP through both the get and list read paths.
+#[sqlx::test]
+async fn time_entry_response_carries_work_item_names(pool: PgPool) {
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let work_types: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/work-types"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("work types")
+        .json()
+        .await
+        .expect("work types JSON");
+    let work_type_id = work_types["data"][0]["id"].as_str().expect("a work type");
+
+    // A ticket, a project, and a task to link against.
+    let ticket: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Printer down",
+            "company_id": company_id,
+            "description": "PCL errors.",
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket")
+        .json()
+        .await
+        .expect("ticket JSON");
+    let ticket_id = ticket["id"].as_str().expect("ticket id");
+
+    let project: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/projects"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Delivery", "company_id": company_id, "status": "active" }))
+        .send()
+        .await
+        .expect("create project")
+        .json()
+        .await
+        .expect("project JSON");
+    let project_id = project["id"].as_str().expect("project id").to_string();
+
+    let statuses: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/task-statuses"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("task statuses")
+        .json()
+        .await
+        .expect("statuses JSON");
+    let status_id = statuses["data"][0]["id"].as_str().expect("a task status");
+    let task: serde_json::Value = app
+        .client
+        .post(app.url(&format!("/api/v1/projects/{project_id}/tasks")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "title": "Build", "status_id": status_id }))
+        .send()
+        .await
+        .expect("create task")
+        .json()
+        .await
+        .expect("task JSON");
+    let task_id = task["id"].as_str().expect("task id");
+
+    // Helper: POST a time entry and return its created response.
+    let create_entry = |body: serde_json::Value| {
+        let app = &app;
+        let token = &token;
+        async move {
+            app.client
+                .post(app.url("/api/v1/time-entries"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("create entry")
+                .json::<serde_json::Value>()
+                .await
+                .expect("entry JSON")
+        }
+    };
+
+    // Ticket-linked entry: ticket name present, project/task null.
+    let ticket_entry = create_entry(serde_json::json!({
+        "user_id": admin_id,
+        "date": "2026-03-02",
+        "duration_minutes": 60,
+        "work_type_id": work_type_id,
+        "ticket_id": ticket_id,
+        "company_id": company_id,
+    }))
+    .await;
+    let ticket_entry_id = ticket_entry["id"].as_str().expect("entry id").to_string();
+
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/time-entries/{ticket_entry_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get ticket entry")
+        .json()
+        .await
+        .expect("entry JSON");
+    assert!(
+        got["ticket_number"].as_str().is_some(),
+        "ticket entry carries a ticket_number"
+    );
+    assert_eq!(
+        got["ticket_title"].as_str(),
+        Some("Printer down"),
+        "ticket entry carries the ticket title"
+    );
+    assert!(
+        got["project_name"].is_null(),
+        "no project link -> null name"
+    );
+    assert!(got["task_title"].is_null(), "no task link -> null title");
+
+    // Project + task entry: project/task names present, ticket null.
+    let project_entry = create_entry(serde_json::json!({
+        "user_id": admin_id,
+        "date": "2026-03-03",
+        "duration_minutes": 90,
+        "work_type_id": work_type_id,
+        "project_id": project_id,
+        "task_id": task_id,
+        "company_id": company_id,
+    }))
+    .await;
+    let project_entry_id = project_entry["id"].as_str().expect("entry id").to_string();
+
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/time-entries/{project_entry_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get project entry")
+        .json()
+        .await
+        .expect("entry JSON");
+    assert_eq!(
+        got["project_name"].as_str(),
+        Some("Delivery"),
+        "project entry carries the project name"
+    );
+    assert_eq!(
+        got["task_title"].as_str(),
+        Some("Build"),
+        "project entry carries the task title"
+    );
+    assert!(
+        got["ticket_number"].is_null(),
+        "no ticket link -> null number"
+    );
+    assert!(
+        got["ticket_title"].is_null(),
+        "no ticket link -> null title"
+    );
+
+    // The list read path carries the same joined names.
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/time-entries"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list entries")
+        .json()
+        .await
+        .expect("list JSON");
+    let rows = list["data"].as_array().expect("list data");
+    let listed_ticket = rows
+        .iter()
+        .find(|e| e["id"].as_str() == Some(ticket_entry_id.as_str()))
+        .expect("ticket entry listed");
+    assert_eq!(listed_ticket["ticket_title"].as_str(), Some("Printer down"));
+    let listed_project = rows
+        .iter()
+        .find(|e| e["id"].as_str() == Some(project_entry_id.as_str()))
+        .expect("project entry listed");
+    assert_eq!(listed_project["task_title"].as_str(), Some("Build"));
+}
