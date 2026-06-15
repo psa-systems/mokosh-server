@@ -314,3 +314,273 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
         "withdrawing an approved timesheet must be rejected"
     );
 }
+
+// ============================================================================
+// PMS-328: PUT /time-entries preserves task_id, and the read paths expose it.
+// ============================================================================
+
+use mokosh_server::modules::auth::TenantId;
+use mokosh_server::modules::time_tracking::{
+    CreateTimeEntryRequest, TimeTrackingService, UpdateTimeEntryRequest,
+};
+use mokosh_server::Database;
+
+/// Fetch the default tenant's first seeded work type, needed to classify a
+/// service-level time entry.
+async fn seeded_work_type(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM work_types WHERE tenant_id = $1 ORDER BY sort_order LIMIT 1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(pool)
+        .await
+        .expect("seeded work type")
+}
+
+/// Build a create request for the default tenant with a given task link.
+fn create_req(
+    user_id: Uuid,
+    work_type_id: Uuid,
+    company_id: Uuid,
+    task_id: Option<Uuid>,
+) -> CreateTimeEntryRequest {
+    CreateTimeEntryRequest {
+        user_id,
+        date: chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        start_time: None,
+        end_time: None,
+        duration_minutes: Some(60),
+        work_type_id,
+        ticket_id: None,
+        project_id: None,
+        task_id,
+        company_id,
+        notes: Some("initial".to_string()),
+        is_billable: true,
+        hourly_rate: None,
+    }
+}
+
+/// An update that touches only `notes`, omitting every other field.
+fn notes_only_update(notes: &str) -> UpdateTimeEntryRequest {
+    UpdateTimeEntryRequest {
+        date: None,
+        start_time: None,
+        end_time: None,
+        duration_minutes: None,
+        work_type_id: None,
+        ticket_id: None,
+        project_id: None,
+        task_id: None,
+        notes: Some(notes.to_string()),
+        is_billable: None,
+        hourly_rate: None,
+    }
+}
+
+/// AC1: a partial PUT that omits `task_id` leaves the existing link intact.
+#[sqlx::test]
+async fn update_preserves_task_id_when_omitted(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let task_id = Uuid::new_v4();
+    let created = svc
+        .create_time_entry(
+            tenant,
+            &create_req(user_id, work_type_id, company_id, Some(task_id)),
+        )
+        .await
+        .expect("create entry with task");
+    assert_eq!(created.task_id, Some(task_id), "create keeps the task link");
+
+    let updated = svc
+        .update_time_entry(tenant, created.id, &notes_only_update("edited"))
+        .await
+        .expect("update notes only");
+    assert_eq!(
+        updated.task_id,
+        Some(task_id),
+        "omitting task_id must preserve the existing link, not wipe it"
+    );
+    assert_eq!(updated.notes.as_deref(), Some("edited"));
+}
+
+/// AC3 (change): sending an explicit `task_id` reassigns the link.
+#[sqlx::test]
+async fn update_with_explicit_task_id_changes_link(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let first = Uuid::new_v4();
+    let created = svc
+        .create_time_entry(
+            tenant,
+            &create_req(user_id, work_type_id, company_id, Some(first)),
+        )
+        .await
+        .expect("create entry");
+
+    let second = Uuid::new_v4();
+    let mut req = notes_only_update("retask");
+    req.task_id = Some(second);
+    let updated = svc
+        .update_time_entry(tenant, created.id, &req)
+        .await
+        .expect("update task link");
+    assert_eq!(
+        updated.task_id,
+        Some(second),
+        "an explicit task_id must replace the prior link"
+    );
+}
+
+/// AC2: the get and list read paths surface `task_id`.
+#[sqlx::test]
+async fn read_paths_expose_task_id(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let task_id = Uuid::new_v4();
+    let created = svc
+        .create_time_entry(
+            tenant,
+            &create_req(user_id, work_type_id, company_id, Some(task_id)),
+        )
+        .await
+        .expect("create entry");
+
+    let got = svc.get_time_entry(tenant, created.id).await.expect("get");
+    assert_eq!(got.task_id, Some(task_id), "get exposes task_id");
+
+    let filter = mokosh_server::modules::time_tracking::TimeEntryFilter::default();
+    let pagination = mokosh_server::utils::pagination::PaginationParams::default();
+    let (items, _) = svc
+        .list_time_entries(tenant, &filter, &pagination)
+        .await
+        .expect("list");
+    let listed = items
+        .iter()
+        .find(|e| e.id == created.id)
+        .expect("entry in list");
+    assert_eq!(listed.task_id, Some(task_id), "list exposes task_id");
+}
+
+/// PMS-328 (auth gate): edit/delete of a time entry is restricted to the
+/// entry's owner or an admin. A second technician must not be able to edit or
+/// delete an entry they do not own, while the owner and an admin can.
+#[sqlx::test]
+async fn non_owner_cannot_edit_or_delete_time_entry(pool: PgPool) {
+    let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+    let (_a_id, a_email, a_pw) = seed_technician(&pool).await;
+    let (_b_id, b_email, b_pw) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech-b@example.com",
+        "technician",
+    )
+    .await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+
+    let admin_token = common::login(&app, &admin_email, &admin_pw).await;
+    let a_token = common::login(&app, &a_email, &a_pw).await;
+    let b_token = common::login(&app, &b_email, &b_pw).await;
+
+    let work_types: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/work-types"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("list work types")
+        .json()
+        .await
+        .expect("work types JSON");
+    let work_type_id = work_types["data"][0]["id"].as_str().expect("a work type");
+
+    // Technician A logs an entry for themselves.
+    let entry: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/time-entries"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({
+            "user_id": _a_id,
+            "date": "2026-06-15",
+            "duration_minutes": 60,
+            "work_type_id": work_type_id,
+            "company_id": company_id,
+        }))
+        .send()
+        .await
+        .expect("create entry")
+        .json()
+        .await
+        .expect("entry JSON");
+    let entry_id = entry["id"].as_str().expect("entry id");
+
+    // Technician B cannot edit A's entry.
+    let b_edit = app
+        .client
+        .put(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&b_token)
+        .json(&serde_json::json!({ "notes": "not mine" }))
+        .send()
+        .await
+        .expect("B edit attempt");
+    assert_eq!(
+        b_edit.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a non-owner technician must not edit another user's entry"
+    );
+
+    // Technician B cannot delete A's entry.
+    let b_delete = app
+        .client
+        .delete(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&b_token)
+        .send()
+        .await
+        .expect("B delete attempt");
+    assert_eq!(
+        b_delete.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a non-owner technician must not delete another user's entry"
+    );
+
+    // The owner can edit their own entry.
+    let a_edit = app
+        .client
+        .put(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({ "notes": "mine, edited" }))
+        .send()
+        .await
+        .expect("owner edit");
+    assert_eq!(
+        a_edit.status(),
+        reqwest::StatusCode::OK,
+        "the owner can edit their own entry"
+    );
+
+    // An admin can delete any entry in the tenant.
+    let admin_delete = app
+        .client
+        .delete(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("admin delete");
+    assert!(
+        admin_delete.status().is_success(),
+        "an admin can delete any entry, got {}",
+        admin_delete.status()
+    );
+}

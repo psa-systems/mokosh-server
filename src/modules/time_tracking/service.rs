@@ -225,7 +225,7 @@ impl TimeTrackingService {
         let query = format!(
             r#"
             SELECT id, user_id, date, start_time, end_time, duration_minutes,
-                   work_type_id, ticket_id, project_id, company_id, notes,
+                   work_type_id, ticket_id, project_id, task_id, company_id, notes,
                    is_billable, billing_status, hourly_rate, total_amount,
                    approval_status, created_at, updated_at
             FROM time_entries
@@ -335,7 +335,7 @@ impl TimeTrackingService {
         let row = sqlx::query_as::<_, TimeEntryRow>(
             r#"
             SELECT id, user_id, date, start_time, end_time, duration_minutes,
-                   work_type_id, ticket_id, project_id, company_id, notes,
+                   work_type_id, ticket_id, project_id, task_id, company_id, notes,
                    is_billable, billing_status, hourly_rate, total_amount,
                    approval_status, created_at, updated_at
             FROM time_entries
@@ -391,7 +391,7 @@ impl TimeTrackingService {
                 is_billable       = COALESCE($11, is_billable),
                 hourly_rate       = $12,
                 total_amount      = $13,
-                task_id           = $14,
+                task_id           = COALESCE($14, task_id),
                 updated_at        = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -1358,6 +1358,7 @@ struct TimeEntryRow {
     work_type_id: Uuid,
     ticket_id: Option<Uuid>,
     project_id: Option<Uuid>,
+    task_id: Option<Uuid>,
     company_id: Uuid,
     notes: Option<String>,
     is_billable: Option<bool>,
@@ -1381,6 +1382,7 @@ impl From<TimeEntryRow> for TimeEntryResponse {
             work_type_id: r.work_type_id,
             ticket_id: r.ticket_id,
             project_id: r.project_id,
+            task_id: r.task_id,
             company_id: r.company_id,
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
