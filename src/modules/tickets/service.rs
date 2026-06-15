@@ -1606,6 +1606,40 @@ impl TicketService {
         }
         self.validate_fk_opt(tenant_id, "ticket_categories", request.parent_id)
             .await?;
+        // Reject a parent that would form a cycle: if `id` already sits among
+        // the proposed parent's ancestors, re-parenting under it closes a loop
+        // (A -> B -> C -> A) and any tree walk over `parent_id` would never
+        // terminate. The depth-1 self-parent case above is the trivial member
+        // of this set; this CTE covers the transitive cases.
+        if let Some(parent_id) = request.parent_id {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            let forms_cycle: bool = sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE ancestors AS (
+                    SELECT id, parent_id
+                    FROM ticket_categories
+                    WHERE tenant_id = $1 AND id = $2
+                    UNION ALL
+                    SELECT c.id, c.parent_id
+                    FROM ticket_categories c
+                    JOIN ancestors a ON c.id = a.parent_id
+                    WHERE c.tenant_id = $1
+                )
+                SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = $3)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(parent_id)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            drop(tx);
+            if forms_cycle {
+                return Err(AppError::BadRequest(
+                    "Cannot set parent: it would create a category cycle".to_string(),
+                ));
+            }
+        }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE ticket_categories

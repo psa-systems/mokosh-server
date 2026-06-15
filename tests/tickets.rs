@@ -613,3 +613,139 @@ async fn non_admin_cannot_mutate_lookups(pool: PgPool) {
         "a technician must not create a status"
     );
 }
+
+/// Priority create + update exercises the `sla_multiplier` f64 -> DECIMAL(3,2)
+/// binding (the lookup whose numeric column is most likely to trip an
+/// encode/decode mismatch) and the priority default-clearing invariant.
+#[sqlx::test]
+async fn lookup_priority_crud_and_default(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // CREATE with a non-integer multiplier and default flag.
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets/priorities"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Critical",
+            "color": "#ff0000",
+            "icon": "alert",
+            "sla_multiplier": 1.5,
+            "is_default": true,
+        }))
+        .send()
+        .await
+        .expect("send create priority")
+        .json()
+        .await
+        .expect("create priority JSON");
+    let priority_id = created["id"].as_str().expect("priority id").to_string();
+    assert_eq!(created["sla_multiplier"].as_f64(), Some(1.5));
+
+    // The new priority is now the sole default.
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tickets/priorities?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list priorities")
+        .json()
+        .await
+        .expect("list priorities JSON");
+    let defaults = list["data"]
+        .as_array()
+        .expect("priorities data")
+        .iter()
+        .filter(|p| p["is_default"].as_bool() == Some(true))
+        .count();
+    assert_eq!(defaults, 1, "exactly one default priority");
+
+    // UPDATE round-trips the multiplier.
+    let updated: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/priorities/{priority_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Critical",
+            "color": "#ee0000",
+            "sla_multiplier": 2.25,
+            "is_default": true,
+        }))
+        .send()
+        .await
+        .expect("send update priority")
+        .json()
+        .await
+        .expect("update priority JSON");
+    assert_eq!(updated["sla_multiplier"].as_f64(), Some(2.25));
+
+    // An out-of-range multiplier (> DECIMAL(3,2) max) is rejected by request
+    // validation (422) before it can reach Postgres, never a 500.
+    let bad = app
+        .client
+        .post(app.url("/api/v1/tickets/priorities"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Overflow",
+            "color": "#000000",
+            "sla_multiplier": 99.9,
+        }))
+        .send()
+        .await
+        .expect("send overflow priority");
+    assert_eq!(
+        bad.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "an over-range sla_multiplier must be a validation 422, not a 500"
+    );
+}
+
+/// A transitive parent cycle (A -> B, then re-parent A under B) is rejected,
+/// not just the depth-1 self-parent case.
+#[sqlx::test]
+async fn category_transitive_cycle_rejected(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let mk = |body: serde_json::Value| {
+        let app = &app;
+        let token = &token;
+        async move {
+            app.client
+                .post(app.url("/api/v1/tickets/categories"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("send create category")
+                .json::<serde_json::Value>()
+                .await
+                .expect("category JSON")
+        }
+    };
+
+    // A is the root; B is a child of A.
+    let a = mk(serde_json::json!({ "name": "A" })).await;
+    let a_id = a["id"].as_str().expect("a id").to_string();
+    let b = mk(serde_json::json!({ "name": "B", "parent_id": a_id })).await;
+    let b_id = b["id"].as_str().expect("b id").to_string();
+
+    // Re-parenting A under B (its own descendant) would close a cycle.
+    let cycle = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/categories/{a_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "A", "parent_id": b_id }))
+        .send()
+        .await
+        .expect("send cycle update");
+    assert_eq!(
+        cycle.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a transitive parent cycle must 400"
+    );
+}
