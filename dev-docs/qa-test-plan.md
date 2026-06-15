@@ -108,6 +108,9 @@ You are done only when:
 - Relationship/secondary features that are easy to skip: KB categories and tags, tag search, project tasks/milestones, invoice line items, contract type-specific fields.
 - Backend inputs that violate DB constraints surfacing as 500 instead of 4xx; inconsistent error envelopes; missing length/URL validation; certain enum values (e.g. contract types recurring/retainer) crashing on create.
 - Stored-XSS via URL fields rendered into href attributes.
+- Numeric/Decimal money & hours fields: the API may accept only a string OR only a JSON number for a `Decimal`, so the exact wire form the UI sends can 422 in the JSON extractor BEFORE validation runs (e.g. project Budget Hours posted as a number). Test the payload the form actually sends, and confirm > 2 decimal places, negatives, and out-of-column-range values are rejected with a field 422 (not silently rounded, not a 500).
+- Phone / time zone / country / postal validation: phone should normalize formatting then enforce E.164; time zone must be a valid IANA name (reject "America/New York" with a space); country must be an ISO 3166-1 alpha-2 code; postal a sane charset/length. Confirm each bad value is a field 422, never a 500 or silent accept.
+- Edit controls present where expected: every entity that can be created should be editable. Flag detail pages that render data but offer no working Edit control.
 ```
 
 ## Reference: issues filed during the initial pass
@@ -124,3 +127,5 @@ These are the defects this plan grew out of; check them before re-filing.
 - PMS-297 - company create: DB-constraint-violating input returns 500 instead of 4xx; missing length/URL validation on website.
 - PMS-298 - inconsistent error envelope: deserialization errors return raw serde plaintext; empty validation messages.
 - PMS-299 - creating a contract with type `recurring` or `retainer` returns 500 DATABASE_ERROR.
+- PMS-324 / MAPPS-176 - project create/edit: Budget Hours 422 (client posts JSON numbers; server `Decimal` accepted only strings), plus no Name length cap and no budget range/scale validation. Server + client fixes.
+- PMS-325 / MAPPS-177 - contacts/companies/sites: phone (normalize + E.164), time zone (IANA), country (ISO 3166-1 alpha-2), and postal validation added; contact phone previously 500. Server + client fixes.
