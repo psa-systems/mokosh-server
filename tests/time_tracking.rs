@@ -472,3 +472,115 @@ async fn read_paths_expose_task_id(pool: PgPool) {
         .expect("entry in list");
     assert_eq!(listed.task_id, Some(task_id), "list exposes task_id");
 }
+
+/// PMS-328 (auth gate): edit/delete of a time entry is restricted to the
+/// entry's owner or an admin. A second technician must not be able to edit or
+/// delete an entry they do not own, while the owner and an admin can.
+#[sqlx::test]
+async fn non_owner_cannot_edit_or_delete_time_entry(pool: PgPool) {
+    let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+    let (_a_id, a_email, a_pw) = seed_technician(&pool).await;
+    let (_b_id, b_email, b_pw) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech-b@example.com",
+        "technician",
+    )
+    .await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+
+    let admin_token = common::login(&app, &admin_email, &admin_pw).await;
+    let a_token = common::login(&app, &a_email, &a_pw).await;
+    let b_token = common::login(&app, &b_email, &b_pw).await;
+
+    let work_types: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/work-types"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("list work types")
+        .json()
+        .await
+        .expect("work types JSON");
+    let work_type_id = work_types["data"][0]["id"].as_str().expect("a work type");
+
+    // Technician A logs an entry for themselves.
+    let entry: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/time-entries"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({
+            "user_id": _a_id,
+            "date": "2026-06-15",
+            "duration_minutes": 60,
+            "work_type_id": work_type_id,
+            "company_id": company_id,
+        }))
+        .send()
+        .await
+        .expect("create entry")
+        .json()
+        .await
+        .expect("entry JSON");
+    let entry_id = entry["id"].as_str().expect("entry id");
+
+    // Technician B cannot edit A's entry.
+    let b_edit = app
+        .client
+        .put(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&b_token)
+        .json(&serde_json::json!({ "notes": "not mine" }))
+        .send()
+        .await
+        .expect("B edit attempt");
+    assert_eq!(
+        b_edit.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a non-owner technician must not edit another user's entry"
+    );
+
+    // Technician B cannot delete A's entry.
+    let b_delete = app
+        .client
+        .delete(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&b_token)
+        .send()
+        .await
+        .expect("B delete attempt");
+    assert_eq!(
+        b_delete.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a non-owner technician must not delete another user's entry"
+    );
+
+    // The owner can edit their own entry.
+    let a_edit = app
+        .client
+        .put(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({ "notes": "mine, edited" }))
+        .send()
+        .await
+        .expect("owner edit");
+    assert_eq!(
+        a_edit.status(),
+        reqwest::StatusCode::OK,
+        "the owner can edit their own entry"
+    );
+
+    // An admin can delete any entry in the tenant.
+    let admin_delete = app
+        .client
+        .delete(app.url(&format!("/api/v1/time-entries/{entry_id}")))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("admin delete");
+    assert!(
+        admin_delete.status().is_success(),
+        "an admin can delete any entry, got {}",
+        admin_delete.status()
+    );
+}

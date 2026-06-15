@@ -193,6 +193,13 @@ async fn update_time_entry(
     Json(request): Json<UpdateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
     request.validate()?;
+    // A non-admin can only edit their own entry; an unknown id 404s first.
+    let existing = state.service.get_time_entry(user.tenant(), id).await?;
+    if !user.role.is_admin() && existing.user_id != user.id {
+        return Err(crate::utils::error::AppError::Forbidden(
+            "Cannot edit another user's time entry".to_string(),
+        ));
+    }
     Ok(Json(
         state
             .service
@@ -206,6 +213,13 @@ async fn delete_time_entry(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
+    // A non-admin can only delete their own entry; an unknown id 404s first.
+    let existing = state.service.get_time_entry(user.tenant(), id).await?;
+    if !user.role.is_admin() && existing.user_id != user.id {
+        return Err(crate::utils::error::AppError::Forbidden(
+            "Cannot delete another user's time entry".to_string(),
+        ));
+    }
     state.service.delete_time_entry(user.tenant(), id).await
 }
 
