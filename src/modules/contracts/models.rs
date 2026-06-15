@@ -46,12 +46,14 @@ pub struct CreateContractRequest {
     #[validate(custom(function = crate::utils::validation::validate_contract_type))]
     pub contract_type: String,
     #[serde(default = "default_draft")]
+    #[validate(custom(function = crate::utils::validation::validate_contract_status))]
     pub status: String,
     pub start_date: NaiveDate,
     pub end_date: Option<NaiveDate>,
     #[serde(default)]
     pub auto_renew: bool,
     #[serde(default = "default_monthly")]
+    #[validate(custom(function = crate::utils::validation::validate_billing_cycle))]
     pub billing_cycle: String,
     pub billing_amount: Option<Decimal>,
     pub sla_id: Option<Uuid>,
@@ -88,9 +90,11 @@ fn validate_contract_date_range(
 pub struct UpdateContractRequest {
     pub contract_number: Option<String>,
     pub name: Option<String>,
+    #[validate(custom(function = crate::utils::validation::validate_contract_status))]
     pub status: Option<String>,
     pub end_date: Option<NaiveDate>,
     pub auto_renew: Option<bool>,
+    #[validate(custom(function = crate::utils::validation::validate_billing_cycle))]
     pub billing_cycle: Option<String>,
     pub billing_amount: Option<Decimal>,
     pub sla_id: Option<Uuid>,
@@ -236,6 +240,62 @@ mod tests {
         // Open-ended contract (no end date) is allowed.
         let open = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
         assert!(open.validate().is_ok());
+    }
+
+    #[test]
+    fn create_rejects_out_of_set_status_and_billing_cycle() {
+        // PMS-337: an out-of-set value must be a 422 at the request layer,
+        // not a 500 from the DB CHECK constraint.
+        let mut bad_status = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
+        bad_status.status = "pending".into();
+        assert!(bad_status.validate().is_err());
+
+        let mut bad_cycle = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
+        bad_cycle.billing_cycle = "weekly".into();
+        assert!(bad_cycle.validate().is_err());
+    }
+
+    #[test]
+    fn create_accepts_in_set_status_and_billing_cycle() {
+        let mut req = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
+        req.status = "active".into();
+        req.billing_cycle = "quarterly".into();
+        assert!(req.validate().is_ok());
+    }
+
+    fn base_update() -> UpdateContractRequest {
+        UpdateContractRequest {
+            contract_number: None,
+            name: None,
+            status: None,
+            end_date: None,
+            auto_renew: None,
+            billing_cycle: None,
+            billing_amount: None,
+            sla_id: None,
+            signed_date: None,
+            signed_by_contact_id: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn update_validates_optional_status_and_billing_cycle() {
+        // PMS-337: None skips the check; an out-of-set Some is rejected.
+        assert!(base_update().validate().is_ok());
+
+        let mut bad_status = base_update();
+        bad_status.status = Some("pending".into());
+        assert!(bad_status.validate().is_err());
+
+        let mut bad_cycle = base_update();
+        bad_cycle.billing_cycle = Some("weekly".into());
+        assert!(bad_cycle.validate().is_err());
+
+        let mut ok = base_update();
+        ok.status = Some("renewed".into());
+        ok.billing_cycle = Some("annually".into());
+        assert!(ok.validate().is_ok());
     }
 }
 
