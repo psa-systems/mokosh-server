@@ -89,6 +89,10 @@ pub struct TimeEntryResponse {
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+    /// Optional link to a project task (PMS-51). Exposed so a client editing
+    /// an entry can read and re-send the current task link; a partial PUT that
+    /// omits `task_id` preserves it server-side (PMS-328).
+    pub task_id: Option<Uuid>,
     pub company_id: Uuid,
     pub notes: Option<String>,
     pub is_billable: bool,
