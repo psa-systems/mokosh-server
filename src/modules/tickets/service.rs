@@ -1137,6 +1137,591 @@ impl TicketService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // ========================================================================
+    // LOOKUP MANAGEMENT (PMS-321)
+    //
+    // Create/update/delete for the ticket lookup tables, mirroring the
+    // asset-type CRUD. All tenant-scoped; the routes admin-gate the mutations.
+    // For the `is_default` lookups (statuses, priorities, queues) setting a new
+    // default clears the prior default in the SAME transaction so a tenant
+    // never has two defaults. Deletes catch the FK violation a still-referenced
+    // row raises (SQLSTATE 23503) and surface it as a 409 instead of a 500.
+    // ========================================================================
+
+    /// Create a ticket status.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_status(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertTicketStatusRequest,
+    ) -> AppResult<TicketStatus> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE ticket_statuses SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE")
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            r#"INSERT INTO ticket_statuses (id, tenant_id, name, color, is_closed, is_default, sort_order)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(&request.color)
+        .bind(request.is_closed)
+        .bind(request.is_default)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(TicketStatus {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            color: request.color.clone(),
+            is_closed: request.is_closed,
+            is_default: request.is_default,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Update a ticket status. 404 when absent in this tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_status(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertTicketStatusRequest,
+    ) -> AppResult<TicketStatus> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE ticket_statuses SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE AND id <> $2")
+                .bind(tenant_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let n = sqlx::query(
+            r#"UPDATE ticket_statuses
+               SET name = $3, color = $4, is_closed = $5, is_default = $6, sort_order = $7, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.color)
+        .bind(request.is_closed)
+        .bind(request.is_default)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("TicketStatus".to_string()));
+        }
+        tx.commit().await?;
+        Ok(TicketStatus {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            color: request.color.clone(),
+            is_closed: request.is_closed,
+            is_default: request.is_default,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Delete a ticket status. 409 if still referenced by a ticket.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_status(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        self.delete_lookup(tenant_id, "ticket_statuses", id, "TicketStatus", "status")
+            .await
+    }
+
+    /// Create a ticket priority.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_priority(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertTicketPriorityRequest,
+    ) -> AppResult<TicketPriority> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE ticket_priorities SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE")
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            r#"INSERT INTO ticket_priorities (id, tenant_id, name, color, icon, sla_multiplier, sort_order, is_default)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(&request.color)
+        .bind(&request.icon)
+        .bind(request.sla_multiplier)
+        .bind(request.sort_order)
+        .bind(request.is_default)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(TicketPriority {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            color: request.color.clone(),
+            icon: request.icon.clone(),
+            sla_multiplier: request.sla_multiplier,
+            sort_order: request.sort_order,
+            is_default: request.is_default,
+        })
+    }
+
+    /// Update a ticket priority. 404 when absent in this tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_priority(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertTicketPriorityRequest,
+    ) -> AppResult<TicketPriority> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE ticket_priorities SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE AND id <> $2")
+                .bind(tenant_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let n = sqlx::query(
+            r#"UPDATE ticket_priorities
+               SET name = $3, color = $4, icon = $5, sla_multiplier = $6, sort_order = $7, is_default = $8, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.color)
+        .bind(&request.icon)
+        .bind(request.sla_multiplier)
+        .bind(request.sort_order)
+        .bind(request.is_default)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("TicketPriority".to_string()));
+        }
+        tx.commit().await?;
+        Ok(TicketPriority {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            color: request.color.clone(),
+            icon: request.icon.clone(),
+            sla_multiplier: request.sla_multiplier,
+            sort_order: request.sort_order,
+            is_default: request.is_default,
+        })
+    }
+
+    /// Delete a ticket priority. 409 if still referenced by a ticket.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_priority(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        self.delete_lookup(
+            tenant_id,
+            "ticket_priorities",
+            id,
+            "TicketPriority",
+            "priority",
+        )
+        .await
+    }
+
+    /// Create a ticket type.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_type(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertTicketTypeRequest,
+    ) -> AppResult<TicketType> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"INSERT INTO ticket_types (id, tenant_id, name, description, icon, is_active, sort_order)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(&request.icon)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(TicketType {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            description: request.description.clone(),
+            icon: request.icon.clone(),
+            is_active: request.is_active,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Update a ticket type. 404 when absent in this tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_type(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertTicketTypeRequest,
+    ) -> AppResult<TicketType> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query(
+            r#"UPDATE ticket_types
+               SET name = $3, description = $4, icon = $5, is_active = $6, sort_order = $7, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(&request.icon)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("TicketType".to_string()));
+        }
+        tx.commit().await?;
+        Ok(TicketType {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            description: request.description.clone(),
+            icon: request.icon.clone(),
+            is_active: request.is_active,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Delete a ticket type. 409 if still referenced by a ticket.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        self.delete_lookup(tenant_id, "ticket_types", id, "TicketType", "type")
+            .await
+    }
+
+    /// Create a ticket queue.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_queue(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertTicketQueueRequest,
+    ) -> AppResult<TicketQueue> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE ticket_queues SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE")
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            r#"INSERT INTO ticket_queues (id, tenant_id, name, description, color, icon, is_default, sort_order)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(&request.color)
+        .bind(&request.icon)
+        .bind(request.is_default)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(TicketQueue {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            description: request.description.clone(),
+            color: request.color.clone(),
+            icon: request.icon.clone(),
+            is_default: request.is_default,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Update a ticket queue. 404 when absent in this tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_queue(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertTicketQueueRequest,
+    ) -> AppResult<TicketQueue> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE ticket_queues SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE AND id <> $2")
+                .bind(tenant_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let n = sqlx::query(
+            r#"UPDATE ticket_queues
+               SET name = $3, description = $4, color = $5, icon = $6, is_default = $7, sort_order = $8, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(&request.color)
+        .bind(&request.icon)
+        .bind(request.is_default)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("TicketQueue".to_string()));
+        }
+        tx.commit().await?;
+        Ok(TicketQueue {
+            id,
+            tenant_id: tenant_id.get(),
+            name: request.name.clone(),
+            description: request.description.clone(),
+            color: request.color.clone(),
+            icon: request.icon.clone(),
+            is_default: request.is_default,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Delete a ticket queue. 409 if still referenced by a ticket.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_queue(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        self.delete_lookup(tenant_id, "ticket_queues", id, "TicketQueue", "queue")
+            .await
+    }
+
+    /// List ticket categories for the tenant (hierarchical via `parent_id`).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_categories(
+        &self,
+        tenant_id: TenantId,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketCategoryResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ticket_categories WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        let rows = sqlx::query_as::<_, TicketCategoryRow>(
+            r#"
+            SELECT id, parent_id, name, description, is_active, sort_order
+            FROM ticket_categories
+            WHERE tenant_id = $1
+            ORDER BY sort_order, name
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// Create a ticket category. A `parent_id` must reference a category in
+    /// the same tenant (reuses the FK-validation path).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_category(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertTicketCategoryRequest,
+    ) -> AppResult<TicketCategoryResponse> {
+        self.validate_fk_opt(tenant_id, "ticket_categories", request.parent_id)
+            .await?;
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"INSERT INTO ticket_categories (id, tenant_id, parent_id, name, description, is_active, sort_order)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(request.parent_id)
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(TicketCategoryResponse {
+            id,
+            parent_id: request.parent_id,
+            name: request.name.clone(),
+            description: request.description.clone(),
+            is_active: request.is_active,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Update a ticket category. 404 when absent in this tenant; rejects a
+    /// `parent_id` that is not a same-tenant category or that points at the
+    /// category itself.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_category(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertTicketCategoryRequest,
+    ) -> AppResult<TicketCategoryResponse> {
+        if request.parent_id == Some(id) {
+            return Err(AppError::BadRequest(
+                "A category cannot be its own parent".to_string(),
+            ));
+        }
+        self.validate_fk_opt(tenant_id, "ticket_categories", request.parent_id)
+            .await?;
+        // Reject a parent that would form a cycle: if `id` already sits among
+        // the proposed parent's ancestors, re-parenting under it closes a loop
+        // (A -> B -> C -> A) and any tree walk over `parent_id` would never
+        // terminate. The depth-1 self-parent case above is the trivial member
+        // of this set; this CTE covers the transitive cases.
+        if let Some(parent_id) = request.parent_id {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            let forms_cycle: bool = sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE ancestors AS (
+                    SELECT id, parent_id
+                    FROM ticket_categories
+                    WHERE tenant_id = $1 AND id = $2
+                    UNION ALL
+                    SELECT c.id, c.parent_id
+                    FROM ticket_categories c
+                    JOIN ancestors a ON c.id = a.parent_id
+                    WHERE c.tenant_id = $1
+                )
+                SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = $3)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(parent_id)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            drop(tx);
+            if forms_cycle {
+                return Err(AppError::BadRequest(
+                    "Cannot set parent: it would create a category cycle".to_string(),
+                ));
+            }
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query(
+            r#"UPDATE ticket_categories
+               SET parent_id = $3, name = $4, description = $5, is_active = $6, sort_order = $7, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(request.parent_id)
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("TicketCategory".to_string()));
+        }
+        tx.commit().await?;
+        Ok(TicketCategoryResponse {
+            id,
+            parent_id: request.parent_id,
+            name: request.name.clone(),
+            description: request.description.clone(),
+            is_active: request.is_active,
+            sort_order: request.sort_order,
+        })
+    }
+
+    /// Delete a ticket category. 409 if still referenced by a ticket or a
+    /// child category.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_category(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        self.delete_lookup(
+            tenant_id,
+            "ticket_categories",
+            id,
+            "TicketCategory",
+            "category",
+        )
+        .await
+    }
+
+    /// Shared delete for a tenant-scoped lookup row. `table` and `kind` are
+    /// compile-time constants, never user input. Maps the FK violation a
+    /// still-referenced row raises (SQLSTATE 23503) to a 409, and a missing
+    /// row to a 404.
+    async fn delete_lookup(
+        &self,
+        tenant_id: TenantId,
+        table: &'static str,
+        id: Uuid,
+        not_found: &'static str,
+        kind: &'static str,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let result = sqlx::query(&format!(
+            "DELETE FROM {table} WHERE tenant_id = $1 AND id = $2"
+        ))
+        .bind(tenant_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await;
+        let n = match result {
+            Ok(r) => r.rows_affected(),
+            Err(e) => {
+                if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
+                    return Err(AppError::Conflict(format!(
+                        "Cannot delete this {kind}: it is still referenced by a ticket or child record"
+                    )));
+                }
+                return Err(e.into());
+            }
+        };
+        if n == 0 {
+            return Err(AppError::NotFound(not_found.to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Create a portal-originated ticket. Used by `POST
     /// /api/v1/portal/tickets`. Looks up an admin user in the tenant to
     /// satisfy the NOT NULL FK on `tickets.created_by_id` (portal
@@ -1803,6 +2388,29 @@ impl From<TicketTypeRow> for TicketType {
             name: row.name,
             description: row.description,
             icon: row.icon,
+            is_active: row.is_active,
+            sort_order: row.sort_order,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct TicketCategoryRow {
+    id: Uuid,
+    parent_id: Option<Uuid>,
+    name: String,
+    description: Option<String>,
+    is_active: bool,
+    sort_order: i32,
+}
+
+impl From<TicketCategoryRow> for TicketCategoryResponse {
+    fn from(row: TicketCategoryRow) -> Self {
+        Self {
+            id: row.id,
+            parent_id: row.parent_id,
+            name: row.name,
+            description: row.description,
             is_active: row.is_active,
             sort_order: row.sort_order,
         }

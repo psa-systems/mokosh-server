@@ -10,10 +10,12 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    CreateNoteRequest, CreateTicketRequest, TicketFilter, TicketNoteResponse, TicketPriority,
-    TicketQueue, TicketResponse, TicketService, TicketStatus, TicketType, UpdateTicketRequest,
+    CreateNoteRequest, CreateTicketRequest, TicketCategoryResponse, TicketFilter,
+    TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService, TicketStatus,
+    TicketType, UpdateTicketRequest, UpsertTicketCategoryRequest, UpsertTicketPriorityRequest,
+    UpsertTicketQueueRequest, UpsertTicketStatusRequest, UpsertTicketTypeRequest,
 };
-use crate::modules::auth::{RequireAuth, TenantScoped};
+use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -38,11 +40,24 @@ pub fn ticket_routes(ticket_service: TicketService) -> Router {
         .route("/{ticket_id}/assign", post(assign_ticket))
         .route("/{ticket_id}/notes", get(get_ticket_notes))
         .route("/{ticket_id}/notes", post(add_note))
-        // Configuration
-        .route("/statuses", get(get_statuses))
-        .route("/priorities", get(get_priorities))
-        .route("/queues", get(get_queues))
-        .route("/types", get(get_types))
+        // Configuration / lookup CRUD (PMS-321). GET handlers unchanged;
+        // mutations are admin-gated inside each handler.
+        .route("/statuses", get(get_statuses).post(create_status))
+        .route("/statuses/{id}", put(update_status).delete(delete_status))
+        .route("/priorities", get(get_priorities).post(create_priority))
+        .route(
+            "/priorities/{id}",
+            put(update_priority).delete(delete_priority),
+        )
+        .route("/queues", get(get_queues).post(create_queue))
+        .route("/queues/{id}", put(update_queue).delete(delete_queue))
+        .route("/types", get(get_types).post(create_type))
+        .route("/types/{id}", put(update_type).delete(delete_type))
+        .route("/categories", get(get_categories).post(create_category))
+        .route(
+            "/categories/{id}",
+            put(update_category).delete(delete_category),
+        )
         .with_state(state)
 }
 
@@ -265,4 +280,231 @@ async fn get_types(
         &pagination,
         total,
     )))
+}
+
+// ----------------------------------------------------------------------------
+// Lookup management (PMS-321). Mutations require admin (`RequireAdmin`),
+// matching the asset-type write routes; reads stay on `RequireAuth`.
+// ----------------------------------------------------------------------------
+
+async fn create_status(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Json(request): Json<UpsertTicketStatusRequest>,
+) -> AppResult<Json<TicketStatus>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .create_status(user.tenant(), &request)
+            .await?,
+    ))
+}
+
+async fn update_status(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertTicketStatusRequest>,
+) -> AppResult<Json<TicketStatus>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .update_status(user.tenant(), id, &request)
+            .await?,
+    ))
+}
+
+async fn delete_status(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state.ticket_service.delete_status(user.tenant(), id).await
+}
+
+async fn create_priority(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Json(request): Json<UpsertTicketPriorityRequest>,
+) -> AppResult<Json<TicketPriority>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .create_priority(user.tenant(), &request)
+            .await?,
+    ))
+}
+
+async fn update_priority(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertTicketPriorityRequest>,
+) -> AppResult<Json<TicketPriority>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .update_priority(user.tenant(), id, &request)
+            .await?,
+    ))
+}
+
+async fn delete_priority(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .ticket_service
+        .delete_priority(user.tenant(), id)
+        .await
+}
+
+async fn create_queue(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Json(request): Json<UpsertTicketQueueRequest>,
+) -> AppResult<Json<TicketQueue>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .create_queue(user.tenant(), &request)
+            .await?,
+    ))
+}
+
+async fn update_queue(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertTicketQueueRequest>,
+) -> AppResult<Json<TicketQueue>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .update_queue(user.tenant(), id, &request)
+            .await?,
+    ))
+}
+
+async fn delete_queue(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state.ticket_service.delete_queue(user.tenant(), id).await
+}
+
+async fn create_type(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Json(request): Json<UpsertTicketTypeRequest>,
+) -> AppResult<Json<TicketType>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .create_type(user.tenant(), &request)
+            .await?,
+    ))
+}
+
+async fn update_type(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertTicketTypeRequest>,
+) -> AppResult<Json<TicketType>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .update_type(user.tenant(), id, &request)
+            .await?,
+    ))
+}
+
+async fn delete_type(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state.ticket_service.delete_type(user.tenant(), id).await
+}
+
+async fn get_categories(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketCategoryResponse>>> {
+    let (categories, total) = state
+        .ticket_service
+        .get_categories(user.tenant(), &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        categories,
+        &pagination,
+        total,
+    )))
+}
+
+async fn create_category(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Json(request): Json<UpsertTicketCategoryRequest>,
+) -> AppResult<Json<TicketCategoryResponse>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .create_category(user.tenant(), &request)
+            .await?,
+    ))
+}
+
+async fn update_category(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertTicketCategoryRequest>,
+) -> AppResult<Json<TicketCategoryResponse>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .ticket_service
+            .update_category(user.tenant(), id, &request)
+            .await?,
+    ))
+}
+
+async fn delete_category(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .ticket_service
+        .delete_category(user.tenant(), id)
+        .await
 }

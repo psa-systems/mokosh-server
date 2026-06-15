@@ -185,6 +185,124 @@ pub struct TicketQueue {
 }
 
 // ============================================================================
+// TICKET CATEGORY
+// ============================================================================
+
+/// Hierarchical, tenant-scoped ticket category (`ticket_categories`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketCategory {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub sort_order: i32,
+}
+
+/// Wire-shaped category (drops `tenant_id`), mirroring the other lookup
+/// response DTOs (e.g. `AssetTypeResponse`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketCategoryResponse {
+    pub id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub sort_order: i32,
+}
+
+// ============================================================================
+// LOOKUP UPSERT REQUESTS (PMS-321)
+//
+// Create/update bodies for the ticket lookup tables. Lengths mirror the
+// column widths in migrations/005_tickets.sql so a too-long value is a 400
+// here rather than a 500 from Postgres. Each mirrors `UpsertAssetTypeRequest`.
+// ============================================================================
+
+fn default_sla_multiplier() -> f64 {
+    1.0
+}
+
+/// Create/update body for `ticket_statuses`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertTicketStatusRequest {
+    #[validate(length(min = 1, max = 50))]
+    pub name: String,
+    #[validate(length(min = 1, max = 7))]
+    pub color: String,
+    #[serde(default)]
+    pub is_closed: bool,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
+/// Create/update body for `ticket_priorities`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertTicketPriorityRequest {
+    #[validate(length(min = 1, max = 50))]
+    pub name: String,
+    #[validate(length(min = 1, max = 7))]
+    pub color: String,
+    #[validate(length(max = 50))]
+    pub icon: Option<String>,
+    /// `ticket_priorities.sla_multiplier` is `DECIMAL(3, 2)`, so the value
+    /// must fit in `[0, 9.99]`; reject out-of-range before Postgres does.
+    #[validate(range(min = 0.0, max = 9.99))]
+    #[serde(default = "default_sla_multiplier")]
+    pub sla_multiplier: f64,
+    #[serde(default)]
+    pub sort_order: i32,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// Create/update body for `ticket_types`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertTicketTypeRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: String,
+    pub description: Option<String>,
+    #[validate(length(max = 50))]
+    pub icon: Option<String>,
+    #[serde(default = "crate::default_true")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
+/// Create/update body for `ticket_queues`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertTicketQueueRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: String,
+    pub description: Option<String>,
+    #[validate(length(max = 7))]
+    pub color: Option<String>,
+    #[validate(length(max = 50))]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
+/// Create/update body for `ticket_categories`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertTicketCategoryRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: String,
+    pub description: Option<String>,
+    pub parent_id: Option<Uuid>,
+    #[serde(default = "crate::default_true")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
+// ============================================================================
 // TICKET
 // ============================================================================
 
