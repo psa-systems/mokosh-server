@@ -528,3 +528,226 @@ async fn task_and_project_edits_write_audit_rows(pool: PgPool) {
         "project edit must write an entity-scoped audit row"
     );
 }
+
+// ============================================================================
+// PMS-322: project_types lookup table + CRUD.
+// ============================================================================
+
+/// The migration seeds client/internal as system defaults; the lookup has full
+/// CRUD; and a newly created project resolves its project_type_id from the
+/// legacy string.
+#[sqlx::test]
+async fn project_types_seeded_crud_and_backfill(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company_id = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // Seeded system defaults present.
+    let list = get_json(&app, &token, "/api/v1/project-types?per_page=100").await;
+    let items = list["data"].as_array().expect("project-types data");
+    let client = items
+        .iter()
+        .find(|t| t["name"].as_str() == Some("client"))
+        .expect("seeded 'client' type");
+    assert_eq!(client["is_system"].as_bool(), Some(true));
+    assert_eq!(client["is_default"].as_bool(), Some(true));
+    assert!(
+        items
+            .iter()
+            .any(|t| t["name"].as_str() == Some("internal")
+                && t["is_system"].as_bool() == Some(true)),
+        "seeded 'internal' system type"
+    );
+
+    // CREATE a custom type.
+    let created = post(
+        &app,
+        &token,
+        "/api/v1/project-types",
+        serde_json::json!({ "name": "retainer", "sort_order": 5 }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+    let created: serde_json::Value = created.json().await.expect("create JSON");
+    let custom_id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(created["is_system"].as_bool(), Some(false));
+
+    // UPDATE it.
+    let updated = app
+        .client
+        .put(app.url(&format!("/api/v1/project-types/{custom_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "retainer", "is_active": false, "sort_order": 9 }))
+        .send()
+        .await
+        .expect("send update");
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let updated: serde_json::Value = updated.json().await.expect("update JSON");
+    assert_eq!(updated["is_active"].as_bool(), Some(false));
+    assert_eq!(
+        updated["is_system"].as_bool(),
+        Some(false),
+        "update must echo the stored is_system flag"
+    );
+
+    // A new project created with the legacy string resolves project_type_id.
+    let proj = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "P1", "company_id": company_id, "project_type": "client" }),
+    )
+    .await;
+    assert_eq!(proj.status(), reqwest::StatusCode::OK);
+    let proj: serde_json::Value = proj.json().await.expect("project JSON");
+    assert_eq!(proj["project_type"].as_str(), Some("client"));
+    assert_eq!(
+        proj["project_type_id"].as_str(),
+        client["id"].as_str(),
+        "new project must resolve project_type_id from the seeded client row"
+    );
+
+    // DELETE the custom type, then re-delete is 404.
+    let del = app
+        .client
+        .delete(app.url(&format!("/api/v1/project-types/{custom_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete");
+    assert!(
+        del.status().is_success(),
+        "delete custom type 2xx, got {}",
+        del.status()
+    );
+    let redel = app
+        .client
+        .delete(app.url(&format!("/api/v1/project-types/{custom_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send re-delete");
+    assert_eq!(redel.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// A system project type cannot be deleted via the API (409). A custom type
+/// still referenced by a project is also 409, not 500.
+#[sqlx::test]
+async fn project_type_delete_protections(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company_id = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // System row (client) is delete-protected.
+    let list = get_json(&app, &token, "/api/v1/project-types?per_page=100").await;
+    let client_id = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"].as_str() == Some("client"))
+        .and_then(|t| t["id"].as_str())
+        .expect("client id")
+        .to_string();
+    let del_system = app
+        .client
+        .delete(app.url(&format!("/api/v1/project-types/{client_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete system");
+    assert_eq!(
+        del_system.status(),
+        reqwest::StatusCode::CONFLICT,
+        "deleting a system project type must 409"
+    );
+
+    // Custom type referenced by a project is delete-blocked with 409.
+    post(
+        &app,
+        &token,
+        "/api/v1/project-types",
+        serde_json::json!({ "name": "special" }),
+    )
+    .await;
+    let custom_id = get_json(&app, &token, "/api/v1/project-types?per_page=100").await["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"].as_str() == Some("special"))
+        .and_then(|t| t["id"].as_str())
+        .expect("special id")
+        .to_string();
+    post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "P-special", "company_id": company_id, "project_type": "special" }),
+    )
+    .await;
+    let del_ref = app
+        .client
+        .delete(app.url(&format!("/api/v1/project-types/{custom_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete referenced");
+    assert_eq!(
+        del_ref.status(),
+        reqwest::StatusCode::CONFLICT,
+        "deleting a referenced project type must 409, not 500"
+    );
+}
+
+/// Setting a new default clears the prior default (seeded `client`).
+#[sqlx::test]
+async fn project_type_new_default_clears_prior(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    post(
+        &app,
+        &token,
+        "/api/v1/project-types",
+        serde_json::json!({ "name": "managed-services", "is_default": true }),
+    )
+    .await;
+    let list = get_json(&app, &token, "/api/v1/project-types?per_page=100").await;
+    let defaults: Vec<&serde_json::Value> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["is_default"].as_bool() == Some(true))
+        .collect();
+    assert_eq!(defaults.len(), 1, "exactly one default project type");
+    assert_eq!(defaults[0]["name"].as_str(), Some("managed-services"));
+}
+
+/// A non-admin (technician) is refused on the mutation routes.
+#[sqlx::test]
+async fn project_type_mutation_requires_admin(pool: PgPool) {
+    let (_id, email, pw) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "pt-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let create = post(
+        &app,
+        &token,
+        "/api/v1/project-types",
+        serde_json::json!({ "name": "nope" }),
+    )
+    .await;
+    assert_eq!(
+        create.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a technician must not create a project type"
+    );
+}

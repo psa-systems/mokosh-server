@@ -14,7 +14,12 @@ pub struct ProjectResponse {
     pub project_number: Option<String>,
     pub company_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
+    /// Legacy free-string classification, kept for one release (PMS-322).
+    /// Prefer `project_type_id`, which references the `project_types` lookup.
     pub project_type: String,
+    /// FK into the tenant-scoped `project_types` lookup. `None` only for rows
+    /// whose legacy `project_type` string had no matching lookup row.
+    pub project_type_id: Option<Uuid>,
     pub status: String,
     pub project_manager_id: Option<Uuid>,
     pub start_date: Option<NaiveDate>,
@@ -144,6 +149,33 @@ pub struct UpsertTaskStatusRequest {
     pub color: String,
     #[serde(default)]
     pub is_completed: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
+/// Wire shape for a `project_types` lookup row (PMS-322). `is_system` is
+/// read-only; the API sets it only on the seeded client/internal rows and
+/// refuses to delete a row that carries it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectTypeResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub is_default: bool,
+    pub is_active: bool,
+    pub sort_order: i32,
+    pub is_system: bool,
+}
+
+/// Create/update body for a `project_types` lookup row. `is_system` is not
+/// settable from the wire.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertProjectTypeRequest {
+    #[validate(length(min = 1, max = 50))]
+    pub name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
     #[serde(default)]
     pub sort_order: i32,
 }

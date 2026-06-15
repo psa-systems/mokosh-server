@@ -69,7 +69,7 @@ impl ProjectsService {
         let query = format!(
             r#"
             SELECT id, name, description, project_number, company_id, contract_id,
-                   project_type, status, project_manager_id, start_date,
+                   project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                              WHERE te.project_id = projects.id
@@ -119,10 +119,17 @@ impl ProjectsService {
             r#"
             INSERT INTO projects (
                 id, tenant_id, name, description, project_number, company_id,
-                contract_id, project_type, status, project_manager_id, start_date,
+                contract_id, project_type, project_type_id, status, project_manager_id, start_date,
                 target_end_date, budget_hours, budget_amount, billing_method,
                 hourly_rate, is_billable
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                -- Resolve the lookup id from the legacy string so new rows
+                -- carry project_type_id too (PMS-322); NULL if the tenant has
+                -- no matching type row.
+                (SELECT id FROM project_types WHERE tenant_id = $2 AND name = $8),
+                $9, $10, $11, $12, $13, $14, $15, $16, $17
+            )
             "#,
         )
         .bind(id)
@@ -154,7 +161,7 @@ impl ProjectsService {
         let row = sqlx::query_as::<_, ProjectRow>(
             r#"
             SELECT id, name, description, project_number, company_id, contract_id,
-                   project_type, status, project_manager_id, start_date,
+                   project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                              WHERE te.project_id = projects.id
@@ -507,6 +514,153 @@ impl ProjectsService {
     }
 
     // ========================================================================
+    // PMS-322 project types CRUD. Mirrors task_statuses, plus: one default per
+    // tenant (setting a new default clears the prior in the same tx), system
+    // rows cannot be deleted, and a delete blocked by a referencing project FK
+    // surfaces as a 409 instead of a 500.
+    // ========================================================================
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_project_types(
+        &self,
+        tenant_id: TenantId,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ProjectTypeResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_types WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        let rows = sqlx::query_as::<_, ProjectTypeRow>(
+            r#"SELECT id, name, is_default, is_active, sort_order, is_system
+               FROM project_types WHERE tenant_id = $1 ORDER BY sort_order, name
+               LIMIT $2 OFFSET $3"#,
+        )
+        .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_project_type(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertProjectTypeRequest,
+    ) -> AppResult<ProjectTypeResponse> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE project_types SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE")
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            r#"INSERT INTO project_types (id, tenant_id, name, is_default, is_active, sort_order)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(request.is_default)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ProjectTypeResponse {
+            id,
+            name: request.name.clone(),
+            is_default: request.is_default,
+            is_active: request.is_active,
+            sort_order: request.sort_order,
+            is_system: false,
+        })
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_project_type(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertProjectTypeRequest,
+    ) -> AppResult<ProjectTypeResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE project_types SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE AND id <> $2")
+                .bind(tenant_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // RETURNING is_system so we echo the stored (read-only) flag rather than
+        // guessing it.
+        let row: Option<ProjectTypeRow> = sqlx::query_as(
+            r#"UPDATE project_types
+               SET name = $3, is_default = $4, is_active = $5, sort_order = $6, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2
+               RETURNING id, name, is_default, is_active, sort_order, is_system"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(request.is_default)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(AppError::NotFound("ProjectType".to_string()));
+        };
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_project_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // A system row (the seeded client/internal values the code still depends
+        // on) cannot be deleted via the API. 404 first if the row is absent.
+        let is_system: Option<bool> = sqlx::query_scalar(
+            "SELECT is_system FROM project_types WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match is_system {
+            None => return Err(AppError::NotFound("ProjectType".to_string())),
+            Some(true) => {
+                return Err(AppError::Conflict(
+                    "Cannot delete a system project type".to_string(),
+                ))
+            }
+            Some(false) => {}
+        }
+        let result = sqlx::query("DELETE FROM project_types WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+        if let Err(e) = result {
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
+                return Err(AppError::Conflict(
+                    "Cannot delete this project type: it is still referenced by a project"
+                        .to_string(),
+                ));
+            }
+            return Err(e.into());
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ========================================================================
     // PMS-56 tasks CRUD
     // ========================================================================
 
@@ -793,6 +947,7 @@ struct ProjectRow {
     company_id: Option<Uuid>,
     contract_id: Option<Uuid>,
     project_type: String,
+    project_type_id: Option<Uuid>,
     status: String,
     project_manager_id: Option<Uuid>,
     start_date: Option<chrono::NaiveDate>,
@@ -819,6 +974,7 @@ impl From<ProjectRow> for ProjectResponse {
             company_id: r.company_id,
             contract_id: r.contract_id,
             project_type: r.project_type,
+            project_type_id: r.project_type_id,
             status: r.status,
             project_manager_id: r.project_manager_id,
             start_date: r.start_date,
@@ -883,6 +1039,29 @@ impl From<TaskStatusRow> for TaskStatusResponse {
             color: r.color,
             is_completed: r.is_completed.unwrap_or(false),
             sort_order: r.sort_order.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ProjectTypeRow {
+    id: Uuid,
+    name: String,
+    is_default: bool,
+    is_active: bool,
+    sort_order: i32,
+    is_system: bool,
+}
+
+impl From<ProjectTypeRow> for ProjectTypeResponse {
+    fn from(r: ProjectTypeRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            is_default: r.is_default,
+            is_active: r.is_active,
+            sort_order: r.sort_order,
+            is_system: r.is_system,
         }
     }
 }
