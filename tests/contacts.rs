@@ -172,7 +172,7 @@ async fn company_update_persists_all_fields(pool: PgPool) {
                 "city": "Austin",
                 "state": "TX",
                 "postal_code": "78701",
-                "country": "USA",
+                "country": "US",
             },
             "payment_terms": "net15",
             "tax_exempt": true,
@@ -190,7 +190,7 @@ async fn company_update_persists_all_fields(pool: PgPool) {
     assert_eq!(put_json["name"].as_str(), Some("Renamed"));
     assert_eq!(put_json["industry"].as_str(), Some("Healthcare"));
     assert_eq!(put_json["website"].as_str(), Some("https://example.com"));
-    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0300"));
+    assert_eq!(put_json["phone"].as_str(), Some("+15550300"));
     assert_eq!(
         put_json["address"]["line1"].as_str(),
         Some("123 Business Ave")
@@ -211,7 +211,7 @@ async fn company_update_persists_all_fields(pool: PgPool) {
     assert_eq!(get_json["name"].as_str(), Some("Renamed"));
     assert_eq!(get_json["industry"].as_str(), Some("Healthcare"));
     assert_eq!(get_json["website"].as_str(), Some("https://example.com"));
-    assert_eq!(get_json["phone"].as_str(), Some("+1 555 0300"));
+    assert_eq!(get_json["phone"].as_str(), Some("+15550300"));
     assert_eq!(
         get_json["address"]["line1"].as_str(),
         Some("123 Business Ave")
@@ -262,7 +262,7 @@ async fn site_update_persists_changes(pool: PgPool) {
     let put_json: serde_json::Value = put_resp.json().await.expect("update response JSON");
     assert_eq!(put_json["name"].as_str(), Some("Renamed HQ"));
     assert_eq!(put_json["is_primary"].as_bool(), Some(true));
-    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0100"));
+    assert_eq!(put_json["phone"].as_str(), Some("+15550100"));
 
     // Independent GET to prove the write hit the database, not just the
     // response builder. This is the actual F4 regression pin: a no-op
@@ -279,7 +279,7 @@ async fn site_update_persists_changes(pool: PgPool) {
     let get_json: serde_json::Value = get_resp.json().await.expect("get response JSON");
     assert_eq!(get_json["name"].as_str(), Some("Renamed HQ"));
     assert_eq!(get_json["is_primary"].as_bool(), Some(true));
-    assert_eq!(get_json["phone"].as_str(), Some("+1 555 0100"));
+    assert_eq!(get_json["phone"].as_str(), Some("+15550100"));
 }
 
 /// Site CRUD round-trip: covers create/list/get/update/delete plus the
@@ -479,8 +479,8 @@ async fn contact_crud_happy_path(pool: PgPool) {
     let put_json: serde_json::Value = put_resp.json().await.expect("update JSON");
     assert_eq!(put_json["title"].as_str(), Some("CTO"));
     assert_eq!(put_json["department"].as_str(), Some("Engineering"));
-    assert_eq!(put_json["phone"].as_str(), Some("+1 555 0100"));
-    assert_eq!(put_json["mobile"].as_str(), Some("+1 555 0200"));
+    assert_eq!(put_json["phone"].as_str(), Some("+15550100"));
+    assert_eq!(put_json["mobile"].as_str(), Some("+15550200"));
 
     let reget: serde_json::Value = app
         .client
@@ -494,8 +494,8 @@ async fn contact_crud_happy_path(pool: PgPool) {
         .expect("re-get JSON");
     assert_eq!(reget["title"].as_str(), Some("CTO"));
     assert_eq!(reget["department"].as_str(), Some("Engineering"));
-    assert_eq!(reget["phone"].as_str(), Some("+1 555 0100"));
-    assert_eq!(reget["mobile"].as_str(), Some("+1 555 0200"));
+    assert_eq!(reget["phone"].as_str(), Some("+15550100"));
+    assert_eq!(reget["mobile"].as_str(), Some("+15550200"));
 
     // DELETE then confirm 404.
     let del_resp = app
@@ -758,5 +758,132 @@ async fn company_filter_rejects_oversize_q(pool: PgPool) {
         status == reqwest::StatusCode::BAD_REQUEST
             || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         "oversize q should be rejected with 400 or 422, got {status}"
+    );
+}
+
+// ============================================================================
+// PMS-325: contact / company / site field validation.
+//
+// Invalid phone, time zone, country, and postal code must return a 422 field
+// error (never a 500, never silent acceptance), and a formatted phone must be
+// normalized to E.164 on the way in.
+// ============================================================================
+
+#[sqlx::test]
+async fn contact_field_validation(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Validation Co").await;
+
+    let post_contact = |body: serde_json::Value| {
+        let app = &app;
+        let token = &token;
+        async move {
+            app.client
+                .post(app.url("/api/v1/contacts/contacts"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("send create contact")
+        }
+    };
+    let base = serde_json::json!({
+        "company_id": company_id,
+        "first_name": "Ada",
+        "last_name": "Lovelace",
+    });
+    let with = |k: &str, v: serde_json::Value| {
+        let mut b = base.clone();
+        b[k] = v;
+        b
+    };
+
+    // Invalid phone -> 422, not 500 (the reported contact-phone failure).
+    let bad_phone = post_contact(with("phone", serde_json::json!("not-a-phone"))).await;
+    assert_eq!(
+        bad_phone.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid phone must 422, got {}",
+        bad_phone.status()
+    );
+
+    // Time zone with a space -> 422.
+    let bad_tz = post_contact(with("timezone", serde_json::json!("America/New York"))).await;
+    assert_eq!(
+        bad_tz.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid timezone must 422, got {}",
+        bad_tz.status()
+    );
+
+    // Formatted phone is accepted and normalized to E.164.
+    let ok = post_contact(with("phone", serde_json::json!("+1 (415) 555-1234"))).await;
+    assert!(
+        ok.status().is_success(),
+        "formatted phone should 2xx, got {}",
+        ok.status()
+    );
+    let created: serde_json::Value = ok.json().await.expect("contact JSON");
+    assert_eq!(created["phone"].as_str(), Some("+14155551234"));
+}
+
+#[sqlx::test]
+async fn company_address_validation(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let post_company = |body: serde_json::Value| {
+        let app = &app;
+        let token = &token;
+        async move {
+            app.client
+                .post(app.url("/api/v1/contacts/companies"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("send create company")
+        }
+    };
+
+    // Non-ISO country -> 422.
+    let bad_country = post_company(serde_json::json!({
+        "name": "Geo Co",
+        "address": { "country": "United States" }
+    }))
+    .await;
+    assert_eq!(
+        bad_country.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "non-ISO country must 422, got {}",
+        bad_country.status()
+    );
+
+    // Over-long postal code -> 422.
+    let bad_postal = post_company(serde_json::json!({
+        "name": "Geo Co",
+        "address": { "postal_code": "X".repeat(20) }
+    }))
+    .await;
+    assert_eq!(
+        bad_postal.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "over-long postal code must 422, got {}",
+        bad_postal.status()
+    );
+
+    // Valid ISO country + postal -> 2xx.
+    let ok = post_company(serde_json::json!({
+        "name": "Geo Co",
+        "address": { "country": "us", "postal_code": "94105" }
+    }))
+    .await;
+    assert!(
+        ok.status().is_success(),
+        "valid address should 2xx, got {}",
+        ok.status()
     );
 }
