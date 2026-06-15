@@ -751,3 +751,49 @@ async fn project_type_mutation_requires_admin(pool: PgPool) {
         "a technician must not create a project type"
     );
 }
+
+/// A duplicate name in the same tenant violates the UNIQUE (tenant_id, name)
+/// index and surfaces as a 409, not a 500. Covers both colliding with a seeded
+/// system row and with a custom row.
+#[sqlx::test]
+async fn project_type_duplicate_name_conflicts(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // Colliding with a seeded system name ("client").
+    let dup_system = post(
+        &app,
+        &token,
+        "/api/v1/project-types",
+        serde_json::json!({ "name": "client" }),
+    )
+    .await;
+    assert_eq!(
+        dup_system.status(),
+        reqwest::StatusCode::CONFLICT,
+        "reusing a seeded system name must 409"
+    );
+
+    // Colliding with a custom row.
+    let first = post(
+        &app,
+        &token,
+        "/api/v1/project-types",
+        serde_json::json!({ "name": "retainer" }),
+    )
+    .await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let dup_custom = post(
+        &app,
+        &token,
+        "/api/v1/project-types",
+        serde_json::json!({ "name": "retainer" }),
+    )
+    .await;
+    assert_eq!(
+        dup_custom.status(),
+        reqwest::StatusCode::CONFLICT,
+        "reusing a custom name must 409, not 500"
+    );
+}
