@@ -758,6 +758,19 @@ impl TenantService {
         .execute(&mut *tx)
         .await?;
 
+        // Payment terms (PMS-333)
+        sqlx::query(
+            r#"
+            INSERT INTO payment_terms (tenant_id, name, is_default, is_active, sort_order)
+            SELECT $1, name, is_default, is_active, sort_order
+            FROM payment_terms WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
         // KB categories: parents first, then children re-linked by name.
         sqlx::query(
             r#"

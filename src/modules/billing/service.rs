@@ -122,6 +122,51 @@ impl BillingService {
         ))
     }
 
+    /// Validate that `payment_term_id` references a `payment_terms` row in the
+    /// caller's tenant (PMS-333). RLS scopes the lookup, so a foreign-tenant id
+    /// (whose FK would otherwise pass, since FK checks bypass RLS) is rejected
+    /// with a 400 instead of silently linking across tenants.
+    async fn assert_payment_term_in_tenant(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        payment_term_id: Uuid,
+    ) -> AppResult<()> {
+        let found: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM payment_terms WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(payment_term_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if found.is_none() {
+            return Err(AppError::BadRequest(
+                "payment_term_id does not reference a payment term in this tenant".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve a set of payment-term ids to their names, tenant-scoped
+    /// (PMS-333). Lets `enrich_invoices` attach `payment_term_name` without a
+    /// per-row round-trip.
+    async fn payment_term_name_map(
+        &self,
+        tenant_id: TenantId,
+        ids: &[Uuid],
+    ) -> AppResult<std::collections::HashMap<Uuid, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, name FROM payment_terms WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(tenant_id)
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
@@ -130,8 +175,13 @@ impl BillingService {
     ) -> AppResult<()> {
         let ids: Vec<Uuid> = resp.iter().map(|r| r.company_id).collect();
         let names = self.company_name_map(tenant_id, &ids).await?;
+        let term_ids: Vec<Uuid> = resp.iter().filter_map(|r| r.payment_term_id).collect();
+        let term_names = self.payment_term_name_map(tenant_id, &term_ids).await?;
         for r in resp.iter_mut() {
             r.company_name = names.get(&r.company_id).cloned();
+            r.payment_term_name = r
+                .payment_term_id
+                .and_then(|id| term_names.get(&id).cloned());
         }
         Ok(())
     }
@@ -222,6 +272,7 @@ impl BillingService {
             r#"
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
                    contract_id, status, invoice_date, due_date, payment_terms,
+                   payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at
@@ -296,16 +347,21 @@ impl BillingService {
         let discount = request.discount_amount.unwrap_or(Decimal::ZERO);
         let total = subtotal + tax - discount;
 
+        if let Some(pt) = request.payment_term_id {
+            Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
+        }
+
         let invoice_id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO invoices (
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
+                payment_term_id,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
+            VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
                     $12, $13, 0, $13, $14, $15, $16)
             "#,
         )
@@ -325,6 +381,7 @@ impl BillingService {
         .bind(request.currency.as_deref().unwrap_or("USD"))
         .bind(&request.notes)
         .bind(&request.po_number)
+        .bind(request.payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1747,6 +1804,10 @@ impl BillingService {
             current.sent_at
         };
 
+        if let Some(pt) = request.payment_term_id {
+            Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
+        }
+
         sqlx::query(
             r#"
             UPDATE invoices SET
@@ -1764,6 +1825,7 @@ impl BillingService {
                 total              = $13,
                 balance_due        = $14,
                 sent_at            = $15,
+                payment_term_id    = COALESCE($16, payment_term_id),
                 updated_at         = NOW()
             WHERE id = $1
             "#,
@@ -1783,6 +1845,7 @@ impl BillingService {
         .bind(total)
         .bind(balance_due)
         .bind(sent_at)
+        .bind(request.payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1823,6 +1886,7 @@ impl BillingService {
             r#"
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
                    contract_id, status, invoice_date, due_date, payment_terms,
+                   payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at
@@ -1855,6 +1919,135 @@ impl BillingService {
         self.enrich_invoices(tenant_id, std::slice::from_mut(&mut resp))
             .await?;
         Ok(resp)
+    }
+
+    // ========================================================================
+    // PMS-333 payment terms lookup (mirrors work_types; single default/tenant).
+    // ========================================================================
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_payment_terms(
+        &self,
+        tenant_id: TenantId,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<PaymentTermResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payment_terms WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let rows = sqlx::query_as::<_, PaymentTermRow>(
+            r#"SELECT id, name, is_default, is_active, sort_order
+               FROM payment_terms WHERE tenant_id = $1 ORDER BY sort_order, name
+               LIMIT $2 OFFSET $3"#,
+        )
+        .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_payment_term(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertPaymentTermRequest,
+    ) -> AppResult<PaymentTermResponse> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE payment_terms SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE")
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            r#"INSERT INTO payment_terms (id, tenant_id, name, is_default, is_active, sort_order)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(request.is_default)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PaymentTermResponse {
+            id,
+            name: request.name.clone(),
+            is_default: request.is_default,
+            is_active: request.is_active,
+            sort_order: request.sort_order,
+        })
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_payment_term(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertPaymentTermRequest,
+    ) -> AppResult<PaymentTermResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        if request.is_default {
+            sqlx::query("UPDATE payment_terms SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE AND id <> $2")
+                .bind(tenant_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let row: Option<PaymentTermRow> = sqlx::query_as(
+            r#"UPDATE payment_terms
+               SET name = $3, is_default = $4, is_active = $5, sort_order = $6, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2
+               RETURNING id, name, is_default, is_active, sort_order"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(request.is_default)
+        .bind(request.is_active)
+        .bind(request.sort_order)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(AppError::NotFound("PaymentTerm".to_string()));
+        };
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_payment_term(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let result = sqlx::query("DELETE FROM payment_terms WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+        let affected = match result {
+            Ok(r) => r.rows_affected(),
+            Err(e) => {
+                // An invoice still references this term (FK 23503): 409, not 500.
+                if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
+                    return Err(AppError::Conflict(
+                        "Cannot delete this payment term: it is still referenced by an invoice"
+                            .to_string(),
+                    ));
+                }
+                return Err(e.into());
+            }
+        };
+        if affected == 0 {
+            return Err(AppError::NotFound("PaymentTerm".to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -2063,6 +2256,7 @@ struct InvoiceRow {
     invoice_date: chrono::NaiveDate,
     due_date: chrono::NaiveDate,
     payment_terms: Option<String>,
+    payment_term_id: Option<Uuid>,
     subtotal: Decimal,
     tax_amount: Decimal,
     discount_amount: Decimal,
@@ -2092,6 +2286,8 @@ impl From<InvoiceRow> for InvoiceResponse {
             invoice_date: r.invoice_date,
             due_date: r.due_date,
             payment_terms: r.payment_terms,
+            payment_term_id: r.payment_term_id,
+            payment_term_name: None,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
             discount_amount: r.discount_amount,
@@ -2106,6 +2302,27 @@ impl From<InvoiceRow> for InvoiceResponse {
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PaymentTermRow {
+    id: Uuid,
+    name: String,
+    is_default: Option<bool>,
+    is_active: Option<bool>,
+    sort_order: Option<i32>,
+}
+
+impl From<PaymentTermRow> for PaymentTermResponse {
+    fn from(r: PaymentTermRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            is_default: r.is_default.unwrap_or(false),
+            is_active: r.is_active.unwrap_or(true),
+            sort_order: r.sort_order.unwrap_or(0),
         }
     }
 }

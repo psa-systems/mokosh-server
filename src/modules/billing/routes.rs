@@ -53,7 +53,71 @@ pub fn billing_routes(service: BillingService) -> Router {
             put(update_tax_rate).delete(delete_tax_rate),
         )
         .route("/tax-rates/lookup", get(lookup_tax_rate))
+        .route(
+            "/payment-terms",
+            get(list_payment_terms).post(create_payment_term),
+        )
+        .route(
+            "/payment-terms/{id}",
+            put(update_payment_term).delete(delete_payment_term),
+        )
         .with_state(state)
+}
+
+async fn list_payment_terms(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<PaymentTermResponse>>> {
+    let (terms, total) = state
+        .service
+        .list_payment_terms(user.tenant(), &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        terms,
+        &pagination,
+        total,
+    )))
+}
+
+async fn create_payment_term(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Json(request): Json<UpsertPaymentTermRequest>,
+) -> AppResult<Json<PaymentTermResponse>> {
+    request.validate()?;
+    let t = state
+        .service
+        .create_payment_term(user.tenant(), &request)
+        .await?;
+    Ok(Json(t))
+}
+
+async fn update_payment_term(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertPaymentTermRequest>,
+) -> AppResult<Json<PaymentTermResponse>> {
+    request.validate()?;
+    let t = state
+        .service
+        .update_payment_term(user.tenant(), id, &request)
+        .await?;
+    Ok(Json(t))
+}
+
+async fn delete_payment_term(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state.service.delete_payment_term(user.tenant(), id).await?;
+    Ok(())
 }
 
 async fn list_tax_rates(
