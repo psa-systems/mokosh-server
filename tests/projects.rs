@@ -819,3 +819,160 @@ async fn project_type_duplicate_name_conflicts(pool: PgPool) {
         "reusing a custom name must 409, not 500"
     );
 }
+
+// ============================================================================
+// PMS-324: project create/edit input validation.
+//
+// Reproduces the "Budget Hours request failed" 422 (the client posts budgets
+// as JSON numbers, which the server's Decimal field rejected) and pins the
+// Name length cap (80) plus the budget rules (non-negative, <= 2 decimal
+// places, within the backing DECIMAL column).
+// ============================================================================
+
+/// PUT a partial update to a project, returning the raw response.
+async fn put_project(
+    app: &common::TestApp,
+    token: &str,
+    project_id: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    app.client
+        .put(app.url(&format!("/api/v1/projects/{project_id}")))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send PUT project")
+}
+
+#[sqlx::test]
+async fn project_input_validation(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Budget Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // Baseline create (string budgets, as the existing flow and other callers use).
+    let created = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Budgeting",
+            "company_id": company,
+            "status": "active",
+            "budget_hours": "100",
+            "budget_amount": "10000",
+        }),
+    )
+    .await;
+    assert!(created.status().is_success(), "baseline create should 2xx");
+    let project: serde_json::Value = created.json().await.expect("project JSON");
+    let id = project["id"].as_str().expect("project id").to_string();
+
+    // --- Budget Hours 422 reproduction: budgets posted as JSON numbers ---
+    // mokosh-apps `insert_opt_num` serializes both budget fields as JSON
+    // numbers, not strings. Both must be accepted (no 422 on the wire form).
+    let num_amount = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "budget_amount": 500 }),
+    )
+    .await;
+    assert!(
+        num_amount.status().is_success(),
+        "numeric budget_amount should 2xx, got {}",
+        num_amount.status()
+    );
+    let num_hours = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "budget_hours": 8.5 }),
+    )
+    .await;
+    assert!(
+        num_hours.status().is_success(),
+        "numeric budget_hours should 2xx (the reported 422 bug), got {}",
+        num_hours.status()
+    );
+
+    // Values persisted, parsed from the exact textual form (no float drift).
+    let after = get_json(&app, &token, &format!("/api/v1/projects/{id}")).await;
+    assert_eq!(dec(&after["budget_hours"]), 8.5);
+    assert_eq!(dec(&after["budget_amount"]), 500.0);
+
+    // --- Name length cap = 80 ---
+    let too_long = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "name": "x".repeat(81) }),
+    )
+    .await;
+    assert_eq!(
+        too_long.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "name longer than 80 must 422"
+    );
+    let at_limit = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "name": "x".repeat(80) }),
+    )
+    .await;
+    assert!(
+        at_limit.status().is_success(),
+        "name of exactly 80 should 2xx"
+    );
+
+    // --- Budget rules: non-negative, <= 2 decimal places, no opaque 500 ---
+    let negative = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "budget_amount": -1 }),
+    )
+    .await;
+    assert_eq!(
+        negative.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "negative budget must 422"
+    );
+    let too_precise = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "budget_hours": 1.234 }),
+    )
+    .await;
+    assert_eq!(
+        too_precise.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "budget with more than 2 decimal places must 422, not silent rounding"
+    );
+    let bobby = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "budget_amount": "Bobby Tables" }),
+    )
+    .await;
+    assert_eq!(
+        bobby.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "non-numeric budget must 422, not 500 or silent acceptance"
+    );
+
+    // null is accepted (clears / leaves the field), never an error.
+    let nulled = put_project(
+        &app,
+        &token,
+        &id,
+        serde_json::json!({ "budget_hours": null }),
+    )
+    .await;
+    assert!(nulled.status().is_success(), "null budget should 2xx");
+}
