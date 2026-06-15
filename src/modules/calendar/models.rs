@@ -77,6 +77,15 @@ fn default_utc() -> String {
     "UTC".into()
 }
 
+/// An appointment's `end_time` must be strictly after its `start_time`
+/// (PMS-343): zero-length and inverted ranges are rejected. Shared by the
+/// create and update service paths so both enforce the same rule (the create
+/// path already enforced it inline; the update path did not, allowing a
+/// partial PUT to invert the range against the stored values).
+pub(crate) fn appointment_range_ok(start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+    end > start
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAppointmentRequest {
     pub title: Option<String>,
@@ -253,4 +262,37 @@ pub struct DispatchResponse {
     pub time_off: Vec<TimeOffResponse>,
     /// Who is on call right now, one entry per active schedule.
     pub on_call: Vec<OnCallNowResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn range_ok_accepts_end_after_start() {
+        assert!(appointment_range_ok(
+            ts("2026-06-20T14:00:00Z"),
+            ts("2026-06-20T15:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn range_ok_rejects_end_before_start() {
+        // PMS-343: a negative-duration appointment must be rejected.
+        assert!(!appointment_range_ok(
+            ts("2026-06-20T15:00:00Z"),
+            ts("2026-06-20T14:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn range_ok_rejects_zero_length() {
+        // Matches the existing create-path behavior (end must be strictly after start).
+        let t = ts("2026-06-20T14:00:00Z");
+        assert!(!appointment_range_ok(t, t));
+    }
 }

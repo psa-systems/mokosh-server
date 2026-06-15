@@ -426,7 +426,7 @@ impl CalendarService {
         tenant_id: TenantId,
         request: &CreateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
-        if request.end_time <= request.start_time {
+        if !appointment_range_ok(request.start_time, request.end_time) {
             return Err(AppError::BadRequest(
                 "end_time must be after start_time".to_string(),
             ));
@@ -515,6 +515,27 @@ impl CalendarService {
         self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
             .await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-343: a partial update may carry only one of start_time / end_time,
+        // so validate the *effective* range (the request value when provided,
+        // else the stored value) before writing. Mirrors the create-path guard
+        // so a PUT cannot invert an appointment's range.
+        let current: Option<(DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT start_time, end_time FROM appointments WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((cur_start, cur_end)) = current else {
+            return Err(AppError::NotFound("Appointment".to_string()));
+        };
+        let eff_start = request.start_time.unwrap_or(cur_start);
+        let eff_end = request.end_time.unwrap_or(cur_end);
+        if !appointment_range_ok(eff_start, eff_end) {
+            return Err(AppError::BadRequest(
+                "end_time must be after start_time".to_string(),
+            ));
+        }
         let n = sqlx::query(
             r#"UPDATE appointments SET
                 title = COALESCE($3, title),
