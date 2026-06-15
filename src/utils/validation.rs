@@ -115,6 +115,55 @@ pub fn validate_contract_type(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Contract statuses accepted by the `contracts.status` CHECK constraint
+/// (migration `009_contracts.sql`). Kept in sync with the DB so a request
+/// carrying an out-of-set value is rejected with a 422 at the request layer
+/// instead of hitting the constraint and surfacing as a 500 DATABASE_ERROR
+/// (PMS-337).
+pub const CONTRACT_STATUSES: [&str; 5] = ["draft", "active", "expired", "cancelled", "renewed"];
+
+/// Validate a contract status against the set the DB CHECK constraint allows.
+/// The `status` field deserializes as a free `String`, so an unknown value
+/// passes deserialization but violates the DB constraint; rejecting it here
+/// turns an unhandled 500 into a clear 422 (PMS-337).
+pub fn validate_contract_status(value: &str) -> Result<(), ValidationError> {
+    if CONTRACT_STATUSES.contains(&value) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_contract_status");
+        error.message =
+            Some(format!("status must be one of: {}", CONTRACT_STATUSES.join(", ")).into());
+        Err(error)
+    }
+}
+
+/// Billing cycles accepted by the `contracts.billing_cycle` CHECK constraint
+/// (migration `009_contracts.sql`). Kept in sync with the DB so a request
+/// carrying an out-of-set value is rejected with a 422 at the request layer
+/// instead of hitting the constraint and surfacing as a 500 DATABASE_ERROR
+/// (PMS-337).
+pub const BILLING_CYCLES: [&str; 4] = ["monthly", "quarterly", "annually", "one_time"];
+
+/// Validate a billing cycle against the set the DB CHECK constraint allows.
+/// The `billing_cycle` field deserializes as a free `String`, so an unknown
+/// value passes deserialization but violates the DB constraint; rejecting it
+/// here turns an unhandled 500 into a clear 422 (PMS-337).
+pub fn validate_billing_cycle(value: &str) -> Result<(), ValidationError> {
+    if BILLING_CYCLES.contains(&value) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_billing_cycle");
+        error.message = Some(
+            format!(
+                "billing_cycle must be one of: {}",
+                BILLING_CYCLES.join(", ")
+            )
+            .into(),
+        );
+        Err(error)
+    }
+}
+
 /// Exclusive upper bound on the magnitude of a money amount stored in a
 /// `DECIMAL(12, 2)` column: 10 integer digits, so values must satisfy
 /// `|amount| < 10_000_000_000`. The bound is exclusive because the largest
@@ -323,6 +372,33 @@ mod tests {
         assert!(validate_contract_type("recurring").is_err());
         assert!(validate_contract_type("retainer").is_err());
         assert!(validate_contract_type("").is_err());
+    }
+
+    #[test]
+    fn test_validate_contract_status() {
+        // PMS-337: only the DB CHECK set is accepted.
+        assert!(validate_contract_status("draft").is_ok());
+        assert!(validate_contract_status("active").is_ok());
+        assert!(validate_contract_status("expired").is_ok());
+        assert!(validate_contract_status("cancelled").is_ok());
+        assert!(validate_contract_status("renewed").is_ok());
+        // Values that passed deserialization but caused a 500 before.
+        assert!(validate_contract_status("pending").is_err());
+        assert!(validate_contract_status("Active").is_err());
+        assert!(validate_contract_status("").is_err());
+    }
+
+    #[test]
+    fn test_validate_billing_cycle() {
+        // PMS-337: only the DB CHECK set is accepted.
+        assert!(validate_billing_cycle("monthly").is_ok());
+        assert!(validate_billing_cycle("quarterly").is_ok());
+        assert!(validate_billing_cycle("annually").is_ok());
+        assert!(validate_billing_cycle("one_time").is_ok());
+        // Values that passed deserialization but caused a 500 before.
+        assert!(validate_billing_cycle("weekly").is_err());
+        assert!(validate_billing_cycle("yearly").is_err());
+        assert!(validate_billing_cycle("").is_err());
     }
 
     #[test]
