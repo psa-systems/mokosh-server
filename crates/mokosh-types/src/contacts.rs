@@ -69,6 +69,132 @@ fn validate_website(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Normalize a phone number for storage (PMS-325): keep a single leading `+`
+/// and drop common formatting characters (spaces, dashes, parentheses, dots),
+/// so `+1 (415) 555-1234` becomes `+14155551234`. Returns the digits-only
+/// (optionally `+`-prefixed) form; validation of the result is left to
+/// [`validate_phone_e164`].
+fn normalize_phone(raw: &str) -> String {
+    // Strip only common formatting characters, NOT arbitrary non-digits: a value
+    // like "not-a-phone" must survive normalization (minus its dashes) so the
+    // E.164 check can reject it, rather than collapsing to empty and being
+    // silently treated as "no phone".
+    raw.chars()
+        .filter(|c| !matches!(c, ' ' | '\t' | '\u{00A0}' | '-' | '(' | ')' | '.'))
+        .collect()
+}
+
+/// Deserialize an optional phone field, normalizing formatting and mapping a
+/// blank value to `None` (PMS-325). Pairs with `#[validate(custom = ...)]` on
+/// the same field so the stored value is clean and E.164-valid.
+fn de_phone_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.map(|s| normalize_phone(&s)).filter(|s| !s.is_empty()))
+}
+
+/// Validate a (normalized) phone number against E.164: an optional leading `+`
+/// followed by 1-15 digits, the first of which is 1-9. An empty string is
+/// treated as "no value" and accepted (the deserializer maps blanks to `None`,
+/// but a required `String` field may still pass `""`). Turns the
+/// previously-unvalidated phone path into a clear 422 instead of a downstream
+/// failure.
+fn validate_phone_e164(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    let valid = (2..=15).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| (b'1'..=b'9').contains(&b));
+    if valid {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_phone");
+        error.message = Some("must be a valid phone number (E.164, e.g. +14155551234)".into());
+        Err(error)
+    }
+}
+
+/// Validate an IANA time zone name (PMS-325) using the tz database. Rejects
+/// values such as `America/New York` (a space instead of an underscore) that
+/// would otherwise be stored and later fail to resolve to an offset. Empty is
+/// accepted as "no value".
+fn validate_timezone(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.parse::<chrono_tz::Tz>().is_ok() {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_timezone");
+        error.message = Some("must be a valid IANA time zone (e.g. America/New_York)".into());
+        Err(error)
+    }
+}
+
+/// Validate an ISO 3166-1 alpha-2 country code (PMS-325): exactly two ASCII
+/// letters present in the official set. Empty is accepted as "no value".
+fn validate_country(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let upper = value.to_ascii_uppercase();
+    if ISO_3166_1_ALPHA2.contains(&upper.as_str()) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_country");
+        error.message = Some("must be a 2-letter ISO 3166-1 country code (e.g. US)".into());
+        Err(error)
+    }
+}
+
+/// Validate a postal code (PMS-325) with a permissive, country-agnostic rule:
+/// 2-12 characters of letters, digits, spaces, or hyphens. Empty is accepted.
+fn validate_postal_code(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let len_ok = (2..=12).contains(&value.chars().count());
+    let charset_ok = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-');
+    if len_ok && charset_ok {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_postal_code");
+        error.message = Some("must be 2-12 letters, digits, spaces, or hyphens".into());
+        Err(error)
+    }
+}
+
+/// ISO 3166-1 alpha-2 country codes (officially assigned). Used by
+/// [`validate_country`]; kept as a static set so an unknown code is rejected
+/// with a 422 rather than stored as free text.
+const ISO_3166_1_ALPHA2: [&str; 249] = [
+    "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ",
+    "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS",
+    "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN",
+    "CO", "CR", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM", "DO", "DZ", "EC", "EE",
+    "EG", "EH", "ER", "ES", "ET", "FI", "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF",
+    "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM",
+    "HN", "HR", "HT", "HU", "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT", "JE", "JM",
+    "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC",
+    "LI", "LK", "LR", "LS", "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK",
+    "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA",
+    "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG",
+    "PH", "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS", "RU", "RW",
+    "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS",
+    "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO",
+    "TR", "TT", "TV", "TW", "TZ", "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI",
+    "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW",
+];
+
 // ============================================================================
 // COMPANY TYPES
 // ============================================================================
@@ -145,9 +271,9 @@ pub struct Address {
     pub city: Option<String>,
     #[validate(custom(function = "validate_text_no_nul"))]
     pub state: Option<String>,
-    #[validate(custom(function = "validate_text_no_nul"))]
+    #[validate(custom(function = "validate_postal_code"))]
     pub postal_code: Option<String>,
-    #[validate(custom(function = "validate_text_no_nul"))]
+    #[validate(custom(function = "validate_country"))]
     pub country: Option<String>,
 }
 
@@ -236,9 +362,11 @@ pub struct CreateCompanyRequest {
     pub industry: Option<String>,
     #[validate(length(max = 255), custom(function = "validate_website"))]
     pub website: Option<String>,
-    #[validate(custom(function = "validate_text_no_nul"))]
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub phone: Option<String>,
-    #[validate(custom(function = "validate_text_no_nul"))]
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub fax: Option<String>,
     #[validate(nested)]
     pub address: Option<Address>,
@@ -277,9 +405,11 @@ pub struct UpdateCompanyRequest {
     pub industry: Option<String>,
     #[validate(length(max = 255), custom(function = "validate_website"))]
     pub website: Option<String>,
-    #[validate(custom(function = "validate_text_no_nul"))]
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub phone: Option<String>,
-    #[validate(custom(function = "validate_text_no_nul"))]
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub fax: Option<String>,
     #[validate(nested)]
     pub address: Option<Address>,
@@ -491,8 +621,14 @@ pub struct CreateContactRequest {
     pub last_name: String,
     #[validate(email)]
     pub email: Option<String>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub phone: Option<String>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub mobile: Option<String>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub fax: Option<String>,
     pub title: Option<String>,
     pub department: Option<String>,
@@ -500,6 +636,7 @@ pub struct CreateContactRequest {
     pub contact_type: ContactType,
     #[serde(default)]
     pub preferred_contact_method: PreferredContactMethod,
+    #[validate(custom(function = "validate_timezone"))]
     pub timezone: Option<String>,
     #[serde(default)]
     pub custom_fields: serde_json::Value,
@@ -521,13 +658,20 @@ pub struct UpdateContactRequest {
     pub last_name: Option<String>,
     #[validate(email)]
     pub email: Option<String>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub phone: Option<String>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub mobile: Option<String>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub fax: Option<String>,
     pub title: Option<String>,
     pub department: Option<String>,
     pub contact_type: Option<ContactType>,
     pub preferred_contact_method: Option<PreferredContactMethod>,
+    #[validate(custom(function = "validate_timezone"))]
     pub timezone: Option<String>,
     pub custom_fields: Option<serde_json::Value>,
     pub tags: Option<Vec<String>>,
@@ -640,10 +784,14 @@ pub struct CreateSiteRequest {
     pub company_id: Uuid,
     #[validate(length(min = 1, max = 255))]
     pub name: String,
+    #[validate(nested)]
     pub address: Option<Address>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub phone: Option<String>,
     #[serde(default)]
     pub is_primary: bool,
+    #[validate(custom(function = "validate_timezone"))]
     pub timezone: Option<String>,
     pub notes: Option<String>,
     pub latitude: Option<f64>,
@@ -655,9 +803,13 @@ pub struct CreateSiteRequest {
 pub struct UpdateSiteRequest {
     #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
+    #[validate(nested)]
     pub address: Option<Address>,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(custom(function = "validate_phone_e164"))]
     pub phone: Option<String>,
     pub is_primary: Option<bool>,
+    #[validate(custom(function = "validate_timezone"))]
     pub timezone: Option<String>,
     pub notes: Option<String>,
     pub latitude: Option<f64>,
@@ -834,5 +986,107 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "website": "javascript:alert(1)" }))
                 .expect("request deserializes");
         assert!(req.validate().is_err());
+    }
+
+    // ---- PMS-325: phone / timezone / country / postal validation ----
+
+    /// Build a minimal valid `CreateContactRequest`, merging overrides.
+    fn contact_req(overrides: serde_json::Value) -> CreateContactRequest {
+        let mut body = serde_json::json!({
+            "company_id": "00000000-0000-0000-0000-000000000000",
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+        });
+        if let serde_json::Value::Object(extra) = overrides {
+            for (k, v) in extra {
+                body[k] = v;
+            }
+        }
+        serde_json::from_value(body).expect("contact request deserializes")
+    }
+
+    #[test]
+    fn phone_normalized_and_e164_validated() {
+        // Formatted input is normalized and accepted.
+        let req = contact_req(serde_json::json!({ "phone": "+1 (415) 555-1234" }));
+        assert!(req.validate().is_ok());
+        assert_eq!(req.phone.as_deref(), Some("+14155551234"));
+        // Blank -> None.
+        assert_eq!(
+            contact_req(serde_json::json!({ "phone": "  " })).phone,
+            None
+        );
+        // Letters / nonsense rejected (was previously unvalidated).
+        assert!(contact_req(serde_json::json!({ "phone": "not-a-phone" }))
+            .validate()
+            .is_err());
+        // Leading zero is not E.164.
+        assert!(contact_req(serde_json::json!({ "mobile": "0412 345 678" }))
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn timezone_validated_against_iana() {
+        assert!(
+            contact_req(serde_json::json!({ "timezone": "America/New_York" }))
+                .validate()
+                .is_ok()
+        );
+        // The space variant must be rejected (PMS-325 example).
+        assert!(
+            contact_req(serde_json::json!({ "timezone": "America/New York" }))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn country_must_be_iso_alpha2() {
+        assert!(
+            create_req(serde_json::json!({ "address": { "country": "US" } }))
+                .validate()
+                .is_ok()
+        );
+        // Lowercase is accepted (normalized to uppercase for the check).
+        assert!(
+            create_req(serde_json::json!({ "address": { "country": "au" } }))
+                .validate()
+                .is_ok()
+        );
+        // Full names / unknown codes rejected.
+        assert!(
+            create_req(serde_json::json!({ "address": { "country": "United States" } }))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            create_req(serde_json::json!({ "address": { "country": "ZZ" } }))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn postal_code_permissive_charset_and_length() {
+        for ok in ["12345", "90210-1234", "K1A 0B1", "SW1A 1AA"] {
+            assert!(
+                create_req(serde_json::json!({ "address": { "postal_code": ok } }))
+                    .validate()
+                    .is_ok(),
+                "{ok} should be accepted"
+            );
+        }
+        // Too long, or disallowed characters.
+        assert!(
+            create_req(serde_json::json!({ "address": { "postal_code": "X".repeat(13) } }))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            create_req(serde_json::json!({ "address": { "postal_code": "12_34" } }))
+                .validate()
+                .is_err()
+        );
     }
 }
