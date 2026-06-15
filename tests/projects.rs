@@ -401,6 +401,137 @@ async fn approved_time_rolls_into_actuals(pool: PgPool) {
     );
 }
 
+/// PMS-329: a task exposes `logged_hours` (every non-rejected entry) next to
+/// `actual_hours` (approved-only). Draft time shows in logged but not actual;
+/// approving makes both reflect it; rejecting drops it from both. The approval
+/// transitions are driven directly in SQL so the test pins the rollup SELECT,
+/// not the timesheet state machine.
+#[sqlx::test]
+async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
+    let probe = pool.clone();
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Logged Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Delivery", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let status_id = first_task_status(&app, &token).await;
+    let task: serde_json::Value = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        serde_json::json!({ "title": "Build", "status_id": status_id }),
+    )
+    .await
+    .json()
+    .await
+    .expect("task JSON");
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let work_types = get_json(&app, &token, "/api/v1/work-types").await;
+    let work_type_id = work_types["data"][0]["id"].as_str().unwrap().to_string();
+
+    // Log 2h against the task. Entries default to 'draft' (non-rejected).
+    let entry = post(
+        &app,
+        &token,
+        "/api/v1/time-entries",
+        serde_json::json!({
+            "user_id": admin_id,
+            "date": "2026-03-02",
+            "duration_minutes": 120,
+            "work_type_id": work_type_id,
+            "project_id": project_id,
+            "task_id": task_id,
+            "company_id": company,
+        }),
+    )
+    .await;
+    assert!(
+        entry.status().is_success(),
+        "create entry: {}",
+        entry.status()
+    );
+    let entry_id = entry.json::<serde_json::Value>().await.expect("entry JSON")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Draft: logged counts it, actual does not.
+    let t = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
+    assert!(
+        (dec(&t["logged_hours"]) - 2.0).abs() < 0.01,
+        "draft time counts toward logged_hours (got {})",
+        dec(&t["logged_hours"])
+    );
+    assert_eq!(
+        dec(&t["actual_hours"]),
+        0.0,
+        "draft time does not count toward actual_hours"
+    );
+
+    // The list read path carries logged_hours too.
+    let list = get_json(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+    )
+    .await;
+    assert!(
+        (dec(&list["data"][0]["logged_hours"]) - 2.0).abs() < 0.01,
+        "list_tasks exposes logged_hours"
+    );
+
+    // Approve -> both reflect it.
+    set_entry_approval(&probe, &entry_id, "approved").await;
+    let t = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
+    assert!(
+        (dec(&t["logged_hours"]) - 2.0).abs() < 0.01,
+        "approved time stays in logged_hours"
+    );
+    assert!(
+        (dec(&t["actual_hours"]) - 2.0).abs() < 0.01,
+        "approved time rolls into actual_hours"
+    );
+
+    // Reject -> neither reflects it.
+    set_entry_approval(&probe, &entry_id, "rejected").await;
+    let t = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
+    assert_eq!(
+        dec(&t["logged_hours"]),
+        0.0,
+        "rejected time drops out of logged_hours"
+    );
+    assert_eq!(
+        dec(&t["actual_hours"]),
+        0.0,
+        "rejected time drops out of actual_hours"
+    );
+}
+
+/// Force a time entry's approval_status directly, bypassing the timesheet
+/// workflow, so a test can pin the task rollup SELECT across all states.
+async fn set_entry_approval(pool: &PgPool, entry_id: &str, status: &str) {
+    let id: Uuid = entry_id.parse().expect("entry uuid");
+    sqlx::query("UPDATE time_entries SET approval_status = $1 WHERE id = $2")
+        .bind(status)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("set approval status");
+}
+
 // AC6 / AC5: projects + tasks routes are wired (never 501) and require auth.
 #[sqlx::test]
 async fn projects_routes_require_auth_and_never_501(pool: PgPool) {

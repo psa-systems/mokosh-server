@@ -687,6 +687,10 @@ impl ProjectsService {
                                 WHERE te.task_id = tasks.id
                                   AND te.approval_status = 'approved'), 0)::numeric / 60.0
                           AS actual_hours,
+                      COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
+                                WHERE te.task_id = tasks.id
+                                  AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
+                          AS logged_hours,
                       start_date,
                       due_date, completed_at, sort_order
                FROM tasks WHERE tenant_id = $1 AND project_id = $2 ORDER BY sort_order, created_at
@@ -746,6 +750,10 @@ impl ProjectsService {
                                 WHERE te.task_id = tasks.id
                                   AND te.approval_status = 'approved'), 0)::numeric / 60.0
                           AS actual_hours,
+                      COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
+                                WHERE te.task_id = tasks.id
+                                  AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
+                          AS logged_hours,
                       start_date,
                       due_date, completed_at, sort_order
                FROM tasks WHERE tenant_id = $1 AND id = $2"#,
@@ -1079,6 +1087,7 @@ struct TaskRow {
     assigned_to_id: Option<Uuid>,
     estimated_hours: Option<Decimal>,
     actual_hours: Option<Decimal>,
+    logged_hours: Option<Decimal>,
     start_date: Option<chrono::NaiveDate>,
     due_date: Option<chrono::NaiveDate>,
     completed_at: Option<chrono::DateTime<Utc>>,
@@ -1099,6 +1108,7 @@ impl From<TaskRow> for TaskResponse {
             assigned_to_id: r.assigned_to_id,
             estimated_hours: r.estimated_hours,
             actual_hours: r.actual_hours,
+            logged_hours: r.logged_hours,
             start_date: r.start_date,
             due_date: r.due_date,
             completed_at: r.completed_at,
