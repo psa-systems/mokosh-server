@@ -749,3 +749,52 @@ async fn category_transitive_cycle_rejected(pool: PgPool) {
         "a transitive parent cycle must 400"
     );
 }
+
+/// PMS-321 schema hardening: the composite `(tenant_id, parent_id)` FK added
+/// in migration 047 rejects a cross-tenant parent at the database layer, even
+/// for a write that bypasses the service-layer `validate_fk` guard. Same-tenant
+/// parenting still works.
+#[sqlx::test]
+async fn category_parent_cross_tenant_blocked_at_db(pool: PgPool) {
+    let (tenant_b, _u, _e, _p) = common::seed_tenant_with_admin(&pool, "tenant-b").await;
+
+    // Root category in the default tenant (tenant A).
+    let parent_a = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO ticket_categories (id, tenant_id, name) VALUES ($1, $2, 'A-root')")
+        .bind(parent_a)
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(&pool)
+        .await
+        .expect("insert tenant-A root category");
+
+    // Same-tenant child is allowed.
+    sqlx::query(
+        "INSERT INTO ticket_categories (id, tenant_id, parent_id, name) VALUES ($1, $2, $3, 'A-child')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(parent_a)
+    .execute(&pool)
+    .await
+    .expect("same-tenant child must be allowed");
+
+    // A tenant-B category parented under tenant A's row must violate the FK.
+    let res = sqlx::query(
+        "INSERT INTO ticket_categories (id, tenant_id, parent_id, name) VALUES ($1, $2, $3, 'B-bad')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tenant_b)
+    .bind(parent_a)
+    .execute(&pool)
+    .await;
+    let err = res.expect_err("cross-tenant parent must violate the composite FK");
+    let code = err
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned());
+    assert_eq!(
+        code.as_deref(),
+        Some("23503"),
+        "expected a foreign-key violation, got {err}"
+    );
+}
