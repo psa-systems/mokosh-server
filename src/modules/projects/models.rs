@@ -242,6 +242,10 @@ pub struct TaskResponse {
     /// Actual hours rolled up from approved time entries linked to this
     /// task (PMS-51 AC5). Derived on read, not settable directly.
     pub actual_hours: Option<Decimal>,
+    /// Logged hours rolled up from every non-rejected time entry linked to
+    /// this task (draft + pending + approved), in hours (PMS-329). Always
+    /// `>= actual_hours`. Derived on read, not settable directly.
+    pub logged_hours: Option<Decimal>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
     pub completed_at: Option<DateTime<Utc>>,
