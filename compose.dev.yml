@@ -205,6 +205,24 @@ services:
         $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mokosh_app" || true
         $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO mokosh_app" || true
         $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO mokosh_app" || true
+        # Pre-create the extensions the migrations need. The public-schema
+        # migrations want uuid-ossp + pg_trgm (migration 002); the mokosh-auth
+        # subsystem migrations also want citext + pgcrypto. These extensions are
+        # untrusted, so only a superuser can CREATE them; the unprivileged
+        # mokosh_migrator that runs both migration sets cannot. Every migration
+        # uses CREATE EXTENSION IF NOT EXISTS, so once they exist here the
+        # migration step is a no-op. Done as POSTGRES_USER (superuser) over the
+        # socket, like the role provisioning above.
+        $$P -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"" || echo "[entrypoint] create extension uuid-ossp failed; continuing"
+        $$P -c "CREATE EXTENSION IF NOT EXISTS pg_trgm" || echo "[entrypoint] create extension pg_trgm failed; continuing"
+        $$P -c "CREATE EXTENSION IF NOT EXISTS citext" || echo "[entrypoint] create extension citext failed; continuing"
+        $$P -c "CREATE EXTENSION IF NOT EXISTS pgcrypto" || echo "[entrypoint] create extension pgcrypto failed; continuing"
+        # The mokosh-auth bootstrap (which runs as mokosh_migrator, see
+        # main.rs try_bootstrap_sso -> migrator_pool) does CREATE SCHEMA
+        # mokosh_auth. CREATE SCHEMA needs the CREATE privilege on the database,
+        # which a plain BYPASSRLS role lacks; grant it so the auth schema and
+        # its tables are created + owned by mokosh_migrator.
+        $$P -c "GRANT CREATE ON DATABASE \"$$POSTGRES_DB\" TO mokosh_migrator" || echo "[entrypoint] grant create-on-db to mokosh_migrator failed; continuing"
         echo "[entrypoint] mokosh_migrator / mokosh_app roles provisioned"
         wait "$$pg_pid"
 
