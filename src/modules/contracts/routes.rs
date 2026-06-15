@@ -45,7 +45,9 @@ pub fn contracts_routes(service: ContractsService) -> Router {
         .route("/rate-cards", get(list_rate_cards).post(create_rate_card))
         .route(
             "/rate-cards/{id}",
-            put(update_rate_card).delete(delete_rate_card),
+            get(get_rate_card)
+                .put(update_rate_card)
+                .delete(delete_rate_card),
         )
         .route(
             "/rate-cards/{id}/items",
@@ -210,6 +212,14 @@ async fn list_rate_cards(
         &pagination,
         total,
     )))
+}
+
+async fn get_rate_card(
+    State(s): State<ContractsRouterState>,
+    RequireContracts { user: u, .. }: RequireContracts,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<RateCardResponse>> {
+    Ok(Json(s.service.get_rate_card(u.tenant(), id).await?))
 }
 
 async fn create_rate_card(
