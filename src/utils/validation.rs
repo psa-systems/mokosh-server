@@ -144,6 +144,55 @@ pub fn validate_money_amount(value: &Decimal) -> Result<(), ValidationError> {
     }
 }
 
+/// Exclusive upper bound on the magnitude of a project budget *amount* stored
+/// in a `DECIMAL(12, 2)` column (largest holdable value `9_999_999_999.99`).
+const BUDGET_AMOUNT_MAX_EXCLUSIVE: i64 = 10_000_000_000;
+
+/// Exclusive upper bound on the magnitude of a project budget *hours* value
+/// stored in a `DECIMAL(10, 2)` column (largest holdable value `99_999_999.99`).
+const BUDGET_HOURS_MAX_EXCLUSIVE: i64 = 100_000_000;
+
+/// Shared budget rule (PMS-324): reject negatives, more than two decimal
+/// places, and magnitudes that would overflow the backing `DECIMAL` column.
+/// Without the range check an oversized value reaches Postgres and surfaces as
+/// a 500 numeric-overflow rather than a clear 422 (same class as PMS-306);
+/// without the scale check a value like `1.234` is silently rounded to `1.23`
+/// by the column. `column` names the backing type in the message only.
+fn validate_budget(
+    value: &Decimal,
+    max_exclusive: i64,
+    column: &'static str,
+) -> Result<(), ValidationError> {
+    if value.is_sign_negative() {
+        let mut error = ValidationError::new("budget_negative");
+        error.message = Some("budget must not be negative".into());
+        return Err(error);
+    }
+    if value.scale() > 2 {
+        let mut error = ValidationError::new("budget_scale");
+        error.message = Some("budget must have at most 2 decimal places".into());
+        return Err(error);
+    }
+    if value.abs() >= Decimal::from(max_exclusive) {
+        let mut error = ValidationError::new("budget_out_of_range");
+        error.message = Some(
+            format!("budget must be less than {max_exclusive} (the {column} column limit)").into(),
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Validate a project `budget_amount` against its `DECIMAL(12, 2)` column.
+pub fn validate_budget_amount(value: &Decimal) -> Result<(), ValidationError> {
+    validate_budget(value, BUDGET_AMOUNT_MAX_EXCLUSIVE, "DECIMAL(12, 2)")
+}
+
+/// Validate a project `budget_hours` against its `DECIMAL(10, 2)` column.
+pub fn validate_budget_hours(value: &Decimal) -> Result<(), ValidationError> {
+    validate_budget(value, BUDGET_HOURS_MAX_EXCLUSIVE, "DECIMAL(10, 2)")
+}
+
 /// Generate a slug from a string
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
@@ -248,6 +297,27 @@ mod tests {
         assert!(validate_money_amount(&Decimal::from_str("10000000000").unwrap()).is_err());
         assert!(validate_money_amount(&Decimal::from_str("1000000000000000").unwrap()).is_err());
         assert!(validate_money_amount(&Decimal::from_str("-1000000000000000").unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_validate_budget() {
+        use std::str::FromStr;
+        // Valid: zero, two decimal places, the column maxima.
+        assert!(validate_budget_amount(&Decimal::from_str("0").unwrap()).is_ok());
+        assert!(validate_budget_amount(&Decimal::from_str("9999999999.99").unwrap()).is_ok());
+        assert!(validate_budget_hours(&Decimal::from_str("99999999.99").unwrap()).is_ok());
+        assert!(validate_budget_hours(&Decimal::from_str("8.50").unwrap()).is_ok());
+        // Negative rejected (PMS-324).
+        assert!(validate_budget_amount(&Decimal::from_str("-1").unwrap()).is_err());
+        assert!(validate_budget_hours(&Decimal::from_str("-0.01").unwrap()).is_err());
+        // More than 2 decimal places rejected (would be silently rounded by the column).
+        assert!(validate_budget_amount(&Decimal::from_str("1.234").unwrap()).is_err());
+        assert!(validate_budget_hours(&Decimal::from_str("1.001").unwrap()).is_err());
+        // Out of range for the respective column (would overflow -> 500).
+        assert!(validate_budget_amount(&Decimal::from_str("10000000000").unwrap()).is_err());
+        assert!(validate_budget_hours(&Decimal::from_str("100000000").unwrap()).is_err());
+        // A value that fits hours' bigger sibling but overflows hours' DECIMAL(10, 2).
+        assert!(validate_budget_amount(&Decimal::from_str("99999999.99").unwrap()).is_ok());
     }
 
     #[test]

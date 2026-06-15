@@ -6,6 +6,45 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+/// Tolerant deserialization for the optional `Decimal` budget fields (PMS-324).
+///
+/// The mokosh-apps client posts budgets as JSON *numbers* (`8.5`), while the
+/// integration suite and other callers post numeric *strings* (`"8.5"`).
+/// rust_decimal's default `serde` impl only accepts strings, so a numeric
+/// budget was rejected by the `Json` extractor as a 422 before validation even
+/// ran (the "Budget Hours request failed" bug). Accept a JSON number, a numeric
+/// string, or null; a number is parsed from its exact textual form (not via
+/// `f64`) so no floating-point error is introduced.
+mod decimal_opt {
+    use rust_decimal::Decimal;
+    use serde::{Deserialize, Deserializer};
+    use std::str::FromStr;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    Ok(None)
+                } else {
+                    Decimal::from_str(s).map(Some).map_err(Error::custom)
+                }
+            }
+            serde_json::Value::Number(n) => Decimal::from_str(&n.to_string())
+                .map(Some)
+                .map_err(Error::custom),
+            other => Err(Error::custom(format!(
+                "expected a number, decimal string, or null, got {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectResponse {
     pub id: Uuid,
@@ -43,7 +82,7 @@ pub struct ProjectResponse {
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateProjectRequest {
-    #[validate(length(min = 1, max = 255))]
+    #[validate(length(min = 1, max = 80))]
     pub name: String,
     pub description: Option<String>,
     pub project_number: Option<String>,
@@ -56,7 +95,11 @@ pub struct CreateProjectRequest {
     pub project_manager_id: Option<Uuid>,
     pub start_date: Option<NaiveDate>,
     pub target_end_date: Option<NaiveDate>,
+    #[serde(default, deserialize_with = "decimal_opt::deserialize")]
+    #[validate(custom(function = crate::utils::validation::validate_budget_hours))]
     pub budget_hours: Option<Decimal>,
+    #[serde(default, deserialize_with = "decimal_opt::deserialize")]
+    #[validate(custom(function = crate::utils::validation::validate_budget_amount))]
     pub budget_amount: Option<Decimal>,
     #[serde(default = "default_tm")]
     pub billing_method: String,
@@ -80,7 +123,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateProjectRequest {
-    #[validate(length(min = 1, max = 255))]
+    #[validate(length(min = 1, max = 80))]
     pub name: Option<String>,
     pub description: Option<String>,
     pub status: Option<String>,
@@ -88,7 +131,11 @@ pub struct UpdateProjectRequest {
     pub start_date: Option<NaiveDate>,
     pub target_end_date: Option<NaiveDate>,
     pub actual_end_date: Option<NaiveDate>,
+    #[serde(default, deserialize_with = "decimal_opt::deserialize")]
+    #[validate(custom(function = crate::utils::validation::validate_budget_hours))]
     pub budget_hours: Option<Decimal>,
+    #[serde(default, deserialize_with = "decimal_opt::deserialize")]
+    #[validate(custom(function = crate::utils::validation::validate_budget_amount))]
     pub budget_amount: Option<Decimal>,
     pub billing_method: Option<String>,
     pub hourly_rate: Option<Decimal>,
