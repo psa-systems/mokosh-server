@@ -278,3 +278,338 @@ async fn ticket_history_records_description_edit(pool: PgPool) {
         "non-whitelisted entity type must 404"
     );
 }
+
+// ============================================================================
+// PMS-321: ticket lookup management CRUD (statuses, priorities, types,
+// queues, categories).
+// ============================================================================
+
+/// Full create/list/update/delete cycle for a ticket status, plus the
+/// re-delete 404. Exercises the admin-gated mutation routes end to end.
+#[sqlx::test]
+async fn lookup_status_crud_lifecycle(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // CREATE
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/tickets/statuses"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Escalated",
+            "color": "#ff0000",
+            "is_closed": false,
+            "sort_order": 42,
+        }))
+        .send()
+        .await
+        .expect("send create status");
+    assert_eq!(
+        create_resp.status(),
+        reqwest::StatusCode::OK,
+        "create status should 2xx"
+    );
+    let created: serde_json::Value = create_resp.json().await.expect("create status JSON");
+    let status_id = created["id"].as_str().expect("status id").to_string();
+    assert_eq!(created["name"].as_str(), Some("Escalated"));
+    assert_eq!(created["sort_order"].as_i64(), Some(42));
+
+    // LIST contains it
+    let list_resp = app
+        .client
+        .get(app.url("/api/v1/tickets/statuses?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list statuses");
+    let list: serde_json::Value = list_resp.json().await.expect("list statuses JSON");
+    assert!(
+        list["data"]
+            .as_array()
+            .expect("statuses data")
+            .iter()
+            .any(|s| s["id"].as_str() == Some(&status_id)),
+        "list must contain the created status"
+    );
+
+    // UPDATE
+    let update_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/statuses/{status_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Escalated (P1)",
+            "color": "#cc0000",
+            "is_closed": true,
+            "sort_order": 7,
+        }))
+        .send()
+        .await
+        .expect("send update status");
+    assert_eq!(update_resp.status(), reqwest::StatusCode::OK);
+    let updated: serde_json::Value = update_resp.json().await.expect("update status JSON");
+    assert_eq!(updated["name"].as_str(), Some("Escalated (P1)"));
+    assert_eq!(updated["is_closed"].as_bool(), Some(true));
+
+    // DELETE
+    let del_resp = app
+        .client
+        .delete(app.url(&format!("/api/v1/tickets/statuses/{status_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete status");
+    assert!(
+        del_resp.status().is_success(),
+        "delete status should 2xx, got {}",
+        del_resp.status()
+    );
+
+    // Re-delete is 404
+    let redel_resp = app
+        .client
+        .delete(app.url(&format!("/api/v1/tickets/statuses/{status_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send re-delete status");
+    assert_eq!(
+        redel_resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "deleting an absent status must 404"
+    );
+}
+
+/// Setting a new default status clears the previously-seeded default, so a
+/// tenant never carries two defaults at once.
+#[sqlx::test]
+async fn setting_new_default_status_clears_prior(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Create a fresh status flagged default.
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/tickets/statuses"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Brand New Default",
+            "color": "#00aa00",
+            "is_default": true,
+        }))
+        .send()
+        .await
+        .expect("send create default status");
+    assert_eq!(create_resp.status(), reqwest::StatusCode::OK);
+    let new_default_id = create_resp.json::<serde_json::Value>().await.expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Exactly one default remains, and it is the new one.
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tickets/statuses?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list statuses")
+        .json()
+        .await
+        .expect("list statuses JSON");
+    let defaults: Vec<&serde_json::Value> = list["data"]
+        .as_array()
+        .expect("statuses data")
+        .iter()
+        .filter(|s| s["is_default"].as_bool() == Some(true))
+        .collect();
+    assert_eq!(
+        defaults.len(),
+        1,
+        "exactly one status may be default, found {}",
+        defaults.len()
+    );
+    assert_eq!(
+        defaults[0]["id"].as_str(),
+        Some(new_default_id.as_str()),
+        "the new status must be the sole default"
+    );
+}
+
+/// Deleting a lookup still referenced by a ticket returns 409, not 500 (and
+/// not a silent FK 500 from Postgres).
+#[sqlx::test]
+async fn delete_status_referenced_by_ticket_returns_409(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Create a ticket; it adopts the seeded default status.
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Reference holder",
+            "company_id": company_id,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("send create ticket")
+        .json()
+        .await
+        .expect("create ticket JSON");
+    let status_id = created["status"]["id"]
+        .as_str()
+        .expect("ticket status id")
+        .to_string();
+
+    let del_resp = app
+        .client
+        .delete(app.url(&format!("/api/v1/tickets/statuses/{status_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete referenced status");
+    assert_eq!(
+        del_resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "deleting a status a ticket still references must 409, got {}",
+        del_resp.status()
+    );
+}
+
+/// Category create + child-via-parent + cross-tenant/self parent rejection.
+#[sqlx::test]
+async fn category_crud_and_parent_validation(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Parent category.
+    let parent: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets/categories"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Hardware" }))
+        .send()
+        .await
+        .expect("send create parent category")
+        .json()
+        .await
+        .expect("parent category JSON");
+    let parent_id = parent["id"].as_str().expect("parent id").to_string();
+
+    // Child referencing the parent.
+    let child_resp = app
+        .client
+        .post(app.url("/api/v1/tickets/categories"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Laptops", "parent_id": parent_id }))
+        .send()
+        .await
+        .expect("send create child category");
+    assert_eq!(child_resp.status(), reqwest::StatusCode::OK);
+    let child_id = child_resp
+        .json::<serde_json::Value>()
+        .await
+        .expect("child JSON")["id"]
+        .as_str()
+        .expect("child id")
+        .to_string();
+
+    // List shows both.
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tickets/categories?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list categories")
+        .json()
+        .await
+        .expect("list categories JSON");
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .expect("categories data")
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert!(ids.contains(&parent_id.as_str()) && ids.contains(&child_id.as_str()));
+
+    // A parent_id that is not a category in this tenant is rejected (400).
+    let unknown_parent = uuid::Uuid::new_v4();
+    let bad_parent = app
+        .client
+        .post(app.url("/api/v1/tickets/categories"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Orphan", "parent_id": unknown_parent }))
+        .send()
+        .await
+        .expect("send create with bad parent");
+    assert_eq!(
+        bad_parent.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an unknown parent_id must 400"
+    );
+
+    // A category cannot be its own parent (400).
+    let self_parent = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/categories/{child_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Laptops", "parent_id": child_id }))
+        .send()
+        .await
+        .expect("send self-parent update");
+    assert_eq!(
+        self_parent.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a self-referential parent_id must 400"
+    );
+}
+
+/// A non-admin (technician) is refused on the lookup mutation routes; reads
+/// stay open to any authenticated member.
+#[sqlx::test]
+async fn non_admin_cannot_mutate_lookups(pool: PgPool) {
+    let (_tech_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Read is allowed.
+    let list = app
+        .client
+        .get(app.url("/api/v1/tickets/statuses"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list statuses");
+    assert_eq!(list.status(), reqwest::StatusCode::OK);
+
+    // Write is forbidden.
+    let create = app
+        .client
+        .post(app.url("/api/v1/tickets/statuses"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Nope", "color": "#000000" }))
+        .send()
+        .await
+        .expect("send create status as technician");
+    assert_eq!(
+        create.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a technician must not create a status"
+    );
+}
