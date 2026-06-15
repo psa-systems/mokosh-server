@@ -574,6 +574,25 @@ impl ContractsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_rate_card(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<RateCardResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, RateCardRow>(
+            r#"SELECT id, name, description, is_default
+               FROM rate_cards WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("RateCard".to_string()))?;
+        Ok(row.into())
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rate_card(
         &self,
         tenant_id: TenantId,
