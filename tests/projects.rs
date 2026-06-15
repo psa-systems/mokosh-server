@@ -725,6 +725,28 @@ async fn project_type_new_default_clears_prior(pool: PgPool) {
     assert_eq!(defaults[0]["name"].as_str(), Some("managed-services"));
 }
 
+/// PMS-323: the partial unique index `idx_project_types_one_default` makes a
+/// second `is_default = true` row in the same tenant impossible at the DB
+/// layer, independent of the service guard. The default tenant already has the
+/// seeded `client` row as default, so a direct insert of a second default
+/// row for that tenant must raise a unique_violation (23505).
+#[sqlx::test]
+async fn project_type_second_default_violates_db_index(pool: PgPool) {
+    let err = sqlx::query(
+        "INSERT INTO project_types (tenant_id, name, is_default) VALUES ($1, $2, TRUE)",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("second-default")
+    .execute(&pool)
+    .await
+    .expect_err("a second default in one tenant must violate the partial unique index");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23505"),
+        "expected a unique_violation (23505) from idx_project_types_one_default, got: {err}"
+    );
+}
+
 /// A non-admin (technician) is refused on the mutation routes.
 #[sqlx::test]
 async fn project_type_mutation_requires_admin(pool: PgPool) {
