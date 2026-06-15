@@ -473,3 +473,232 @@ async fn billing_responses_carry_company_name(pool: PgPool) {
         "payment list rows carry the linked invoice number"
     );
 }
+
+// ============================================================================
+// PMS-333: payment_terms lookup + invoice FK.
+// ============================================================================
+
+/// Find a payment term id by name from `GET /payment-terms`.
+async fn term_id(app: &common::TestApp, token: &str, name: &str) -> String {
+    let body: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/payment-terms"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list payment terms")
+        .json()
+        .await
+        .expect("payment terms JSON");
+    body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .find(|t| t["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("seeded term {name} present"))["id"]
+        .as_str()
+        .expect("term id")
+        .to_string()
+}
+
+/// Migration 050 seeds net30 as the single default per tenant; setting a new
+/// default clears the prior one.
+#[sqlx::test]
+async fn payment_terms_seeded_and_single_default(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/payment-terms"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("JSON");
+    let rows = list["data"].as_array().expect("data");
+    let net30 = rows
+        .iter()
+        .find(|t| t["name"].as_str() == Some("net30"))
+        .expect("net30 seeded");
+    assert_eq!(
+        net30["is_default"].as_bool(),
+        Some(true),
+        "net30 is the seeded default"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|t| t["is_default"].as_bool() == Some(true))
+            .count(),
+        1,
+        "exactly one default per tenant"
+    );
+
+    // Create a new default; the prior default (net30) must clear.
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/payment-terms"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "net90", "is_default": true, "sort_order": 9 }))
+        .send()
+        .await
+        .expect("create term")
+        .json()
+        .await
+        .expect("term JSON");
+    assert_eq!(created["is_default"].as_bool(), Some(true));
+
+    // net30 is no longer the default.
+    let relist: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/payment-terms"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("relist")
+        .json()
+        .await
+        .expect("JSON");
+    let n30 = relist["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"].as_str() == Some("net30"))
+        .expect("net30 row");
+    assert_eq!(
+        n30["is_default"].as_bool(),
+        Some(false),
+        "prior default cleared when a new default is set"
+    );
+    assert_eq!(
+        relist["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["is_default"].as_bool() == Some(true))
+            .count(),
+        1,
+        "still exactly one default after the switch"
+    );
+}
+
+/// An invoice references a payment term by FK; the response carries
+/// payment_term_id + payment_term_name, and a rename of the term is reflected
+/// on the invoice (rename-safe FK). Deleting a referenced term is a 409.
+#[sqlx::test]
+async fn invoice_payment_term_link_rename_and_delete_guard(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let net30 = term_id(&app, &token, "net30").await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "payment_term_id": net30,
+            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
+        }))
+        .send()
+        .await
+        .expect("create invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
+    assert_eq!(invoice["payment_term_id"].as_str(), Some(net30.as_str()));
+    assert_eq!(invoice["payment_term_name"].as_str(), Some("net30"));
+
+    // Rename the term; the invoice's joined name follows (FK, not a copy).
+    let put = app
+        .client
+        .put(app.url(&format!("/api/v1/payment-terms/{net30}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "net-30-renamed" }))
+        .send()
+        .await
+        .expect("rename term");
+    assert!(put.status().is_success(), "rename: {}", put.status());
+
+    let reread: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    assert_eq!(
+        reread["payment_term_name"].as_str(),
+        Some("net-30-renamed"),
+        "a renamed term is reflected on the invoice"
+    );
+
+    // Deleting a term still referenced by an invoice is a 409, not a 500.
+    let del = app
+        .client
+        .delete(app.url(&format!("/api/v1/payment-terms/{net30}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete referenced term");
+    assert_eq!(
+        del.status(),
+        reqwest::StatusCode::CONFLICT,
+        "deleting a referenced payment term is a 409"
+    );
+}
+
+/// A payment_term_id from another tenant is rejected with a 400, never linked
+/// across tenants (the FK alone would pass since FK checks bypass RLS).
+#[sqlx::test]
+async fn invoice_rejects_cross_tenant_payment_term(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+
+    // A payment term owned by a different tenant.
+    let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&pool, "pt-other").await;
+    let foreign_term = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO payment_terms (id, tenant_id, name, is_default) VALUES ($1, $2, 'foreign', FALSE)",
+    )
+    .bind(foreign_term)
+    .bind(other_tenant)
+    .execute(&pool)
+    .await
+    .expect("seed foreign term");
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "payment_term_id": foreign_term,
+            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
+        }))
+        .send()
+        .await
+        .expect("create invoice with foreign term");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a cross-tenant payment_term_id is rejected with 400"
+    );
+}

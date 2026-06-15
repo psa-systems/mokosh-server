@@ -127,7 +127,15 @@ pub struct InvoiceResponse {
     pub status: InvoiceStatus,
     pub invoice_date: NaiveDate,
     pub due_date: NaiveDate,
+    /// Legacy free-text terms, kept for one release (PMS-333). Prefer
+    /// `payment_term_id`, which references the `payment_terms` lookup.
     pub payment_terms: Option<String>,
+    /// FK into the tenant-scoped `payment_terms` lookup (PMS-333). `None` for
+    /// invoices whose legacy `payment_terms` string had no matching lookup row.
+    pub payment_term_id: Option<Uuid>,
+    /// Joined name of `payment_term_id`, resolved on read so the client renders
+    /// the term without a second fetch. `None` when there is no term linked.
+    pub payment_term_name: Option<String>,
     pub subtotal: Decimal,
     pub tax_amount: Decimal,
     pub discount_amount: Decimal,
@@ -181,6 +189,9 @@ pub struct CreateInvoiceRequest {
     pub due_date: NaiveDate,
     #[validate(length(max = 20))]
     pub payment_terms: Option<String>,
+    /// Optional FK into the tenant's `payment_terms` lookup (PMS-333). The
+    /// service validates it belongs to the caller's tenant.
+    pub payment_term_id: Option<Uuid>,
     pub tax_amount: Option<Decimal>,
     pub discount_amount: Option<Decimal>,
     #[validate(length(max = 3))]
@@ -235,6 +246,9 @@ pub struct UpdateInvoiceRequest {
     pub due_date: Option<NaiveDate>,
     #[validate(length(max = 20))]
     pub payment_terms: Option<String>,
+    /// Optional FK into the tenant's `payment_terms` lookup (PMS-333),
+    /// preserved on omit; an explicit value re-links and is tenant-validated.
+    pub payment_term_id: Option<Uuid>,
     pub tax_amount: Option<Decimal>,
     pub discount_amount: Option<Decimal>,
     pub notes: Option<String>,
@@ -412,6 +426,31 @@ pub struct UpsertTaxRateRequest {
     pub is_active: bool,
 }
 
+// ============================================================================
+// Payment terms (PMS-333) - tenant-scoped lookup, mirrors work_types.
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaymentTermResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub is_default: bool,
+    pub is_active: bool,
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertPaymentTermRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +477,7 @@ mod tests {
             invoice_date,
             due_date,
             payment_terms: None,
+            payment_term_id: None,
             tax_amount: None,
             discount_amount: None,
             currency: None,
