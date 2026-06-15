@@ -50,6 +50,15 @@ pub fn projects_routes(service: ProjectsService) -> Router {
             "/task-statuses/{id}",
             put(update_task_status).delete(delete_task_status),
         )
+        // PMS-322 project types
+        .route(
+            "/project-types",
+            get(list_project_types).post(create_project_type),
+        )
+        .route(
+            "/project-types/{id}",
+            put(update_project_type).delete(delete_project_type),
+        )
         // PMS-56 tasks
         .route(
             "/projects/{id}/tasks",
@@ -214,6 +223,56 @@ async fn delete_task_status(
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_task_status(u.tenant(), id).await
+}
+
+// PMS-322 project types. Reads need only project access; mutations are
+// admin-gated, mirroring task-statuses.
+async fn list_project_types(
+    State(s): State<ProjectsRouterState>,
+    RequireProjects { user: u, .. }: RequireProjects,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ProjectTypeResponse>>> {
+    let (items, total) = s
+        .service
+        .list_project_types(u.tenant(), &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
+}
+
+async fn create_project_type(
+    State(s): State<ProjectsRouterState>,
+    RequireProjects { user: u, .. }: RequireProjects,
+    _a: RequireAdmin,
+    Json(req): Json<UpsertProjectTypeRequest>,
+) -> AppResult<Json<ProjectTypeResponse>> {
+    req.validate()?;
+    Ok(Json(s.service.create_project_type(u.tenant(), &req).await?))
+}
+
+async fn update_project_type(
+    State(s): State<ProjectsRouterState>,
+    RequireProjects { user: u, .. }: RequireProjects,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertProjectTypeRequest>,
+) -> AppResult<Json<ProjectTypeResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.update_project_type(u.tenant(), id, &req).await?,
+    ))
+}
+
+async fn delete_project_type(
+    State(s): State<ProjectsRouterState>,
+    RequireProjects { user: u, .. }: RequireProjects,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    s.service.delete_project_type(u.tenant(), id).await
 }
 
 async fn list_project_tasks(

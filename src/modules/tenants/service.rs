@@ -705,6 +705,20 @@ impl TenantService {
         .execute(&mut *tx)
         .await?;
 
+        // Project types (PMS-322), including the is_system flag so the seeded
+        // client/internal rows stay delete-protected in the new tenant.
+        sqlx::query(
+            r#"
+            INSERT INTO project_types (tenant_id, name, is_default, is_active, sort_order, is_system)
+            SELECT $1, name, is_default, is_active, sort_order, is_system
+            FROM project_types WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
         // Asset types (top-level only, matching prior behaviour)
         sqlx::query(
             r#"
