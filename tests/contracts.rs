@@ -23,6 +23,7 @@ mod common;
 use chrono::{NaiveDate, TimeZone, Utc};
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::contracts::ContractsService;
+use mokosh_server::utils::error::AppError;
 use mokosh_server::Database;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -396,4 +397,61 @@ async fn list_recurring_items_returns_recurring_and_retainer(pool: PgPool) {
         .expect("list recurring");
     assert_eq!(items.len(), 2, "only recurring_service + retainer");
     assert!(items.iter().all(|i| i.item_type != "block_hours"));
+}
+
+#[sqlx::test]
+async fn get_rate_card_returns_card_in_tenant(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+
+    let id: Uuid =
+        sqlx::query_scalar("SELECT id FROM rate_cards WHERE tenant_id = $1 AND is_default = TRUE")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("default rate card");
+
+    let card = svc
+        .get_rate_card(TenantId::from_trusted(tenant), id)
+        .await
+        .expect("fetch seeded rate card");
+    assert_eq!(card.id, id);
+    assert!(card.is_default);
+}
+
+#[sqlx::test]
+async fn get_rate_card_missing_id_is_not_found(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+
+    let err = svc
+        .get_rate_card(TenantId::from_trusted(tenant), Uuid::new_v4())
+        .await
+        .expect_err("missing id is 404");
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[sqlx::test]
+async fn get_rate_card_other_tenant_is_not_found(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+
+    // A rate card owned by a different tenant must not be visible.
+    let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&pool, "rate-card-other").await;
+    let other_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO rate_cards (id, tenant_id, name, description, is_default)
+           VALUES ($1, $2, 'Foreign', NULL, FALSE)"#,
+    )
+    .bind(other_id)
+    .bind(other_tenant)
+    .execute(&pool)
+    .await
+    .expect("seed foreign rate card");
+
+    let err = svc
+        .get_rate_card(TenantId::from_trusted(tenant), other_id)
+        .await
+        .expect_err("cross-tenant id is 404");
+    assert!(matches!(err, AppError::NotFound(_)));
 }
