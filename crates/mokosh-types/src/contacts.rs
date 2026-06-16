@@ -65,7 +65,14 @@ fn validate_website(value: &str) -> Result<(), ValidationError> {
         .or_else(|| lower.strip_prefix("http://"));
     match host {
         Some(rest) if !rest.is_empty() && !rest.starts_with('/') => Ok(()),
-        _ => Err(ValidationError::new("invalid_url")),
+        _ => {
+            // Carry an explicit message so the field surfaces inline like the
+            // phone field does (PMS-351), instead of a bare error code. The SPA
+            // prefixes the field label, yielding "Website must be a valid URL ...".
+            let mut error = ValidationError::new("invalid_url");
+            error.message = Some("must be a valid URL (e.g. https://example.com)".into());
+            Err(error)
+        }
     }
 }
 
@@ -958,6 +965,26 @@ mod tests {
     fn non_url_website_rejected() {
         let req = create_req(serde_json::json!({ "website": "not a url" }));
         assert!(req.validate().is_err());
+    }
+
+    // PMS-351 acceptance criteria: the exact strings the external reviewer
+    // entered on the New Company form must be rejected, and a scheme-bearing
+    // https URL accepted.
+    #[test]
+    fn website_acceptance_cases() {
+        for bad in ["not-a-valid-url", "example.com", "ftp://example.com"] {
+            assert!(
+                create_req(serde_json::json!({ "website": bad }))
+                    .validate()
+                    .is_err(),
+                "{bad} should be rejected"
+            );
+        }
+        assert!(
+            create_req(serde_json::json!({ "website": "https://example.com" }))
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

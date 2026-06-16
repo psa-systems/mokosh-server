@@ -190,6 +190,11 @@ pub struct CreateCredentialRequest {
     pub credential_type: String,
     pub username: String,
     pub password: String,
+    // PMS-351: a stored credential's login URL is free-text the user types,
+    // so validate it like the RMM `api_url` field. `url` (any scheme) rather
+    // than the company-website http(s)-only rule, because a saved credential
+    // may legitimately target rdp://, ssh://, etc. Empty/None stays accepted.
+    #[validate(url)]
     pub url: Option<String>,
     pub notes: Option<String>,
 }
@@ -202,4 +207,41 @@ pub struct AssetAuditLogResponse {
     pub changes: Option<serde_json::Value>,
     pub performed_by_id: Option<Uuid>,
     pub performed_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credential_req(url: serde_json::Value) -> CreateCredentialRequest {
+        serde_json::from_value(serde_json::json!({
+            "name": "domain-admin",
+            "credential_type": "domain",
+            "username": "administrator",
+            "password": "sup3r-s3cret-pw",
+            "url": url,
+        }))
+        .expect("request deserializes")
+    }
+
+    // PMS-351: a stored credential's login URL must reject the same junk the
+    // company website field does, while still accepting any real scheme.
+    #[test]
+    fn credential_url_validated() {
+        assert!(credential_req(serde_json::json!(null)).validate().is_ok());
+        assert!(
+            credential_req(serde_json::json!("https://vault.example.com"))
+                .validate()
+                .is_ok()
+        );
+        assert!(credential_req(serde_json::json!("rdp://10.0.0.5"))
+            .validate()
+            .is_ok());
+        for bad in ["not-a-valid-url", "example.com"] {
+            assert!(
+                credential_req(serde_json::json!(bad)).validate().is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
 }
