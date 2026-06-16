@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -119,6 +120,7 @@ impl MileageTrackingService {
         &self,
         tenant_id: TenantId,
         request: &CreateMileageEntryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<MileageEntryResponse> {
         if request.distance_miles <= Decimal::ZERO {
             return Err(AppError::BadRequest(
@@ -185,6 +187,28 @@ impl MileageTrackingService {
         .bind(total)
         .bind(billing_status)
         .execute(&mut *tx)
+        .await?;
+
+        // PMS-318 sweep: emit the Create audit row inside the same tx as the
+        // INSERT (mirrors create_task / the PMS-117 pattern) so the entry's
+        // change-history feed shows the create event and a rollback drops both.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM mileage_entries t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "mileage_entries",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_mileage_entry(tenant_id, id).await
