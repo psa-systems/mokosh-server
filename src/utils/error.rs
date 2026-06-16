@@ -462,18 +462,36 @@ fn humanize_field_error(error: &validator::ValidationError) -> String {
     }
 }
 
+/// Extract the form field a schema-level (cross-field) validation error should
+/// attach to, if the rule recorded one via `validation::cross_field_error`.
+///
+/// validator-crate keys schema rules under the `__all__` bucket; this lets the
+/// conversion re-key the error onto the named field so the client can render it
+/// inline (PMS-364). Returns `None` for ordinary single-field errors, which are
+/// already keyed on their field.
+fn cross_field_target(error: &validator::ValidationError) -> Option<String> {
+    error
+        .params
+        .get(crate::utils::validation::CROSS_FIELD_TARGET_PARAM)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 impl From<validator::ValidationErrors> for AppError {
     fn from(errors: validator::ValidationErrors) -> Self {
         let field_errors: Vec<FieldError> = errors
             .field_errors()
             .iter()
             .flat_map(|(field, errs)| {
-                errs.iter().map(|e| {
-                    FieldError::new(
-                        field.to_string(),
-                        humanize_field_error(e),
-                        e.code.to_string(),
-                    )
+                errs.iter().map(move |e| {
+                    // Schema-level (cross-field) rules are keyed under
+                    // validator-crate's `__all__` bucket, which the client
+                    // cannot bind to a form field. When the rule recorded a
+                    // target field (see `validation::cross_field_error`),
+                    // re-key the error onto that field so the form renders it
+                    // inline instead of as a generic banner (PMS-364).
+                    let field = cross_field_target(e).unwrap_or_else(|| field.to_string());
+                    FieldError::new(field, humanize_field_error(e), e.code.to_string())
                 })
             })
             .collect();
@@ -640,6 +658,74 @@ mod tests {
                     "bound missing: {:?}",
                     errors[0].message
                 );
+            }
+            other => panic!("Expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cross_field_error_rekeyed_to_named_field() {
+        // PMS-364: a schema-level rule built via `cross_field_error` lands in
+        // validator-crate's `__all__` bucket, but the conversion must re-key
+        // it onto the named field so the client can render it inline.
+        use validator::Validate;
+
+        fn check_range(req: &Demo) -> Result<(), validator::ValidationError> {
+            if req.end < req.start {
+                return Err(crate::utils::validation::cross_field_error(
+                    "invalid_date_range",
+                    "end",
+                    "end must be on or after start",
+                ));
+            }
+            Ok(())
+        }
+
+        #[derive(Validate)]
+        #[validate(schema(function = check_range))]
+        struct Demo {
+            start: i32,
+            end: i32,
+        }
+
+        let errs = Demo { start: 5, end: 1 }.validate().unwrap_err();
+        // Sanity: validator keyed it under `__all__`, not the target field.
+        assert!(errs.field_errors().contains_key("__all__"));
+
+        match AppError::from(errs) {
+            AppError::Validation { errors, .. } => {
+                assert_eq!(errors.len(), 1);
+                // Re-keyed onto the named field, not left as `__all__`.
+                assert_eq!(errors[0].field, "end");
+                assert_eq!(errors[0].code, "invalid_date_range");
+                assert_eq!(errors[0].message, "end must be on or after start");
+            }
+            other => panic!("Expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_single_field_error_not_rekeyed() {
+        // A plain single-field error has no target param and must keep its own
+        // field key (no regression on the phone-validator pattern, PMS-364).
+        use validator::Validate;
+
+        #[derive(Validate)]
+        struct Demo {
+            #[validate(length(max = 3))]
+            name: String,
+        }
+
+        let errs = Demo {
+            name: "too long".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+
+        match AppError::from(errs) {
+            AppError::Validation { errors, .. } => {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].field, "name");
             }
             other => panic!("Expected Validation error, got {other:?}"),
         }

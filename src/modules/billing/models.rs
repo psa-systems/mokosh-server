@@ -209,9 +209,13 @@ fn validate_invoice_date_range(
     req: &CreateInvoiceRequest,
 ) -> Result<(), validator::ValidationError> {
     if req.due_date < req.invoice_date {
-        let mut error = validator::ValidationError::new("invalid_date_range");
-        error.message = Some("due_date must be on or after invoice_date".into());
-        return Err(error);
+        // Re-key onto `due_date` so the form shows the message inline
+        // rather than as a generic banner (PMS-364).
+        return Err(crate::utils::validation::cross_field_error(
+            "invalid_date_range",
+            "due_date",
+            "due_date must be on or after invoice_date",
+        ));
     }
     Ok(())
 }

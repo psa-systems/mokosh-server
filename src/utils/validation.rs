@@ -325,6 +325,32 @@ pub fn truncate(s: &str, max_len: usize) -> String {
     format!("{}...", &s[..cut])
 }
 
+/// Param key used to carry the form field a schema-level (cross-field)
+/// validation error should attach to. `From<ValidationErrors> for AppError`
+/// reads this param to re-key the error off validator-crate's `__all__`
+/// bucket and onto a real field (PMS-364).
+pub const CROSS_FIELD_TARGET_PARAM: &str = "field";
+
+/// Build a schema-level (cross-field) `ValidationError` that names the form
+/// field its message should attach to.
+///
+/// validator-crate keys every `#[validate(schema(...))]` error under the
+/// special `__all__` bucket, which the client cannot bind to a form field, so
+/// the message degrades to a generic banner instead of an inline field error
+/// (PMS-364). Recording the target field as a param lets the
+/// `From<ValidationErrors> for AppError` conversion re-key the error onto that
+/// field so the form renders it inline, the same as a single-field error.
+pub fn cross_field_error(
+    code: &'static str,
+    field: &'static str,
+    message: &'static str,
+) -> ValidationError {
+    let mut error = ValidationError::new(code);
+    error.message = Some(message.into());
+    error.add_param(std::borrow::Cow::Borrowed(CROSS_FIELD_TARGET_PARAM), &field);
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

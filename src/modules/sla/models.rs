@@ -59,10 +59,13 @@ fn validate_sla_target_range(
         (req.first_response_hours, req.resolution_hours)
     {
         if first_response > resolution {
-            let mut error = validator::ValidationError::new("invalid_sla_target_range");
-            error.message =
-                Some("first_response_hours must be less than or equal to resolution_hours".into());
-            return Err(error);
+            // Re-key onto `first_response_hours` so the form shows the message
+            // inline rather than as a generic banner (PMS-364).
+            return Err(crate::utils::validation::cross_field_error(
+                "invalid_sla_target_range",
+                "first_response_hours",
+                "first_response_hours must be less than or equal to resolution_hours",
+            ));
         }
     }
     Ok(())
