@@ -422,6 +422,13 @@ async fn contact_crud_happy_path(pool: PgPool) {
     );
     let created: serde_json::Value = create_resp.json().await.expect("create JSON");
     let contact_id = created["id"].as_str().expect("contact has id").to_string();
+    // PMS-334: the create response carries the linked company's name,
+    // resolved via the LEFT JOIN to companies (previously hardcoded null).
+    assert_eq!(
+        created["company_name"].as_str(),
+        Some("Acme"),
+        "create response should populate company_name"
+    );
 
     // LIST contains it.
     let list_resp = app
@@ -434,9 +441,16 @@ async fn contact_crud_happy_path(pool: PgPool) {
     assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
     let list: serde_json::Value = list_resp.json().await.expect("list JSON");
     let items = list["data"].as_array().expect("list has data array");
-    assert!(
-        items.iter().any(|c| c["id"].as_str() == Some(&contact_id)),
-        "contact list should contain the new contact"
+    let listed = items
+        .iter()
+        .find(|c| c["id"].as_str() == Some(&contact_id))
+        .expect("contact list should contain the new contact");
+    // PMS-334: the Contacts list Company column is backed by company_name,
+    // which the list query now fills from the joined company.
+    assert_eq!(
+        listed["company_name"].as_str(),
+        Some("Acme"),
+        "contact list row should populate company_name"
     );
 
     // GET single.
@@ -451,6 +465,8 @@ async fn contact_crud_happy_path(pool: PgPool) {
     let got: serde_json::Value = get_resp.json().await.expect("get JSON");
     assert_eq!(got["first_name"].as_str(), Some("Bob"));
     assert_eq!(got["last_name"].as_str(), Some("Johnson"));
+    // PMS-334: single-contact GET also populates company_name.
+    assert_eq!(got["company_name"].as_str(), Some("Acme"));
 
     // UPDATE - touch two fields and re-GET to verify persistence (same
     // pattern as the site_update test for symmetry).

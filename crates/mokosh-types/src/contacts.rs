@@ -589,6 +589,11 @@ pub struct Contact {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub company_id: Uuid,
+    /// Name of the linked company, resolved via a LEFT JOIN in the read
+    /// queries (PMS-334). `None` only when the company row is missing;
+    /// `company_id` is NOT NULL so this is populated in practice.
+    #[serde(default)]
+    pub company_name: Option<String>,
     pub first_name: String,
     pub last_name: String,
     pub email: Option<String>,
@@ -742,7 +747,7 @@ impl From<Contact> for ContactResponse {
         Self {
             id: c.id,
             company_id: c.company_id,
-            company_name: None,
+            company_name: c.company_name.clone(),
             first_name: c.first_name.clone(),
             last_name: c.last_name.clone(),
             full_name: c.full_name(),
