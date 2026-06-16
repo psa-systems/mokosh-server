@@ -611,6 +611,148 @@ async fn vote_is_per_user_exclusive_and_toggleable(pool: PgPool) {
     assert_eq!(got["not_helpful_count"].as_i64(), Some(1));
 }
 
+/// PMS-341: the write path for `client_specific` scoping.
+///
+/// Exercises every backend acceptance criterion through the real router:
+/// creating a `client_specific` article with `company_ids` persists and
+/// round-trips them; omitting `company_ids` is a 422; a foreign company id
+/// is a 400; and switching an article away from `client_specific` clears
+/// the scope.
+#[sqlx::test]
+async fn client_specific_company_ids_write_path(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+
+    // A company in the caller's tenant, plus one in another tenant to prove
+    // the tenant-ownership check.
+    let company_a = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(company_a)
+        .bind(tenant_id)
+        .bind("Company A")
+        .execute(&pool)
+        .await
+        .expect("seed company A");
+    let (other_tenant, _other_author, _e, _p) =
+        common::seed_tenant_with_admin(&pool, "pms341-other").await;
+    let foreign_company = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(foreign_company)
+        .bind(other_tenant)
+        .bind("Foreign Co")
+        .execute(&pool)
+        .await
+        .expect("seed foreign company");
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // 1) client_specific with no company_ids -> 422.
+    let missing = app
+        .client
+        .post(app.url("/api/v1/kb/articles"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Scoped doc",
+            "slug": "scoped-doc-missing",
+            "content": "secret",
+            "visibility": "client_specific",
+        }))
+        .send()
+        .await
+        .expect("send create missing company_ids");
+    assert_eq!(
+        missing.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "client_specific without company_ids must be 422, got {}",
+        missing.status()
+    );
+
+    // 2) client_specific with a company from ANOTHER tenant -> 400.
+    let foreign = app
+        .client
+        .post(app.url("/api/v1/kb/articles"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Scoped doc",
+            "slug": "scoped-doc-foreign",
+            "content": "secret",
+            "visibility": "client_specific",
+            "company_ids": [foreign_company],
+        }))
+        .send()
+        .await
+        .expect("send create foreign company_ids");
+    assert_eq!(
+        foreign.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "client_specific with a foreign company must be 400, got {}",
+        foreign.status()
+    );
+
+    // 3) Valid client_specific create persists and round-trips company_ids.
+    let article = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Scoped doc",
+            "slug": "scoped-doc",
+            "content": "secret",
+            "visibility": "client_specific",
+            "status": "published",
+            "company_ids": [company_a],
+        }),
+    )
+    .await;
+    let article_id = article["id"].as_str().expect("article id").to_string();
+    let ids: Vec<&str> = article["company_ids"]
+        .as_array()
+        .expect("company_ids array")
+        .iter()
+        .map(|v| v.as_str().expect("company id string"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![company_a.to_string()],
+        "create response must carry the scoped company_ids"
+    );
+
+    // GET round-trips the scope.
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get article")
+        .json()
+        .await
+        .expect("get article JSON");
+    assert_eq!(
+        got["company_ids"].as_array().map(|a| a.len()),
+        Some(1),
+        "GET must round-trip company_ids"
+    );
+
+    // 4) Switching away from client_specific clears the scope.
+    let updated: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "visibility": "internal" }))
+        .send()
+        .await
+        .expect("send update visibility")
+        .json()
+        .await
+        .expect("update article JSON");
+    assert_eq!(
+        updated["company_ids"].as_array().map(|a| a.len()),
+        Some(0),
+        "switching away from client_specific must clear company_ids"
+    );
+}
+
 /// Seed a portal-enabled contact under a company and return
 /// `(company_id, email, plaintext_password)`. The contact is created with
 /// `is_portal_user = TRUE` and a real Argon2 hash so it can drive

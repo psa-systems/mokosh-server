@@ -51,6 +51,10 @@ pub struct KbArticleResponse {
     pub not_helpful_count: i32,
     pub published_at: Option<DateTime<Utc>>,
     pub tags: Vec<String>,
+    /// Companies a `client_specific` article is scoped to. Empty for
+    /// `public` / `internal` articles. Returned so the editor can
+    /// round-trip the multi-select selection (PMS-341).
+    pub company_ids: Vec<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -71,6 +75,11 @@ pub struct CreateKbArticleRequest {
     pub status: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Companies a `client_specific` article is scoped to (PMS-341).
+    /// Required (non-empty) when `visibility = client_specific`; ignored
+    /// and stored empty for `public` / `internal`.
+    #[serde(default)]
+    pub company_ids: Option<Vec<Uuid>>,
 }
 
 fn default_draft() -> String {
@@ -87,6 +96,11 @@ pub struct UpdateKbArticleRequest {
     pub visibility: Option<String>,
     pub status: Option<String>,
     pub tags: Option<Vec<String>>,
+    /// Companies a `client_specific` article is scoped to (PMS-341). When
+    /// omitted the existing scope is kept; when the (effective) visibility
+    /// is not `client_specific` the scope is cleared regardless.
+    #[serde(default)]
+    pub company_ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
