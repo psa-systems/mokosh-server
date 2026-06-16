@@ -571,17 +571,22 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        audit_write(
-            &mut *tx,
-            tenant_id,
-            ctx,
-            AuditAction::Update,
-            "tickets",
-            Some(ticket_id),
-            before,
-            after,
-        )
-        .await?;
+        // PMS-349: a description edit that only flips task-list checkboxes is a
+        // checklist toggle, not a content change, so skip the audit entry to
+        // keep the change history free of checkbox noise.
+        if !crate::modules::audit::is_task_marker_only_change(&before, &after) {
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Update,
+                "tickets",
+                Some(ticket_id),
+                before,
+                after,
+            )
+            .await?;
+        }
         tx.commit().await?;
 
         // Recalculate SLA when priority changes. Runs after commit so it
