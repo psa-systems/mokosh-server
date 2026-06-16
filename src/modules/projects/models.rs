@@ -52,6 +52,11 @@ pub struct ProjectResponse {
     pub description: Option<String>,
     pub project_number: Option<String>,
     pub company_id: Option<Uuid>,
+    /// Name of the owning company, resolved via a tenant-scoped LEFT join on
+    /// `companies` (PMS-335). `None` when the project has no `company_id` (or
+    /// the company row is gone), so the DTO carries the client name without an
+    /// N+1 lookup per project.
+    pub company_name: Option<String>,
     pub contract_id: Option<Uuid>,
     /// Legacy free-string classification, kept for one release (PMS-322).
     /// Prefer `project_type_id`, which references the `project_types` lookup.

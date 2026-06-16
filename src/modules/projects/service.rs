@@ -68,7 +68,11 @@ impl ProjectsService {
         let order_by = pagination.order_by("created_at", &["name", "start_date", "created_at"]);
         let query = format!(
             r#"
-            SELECT id, name, description, project_number, company_id, contract_id,
+            SELECT id, name, description, project_number, company_id,
+                   (SELECT co.name FROM companies co
+                     WHERE co.id = projects.company_id
+                       AND co.tenant_id = projects.tenant_id) AS company_name,
+                   contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
@@ -160,7 +164,11 @@ impl ProjectsService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ProjectRow>(
             r#"
-            SELECT id, name, description, project_number, company_id, contract_id,
+            SELECT id, name, description, project_number, company_id,
+                   (SELECT co.name FROM companies co
+                     WHERE co.id = projects.company_id
+                       AND co.tenant_id = projects.tenant_id) AS company_name,
+                   contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
@@ -970,6 +978,7 @@ struct ProjectRow {
     description: Option<String>,
     project_number: Option<String>,
     company_id: Option<Uuid>,
+    company_name: Option<String>,
     contract_id: Option<Uuid>,
     project_type: String,
     project_type_id: Option<Uuid>,
@@ -997,6 +1006,7 @@ impl From<ProjectRow> for ProjectResponse {
             description: r.description,
             project_number: r.project_number,
             company_id: r.company_id,
+            company_name: r.company_name,
             contract_id: r.contract_id,
             project_type: r.project_type,
             project_type_id: r.project_type_id,
