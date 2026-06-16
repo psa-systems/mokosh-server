@@ -326,12 +326,13 @@ pub struct CreatePaymentRequest {
     pub invoice_id: Option<Uuid>,
     pub company_id: Uuid,
     pub payment_date: NaiveDate,
-    /// Payment amount. Bounded to the `DECIMAL(12, 2)` column magnitude so an
-    /// oversized value returns a 422 rather than overflowing the column and
-    /// surfacing as a 500 (PMS-306). The sign is intentionally NOT constrained:
-    /// negative amounts represent refunds / reversals and are allowed by
-    /// design, so only the magnitude is validated here.
-    #[validate(custom(function = crate::utils::validation::validate_money_amount))]
+    /// Payment amount. Must be strictly positive and at most 2 decimal places,
+    /// and within the `DECIMAL(12, 2)` column magnitude. A zero or negative
+    /// amount is rejected with a 422 field error rather than persisted, since
+    /// it corrupts invoice balances and revenue reporting (PMS-373); an
+    /// oversized value is likewise a 422 rather than a column overflow / 500
+    /// (PMS-306).
+    #[validate(custom(function = crate::utils::validation::validate_payment_amount))]
     pub amount: Decimal,
     pub payment_method: PaymentMethod,
     pub reference_number: Option<String>,
@@ -533,13 +534,29 @@ mod tests {
     }
 
     #[test]
-    fn accepts_in_range_and_signed_payment_amount() {
+    fn accepts_in_range_positive_payment_amount() {
         assert!(payment(Decimal::from_str("9999999999.99").unwrap())
             .validate()
             .is_ok());
-        // Negative amounts (refunds) are intentionally allowed.
-        assert!(payment(Decimal::from_str("-250.00").unwrap())
+        assert!(payment(Decimal::from_str("0.01").unwrap())
             .validate()
             .is_ok());
+    }
+
+    #[test]
+    fn rejects_non_positive_payment_amount() {
+        // PMS-373: zero and negative amounts must be a 422, not persisted.
+        assert!(payment(Decimal::from_str("0").unwrap()).validate().is_err());
+        assert!(payment(Decimal::from_str("-50.00").unwrap())
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_over_precise_payment_amount() {
+        // PMS-373: more than 2 decimal places would be silently rounded.
+        assert!(payment(Decimal::from_str("50.001").unwrap())
+            .validate()
+            .is_err());
     }
 }

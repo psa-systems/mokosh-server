@@ -193,6 +193,40 @@ pub fn validate_money_amount(value: &Decimal) -> Result<(), ValidationError> {
     }
 }
 
+/// Validate a payment `amount` against its `DECIMAL(12, 2)` column (PMS-373).
+///
+/// A payment must be strictly positive: a zero or negative amount distorts
+/// invoice balances, customer statements, and revenue reporting, so it is
+/// rejected with a 422 field error before any row is created (refunds /
+/// reversals are modelled separately, not as negative payments). More than two
+/// decimal places would be silently rounded by the column, and an oversized
+/// magnitude would overflow it and surface as a 500 (same class as PMS-306).
+/// A `payments_amount_positive` CHECK constraint backstops this at the DB.
+pub fn validate_payment_amount(value: &Decimal) -> Result<(), ValidationError> {
+    if !value.is_sign_positive() || value.is_zero() {
+        let mut error = ValidationError::new("payment_amount_not_positive");
+        error.message = Some("payment amount must be greater than 0".into());
+        return Err(error);
+    }
+    if value.scale() > 2 {
+        let mut error = ValidationError::new("payment_amount_scale");
+        error.message = Some("payment amount must have at most 2 decimal places".into());
+        return Err(error);
+    }
+    if *value >= Decimal::from(MONEY_AMOUNT_MAX_EXCLUSIVE) {
+        let mut error = ValidationError::new("payment_amount_out_of_range");
+        error.message = Some(
+            format!(
+                "payment amount must be less than {MONEY_AMOUNT_MAX_EXCLUSIVE} \
+                 (the DECIMAL(12, 2) column limit)"
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Exclusive upper bound on the magnitude of a project budget *amount* stored
 /// in a `DECIMAL(12, 2)` column (largest holdable value `9_999_999_999.99`).
 const BUDGET_AMOUNT_MAX_EXCLUSIVE: i64 = 10_000_000_000;
@@ -413,6 +447,22 @@ mod tests {
         assert!(validate_money_amount(&Decimal::from_str("10000000000").unwrap()).is_err());
         assert!(validate_money_amount(&Decimal::from_str("1000000000000000").unwrap()).is_err());
         assert!(validate_money_amount(&Decimal::from_str("-1000000000000000").unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_validate_payment_amount() {
+        use std::str::FromStr;
+        // Valid: strictly-positive, at most 2 dp, within the column range.
+        assert!(validate_payment_amount(&Decimal::from_str("50.00").unwrap()).is_ok());
+        assert!(validate_payment_amount(&Decimal::from_str("0.01").unwrap()).is_ok());
+        assert!(validate_payment_amount(&Decimal::from_str("9999999999.99").unwrap()).is_ok());
+        // PMS-373: zero and negative amounts are rejected (no longer "refunds").
+        assert!(validate_payment_amount(&Decimal::from_str("0").unwrap()).is_err());
+        assert!(validate_payment_amount(&Decimal::from_str("-50.00").unwrap()).is_err());
+        // More than 2 decimal places rejected (would be silently rounded).
+        assert!(validate_payment_amount(&Decimal::from_str("1.001").unwrap()).is_err());
+        // Out of range for DECIMAL(12, 2) (would overflow -> 500).
+        assert!(validate_payment_amount(&Decimal::from_str("10000000000").unwrap()).is_err());
     }
 
     #[test]
