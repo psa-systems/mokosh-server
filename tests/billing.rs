@@ -702,3 +702,144 @@ async fn invoice_rejects_cross_tenant_payment_term(pool: PgPool) {
         "a cross-tenant payment_term_id is rejected with 400"
     );
 }
+
+/// PMS-342: the payment-gateway secret is write-only. The upsert response and
+/// the `GET /payment-gateways` list must never echo the decrypted credential;
+/// they expose only non-secret metadata plus `configured`. Updating a gateway
+/// without re-sending `config` preserves the stored secret.
+#[sqlx::test]
+async fn payment_gateway_secret_is_write_only(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    const SECRET: &str = "sk_live_supersecret_PMS342";
+
+    // 1. Create a gateway carrying a secret in its config blob.
+    let resp = app
+        .client
+        .put(app.url("/api/v1/payment-gateways"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "provider": "stripe",
+            "is_active": true,
+            "is_test_mode": false,
+            "config": { "api_key": SECRET },
+        }))
+        .send()
+        .await
+        .expect("upsert payment gateway");
+    assert!(
+        resp.status().is_success(),
+        "create gateway should 2xx, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("upsert body");
+    assert!(
+        !body.contains(SECRET),
+        "upsert response must not echo the plaintext secret, got {body}"
+    );
+    let created: serde_json::Value = serde_json::from_str(&body).expect("upsert JSON");
+    assert!(
+        created.get("config").is_none(),
+        "response must not carry a `config` field, got {created}"
+    );
+    assert_eq!(
+        created["configured"].as_bool(),
+        Some(true),
+        "a stored gateway reports configured = true"
+    );
+
+    // Capture the encrypted secret as stored, to prove a metadata-only update
+    // leaves it untouched.
+    let secret_before: String = sqlx::query_scalar(
+        "SELECT config_encrypted FROM payment_gateway_configs WHERE provider = 'stripe'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("read stored secret");
+
+    // 2. `GET /payment-gateways` exposes metadata but never the secret.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/payment-gateways"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list payment gateways");
+    assert!(resp.status().is_success(), "list gateways should 2xx");
+    let body = resp.text().await.expect("list body");
+    assert!(
+        !body.contains(SECRET),
+        "list response must not contain the plaintext secret, got {body}"
+    );
+    let list: serde_json::Value = serde_json::from_str(&body).expect("list JSON");
+    let gw = &list["data"][0];
+    assert!(
+        gw.get("config").is_none(),
+        "list item must not carry a `config` field, got {gw}"
+    );
+    assert_eq!(gw["provider"].as_str(), Some("stripe"));
+    assert_eq!(gw["is_active"].as_bool(), Some(true));
+    assert_eq!(gw["is_test_mode"].as_bool(), Some(false));
+    assert_eq!(
+        gw["configured"].as_bool(),
+        Some(true),
+        "list conveys that a secret is configured"
+    );
+
+    // 3. Update metadata only (no `config`): the stored secret is preserved.
+    let resp = app
+        .client
+        .put(app.url("/api/v1/payment-gateways"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "provider": "stripe",
+            "is_active": false,
+            "is_test_mode": true,
+        }))
+        .send()
+        .await
+        .expect("update gateway without config");
+    assert!(
+        resp.status().is_success(),
+        "config-less update should 2xx, got {}",
+        resp.status()
+    );
+
+    let (secret_after, is_active_after, is_test_after): (String, bool, bool) = sqlx::query_as(
+        "SELECT config_encrypted, is_active, is_test_mode \
+         FROM payment_gateway_configs WHERE provider = 'stripe'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("read gateway after metadata update");
+    assert_eq!(
+        secret_after, secret_before,
+        "a config-less update must preserve the stored encrypted secret"
+    );
+    assert!(
+        !is_active_after,
+        "metadata update applied is_active = false"
+    );
+    assert!(is_test_after, "metadata update applied is_test_mode = true");
+
+    // 4. First-time create with no config is rejected (nothing to preserve).
+    let resp = app
+        .client
+        .put(app.url("/api/v1/payment-gateways"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "provider": "paypal",
+            "is_active": true,
+            "is_test_mode": true,
+        }))
+        .send()
+        .await
+        .expect("create gateway without config");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "creating a new gateway without a config is a 400"
+    );
+}
