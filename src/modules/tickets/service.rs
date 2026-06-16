@@ -273,6 +273,29 @@ impl TicketService {
         // Calculate and set SLA due dates
         self.calculate_sla_dates(tenant_id, ticket_id).await?;
 
+        // PMS-345: tickets that match no SLA get no resolution due date.
+        // Fall back to the tenant-wide standard due date (today + N business
+        // days; N = 0 disables it). Only fills when calculate_sla_dates left
+        // sla_due_date NULL, so SLA-derived dates always win.
+        let n =
+            crate::modules::settings::read_default_due_business_days(&self.db, tenant_id).await?;
+        if n > 0 {
+            let now = Utc::now();
+            let due = crate::utils::datetime::add_business_days(now.date_naive(), n)
+                .and_time(now.time())
+                .and_utc();
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                "UPDATE tickets SET sla_due_date = $1 WHERE tenant_id = $2 AND id = $3 AND sla_due_date IS NULL",
+            )
+            .bind(due)
+            .bind(tenant_id)
+            .bind(ticket_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+
         // Audit F11: run on_create automation rules. Failures are logged
         // but do not abort the ticket creation - a misconfigured rule
         // shouldn't block legitimate work.

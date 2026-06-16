@@ -113,6 +113,16 @@ pub fn validate_setting_value(
             Some(n) if (1..=90).contains(&n) => Ok(()),
             _ => Err(bad("value", "expected an integer in 1..=90")),
         },
+        // PMS-345: standard due date offset in business days, applied to new
+        // tasks (when no due date is given) and to tickets with no SLA-derived
+        // due date. 0 disables it.
+        ("scheduling", "default_due_business_days") => match value.as_u64() {
+            Some(n) if n <= 365 => Ok(()),
+            _ => Err(bad(
+                "value",
+                "expected an integer in 0..=365 (0 disables the default due date)",
+            )),
+        },
         // Unknown (category, key): accept with a warning so a future SPA
         // experiment doesn't require a server change before the
         // validator can be taught the shape.
