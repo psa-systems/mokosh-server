@@ -484,7 +484,11 @@ impl TicketService {
             .await?;
         self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
             .await?;
-        self.validate_fk_opt(tenant_id, "assets", request.asset_id)
+        // PMS-344 follow-up: asset_id is now PATCH-nullable
+        // (Option<Option<Uuid>>); only the inner Some(uuid) needs an FK
+        // validation. Some(None) means "clear to NULL", which is always
+        // safe; None means "leave unchanged".
+        self.validate_fk_opt(tenant_id, "assets", request.asset_id.flatten())
             .await?;
 
         // Mutation + audit row in one transaction: snapshot the row
@@ -579,6 +583,22 @@ impl TicketService {
         if let Some(queue_id) = request.queue_id {
             sqlx::query("UPDATE tickets SET queue_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
                 .bind(queue_id)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // PMS-344 follow-up: PATCH-style nullable update for asset_id.
+        // Some(Some(uuid)) sets the association, Some(None) clears it to
+        // NULL (powers the inline-editor "Unassign" button), and None
+        // leaves the column untouched. The previous code validated the
+        // FK but never ran an UPDATE, so the picker's PUT round-tripped
+        // with a bare "Updated" audit row and no actual mutation.
+        if let Some(asset_id_opt) = request.asset_id {
+            sqlx::query("UPDATE tickets SET asset_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(asset_id_opt)
                 .bind(user_id)
                 .bind(tenant_id)
                 .bind(ticket_id)

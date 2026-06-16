@@ -56,6 +56,11 @@ pub struct AssetFilter {
     pub asset_type_id: Option<Uuid>,
     #[validate(length(max = 100))]
     pub status: Option<String>,
+    /// PMS-344 follow-up: free-text search on the asset name, used by
+    /// the AssetPicker on the ticket form / inline editor. ILIKE-matched
+    /// in the service, mirroring CompanyFilter.q.
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
