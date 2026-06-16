@@ -177,6 +177,12 @@ async fn projects_report(
 async fn clients_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
+    // PMS-350: the clients report is Client Profitability - it sums
+    // invoiced / paid / outstanding from the invoices table, so it carries
+    // the same financial data as the Invoices page and the billing report.
+    // Gate it behind the same finance check rather than letting any
+    // reports-enabled role (e.g. technician) read company financials.
+    _f: RequireFinance,
 ) -> AppResult<Json<ClientsReportResponse>> {
     Ok(Json(s.service.clients(u.tenant()).await?))
 }
@@ -253,7 +259,16 @@ async fn export_report(
             csv_for_billing(&s.service.billing(u.tenant(), q.company_id).await?)
         }
         "projects" => csv_for_projects(&s.service.projects(u.tenant()).await?),
-        "clients" => csv_for_clients(&s.service.clients(u.tenant()).await?),
+        "clients" => {
+            // The clients export is Client Profitability (invoiced / paid /
+            // outstanding), the same financial data as GET /reports/clients,
+            // so it enforces the same finance gate as the billing export above
+            // rather than leaving a CSV side-door open (PMS-350).
+            if !u.role.can_manage_billing() {
+                return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+            }
+            csv_for_clients(&s.service.clients(u.tenant()).await?)
+        }
         other => return Err(AppError::NotFound(format!("report {other:?}"))),
     };
     Ok((

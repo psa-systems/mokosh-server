@@ -102,12 +102,22 @@ async fn role_route_coverage_matrix(pool: PgPool) {
     assert_matrix(&app, &tokens, "/api/v1/rate-cards", FINANCE_ROLES).await;
 
     // Financial reports: the direct route and the CSV export side-door both
-    // enforce the Invoices gate.
+    // enforce the Invoices gate. Covers both the Revenue & A/R report
+    // (/reports/billing) and Client Profitability (/reports/clients), which
+    // sums invoiced/paid/outstanding from the invoices table (PMS-350).
     assert_matrix(&app, &tokens, "/api/v1/reports/billing", FINANCE_ROLES).await;
     assert_matrix(
         &app,
         &tokens,
         "/api/v1/reports/billing/export?format=csv",
+        FINANCE_ROLES,
+    )
+    .await;
+    assert_matrix(&app, &tokens, "/api/v1/reports/clients", FINANCE_ROLES).await;
+    assert_matrix(
+        &app,
+        &tokens,
+        "/api/v1/reports/clients/export?format=csv",
         FINANCE_ROLES,
     )
     .await;
