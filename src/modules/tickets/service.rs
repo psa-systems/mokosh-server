@@ -2044,6 +2044,15 @@ fn build_ticket_filter_sql(filter: &TicketFilter, is_open_fragment: &str) -> Tic
         count_idx += 1;
         binds.push(TicketFilterBind::Id(assigned_to_id));
     }
+    // PMS-344: filter tickets by their associated asset. Drives the
+    // Related Tickets section the asset detail page renders.
+    if let Some(asset_id) = filter.asset_id {
+        data_conds.push(format!("t.asset_id = ${data_idx}"));
+        count_conds.push(format!("t.asset_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(asset_id));
+    }
     // The remaining conditions are literal SQL (no placeholders, no
     // binds), so they do not touch the indices.
     if filter.is_unassigned == Some(true) {
@@ -2073,6 +2082,7 @@ const TICKET_RESPONSE_SELECT: &str = r#"
 SELECT
     t.id, t.ticket_number, t.title, t.description,
     t.source, t.company_id, t.contact_id, t.assigned_to_id,
+    t.asset_id,
     t.sla_due_date, t.is_billable, t.billing_status,
     t.estimated_hours, t.actual_hours, t.tags,
     t.closed_at, t.created_at, t.updated_at,
@@ -2089,6 +2099,10 @@ SELECT
     co.name AS company_name,
     NULLIF(TRIM(COALESCE(ct.first_name, '') || ' ' || COALESCE(ct.last_name, '')), '') AS contact_name,
     NULLIF(TRIM(COALESCE(au.first_name, '') || ' ' || COALESCE(au.last_name, '')), '') AS assigned_to_name,
+    -- PMS-344: include the asset display name so the SPA's ticket
+    -- detail can render a link directly without a second fetch. NULL
+    -- when the ticket has no associated asset.
+    a.name AS asset_name,
     COALESCE(TRIM(cu.first_name || ' ' || cu.last_name), '') AS created_by_name
 FROM tickets t
 INNER JOIN ticket_statuses    ts ON t.status_id   = ts.id
@@ -2099,6 +2113,7 @@ LEFT  JOIN ticket_categories  tc ON t.category_id = tc.id
 INNER JOIN companies          co ON t.company_id  = co.id
 LEFT  JOIN contacts           ct ON t.contact_id  = ct.id
 LEFT  JOIN users              au ON t.assigned_to_id = au.id
+LEFT  JOIN assets             a  ON t.asset_id   = a.id
 LEFT  JOIN users              cu ON t.created_by_id  = cu.id
 "#;
 
@@ -2209,6 +2224,7 @@ struct TicketResponseRow {
     company_id: Uuid,
     contact_id: Option<Uuid>,
     assigned_to_id: Option<Uuid>,
+    asset_id: Option<Uuid>,
     sla_due_date: Option<chrono::DateTime<Utc>>,
     is_billable: bool,
     billing_status: String,
@@ -2231,6 +2247,7 @@ struct TicketResponseRow {
     company_name: String,
     contact_name: Option<String>,
     assigned_to_name: Option<String>,
+    asset_name: Option<String>,
     created_by_name: String,
 }
 
@@ -2276,6 +2293,8 @@ impl From<TicketResponseRow> for TicketResponse {
                 .map(|d| d.to_string().parse().unwrap_or(0.0)),
             actual_hours: r.actual_hours.to_string().parse().unwrap_or(0.0),
             tags: r.tags,
+            asset_id: r.asset_id,
+            asset_name: r.asset_name,
             created_by_name: r.created_by_name,
             created_at: r.created_at,
             updated_at: r.updated_at,
