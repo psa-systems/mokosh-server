@@ -272,6 +272,39 @@ pub fn field_changes(
     }
 }
 
+/// True when the only meaningful difference between two row snapshots is a
+/// `description` whose change is solely GFM task-list marker flips
+/// (`[ ]` <-> `[x]`). Toggling a rendered checkbox (PMS-348) rewrites the
+/// description with a flipped marker; that "checklist toggle" is a state
+/// change, not a content edit, so callers skip writing an audit entry for it
+/// (PMS-349) to keep the change history free of checkbox noise. Any other
+/// changed field, a non-marker text change, or adding/removing the description
+/// (null <-> text) makes this `false`, so the edit is audited normally.
+pub fn is_task_marker_only_change(
+    old: &Option<serde_json::Value>,
+    new: &Option<serde_json::Value>,
+) -> bool {
+    match field_changes(old, new).as_slice() {
+        [c] if c.field == "description" => {
+            match (
+                c.old.as_ref().and_then(serde_json::Value::as_str),
+                c.new.as_ref().and_then(serde_json::Value::as_str),
+            ) {
+                (Some(a), Some(b)) => normalize_task_markers(a) == normalize_task_markers(b),
+                // null <-> text (description added or cleared) is a real edit.
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Lower every GFM task marker to its unchecked form so two descriptions that
+/// differ only in which boxes are ticked compare equal.
+fn normalize_task_markers(s: &str) -> String {
+    s.replace("[x]", "[ ]").replace("[X]", "[ ]")
+}
+
 #[derive(sqlx::FromRow)]
 struct HistoryRow {
     id: Uuid,
@@ -331,5 +364,55 @@ impl From<AuditRow> for AuditLogEntryResponse {
             user_agent: r.user_agent,
             timestamp: r.timestamp,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn snap(v: serde_json::Value) -> Option<serde_json::Value> {
+        Some(v)
+    }
+
+    #[test]
+    fn marker_only_change_is_detected() {
+        // Only the checkbox flips; updated_at is a noise field and ignored.
+        let old = snap(json!({"description": "- [ ] a\n- [ ] b", "updated_at": "t1"}));
+        let new = snap(json!({"description": "- [x] a\n- [ ] b", "updated_at": "t2"}));
+        assert!(is_task_marker_only_change(&old, &new));
+        // Unchecking is symmetric, and uppercase X is handled.
+        let old = snap(json!({"description": "- [X] a"}));
+        let new = snap(json!({"description": "- [ ] a"}));
+        assert!(is_task_marker_only_change(&old, &new));
+    }
+
+    #[test]
+    fn text_edit_is_audited() {
+        let old = snap(json!({"description": "- [ ] a"}));
+        let new = snap(json!({"description": "- [ ] a renamed"}));
+        assert!(!is_task_marker_only_change(&old, &new));
+    }
+
+    #[test]
+    fn other_field_change_is_audited() {
+        let old = snap(json!({"description": "- [ ] a", "title": "x"}));
+        let new = snap(json!({"description": "- [x] a", "title": "y"}));
+        assert!(!is_task_marker_only_change(&old, &new));
+    }
+
+    #[test]
+    fn adding_or_clearing_description_is_audited() {
+        let old = snap(json!({"description": serde_json::Value::Null}));
+        let new = snap(json!({"description": "- [x] a"}));
+        assert!(!is_task_marker_only_change(&old, &new));
+        assert!(!is_task_marker_only_change(&new, &old));
+    }
+
+    #[test]
+    fn no_change_is_not_a_marker_toggle() {
+        let same = snap(json!({"description": "- [ ] a"}));
+        assert!(!is_task_marker_only_change(&same, &same));
     }
 }

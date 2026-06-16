@@ -252,17 +252,21 @@ impl ProjectsService {
 
         // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
         // unwrap the TenantId at the boundary.
-        audit_write(
-            &mut *tx,
-            tenant_id,
-            ctx,
-            AuditAction::Update,
-            "projects",
-            Some(id),
-            before,
-            after,
-        )
-        .await?;
+        // PMS-349: skip the audit entry when the only change is task-list
+        // checkbox flips in the description (a checklist toggle, not an edit).
+        if !crate::modules::audit::is_task_marker_only_change(&before, &after) {
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Update,
+                "projects",
+                Some(id),
+                before,
+                after,
+            )
+            .await?;
+        }
         tx.commit().await?;
         self.get_project(tenant_id, id).await
     }
