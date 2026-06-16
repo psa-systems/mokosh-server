@@ -34,8 +34,23 @@ impl ReportsService {
     }
 
     // PMS-95 dashboard --------------------------------------------------------
+    /// `user_tz` is the active user's `users.timezone` preference (PMS-253).
+    /// The 30-day ticket trend is the one server-computed per-day bucket on a
+    /// `timestamptz`, so it must group by the user's local day rather than the
+    /// UTC day (PMS-360); otherwise a ticket created at 23:30 Pacific lands in
+    /// tomorrow's UTC bar and the chart disagrees with every other "today"
+    /// surface.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn dashboard(&self, tenant_id: TenantId) -> AppResult<DashboardResponse> {
+    pub async fn dashboard(
+        &self,
+        tenant_id: TenantId,
+        user_tz: &str,
+    ) -> AppResult<DashboardResponse> {
+        let tz_name = mokosh_types::datetime::canonical_tz_name(user_tz);
+        // Anchor the 30-day window to "today" in the user's zone, computed in
+        // Rust so the bound and the SQL bucket agree on which zone they mean.
+        let window_start = mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz)
+            - chrono::Duration::days(30);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let open_by_priority: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT tp.name, COUNT(*)::bigint
@@ -67,12 +82,14 @@ impl ReportsService {
         .await?;
 
         let trend: Vec<(NaiveDate, i64)> = sqlx::query_as(
-            r#"SELECT (created_at::date) AS d, COUNT(*)::bigint
+            r#"SELECT ((created_at AT TIME ZONE $2)::date) AS d, COUNT(*)::bigint
                FROM tickets WHERE tenant_id = $1
-                 AND created_at >= CURRENT_DATE - INTERVAL '30 days'
+                 AND (created_at AT TIME ZONE $2)::date >= $3
                GROUP BY d ORDER BY d"#,
         )
         .bind(tenant_id)
+        .bind(tz_name)
+        .bind(window_start)
         .fetch_all(&mut *tx)
         .await?;
 
