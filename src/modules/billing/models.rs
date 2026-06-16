@@ -423,6 +423,7 @@ pub struct TaxRateResponse {
 pub struct UpsertTaxRateRequest {
     #[validate(length(min = 1, max = 100))]
     pub name: String,
+    #[validate(custom(function = crate::utils::validation::validate_tax_rate))]
     pub rate: Decimal,
     #[serde(default)]
     pub is_default: bool,

@@ -282,6 +282,44 @@ pub fn validate_sla_target_hours(value: &Decimal) -> Result<(), ValidationError>
     Ok(())
 }
 
+/// Inclusive upper bound on a tax rate, expressed as a percentage (PMS-339).
+/// The stored value is the percentage as-typed (e.g. 8.25, not 0.0825), so a
+/// single rate above 100% is almost certainly a data-entry error and is
+/// rejected. The backing column is `DECIMAL(7, 4)` (max magnitude 999.9999),
+/// widened from `DECIMAL(5, 4)` in migration 051 precisely so a percentage
+/// >= 10% fits; this bound stays well inside it.
+const TAX_RATE_MAX_INCLUSIVE: i64 = 100;
+
+/// Validate a tax rate percentage against its `DECIMAL(7, 4)` column (PMS-339).
+///
+/// `UpsertTaxRateRequest.rate` deserializes as a free `Decimal`, so before this
+/// check a rate >= 10 overflowed the old `DECIMAL(5, 4)` column and surfaced as
+/// an opaque 500 `DATABASE_ERROR`, while a negative or absurd value reached the
+/// DB unchecked. We require `0 <= rate <= 100` (a percentage, not a fraction)
+/// and at most 4 decimal places, matching the column scale; more than 4 dp
+/// would be silently rounded by the column. This turns the DB 500 into a clean
+/// 422 with a field-level message (same class as PMS-306 / PMS-324).
+pub fn validate_tax_rate(value: &Decimal) -> Result<(), ValidationError> {
+    if value.is_sign_negative() {
+        let mut error = ValidationError::new("tax_rate_negative");
+        error.message = Some("tax rate must not be negative".into());
+        return Err(error);
+    }
+    if value.scale() > 4 {
+        let mut error = ValidationError::new("tax_rate_scale");
+        error.message = Some("tax rate must have at most 4 decimal places".into());
+        return Err(error);
+    }
+    if *value > Decimal::from(TAX_RATE_MAX_INCLUSIVE) {
+        let mut error = ValidationError::new("tax_rate_out_of_range");
+        error.message = Some(
+            format!("tax rate must be a percentage between 0 and {TAX_RATE_MAX_INCLUSIVE}").into(),
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Generate a slug from a string
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
@@ -477,6 +515,25 @@ mod tests {
         assert!(validate_sla_target_hours(&Decimal::from_str("1.001").unwrap()).is_err());
         // Out of range for DECIMAL(10, 2) (would overflow -> 500).
         assert!(validate_sla_target_hours(&Decimal::from_str("100000000").unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_validate_tax_rate() {
+        use std::str::FromStr;
+        // Boundaries valid: 0 and 100 (PMS-339).
+        assert!(validate_tax_rate(&Decimal::from_str("0").unwrap()).is_ok());
+        assert!(validate_tax_rate(&Decimal::from_str("100").unwrap()).is_ok());
+        // Real-world rates that overflowed the old DECIMAL(5, 4) column.
+        assert!(validate_tax_rate(&Decimal::from_str("10").unwrap()).is_ok());
+        assert!(validate_tax_rate(&Decimal::from_str("20").unwrap()).is_ok());
+        // Non-integer percentages keep full precision (up to 4 dp).
+        assert!(validate_tax_rate(&Decimal::from_str("8.25").unwrap()).is_ok());
+        assert!(validate_tax_rate(&Decimal::from_str("7.375").unwrap()).is_ok());
+        // Rejections: negative and just over the 100% cap.
+        assert!(validate_tax_rate(&Decimal::from_str("-1").unwrap()).is_err());
+        assert!(validate_tax_rate(&Decimal::from_str("100.01").unwrap()).is_err());
+        // More than 4 decimal places would be silently rounded by the column.
+        assert!(validate_tax_rate(&Decimal::from_str("1.23456").unwrap()).is_err());
     }
 
     #[test]
