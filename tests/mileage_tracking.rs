@@ -16,7 +16,9 @@ mod common;
 
 use chrono::NaiveDate;
 use mokosh_server::modules::auth::TenantId;
-use mokosh_server::modules::mileage_tracking::{CreateMileageEntryRequest, MileageTrackingService};
+use mokosh_server::modules::mileage_tracking::{
+    CreateMileageEntryRequest, MileageTrackingService, UpdateMileageEntryRequest,
+};
 use mokosh_server::utils::error::AppError;
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
@@ -364,4 +366,63 @@ async fn mileage_entries_are_tenant_isolated(pool: PgPool) {
 
     // Tenant A still reads its own entry.
     assert!(svc.get_mileage_entry(ta, entry_a.id).await.is_ok());
+}
+
+/// PMS-315 review hardening: update_mileage_entry validates a re-associated
+/// ticket_id against the tenant, exactly like create. A ticket that is not the
+/// tenant's (here a non-existent id stands in for any out-of-tenant ticket,
+/// which RLS makes indistinguishable from absent) is rejected before the row
+/// is rewritten, so the cross-tenant link is never persisted.
+#[sqlx::test]
+async fn update_mileage_entry_rejects_foreign_ticket(pool: PgPool) {
+    let (admin_a, _email, _pw) = common::seed_admin(&pool).await;
+    let company_a = common::seed_company(&pool).await;
+    let svc = MileageTrackingService::new(Database::from_pool(pool.clone()));
+    let ta = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let entry = svc
+        .create_mileage_entry(
+            ta,
+            &CreateMileageEntryRequest {
+                user_id: admin_a,
+                date: NaiveDate::from_ymd_opt(2026, 6, 16).unwrap(),
+                distance_miles: common::dec("12.00"),
+                start_address: None,
+                end_address: None,
+                ticket_id: None,
+                project_id: None,
+                task_id: None,
+                company_id: company_a,
+                contract_id: None,
+                notes: None,
+                is_billable: true,
+                rate_per_mile: Some(common::dec("0.6000")),
+            },
+        )
+        .await
+        .expect("create entry");
+
+    // Re-associating to a ticket outside the tenant is rejected with NotFound.
+    let foreign_ticket = Uuid::new_v4();
+    let res = svc
+        .update_mileage_entry(
+            ta,
+            entry.id,
+            &UpdateMileageEntryRequest {
+                ticket_id: Some(foreign_ticket),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(res, Err(AppError::NotFound(_))),
+        "updating with a foreign/non-tenant ticket_id must be NotFound, got {res:?}"
+    );
+
+    // The stored entry is untouched: still has no ticket linked.
+    let after = svc.get_mileage_entry(ta, entry.id).await.expect("re-read");
+    assert!(
+        after.ticket_id.is_none(),
+        "rejected update must not persist the ticket link"
+    );
 }

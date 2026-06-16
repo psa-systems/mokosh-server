@@ -243,6 +243,14 @@ impl MileageTrackingService {
         };
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Write-side tenant validation on update, mirroring create: the UPDATE
+        // sets ticket_id straight from the request body, and the FK only checks
+        // existence, not tenant ownership, so a re-association could otherwise
+        // point a mileage entry at another tenant's ticket. RLS hides the row
+        // on read-back, but reject up front so the link is never written.
+        if let Some(ticket_id) = request.ticket_id {
+            assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
+        }
         let affected = sqlx::query(
             r#"
             UPDATE mileage_entries SET

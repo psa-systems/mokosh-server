@@ -77,7 +77,7 @@ pub struct CreateMileageEntryRequest {
     pub rate_per_mile: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Deserialize, Validate)]
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
 pub struct UpdateMileageEntryRequest {
     pub date: Option<NaiveDate>,
     pub distance_miles: Option<Decimal>,
