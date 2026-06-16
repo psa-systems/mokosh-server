@@ -36,6 +36,12 @@ pub struct AssetResponse {
     pub name: String,
     pub asset_type_id: Uuid,
     pub company_id: Uuid,
+    /// PMS-336: owning company display name, resolved via LEFT JOIN on
+    /// companies (mirrors how TicketResponse surfaces company_name). The
+    /// Assets list Company column and asset detail render this. Option
+    /// because the JOIN is left; in practice an asset always has a
+    /// company_id so it is populated for every row.
+    pub company_name: Option<String>,
     pub site_id: Option<Uuid>,
     pub contact_id: Option<Uuid>,
     pub status: String,
