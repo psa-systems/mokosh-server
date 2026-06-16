@@ -120,7 +120,7 @@ impl ProjectsService {
             INSERT INTO projects (
                 id, tenant_id, name, description, project_number, company_id,
                 contract_id, project_type, project_type_id, status, project_manager_id, start_date,
-                target_end_date, budget_hours, budget_amount, billing_method,
+                target_end_date, actual_end_date, budget_hours, budget_amount, billing_method,
                 hourly_rate, is_billable
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
@@ -128,7 +128,7 @@ impl ProjectsService {
                 -- carry project_type_id too (PMS-322); NULL if the tenant has
                 -- no matching type row.
                 (SELECT id FROM project_types WHERE tenant_id = $2 AND name = $8),
-                $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -144,6 +144,7 @@ impl ProjectsService {
         .bind(request.project_manager_id)
         .bind(request.start_date)
         .bind(request.target_end_date)
+        .bind(request.actual_end_date)
         .bind(request.budget_hours)
         .bind(request.budget_amount)
         .bind(&request.billing_method)

@@ -280,6 +280,76 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
     );
 }
 
+// PMS-361: the create form exposes the same status/date/manager fields the
+// edit form does, so a project can be born "active" (and with a manager and
+// dates) in one submission instead of create-then-edit. Prove every such
+// field set on POST /projects round-trips into the row and back out on read.
+#[sqlx::test]
+async fn create_accepts_status_dates_and_manager(pool: PgPool) {
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // No status override -> default stays "planning" (today's behaviour).
+    let defaulted = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Defaulted", "company_id": company }),
+    )
+    .await;
+    assert!(defaulted.status().is_success(), "create project should 2xx");
+    let defaulted: serde_json::Value = defaulted.json().await.expect("project JSON");
+    assert_eq!(
+        defaulted["status"].as_str(),
+        Some("planning"),
+        "no status override keeps the 'planning' default"
+    );
+
+    // Full override: status, both dates, actual_end_date, and a manager all
+    // supplied on create.
+    let created = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Born Active",
+            "company_id": company,
+            "status": "active",
+            "project_manager_id": admin_id,
+            "start_date": "2026-01-05",
+            "target_end_date": "2026-06-30",
+            "actual_end_date": "2026-06-28",
+        }),
+    )
+    .await;
+    assert!(created.status().is_success(), "create project should 2xx");
+    let created: serde_json::Value = created.json().await.expect("project JSON");
+    let project_id = created["id"].as_str().expect("project id").to_string();
+
+    // Round-trips on the create response itself.
+    assert_eq!(created["status"].as_str(), Some("active"));
+    assert_eq!(
+        created["project_manager_id"].as_str(),
+        Some(admin_id.to_string().as_str())
+    );
+    assert_eq!(created["start_date"].as_str(), Some("2026-01-05"));
+    assert_eq!(created["target_end_date"].as_str(), Some("2026-06-30"));
+    assert_eq!(created["actual_end_date"].as_str(), Some("2026-06-28"));
+
+    // And lands on the detail read (what the project page shows).
+    let fetched = get_json(&app, &token, &format!("/api/v1/projects/{project_id}")).await;
+    assert_eq!(fetched["status"].as_str(), Some("active"));
+    assert_eq!(
+        fetched["project_manager_id"].as_str(),
+        Some(admin_id.to_string().as_str())
+    );
+    assert_eq!(fetched["start_date"].as_str(), Some("2026-01-05"));
+    assert_eq!(fetched["target_end_date"].as_str(), Some("2026-06-30"));
+    assert_eq!(fetched["actual_end_date"].as_str(), Some("2026-06-28"));
+}
+
 // AC5: a time entry linked to a task/project rolls into actual hours and
 // amount once approved (and not before).
 #[sqlx::test]
