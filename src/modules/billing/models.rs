@@ -391,9 +391,12 @@ pub struct PaymentGatewayConfigResponse {
     pub provider: GatewayProvider,
     pub is_active: bool,
     pub is_test_mode: bool,
-    /// The decrypted plaintext config (typically JSON). Never serialise
-    /// the raw column blob.
-    pub config: serde_json::Value,
+    /// Write-only secret (PMS-342): the stored credential is never returned.
+    /// `true` when a config blob is stored for this gateway, so the client can
+    /// render "configured" without seeing the plaintext. The secret stays
+    /// decryptable strictly server-side for actual gateway calls; to change it,
+    /// send a new `config` on upsert.
+    pub configured: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -403,8 +406,12 @@ pub struct UpsertPaymentGatewayConfigRequest {
     pub is_active: bool,
     #[serde(default = "default_true")]
     pub is_test_mode: bool,
-    /// Plaintext config; encrypted at rest before persisting.
-    pub config: serde_json::Value,
+    /// Plaintext config; encrypted at rest before persisting. Write-only
+    /// (PMS-342): omit (or send `null`) on update to keep the existing stored
+    /// secret untouched; provide a value to replace it. Required when creating
+    /// a gateway for the first time.
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 fn default_true() -> bool {

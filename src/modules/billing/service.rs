@@ -1321,10 +1321,11 @@ impl BillingService {
         Ok(fallback.into())
     }
 
-    /// PMS-40: list payment gateway configs for the tenant. Each
-    /// response carries the *decrypted* config so a finance admin can
-    /// confirm what's wired without an extra round-trip to a "reveal"
-    /// endpoint.
+    /// PMS-40 / PMS-342: list payment gateway configs for the tenant. The
+    /// stored credential is a write-only secret, so the response carries only
+    /// non-secret metadata plus `configured` (whether a secret is stored). The
+    /// decrypted config is never returned; decryption stays server-internal for
+    /// actual gateway calls.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payment_gateways(
         &self,
@@ -1353,30 +1354,27 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
 
-        let decrypted: Vec<PaymentGatewayConfigResponse> = rows
+        let gateways: Vec<PaymentGatewayConfigResponse> = rows
             .into_iter()
-            .map(|r| {
-                let decrypted =
-                    crate::utils::crypto::decrypt(&r.config_encrypted, &self.encryption_key)?;
-                let config: serde_json::Value =
-                    serde_json::from_str(&decrypted).unwrap_or(serde_json::Value::Null);
-                Ok(PaymentGatewayConfigResponse {
-                    id: r.id,
-                    provider: GatewayProvider::from_str(&r.provider)
-                        .unwrap_or(GatewayProvider::Stripe),
-                    is_active: r.is_active,
-                    is_test_mode: r.is_test_mode,
-                    config,
-                })
+            .map(|r| PaymentGatewayConfigResponse {
+                id: r.id,
+                provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
+                is_active: r.is_active,
+                is_test_mode: r.is_test_mode,
+                configured: !r.config_encrypted.is_empty(),
             })
-            .collect::<AppResult<Vec<_>>>()?;
+            .collect();
 
-        Ok((decrypted, total as u64))
+        Ok((gateways, total as u64))
     }
 
-    /// PMS-40: upsert a payment gateway config. `(tenant_id, provider)`
-    /// is unique in the schema, so the same call ends up insert-or-update.
-    /// Encrypts the `config` blob at rest with the host encryption key.
+    /// PMS-40 / PMS-342: upsert a payment gateway config. `(tenant_id,
+    /// provider)` is unique in the schema, so the same call ends up
+    /// insert-or-update. The credential is write-only: when `config` is
+    /// provided it is encrypted at rest with the host key and replaces the
+    /// stored secret; when omitted it preserves the existing secret (and is
+    /// required when creating a gateway for the first time). The decrypted
+    /// secret is never echoed back.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_payment_gateway(
         &self,
@@ -1384,9 +1382,20 @@ impl BillingService {
         request: &UpsertPaymentGatewayConfigRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentGatewayConfigResponse> {
-        let plaintext = serde_json::to_string(&request.config)
-            .map_err(|e| AppError::BadRequest(format!("config must serialise to JSON: {e}")))?;
-        let encrypted = crate::utils::crypto::encrypt(&plaintext, &self.encryption_key)?;
+        // Encrypt only when the caller supplied a new config; `None` means
+        // "keep the existing secret" (write-only update semantics, PMS-342).
+        let encrypted = match request.config.as_ref() {
+            Some(config) => {
+                let plaintext = serde_json::to_string(config).map_err(|e| {
+                    AppError::BadRequest(format!("config must serialise to JSON: {e}"))
+                })?;
+                Some(crate::utils::crypto::encrypt(
+                    &plaintext,
+                    &self.encryption_key,
+                )?)
+            }
+            None => None,
+        };
 
         // Mutation + audit row in one transaction. PMS-117. The secret
         // `config_encrypted` column is subtracted from both snapshots so
@@ -1409,26 +1418,57 @@ impl BillingService {
             AuditAction::Create
         };
 
-        let id: Uuid = sqlx::query_scalar(
-            r#"
-            INSERT INTO payment_gateway_configs
-                (tenant_id, provider, is_active, is_test_mode, config_encrypted)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (tenant_id, provider) DO UPDATE SET
-                is_active        = EXCLUDED.is_active,
-                is_test_mode     = EXCLUDED.is_test_mode,
-                config_encrypted = EXCLUDED.config_encrypted,
-                updated_at       = NOW()
-            RETURNING id
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(request.provider.as_str())
-        .bind(request.is_active)
-        .bind(request.is_test_mode)
-        .bind(&encrypted)
-        .fetch_one(&mut *tx)
-        .await?;
+        // A brand-new gateway must carry a config: `config_encrypted` is NOT
+        // NULL, and there is no existing secret to preserve.
+        let id: Uuid = match encrypted.as_ref() {
+            Some(encrypted) => {
+                sqlx::query_scalar(
+                    r#"
+                    INSERT INTO payment_gateway_configs
+                        (tenant_id, provider, is_active, is_test_mode, config_encrypted)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (tenant_id, provider) DO UPDATE SET
+                        is_active        = EXCLUDED.is_active,
+                        is_test_mode     = EXCLUDED.is_test_mode,
+                        config_encrypted = EXCLUDED.config_encrypted,
+                        updated_at       = NOW()
+                    RETURNING id
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(request.provider.as_str())
+                .bind(request.is_active)
+                .bind(request.is_test_mode)
+                .bind(encrypted)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            None => {
+                if before.is_none() {
+                    return Err(AppError::BadRequest(
+                        "config is required when first configuring a gateway".to_string(),
+                    ));
+                }
+                // Preserve the stored secret: update metadata only, leave
+                // `config_encrypted` untouched.
+                sqlx::query_scalar(
+                    r#"
+                    UPDATE payment_gateway_configs
+                    SET is_active    = $3,
+                        is_test_mode = $4,
+                        updated_at   = NOW()
+                    WHERE tenant_id = $1 AND provider = $2
+                    RETURNING id
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(request.provider.as_str())
+                .bind(request.is_active)
+                .bind(request.is_test_mode)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
@@ -1451,12 +1491,14 @@ impl BillingService {
         .await?;
         tx.commit().await?;
 
+        // After an upsert a secret is always stored (either the new one or the
+        // preserved existing one), so the gateway is configured.
         Ok(PaymentGatewayConfigResponse {
             id,
             provider: request.provider,
             is_active: request.is_active,
             is_test_mode: request.is_test_mode,
-            config: request.config.clone(),
+            configured: true,
         })
     }
 
