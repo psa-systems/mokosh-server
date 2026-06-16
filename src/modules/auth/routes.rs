@@ -393,12 +393,13 @@ async fn list_api_keys(
 async fn create_api_key(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateApiKeyRequest>,
 ) -> AppResult<Json<CreateApiKeyResponse>> {
     request.validate()?;
     let resp = state
         .auth_service
-        .create_api_key(user.tenant_id, user.id, &request)
+        .create_api_key(user.tenant_id, user.id, &request, &ctx)
         .await?;
     Ok(Json(resp))
 }

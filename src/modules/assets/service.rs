@@ -57,6 +57,7 @@ impl AssetsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertAssetTypeRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<AssetTypeResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -71,6 +72,24 @@ impl AssetsService {
         .bind(request.parent_type_id)
         .bind(request.is_active)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM asset_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "asset_types",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(AssetTypeResponse {
@@ -219,6 +238,7 @@ impl AssetsService {
         tenant_id: TenantId,
         performer: Uuid,
         request: &CreateAssetRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<AssetResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -254,6 +274,23 @@ impl AssetsService {
         .bind(id)
         .bind(performer)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM assets t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "assets",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_asset(tenant_id, id).await
@@ -436,6 +473,7 @@ impl AssetsService {
         tenant_id: TenantId,
         parent_id: Uuid,
         request: &CreateAssetRelationshipRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<AssetRelationshipResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -450,6 +488,24 @@ impl AssetsService {
         .bind(request.child_asset_id)
         .bind(&request.relationship_type)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM asset_relationships t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "asset_relationships",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(AssetRelationshipResponse {
@@ -570,6 +626,7 @@ impl AssetsService {
         tenant_id: TenantId,
         asset_id: Uuid,
         request: &UpsertConfigurationItemRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ConfigurationItemResponse> {
         let encrypted = crate::utils::crypto::encrypt(&request.value, &self.encryption_key)?;
         let id = Uuid::new_v4();
@@ -587,6 +644,25 @@ impl AssetsService {
         .bind(&encrypted)
         .bind(&request.notes)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'value_encrypted' \
+             FROM configuration_items t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "configuration_items",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(ConfigurationItemResponse {

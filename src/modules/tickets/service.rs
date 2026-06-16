@@ -762,6 +762,7 @@ impl TicketService {
         ticket_id: Uuid,
         user_id: Uuid,
         request: &CreateNoteRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TicketNote> {
         let note_id = Uuid::new_v4();
 
@@ -804,6 +805,25 @@ impl TicketService {
             .execute(&mut *tx)
             .await?;
         }
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "ticket_notes",
+            Some(note_id),
+            None,
+            after,
+        )
+        .await?;
         tx.commit().await?;
 
         // PMS-15: customer notification on public notes. Internal notes
@@ -1202,6 +1222,7 @@ impl TicketService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTicketStatusRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TicketStatus> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1223,6 +1244,24 @@ impl TicketService {
         .bind(request.is_default)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_statuses t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "ticket_statuses",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TicketStatus {
@@ -1295,6 +1334,7 @@ impl TicketService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTicketPriorityRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TicketPriority> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1317,6 +1357,24 @@ impl TicketService {
         .bind(request.sort_order)
         .bind(request.is_default)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_priorities t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "ticket_priorities",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TicketPriority {
@@ -1398,6 +1456,7 @@ impl TicketService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTicketTypeRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TicketType> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1413,6 +1472,24 @@ impl TicketService {
         .bind(request.is_active)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "ticket_types",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TicketType {
@@ -1478,6 +1555,7 @@ impl TicketService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTicketQueueRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TicketQueue> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1500,6 +1578,24 @@ impl TicketService {
         .bind(request.is_default)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_queues t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "ticket_queues",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TicketQueue {
@@ -1608,6 +1704,7 @@ impl TicketService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTicketCategoryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TicketCategoryResponse> {
         self.validate_fk_opt(tenant_id, "ticket_categories", request.parent_id)
             .await?;
@@ -1625,6 +1722,24 @@ impl TicketService {
         .bind(request.is_active)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_categories t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "ticket_categories",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TicketCategoryResponse {

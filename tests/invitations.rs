@@ -4,6 +4,7 @@ mod common;
 
 use sqlx::PgPool;
 
+use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
 use mokosh_server::utils::pagination::PaginationParams;
@@ -11,6 +12,16 @@ use mokosh_server::Database;
 
 fn svc(pool: &PgPool) -> InvitationsService {
     InvitationsService::new(Database::from_pool(pool.clone()))
+}
+
+// PMS-318 sweep: create now writes a Create audit row, so it takes an AuditCtx.
+fn actx() -> AuditCtx {
+    AuditCtx {
+        tenant_id: Some(common::DEFAULT_TENANT_ID),
+        user_id: None,
+        ip: None,
+        user_agent: None,
+    }
 }
 
 fn page() -> PaginationParams {
@@ -36,7 +47,12 @@ async fn create_list_revoke_roundtrip(pool: PgPool) {
     let s = svc(&pool);
 
     let inv = s
-        .create(tenant, admin_id, &req("Tech@Example.com", "technician"))
+        .create(
+            tenant,
+            admin_id,
+            &req("Tech@Example.com", "technician"),
+            &actx(),
+        )
         .await
         .expect("create invite");
     assert_eq!(inv.email, "tech@example.com", "email is lowercased");
@@ -65,11 +81,21 @@ async fn reinvite_same_email_upserts(pool: PgPool) {
     let s = svc(&pool);
 
     let first = s
-        .create(tenant, admin_id, &req("dup@example.com", "technician"))
+        .create(
+            tenant,
+            admin_id,
+            &req("dup@example.com", "technician"),
+            &actx(),
+        )
         .await
         .expect("first");
     let second = s
-        .create(tenant, admin_id, &req("dup@example.com", "manager"))
+        .create(
+            tenant,
+            admin_id,
+            &req("dup@example.com", "manager"),
+            &actx(),
+        )
         .await
         .expect("re-invite");
 
@@ -86,7 +112,12 @@ async fn rejects_non_invitable_role(pool: PgPool) {
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
 
     let err = svc(&pool)
-        .create(tenant, admin_id, &req("x@example.com", "super_admin"))
+        .create(
+            tenant,
+            admin_id,
+            &req("x@example.com", "super_admin"),
+            &actx(),
+        )
         .await;
     assert!(err.is_err(), "super_admin is not invitable");
 }
@@ -100,9 +131,14 @@ async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
     let s = InvitationsService::new(Database::from_pool(pool.clone()))
         .with_app_url("https://app.example.test".to_string());
 
-    s.create(tenant, admin_id, &req("Invitee@Example.com", "technician"))
-        .await
-        .expect("create invite");
+    s.create(
+        tenant,
+        admin_id,
+        &req("Invitee@Example.com", "technician"),
+        &actx(),
+    )
+    .await
+    .expect("create invite");
 
     let row: Option<(String, Option<String>, String)> = sqlx::query_as(
         "SELECT channel_type, recipient, body FROM notifications
@@ -124,9 +160,14 @@ async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
 
     // Without a SPA URL, no email is enqueued (tests / unconfigured deploys).
     let s2 = InvitationsService::new(Database::from_pool(pool.clone()));
-    s2.create(tenant, admin_id, &req("noemail@example.com", "technician"))
-        .await
-        .expect("create invite without email");
+    s2.create(
+        tenant,
+        admin_id,
+        &req("noemail@example.com", "technician"),
+        &actx(),
+    )
+    .await
+    .expect("create invite without email");
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM notifications WHERE recipient = 'noemail@example.com'",
     )
@@ -145,7 +186,12 @@ async fn newest_pending_lookup_then_accept(pool: PgPool) {
     let s = svc(&pool);
 
     let inv = s
-        .create(tenant, admin_id, &req("Joiner@Example.com", "manager"))
+        .create(
+            tenant,
+            admin_id,
+            &req("Joiner@Example.com", "manager"),
+            &actx(),
+        )
         .await
         .expect("invite");
 
@@ -191,6 +237,7 @@ async fn first_invite_promotes_personal_tenant_to_org(pool: PgPool) {
             tenant,
             admin_id,
             &req("colleague@example.com", "technician"),
+            &actx(),
         )
         .await
         .expect("invite");

@@ -112,6 +112,7 @@ impl ProjectsService {
         &self,
         tenant_id: TenantId,
         request: &CreateProjectRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -150,6 +151,24 @@ impl ProjectsService {
         .bind(request.hourly_rate)
         .bind(request.is_billable)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM projects t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "projects",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_project(tenant_id, id).await
@@ -327,6 +346,7 @@ impl ProjectsService {
         tenant_id: TenantId,
         project_id: Uuid,
         request: &UpsertProjectPhaseRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectPhaseResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -338,6 +358,24 @@ impl ProjectsService {
         .bind(&request.name).bind(&request.description).bind(request.sort_order)
         .bind(request.start_date).bind(request.end_date).bind(&request.status)
         .execute(&mut *tx).await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM project_phases t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "project_phases",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(ProjectPhaseResponse {
             id,
@@ -441,6 +479,7 @@ impl ProjectsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTaskStatusRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaskStatusResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -455,6 +494,24 @@ impl ProjectsService {
         .bind(request.is_completed)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM task_statuses t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "task_statuses",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TaskStatusResponse {
@@ -555,6 +612,7 @@ impl ProjectsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertProjectTypeRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectTypeResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -575,6 +633,24 @@ impl ProjectsService {
         .bind(request.is_active)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM project_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "project_types",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(ProjectTypeResponse {
@@ -923,6 +999,7 @@ impl ProjectsService {
         tenant_id: TenantId,
         task_id: Uuid,
         depends_on: Uuid,
+        ctx: &AuditCtx,
     ) -> AppResult<()> {
         if task_id == depends_on {
             return Err(AppError::BadRequest(
@@ -955,15 +1032,34 @@ impl ProjectsService {
                 "Refusing: this edge would create a dependency cycle".to_string(),
             ));
         }
+        let dep_id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO task_dependencies (id, tenant_id, task_id, depends_on_task_id)
                VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"#,
         )
-        .bind(Uuid::new_v4())
+        .bind(dep_id)
         .bind(tenant_id)
         .bind(task_id)
         .bind(depends_on)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM task_dependencies t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(dep_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "task_dependencies",
+            Some(dep_id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(())

@@ -50,10 +50,11 @@ async fn create_invitation(
     State(s): State<InvitationsRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateInvitationRequest>,
 ) -> AppResult<Json<InvitationResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create(u.tenant(), u.id, &req).await?))
+    Ok(Json(s.service.create(u.tenant(), u.id, &req, &ctx).await?))
 }
 
 async fn revoke_invitation(

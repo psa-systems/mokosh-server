@@ -82,6 +82,7 @@ async fn create_connection(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateRmmConnectionRequest>,
 ) -> AppResult<Json<RmmConnectionResponse>> {
     req.validate()?;
@@ -94,7 +95,9 @@ async fn create_connection(
             req.provider
         )));
     }
-    Ok(Json(s.service.create_connection(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_connection(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn delete_connection(
@@ -163,11 +166,14 @@ async fn create_device_mapping(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateRmmDeviceMappingRequest>,
 ) -> AppResult<Json<RmmDeviceMappingResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_device_mapping(u.tenant(), &req).await?,
+        s.service
+            .create_device_mapping(u.tenant(), &req, &ctx)
+            .await?,
     ))
 }
 
@@ -201,10 +207,13 @@ async fn create_alert_rule(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertRmmAlertRuleRequest>,
 ) -> AppResult<Json<RmmAlertRuleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_alert_rule(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_alert_rule(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn delete_alert_rule(

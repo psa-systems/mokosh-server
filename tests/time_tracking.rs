@@ -319,11 +319,23 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
 // PMS-328: PUT /time-entries preserves task_id, and the read paths expose it.
 // ============================================================================
 
+use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::time_tracking::{
     CreateTimeEntryRequest, TimeTrackingService, UpdateTimeEntryRequest,
 };
 use mokosh_server::Database;
+
+// PMS-318 sweep: create_time_entry now writes a Create audit row, so the
+// service signature carries an AuditCtx. A default ctx suffices for tests.
+fn actx() -> AuditCtx {
+    AuditCtx {
+        tenant_id: Some(common::DEFAULT_TENANT_ID),
+        user_id: None,
+        ip: None,
+        user_agent: None,
+    }
+}
 
 /// Fetch the default tenant's first seeded work type, needed to classify a
 /// service-level time entry.
@@ -390,6 +402,7 @@ async fn update_preserves_task_id_when_omitted(pool: PgPool) {
         .create_time_entry(
             tenant,
             &create_req(user_id, work_type_id, company_id, Some(task_id)),
+            &actx(),
         )
         .await
         .expect("create entry with task");
@@ -421,6 +434,7 @@ async fn update_with_explicit_task_id_changes_link(pool: PgPool) {
         .create_time_entry(
             tenant,
             &create_req(user_id, work_type_id, company_id, Some(first)),
+            &actx(),
         )
         .await
         .expect("create entry");
@@ -453,6 +467,7 @@ async fn read_paths_expose_task_id(pool: PgPool) {
         .create_time_entry(
             tenant,
             &create_req(user_id, work_type_id, company_id, Some(task_id)),
+            &actx(),
         )
         .await
         .expect("create entry");

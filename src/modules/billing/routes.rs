@@ -85,12 +85,13 @@ async fn create_payment_term(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertPaymentTermRequest>,
 ) -> AppResult<Json<PaymentTermResponse>> {
     request.validate()?;
     let t = state
         .service
-        .create_payment_term(user.tenant(), &request)
+        .create_payment_term(user.tenant(), &request, &ctx)
         .await?;
     Ok(Json(t))
 }

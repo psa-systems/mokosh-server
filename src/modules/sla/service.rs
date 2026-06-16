@@ -8,6 +8,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -126,6 +127,7 @@ impl SlaService {
         &self,
         tenant_id: TenantId,
         request: &UpsertSlaPolicyRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<SlaPolicyResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
@@ -142,6 +144,24 @@ impl SlaService {
         .bind(id).bind(tenant_id)
         .bind(&request.name).bind(&request.description).bind(request.business_hours_id).bind(request.is_default)
         .execute(&mut *tx).await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM sla_policies t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "sla_policies",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(SlaPolicyResponse {
             id,
@@ -364,6 +384,7 @@ impl SlaService {
         &self,
         tenant_id: TenantId,
         request: &UpsertBusinessHoursRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<BusinessHoursResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if request.is_default {
@@ -384,6 +405,24 @@ impl SlaService {
         .bind(&request.schedule)
         .bind(request.is_default)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM business_hours t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "business_hours",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(BusinessHoursResponse {
@@ -491,6 +530,7 @@ impl SlaService {
         &self,
         tenant_id: TenantId,
         request: &UpsertHolidayCalendarRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<HolidayCalendarResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -503,6 +543,24 @@ impl SlaService {
         .bind(&request.name)
         .bind(&request.holidays)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM holiday_calendars t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "holiday_calendars",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(HolidayCalendarResponse {

@@ -83,10 +83,13 @@ async fn create_category(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertKbCategoryRequest>,
 ) -> AppResult<Json<KbCategoryResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_category(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_category(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn update_category(
@@ -128,11 +131,14 @@ async fn create_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_article(u.tenant(), u.id, &req).await?,
+        s.service
+            .create_article(u.tenant(), u.id, &req, &ctx)
+            .await?,
     ))
 }
 
