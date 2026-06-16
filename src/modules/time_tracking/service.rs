@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -61,6 +62,7 @@ impl TimeTrackingService {
         &self,
         tenant_id: TenantId,
         request: &UpsertWorkTypeRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<WorkTypeResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
@@ -80,6 +82,24 @@ impl TimeTrackingService {
         .bind(request.is_active)
         .bind(request.sort_order)
         .fetch_one(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM work_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "work_types",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(WorkTypeResponse {
@@ -284,6 +304,7 @@ impl TimeTrackingService {
         &self,
         tenant_id: TenantId,
         request: &CreateTimeEntryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TimeEntryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Write-side tenant validation: FKs check existence, not ownership,
@@ -333,6 +354,24 @@ impl TimeTrackingService {
         .bind(total)
         .bind(request.task_id)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM time_entries t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "time_entries",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_time_entry(tenant_id, id).await
@@ -395,6 +434,15 @@ impl TimeTrackingService {
         let total = hourly_rate.map(|r| r * Decimal::from(duration) / Decimal::from(60));
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Write-side tenant validation on update, mirroring create_time_entry:
+        // the UPDATE sets ticket_id straight from the request body and the FK
+        // only checks existence, not tenant ownership, so a re-association could
+        // otherwise point a time entry at another tenant's ticket. RLS hides the
+        // row on read-back, but reject up front so the link is never written
+        // (PMS-315 review hardening; same fix applied to mileage_entries).
+        if let Some(ticket_id) = request.ticket_id {
+            assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
+        }
         let affected = sqlx::query(
             r#"
             UPDATE time_entries SET
@@ -1047,6 +1095,7 @@ impl TimeTrackingService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTimeRoundingRuleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TimeRoundingRuleResponse> {
         Self::validate_rounding_method(&request.rounding_method)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1072,6 +1121,24 @@ impl TimeTrackingService {
         .bind(request.minimum_minutes)
         .bind(request.is_default)
         .fetch_one(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM time_rounding_rules t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "time_rounding_rules",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TimeRoundingRuleResponse {

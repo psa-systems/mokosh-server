@@ -70,6 +70,79 @@ async fn create_site(
         .to_string()
 }
 
+/// Helper: search companies via the picker endpoint and return the names
+/// of the matched rows. Mirrors the `GET /contacts/companies?q=` call the
+/// company picker makes.
+async fn search_company_names(app: &common::TestApp, token: &str, q: &str) -> Vec<String> {
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contacts/companies"))
+        .query(&[("q", q), ("per_page", "50")])
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send company search");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "company search q={q:?} should 200"
+    );
+    let body: serde_json::Value = resp.json().await.expect("search response JSON");
+    body["data"]
+        .as_array()
+        .expect("search has data array")
+        .iter()
+        .filter_map(|c| c["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// PMS-372: company search must be a case-insensitive substring (ILIKE
+/// `%q%`) match, not a leading-prefix match. The picker calls
+/// `GET /contacts/companies?q=` and users expect the exact full name, an
+/// interior word, and a leading prefix to all find the company. The bug
+/// was that only a leading prefix matched, so the full multi-word name and
+/// interior words returned zero rows.
+#[sqlx::test]
+async fn company_search_matches_substring_not_just_prefix(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    create_company(&app, &token, "ZQA live").await;
+    create_company(&app, &token, "Acme Live Corp").await;
+    create_company(&app, &token, "Unrelated Inc").await;
+
+    // AC1: the exact full multi-word name returns that company.
+    let exact = search_company_names(&app, &token, "ZQA live").await;
+    assert!(
+        exact.iter().any(|n| n == "ZQA live"),
+        "exact full name `ZQA live` must match; got {exact:?}"
+    );
+
+    // AC2: an interior word matches every company containing it,
+    // case-insensitively (`live` should hit `ZQA live` and `Acme Live Corp`).
+    let interior = search_company_names(&app, &token, "live").await;
+    assert!(
+        interior.iter().any(|n| n == "ZQA live"),
+        "interior word `live` must match `ZQA live`; got {interior:?}"
+    );
+    assert!(
+        interior.iter().any(|n| n == "Acme Live Corp"),
+        "interior word `live` must match `Acme Live Corp` case-insensitively; got {interior:?}"
+    );
+    assert!(
+        !interior.iter().any(|n| n == "Unrelated Inc"),
+        "interior word `live` must not match `Unrelated Inc`; got {interior:?}"
+    );
+
+    // AC3: a leading prefix still matches (the original behaviour is kept).
+    let prefix = search_company_names(&app, &token, "ZQA").await;
+    assert!(
+        prefix.iter().any(|n| n == "ZQA live"),
+        "leading prefix `ZQA` must match `ZQA live`; got {prefix:?}"
+    );
+}
+
 #[sqlx::test]
 async fn company_crud_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -422,6 +495,13 @@ async fn contact_crud_happy_path(pool: PgPool) {
     );
     let created: serde_json::Value = create_resp.json().await.expect("create JSON");
     let contact_id = created["id"].as_str().expect("contact has id").to_string();
+    // PMS-334: the create response carries the linked company's name,
+    // resolved via the LEFT JOIN to companies (previously hardcoded null).
+    assert_eq!(
+        created["company_name"].as_str(),
+        Some("Acme"),
+        "create response should populate company_name"
+    );
 
     // LIST contains it.
     let list_resp = app
@@ -434,9 +514,16 @@ async fn contact_crud_happy_path(pool: PgPool) {
     assert_eq!(list_resp.status(), reqwest::StatusCode::OK);
     let list: serde_json::Value = list_resp.json().await.expect("list JSON");
     let items = list["data"].as_array().expect("list has data array");
-    assert!(
-        items.iter().any(|c| c["id"].as_str() == Some(&contact_id)),
-        "contact list should contain the new contact"
+    let listed = items
+        .iter()
+        .find(|c| c["id"].as_str() == Some(&contact_id))
+        .expect("contact list should contain the new contact");
+    // PMS-334: the Contacts list Company column is backed by company_name,
+    // which the list query now fills from the joined company.
+    assert_eq!(
+        listed["company_name"].as_str(),
+        Some("Acme"),
+        "contact list row should populate company_name"
     );
 
     // GET single.
@@ -451,6 +538,8 @@ async fn contact_crud_happy_path(pool: PgPool) {
     let got: serde_json::Value = get_resp.json().await.expect("get JSON");
     assert_eq!(got["first_name"].as_str(), Some("Bob"));
     assert_eq!(got["last_name"].as_str(), Some("Johnson"));
+    // PMS-334: single-contact GET also populates company_name.
+    assert_eq!(got["company_name"].as_str(), Some("Acme"));
 
     // UPDATE - touch two fields and re-GET to verify persistence (same
     // pattern as the site_update test for symmetry).

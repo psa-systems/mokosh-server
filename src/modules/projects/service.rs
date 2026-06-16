@@ -68,7 +68,11 @@ impl ProjectsService {
         let order_by = pagination.order_by("created_at", &["name", "start_date", "created_at"]);
         let query = format!(
             r#"
-            SELECT id, name, description, project_number, company_id, contract_id,
+            SELECT id, name, description, project_number, company_id,
+                   (SELECT co.name FROM companies co
+                     WHERE co.id = projects.company_id
+                       AND co.tenant_id = projects.tenant_id) AS company_name,
+                   contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
@@ -112,6 +116,7 @@ impl ProjectsService {
         &self,
         tenant_id: TenantId,
         request: &CreateProjectRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -120,7 +125,7 @@ impl ProjectsService {
             INSERT INTO projects (
                 id, tenant_id, name, description, project_number, company_id,
                 contract_id, project_type, project_type_id, status, project_manager_id, start_date,
-                target_end_date, budget_hours, budget_amount, billing_method,
+                target_end_date, actual_end_date, budget_hours, budget_amount, billing_method,
                 hourly_rate, is_billable
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
@@ -128,7 +133,7 @@ impl ProjectsService {
                 -- carry project_type_id too (PMS-322); NULL if the tenant has
                 -- no matching type row.
                 (SELECT id FROM project_types WHERE tenant_id = $2 AND name = $8),
-                $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -144,12 +149,31 @@ impl ProjectsService {
         .bind(request.project_manager_id)
         .bind(request.start_date)
         .bind(request.target_end_date)
+        .bind(request.actual_end_date)
         .bind(request.budget_hours)
         .bind(request.budget_amount)
         .bind(&request.billing_method)
         .bind(request.hourly_rate)
         .bind(request.is_billable)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM projects t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "projects",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_project(tenant_id, id).await
@@ -160,7 +184,11 @@ impl ProjectsService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ProjectRow>(
             r#"
-            SELECT id, name, description, project_number, company_id, contract_id,
+            SELECT id, name, description, project_number, company_id,
+                   (SELECT co.name FROM companies co
+                     WHERE co.id = projects.company_id
+                       AND co.tenant_id = projects.tenant_id) AS company_name,
+                   contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
@@ -327,6 +355,7 @@ impl ProjectsService {
         tenant_id: TenantId,
         project_id: Uuid,
         request: &UpsertProjectPhaseRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectPhaseResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -338,6 +367,24 @@ impl ProjectsService {
         .bind(&request.name).bind(&request.description).bind(request.sort_order)
         .bind(request.start_date).bind(request.end_date).bind(&request.status)
         .execute(&mut *tx).await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM project_phases t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "project_phases",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(ProjectPhaseResponse {
             id,
@@ -441,6 +488,7 @@ impl ProjectsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertTaskStatusRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaskStatusResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -455,6 +503,24 @@ impl ProjectsService {
         .bind(request.is_completed)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM task_statuses t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "task_statuses",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(TaskStatusResponse {
@@ -555,6 +621,7 @@ impl ProjectsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertProjectTypeRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<ProjectTypeResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -575,6 +642,24 @@ impl ProjectsService {
         .bind(request.is_active)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM project_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "project_types",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(ProjectTypeResponse {
@@ -715,6 +800,7 @@ impl ProjectsService {
         tenant_id: TenantId,
         project_id: Uuid,
         request: &CreateTaskRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
         let id = Uuid::new_v4();
         // PMS-345: when no due date is given, fall back to the tenant-wide
@@ -752,6 +838,29 @@ impl ProjectsService {
         .bind(due_date)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+
+        // PMS-318: emit the Create audit row inside the same tx as the INSERT
+        // (mirrors update_task above and the PMS-117 create_user pattern) so the
+        // task's change-history feed shows the create event, and a rollback
+        // drops both the task and its audit row together. `before` is NULL on a
+        // create; `after` snapshots the inserted row via to_jsonb.
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tasks t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "tasks",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_task(tenant_id, id).await
@@ -899,6 +1008,7 @@ impl ProjectsService {
         tenant_id: TenantId,
         task_id: Uuid,
         depends_on: Uuid,
+        ctx: &AuditCtx,
     ) -> AppResult<()> {
         if task_id == depends_on {
             return Err(AppError::BadRequest(
@@ -931,15 +1041,34 @@ impl ProjectsService {
                 "Refusing: this edge would create a dependency cycle".to_string(),
             ));
         }
+        let dep_id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO task_dependencies (id, tenant_id, task_id, depends_on_task_id)
                VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"#,
         )
-        .bind(Uuid::new_v4())
+        .bind(dep_id)
         .bind(tenant_id)
         .bind(task_id)
         .bind(depends_on)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM task_dependencies t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(dep_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "task_dependencies",
+            Some(dep_id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(())
@@ -970,6 +1099,7 @@ struct ProjectRow {
     description: Option<String>,
     project_number: Option<String>,
     company_id: Option<Uuid>,
+    company_name: Option<String>,
     contract_id: Option<Uuid>,
     project_type: String,
     project_type_id: Option<Uuid>,
@@ -997,6 +1127,7 @@ impl From<ProjectRow> for ProjectResponse {
             description: r.description,
             project_number: r.project_number,
             company_id: r.company_id,
+            company_name: r.company_name,
             contract_id: r.contract_id,
             project_type: r.project_type,
             project_type_id: r.project_type_id,

@@ -82,10 +82,13 @@ async fn create_channel(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertNotificationChannelRequest>,
 ) -> AppResult<Json<NotificationChannelResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_channel(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_channel(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn delete_channel(
@@ -114,10 +117,13 @@ async fn create_template(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertNotificationTemplateRequest>,
 ) -> AppResult<Json<NotificationTemplateResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_template(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_template(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn delete_template(
@@ -196,10 +202,11 @@ async fn create_rule(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertNotificationRuleRequest>,
 ) -> AppResult<Json<NotificationRuleResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_rule(u.tenant(), &req).await?))
+    Ok(Json(s.service.create_rule(u.tenant(), &req, &ctx).await?))
 }
 
 async fn delete_rule(

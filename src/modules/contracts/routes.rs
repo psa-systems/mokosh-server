@@ -63,6 +63,7 @@ pub fn contracts_routes(service: ContractsService) -> Router {
 async fn list_contracts(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
+    _f: RequireFinance,
     Query(f): Query<ContractFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractResponse>>> {
@@ -94,6 +95,7 @@ async fn create_contract(
 async fn get_contract(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
+    _f: RequireFinance,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ContractResponse>> {
     Ok(Json(s.service.get_contract(u.tenant(), id).await?))
@@ -128,6 +130,7 @@ async fn delete_contract(
 async fn list_contract_items(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
+    _f: RequireFinance,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractItemResponse>>> {
@@ -187,6 +190,7 @@ async fn delete_contract_item(
 async fn get_hour_balance(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
+    _f: RequireFinance,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractHourBalanceResponse>>> {
@@ -204,6 +208,7 @@ async fn get_hour_balance(
 async fn list_rate_cards(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
+    _f: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RateCardResponse>>> {
     let (items, total) = s.service.list_rate_cards(u.tenant(), &pagination).await?;
@@ -217,6 +222,7 @@ async fn list_rate_cards(
 async fn get_rate_card(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
+    _f: RequireFinance,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RateCardResponse>> {
     Ok(Json(s.service.get_rate_card(u.tenant(), id).await?))
@@ -264,6 +270,7 @@ async fn delete_rate_card(
 async fn list_rate_card_items(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
+    _f: RequireFinance,
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RateCardItemResponse>>> {

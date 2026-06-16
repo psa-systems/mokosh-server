@@ -4,6 +4,7 @@ use crate::modules::auth::TenantId;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -17,6 +18,30 @@ pub struct KbService {
 impl KbService {
     pub fn new(db: Database) -> Self {
         Self { db }
+    }
+
+    /// Reject any `company_ids` entry that is not a company owned by this
+    /// tenant, so a `client_specific` article cannot be scoped to another
+    /// tenant's company (PMS-341). No-op for an empty set.
+    async fn validate_company_ids(&self, tenant_id: TenantId, ids: &[Uuid]) -> AppResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT id) FROM companies WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(tenant_id)
+        .bind(ids)
+        .fetch_one(&mut *tx)
+        .await?;
+        let distinct = ids.iter().collect::<std::collections::HashSet<_>>().len() as i64;
+        if found != distinct {
+            return Err(AppError::BadRequest(
+                "One or more company_ids do not belong to this tenant".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     // PMS-81 categories -------------------------------------------------------
@@ -52,6 +77,7 @@ impl KbService {
         &self,
         tenant_id: TenantId,
         request: &UpsertKbCategoryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<KbCategoryResponse> {
         // Per-tenant unique slug (enforced at the app layer; the
         // `uq_kb_categories_tenant_slug` constraint is the DB backstop).
@@ -84,6 +110,24 @@ impl KbService {
         .bind(&request.visibility)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM kb_categories t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "kb_categories",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(KbCategoryResponse {
@@ -205,7 +249,7 @@ impl KbService {
         let query = format!(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
                       author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, created_at, updated_at
+                      published_at, tags, company_ids, created_at, updated_at
                FROM kb_articles WHERE {where_clause}
                ORDER BY {order_by}
                LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
@@ -247,7 +291,26 @@ impl KbService {
         tenant_id: TenantId,
         author_id: Uuid,
         request: &CreateKbArticleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<KbArticleResponse> {
+        // Resolve the company scope before any write. A
+        // `client_specific` article requires a non-empty, tenant-owned
+        // `company_ids`; for any other visibility the scope is ignored and
+        // stored empty so it cannot leak into the portal filter (PMS-341).
+        let company_ids: Vec<Uuid> = if request.visibility == "client_specific" {
+            let ids = request.company_ids.clone().unwrap_or_default();
+            if ids.is_empty() {
+                return Err(AppError::validation_field(
+                    "company_ids",
+                    "client_specific articles require at least one company",
+                ));
+            }
+            self.validate_company_ids(tenant_id, &ids).await?;
+            ids
+        } else {
+            Vec::new()
+        };
+
         // Per-tenant unique slug (app-layer check; the
         // `uq_kb_articles_tenant_slug` constraint is the DB backstop).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -272,9 +335,9 @@ impl KbService {
         sqlx::query(
             r#"INSERT INTO kb_articles
                (id, tenant_id, title, slug, content, summary, category_id, visibility,
-                status, author_id, tags, published_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                       CASE WHEN $12 THEN NOW() ELSE NULL END)"#,
+                status, author_id, tags, company_ids, published_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                       CASE WHEN $13 THEN NOW() ELSE NULL END)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -287,6 +350,7 @@ impl KbService {
         .bind(&request.status)
         .bind(author_id)
         .bind(&request.tags)
+        .bind(&company_ids)
         .bind(publish_now)
         .execute(&mut *tx)
         .await?;
@@ -301,6 +365,24 @@ impl KbService {
         .bind(&request.content)
         .bind(author_id)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM kb_articles t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "kb_articles",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_article_inner(tenant_id, id, false).await
@@ -326,7 +408,7 @@ impl KbService {
         let row = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
                       author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, created_at, updated_at
+                      published_at, tags, company_ids, created_at, updated_at
                FROM kb_articles WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
@@ -354,6 +436,37 @@ impl KbService {
         request: &UpdateKbArticleRequest,
     ) -> AppResult<KbArticleResponse> {
         let prior = self.get_article_inner(tenant_id, id, false).await?;
+
+        // Resolve the company scope for the post-update state (PMS-341).
+        // The effective visibility is the requested one when present, else
+        // the article's current value. When that is `client_specific` the
+        // scope must end up non-empty and tenant-owned (taking the request
+        // override when given, otherwise keeping the existing set); for any
+        // other visibility the scope is cleared so a downgraded article can
+        // never stay portal-visible.
+        let effective_visibility = request
+            .visibility
+            .as_deref()
+            .unwrap_or(prior.visibility.as_str());
+        let company_ids: Vec<Uuid> = if effective_visibility == "client_specific" {
+            let ids = match &request.company_ids {
+                Some(ids) => ids.clone(),
+                None => prior.company_ids.clone(),
+            };
+            if ids.is_empty() {
+                return Err(AppError::validation_field(
+                    "company_ids",
+                    "client_specific articles require at least one company",
+                ));
+            }
+            if request.company_ids.is_some() {
+                self.validate_company_ids(tenant_id, &ids).await?;
+            }
+            ids
+        } else {
+            Vec::new()
+        };
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
@@ -365,6 +478,7 @@ impl KbService {
                 visibility = COALESCE($8, visibility),
                 status = COALESCE($9, status),
                 tags = COALESCE($10, tags),
+                company_ids = $11,
                 -- Stamp published_at on the first transition to
                 -- 'published'; leave it untouched once set and for
                 -- draft / archived transitions.
@@ -386,6 +500,7 @@ impl KbService {
         .bind(&request.visibility)
         .bind(&request.status)
         .bind(&request.tags)
+        .bind(&company_ids)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -770,7 +885,7 @@ impl KbService {
         let rows = sqlx::query_as::<_, ArticleRow>(
             r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
                       author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, created_at, updated_at
+                      published_at, tags, company_ids, created_at, updated_at
                FROM kb_articles
                WHERE tenant_id = $1 AND status = 'published'
                  AND (
@@ -831,6 +946,7 @@ struct ArticleRow {
     not_helpful_count: Option<i32>,
     published_at: Option<chrono::DateTime<chrono::Utc>>,
     tags: Option<Vec<String>>,
+    company_ids: Option<Vec<Uuid>>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -852,6 +968,7 @@ impl From<ArticleRow> for KbArticleResponse {
             not_helpful_count: r.not_helpful_count.unwrap_or(0),
             published_at: r.published_at,
             tags: r.tags.unwrap_or_default(),
+            company_ids: r.company_ids.unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

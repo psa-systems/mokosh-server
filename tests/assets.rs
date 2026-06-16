@@ -96,6 +96,9 @@ async fn asset_crud_and_filtering(pool: PgPool) {
         .await
         .expect("asset JSON");
     assert_eq!(got["name"].as_str(), Some("web-01"));
+    // PMS-336: the asset detail surfaces the owning company name, resolved
+    // via the LEFT JOIN on companies (mirrors TicketResponse.company_name).
+    assert_eq!(got["company_name"].as_str(), Some("Acme Co"));
 
     // List, filtered by company + name search.
     let list: serde_json::Value = app
@@ -108,14 +111,14 @@ async fn asset_crud_and_filtering(pool: PgPool) {
         .json()
         .await
         .expect("list JSON");
-    assert!(
-        list["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["id"].as_str() == Some(asset_id.as_str())),
-        "asset appears in the filtered list"
-    );
+    let listed = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"].as_str() == Some(asset_id.as_str()))
+        .expect("asset appears in the filtered list");
+    // PMS-336: the list Company column has a value to render for every row.
+    assert_eq!(listed["company_name"].as_str(), Some("Acme Co"));
 
     // Update status.
     let upd = app

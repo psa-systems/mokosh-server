@@ -915,13 +915,16 @@ impl ContactService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ContactRow>(
             r#"
-            SELECT id, tenant_id, company_id, first_name, last_name, email,
-                   phone, mobile, fax, title, department, contact_type,
-                   is_portal_user, portal_user_id, preferred_contact_method,
-                   timezone, locale, custom_fields, tags, notes, avatar_url,
-                   status, created_at, updated_at
-            FROM contacts
-            WHERE tenant_id = $1 AND id = $2
+            SELECT c.id, c.tenant_id, c.company_id, co.name AS company_name,
+                   c.first_name, c.last_name, c.email,
+                   c.phone, c.mobile, c.fax, c.title, c.department, c.contact_type,
+                   c.is_portal_user, c.portal_user_id, c.preferred_contact_method,
+                   c.timezone, c.locale, c.custom_fields, c.tags, c.notes, c.avatar_url,
+                   c.status, c.created_at, c.updated_at
+            FROM contacts c
+            LEFT JOIN companies co
+                ON co.id = c.company_id AND co.tenant_id = c.tenant_id
+            WHERE c.tenant_id = $1 AND c.id = $2
             "#,
         )
         .bind(tenant_id)
@@ -948,14 +951,19 @@ impl ContactService {
         // correctly numbered placeholders. data has $1 tenant + $2 limit
         // + $3 offset → filter binds at $4+; count has $1 tenant only →
         // filter binds at $2+.
-        let mut data_conds = vec!["tenant_id = $1".to_string()];
+        // The data query joins companies (alias `co`) to resolve
+        // company_name (PMS-334), so its conditions and ORDER BY are
+        // qualified with the contacts alias `c` to stay unambiguous
+        // (both tables expose tenant_id / status / created_at). The
+        // count query has no JOIN, so its conditions stay unqualified.
+        let mut data_conds = vec!["c.tenant_id = $1".to_string()];
         let mut count_conds = vec!["tenant_id = $1".to_string()];
         let mut data_idx = 4;
         let mut count_idx = 2;
 
         if filter.q.is_some() {
             data_conds.push(format!(
-                "(first_name ILIKE ${idx} OR last_name ILIKE ${idx} OR email ILIKE ${idx})",
+                "(c.first_name ILIKE ${idx} OR c.last_name ILIKE ${idx} OR c.email ILIKE ${idx})",
                 idx = data_idx
             ));
             count_conds.push(format!(
@@ -966,19 +974,19 @@ impl ContactService {
             count_idx += 1;
         }
         if filter.company_id.is_some() {
-            data_conds.push(format!("company_id = ${data_idx}"));
+            data_conds.push(format!("c.company_id = ${data_idx}"));
             count_conds.push(format!("company_id = ${count_idx}"));
             data_idx += 1;
             count_idx += 1;
         }
         if filter.contact_type.is_some() {
-            data_conds.push(format!("contact_type = ${data_idx}"));
+            data_conds.push(format!("c.contact_type = ${data_idx}"));
             count_conds.push(format!("contact_type = ${count_idx}"));
             data_idx += 1;
             count_idx += 1;
         }
         if filter.status.is_some() {
-            data_conds.push(format!("status = ${data_idx}"));
+            data_conds.push(format!("c.status = ${data_idx}"));
             count_conds.push(format!("status = ${count_idx}"));
         }
 
@@ -991,14 +999,17 @@ impl ContactService {
 
         let query = format!(
             r#"
-            SELECT id, tenant_id, company_id, first_name, last_name, email,
-                   phone, mobile, fax, title, department, contact_type,
-                   is_portal_user, portal_user_id, preferred_contact_method,
-                   timezone, locale, custom_fields, tags, notes, avatar_url,
-                   status, created_at, updated_at
-            FROM contacts
+            SELECT c.id, c.tenant_id, c.company_id, co.name AS company_name,
+                   c.first_name, c.last_name, c.email,
+                   c.phone, c.mobile, c.fax, c.title, c.department, c.contact_type,
+                   c.is_portal_user, c.portal_user_id, c.preferred_contact_method,
+                   c.timezone, c.locale, c.custom_fields, c.tags, c.notes, c.avatar_url,
+                   c.status, c.created_at, c.updated_at
+            FROM contacts c
+            LEFT JOIN companies co
+                ON co.id = c.company_id AND co.tenant_id = c.tenant_id
             WHERE {data_where}
-            ORDER BY {order_by}
+            ORDER BY c.{order_by}
             LIMIT $2 OFFSET $3
             "#
         );
@@ -1056,14 +1067,17 @@ impl ContactService {
 
         let rows = sqlx::query_as::<_, ContactRow>(
             r#"
-            SELECT id, tenant_id, company_id, first_name, last_name, email,
-                   phone, mobile, fax, title, department, contact_type,
-                   is_portal_user, portal_user_id, preferred_contact_method,
-                   timezone, locale, custom_fields, tags, notes, avatar_url,
-                   status, created_at, updated_at
-            FROM contacts
-            WHERE tenant_id = $1 AND company_id = $2
-            ORDER BY contact_type, last_name
+            SELECT c.id, c.tenant_id, c.company_id, co.name AS company_name,
+                   c.first_name, c.last_name, c.email,
+                   c.phone, c.mobile, c.fax, c.title, c.department, c.contact_type,
+                   c.is_portal_user, c.portal_user_id, c.preferred_contact_method,
+                   c.timezone, c.locale, c.custom_fields, c.tags, c.notes, c.avatar_url,
+                   c.status, c.created_at, c.updated_at
+            FROM contacts c
+            LEFT JOIN companies co
+                ON co.id = c.company_id AND co.tenant_id = c.tenant_id
+            WHERE c.tenant_id = $1 AND c.company_id = $2
+            ORDER BY c.contact_type, c.last_name
             LIMIT $3 OFFSET $4
             "#,
         )
@@ -1799,6 +1813,9 @@ struct ContactRow {
     id: Uuid,
     tenant_id: Uuid,
     company_id: Uuid,
+    // PMS-334: resolved from the LEFT JOIN to companies in the read
+    // queries; populates Contact.company_name so the API DTO carries it.
+    company_name: Option<String>,
     first_name: String,
     last_name: String,
     email: Option<String>,
@@ -1828,6 +1845,7 @@ impl From<ContactRow> for Contact {
             id: row.id,
             tenant_id: row.tenant_id,
             company_id: row.company_id,
+            company_name: row.company_name,
             first_name: row.first_name,
             last_name: row.last_name,
             email: row.email,

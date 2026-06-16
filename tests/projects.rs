@@ -102,6 +102,13 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
     assert!(created.status().is_success(), "create project should 2xx");
     let project: serde_json::Value = created.json().await.expect("project JSON");
     let project_id = project["id"].as_str().expect("project id").to_string();
+    // Owning company name is resolved via the LEFT join (PMS-335), so a
+    // consumer can render the client without a second lookup.
+    assert_eq!(
+        project["company_name"].as_str(),
+        Some("Acme Co"),
+        "create response carries the owning company name"
+    );
     // Fresh project: budget present, actuals zero (no approved time yet).
     assert_eq!(dec(&project["budget_hours"]), 100.0);
     assert_eq!(
@@ -118,13 +125,18 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
         &format!("/api/v1/projects?company_id={company}&status=active"),
     )
     .await;
-    assert!(
-        listed["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["id"].as_str() == Some(project_id.as_str())),
-        "project appears in the filtered list"
+    let listed_project = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"].as_str() == Some(project_id.as_str()))
+        .expect("project appears in the filtered list");
+    // The list query resolves company_name too (PMS-335), so the list view
+    // can show a Company column.
+    assert_eq!(
+        listed_project["company_name"].as_str(),
+        Some("Acme Co"),
+        "list response carries the owning company name"
     );
 
     // --- Phases, ordered by sort_order (AC2) ---
@@ -278,6 +290,76 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
         reqwest::StatusCode::BAD_REQUEST,
         "a self-dependency is rejected with 400"
     );
+}
+
+// PMS-361: the create form exposes the same status/date/manager fields the
+// edit form does, so a project can be born "active" (and with a manager and
+// dates) in one submission instead of create-then-edit. Prove every such
+// field set on POST /projects round-trips into the row and back out on read.
+#[sqlx::test]
+async fn create_accepts_status_dates_and_manager(pool: PgPool) {
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // No status override -> default stays "planning" (today's behaviour).
+    let defaulted = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Defaulted", "company_id": company }),
+    )
+    .await;
+    assert!(defaulted.status().is_success(), "create project should 2xx");
+    let defaulted: serde_json::Value = defaulted.json().await.expect("project JSON");
+    assert_eq!(
+        defaulted["status"].as_str(),
+        Some("planning"),
+        "no status override keeps the 'planning' default"
+    );
+
+    // Full override: status, both dates, actual_end_date, and a manager all
+    // supplied on create.
+    let created = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Born Active",
+            "company_id": company,
+            "status": "active",
+            "project_manager_id": admin_id,
+            "start_date": "2026-01-05",
+            "target_end_date": "2026-06-30",
+            "actual_end_date": "2026-06-28",
+        }),
+    )
+    .await;
+    assert!(created.status().is_success(), "create project should 2xx");
+    let created: serde_json::Value = created.json().await.expect("project JSON");
+    let project_id = created["id"].as_str().expect("project id").to_string();
+
+    // Round-trips on the create response itself.
+    assert_eq!(created["status"].as_str(), Some("active"));
+    assert_eq!(
+        created["project_manager_id"].as_str(),
+        Some(admin_id.to_string().as_str())
+    );
+    assert_eq!(created["start_date"].as_str(), Some("2026-01-05"));
+    assert_eq!(created["target_end_date"].as_str(), Some("2026-06-30"));
+    assert_eq!(created["actual_end_date"].as_str(), Some("2026-06-28"));
+
+    // And lands on the detail read (what the project page shows).
+    let fetched = get_json(&app, &token, &format!("/api/v1/projects/{project_id}")).await;
+    assert_eq!(fetched["status"].as_str(), Some("active"));
+    assert_eq!(
+        fetched["project_manager_id"].as_str(),
+        Some(admin_id.to_string().as_str())
+    );
+    assert_eq!(fetched["start_date"].as_str(), Some("2026-01-05"));
+    assert_eq!(fetched["target_end_date"].as_str(), Some("2026-06-30"));
+    assert_eq!(fetched["actual_end_date"].as_str(), Some("2026-06-28"));
 }
 
 // AC5: a time entry linked to a task/project rolls into actual hours and
@@ -658,6 +740,153 @@ async fn task_and_project_edits_write_audit_rows(pool: PgPool) {
         project_changed,
         "project edit must write an entity-scoped audit row"
     );
+}
+
+/// PMS-318: creating a task writes a `create` audit row in the same tx as the
+/// INSERT, so the task's change-history pane surfaces the create event. The
+/// row is entity-scoped, has no `before` snapshot, captures the inserted row
+/// in `after`, and records the creating user as actor.
+#[sqlx::test]
+async fn create_task_writes_create_audit_row(pool: PgPool) {
+    let probe = pool.clone();
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Create Audit Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Audit P", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = project["id"].as_str().expect("project id").to_string();
+
+    let status_id = first_task_status(&app, &token).await;
+    let task: serde_json::Value = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        serde_json::json!({ "title": "Fresh", "status_id": status_id, "priority": "low" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("task JSON");
+    let task_id = task["id"].as_str().expect("task id").to_string();
+    let task_uuid = Uuid::parse_str(&task_id).unwrap();
+
+    let (action, old_values, new_values, user_id): (
+        String,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        r#"SELECT action, old_values, new_values, user_id
+             FROM audit_log
+             WHERE entity_type = 'tasks' AND entity_id = $1 AND action = 'create'"#,
+    )
+    .bind(task_uuid)
+    .fetch_one(&probe)
+    .await
+    .expect("a create audit row exists for the new task");
+
+    assert_eq!(action, "create");
+    assert!(old_values.is_none(), "before snapshot is NULL on a create");
+    let after = new_values.expect("after snapshot present");
+    assert_eq!(after["id"].as_str(), Some(task_id.as_str()));
+    assert_eq!(after["title"].as_str(), Some("Fresh"));
+    assert_eq!(user_id, Some(admin_id), "actor is the creating user");
+}
+
+/// PMS-318 AC3: the create audit row shares the task INSERT's transaction.
+/// Forcing the audit write to fail strictly after the INSERT (here a ctx whose
+/// `user_id` violates the `audit_log -> users` FK) rolls the whole transaction
+/// back, so neither the task nor an audit row survives.
+#[sqlx::test]
+async fn create_task_audit_failure_rolls_back_the_task(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::projects::{CreateTaskRequest, ProjectsService};
+    use mokosh_server::Database;
+
+    let probe = pool.clone();
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Rollback Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Doomed P", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = Uuid::parse_str(project["id"].as_str().expect("project id")).unwrap();
+    let status_id = Uuid::parse_str(&first_task_status(&app, &token).await).unwrap();
+
+    let service = ProjectsService::new(Database::from_pool(app.pool.clone()));
+    // `user_id` references a row that does not exist in `users`, so audit_write's
+    // INSERT fails the FK *after* the task INSERT has already run on the tx.
+    let ctx = AuditCtx {
+        tenant_id: Some(common::DEFAULT_TENANT_ID),
+        user_id: Some(Uuid::new_v4()),
+        ip: None,
+        user_agent: None,
+    };
+    let req = CreateTaskRequest {
+        title: "Doomed".to_string(),
+        description: None,
+        status_id,
+        phase_id: None,
+        parent_task_id: None,
+        priority: "low".to_string(),
+        assigned_to_id: None,
+        estimated_hours: None,
+        start_date: None,
+        due_date: None,
+        sort_order: 0,
+    };
+
+    let result = service
+        .create_task(
+            TenantId::from_trusted(common::DEFAULT_TENANT_ID),
+            project_id,
+            &req,
+            &ctx,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "create must fail when the in-tx audit write FK-violates"
+    );
+
+    let task_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE project_id = $1 AND title = 'Doomed'")
+            .bind(project_id)
+            .fetch_one(&probe)
+            .await
+            .expect("count tasks");
+    assert_eq!(
+        task_count, 0,
+        "the task INSERT must roll back with the failed audit write"
+    );
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE entity_type = 'tasks' AND action = 'create'",
+    )
+    .fetch_one(&probe)
+    .await
+    .expect("count audit rows");
+    assert_eq!(audit_count, 0, "no create audit row survives the rollback");
 }
 
 // ============================================================================
@@ -1106,4 +1335,121 @@ async fn project_input_validation(pool: PgPool) {
     )
     .await;
     assert!(nulled.status().is_success(), "null budget should 2xx");
+}
+
+// ============================================================================
+// PMS-316: oversized-budget rejection + company display-text safety.
+//
+// The budget fields back onto DECIMAL(12, 2) (amount) and DECIMAL(10, 2)
+// (hours). Before the budget range check, an extreme value reached Postgres
+// and surfaced as a 500 numeric-overflow (amount) / a raw deserialization 422
+// (hours) instead of a controlled, field-level validation error. This pins the
+// in-range maxima as accepted and the just-over-the-limit values as a clean
+// 422 on the create path. Separately, a company is selected by typed `Uuid`
+// (`company_id`), so a raw display string can never reach the query: a
+// SQL-injection-shaped value is rejected at extraction and the companies table
+// is left intact.
+// ============================================================================
+
+#[sqlx::test]
+async fn project_oversized_budget_and_safe_company_id(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Oversize Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // --- Largest in-range budgets create cleanly (column maxima) ---
+    let at_max = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "At column maxima",
+            "company_id": company,
+            "budget_amount": "9999999999.99",
+            "budget_hours": "99999999.99",
+        }),
+    )
+    .await;
+    assert!(
+        at_max.status().is_success(),
+        "budgets at the DECIMAL column maxima must 2xx, got {}",
+        at_max.status()
+    );
+
+    // --- Oversized budget_amount: a clean 422, never a 500 overflow ---
+    let big_amount = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Oversize amount",
+            "company_id": company,
+            "budget_amount": 10_000_000_000_i64,
+            "budget_hours": "100",
+        }),
+    )
+    .await;
+    assert_eq!(
+        big_amount.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "budget_amount above the DECIMAL(12, 2) limit must 422, not 500"
+    );
+
+    // --- Oversized budget_hours: a clean 422, never a 500 overflow ---
+    let big_hours = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Oversize hours",
+            "company_id": company,
+            "budget_amount": "10000",
+            "budget_hours": 100_000_000_i64,
+        }),
+    )
+    .await;
+    assert_eq!(
+        big_hours.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "budget_hours above the DECIMAL(10, 2) limit must 422, not 500"
+    );
+
+    // --- Company selection is by typed id, never by raw display text ---
+    // A SQL-injection-shaped company value cannot deserialize into the
+    // `Option<Uuid>` field, so it is rejected at request extraction and never
+    // reaches the parameterized query.
+    let injected = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Injection attempt",
+            "company_id": "ZQA'); DROP TABLE companies;--",
+        }),
+    )
+    .await;
+    assert_eq!(
+        injected.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a non-UUID company_id must 422 (typed id), never reaching the query"
+    );
+
+    // The companies table is intact: a normal create against the real,
+    // typed company id still succeeds after the injection attempt.
+    let after_injection = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Post-injection create",
+            "company_id": company,
+        }),
+    )
+    .await;
+    assert!(
+        after_injection.status().is_success(),
+        "create with a valid company_id must still 2xx after the injection attempt, got {}",
+        after_injection.status()
+    );
 }

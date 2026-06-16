@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use uuid::Uuid;
 
@@ -91,6 +92,7 @@ impl NotificationsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertNotificationChannelRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<NotificationChannelResponse> {
         let plain = serde_json::to_string(&request.config)
             .map_err(|e| AppError::BadRequest(format!("config serialise: {e}")))?;
@@ -110,6 +112,24 @@ impl NotificationsService {
         .bind(request.is_active)
         .bind(request.is_default)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_channels t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "notification_channels",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(NotificationChannelResponse {
@@ -171,6 +191,7 @@ impl NotificationsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertNotificationTemplateRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<NotificationTemplateResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -183,6 +204,24 @@ impl NotificationsService {
         .bind(&request.name).bind(&request.event_type).bind(&request.channel_type)
         .bind(&request.subject).bind(&request.body_text).bind(&request.body_html).bind(request.is_active)
         .execute(&mut *tx).await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_templates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "notification_templates",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(NotificationTemplateResponse {
             id,
@@ -367,6 +406,7 @@ impl NotificationsService {
         &self,
         tenant_id: TenantId,
         request: &UpsertNotificationRuleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<NotificationRuleResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -386,6 +426,24 @@ impl NotificationsService {
         .bind(request.template_id)
         .bind(request.is_active)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_rules t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "notification_rules",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(NotificationRuleResponse {

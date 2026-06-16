@@ -279,6 +279,114 @@ async fn ticket_history_records_description_edit(pool: PgPool) {
     );
 }
 
+/// PMS-370 (PMS-359 follow-up): a Status edit via the inline editor must show
+/// up in the change history with the humanised field name `status`, not the
+/// raw column `status_id`. The SPA capitalises for display, so a leaked `_id`
+/// suffix renders as `Updated: Status id`; stripping it server-side at the
+/// history read boundary gives `Updated: Status`. The stored audit row is
+/// unaffected; only the rendered field label is cleaned up.
+#[sqlx::test]
+async fn ticket_history_humanises_status_id_field(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Printer jammed",
+            "company_id": company_id,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket")
+        .json()
+        .await
+        .expect("create ticket JSON");
+    let ticket_id = created["id"].as_str().expect("ticket id").to_string();
+
+    // A second status to switch the ticket to (distinct from the seeded default).
+    let new_status: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets/statuses"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Escalated",
+            "color": "#ff0000",
+            "is_closed": false,
+            "sort_order": 99,
+        }))
+        .send()
+        .await
+        .expect("create status")
+        .json()
+        .await
+        .expect("create status JSON");
+    let new_status_id = new_status["id"].as_str().expect("status id").to_string();
+
+    // Inline-editor Status change.
+    let update_status = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "status_id": new_status_id }))
+        .send()
+        .await
+        .expect("update ticket status")
+        .status();
+    assert!(update_status.is_success(), "PUT status_id should 2xx");
+
+    let hist: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/audit-log/entity/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get ticket history")
+        .json()
+        .await
+        .expect("history JSON");
+    let entries = hist["data"].as_array().expect("history has data");
+    let edit = entries
+        .iter()
+        .find(|e| {
+            e["action"].as_str() == Some("update")
+                && e["changed_fields"]
+                    .as_array()
+                    .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("status")))
+        })
+        .expect("history must surface the status edit under the humanised field `status`");
+
+    // The raw column name must NOT leak into the rendered field labels.
+    assert!(
+        edit["changed_fields"]
+            .as_array()
+            .expect("changed_fields array")
+            .iter()
+            .all(|v| v.as_str() != Some("status_id")),
+        "changed_fields must not carry the raw column `status_id`"
+    );
+    let status_change = edit["changes"]
+        .as_array()
+        .expect("entry has a changes array")
+        .iter()
+        .find(|c| c["field"].as_str() == Some("status"))
+        .expect("changes must include the humanised `status` field");
+    assert_eq!(
+        status_change["field"].as_str(),
+        Some("status"),
+        "change field must be the humanised `status`, not `status_id`"
+    );
+    assert!(
+        edit["timestamp"].as_str().is_some(),
+        "history entry must carry a timestamp"
+    );
+}
+
 // ============================================================================
 // PMS-321: ticket lookup management CRUD (statuses, priorities, types,
 // queues, categories).
@@ -797,4 +905,120 @@ async fn category_parent_cross_tenant_blocked_at_db(pool: PgPool) {
         Some("23503"),
         "expected a foreign-key violation, got {err}"
     );
+}
+
+/// PMS-358: an explicit `priority_id` on POST /api/v1/tickets must round-trip
+/// unchanged into the persisted row.
+///
+/// External review reproduced "select Priority = High on New Ticket, ticket
+/// saves as Medium". Medium is the seeded *default* priority, so the symptom
+/// is the create path falling back to the default whenever `priority_id` is
+/// dropped before it reaches the DB. This test pins the server half of the
+/// round-trip: for every available priority we create a ticket with that
+/// explicit `priority_id`, then assert both the create response and a fresh
+/// GET carry that exact id+name, never the default. If this stays green, the
+/// regression lives in the SPA form binding (it omits `priority_id`), not in
+/// the backend.
+#[sqlx::test]
+async fn create_ticket_round_trips_every_priority(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Enumerate the priorities the tenant actually offers, exactly as the
+    // New Ticket dropdown would populate itself.
+    let prio_resp = app
+        .client
+        .get(app.url("/api/v1/tickets/priorities?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list priorities");
+    assert_eq!(prio_resp.status(), reqwest::StatusCode::OK);
+    let prio_json: serde_json::Value = prio_resp.json().await.expect("priorities JSON");
+    let priorities = prio_json["data"]
+        .as_array()
+        .expect("priorities list has data");
+    assert!(
+        priorities.len() >= 2,
+        "need at least two priorities to prove non-default round-trip, got {}",
+        priorities.len()
+    );
+
+    for prio in priorities {
+        let prio_id = prio["id"].as_str().expect("priority id").to_string();
+        let prio_name = prio["name"].as_str().expect("priority name").to_string();
+
+        // CREATE with an explicit priority. `custom_fields` is sent as `{}`
+        // for the same NOT NULL reason documented in the happy-path test.
+        let create_body = serde_json::json!({
+            "title": format!("Priority round-trip: {prio_name}"),
+            "company_id": company_id,
+            "priority_id": prio_id,
+            "custom_fields": {},
+        });
+        let create_resp = app
+            .client
+            .post(app.url("/api/v1/tickets"))
+            .bearer_auth(&token)
+            .json(&create_body)
+            .send()
+            .await
+            .expect("send create ticket");
+        let create_status = create_resp.status();
+        let create_text = create_resp.text().await.expect("create ticket body");
+        assert!(
+            create_status.is_success(),
+            "create ticket should 2xx, got {create_status} body={create_text}"
+        );
+        let created: serde_json::Value =
+            serde_json::from_str(&create_text).expect("create ticket JSON");
+        let ticket_id = created["id"]
+            .as_str()
+            .expect("created ticket has id")
+            .to_string();
+
+        // The create response must echo the selected priority, never the
+        // tenant default.
+        assert_eq!(
+            created["priority"]["id"].as_str(),
+            Some(prio_id.as_str()),
+            "create response priority.id must equal the selected priority for {prio_name}"
+        );
+        assert_eq!(
+            created["priority"]["name"].as_str(),
+            Some(prio_name.as_str()),
+            "create response priority.name must equal the selected priority"
+        );
+        // No regression on other fields persisted in the same submit.
+        assert_eq!(
+            created["company_name"].as_str(),
+            Some("Acme Co"),
+            "company must still resolve via the JOIN"
+        );
+        assert_joined_fields_populated(&created, &format!("create:{prio_name}"));
+
+        // GET it back fresh to prove the value is in the DB row, not merely
+        // reflected by the create handler.
+        let get_resp = app
+            .client
+            .get(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("send get ticket");
+        assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+        let got: serde_json::Value = get_resp.json().await.expect("get ticket JSON");
+        assert_eq!(
+            got["priority"]["id"].as_str(),
+            Some(prio_id.as_str()),
+            "persisted priority.id must equal the selected priority for {prio_name}"
+        );
+        assert_eq!(
+            got["priority"]["name"].as_str(),
+            Some(prio_name.as_str()),
+            "persisted priority.name must equal the selected priority for {prio_name}"
+        );
+    }
 }

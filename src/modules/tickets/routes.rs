@@ -197,6 +197,7 @@ async fn get_ticket_notes(
 async fn add_note(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
     Path(ticket_id): Path<Uuid>,
     Json(request): Json<CreateNoteRequest>,
 ) -> AppResult<Json<TicketNoteResponse>> {
@@ -204,7 +205,7 @@ async fn add_note(
 
     let note = state
         .ticket_service
-        .add_note(user.tenant(), ticket_id, user.id, &request)
+        .add_note(user.tenant(), ticket_id, user.id, &request, &ctx)
         .await?;
 
     Ok(Json(TicketNoteResponse {
@@ -291,13 +292,14 @@ async fn create_status(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTicketStatusRequest>,
 ) -> AppResult<Json<TicketStatus>> {
     request.validate()?;
     Ok(Json(
         state
             .ticket_service
-            .create_status(user.tenant(), &request)
+            .create_status(user.tenant(), &request, &ctx)
             .await?,
     ))
 }
@@ -331,13 +333,14 @@ async fn create_priority(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTicketPriorityRequest>,
 ) -> AppResult<Json<TicketPriority>> {
     request.validate()?;
     Ok(Json(
         state
             .ticket_service
-            .create_priority(user.tenant(), &request)
+            .create_priority(user.tenant(), &request, &ctx)
             .await?,
     ))
 }
@@ -374,13 +377,14 @@ async fn create_queue(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTicketQueueRequest>,
 ) -> AppResult<Json<TicketQueue>> {
     request.validate()?;
     Ok(Json(
         state
             .ticket_service
-            .create_queue(user.tenant(), &request)
+            .create_queue(user.tenant(), &request, &ctx)
             .await?,
     ))
 }
@@ -414,13 +418,14 @@ async fn create_type(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTicketTypeRequest>,
 ) -> AppResult<Json<TicketType>> {
     request.validate()?;
     Ok(Json(
         state
             .ticket_service
-            .create_type(user.tenant(), &request)
+            .create_type(user.tenant(), &request, &ctx)
             .await?,
     ))
 }
@@ -470,13 +475,14 @@ async fn create_category(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTicketCategoryRequest>,
 ) -> AppResult<Json<TicketCategoryResponse>> {
     request.validate()?;
     Ok(Json(
         state
             .ticket_service
-            .create_category(user.tenant(), &request)
+            .create_category(user.tenant(), &request, &ctx)
             .await?,
     ))
 }

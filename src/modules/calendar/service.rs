@@ -7,6 +7,7 @@ use chrono::{DateTime, Datelike, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -425,11 +426,29 @@ impl CalendarService {
         &self,
         tenant_id: TenantId,
         request: &CreateAppointmentRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<AppointmentResponse> {
         if !appointment_range_ok(request.start_time, request.end_time) {
             return Err(AppError::BadRequest(
                 "end_time must be after start_time".to_string(),
             ));
+        }
+        // PMS-374: reject a non-RFC-5545 recurrence_rule with a 422 field
+        // error so garbage text is never persisted. Validate with the same
+        // parser the read-time expander uses, anchored on this request's
+        // start_time, so a rule accepted here is exactly one the expander can
+        // later walk. A blank value is treated as "no recurrence" and skipped.
+        if let Some(rule) = request
+            .recurrence_rule
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+        {
+            if let Err(e) = parse_recurrence_rule(rule, request.start_time) {
+                return Err(AppError::validation_field(
+                    "recurrence_rule",
+                    format!("not a valid RFC 5545 RRULE: {e}"),
+                ));
+            }
         }
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked.
@@ -475,6 +494,24 @@ impl CalendarService {
         .bind(&request.location)
         .bind(&request.recurrence_rule)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM appointments t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "appointments",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_appointment(tenant_id, id).await
@@ -740,6 +777,7 @@ impl CalendarService {
         &self,
         tenant_id: TenantId,
         request: &CreateTimeOffRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TimeOffResponse> {
         if request.end_date < request.start_date {
             return Err(AppError::BadRequest(
@@ -760,6 +798,24 @@ impl CalendarService {
         .bind(&request.kind)
         .bind(&request.notes)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM time_off t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "time_off",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_time_off(tenant_id, id).await
@@ -860,6 +916,7 @@ impl CalendarService {
         &self,
         tenant_id: TenantId,
         request: &UpsertOnCallScheduleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<OnCallScheduleResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -876,6 +933,24 @@ impl CalendarService {
         .bind(&request.rotation_config)
         .bind(request.is_active)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM on_call_schedules t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "on_call_schedules",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(OnCallScheduleResponse {
@@ -1101,6 +1176,40 @@ impl CalendarService {
     }
 }
 
+/// Normalise a stored `recurrence_rule` and parse it as an `RRuleSet`
+/// anchored on `start`.
+///
+/// The series is anchored on the appointment's `start_time`, so any
+/// `DTSTART` line the caller stored is dropped and a canonical one is
+/// synthesised; a leading `RRULE:` token is also stripped before the
+/// `DTSTART:...\nRRULE:...` document is rebuilt and parsed. This is the
+/// single source of truth for "is this rule parseable", shared by the
+/// read-time expander ([`expand_recurrence`]) and the create-path guard
+/// (`create_appointment`) so a rule accepted at write time is exactly the
+/// rule the expander can later walk.
+fn parse_recurrence_rule(
+    rule_raw: &str,
+    start: DateTime<Utc>,
+) -> Result<rrule::RRuleSet, rrule::RRuleError> {
+    let rule_body = rule_raw
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            let upper = l.to_uppercase();
+            !upper.starts_with("DTSTART") && !l.is_empty()
+        })
+        .map(|l| {
+            l.strip_prefix("RRULE:")
+                .or_else(|| l.strip_prefix("rrule:"))
+                .unwrap_or(l)
+        })
+        .unwrap_or(rule_raw);
+
+    let dtstart = start.format("%Y%m%dT%H%M%SZ");
+    let ical = format!("DTSTART:{dtstart}\nRRULE:{rule_body}");
+    ical.parse()
+}
+
 /// Expand a recurring appointment master into concrete occurrence
 /// instances overlapping `[from, to]`.
 ///
@@ -1124,32 +1233,13 @@ fn expand_recurrence(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<AppointmentResponse> {
-    use rrule::{RRuleSet, Tz};
+    use rrule::Tz;
 
     let Some(rule_raw) = base.recurrence_rule.as_deref() else {
         return Vec::new();
     };
-    // Normalise: drop any DTSTART line the caller stored (we anchor on
-    // the appointment's start_time) and any leading `RRULE:` token, then
-    // rebuild a canonical `DTSTART:...\nRRULE:...` document.
-    let rule_body = rule_raw
-        .lines()
-        .map(str::trim)
-        .find(|l| {
-            let upper = l.to_uppercase();
-            !upper.starts_with("DTSTART") && !l.is_empty()
-        })
-        .map(|l| {
-            l.strip_prefix("RRULE:")
-                .or_else(|| l.strip_prefix("rrule:"))
-                .unwrap_or(l)
-        })
-        .unwrap_or(rule_raw);
 
-    let dtstart = base.start_time.format("%Y%m%dT%H%M%SZ");
-    let ical = format!("DTSTART:{dtstart}\nRRULE:{rule_body}");
-
-    let set: RRuleSet = match ical.parse() {
+    let set = match parse_recurrence_rule(rule_raw, base.start_time) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(

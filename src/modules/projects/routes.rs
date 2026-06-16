@@ -90,10 +90,13 @@ async fn list_projects(
 async fn create_project(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateProjectRequest>,
 ) -> AppResult<Json<ProjectResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_project(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_project(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn get_project(
@@ -146,12 +149,15 @@ async fn list_project_phases(
 async fn create_project_phase(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertProjectPhaseRequest>,
 ) -> AppResult<Json<ProjectPhaseResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_project_phase(u.tenant(), id, &req).await?,
+        s.service
+            .create_project_phase(u.tenant(), id, &req, &ctx)
+            .await?,
     ))
 }
 
@@ -197,10 +203,13 @@ async fn create_task_status(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertTaskStatusRequest>,
 ) -> AppResult<Json<TaskStatusResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_task_status(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_task_status(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn update_task_status(
@@ -247,10 +256,15 @@ async fn create_project_type(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertProjectTypeRequest>,
 ) -> AppResult<Json<ProjectTypeResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_project_type(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service
+            .create_project_type(u.tenant(), &req, &ctx)
+            .await?,
+    ))
 }
 
 async fn update_project_type(
@@ -295,11 +309,14 @@ async fn list_project_tasks(
 async fn create_task(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateTaskRequest>,
 ) -> AppResult<Json<TaskResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_task(u.tenant(), id, &req).await?))
+    Ok(Json(
+        s.service.create_task(u.tenant(), id, &req, &ctx).await?,
+    ))
 }
 
 async fn get_task(
@@ -334,9 +351,12 @@ async fn delete_task(
 async fn add_dep(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
+    ctx: crate::modules::audit::AuditCtx,
     Path((id, other)): Path<(Uuid, Uuid)>,
 ) -> AppResult<()> {
-    s.service.add_task_dependency(u.tenant(), id, other).await
+    s.service
+        .add_task_dependency(u.tenant(), id, other, &ctx)
+        .await
 }
 
 async fn remove_dep(

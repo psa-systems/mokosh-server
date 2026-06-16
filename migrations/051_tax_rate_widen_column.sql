@@ -1,0 +1,11 @@
+-- PMS-339: widen tax_rates.rate so a percentage >= 10% can be stored.
+--
+-- The column was declared DECIMAL(5, 4) (max magnitude 9.9999), sized as if
+-- the value were a fraction (0.0825). The entire UI contract is a percentage
+-- number: the user types "20", it is displayed "20%" and stored as 20. Any
+-- rate >= 10 therefore overflowed the column and surfaced as an opaque 500.
+--
+-- Widen to DECIMAL(7, 4) (max magnitude 999.9999), keeping 4 decimal places
+-- so existing sub-percent precision (e.g. 8.25, 7.375) is preserved. The type
+-- change is a straight widening, so all existing rows survive unchanged.
+ALTER TABLE tax_rates ALTER COLUMN rate TYPE DECIMAL(7, 4);

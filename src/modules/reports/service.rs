@@ -288,7 +288,7 @@ impl ReportsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn projects(&self, tenant_id: TenantId) -> AppResult<ProjectsReportResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let by_status: Vec<(String, i64)> = sqlx::query_as(
+        let grouped: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT status, COUNT(*)::bigint
                FROM projects WHERE tenant_id = $1
                GROUP BY status ORDER BY status"#,
@@ -296,6 +296,33 @@ impl ReportsService {
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
+
+        // PMS-366: GROUP BY only emits statuses that have rows, so a tenant
+        // with no Planning or Cancelled projects loses those buckets and the
+        // dashboard counters silently omit those states. A brand-new project
+        // (born "planning", since the create form has no status field) then
+        // counts toward nothing. Zero-fill every canonical project status -
+        // the exact set the `projects.status` CHECK constraint allows - so all
+        // five states are always countable from the server; the sum across
+        // buckets still equals the total project rows. Any non-canonical
+        // status that somehow appears is preserved, appended (sorted) after
+        // the canonical five so the totals still reconcile.
+        const CANONICAL_PROJECT_STATUSES: [&str; 5] =
+            ["planning", "active", "on_hold", "completed", "cancelled"];
+        let mut counts: std::collections::HashMap<String, i64> = grouped.into_iter().collect();
+        let mut by_status: Vec<Bucket> = CANONICAL_PROJECT_STATUSES
+            .iter()
+            .map(|&label| Bucket {
+                label: label.to_string(),
+                count: counts.remove(label).unwrap_or(0),
+            })
+            .collect();
+        let mut extra: Vec<Bucket> = counts
+            .into_iter()
+            .map(|(label, count)| Bucket { label, count })
+            .collect();
+        extra.sort_by(|a, b| a.label.cmp(&b.label));
+        by_status.append(&mut extra);
 
         let (budget_hours, budget_amount): (Decimal, Decimal) = sqlx::query_as(
             r#"SELECT COALESCE(SUM(budget_hours), 0), COALESCE(SUM(budget_amount), 0)
@@ -340,10 +367,7 @@ impl ReportsService {
         .await?;
 
         Ok(ProjectsReportResponse {
-            by_status: by_status
-                .into_iter()
-                .map(|(label, count)| Bucket { label, count })
-                .collect(),
+            by_status,
             budget_hours,
             budget_amount,
             actual_hours,
@@ -386,7 +410,7 @@ impl ReportsService {
         .fetch_all(&mut *tx)
         .await?;
 
-        let by_status: Vec<(String, i64)> = sqlx::query_as(
+        let grouped: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT status, COUNT(*)::bigint
                FROM assets WHERE tenant_id = $1
                GROUP BY status ORDER BY status"#,
@@ -394,6 +418,26 @@ impl ReportsService {
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
+
+        // PMS-366: same zero-omission gap as the projects counter above. Asset
+        // state has a fixed `assets.status` CHECK set; zero-fill it so every
+        // state is always countable and the buckets sum to the asset total.
+        const CANONICAL_ASSET_STATUSES: [&str; 5] =
+            ["active", "inactive", "retired", "in_repair", "in_stock"];
+        let mut counts: std::collections::HashMap<String, i64> = grouped.into_iter().collect();
+        let mut by_status: Vec<Bucket> = CANONICAL_ASSET_STATUSES
+            .iter()
+            .map(|&label| Bucket {
+                label: label.to_string(),
+                count: counts.remove(label).unwrap_or(0),
+            })
+            .collect();
+        let mut extra: Vec<Bucket> = counts
+            .into_iter()
+            .map(|(label, count)| Bucket { label, count })
+            .collect();
+        extra.sort_by(|a, b| a.label.cmp(&b.label));
+        by_status.append(&mut extra);
 
         let warranty_expiring_90d: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*)::bigint FROM assets
@@ -425,10 +469,7 @@ impl ReportsService {
                 .into_iter()
                 .map(|(label, count)| Bucket { label, count })
                 .collect(),
-            assets_by_status: by_status
-                .into_iter()
-                .map(|(label, count)| Bucket { label, count })
-                .collect(),
+            assets_by_status: by_status,
             warranty_expiring_90d,
             contracts_active,
             contracts_renewing_90d,

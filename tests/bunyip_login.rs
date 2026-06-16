@@ -80,6 +80,7 @@ async fn invited_user_lands_in_inviting_tenant_with_invite_role(pool: PgPool) {
             TenantId::from_trusted(org),
             admin_id,
             &invite("Joiner@Example.com", "manager"),
+            &AuditCtx::system(org),
         )
         .await
         .expect("invite");
@@ -281,6 +282,7 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
             TenantId::from_trusted(org),
             admin_id,
             &invite("pending@example.com", "manager"),
+            &AuditCtx::system(org),
         )
         .await
         .expect("invite");

@@ -494,9 +494,33 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
 
-        if entries.is_empty() {
+        // 1b. PMS-315: lock the company's eligible mileage entries with the
+        //     SAME predicate (billable, unbilled, ready_to_bill). Mileage has
+        //     no timesheet gate, so a billable mileage entry is ready_to_bill
+        //     on creation (see MileageTrackingService). The `time_entry_ids`
+        //     id filter never restricts mileage; it names time entries only.
+        let mileage: Vec<MileageBillingRow> = sqlx::query_as(
+            r#"
+            SELECT id, distance_miles, rate_per_mile, total_amount, ticket_id,
+                   start_address, end_address
+            FROM mileage_entries
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND is_billable = TRUE
+              AND invoice_id IS NULL
+              AND billing_status = 'ready_to_bill'
+            ORDER BY date, created_at
+            FOR UPDATE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(request.company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if entries.is_empty() && mileage.is_empty() {
             return Err(AppError::BadRequest(
-                "no billable time entries found for this company".to_string(),
+                "no billable time or mileage entries found for this company".to_string(),
             ));
         }
 
@@ -525,6 +549,28 @@ impl BillingService {
                 total,
                 entry.ticket_id,
             ));
+        }
+
+        // 3b. PMS-315: one line per mileage entry. quantity = distance_miles,
+        //     unit_price = rate_per_mile, total = total_amount (falling back to
+        //     quantity * unit_price). Description renders the route when either
+        //     address is present, else a bare "Mileage".
+        let mut mileage_lines: Vec<(Uuid, String, Decimal, Decimal, Decimal, Option<Uuid>)> =
+            Vec::with_capacity(mileage.len());
+        for m in &mileage {
+            let quantity = m.distance_miles;
+            let unit_price = m.rate_per_mile.unwrap_or(Decimal::ZERO);
+            let total = m.total_amount.unwrap_or(quantity * unit_price);
+            subtotal += total;
+            let description = match (m.start_address.as_deref(), m.end_address.as_deref()) {
+                (None, None) => "Mileage".to_string(),
+                (start, end) => format!(
+                    "Mileage: {} \u{2192} {}",
+                    start.unwrap_or(""),
+                    end.unwrap_or("")
+                ),
+            };
+            mileage_lines.push((m.id, description, quantity, unit_price, total, m.ticket_id));
         }
 
         // Tax / discount left at 0 (see method doc); total == subtotal.
@@ -602,6 +648,35 @@ impl BillingService {
             .await?;
         }
 
+        // 5b. PMS-315: one 'mileage' line per mileage entry. `sort_order`
+        //     continues after the time-entry lines. Mileage lines do not set
+        //     `time_entry_ids` (that column references time_entries only); the
+        //     source is traced back via the matched mileage rows below.
+        let time_line_count = lines.len();
+        for (offset, (_mileage_id, description, quantity, unit_price, line_total, ticket_id)) in
+            mileage_lines.iter().enumerate()
+        {
+            sqlx::query(
+                r#"
+                INSERT INTO invoice_lines (
+                    id, invoice_id, line_type, description, quantity, unit_price,
+                    total, ticket_id, sort_order
+                )
+                VALUES ($1, $2, 'mileage', $3, $4, $5, $6, $7, $8)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(invoice_id)
+            .bind(description)
+            .bind(quantity)
+            .bind(unit_price)
+            .bind(line_total)
+            .bind(ticket_id)
+            .bind((time_line_count + offset) as i32)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         // 6. Mark the source entries billed and link them to the invoice,
         //    within the same transaction. Scoped to the locked id set so
         //    a concurrently-inserted eligible entry is not swept in.
@@ -618,6 +693,23 @@ impl BillingService {
         .bind(tenant_id)
         .bind(invoice_id)
         .bind(&billed_ids)
+        .execute(&mut *tx)
+        .await?;
+
+        // 6b. PMS-315: same flip for the billed mileage entries.
+        let billed_mileage_ids: Vec<Uuid> = mileage.iter().map(|m| m.id).collect();
+        sqlx::query(
+            r#"
+            UPDATE mileage_entries
+            SET billing_status = 'billed',
+                invoice_id     = $2,
+                updated_at     = NOW()
+            WHERE tenant_id = $1 AND id = ANY($3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .bind(&billed_mileage_ids)
         .execute(&mut *tx)
         .await?;
 
@@ -1229,10 +1321,11 @@ impl BillingService {
         Ok(fallback.into())
     }
 
-    /// PMS-40: list payment gateway configs for the tenant. Each
-    /// response carries the *decrypted* config so a finance admin can
-    /// confirm what's wired without an extra round-trip to a "reveal"
-    /// endpoint.
+    /// PMS-40 / PMS-342: list payment gateway configs for the tenant. The
+    /// stored credential is a write-only secret, so the response carries only
+    /// non-secret metadata plus `configured` (whether a secret is stored). The
+    /// decrypted config is never returned; decryption stays server-internal for
+    /// actual gateway calls.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payment_gateways(
         &self,
@@ -1261,30 +1354,27 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
 
-        let decrypted: Vec<PaymentGatewayConfigResponse> = rows
+        let gateways: Vec<PaymentGatewayConfigResponse> = rows
             .into_iter()
-            .map(|r| {
-                let decrypted =
-                    crate::utils::crypto::decrypt(&r.config_encrypted, &self.encryption_key)?;
-                let config: serde_json::Value =
-                    serde_json::from_str(&decrypted).unwrap_or(serde_json::Value::Null);
-                Ok(PaymentGatewayConfigResponse {
-                    id: r.id,
-                    provider: GatewayProvider::from_str(&r.provider)
-                        .unwrap_or(GatewayProvider::Stripe),
-                    is_active: r.is_active,
-                    is_test_mode: r.is_test_mode,
-                    config,
-                })
+            .map(|r| PaymentGatewayConfigResponse {
+                id: r.id,
+                provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
+                is_active: r.is_active,
+                is_test_mode: r.is_test_mode,
+                configured: !r.config_encrypted.is_empty(),
             })
-            .collect::<AppResult<Vec<_>>>()?;
+            .collect();
 
-        Ok((decrypted, total as u64))
+        Ok((gateways, total as u64))
     }
 
-    /// PMS-40: upsert a payment gateway config. `(tenant_id, provider)`
-    /// is unique in the schema, so the same call ends up insert-or-update.
-    /// Encrypts the `config` blob at rest with the host encryption key.
+    /// PMS-40 / PMS-342: upsert a payment gateway config. `(tenant_id,
+    /// provider)` is unique in the schema, so the same call ends up
+    /// insert-or-update. The credential is write-only: when `config` is
+    /// provided it is encrypted at rest with the host key and replaces the
+    /// stored secret; when omitted it preserves the existing secret (and is
+    /// required when creating a gateway for the first time). The decrypted
+    /// secret is never echoed back.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_payment_gateway(
         &self,
@@ -1292,9 +1382,20 @@ impl BillingService {
         request: &UpsertPaymentGatewayConfigRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentGatewayConfigResponse> {
-        let plaintext = serde_json::to_string(&request.config)
-            .map_err(|e| AppError::BadRequest(format!("config must serialise to JSON: {e}")))?;
-        let encrypted = crate::utils::crypto::encrypt(&plaintext, &self.encryption_key)?;
+        // Encrypt only when the caller supplied a new config; `None` means
+        // "keep the existing secret" (write-only update semantics, PMS-342).
+        let encrypted = match request.config.as_ref() {
+            Some(config) => {
+                let plaintext = serde_json::to_string(config).map_err(|e| {
+                    AppError::BadRequest(format!("config must serialise to JSON: {e}"))
+                })?;
+                Some(crate::utils::crypto::encrypt(
+                    &plaintext,
+                    &self.encryption_key,
+                )?)
+            }
+            None => None,
+        };
 
         // Mutation + audit row in one transaction. PMS-117. The secret
         // `config_encrypted` column is subtracted from both snapshots so
@@ -1317,26 +1418,57 @@ impl BillingService {
             AuditAction::Create
         };
 
-        let id: Uuid = sqlx::query_scalar(
-            r#"
-            INSERT INTO payment_gateway_configs
-                (tenant_id, provider, is_active, is_test_mode, config_encrypted)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (tenant_id, provider) DO UPDATE SET
-                is_active        = EXCLUDED.is_active,
-                is_test_mode     = EXCLUDED.is_test_mode,
-                config_encrypted = EXCLUDED.config_encrypted,
-                updated_at       = NOW()
-            RETURNING id
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(request.provider.as_str())
-        .bind(request.is_active)
-        .bind(request.is_test_mode)
-        .bind(&encrypted)
-        .fetch_one(&mut *tx)
-        .await?;
+        // A brand-new gateway must carry a config: `config_encrypted` is NOT
+        // NULL, and there is no existing secret to preserve.
+        let id: Uuid = match encrypted.as_ref() {
+            Some(encrypted) => {
+                sqlx::query_scalar(
+                    r#"
+                    INSERT INTO payment_gateway_configs
+                        (tenant_id, provider, is_active, is_test_mode, config_encrypted)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (tenant_id, provider) DO UPDATE SET
+                        is_active        = EXCLUDED.is_active,
+                        is_test_mode     = EXCLUDED.is_test_mode,
+                        config_encrypted = EXCLUDED.config_encrypted,
+                        updated_at       = NOW()
+                    RETURNING id
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(request.provider.as_str())
+                .bind(request.is_active)
+                .bind(request.is_test_mode)
+                .bind(encrypted)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            None => {
+                if before.is_none() {
+                    return Err(AppError::BadRequest(
+                        "config is required when first configuring a gateway".to_string(),
+                    ));
+                }
+                // Preserve the stored secret: update metadata only, leave
+                // `config_encrypted` untouched.
+                sqlx::query_scalar(
+                    r#"
+                    UPDATE payment_gateway_configs
+                    SET is_active    = $3,
+                        is_test_mode = $4,
+                        updated_at   = NOW()
+                    WHERE tenant_id = $1 AND provider = $2
+                    RETURNING id
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(request.provider.as_str())
+                .bind(request.is_active)
+                .bind(request.is_test_mode)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
@@ -1359,12 +1491,14 @@ impl BillingService {
         .await?;
         tx.commit().await?;
 
+        // After an upsert a secret is always stored (either the new one or the
+        // preserved existing one), so the gateway is configured.
         Ok(PaymentGatewayConfigResponse {
             id,
             provider: request.provider,
             is_active: request.is_active,
             is_test_mode: request.is_test_mode,
-            config: request.config.clone(),
+            configured: true,
         })
     }
 
@@ -1955,6 +2089,7 @@ impl BillingService {
         &self,
         tenant_id: TenantId,
         request: &UpsertPaymentTermRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<PaymentTermResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1975,6 +2110,24 @@ impl BillingService {
         .bind(request.is_active)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM payment_terms t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "payment_terms",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(PaymentTermResponse {
@@ -2147,6 +2300,18 @@ struct TimeEntryBillingRow {
     hourly_rate: Option<Decimal>,
     total_amount: Option<Decimal>,
     ticket_id: Option<Uuid>,
+}
+
+/// PMS-315: mileage entry projection for the invoice builder.
+#[derive(sqlx::FromRow)]
+struct MileageBillingRow {
+    id: Uuid,
+    distance_miles: Decimal,
+    rate_per_mile: Option<Decimal>,
+    total_amount: Option<Decimal>,
+    ticket_id: Option<Uuid>,
+    start_address: Option<String>,
+    end_address: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

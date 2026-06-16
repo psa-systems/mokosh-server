@@ -102,13 +102,14 @@ async fn create_work_type(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertWorkTypeRequest>,
 ) -> AppResult<Json<WorkTypeResponse>> {
     request.validate()?;
     Ok(Json(
         state
             .service
-            .create_work_type(user.tenant(), &request)
+            .create_work_type(user.tenant(), &request, &ctx)
             .await?,
     ))
 }
@@ -163,6 +164,7 @@ async fn list_time_entries(
 async fn create_time_entry(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
+    ctx: crate::modules::audit::AuditCtx,
     Json(mut request): Json<CreateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
     // Non-admins can only log time for themselves.
@@ -173,7 +175,7 @@ async fn create_time_entry(
     Ok(Json(
         state
             .service
-            .create_time_entry(user.tenant(), &request)
+            .create_time_entry(user.tenant(), &request, &ctx)
             .await?,
     ))
 }
@@ -389,13 +391,14 @@ async fn create_rounding_rule(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTimeRoundingRuleRequest>,
 ) -> AppResult<Json<TimeRoundingRuleResponse>> {
     request.validate()?;
     Ok(Json(
         state
             .service
-            .create_rounding_rule(user.tenant(), &request)
+            .create_rounding_rule(user.tenant(), &request, &ctx)
             .await?,
     ))
 }
