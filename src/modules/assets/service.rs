@@ -141,18 +141,22 @@ impl AssetsService {
         filter: &AssetFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AssetResponse>, u64)> {
-        let mut conditions = vec!["tenant_id = $1".to_string()];
+        // PMS-336: the assets table is aliased `a` so the SELECT can LEFT
+        // JOIN companies for company_name; qualify every condition with
+        // `a.` so columns (tenant_id, status, ...) are unambiguous across
+        // the join. The COUNT query reuses the same aliased clause.
+        let mut conditions = vec!["a.tenant_id = $1".to_string()];
         let mut idx = 2;
         if filter.company_id.is_some() {
-            conditions.push(format!("company_id = ${idx}"));
+            conditions.push(format!("a.company_id = ${idx}"));
             idx += 1;
         }
         if filter.asset_type_id.is_some() {
-            conditions.push(format!("asset_type_id = ${idx}"));
+            conditions.push(format!("a.asset_type_id = ${idx}"));
             idx += 1;
         }
         if filter.status.is_some() {
-            conditions.push(format!("status = ${idx}"));
+            conditions.push(format!("a.status = ${idx}"));
             idx += 1;
         }
         // PMS-344 follow-up: free-text name match for the AssetPicker.
@@ -161,13 +165,13 @@ impl AssetsService {
         // dropped, so the dropdown listed every asset regardless of
         // typed text.
         if filter.q.is_some() {
-            conditions.push(format!("name ILIKE ${idx}"));
+            conditions.push(format!("a.name ILIKE ${idx}"));
             idx += 1;
         }
         let where_clause = conditions.join(" AND ");
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let count_query = format!("SELECT COUNT(*) FROM assets WHERE {where_clause}");
+        let count_query = format!("SELECT COUNT(*) FROM assets a WHERE {where_clause}");
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
         if let Some(v) = filter.company_id {
             cq = cq.bind(v);
@@ -185,10 +189,13 @@ impl AssetsService {
         let total: i64 = cq.fetch_one(&mut *tx).await?;
 
         let query = format!(
-            r#"SELECT id, asset_tag, name, asset_type_id, company_id, site_id, contact_id,
-                      status, manufacturer, model, serial_number, purchase_date,
-                      purchase_price, warranty_expiry, end_of_life, created_at, updated_at
-               FROM assets WHERE {where_clause} ORDER BY name
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
+                      a.created_at, a.updated_at
+               FROM assets a
+               LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
+               WHERE {where_clause} ORDER BY a.name
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
             limit_idx = idx,
             offset_idx = idx + 1,
@@ -263,10 +270,13 @@ impl AssetsService {
     pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, AssetRow>(
-            r#"SELECT id, asset_tag, name, asset_type_id, company_id, site_id, contact_id,
-                      status, manufacturer, model, serial_number, purchase_date,
-                      purchase_price, warranty_expiry, end_of_life, created_at, updated_at
-               FROM assets WHERE tenant_id = $1 AND id = $2"#,
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
+                      a.created_at, a.updated_at
+               FROM assets a
+               LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
+               WHERE a.tenant_id = $1 AND a.id = $2"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -932,6 +942,9 @@ struct AssetRow {
     name: String,
     asset_type_id: Uuid,
     company_id: Uuid,
+    // PMS-336: resolved from the LEFT JOIN on companies. NULL only if the
+    // company row is missing; populated for every real asset.
+    company_name: Option<String>,
     site_id: Option<Uuid>,
     contact_id: Option<Uuid>,
     status: Option<String>,
@@ -954,6 +967,7 @@ impl From<AssetRow> for AssetResponse {
             name: r.name,
             asset_type_id: r.asset_type_id,
             company_id: r.company_id,
+            company_name: r.company_name,
             site_id: r.site_id,
             contact_id: r.contact_id,
             status: r.status.unwrap_or_else(|| "active".into()),
