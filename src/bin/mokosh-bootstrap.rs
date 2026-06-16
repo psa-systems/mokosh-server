@@ -92,6 +92,23 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // `mokosh-bootstrap qa-seed --tenant <uuid>` loads the QA walkthrough
+        // dataset (PMS-331) into a tenant explicitly marked QA. `qa-teardown`
+        // removes it. Both fail closed against any non-QA / production tenant.
+        Some("qa-seed") => match run_qa("qa-seed", &args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {:#}", e);
+                ExitCode::FAILURE
+            }
+        },
+        Some("qa-teardown") => match run_qa("qa-teardown", &args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {:#}", e);
+                ExitCode::FAILURE
+            }
+        },
         Some("--help") | Some("-h") | None => {
             print_help();
             ExitCode::SUCCESS
@@ -116,7 +133,16 @@ SUBCOMMANDS:
     bootstrap-infisical    First-run setup of a fresh Infisical instance.
     provision-roles        Create the split DB roles (mokosh_migrator / mokosh_app).
     clients register       Register a new OAuth/OIDC client in mokosh_auth.
+    qa-seed                Seed the QA walkthrough dataset into a QA-marked tenant (PMS-331).
+    qa-teardown            Remove the QA walkthrough dataset from a QA-marked tenant.
     --version, -V          Print version information and exit.
+
+ENVIRONMENT (qa-seed / qa-teardown):
+    DATABASE_URL           (required) Privileged Postgres URL.
+    --tenant <uuid>        (required) Target tenant id. May instead be given as MOKOSH_QA_TENANT_ID.
+                           The tenant MUST be marked QA first (fail closed, refuses production):
+                             UPDATE tenants SET settings = jsonb_set(COALESCE(settings,'{{}}'::jsonb),
+                               '{{is_qa}}', 'true'::jsonb, true) WHERE id = '<qa-tenant-id>';
 
 ENVIRONMENT (provision-roles):
     DATABASE_URL                  (required) Privileged Postgres URL (BYPASSRLS / superuser).
@@ -299,6 +325,56 @@ async fn run_provision_roles() -> anyhow::Result<()> {
     println!();
     println!("Point DATABASE_URL at mokosh_migrator and MOKOSH_APP_DATABASE_URL at mokosh_app.");
     Ok(())
+}
+
+// --- qa-seed / qa-teardown (PMS-331) -------------------------------------
+
+/// Drive the on-demand QA walkthrough dataset seed / teardown. `subcommand` is
+/// `"qa-seed"` or `"qa-teardown"`. The target tenant is taken from
+/// `--tenant <uuid>` (or the `MOKOSH_QA_TENANT_ID` env var) and is
+/// cross-checked against the `is_qa` marker by the seed itself, which refuses
+/// (zero writes) for any tenant not explicitly marked QA, production included.
+async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
+    use mokosh_server::db::Database;
+
+    let tenant_id = parse_tenant_arg(args)?;
+
+    // The QA seed is a trusted admin tool. Connect the privileged
+    // `DATABASE_URL` as both pools so per-tenant RLS does not bite while the
+    // seed writes through the tenant-scoped service layer.
+    let database_url = require_env("DATABASE_URL")?;
+    let db = Database::new(&database_url, &database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to database: {e}"))?;
+
+    let report = match subcommand {
+        "qa-seed" => mokosh_server::modules::seed::qa_seed(&db, tenant_id).await,
+        "qa-teardown" => mokosh_server::modules::seed::qa_teardown(&db, tenant_id).await,
+        other => unreachable!("unexpected qa subcommand {other}"),
+    }
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("{subcommand} complete for tenant {tenant_id}.");
+    println!("  {report}");
+    Ok(())
+}
+
+/// Resolve the QA tenant id from `--tenant <uuid>`, falling back to the
+/// `MOKOSH_QA_TENANT_ID` env var. Errors if neither is present or the value is
+/// not a UUID.
+fn parse_tenant_arg(args: &[String]) -> anyhow::Result<uuid::Uuid> {
+    let raw = args
+        .iter()
+        .position(|a| a == "--tenant")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| std::env::var("MOKOSH_QA_TENANT_ID").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the QA tenant id is required: pass --tenant <uuid> or set MOKOSH_QA_TENANT_ID"
+            )
+        })?;
+    uuid::Uuid::parse_str(raw.trim())
+        .map_err(|_| anyhow::anyhow!("invalid tenant id '{raw}': expected a UUID"))
 }
 
 /// Quote a string as a single-quoted SQL literal, doubling embedded quotes.
