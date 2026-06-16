@@ -78,9 +78,13 @@ fn validate_contract_date_range(
 ) -> Result<(), validator::ValidationError> {
     if let Some(end) = req.end_date {
         if end < req.start_date {
-            let mut error = validator::ValidationError::new("invalid_date_range");
-            error.message = Some("end_date must be on or after start_date".into());
-            return Err(error);
+            // Re-key onto `end_date` so the form shows the message inline
+            // rather than as a generic banner (PMS-364).
+            return Err(crate::utils::validation::cross_field_error(
+                "invalid_date_range",
+                "end_date",
+                "end_date must be on or after start_date",
+            ));
         }
     }
     Ok(())
