@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::custom;
 use super::service::*;
-use crate::modules::auth::{RequireManager, RequireReports, TenantScoped};
+use crate::modules::auth::{RequireFinance, RequireReports, TenantScoped};
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -99,7 +99,7 @@ async fn list_reports(
             key: "billing",
             name: "Revenue & A/R Aging",
             description:
-                "Invoiced / paid / outstanding totals and A/R aging buckets. Manager only.",
+                "Invoiced / paid / outstanding totals and A/R aging buckets. Finance only.",
             parameters: vec![ParamSpec {
                 name: "company_id",
                 kind: "uuid",
@@ -161,7 +161,7 @@ struct BillingQ {
 async fn billing_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
-    _m: RequireManager,
+    _f: RequireFinance,
     Query(q): Query<BillingQ>,
 ) -> AppResult<Json<BillingReportResponse>> {
     Ok(Json(s.service.billing(u.tenant(), q.company_id).await?))
@@ -177,6 +177,12 @@ async fn projects_report(
 async fn clients_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
+    // PMS-350: the clients report is Client Profitability - it sums
+    // invoiced / paid / outstanding from the invoices table, so it carries
+    // the same financial data as the Invoices page and the billing report.
+    // Gate it behind the same finance check rather than letting any
+    // reports-enabled role (e.g. technician) read company financials.
+    _f: RequireFinance,
 ) -> AppResult<Json<ClientsReportResponse>> {
     Ok(Json(s.service.clients(u.tenant()).await?))
 }
@@ -242,9 +248,27 @@ async fn export_report(
         "dashboard" => csv_for_dashboard(&s.service.dashboard(u.tenant()).await?),
         "tickets" => csv_for_tickets(&s.service.tickets(u.tenant(), q.from, q.to).await?),
         "time" => csv_for_time(&s.service.time(u.tenant(), q.from, q.to).await?),
-        "billing" => csv_for_billing(&s.service.billing(u.tenant(), q.company_id).await?),
+        "billing" => {
+            // The billing export carries the same revenue / A/R figures as
+            // GET /reports/billing, so it enforces the same finance gate
+            // rather than letting any reports-enabled role read it (PMS-350:
+            // closing the export side-door around the financial report gate).
+            if !u.role.can_manage_billing() {
+                return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+            }
+            csv_for_billing(&s.service.billing(u.tenant(), q.company_id).await?)
+        }
         "projects" => csv_for_projects(&s.service.projects(u.tenant()).await?),
-        "clients" => csv_for_clients(&s.service.clients(u.tenant()).await?),
+        "clients" => {
+            // The clients export is Client Profitability (invoiced / paid /
+            // outstanding), the same financial data as GET /reports/clients,
+            // so it enforces the same finance gate as the billing export above
+            // rather than leaving a CSV side-door open (PMS-350).
+            if !u.role.can_manage_billing() {
+                return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+            }
+            csv_for_clients(&s.service.clients(u.tenant()).await?)
+        }
         other => return Err(AppError::NotFound(format!("report {other:?}"))),
     };
     Ok((
