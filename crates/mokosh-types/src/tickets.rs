@@ -433,6 +433,12 @@ pub struct TicketResponse {
     pub estimated_hours: Option<f64>,
     pub actual_hours: f64,
     pub tags: Vec<String>,
+    /// PMS-344: the asset this ticket is associated with, if any. Both
+    /// the id (for routing / lookups) and the human name (so the SPA
+    /// can render a link without an extra fetch) are returned. NULL
+    /// when the ticket has no associated asset, which is the default.
+    pub asset_id: Option<Uuid>,
+    pub asset_name: Option<String>,
     pub created_by_name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -585,6 +591,10 @@ pub struct TicketFilter {
     pub contact_id: Option<Uuid>,
     pub assigned_to_id: Option<Uuid>,
     pub team_id: Option<Uuid>,
+    /// PMS-344: filter tickets by the asset they reference. The asset
+    /// detail page consumes this to render a Related Tickets section
+    /// (`GET /api/v1/tickets?asset_id=<uuid>`).
+    pub asset_id: Option<Uuid>,
     pub is_unassigned: Option<bool>,
     pub is_overdue: Option<bool>,
     pub is_open: Option<bool>,
