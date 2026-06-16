@@ -102,6 +102,13 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
     assert!(created.status().is_success(), "create project should 2xx");
     let project: serde_json::Value = created.json().await.expect("project JSON");
     let project_id = project["id"].as_str().expect("project id").to_string();
+    // Owning company name is resolved via the LEFT join (PMS-335), so a
+    // consumer can render the client without a second lookup.
+    assert_eq!(
+        project["company_name"].as_str(),
+        Some("Acme Co"),
+        "create response carries the owning company name"
+    );
     // Fresh project: budget present, actuals zero (no approved time yet).
     assert_eq!(dec(&project["budget_hours"]), 100.0);
     assert_eq!(
@@ -118,13 +125,18 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
         &format!("/api/v1/projects?company_id={company}&status=active"),
     )
     .await;
-    assert!(
-        listed["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["id"].as_str() == Some(project_id.as_str())),
-        "project appears in the filtered list"
+    let listed_project = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"].as_str() == Some(project_id.as_str()))
+        .expect("project appears in the filtered list");
+    // The list query resolves company_name too (PMS-335), so the list view
+    // can show a Company column.
+    assert_eq!(
+        listed_project["company_name"].as_str(),
+        Some("Acme Co"),
+        "list response carries the owning company name"
     );
 
     // --- Phases, ordered by sort_order (AC2) ---
