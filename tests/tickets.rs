@@ -798,3 +798,119 @@ async fn category_parent_cross_tenant_blocked_at_db(pool: PgPool) {
         "expected a foreign-key violation, got {err}"
     );
 }
+
+/// PMS-358: an explicit `priority_id` on POST /api/v1/tickets must round-trip
+/// unchanged into the persisted row.
+///
+/// External review reproduced "select Priority = High on New Ticket, ticket
+/// saves as Medium". Medium is the seeded *default* priority, so the symptom
+/// is the create path falling back to the default whenever `priority_id` is
+/// dropped before it reaches the DB. This test pins the server half of the
+/// round-trip: for every available priority we create a ticket with that
+/// explicit `priority_id`, then assert both the create response and a fresh
+/// GET carry that exact id+name, never the default. If this stays green, the
+/// regression lives in the SPA form binding (it omits `priority_id`), not in
+/// the backend.
+#[sqlx::test]
+async fn create_ticket_round_trips_every_priority(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Enumerate the priorities the tenant actually offers, exactly as the
+    // New Ticket dropdown would populate itself.
+    let prio_resp = app
+        .client
+        .get(app.url("/api/v1/tickets/priorities?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list priorities");
+    assert_eq!(prio_resp.status(), reqwest::StatusCode::OK);
+    let prio_json: serde_json::Value = prio_resp.json().await.expect("priorities JSON");
+    let priorities = prio_json["data"]
+        .as_array()
+        .expect("priorities list has data");
+    assert!(
+        priorities.len() >= 2,
+        "need at least two priorities to prove non-default round-trip, got {}",
+        priorities.len()
+    );
+
+    for prio in priorities {
+        let prio_id = prio["id"].as_str().expect("priority id").to_string();
+        let prio_name = prio["name"].as_str().expect("priority name").to_string();
+
+        // CREATE with an explicit priority. `custom_fields` is sent as `{}`
+        // for the same NOT NULL reason documented in the happy-path test.
+        let create_body = serde_json::json!({
+            "title": format!("Priority round-trip: {prio_name}"),
+            "company_id": company_id,
+            "priority_id": prio_id,
+            "custom_fields": {},
+        });
+        let create_resp = app
+            .client
+            .post(app.url("/api/v1/tickets"))
+            .bearer_auth(&token)
+            .json(&create_body)
+            .send()
+            .await
+            .expect("send create ticket");
+        let create_status = create_resp.status();
+        let create_text = create_resp.text().await.expect("create ticket body");
+        assert!(
+            create_status.is_success(),
+            "create ticket should 2xx, got {create_status} body={create_text}"
+        );
+        let created: serde_json::Value =
+            serde_json::from_str(&create_text).expect("create ticket JSON");
+        let ticket_id = created["id"]
+            .as_str()
+            .expect("created ticket has id")
+            .to_string();
+
+        // The create response must echo the selected priority, never the
+        // tenant default.
+        assert_eq!(
+            created["priority"]["id"].as_str(),
+            Some(prio_id.as_str()),
+            "create response priority.id must equal the selected priority for {prio_name}"
+        );
+        assert_eq!(
+            created["priority"]["name"].as_str(),
+            Some(prio_name.as_str()),
+            "create response priority.name must equal the selected priority"
+        );
+        // No regression on other fields persisted in the same submit.
+        assert_eq!(
+            created["company_name"].as_str(),
+            Some("Acme Co"),
+            "company must still resolve via the JOIN"
+        );
+        assert_joined_fields_populated(&created, &format!("create:{prio_name}"));
+
+        // GET it back fresh to prove the value is in the DB row, not merely
+        // reflected by the create handler.
+        let get_resp = app
+            .client
+            .get(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("send get ticket");
+        assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+        let got: serde_json::Value = get_resp.json().await.expect("get ticket JSON");
+        assert_eq!(
+            got["priority"]["id"].as_str(),
+            Some(prio_id.as_str()),
+            "persisted priority.id must equal the selected priority for {prio_name}"
+        );
+        assert_eq!(
+            got["priority"]["name"].as_str(),
+            Some(prio_name.as_str()),
+            "persisted priority.name must equal the selected priority for {prio_name}"
+        );
+    }
+}
