@@ -660,6 +660,153 @@ async fn task_and_project_edits_write_audit_rows(pool: PgPool) {
     );
 }
 
+/// PMS-318: creating a task writes a `create` audit row in the same tx as the
+/// INSERT, so the task's change-history pane surfaces the create event. The
+/// row is entity-scoped, has no `before` snapshot, captures the inserted row
+/// in `after`, and records the creating user as actor.
+#[sqlx::test]
+async fn create_task_writes_create_audit_row(pool: PgPool) {
+    let probe = pool.clone();
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Create Audit Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Audit P", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = project["id"].as_str().expect("project id").to_string();
+
+    let status_id = first_task_status(&app, &token).await;
+    let task: serde_json::Value = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        serde_json::json!({ "title": "Fresh", "status_id": status_id, "priority": "low" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("task JSON");
+    let task_id = task["id"].as_str().expect("task id").to_string();
+    let task_uuid = Uuid::parse_str(&task_id).unwrap();
+
+    let (action, old_values, new_values, user_id): (
+        String,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        r#"SELECT action, old_values, new_values, user_id
+             FROM audit_log
+             WHERE entity_type = 'tasks' AND entity_id = $1 AND action = 'create'"#,
+    )
+    .bind(task_uuid)
+    .fetch_one(&probe)
+    .await
+    .expect("a create audit row exists for the new task");
+
+    assert_eq!(action, "create");
+    assert!(old_values.is_none(), "before snapshot is NULL on a create");
+    let after = new_values.expect("after snapshot present");
+    assert_eq!(after["id"].as_str(), Some(task_id.as_str()));
+    assert_eq!(after["title"].as_str(), Some("Fresh"));
+    assert_eq!(user_id, Some(admin_id), "actor is the creating user");
+}
+
+/// PMS-318 AC3: the create audit row shares the task INSERT's transaction.
+/// Forcing the audit write to fail strictly after the INSERT (here a ctx whose
+/// `user_id` violates the `audit_log -> users` FK) rolls the whole transaction
+/// back, so neither the task nor an audit row survives.
+#[sqlx::test]
+async fn create_task_audit_failure_rolls_back_the_task(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::projects::{CreateTaskRequest, ProjectsService};
+    use mokosh_server::Database;
+
+    let probe = pool.clone();
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Rollback Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Doomed P", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = Uuid::parse_str(project["id"].as_str().expect("project id")).unwrap();
+    let status_id = Uuid::parse_str(&first_task_status(&app, &token).await).unwrap();
+
+    let service = ProjectsService::new(Database::from_pool(app.pool.clone()));
+    // `user_id` references a row that does not exist in `users`, so audit_write's
+    // INSERT fails the FK *after* the task INSERT has already run on the tx.
+    let ctx = AuditCtx {
+        tenant_id: Some(common::DEFAULT_TENANT_ID),
+        user_id: Some(Uuid::new_v4()),
+        ip: None,
+        user_agent: None,
+    };
+    let req = CreateTaskRequest {
+        title: "Doomed".to_string(),
+        description: None,
+        status_id,
+        phase_id: None,
+        parent_task_id: None,
+        priority: "low".to_string(),
+        assigned_to_id: None,
+        estimated_hours: None,
+        start_date: None,
+        due_date: None,
+        sort_order: 0,
+    };
+
+    let result = service
+        .create_task(
+            TenantId::from_trusted(common::DEFAULT_TENANT_ID),
+            project_id,
+            &req,
+            &ctx,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "create must fail when the in-tx audit write FK-violates"
+    );
+
+    let task_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE project_id = $1 AND title = 'Doomed'")
+            .bind(project_id)
+            .fetch_one(&probe)
+            .await
+            .expect("count tasks");
+    assert_eq!(
+        task_count, 0,
+        "the task INSERT must roll back with the failed audit write"
+    );
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE entity_type = 'tasks' AND action = 'create'",
+    )
+    .fetch_one(&probe)
+    .await
+    .expect("count audit rows");
+    assert_eq!(audit_count, 0, "no create audit row survives the rollback");
+}
+
 // ============================================================================
 // PMS-322: project_types lookup table + CRUD.
 // ============================================================================

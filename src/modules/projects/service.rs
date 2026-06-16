@@ -715,6 +715,7 @@ impl ProjectsService {
         tenant_id: TenantId,
         project_id: Uuid,
         request: &CreateTaskRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
         let id = Uuid::new_v4();
         // PMS-345: when no due date is given, fall back to the tenant-wide
@@ -752,6 +753,29 @@ impl ProjectsService {
         .bind(due_date)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+
+        // PMS-318: emit the Create audit row inside the same tx as the INSERT
+        // (mirrors update_task above and the PMS-117 create_user pattern) so the
+        // task's change-history feed shows the create event, and a rollback
+        // drops both the task and its audit row together. `before` is NULL on a
+        // create; `after` snapshots the inserted row via to_jsonb.
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tasks t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "tasks",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_task(tenant_id, id).await

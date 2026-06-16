@@ -295,11 +295,14 @@ async fn list_project_tasks(
 async fn create_task(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateTaskRequest>,
 ) -> AppResult<Json<TaskResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_task(u.tenant(), id, &req).await?))
+    Ok(Json(
+        s.service.create_task(u.tenant(), id, &req, &ctx).await?,
+    ))
 }
 
 async fn get_task(
