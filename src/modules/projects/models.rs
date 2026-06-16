@@ -100,6 +100,10 @@ pub struct CreateProjectRequest {
     pub project_manager_id: Option<Uuid>,
     pub start_date: Option<NaiveDate>,
     pub target_end_date: Option<NaiveDate>,
+    /// Settable on create for parity with edit (PMS-361). Normally left unset
+    /// on a new project; an MSP backfilling a project that already finished
+    /// can record the real end date in one submission instead of create-then-edit.
+    pub actual_end_date: Option<NaiveDate>,
     #[serde(default, deserialize_with = "decimal_opt::deserialize")]
     #[validate(custom(function = crate::utils::validation::validate_budget_hours))]
     pub budget_hours: Option<Decimal>,
