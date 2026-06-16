@@ -305,6 +305,20 @@ fn normalize_task_markers(s: &str) -> String {
     s.replace("[x]", "[ ]").replace("[X]", "[ ]")
 }
 
+/// Turn a raw column name into the human field label shown in change history:
+/// drop a trailing `_id` foreign-key suffix and turn the remaining snake_case
+/// into spaced words. `status_id` -> `status`, `priority_id` -> `priority`,
+/// `assigned_to_id` -> `assigned to`. Non-FK columns (`title`, `description`)
+/// pass through with just the underscore-to-space step. Applied at the history
+/// read boundary so the stored audit rows keep the exact column that changed
+/// while the SPA (which only capitalises for display) stops rendering the raw
+/// `_id` suffix as `Status id` / `Priority id` / `Assigned to id` (PMS-370,
+/// follow-up to PMS-359). Centralising it here means any future FK field
+/// inherits the cleanup without a client change.
+fn humanize_field(field: &str) -> String {
+    field.strip_suffix("_id").unwrap_or(field).replace('_', " ")
+}
+
 #[derive(sqlx::FromRow)]
 struct HistoryRow {
     id: Uuid,
@@ -317,7 +331,17 @@ struct HistoryRow {
 
 impl From<HistoryRow> for EntityHistoryEntry {
     fn from(r: HistoryRow) -> Self {
-        let changes = field_changes(&r.old_values, &r.new_values);
+        // Humanise the column name at the read boundary: the stored audit rows
+        // keep the exact column (`status_id`, `priority_id`, `assigned_to_id`)
+        // for fidelity, but the history feed renders the FK suffix stripped so
+        // the SPA shows `Status` / `Priority` / `Assigned to` (PMS-370).
+        let changes: Vec<FieldChange> = field_changes(&r.old_values, &r.new_values)
+            .into_iter()
+            .map(|c| FieldChange {
+                field: humanize_field(&c.field),
+                ..c
+            })
+            .collect();
         let changed_fields = changes.iter().map(|c| c.field.clone()).collect();
         Self {
             id: r.id,
@@ -414,5 +438,17 @@ mod tests {
     fn no_change_is_not_a_marker_toggle() {
         let same = snap(json!({"description": "- [ ] a"}));
         assert!(!is_task_marker_only_change(&same, &same));
+    }
+
+    #[test]
+    fn humanize_field_strips_fk_suffix_and_underscores() {
+        // PMS-370: the inline-editor FK columns lose their `_id` suffix.
+        assert_eq!(humanize_field("status_id"), "status");
+        assert_eq!(humanize_field("priority_id"), "priority");
+        assert_eq!(humanize_field("assigned_to_id"), "assigned to");
+        // Non-FK columns only get snake_case spaced; plain names pass through.
+        assert_eq!(humanize_field("title"), "title");
+        assert_eq!(humanize_field("description"), "description");
+        assert_eq!(humanize_field("billing_status"), "billing status");
     }
 }
