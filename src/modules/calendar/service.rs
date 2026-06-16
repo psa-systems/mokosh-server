@@ -431,6 +431,23 @@ impl CalendarService {
                 "end_time must be after start_time".to_string(),
             ));
         }
+        // PMS-374: reject a non-RFC-5545 recurrence_rule with a 422 field
+        // error so garbage text is never persisted. Validate with the same
+        // parser the read-time expander uses, anchored on this request's
+        // start_time, so a rule accepted here is exactly one the expander can
+        // later walk. A blank value is treated as "no recurrence" and skipped.
+        if let Some(rule) = request
+            .recurrence_rule
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+        {
+            if let Err(e) = parse_recurrence_rule(rule, request.start_time) {
+                return Err(AppError::validation_field(
+                    "recurrence_rule",
+                    format!("not a valid RFC 5545 RRULE: {e}"),
+                ));
+            }
+        }
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked.
         self.validate_fk(tenant_id, "users", request.assigned_to_id)
@@ -1101,6 +1118,40 @@ impl CalendarService {
     }
 }
 
+/// Normalise a stored `recurrence_rule` and parse it as an `RRuleSet`
+/// anchored on `start`.
+///
+/// The series is anchored on the appointment's `start_time`, so any
+/// `DTSTART` line the caller stored is dropped and a canonical one is
+/// synthesised; a leading `RRULE:` token is also stripped before the
+/// `DTSTART:...\nRRULE:...` document is rebuilt and parsed. This is the
+/// single source of truth for "is this rule parseable", shared by the
+/// read-time expander ([`expand_recurrence`]) and the create-path guard
+/// (`create_appointment`) so a rule accepted at write time is exactly the
+/// rule the expander can later walk.
+fn parse_recurrence_rule(
+    rule_raw: &str,
+    start: DateTime<Utc>,
+) -> Result<rrule::RRuleSet, rrule::RRuleError> {
+    let rule_body = rule_raw
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            let upper = l.to_uppercase();
+            !upper.starts_with("DTSTART") && !l.is_empty()
+        })
+        .map(|l| {
+            l.strip_prefix("RRULE:")
+                .or_else(|| l.strip_prefix("rrule:"))
+                .unwrap_or(l)
+        })
+        .unwrap_or(rule_raw);
+
+    let dtstart = start.format("%Y%m%dT%H%M%SZ");
+    let ical = format!("DTSTART:{dtstart}\nRRULE:{rule_body}");
+    ical.parse()
+}
+
 /// Expand a recurring appointment master into concrete occurrence
 /// instances overlapping `[from, to]`.
 ///
@@ -1124,32 +1175,13 @@ fn expand_recurrence(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<AppointmentResponse> {
-    use rrule::{RRuleSet, Tz};
+    use rrule::Tz;
 
     let Some(rule_raw) = base.recurrence_rule.as_deref() else {
         return Vec::new();
     };
-    // Normalise: drop any DTSTART line the caller stored (we anchor on
-    // the appointment's start_time) and any leading `RRULE:` token, then
-    // rebuild a canonical `DTSTART:...\nRRULE:...` document.
-    let rule_body = rule_raw
-        .lines()
-        .map(str::trim)
-        .find(|l| {
-            let upper = l.to_uppercase();
-            !upper.starts_with("DTSTART") && !l.is_empty()
-        })
-        .map(|l| {
-            l.strip_prefix("RRULE:")
-                .or_else(|| l.strip_prefix("rrule:"))
-                .unwrap_or(l)
-        })
-        .unwrap_or(rule_raw);
 
-    let dtstart = base.start_time.format("%Y%m%dT%H%M%SZ");
-    let ical = format!("DTSTART:{dtstart}\nRRULE:{rule_body}");
-
-    let set: RRuleSet = match ical.parse() {
+    let set = match parse_recurrence_rule(rule_raw, base.start_time) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(

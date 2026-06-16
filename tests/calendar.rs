@@ -233,6 +233,84 @@ async fn recurring_expansion_is_bounded_by_range(pool: PgPool) {
     );
 }
 
+/// PMS-374: a `recurrence_rule` that is not a parseable RFC 5545 RRULE is
+/// rejected with 422 and nothing is persisted. The follow-up range query
+/// must surface no appointment at all (neither the master nor any expanded
+/// occurrence), proving the create was a no-op.
+#[sqlx::test]
+async fn create_appointment_rejects_invalid_recurrence_rule(pool: PgPool) {
+    let (admin_id, email, password) = seed_admin(&pool).await;
+    let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/appointments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Broken series",
+            "assigned_to_id": admin_id,
+            "start_time": "2026-03-02T09:00:00Z",
+            "end_time": "2026-03-02T09:30:00Z",
+            "recurrence_rule": "GARBAGE NOT A RULE",
+        }))
+        .send()
+        .await
+        .expect("send create with invalid recurrence_rule");
+    assert_eq!(
+        resp.status(),
+        422,
+        "a non-RFC-5545 recurrence_rule must be rejected with 422"
+    );
+
+    // Nothing was stored: a window spanning the would-be series is empty.
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/appointments?from=2026-03-01T00:00:00Z&to=2026-03-31T23:59:59Z"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send range query")
+        .json()
+        .await
+        .expect("range query JSON");
+    let data = list["data"].as_array().expect("range query data array");
+    assert!(
+        data.is_empty(),
+        "no appointment may be persisted when the rule is rejected, got {data:?}"
+    );
+}
+
+/// PMS-374: a valid RRULE is still accepted after the create-path guard is
+/// added, and it expands as before. Guards against the validation rejecting
+/// legitimate rules.
+#[sqlx::test]
+async fn create_appointment_accepts_valid_recurrence_rule(pool: PgPool) {
+    let (admin_id, email, password) = seed_admin(&pool).await;
+    let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/appointments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Daily standup",
+            "assigned_to_id": admin_id,
+            "start_time": "2026-03-02T09:00:00Z",
+            "end_time": "2026-03-02T09:30:00Z",
+            "recurrence_rule": "FREQ=DAILY;COUNT=3",
+        }))
+        .send()
+        .await
+        .expect("send create with valid recurrence_rule");
+    assert_eq!(
+        resp.status(),
+        200,
+        "a valid RFC 5545 recurrence_rule must still be accepted"
+    );
+}
+
 /// Time off can be approved and rejected through the approval endpoint.
 /// Both transitions are manager-gated; the seeded super_admin qualifies.
 #[sqlx::test]
