@@ -61,6 +61,7 @@ async fn list_mileage_entries(
 async fn create_mileage_entry(
     State(state): State<MileageTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
+    ctx: crate::modules::audit::AuditCtx,
     Json(mut request): Json<CreateMileageEntryRequest>,
 ) -> AppResult<Json<MileageEntryResponse>> {
     // Non-admins can only log mileage for themselves.
@@ -71,7 +72,7 @@ async fn create_mileage_entry(
     Ok(Json(
         state
             .service
-            .create_mileage_entry(user.tenant(), &request)
+            .create_mileage_entry(user.tenant(), &request, &ctx)
             .await?,
     ))
 }

@@ -15,6 +15,7 @@
 mod common;
 
 use chrono::NaiveDate;
+use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::mileage_tracking::{
     CreateMileageEntryRequest, MileageTrackingService, UpdateMileageEntryRequest,
@@ -24,6 +25,17 @@ use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+// PMS-318 sweep: create_mileage_entry now writes a Create audit row, so the
+// service signature carries an AuditCtx. A default ctx suffices for tests.
+fn actx() -> AuditCtx {
+    AuditCtx {
+        tenant_id: Some(common::DEFAULT_TENANT_ID),
+        user_id: None,
+        ip: None,
+        user_agent: None,
+    }
+}
 
 /// Read a money/decimal JSON field regardless of whether `rust_decimal`
 /// serialized it as a JSON number or a string.
@@ -334,7 +346,7 @@ async fn mileage_entries_are_tenant_isolated(pool: PgPool) {
         rate_per_mile: Some(common::dec("0.6000")),
     };
     let entry_a = svc
-        .create_mileage_entry(ta, &req_a)
+        .create_mileage_entry(ta, &req_a, &actx())
         .await
         .expect("create A");
 
@@ -344,7 +356,7 @@ async fn mileage_entries_are_tenant_isolated(pool: PgPool) {
         ..req_a.clone()
     };
     let entry_b = svc
-        .create_mileage_entry(tb, &req_b)
+        .create_mileage_entry(tb, &req_b, &actx())
         .await
         .expect("create B");
 
@@ -398,6 +410,7 @@ async fn update_mileage_entry_rejects_foreign_ticket(pool: PgPool) {
                 is_billable: true,
                 rate_per_mile: Some(common::dec("0.6000")),
             },
+            &actx(),
         )
         .await
         .expect("create entry");
@@ -425,4 +438,67 @@ async fn update_mileage_entry_rejects_foreign_ticket(pool: PgPool) {
         after.ticket_id.is_none(),
         "rejected update must not persist the ticket link"
     );
+}
+
+/// PMS-318 sweep: creating a mileage entry writes a `create` audit row in the
+/// same tx as the INSERT, so the entry's change-history pane surfaces the
+/// create event. The row is entity-scoped, has no `before` snapshot, captures
+/// the inserted row in `after`, and records the ctx user as actor.
+#[sqlx::test]
+async fn create_mileage_entry_writes_create_audit_row(pool: PgPool) {
+    let probe = pool.clone();
+    let (admin_id, _email, _pw) = common::seed_admin(&pool).await;
+    let company = common::seed_company(&pool).await;
+    let svc = MileageTrackingService::new(Database::from_pool(pool.clone()));
+    let ta = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx {
+        tenant_id: Some(common::DEFAULT_TENANT_ID),
+        user_id: Some(admin_id),
+        ip: None,
+        user_agent: None,
+    };
+
+    let entry = svc
+        .create_mileage_entry(
+            ta,
+            &CreateMileageEntryRequest {
+                user_id: admin_id,
+                date: NaiveDate::from_ymd_opt(2026, 6, 16).unwrap(),
+                distance_miles: common::dec("12.00"),
+                start_address: None,
+                end_address: None,
+                ticket_id: None,
+                project_id: None,
+                task_id: None,
+                company_id: company,
+                contract_id: None,
+                notes: None,
+                is_billable: true,
+                rate_per_mile: Some(common::dec("0.6000")),
+            },
+            &ctx,
+        )
+        .await
+        .expect("create entry");
+
+    let (action, old_values, new_values, user_id): (
+        String,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        r#"SELECT action, old_values, new_values, user_id
+             FROM audit_log
+             WHERE entity_type = 'mileage_entries' AND entity_id = $1 AND action = 'create'"#,
+    )
+    .bind(entry.id)
+    .fetch_one(&probe)
+    .await
+    .expect("a create audit row exists for the new mileage entry");
+
+    assert_eq!(action, "create");
+    assert!(old_values.is_none(), "before snapshot is NULL on a create");
+    let after = new_values.expect("after snapshot present");
+    assert_eq!(after["id"].as_str(), Some(entry.id.to_string().as_str()));
+    assert_eq!(user_id, Some(admin_id), "actor is the ctx user");
 }
