@@ -5,6 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::render_template;
 use crate::modules::tickets::{CreateTicketRequest, TicketService, TicketSource};
@@ -87,6 +88,7 @@ impl RmmService {
         &self,
         tenant_id: TenantId,
         request: &CreateRmmConnectionRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<RmmConnectionResponse> {
         let key_enc = crate::utils::crypto::encrypt(&request.api_key, &self.encryption_key)?;
         let secret_enc = match &request.api_secret {
@@ -111,6 +113,24 @@ impl RmmService {
         .bind(request.is_active)
         .bind(request.sync_interval_minutes)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM rmm_connections t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "rmm_connections",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(RmmConnectionResponse {
@@ -317,6 +337,7 @@ impl RmmService {
         &self,
         tenant_id: TenantId,
         request: &CreateRmmDeviceMappingRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<RmmDeviceMappingResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -333,6 +354,24 @@ impl RmmService {
         .bind(request.company_id)
         .bind(&request.device_name)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM rmm_device_mappings t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "rmm_device_mappings",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(RmmDeviceMappingResponse {
@@ -425,6 +464,7 @@ impl RmmService {
         &self,
         tenant_id: TenantId,
         request: &UpsertRmmAlertRuleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<RmmAlertRuleResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -445,6 +485,24 @@ impl RmmService {
         .bind(&request.ticket_template)
         .bind(request.is_active)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM rmm_alert_rules t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "rmm_alert_rules",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(RmmAlertRuleResponse {

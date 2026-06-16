@@ -80,10 +80,11 @@ async fn create_policy(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertSlaPolicyRequest>,
 ) -> AppResult<Json<SlaPolicyResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_policy(u.tenant(), &req).await?))
+    Ok(Json(s.service.create_policy(u.tenant(), &req, &ctx).await?))
 }
 
 async fn get_policy(
@@ -168,11 +169,14 @@ async fn create_business_hours(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertBusinessHoursRequest>,
 ) -> AppResult<Json<BusinessHoursResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_business_hours(u.tenant(), &req).await?,
+        s.service
+            .create_business_hours(u.tenant(), &req, &ctx)
+            .await?,
     ))
 }
 
@@ -220,11 +224,14 @@ async fn create_holiday_calendar(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertHolidayCalendarRequest>,
 ) -> AppResult<Json<HolidayCalendarResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_holiday_calendar(u.tenant(), &req).await?,
+        s.service
+            .create_holiday_calendar(u.tenant(), &req, &ctx)
+            .await?,
     ))
 }
 

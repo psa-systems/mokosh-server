@@ -130,10 +130,13 @@ async fn list_appointments(
 async fn create_appointment(
     State(s): State<CalendarRouterState>,
     RequireCalendar { user: u, .. }: RequireCalendar,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateAppointmentRequest>,
 ) -> AppResult<Json<AppointmentResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_appointment(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_appointment(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn get_appointment(
@@ -226,13 +229,16 @@ async fn list_time_off(
 async fn create_time_off(
     State(s): State<CalendarRouterState>,
     RequireCalendar { user: u, .. }: RequireCalendar,
+    ctx: crate::modules::audit::AuditCtx,
     Json(mut req): Json<CreateTimeOffRequest>,
 ) -> AppResult<Json<TimeOffResponse>> {
     if !u.role.is_admin() && req.user_id != u.id {
         req.user_id = u.id;
     }
     req.validate()?;
-    Ok(Json(s.service.create_time_off(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_time_off(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn get_time_off(
@@ -286,11 +292,14 @@ async fn create_on_call(
     State(s): State<CalendarRouterState>,
     RequireCalendar { user: u, .. }: RequireCalendar,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertOnCallScheduleRequest>,
 ) -> AppResult<Json<OnCallScheduleResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_on_call_schedule(u.tenant(), &req).await?,
+        s.service
+            .create_on_call_schedule(u.tenant(), &req, &ctx)
+            .await?,
     ))
 }
 

@@ -2047,6 +2047,7 @@ impl BillingService {
         &self,
         tenant_id: TenantId,
         request: &UpsertPaymentTermRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<PaymentTermResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -2067,6 +2068,24 @@ impl BillingService {
         .bind(request.is_active)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM payment_terms t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "payment_terms",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(PaymentTermResponse {

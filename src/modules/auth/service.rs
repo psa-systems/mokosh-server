@@ -1335,6 +1335,7 @@ impl AuthService {
         tenant_id: Uuid,
         user_id: Uuid,
         request: &crate::modules::auth::models::CreateApiKeyRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<crate::modules::auth::models::CreateApiKeyResponse> {
         use crate::utils::crypto::generate_api_key;
 
@@ -1371,6 +1372,27 @@ impl AuthService {
         .bind(scopes_json)
         .bind(request.expires_at)
         .fetch_one(&mut *tx)
+        .await?;
+
+        // CREATE: old = None. Strip `key_hash` (the argon2 secret) from the
+        // snapshot so the audit row never persists key material. PMS-117.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'key_hash' FROM api_keys t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            TenantId::from_trusted(tenant_id),
+            ctx,
+            AuditAction::Create,
+            "api_keys",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
 

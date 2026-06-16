@@ -7,6 +7,7 @@ use chrono::{DateTime, Datelike, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -425,6 +426,7 @@ impl CalendarService {
         &self,
         tenant_id: TenantId,
         request: &CreateAppointmentRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<AppointmentResponse> {
         if !appointment_range_ok(request.start_time, request.end_time) {
             return Err(AppError::BadRequest(
@@ -492,6 +494,24 @@ impl CalendarService {
         .bind(&request.location)
         .bind(&request.recurrence_rule)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM appointments t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "appointments",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_appointment(tenant_id, id).await
@@ -757,6 +777,7 @@ impl CalendarService {
         &self,
         tenant_id: TenantId,
         request: &CreateTimeOffRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TimeOffResponse> {
         if request.end_date < request.start_date {
             return Err(AppError::BadRequest(
@@ -777,6 +798,24 @@ impl CalendarService {
         .bind(&request.kind)
         .bind(&request.notes)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM time_off t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "time_off",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_time_off(tenant_id, id).await
@@ -877,6 +916,7 @@ impl CalendarService {
         &self,
         tenant_id: TenantId,
         request: &UpsertOnCallScheduleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<OnCallScheduleResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -893,6 +933,24 @@ impl CalendarService {
         .bind(&request.rotation_config)
         .bind(request.is_active)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM on_call_schedules t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "on_call_schedules",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(OnCallScheduleResponse {

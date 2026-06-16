@@ -4,6 +4,7 @@ use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -45,6 +46,7 @@ impl InvitationsService {
         tenant_id: TenantId,
         invited_by: Uuid,
         request: &CreateInvitationRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<InvitationResponse> {
         if !INVITABLE_ROLES.contains(&request.role.as_str()) {
             return Err(AppError::BadRequest(format!(
@@ -111,6 +113,25 @@ impl InvitationsService {
             .execute(&mut *tx)
             .await?;
         }
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tenant_invitations t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invite.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "tenant_invitations",
+            Some(invite.id),
+            None,
+            after,
+        )
+        .await?;
 
         tx.commit().await?;
         Ok(invite)

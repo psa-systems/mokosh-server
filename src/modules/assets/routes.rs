@@ -90,10 +90,13 @@ async fn create_asset_type(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertAssetTypeRequest>,
 ) -> AppResult<Json<AssetTypeResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_asset_type(u.tenant(), &req).await?))
+    Ok(Json(
+        s.service.create_asset_type(u.tenant(), &req, &ctx).await?,
+    ))
 }
 
 async fn update_asset_type(
@@ -136,10 +139,13 @@ async fn list_assets(
 async fn create_asset(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
+    ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<CreateAssetRequest>,
 ) -> AppResult<Json<AssetResponse>> {
     req.validate()?;
-    Ok(Json(s.service.create_asset(u.tenant(), u.id, &req).await?))
+    Ok(Json(
+        s.service.create_asset(u.tenant(), u.id, &req, &ctx).await?,
+    ))
 }
 
 async fn get_asset(
@@ -191,13 +197,14 @@ async fn list_asset_relationships(
 async fn create_asset_relationship(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateAssetRelationshipRequest>,
 ) -> AppResult<Json<AssetRelationshipResponse>> {
     req.validate()?;
     Ok(Json(
         s.service
-            .create_asset_relationship(u.tenant(), id, &req)
+            .create_asset_relationship(u.tenant(), id, &req, &ctx)
             .await?,
     ))
 }
@@ -243,13 +250,14 @@ async fn reveal_configuration_item(
 async fn create_configuration_item(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertConfigurationItemRequest>,
 ) -> AppResult<Json<ConfigurationItemResponse>> {
     req.validate()?;
     Ok(Json(
         s.service
-            .upsert_configuration_item(u.tenant(), id, &req)
+            .upsert_configuration_item(u.tenant(), id, &req, &ctx)
             .await?,
     ))
 }

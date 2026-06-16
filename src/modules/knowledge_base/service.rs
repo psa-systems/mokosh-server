@@ -4,6 +4,7 @@ use crate::modules::auth::TenantId;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -52,6 +53,7 @@ impl KbService {
         &self,
         tenant_id: TenantId,
         request: &UpsertKbCategoryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<KbCategoryResponse> {
         // Per-tenant unique slug (enforced at the app layer; the
         // `uq_kb_categories_tenant_slug` constraint is the DB backstop).
@@ -84,6 +86,24 @@ impl KbService {
         .bind(&request.visibility)
         .bind(request.sort_order)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM kb_categories t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "kb_categories",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         Ok(KbCategoryResponse {
@@ -247,6 +267,7 @@ impl KbService {
         tenant_id: TenantId,
         author_id: Uuid,
         request: &CreateKbArticleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<KbArticleResponse> {
         // Per-tenant unique slug (app-layer check; the
         // `uq_kb_articles_tenant_slug` constraint is the DB backstop).
@@ -301,6 +322,24 @@ impl KbService {
         .bind(&request.content)
         .bind(author_id)
         .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM kb_articles t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "kb_articles",
+            Some(id),
+            None,
+            after,
+        )
         .await?;
         tx.commit().await?;
         self.get_article_inner(tenant_id, id, false).await
