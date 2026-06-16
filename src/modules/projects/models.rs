@@ -81,6 +81,11 @@ pub struct ProjectResponse {
     pub billing_method: String,
     pub hourly_rate: Option<Decimal>,
     pub is_billable: bool,
+    /// PMS-345: per-project override of the tenant-wide standard due date
+    /// offset in business days. `None` inherits the tenant
+    /// `scheduling/default_due_business_days` setting; `Some(0)` disables the
+    /// default for tasks created in this project.
+    pub default_due_business_days: Option<i16>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -116,6 +121,11 @@ pub struct CreateProjectRequest {
     pub hourly_rate: Option<Decimal>,
     #[serde(default = "default_true")]
     pub is_billable: bool,
+    /// PMS-345: per-project override of the standard due date offset in
+    /// business days (0..=365, 0 disables). `None` inherits the tenant
+    /// `scheduling/default_due_business_days` setting.
+    #[validate(range(min = 0, max = 365))]
+    pub default_due_business_days: Option<i16>,
 }
 
 fn default_client() -> String {
@@ -151,6 +161,10 @@ pub struct UpdateProjectRequest {
     #[validate(custom(function = mokosh_types::validation::validate_rate))]
     pub hourly_rate: Option<Decimal>,
     pub is_billable: Option<bool>,
+    /// PMS-345: per-project override of the standard due date offset in
+    /// business days (0..=365, 0 disables). Omit to leave unchanged.
+    #[validate(range(min = 0, max = 365))]
+    pub default_due_business_days: Option<i16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
