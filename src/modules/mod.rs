@@ -12,6 +12,7 @@ pub mod contacts;
 pub mod contracts;
 pub mod invitations;
 pub mod knowledge_base;
+pub mod mileage_tracking;
 pub mod notifications;
 pub mod portal;
 pub mod projects;

@@ -69,6 +69,9 @@ pub enum InvoiceLineType {
     Service,
     Product,
     TimeEntry,
+    /// Transportation reimbursement line (PMS-315). Sourced from
+    /// `mileage_entries` by the invoice builder.
+    Mileage,
     Adjustment,
     Tax,
     Discount,
@@ -80,6 +83,7 @@ impl InvoiceLineType {
             Self::Service => "service",
             Self::Product => "product",
             Self::TimeEntry => "time_entry",
+            Self::Mileage => "mileage",
             Self::Adjustment => "adjustment",
             Self::Tax => "tax",
             Self::Discount => "discount",
@@ -91,6 +95,7 @@ impl InvoiceLineType {
             "service" => Some(Self::Service),
             "product" => Some(Self::Product),
             "time_entry" => Some(Self::TimeEntry),
+            "mileage" => Some(Self::Mileage),
             "adjustment" => Some(Self::Adjustment),
             "tax" => Some(Self::Tax),
             "discount" => Some(Self::Discount),
