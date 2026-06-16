@@ -479,22 +479,8 @@ fn cross_field_target(error: &validator::ValidationError) -> Option<String> {
 
 impl From<validator::ValidationErrors> for AppError {
     fn from(errors: validator::ValidationErrors) -> Self {
-        let field_errors: Vec<FieldError> = errors
-            .field_errors()
-            .iter()
-            .flat_map(|(field, errs)| {
-                errs.iter().map(move |e| {
-                    // Schema-level (cross-field) rules are keyed under
-                    // validator-crate's `__all__` bucket, which the client
-                    // cannot bind to a form field. When the rule recorded a
-                    // target field (see `validation::cross_field_error`),
-                    // re-key the error onto that field so the form renders it
-                    // inline instead of as a generic banner (PMS-364).
-                    let field = cross_field_target(e).unwrap_or_else(|| field.to_string());
-                    FieldError::new(field, humanize_field_error(e), e.code.to_string())
-                })
-            })
-            .collect();
+        let mut field_errors = Vec::new();
+        flatten_validation_errors(&errors, "", &mut field_errors);
 
         // The `Validation` Display already prefixes "Validation failed: ", so
         // the message here must not repeat it (PMS-298: the old "Validation
@@ -503,6 +489,63 @@ impl From<validator::ValidationErrors> for AppError {
             message: "one or more fields are invalid".to_string(),
             errors: field_errors,
         }
+    }
+}
+
+/// Recursively flatten a `validator::ValidationErrors` tree into a flat list of
+/// `FieldError`s. Nested struct/list errors produced by `#[validate(nested)]`
+/// land under `ValidationErrorsKind::Struct` / `::List`, which the old top-level
+/// `field_errors()` flatten silently dropped, so a 422 for a bad nested field
+/// (e.g. `address.country`) arrived with an empty `errors[]` (PMS-330). Each
+/// child field path is prefixed with the dotted (and `[index]`-suffixed for
+/// list elements) path accumulated in `prefix` so clients can map the error to
+/// the offending input. `prefix` is "" at the root.
+fn flatten_validation_errors(
+    errors: &validator::ValidationErrors,
+    prefix: &str,
+    out: &mut Vec<FieldError>,
+) {
+    for (field, kind) in errors.errors() {
+        match kind {
+            validator::ValidationErrorsKind::Field(errs) => {
+                for e in errs {
+                    // Schema-level (cross-field) rules are keyed under
+                    // validator-crate's `__all__` bucket, which the client
+                    // cannot bind to a form field. When the rule recorded a
+                    // target field (see `validation::cross_field_error`),
+                    // re-key the error onto that field so the form renders it
+                    // inline instead of as a generic banner (PMS-364).
+                    let target = cross_field_target(e).unwrap_or_else(|| field.to_string());
+                    let path = join_field_path(prefix, &target);
+                    out.push(FieldError::new(
+                        path,
+                        humanize_field_error(e),
+                        e.code.to_string(),
+                    ));
+                }
+            }
+            validator::ValidationErrorsKind::Struct(nested) => {
+                let path = join_field_path(prefix, field);
+                flatten_validation_errors(nested, &path, out);
+            }
+            validator::ValidationErrorsKind::List(items) => {
+                let base = join_field_path(prefix, field);
+                for (index, nested) in items {
+                    let path = format!("{base}[{index}]");
+                    flatten_validation_errors(nested, &path, out);
+                }
+            }
+        }
+    }
+}
+
+/// Join a dotted field path. Returns `field` unchanged at the root (empty
+/// `prefix`), otherwise `prefix.field`.
+fn join_field_path(prefix: &str, field: &str) -> String {
+    if prefix.is_empty() {
+        field.to_string()
+    } else {
+        format!("{prefix}.{field}")
     }
 }
 
@@ -726,6 +769,71 @@ mod tests {
             AppError::Validation { errors, .. } => {
                 assert_eq!(errors.len(), 1);
                 assert_eq!(errors[0].field, "name");
+            }
+            other => panic!("Expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_validation_errors_surface_with_dotted_path() {
+        // PMS-330: a `#[validate(nested)]` struct field lands under
+        // `ValidationErrorsKind::Struct`, which the old top-level flatten
+        // dropped (empty `errors[]`). The recursion must surface each offending
+        // nested field with a dotted path, while a `#[validate(nested)]` list
+        // field uses an `[index]`-suffixed path.
+        use validator::Validate;
+
+        #[derive(Validate)]
+        struct Address {
+            #[validate(length(max = 2))]
+            country: String,
+            #[validate(length(max = 5))]
+            postal_code: String,
+        }
+
+        #[derive(Validate)]
+        struct Company {
+            #[validate(length(max = 3))]
+            name: String,
+            #[validate(nested)]
+            address: Address,
+            #[validate(nested)]
+            sites: Vec<Address>,
+        }
+
+        let errs = Company {
+            name: "ok".to_string(),
+            address: Address {
+                country: "USA".to_string(),
+                postal_code: "way-too-long".to_string(),
+            },
+            sites: vec![Address {
+                country: "ok".to_string(),
+                postal_code: "also-too-long".to_string(),
+            }],
+        }
+        .validate()
+        .unwrap_err();
+
+        match AppError::from(errs) {
+            AppError::Validation { errors, .. } => {
+                let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+                assert!(
+                    fields.contains(&"address.country"),
+                    "missing dotted nested path: {fields:?}"
+                );
+                assert!(
+                    fields.contains(&"address.postal_code"),
+                    "missing dotted nested path: {fields:?}"
+                );
+                assert!(
+                    fields.contains(&"sites[0].postal_code"),
+                    "missing indexed list path: {fields:?}"
+                );
+                // Nested messages are populated, not empty.
+                for e in &errors {
+                    assert!(!e.message.is_empty(), "empty nested message: {:?}", e.field);
+                }
             }
             other => panic!("Expected Validation error, got {other:?}"),
         }
