@@ -279,6 +279,114 @@ async fn ticket_history_records_description_edit(pool: PgPool) {
     );
 }
 
+/// PMS-370 (PMS-359 follow-up): a Status edit via the inline editor must show
+/// up in the change history with the humanised field name `status`, not the
+/// raw column `status_id`. The SPA capitalises for display, so a leaked `_id`
+/// suffix renders as `Updated: Status id`; stripping it server-side at the
+/// history read boundary gives `Updated: Status`. The stored audit row is
+/// unaffected; only the rendered field label is cleaned up.
+#[sqlx::test]
+async fn ticket_history_humanises_status_id_field(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Printer jammed",
+            "company_id": company_id,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket")
+        .json()
+        .await
+        .expect("create ticket JSON");
+    let ticket_id = created["id"].as_str().expect("ticket id").to_string();
+
+    // A second status to switch the ticket to (distinct from the seeded default).
+    let new_status: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets/statuses"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Escalated",
+            "color": "#ff0000",
+            "is_closed": false,
+            "sort_order": 99,
+        }))
+        .send()
+        .await
+        .expect("create status")
+        .json()
+        .await
+        .expect("create status JSON");
+    let new_status_id = new_status["id"].as_str().expect("status id").to_string();
+
+    // Inline-editor Status change.
+    let update_status = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "status_id": new_status_id }))
+        .send()
+        .await
+        .expect("update ticket status")
+        .status();
+    assert!(update_status.is_success(), "PUT status_id should 2xx");
+
+    let hist: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/audit-log/entity/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get ticket history")
+        .json()
+        .await
+        .expect("history JSON");
+    let entries = hist["data"].as_array().expect("history has data");
+    let edit = entries
+        .iter()
+        .find(|e| {
+            e["action"].as_str() == Some("update")
+                && e["changed_fields"]
+                    .as_array()
+                    .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("status")))
+        })
+        .expect("history must surface the status edit under the humanised field `status`");
+
+    // The raw column name must NOT leak into the rendered field labels.
+    assert!(
+        edit["changed_fields"]
+            .as_array()
+            .expect("changed_fields array")
+            .iter()
+            .all(|v| v.as_str() != Some("status_id")),
+        "changed_fields must not carry the raw column `status_id`"
+    );
+    let status_change = edit["changes"]
+        .as_array()
+        .expect("entry has a changes array")
+        .iter()
+        .find(|c| c["field"].as_str() == Some("status"))
+        .expect("changes must include the humanised `status` field");
+    assert_eq!(
+        status_change["field"].as_str(),
+        Some("status"),
+        "change field must be the humanised `status`, not `status_id`"
+    );
+    assert!(
+        edit["timestamp"].as_str().is_some(),
+        "history entry must carry a timestamp"
+    );
+}
+
 // ============================================================================
 // PMS-321: ticket lookup management CRUD (statuses, priorities, types,
 // queues, categories).
