@@ -560,7 +560,7 @@ impl ContractsService {
             .await?;
 
         let rows = sqlx::query_as::<_, RateCardRow>(
-            r#"SELECT id, name, description, is_default
+            r#"SELECT id, name, description, is_default, default_per_mile_rate
                FROM rate_cards WHERE tenant_id = $1
                ORDER BY is_default DESC, name
                LIMIT $2 OFFSET $3"#,
@@ -581,7 +581,7 @@ impl ContractsService {
     ) -> AppResult<RateCardResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, RateCardRow>(
-            r#"SELECT id, name, description, is_default
+            r#"SELECT id, name, description, is_default, default_per_mile_rate
                FROM rate_cards WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
@@ -608,14 +608,15 @@ impl ContractsService {
         }
         let id = Uuid::new_v4();
         sqlx::query(
-            r#"INSERT INTO rate_cards (id, tenant_id, name, description, is_default)
-               VALUES ($1, $2, $3, $4, $5)"#,
+            r#"INSERT INTO rate_cards (id, tenant_id, name, description, is_default, default_per_mile_rate)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
         )
         .bind(id)
         .bind(tenant_id)
         .bind(&request.name)
         .bind(&request.description)
         .bind(request.is_default)
+        .bind(request.default_per_mile_rate)
         .execute(&mut *tx)
         .await?;
 
@@ -645,6 +646,7 @@ impl ContractsService {
             name: request.name.clone(),
             description: request.description.clone(),
             is_default: request.is_default,
+            default_per_mile_rate: request.default_per_mile_rate,
         })
     }
 
@@ -676,11 +678,19 @@ impl ContractsService {
             .await?;
         }
         let n = sqlx::query(
-            r#"UPDATE rate_cards SET name = $3, description = $4, is_default = $5, updated_at = NOW()
+            r#"UPDATE rate_cards SET name = $3, description = $4, is_default = $5,
+                   default_per_mile_rate = $6, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
-        .bind(tenant_id).bind(id).bind(&request.name).bind(&request.description).bind(request.is_default)
-        .execute(&mut *tx).await?.rows_affected();
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(request.is_default)
+        .bind(request.default_per_mile_rate)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("RateCard".to_string()));
         }
@@ -708,6 +718,7 @@ impl ContractsService {
             name: request.name.clone(),
             description: request.description.clone(),
             is_default: request.is_default,
+            default_per_mile_rate: request.default_per_mile_rate,
         })
     }
 
@@ -1574,6 +1585,7 @@ struct RateCardRow {
     name: String,
     description: Option<String>,
     is_default: Option<bool>,
+    default_per_mile_rate: Option<Decimal>,
 }
 
 impl From<RateCardRow> for RateCardResponse {
@@ -1583,6 +1595,7 @@ impl From<RateCardRow> for RateCardResponse {
             name: r.name,
             description: r.description,
             is_default: r.is_default.unwrap_or(false),
+            default_per_mile_rate: r.default_per_mile_rate,
         }
     }
 }

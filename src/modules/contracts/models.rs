@@ -165,6 +165,9 @@ pub struct RateCardResponse {
     pub name: String,
     pub description: Option<String>,
     pub is_default: bool,
+    /// PMS-315: default per-mile reimbursement rate. A mileage entry with no
+    /// explicit `rate_per_mile` inherits this from the tenant's default card.
+    pub default_per_mile_rate: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -174,6 +177,8 @@ pub struct UpsertRateCardRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub is_default: bool,
+    /// PMS-315: default per-mile reimbursement rate (NULL = unset).
+    pub default_per_mile_rate: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize)]

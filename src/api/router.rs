@@ -25,6 +25,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
+use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
@@ -105,6 +106,7 @@ pub fn create_api_router(
     ));
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
     let time_tracking_service = TimeTrackingService::new(db.clone());
+    let mileage_tracking_service = MileageTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
     // Wired with the notifications dispatcher so the appointment-reminder
     // worker (registered in main.rs) fans out `appointment.reminder`
@@ -208,6 +210,9 @@ pub fn create_api_router(
         // Time tracking: time-entries, timesheets, timers, rounding,
         // work-types. PMS-43.
         .merge(time_tracking_routes(time_tracking_service))
+        // Mileage tracking: mileage-entries CRUD (Log Time "Mileage" mode).
+        // Gated by the time-tracking module. PMS-315.
+        .merge(mileage_tracking_routes(mileage_tracking_service))
         // Projects: projects + phases + task statuses + tasks +
         // dependencies. PMS-52.
         .merge(projects_routes(projects_service))
