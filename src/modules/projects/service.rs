@@ -717,6 +717,19 @@ impl ProjectsService {
         request: &CreateTaskRequest,
     ) -> AppResult<TaskResponse> {
         let id = Uuid::new_v4();
+        // PMS-345: when no due date is given, fall back to the tenant-wide
+        // standard due date (today + N business days; N = 0 disables it).
+        let due_date = match request.due_date {
+            Some(d) => Some(d),
+            None => {
+                let n =
+                    crate::modules::settings::read_default_due_business_days(&self.db, tenant_id)
+                        .await?;
+                (n > 0).then(|| {
+                    crate::utils::datetime::add_business_days(chrono::Utc::now().date_naive(), n)
+                })
+            }
+        };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO tasks (id, tenant_id, project_id, phase_id, parent_task_id, title,
@@ -736,7 +749,7 @@ impl ProjectsService {
         .bind(request.assigned_to_id)
         .bind(request.estimated_hours)
         .bind(request.start_date)
-        .bind(request.due_date)
+        .bind(due_date)
         .bind(request.sort_order)
         .execute(&mut *tx)
         .await?;

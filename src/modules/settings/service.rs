@@ -312,3 +312,23 @@ impl From<ModCfgRow> for ModuleConfigResponse {
         }
     }
 }
+
+/// Read the tenant-wide standard-due-date offset in business days
+/// (`scheduling/default_due_business_days`), or `0` when unset (PMS-345). `0`
+/// means "no default due date". Free function so the projects and tickets
+/// services can apply the default without taking a dependency on
+/// `SettingsService`.
+pub async fn read_default_due_business_days(db: &Database, tenant_id: TenantId) -> AppResult<u32> {
+    let mut tx = db.begin_with_tenant(tenant_id).await?;
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'scheduling' AND key = 'default_due_business_days'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(365) as u32)
+        .unwrap_or(0))
+}
