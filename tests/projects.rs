@@ -1107,3 +1107,120 @@ async fn project_input_validation(pool: PgPool) {
     .await;
     assert!(nulled.status().is_success(), "null budget should 2xx");
 }
+
+// ============================================================================
+// PMS-316: oversized-budget rejection + company display-text safety.
+//
+// The budget fields back onto DECIMAL(12, 2) (amount) and DECIMAL(10, 2)
+// (hours). Before the budget range check, an extreme value reached Postgres
+// and surfaced as a 500 numeric-overflow (amount) / a raw deserialization 422
+// (hours) instead of a controlled, field-level validation error. This pins the
+// in-range maxima as accepted and the just-over-the-limit values as a clean
+// 422 on the create path. Separately, a company is selected by typed `Uuid`
+// (`company_id`), so a raw display string can never reach the query: a
+// SQL-injection-shaped value is rejected at extraction and the companies table
+// is left intact.
+// ============================================================================
+
+#[sqlx::test]
+async fn project_oversized_budget_and_safe_company_id(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Oversize Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // --- Largest in-range budgets create cleanly (column maxima) ---
+    let at_max = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "At column maxima",
+            "company_id": company,
+            "budget_amount": "9999999999.99",
+            "budget_hours": "99999999.99",
+        }),
+    )
+    .await;
+    assert!(
+        at_max.status().is_success(),
+        "budgets at the DECIMAL column maxima must 2xx, got {}",
+        at_max.status()
+    );
+
+    // --- Oversized budget_amount: a clean 422, never a 500 overflow ---
+    let big_amount = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Oversize amount",
+            "company_id": company,
+            "budget_amount": 10_000_000_000_i64,
+            "budget_hours": "100",
+        }),
+    )
+    .await;
+    assert_eq!(
+        big_amount.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "budget_amount above the DECIMAL(12, 2) limit must 422, not 500"
+    );
+
+    // --- Oversized budget_hours: a clean 422, never a 500 overflow ---
+    let big_hours = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Oversize hours",
+            "company_id": company,
+            "budget_amount": "10000",
+            "budget_hours": 100_000_000_i64,
+        }),
+    )
+    .await;
+    assert_eq!(
+        big_hours.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "budget_hours above the DECIMAL(10, 2) limit must 422, not 500"
+    );
+
+    // --- Company selection is by typed id, never by raw display text ---
+    // A SQL-injection-shaped company value cannot deserialize into the
+    // `Option<Uuid>` field, so it is rejected at request extraction and never
+    // reaches the parameterized query.
+    let injected = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Injection attempt",
+            "company_id": "ZQA'); DROP TABLE companies;--",
+        }),
+    )
+    .await;
+    assert_eq!(
+        injected.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a non-UUID company_id must 422 (typed id), never reaching the query"
+    );
+
+    // The companies table is intact: a normal create against the real,
+    // typed company id still succeeds after the injection attempt.
+    let after_injection = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Post-injection create",
+            "company_id": company,
+        }),
+    )
+    .await;
+    assert!(
+        after_injection.status().is_success(),
+        "create with a valid company_id must still 2xx after the injection attempt, got {}",
+        after_injection.status()
+    );
+}
