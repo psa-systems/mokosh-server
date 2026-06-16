@@ -622,14 +622,27 @@ async fn projects_report_aggregates(pool: PgPool) {
         .await
         .expect("projects JSON");
 
-    let active = rep["by_status"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|b| b["label"] == "active")
-        .and_then(|b| b["count"].as_i64())
-        .unwrap_or(0);
-    assert_eq!(active, 1, "one active project");
+    let by_status = rep["by_status"].as_array().unwrap();
+    let count_for = |label: &str| -> i64 {
+        by_status
+            .iter()
+            .find(|b| b["label"] == label)
+            .and_then(|b| b["count"].as_i64())
+            .unwrap_or(0)
+    };
+    assert_eq!(count_for("active"), 1, "one active project");
+    assert_eq!(count_for("planning"), 1, "one planning project");
+    // PMS-366: every canonical state is countable even at zero, so a tenant
+    // with no Cancelled/On-Hold/Completed projects still renders those tiles.
+    for state in ["planning", "active", "on_hold", "completed", "cancelled"] {
+        assert!(
+            by_status.iter().any(|b| b["label"] == state),
+            "by_status always includes the '{state}' bucket"
+        );
+    }
+    // Buckets sum to the total project rows (2 seeded here).
+    let sum: i64 = by_status.iter().filter_map(|b| b["count"].as_i64()).sum();
+    assert_eq!(sum, 2, "status buckets sum to total project rows");
     assert!(
         (dec(&rep["budget_hours"]) - 15.0).abs() < 0.01,
         "budget hours sum 10 + 5"
@@ -741,6 +754,20 @@ async fn clients_report_aggregates(pool: PgPool) {
         .filter_map(|b| b["count"].as_i64())
         .sum();
     assert_eq!(by_type, 2, "assets_by_type sums to all assets");
+    // PMS-366: every canonical asset state is countable even at zero, and the
+    // buckets still sum to the asset total.
+    let assets_by_status = rep["assets_by_status"].as_array().unwrap();
+    for state in ["active", "inactive", "retired", "in_repair", "in_stock"] {
+        assert!(
+            assets_by_status.iter().any(|b| b["label"] == state),
+            "assets_by_status always includes the '{state}' bucket"
+        );
+    }
+    let by_status_sum: i64 = assets_by_status
+        .iter()
+        .filter_map(|b| b["count"].as_i64())
+        .sum();
+    assert_eq!(by_status_sum, 2, "assets_by_status sums to all assets");
     assert_eq!(
         rep["warranty_expiring_90d"].as_i64().unwrap(),
         1,
