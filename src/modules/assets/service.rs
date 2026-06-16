@@ -155,6 +155,15 @@ impl AssetsService {
             conditions.push(format!("status = ${idx}"));
             idx += 1;
         }
+        // PMS-344 follow-up: free-text name match for the AssetPicker.
+        // ILIKE on name, mirroring CompanyFilter / TicketFilter free-text
+        // search; without this the picker's `?q=...` was silently
+        // dropped, so the dropdown listed every asset regardless of
+        // typed text.
+        if filter.q.is_some() {
+            conditions.push(format!("name ILIKE ${idx}"));
+            idx += 1;
+        }
         let where_clause = conditions.join(" AND ");
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -168,6 +177,10 @@ impl AssetsService {
         }
         if let Some(v) = &filter.status {
             cq = cq.bind(v);
+        }
+        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+        if let Some(p) = &q_pattern {
+            cq = cq.bind(p);
         }
         let total: i64 = cq.fetch_one(&mut *tx).await?;
 
@@ -189,6 +202,9 @@ impl AssetsService {
         }
         if let Some(v) = &filter.status {
             q = q.bind(v);
+        }
+        if let Some(p) = &q_pattern {
+            q = q.bind(p);
         }
         q = q
             .bind(pagination.limit() as i64)

@@ -30,3 +30,27 @@ pub mod time_tracking;
 pub(crate) fn default_true() -> bool {
     true
 }
+
+/// PMS-344 follow-up: distinguish "field absent" from "field present
+/// with null value" on an `Option<T>` request field. Pair it with
+/// `#[serde(default, deserialize_with = "crate::deserialize_double_option")]`
+/// and a field of type `Option<Option<T>>`:
+///
+/// - field absent in body -> `None` (leave unchanged in the service)
+/// - `"field": null`       -> `Some(None)` (clear to SQL NULL)
+/// - `"field": <value>`    -> `Some(Some(value))` (set to value)
+///
+/// Without this, serde maps both an absent field and an explicit `null`
+/// to plain `None`, so a PUT body `{"asset_id": null}` is
+/// indistinguishable from `{}` and the inline-edit "Unassign" UI can't
+/// communicate "clear this FK". The first consumer is the asset_id
+/// field on UpdateTicketRequest; future PATCH-style nullable FKs should
+/// follow the same pattern.
+pub fn deserialize_double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::de::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Option::<T>::deserialize(de).map(Some)
+}

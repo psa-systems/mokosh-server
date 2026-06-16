@@ -402,7 +402,13 @@ pub struct UpdateTicketRequest {
     pub estimated_hours: Option<f64>,
     pub is_billable: Option<bool>,
     pub billing_status: Option<BillingStatus>,
-    pub asset_id: Option<Uuid>,
+    /// PMS-344 follow-up: nullable FK with PATCH-style clearing semantics.
+    /// `#[serde(default, deserialize_with = "...")]` so the field can
+    /// be absent (leave unchanged), present-as-null (clear to NULL), or
+    /// present-as-uuid (set to value). Without this, an Unassign click
+    /// in the SPA cannot tell the server to drop the association.
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub asset_id: Option<Option<Uuid>>,
     pub custom_fields: Option<serde_json::Value>,
     pub tags: Option<Vec<String>>,
 }
