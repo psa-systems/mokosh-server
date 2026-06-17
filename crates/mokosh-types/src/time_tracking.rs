@@ -136,8 +136,10 @@ pub struct CreateTimeEntryRequest {
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
     /// Either supply (start, end) and let the service compute the
-    /// minutes, or supply `duration_minutes` directly.
-    #[validate(range(min = 1))]
+    /// minutes, or supply `duration_minutes` directly. Capped at 1440
+    /// (24h) so a single entry can never alone exceed a day, regardless
+    /// of the per-tenant day cap (PMS-396).
+    #[validate(range(min = 1, max = 1440))]
     pub duration_minutes: Option<i32>,
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
@@ -163,7 +165,9 @@ pub struct UpdateTimeEntryRequest {
     pub date: Option<NaiveDate>,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
-    #[validate(range(min = 1))]
+    /// Capped at 1440 (24h); a single entry can never alone exceed a day
+    /// regardless of the per-tenant day cap (PMS-396).
+    #[validate(range(min = 1, max = 1440))]
     pub duration_minutes: Option<i32>,
     pub work_type_id: Option<Uuid>,
     pub ticket_id: Option<Uuid>,

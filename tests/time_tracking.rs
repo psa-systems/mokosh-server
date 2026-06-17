@@ -321,9 +321,11 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
 
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
+use mokosh_server::modules::settings::SettingsService;
 use mokosh_server::modules::time_tracking::{
     CreateTimeEntryRequest, TimeTrackingService, UpdateTimeEntryRequest,
 };
+use mokosh_server::utils::error::AppError;
 use mokosh_server::Database;
 
 // PMS-318 sweep: create_time_entry now writes a Create audit row, so the
@@ -368,6 +370,49 @@ fn create_req(
         notes: Some("initial".to_string()),
         work_category: None,
         is_billable: true,
+        hourly_rate: None,
+    }
+}
+
+/// Build a create request for the default tenant on a given date with an
+/// explicit duration in minutes (PMS-396 day-cap tests).
+fn create_minutes(
+    user_id: Uuid,
+    work_type_id: Uuid,
+    company_id: Uuid,
+    date: chrono::NaiveDate,
+    minutes: i32,
+) -> CreateTimeEntryRequest {
+    CreateTimeEntryRequest {
+        user_id,
+        date,
+        start_time: None,
+        end_time: None,
+        duration_minutes: Some(minutes),
+        work_type_id,
+        ticket_id: None,
+        project_id: None,
+        task_id: None,
+        company_id,
+        notes: None,
+        is_billable: true,
+        hourly_rate: None,
+    }
+}
+
+/// An update that sets only `duration_minutes`, omitting every other field.
+fn duration_only_update(minutes: i32) -> UpdateTimeEntryRequest {
+    UpdateTimeEntryRequest {
+        date: None,
+        start_time: None,
+        end_time: None,
+        duration_minutes: Some(minutes),
+        work_type_id: None,
+        ticket_id: None,
+        project_id: None,
+        task_id: None,
+        notes: None,
+        is_billable: None,
         hourly_rate: None,
     }
 }
@@ -599,6 +644,157 @@ async fn non_owner_cannot_edit_or_delete_time_entry(pool: PgPool) {
         admin_delete.status().is_success(),
         "an admin can delete any entry, got {}",
         admin_delete.status()
+    );
+}
+
+// ============================================================================
+// PMS-396: per-tenant max-hours-per-day cap on a user's day total.
+// ============================================================================
+
+/// AC6: two entries totaling under the default 24h cap both succeed; a third
+/// that would cross the cap is rejected with a BadRequest naming the cap and
+/// the remaining minutes.
+#[sqlx::test]
+async fn create_rejects_day_total_over_default_cap(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+
+    // 10h + 10h = 20h, comfortably under the default 24h cap.
+    svc.create_time_entry(
+        tenant,
+        &create_minutes(user_id, work_type_id, company_id, date, 10 * 60),
+        &actx(),
+    )
+    .await
+    .expect("first 10h entry under cap");
+    svc.create_time_entry(
+        tenant,
+        &create_minutes(user_id, work_type_id, company_id, date, 10 * 60),
+        &actx(),
+    )
+    .await
+    .expect("second 10h entry under cap");
+
+    // A third 10h entry would reach 30h > 24h cap: rejected.
+    let err = svc
+        .create_time_entry(
+            tenant,
+            &create_minutes(user_id, work_type_id, company_id, date, 10 * 60),
+            &actx(),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        AppError::BadRequest(msg) => {
+            assert!(msg.contains("24h/day"), "error names the 24h cap: {msg}");
+            assert!(
+                msg.contains("240 minutes for the day"),
+                "error names the remaining minutes (1440 - 1200): {msg}"
+            );
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+/// AC7: with the setting at 18, a day total reaching 19h is rejected while 18h
+/// is allowed; the configured cap overrides the 24h default.
+#[sqlx::test]
+async fn create_honors_configured_lower_cap(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let db = Database::from_pool(pool.clone());
+    let svc = TimeTrackingService::new(db.clone());
+    let settings = SettingsService::new(db);
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+
+    settings
+        .put_setting(
+            tenant,
+            "time_tracking",
+            "max_hours_per_day",
+            serde_json::json!(18),
+        )
+        .await
+        .expect("set the day cap to 18 hours");
+
+    // 17h is under the 18h cap.
+    svc.create_time_entry(
+        tenant,
+        &create_minutes(user_id, work_type_id, company_id, date, 17 * 60),
+        &actx(),
+    )
+    .await
+    .expect("17h under the 18h cap");
+
+    // A further 2h would reach 19h > 18h cap: rejected.
+    let err = svc
+        .create_time_entry(
+            tenant,
+            &create_minutes(user_id, work_type_id, company_id, date, 2 * 60),
+            &actx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AppError::BadRequest(_)),
+        "19h total against an 18h cap must be BadRequest, got {err:?}"
+    );
+}
+
+/// AC4: update enforces the cap against the day, excluding the row being edited
+/// from the sum (so an in-place grow is measured against peers, not itself) and
+/// rejects an edit that would push the target day over the cap.
+#[sqlx::test]
+async fn update_enforces_day_cap_excluding_self(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+
+    // Entry A starts at 10h.
+    let a = svc
+        .create_time_entry(
+            tenant,
+            &create_minutes(user_id, work_type_id, company_id, date, 10 * 60),
+            &actx(),
+        )
+        .await
+        .expect("entry A");
+
+    // Grow A to 20h: excluding A itself the day holds 0h, so 20h <= 24h is OK.
+    // Were A double-counted (10h + 20h = 30h) this would be wrongly rejected.
+    let grown = svc
+        .update_time_entry(tenant, a.id, &duration_only_update(20 * 60))
+        .await
+        .expect("grow A to 20h excluding self");
+    assert_eq!(grown.duration_minutes, 20 * 60);
+
+    // Entry B of 4h reaches exactly 24h (20h + 4h): allowed.
+    let b = svc
+        .create_time_entry(
+            tenant,
+            &create_minutes(user_id, work_type_id, company_id, date, 4 * 60),
+            &actx(),
+        )
+        .await
+        .expect("entry B to exactly the cap");
+
+    // Growing B to 5h would push the day to 25h > 24h: rejected.
+    let err = svc
+        .update_time_entry(tenant, b.id, &duration_only_update(5 * 60))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AppError::BadRequest(_)),
+        "updating B over the cap must be BadRequest, got {err:?}"
     );
 }
 
