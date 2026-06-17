@@ -6,11 +6,11 @@ compose_file := "compose.dev.yml"
 default:
     @just --list
 
-# Create .env from .env.dev if missing
+# Create .env from the committed .env.example if missing
 [private]
 [group: 'hooks']
 ensure-env:
-    @test -f .env || cp .env.dev .env
+    @test -f .env || cp .env.example .env
 
 # Bring up the dev stack (mokosh-server + Postgres + Valkey (no Infisical — use just dev-infisical)). Trailing args go to `docker compose up` (e.g. --detach).
 [doc("Start the dev stack in Docker. Trailing args go to `docker compose up` (e.g. --detach).")]
