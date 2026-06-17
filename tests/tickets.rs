@@ -1022,3 +1022,134 @@ async fn create_ticket_round_trips_every_priority(pool: PgPool) {
         );
     }
 }
+
+/// PMS-406: the `team_id` ticket filter actually filters, a "my teams" scope
+/// returns the union of the caller's teams, and a cross-tenant `team_id` is
+/// rejected rather than leaking another tenant's (or team's) tickets.
+///
+/// The IT / HR / service-vendor split is modeled as distinct `teams` rows, so
+/// the test seeds two teams in the caller's tenant, makes the caller a member
+/// of both, and tags three tickets: one IT, one HR, one teamless. Team
+/// assignment is done with a direct `UPDATE` because the create-DTO path is
+/// covered elsewhere and here we only need rows carrying a specific `team_id`.
+#[sqlx::test]
+async fn ticket_team_scope_filter(pool: sqlx::PgPool) {
+    use uuid::Uuid;
+
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+
+    // Two teams in the caller's tenant; the caller is a member of both.
+    let it_team = Uuid::new_v4();
+    let hr_team = Uuid::new_v4();
+    for (id, name) in [(it_team, "IT"), (hr_team, "HR")] {
+        sqlx::query("INSERT INTO teams (id, tenant_id, name) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(common::DEFAULT_TENANT_ID)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("seed team");
+        sqlx::query("INSERT INTO team_members (tenant_id, team_id, user_id) VALUES ($1, $2, $3)")
+            .bind(common::DEFAULT_TENANT_ID)
+            .bind(id)
+            .bind(admin_id)
+            .execute(&pool)
+            .await
+            .expect("seed team member");
+    }
+
+    // A team in a DIFFERENT tenant, to prove cross-tenant rejection.
+    let (other_tenant, _ou, _oe, _op) = common::seed_tenant_with_admin(&pool, "pms406-other").await;
+    let foreign_team = Uuid::new_v4();
+    sqlx::query("INSERT INTO teams (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(foreign_team)
+        .bind(other_tenant)
+        .bind("Foreign")
+        .execute(&pool)
+        .await
+        .expect("seed foreign team");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Create three tickets, then tag teams via SQL: 0 -> IT, 1 -> HR, 2 -> none.
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let body = serde_json::json!({
+            "title": format!("Team ticket {n}"),
+            "company_id": company_id,
+            "custom_fields": {},
+        });
+        let resp = app
+            .client
+            .post(app.url("/api/v1/tickets"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("create ticket");
+        assert!(resp.status().is_success(), "create ticket should 2xx");
+        let v: serde_json::Value = resp.json().await.expect("create JSON");
+        ids.push(v["id"].as_str().expect("ticket id").to_string());
+    }
+    for (idx, team) in [(0usize, it_team), (1usize, hr_team)] {
+        sqlx::query("UPDATE tickets SET team_id = $1 WHERE id = $2::uuid")
+            .bind(team)
+            .bind(&ids[idx])
+            .execute(&pool)
+            .await
+            .expect("tag ticket team");
+    }
+
+    // Helper: GET the list with a query string, return the id set.
+    let list_ids = |query: String| {
+        let app = &app;
+        let token = &token;
+        async move {
+            let resp = app
+                .client
+                .get(app.url(&format!("/api/v1/tickets?{query}")))
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("list tickets");
+            (
+                resp.status(),
+                resp.json::<serde_json::Value>().await.expect("list JSON"),
+            )
+        }
+    };
+
+    // team_id filter: only the IT-tagged ticket comes back.
+    let (status, body) = list_ids(format!("team_id={it_team}")).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let data = body["data"].as_array().expect("data array");
+    let got: Vec<&str> = data.iter().filter_map(|t| t["id"].as_str()).collect();
+    assert_eq!(
+        got,
+        vec![ids[0].as_str()],
+        "team_id filter must return only the IT-team ticket, got {got:?}"
+    );
+
+    // my_teams scope: the caller belongs to IT and HR, so the union of both
+    // tagged tickets comes back, but never the teamless ticket.
+    let (status, body) = list_ids("my_teams=true".to_string()).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let data = body["data"].as_array().expect("data array");
+    let mut got: Vec<&str> = data.iter().filter_map(|t| t["id"].as_str()).collect();
+    got.sort_unstable();
+    let mut want = vec![ids[0].as_str(), ids[1].as_str()];
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "my_teams must return the union of the caller's IT + HR tickets, got {got:?}"
+    );
+
+    // Cross-tenant team_id: rejected (4xx), never another tenant's data.
+    let (status, _body) = list_ids(format!("team_id={foreign_team}")).await;
+    assert!(
+        status.is_client_error(),
+        "a team_id outside the caller's tenant must be rejected, got {status}"
+    );
+}
