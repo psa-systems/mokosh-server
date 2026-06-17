@@ -142,6 +142,77 @@ impl NotificationsService {
         })
     }
 
+    /// Full replacement (PUT) of an existing channel. All columns are
+    /// overwritten from `request`; `config` is re-encrypted under the
+    /// data key. Missing row -> 404. The mutation and its audit row share
+    /// one transaction (before/after snapshots), matching the create path.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_channel(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertNotificationChannelRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<NotificationChannelResponse> {
+        let plain = serde_json::to_string(&request.config)
+            .map_err(|e| AppError::BadRequest(format!("config serialise: {e}")))?;
+        let encrypted = crate::utils::crypto::encrypt(&plain, &self.encryption_key)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_channels t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let n = sqlx::query(
+            r#"UPDATE notification_channels SET
+                channel_type = $3, name = $4, config_encrypted = $5,
+                is_active = $6, is_default = $7, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.channel_type)
+        .bind(&request.name)
+        .bind(&encrypted)
+        .bind(request.is_active)
+        .bind(request.is_default)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("NotificationChannel".to_string()));
+        }
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_channels t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "notification_channels",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(NotificationChannelResponse {
+            id,
+            channel_type: request.channel_type.clone(),
+            name: request.name.clone(),
+            config: request.config.clone(),
+            is_active: request.is_active,
+            is_default: request.is_default,
+        })
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_channel(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -219,6 +290,77 @@ impl NotificationsService {
             "notification_templates",
             Some(id),
             None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(NotificationTemplateResponse {
+            id,
+            name: request.name.clone(),
+            event_type: request.event_type.clone(),
+            channel_type: request.channel_type.clone(),
+            subject: request.subject.clone(),
+            body_text: request.body_text.clone(),
+            body_html: request.body_html.clone(),
+            is_active: request.is_active,
+        })
+    }
+
+    /// Full replacement (PUT) of an existing template. All columns are
+    /// overwritten from `request`. Missing row -> 404. Mutation + audit
+    /// row share one transaction (before/after snapshots).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_template(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertNotificationTemplateRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<NotificationTemplateResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_templates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let n = sqlx::query(
+            r#"UPDATE notification_templates SET
+                name = $3, event_type = $4, channel_type = $5, subject = $6,
+                body_text = $7, body_html = $8, is_active = $9, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.event_type)
+        .bind(&request.channel_type)
+        .bind(&request.subject)
+        .bind(&request.body_text)
+        .bind(&request.body_html)
+        .bind(request.is_active)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("NotificationTemplate".to_string()));
+        }
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_templates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "notification_templates",
+            Some(id),
+            before,
             after,
         )
         .await?;
@@ -442,6 +584,77 @@ impl NotificationsService {
             "notification_rules",
             Some(id),
             None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(NotificationRuleResponse {
+            id,
+            name: request.name.clone(),
+            event_type: request.event_type.clone(),
+            conditions: request.conditions.clone(),
+            channels: request.channels.clone(),
+            recipients: request.recipients.clone(),
+            template_id: request.template_id,
+            is_active: request.is_active,
+        })
+    }
+
+    /// Full replacement (PUT) of an existing rule. All columns are
+    /// overwritten from `request`. Missing row -> 404. Mutation + audit
+    /// row share one transaction (before/after snapshots).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_rule(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertNotificationRuleRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<NotificationRuleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_rules t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let n = sqlx::query(
+            r#"UPDATE notification_rules SET
+                name = $3, event_type = $4, conditions = $5, channels = $6,
+                recipients = $7, template_id = $8, is_active = $9, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.event_type)
+        .bind(&request.conditions)
+        .bind(&request.channels)
+        .bind(&request.recipients)
+        .bind(request.template_id)
+        .bind(request.is_active)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("NotificationRule".to_string()));
+        }
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM notification_rules t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "notification_rules",
+            Some(id),
+            before,
             after,
         )
         .await?;
