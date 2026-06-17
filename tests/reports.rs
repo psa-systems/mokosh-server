@@ -69,6 +69,59 @@ async fn seed_open_ticket(
     .expect("seed open ticket");
 }
 
+/// Seed an open ticket with an explicit `created_at` instant. Same lookup
+/// strategy as [`seed_open_ticket`]; used to plant a ticket at a UTC moment
+/// that falls on a different calendar day depending on the viewer's timezone
+/// (PMS-360).
+async fn seed_open_ticket_at(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    created_by: Uuid,
+    number: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) {
+    let status_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_closed = FALSE LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(pool)
+    .await
+    .expect("an open ticket status");
+    let priority_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("a ticket priority");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("a ticket queue");
+
+    sqlx::query(
+        r#"INSERT INTO tickets
+           (id, tenant_id, ticket_number, title, status_id, priority_id,
+            queue_id, company_id, created_by_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(number)
+    .bind("Seed ticket")
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(created_by)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("seed open ticket at instant");
+}
+
 async fn seed_company(pool: &PgPool, tenant_id: Uuid, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
@@ -346,7 +399,7 @@ async fn dashboard_is_tenant_scoped(pool: PgPool) {
 
     let reports = ReportsService::new(Database::from_pool(pool.clone()));
     let dash = reports
-        .dashboard(TenantId::from_trusted(tenant_a))
+        .dashboard(TenantId::from_trusted(tenant_a), "UTC")
         .await
         .expect("dashboard");
 
@@ -359,6 +412,57 @@ async fn dashboard_is_tenant_scoped(pool: PgPool) {
     assert_eq!(
         trend, 2,
         "ticket_trend_30d counts only the caller's two tickets, not tenant B's three"
+    );
+}
+
+/// PMS-360: the 30-day ticket trend buckets `created_at` by the active user's
+/// timezone, not UTC. A ticket created at 03:00 UTC is still the previous
+/// evening in America/Los_Angeles, so an LA viewer must see it on the prior
+/// day while a UTC viewer sees it on the UTC day. Same instant, two day
+/// buckets, exactly as the source-of-truth helper computes.
+#[sqlx::test]
+async fn dashboard_trend_buckets_in_user_timezone(pool: PgPool) {
+    let (tenant, admin, _email, _pw) =
+        common::seed_tenant_with_admin(&pool, "pms360-trend-tz").await;
+    let company = seed_company(&pool, tenant, "TZ Co").await;
+
+    // 03:00 UTC today: late yesterday evening in Los Angeles (UTC-7/-8).
+    let created = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(3, 0, 0)
+        .unwrap()
+        .and_utc();
+    seed_open_ticket_at(&pool, tenant, company, admin, "TZ-1", created).await;
+
+    let utc_day = mokosh_types::datetime::user_local_date(created, "UTC");
+    let la_day = mokosh_types::datetime::user_local_date(created, "America/Los_Angeles");
+    assert_ne!(
+        utc_day, la_day,
+        "03:00 UTC straddles the day boundary for Los Angeles"
+    );
+
+    let reports = ReportsService::new(Database::from_pool(pool.clone()));
+
+    let utc_dash = reports
+        .dashboard(TenantId::from_trusted(tenant), "UTC")
+        .await
+        .expect("utc dashboard");
+    let utc_days: Vec<_> = utc_dash.ticket_trend_30d.iter().map(|d| d.date).collect();
+    assert_eq!(
+        utc_days,
+        vec![utc_day],
+        "UTC viewer buckets the ticket on the UTC day"
+    );
+
+    let la_dash = reports
+        .dashboard(TenantId::from_trusted(tenant), "America/Los_Angeles")
+        .await
+        .expect("la dashboard");
+    let la_days: Vec<_> = la_dash.ticket_trend_30d.iter().map(|d| d.date).collect();
+    assert_eq!(
+        la_days,
+        vec![la_day],
+        "Los Angeles viewer buckets the same ticket on the prior local day"
     );
 }
 
