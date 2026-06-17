@@ -131,6 +131,7 @@ pub struct CreateTimeEntryRequest {
     pub end_time: Option<NaiveTime>,
     /// Either supply (start, end) and let the service compute the
     /// minutes, or supply `duration_minutes` directly.
+    #[validate(range(min = 1))]
     pub duration_minutes: Option<i32>,
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
@@ -150,6 +151,7 @@ pub struct UpdateTimeEntryRequest {
     pub date: Option<NaiveDate>,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
+    #[validate(range(min = 1))]
     pub duration_minutes: Option<i32>,
     pub work_type_id: Option<Uuid>,
     pub ticket_id: Option<Uuid>,
