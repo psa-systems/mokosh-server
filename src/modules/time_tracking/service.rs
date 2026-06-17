@@ -1707,7 +1707,10 @@ mod tests {
         // A project with no ticket -> project.
         assert_eq!(derive_work_category(None, None, pr).unwrap(), "project");
         // Blank string is treated as omitted.
-        assert_eq!(derive_work_category(Some("  "), None, None).unwrap(), "general");
+        assert_eq!(
+            derive_work_category(Some("  "), None, None).unwrap(),
+            "general"
+        );
     }
 
     #[test]
