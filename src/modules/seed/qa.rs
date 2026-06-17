@@ -840,6 +840,7 @@ fn qa_project_specs(company_ids: &[Uuid], manager: Uuid) -> Vec<CreateProjectReq
             billing_method: "fixed_price".to_string(),
             hourly_rate: None,
             is_billable: true,
+            default_due_business_days: None,
         },
         CreateProjectRequest {
             name: "QA-Microsoft 365 Migration".to_string(),
@@ -858,6 +859,7 @@ fn qa_project_specs(company_ids: &[Uuid], manager: Uuid) -> Vec<CreateProjectReq
             billing_method: "time_and_materials".to_string(),
             hourly_rate: Some(Decimal::new(15000, 2)),
             is_billable: true,
+            default_due_business_days: None,
         },
     ]
 }
