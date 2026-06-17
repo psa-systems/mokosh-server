@@ -81,6 +81,35 @@ pub fn validate_cron(expr: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Scheduling-template kinds accepted by the `scheduling_templates.kind`
+/// CHECK constraint (migration `054_scheduling_templates.sql`). `dispatch`
+/// templates model on-site work (with travel buffers); `calendar` templates
+/// model client interactions / status updates. Kept in sync with the DB so a
+/// request carrying an out-of-set value is rejected with a 422 at the request
+/// layer instead of hitting the constraint and surfacing as a 500
+/// DATABASE_ERROR (PMS-403).
+pub const SCHEDULING_TEMPLATE_KINDS: [&str; 2] = ["dispatch", "calendar"];
+
+/// Validate a scheduling-template kind against the set the DB CHECK constraint
+/// allows. The `kind` field deserializes as a free `String`, so an unknown
+/// value passes deserialization but violates the DB constraint; rejecting it
+/// here turns an unhandled 500 into a clear 422 (PMS-403).
+pub fn validate_scheduling_template_kind(value: &str) -> Result<(), ValidationError> {
+    if SCHEDULING_TEMPLATE_KINDS.contains(&value) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_scheduling_template_kind");
+        error.message = Some(
+            format!(
+                "kind must be one of: {}",
+                SCHEDULING_TEMPLATE_KINDS.join(", ")
+            )
+            .into(),
+        );
+        Err(error)
+    }
+}
+
 /// Contract types accepted by the `contracts.contract_type` CHECK
 /// constraint (migration `009_contracts.sql`). Kept in sync with the DB
 /// so a request carrying an out-of-set value is rejected with a 422 at
