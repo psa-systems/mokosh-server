@@ -204,6 +204,15 @@ pub struct CurrentUser {
     /// rendering behaviour. Capped server-side at 64 chars.
     #[serde(default)]
     pub date_format_string: Option<String>,
+    /// PMS-410: per-user theme base mode. One of `light`, `dark`,
+    /// `system`. `None` = unset; the client treats it as `system`.
+    #[serde(default)]
+    pub theme_base_mode: Option<String>,
+    /// PMS-410: per-user accent id (opaque; the accent catalog lives in
+    /// the SPA). `None` = unset; the client falls back to its default
+    /// accent. Capped server-side at 32 chars.
+    #[serde(default)]
+    pub theme_accent_id: Option<String>,
 }
 
 impl CurrentUser {
@@ -239,6 +248,12 @@ pub struct User {
     /// PMS-253: per-user date/time format string. See [`CurrentUser::date_format_string`].
     #[serde(default)]
     pub date_format_string: Option<String>,
+    /// PMS-410: per-user theme base mode. See [`CurrentUser::theme_base_mode`].
+    #[serde(default)]
+    pub theme_base_mode: Option<String>,
+    /// PMS-410: per-user accent id. See [`CurrentUser::theme_accent_id`].
+    #[serde(default)]
+    pub theme_accent_id: Option<String>,
     pub role: UserRole,
     pub status: UserStatus,
     pub email_verified_at: Option<DateTime<Utc>>,
@@ -272,6 +287,8 @@ impl User {
             avatar_url: self.avatar_url.clone(),
             profile_completed: self.profile_completed_at.is_some(),
             date_format_string: self.date_format_string.clone(),
+            theme_base_mode: self.theme_base_mode.clone(),
+            theme_accent_id: self.theme_accent_id.clone(),
         }
     }
 }
@@ -389,6 +406,18 @@ fn validate_digits(code: &str) -> Result<(), validator::ValidationError> {
     }
 }
 
+/// PMS-410: validate that a theme base mode is one of the allowed values.
+/// The `users.theme_base_mode` check constraint also enforces this set, but
+/// catching it here turns a bad value into a clean 422 instead of a 500
+/// from the database CHECK violation.
+fn validate_theme_base_mode(value: &str) -> Result<(), validator::ValidationError> {
+    if matches!(value, "light" | "dark" | "system") {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("invalid_theme_base_mode"))
+    }
+}
+
 /// MFA enable response. Includes the freshly minted recovery codes,
 /// shown ONCE and never retrievable afterwards. The client is
 /// responsible for displaying them somewhere the user can save them.
@@ -438,6 +467,19 @@ pub struct CreateUserRequest {
         message = "Date format string must be 64 characters or fewer"
     ))]
     pub date_format_string: Option<String>,
+    /// PMS-410: optional theme base mode (`light` | `dark` | `system`).
+    /// Validated against the allowed set (mirrors the
+    /// users.theme_base_mode check constraint) so a bad value returns a
+    /// 422 rather than a 500 from the database CHECK.
+    #[validate(custom(
+        function = "validate_theme_base_mode",
+        message = "Theme base mode must be one of light, dark, system"
+    ))]
+    pub theme_base_mode: Option<String>,
+    /// PMS-410: optional opaque accent id. Capped at 32 chars to match
+    /// the users.theme_accent_id check constraint.
+    #[validate(length(max = 32, message = "Accent id must be 32 characters or fewer"))]
+    pub theme_accent_id: Option<String>,
     /// If true, send welcome email with password setup link
     #[serde(default = "crate::default_true")]
     pub send_welcome_email: bool,
@@ -463,6 +505,19 @@ pub struct UpdateUserRequest {
         message = "Date format string must be 64 characters or fewer"
     ))]
     pub date_format_string: Option<String>,
+    /// PMS-410: optional theme base mode (`light` | `dark` | `system`).
+    /// Validated against the allowed set (mirrors the
+    /// users.theme_base_mode check constraint) so a bad value returns a
+    /// 422 rather than a 500 from the database CHECK.
+    #[validate(custom(
+        function = "validate_theme_base_mode",
+        message = "Theme base mode must be one of light, dark, system"
+    ))]
+    pub theme_base_mode: Option<String>,
+    /// PMS-410: optional opaque accent id. Capped at 32 chars to match
+    /// the users.theme_accent_id check constraint.
+    #[validate(length(max = 32, message = "Accent id must be 32 characters or fewer"))]
+    pub theme_accent_id: Option<String>,
 }
 
 /// User list filter parameters. Parsed from the query string on
@@ -494,6 +549,12 @@ pub struct UserResponse {
     /// PMS-253: per-user date/time format. See [`CurrentUser::date_format_string`].
     #[serde(default)]
     pub date_format_string: Option<String>,
+    /// PMS-410: per-user theme base mode. See [`CurrentUser::theme_base_mode`].
+    #[serde(default)]
+    pub theme_base_mode: Option<String>,
+    /// PMS-410: per-user accent id. See [`CurrentUser::theme_accent_id`].
+    #[serde(default)]
+    pub theme_accent_id: Option<String>,
     pub role: UserRole,
     pub status: UserStatus,
     pub mfa_enabled: bool,
@@ -518,6 +579,8 @@ impl From<User> for UserResponse {
             avatar_url: user.avatar_url,
             timezone: user.timezone,
             date_format_string: user.date_format_string,
+            theme_base_mode: user.theme_base_mode,
+            theme_accent_id: user.theme_accent_id,
             role: user.role,
             status: user.status,
             mfa_enabled: user.mfa_enabled,
@@ -700,6 +763,8 @@ mod tests {
             avatar_url: None,
             profile_completed: true,
             date_format_string: None,
+            theme_base_mode: None,
+            theme_accent_id: None,
         };
         let tenant_id = user.tenant_id;
 
@@ -722,6 +787,8 @@ mod tests {
             avatar_url: None,
             profile_completed: true,
             date_format_string: None,
+            theme_base_mode: None,
+            theme_accent_id: None,
         };
         let tenant_id = user.tenant_id;
         let state = AuthState::authenticated(user, tenant_id);
@@ -744,6 +811,8 @@ mod tests {
             avatar_url: None,
             profile_completed: true,
             date_format_string: None,
+            theme_base_mode: None,
+            theme_accent_id: None,
         };
 
         assert_eq!(user.full_name(), "John Doe");
@@ -762,6 +831,8 @@ mod tests {
             avatar_url: None,
             profile_completed: true,
             date_format_string: None,
+            theme_base_mode: None,
+            theme_accent_id: None,
         };
 
         assert_eq!(user.initials(), "JD");
@@ -783,6 +854,8 @@ mod tests {
             avatar_url: None,
             profile_completed: true,
             date_format_string: None,
+            theme_base_mode: None,
+            theme_accent_id: None,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
@@ -805,6 +878,8 @@ mod tests {
             avatar_url: None,
             profile_completed: true,
             date_format_string: None,
+            theme_base_mode: None,
+            theme_accent_id: None,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);

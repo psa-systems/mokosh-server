@@ -98,6 +98,8 @@ pub fn current_user_from_at_jwt(v: &VerifiedAtJwt) -> CurrentUser {
         // `true` so a stale propagation never traps a real user.
         profile_completed: true,
         date_format_string: None,
+        theme_base_mode: None,
+        theme_accent_id: None,
     }
 }
 
