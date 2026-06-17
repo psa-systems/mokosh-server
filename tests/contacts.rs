@@ -294,6 +294,72 @@ async fn company_update_persists_all_fields(pool: PgPool) {
     assert_eq!(get_json["address"]["postal_code"].as_str(), Some("78701"));
 }
 
+/// PMS-400: a company name must be unique within a tenant
+/// (case-insensitive, trimmed). Creating a second company with the same
+/// name (differing only by case or surrounding whitespace) must 409 and
+/// insert no row; renaming onto another company's name must 409; re-saving
+/// a company with its own name unchanged must succeed.
+#[sqlx::test]
+async fn company_rejects_duplicate_name(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let first_id = create_company(&app, &token, "Acme").await;
+
+    // Same name, differing only by case + surrounding whitespace -> 409.
+    let dup_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "  acme " }))
+        .send()
+        .await
+        .expect("send duplicate create");
+    assert_eq!(
+        dup_resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "duplicate company name should 409"
+    );
+
+    // No row was inserted: only the original "Acme" remains.
+    let names = search_company_names(&app, &token, "acme").await;
+    assert_eq!(names, vec!["Acme".to_string()], "no duplicate row inserted");
+
+    // A genuinely different name still creates fine.
+    let second_id = create_company(&app, &token, "Beta").await;
+
+    // Renaming "Beta" onto the existing "Acme" name -> 409.
+    let rename_conflict = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{second_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "ACME" }))
+        .send()
+        .await
+        .expect("send conflicting rename");
+    assert_eq!(
+        rename_conflict.status(),
+        reqwest::StatusCode::CONFLICT,
+        "renaming onto an existing name should 409"
+    );
+
+    // Re-saving the first company with its own name unchanged must succeed.
+    let self_save = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{first_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Acme", "industry": "IT" }))
+        .send()
+        .await
+        .expect("send self re-save");
+    assert!(
+        self_save.status().is_success(),
+        "re-saving own unchanged name should 2xx, got {}",
+        self_save.status()
+    );
+}
+
 // ============================================================================
 // PMS-17 AC5: site CRUD + F4 regression pin
 // ============================================================================

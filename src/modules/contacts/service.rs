@@ -118,7 +118,26 @@ impl ContactService {
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+
+        // PMS-400: reject a duplicate name within the tenant
+        // (case-insensitive, trimmed) before the INSERT so the common path
+        // returns a friendly 409. The unique index added in migration 054
+        // closes the TOCTOU race between two concurrent creates.
+        let name_taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM companies \
+             WHERE tenant_id = $1 AND lower(btrim(name)) = lower(btrim($2)))",
+        )
+        .bind(tenant_id)
+        .bind(&request.name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if name_taken {
+            return Err(AppError::Conflict(
+                "A company with this name already exists".to_string(),
+            ));
+        }
+
+        if let Err(e) = sqlx::query(
             r#"
             INSERT INTO companies (
                 id, tenant_id, name, parent_company_id, company_type, status,
@@ -168,7 +187,18 @@ impl ContactService {
         .bind(&request.notes)
         .bind(request.portal_enabled)
         .execute(&mut *tx)
-        .await?;
+        .await
+        {
+            // Race backstop: another concurrent create won the unique index
+            // (migration 054). Map 23505 to the same friendly 409 the
+            // pre-flight check returns instead of a 500.
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
+                return Err(AppError::Conflict(
+                    "A company with this name already exists".to_string(),
+                ));
+            }
+            return Err(e.into());
+        }
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
@@ -628,6 +658,28 @@ impl ContactService {
         // state) and write the audit entry on the same tx so a rollback
         // drops both. PMS-117 AC1.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // PMS-400: when renaming, reject a name already held by ANOTHER
+        // company in the tenant (case-insensitive, trimmed). Excluding this
+        // company's own id lets a re-save with the name unchanged succeed.
+        if let Some(ref name) = request.name {
+            let name_taken: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM companies \
+                 WHERE tenant_id = $1 AND id <> $2 \
+                 AND lower(btrim(name)) = lower(btrim($3)))",
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if name_taken {
+                return Err(AppError::Conflict(
+                    "A company with this name already exists".to_string(),
+                ));
+            }
+        }
+
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
         )
@@ -636,7 +688,15 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        q.execute(&mut *tx).await?;
+        if let Err(e) = q.execute(&mut *tx).await {
+            // Race backstop against the unique index (migration 054).
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
+                return Err(AppError::Conflict(
+                    "A company with this name already exists".to_string(),
+                ));
+            }
+            return Err(e.into());
+        }
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM companies c WHERE tenant_id = $1 AND id = $2",
