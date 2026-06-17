@@ -33,7 +33,7 @@ pub fn notifications_routes(service: NotificationsService) -> Router {
         )
         .route(
             "/notification-channels/{id}",
-            axum::routing::delete(delete_channel),
+            axum::routing::put(update_channel).delete(delete_channel),
         )
         // PMS-88 templates
         .route(
@@ -42,7 +42,7 @@ pub fn notifications_routes(service: NotificationsService) -> Router {
         )
         .route(
             "/notification-templates/{id}",
-            axum::routing::delete(delete_template),
+            axum::routing::put(update_template).delete(delete_template),
         )
         // PMS-89 user prefs
         .route(
@@ -56,7 +56,7 @@ pub fn notifications_routes(service: NotificationsService) -> Router {
         .route("/notification-rules", get(list_rules).post(create_rule))
         .route(
             "/notification-rules/{id}",
-            axum::routing::delete(delete_rule),
+            axum::routing::put(update_rule).delete(delete_rule),
         )
         // PMS-92 dispatcher (manual trigger; the real worker calls
         // NotificationsService::dispatch directly)
@@ -88,6 +88,20 @@ async fn create_channel(
     req.validate()?;
     Ok(Json(
         s.service.create_channel(u.tenant(), &req, &ctx).await?,
+    ))
+}
+
+async fn update_channel(
+    State(s): State<NotificationsRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertNotificationChannelRequest>,
+) -> AppResult<Json<NotificationChannelResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.update_channel(u.tenant(), id, &req, &ctx).await?,
     ))
 }
 
@@ -123,6 +137,22 @@ async fn create_template(
     req.validate()?;
     Ok(Json(
         s.service.create_template(u.tenant(), &req, &ctx).await?,
+    ))
+}
+
+async fn update_template(
+    State(s): State<NotificationsRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertNotificationTemplateRequest>,
+) -> AppResult<Json<NotificationTemplateResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service
+            .update_template(u.tenant(), id, &req, &ctx)
+            .await?,
     ))
 }
 
@@ -207,6 +237,20 @@ async fn create_rule(
 ) -> AppResult<Json<NotificationRuleResponse>> {
     req.validate()?;
     Ok(Json(s.service.create_rule(u.tenant(), &req, &ctx).await?))
+}
+
+async fn update_rule(
+    State(s): State<NotificationsRouterState>,
+    RequireAuth(u): RequireAuth,
+    _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertNotificationRuleRequest>,
+) -> AppResult<Json<NotificationRuleResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.update_rule(u.tenant(), id, &req, &ctx).await?,
+    ))
 }
 
 async fn delete_rule(
