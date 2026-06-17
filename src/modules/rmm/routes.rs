@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -49,7 +49,7 @@ pub fn rmm_routes(service: RmmService) -> Router {
         )
         .route(
             "/rmm/device-mappings/{id}",
-            axum::routing::delete(delete_device_mapping),
+            put(update_device_mapping).delete(delete_device_mapping),
         )
         // PMS-104 alert rules + ingest
         .route(
@@ -58,7 +58,7 @@ pub fn rmm_routes(service: RmmService) -> Router {
         )
         .route(
             "/rmm/alert-rules/{id}",
-            axum::routing::delete(delete_alert_rule),
+            put(update_alert_rule).delete(delete_alert_rule),
         )
         .route("/rmm/alerts", post(ingest_alert))
         .with_state(state)
@@ -177,6 +177,21 @@ async fn create_device_mapping(
     ))
 }
 
+async fn update_device_mapping(
+    State(s): State<RmmRouterState>,
+    RequireRmm { user: u, .. }: RequireRmm,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateRmmDeviceMappingRequest>,
+) -> AppResult<Json<RmmDeviceMappingResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service
+            .update_device_mapping(u.tenant(), id, &req)
+            .await?,
+    ))
+}
+
 async fn delete_device_mapping(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -213,6 +228,19 @@ async fn create_alert_rule(
     req.validate()?;
     Ok(Json(
         s.service.create_alert_rule(u.tenant(), &req, &ctx).await?,
+    ))
+}
+
+async fn update_alert_rule(
+    State(s): State<RmmRouterState>,
+    RequireRmm { user: u, .. }: RequireRmm,
+    _a: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateRmmAlertRuleRequest>,
+) -> AppResult<Json<RmmAlertRuleResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.update_alert_rule(u.tenant(), id, &req).await?,
     ))
 }
 

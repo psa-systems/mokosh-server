@@ -78,6 +78,21 @@ pub struct CreateRmmDeviceMappingRequest {
     pub device_name: Option<String>,
 }
 
+/// PUT /api/v1/rmm/device-mappings/{id}. Parity with the connection
+/// update route: missing fields are left untouched (COALESCE), so an
+/// admin can re-point a mapping's `asset_id` or rename its
+/// `device_name` without re-sending the rest. `rmm_connection_id` is
+/// intentionally not editable; a mapping belongs to the connection it
+/// was created under.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateRmmDeviceMappingRequest {
+    #[validate(length(min = 1, max = 255))]
+    pub rmm_device_id: Option<String>,
+    pub asset_id: Option<Uuid>,
+    pub company_id: Option<Uuid>,
+    pub device_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RmmAlertRuleResponse {
     pub id: Uuid,
@@ -108,6 +123,23 @@ pub struct UpsertRmmAlertRuleRequest {
 
 fn default_true() -> bool {
     true
+}
+
+/// PUT /api/v1/rmm/alert-rules/{id}. Parity with the connection update
+/// route: missing fields are left untouched (COALESCE), so an admin can
+/// flip `is_active` or change a `queue_id` without re-sending the whole
+/// rule. `rmm_connection_id` is intentionally not editable; a rule
+/// belongs to the connection it was created under.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateRmmAlertRuleRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: Option<String>,
+    pub alert_type: Option<String>,
+    pub auto_create_ticket: Option<bool>,
+    pub assign_to_id: Option<Uuid>,
+    pub queue_id: Option<Uuid>,
+    pub ticket_template: Option<serde_json::Value>,
+    pub is_active: Option<bool>,
 }
 
 /// Body for `POST /api/v1/rmm/alerts`. The RMM agent fires this with an
