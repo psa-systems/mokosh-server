@@ -82,6 +82,7 @@ pub struct CreateTenantRequest {
     pub billing_contact_name: Option<String>,
     pub subscription_plan: Option<String>,
     /// Initial admin user
+    #[validate(email)]
     pub admin_email: String,
     pub admin_first_name: String,
     pub admin_last_name: String,

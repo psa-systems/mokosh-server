@@ -303,19 +303,19 @@ impl QaSeeder {
             .into_iter()
             .enumerate()
         {
-            let project = self.projects.create_project(tenant, &spec).await?;
+            let project = self.projects.create_project(tenant, &spec, &ctx).await?;
             report.projects += 1;
 
             for phase_spec in qa_phase_specs(pi) {
                 let phase = self
                     .projects
-                    .create_project_phase(tenant, project.id, &phase_spec)
+                    .create_project_phase(tenant, project.id, &phase_spec, &ctx)
                     .await?;
                 report.phases += 1;
 
                 for task_spec in qa_task_specs(pi, phase.id, task_status_id, user_id) {
                     self.projects
-                        .create_task(tenant, project.id, &task_spec)
+                        .create_task(tenant, project.id, &task_spec, &ctx)
                         .await?;
                     report.tasks += 1;
                 }
@@ -333,7 +333,7 @@ impl QaSeeder {
             &ticket_ids,
             &project_ids,
         ) {
-            self.time.create_time_entry(tenant, &spec).await?;
+            self.time.create_time_entry(tenant, &spec, &ctx).await?;
             report.time_entries += 1;
         }
 
@@ -437,7 +437,8 @@ impl QaSeeder {
             is_active: true,
             sort_order: 100,
         };
-        let wt = self.time.create_work_type(tenant, &req).await?;
+        let ctx = AuditCtx::system(tenant.get());
+        let wt = self.time.create_work_type(tenant, &req, &ctx).await?;
         Ok(wt.id)
     }
 
@@ -461,7 +462,8 @@ impl QaSeeder {
             is_completed: false,
             sort_order: 100,
         };
-        let st = self.projects.create_task_status(tenant, &req).await?;
+        let ctx = AuditCtx::system(tenant.get());
+        let st = self.projects.create_task_status(tenant, &req, &ctx).await?;
         Ok(st.id)
     }
 
@@ -832,6 +834,7 @@ fn qa_project_specs(company_ids: &[Uuid], manager: Uuid) -> Vec<CreateProjectReq
             project_manager_id: Some(manager),
             start_date: Some(today() - Duration::days(20)),
             target_end_date: Some(today() + Duration::days(40)),
+            actual_end_date: None,
             budget_hours: Some(Decimal::new(8000, 2)),
             budget_amount: Some(Decimal::new(2500000, 2)),
             billing_method: "fixed_price".to_string(),
@@ -849,6 +852,7 @@ fn qa_project_specs(company_ids: &[Uuid], manager: Uuid) -> Vec<CreateProjectReq
             project_manager_id: Some(manager),
             start_date: Some(today() - Duration::days(5)),
             target_end_date: Some(today() + Duration::days(60)),
+            actual_end_date: None,
             budget_hours: Some(Decimal::new(12000, 2)),
             budget_amount: Some(Decimal::new(4000000, 2)),
             billing_method: "time_and_materials".to_string(),
