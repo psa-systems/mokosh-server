@@ -134,7 +134,7 @@ async fn dashboard(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
 ) -> AppResult<Json<DashboardResponse>> {
-    Ok(Json(s.service.dashboard(u.tenant()).await?))
+    Ok(Json(s.service.dashboard(u.tenant(), &u.timezone).await?))
 }
 
 async fn tickets_report(
@@ -245,7 +245,7 @@ async fn export_report(
         )));
     }
     let csv = match report.as_str() {
-        "dashboard" => csv_for_dashboard(&s.service.dashboard(u.tenant()).await?),
+        "dashboard" => csv_for_dashboard(&s.service.dashboard(u.tenant(), &u.timezone).await?),
         "tickets" => csv_for_tickets(&s.service.tickets(u.tenant(), q.from, q.to).await?),
         "time" => csv_for_time(&s.service.time(u.tenant(), q.from, q.to).await?),
         "billing" => {
