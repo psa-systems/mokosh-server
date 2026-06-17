@@ -90,6 +90,11 @@ pub struct TimeEntryResponse {
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+    /// Classifier for the kind of work (PMS-394): `ticketed` | `project` |
+    /// `general`. Lets reports split true overhead (`general`) from
+    /// client-attributable work. Derived server-side from the presence of
+    /// `ticket_id` / `project_id` when omitted.
+    pub work_category: Option<String>,
     /// Optional link to a project task (PMS-51). Exposed so a client editing
     /// an entry can read and re-send the current task link; a partial PUT that
     /// omits `task_id` preserves it server-side (PMS-328).
@@ -137,6 +142,11 @@ pub struct CreateTimeEntryRequest {
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+    /// Work classifier (PMS-394): `ticketed` | `project` | `general`. When
+    /// omitted the service derives it from `ticket_id` / `project_id`
+    /// (general when both absent). Supplying `ticketed` with no `ticket_id`
+    /// is a 400.
+    pub work_category: Option<String>,
     /// Optional link to a project task (PMS-51). Approved time against a
     /// task rolls up into the task's and project's actual hours.
     pub task_id: Option<Uuid>,
@@ -158,6 +168,10 @@ pub struct UpdateTimeEntryRequest {
     pub work_type_id: Option<Uuid>,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+    /// Work classifier (PMS-394): `ticketed` | `project` | `general`. When
+    /// omitted the service re-derives it from the resulting `ticket_id` /
+    /// `project_id`.
+    pub work_category: Option<String>,
     pub task_id: Option<Uuid>,
     pub notes: Option<String>,
     pub is_billable: Option<bool>,

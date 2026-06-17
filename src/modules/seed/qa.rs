@@ -941,6 +941,7 @@ fn qa_time_entries(
                 task_id: None,
                 company_id: company_ids[i % company_ids.len()],
                 notes: Some("QA seed time entry.".to_string()),
+                work_category: None,
                 is_billable: i % 3 != 0,
                 hourly_rate: Some(Decimal::new(15000, 2)),
             }

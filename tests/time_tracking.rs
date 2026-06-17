@@ -366,6 +366,7 @@ fn create_req(
         task_id,
         company_id,
         notes: Some("initial".to_string()),
+        work_category: None,
         is_billable: true,
         hourly_rate: None,
     }
@@ -381,6 +382,7 @@ fn notes_only_update(notes: &str) -> UpdateTimeEntryRequest {
         work_type_id: None,
         ticket_id: None,
         project_id: None,
+        work_category: None,
         task_id: None,
         notes: Some(notes.to_string()),
         is_billable: None,

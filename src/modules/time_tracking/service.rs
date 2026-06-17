@@ -255,7 +255,7 @@ impl TimeTrackingService {
             SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
                    te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
-                   te.approval_status, te.created_at, te.updated_at,
+                   te.approval_status, te.work_category, te.created_at, te.updated_at,
                    tk.ticket_number, tk.title AS ticket_title,
                    pr.name AS project_name, ta.title AS task_title
             FROM time_entries te
@@ -315,6 +315,11 @@ impl TimeTrackingService {
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
+        let work_category = derive_work_category(
+            request.work_category.as_deref(),
+            request.ticket_id,
+            request.project_id,
+        )?;
 
         let raw = Self::compute_minutes(request)?;
         let duration = match default_rounding_rule(&mut *tx, tenant_id).await? {
@@ -333,8 +338,9 @@ impl TimeTrackingService {
             INSERT INTO time_entries (
                 id, tenant_id, user_id, date, start_time, end_time,
                 duration_minutes, work_type_id, ticket_id, project_id,
-                company_id, notes, is_billable, hourly_rate, total_amount, task_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                company_id, notes, is_billable, hourly_rate, total_amount, task_id,
+                work_category
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             "#,
         )
         .bind(id)
@@ -353,6 +359,7 @@ impl TimeTrackingService {
         .bind(hourly_rate)
         .bind(total)
         .bind(request.task_id)
+        .bind(&work_category)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -389,7 +396,7 @@ impl TimeTrackingService {
             SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
                    te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
-                   te.approval_status, te.created_at, te.updated_at,
+                   te.approval_status, te.work_category, te.created_at, te.updated_at,
                    tk.ticket_number, tk.title AS ticket_title,
                    pr.name AS project_name, ta.title AS task_title
             FROM time_entries te
@@ -443,6 +450,13 @@ impl TimeTrackingService {
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
+        // The UPDATE binds ticket_id / project_id straight from the request, so
+        // re-derive work_category from those same post-update values (PMS-394).
+        let work_category = derive_work_category(
+            request.work_category.as_deref(),
+            request.ticket_id,
+            request.project_id,
+        )?;
         let affected = sqlx::query(
             r#"
             UPDATE time_entries SET
@@ -458,6 +472,7 @@ impl TimeTrackingService {
                 hourly_rate       = $12,
                 total_amount      = $13,
                 task_id           = COALESCE($14, task_id),
+                work_category     = $15,
                 updated_at        = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -476,6 +491,7 @@ impl TimeTrackingService {
         .bind(hourly_rate)
         .bind(total)
         .bind(request.task_id)
+        .bind(&work_category)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1306,6 +1322,44 @@ where
         .ok_or_else(|| AppError::NotFound("Company".to_string()))
 }
 
+/// Derive the persisted `work_category` (PMS-394) from an optional
+/// client-supplied value and the presence of a ticket / project link.
+///
+/// When the client omits it, classify from the work item: a ticket makes it
+/// `ticketed`, else a project makes it `project`, else `general` (true
+/// overhead, no work item). When the client supplies it, accept any value in
+/// the taxonomy but reject the contradiction of `ticketed` with no ticket so a
+/// mislabelled entry never persists.
+fn derive_work_category(
+    requested: Option<&str>,
+    ticket_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> AppResult<String> {
+    let derived = if ticket_id.is_some() {
+        "ticketed"
+    } else if project_id.is_some() {
+        "project"
+    } else {
+        "general"
+    };
+    match requested.map(str::trim) {
+        None | Some("") => Ok(derived.to_string()),
+        Some(category) => {
+            if !matches!(category, "ticketed" | "project" | "general") {
+                return Err(AppError::BadRequest(format!(
+                    "work_category must be one of ticketed, project, general (got {category:?})"
+                )));
+            }
+            if category == "ticketed" && ticket_id.is_none() {
+                return Err(AppError::BadRequest(
+                    "work_category 'ticketed' requires a ticket_id".to_string(),
+                ));
+            }
+            Ok(category.to_string())
+        }
+    }
+}
+
 /// Anchor a date to the Monday of its ISO week.
 fn monday_anchor(d: NaiveDate) -> NaiveDate {
     d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64)
@@ -1451,6 +1505,7 @@ struct TimeEntryRow {
     hourly_rate: Option<Decimal>,
     total_amount: Option<Decimal>,
     approval_status: Option<String>,
+    work_category: Option<String>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     ticket_number: Option<String>,
@@ -1487,6 +1542,7 @@ impl From<TimeEntryRow> for TimeEntryResponse {
                 .as_deref()
                 .and_then(ApprovalStatus::from_str)
                 .unwrap_or_default(),
+            work_category: r.work_category,
             created_at: r.created_at,
             updated_at: r.updated_at,
             ticket_number: r.ticket_number,
@@ -1637,5 +1693,46 @@ mod tests {
         let (rate, total) = resolve_billing(None, false, &defaults, 60);
         assert_eq!(rate, Some(Decimal::from(100)));
         assert_eq!(total, None);
+    }
+
+    // PMS-394: work_category derivation.
+    #[test]
+    fn work_category_derived_from_work_item_when_omitted() {
+        let tk = Some(Uuid::new_v4());
+        let pr = Some(Uuid::new_v4());
+        // No ticket and no project -> general (the ticketless overhead bucket).
+        assert_eq!(derive_work_category(None, None, None).unwrap(), "general");
+        // A ticket wins over everything.
+        assert_eq!(derive_work_category(None, tk, pr).unwrap(), "ticketed");
+        // A project with no ticket -> project.
+        assert_eq!(derive_work_category(None, None, pr).unwrap(), "project");
+        // Blank string is treated as omitted.
+        assert_eq!(derive_work_category(Some("  "), None, None).unwrap(), "general");
+    }
+
+    #[test]
+    fn work_category_explicit_value_is_honored() {
+        let tk = Some(Uuid::new_v4());
+        assert_eq!(
+            derive_work_category(Some("ticketed"), tk, None).unwrap(),
+            "ticketed"
+        );
+        // Explicit general overrides a present project link.
+        assert_eq!(
+            derive_work_category(Some("general"), None, Some(Uuid::new_v4())).unwrap(),
+            "general"
+        );
+    }
+
+    #[test]
+    fn work_category_ticketed_without_ticket_is_rejected() {
+        let err = derive_work_category(Some("ticketed"), None, None).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn work_category_unknown_value_is_rejected() {
+        let err = derive_work_category(Some("bogus"), None, None).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }
