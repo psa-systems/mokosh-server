@@ -59,8 +59,10 @@ pub struct CreateMileageEntryRequest {
     /// different user. The route handler enforces; service trusts the caller.
     pub user_id: Uuid,
     pub date: NaiveDate,
-    /// Must be > 0; enforced by the service (clean 400) and the
-    /// `distance_miles > 0` DB CHECK.
+    /// Must be > 0 and fit `NUMERIC(8, 2)`; enforced at the request layer
+    /// (clean 422), by the service (clean 400), and the `distance_miles > 0`
+    /// DB CHECK.
+    #[validate(custom(function = crate::validation::validate_distance_miles))]
     pub distance_miles: Decimal,
     pub start_address: Option<String>,
     pub end_address: Option<String>,
@@ -74,12 +76,14 @@ pub struct CreateMileageEntryRequest {
     pub is_billable: bool,
     /// Explicit per-mile rate. `None` inherits the tenant's default rate card
     /// `default_per_mile_rate`.
+    #[validate(custom(function = crate::validation::validate_rate_per_mile))]
     pub rate_per_mile: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Validate)]
 pub struct UpdateMileageEntryRequest {
     pub date: Option<NaiveDate>,
+    #[validate(custom(function = crate::validation::validate_distance_miles))]
     pub distance_miles: Option<Decimal>,
     pub start_address: Option<String>,
     pub end_address: Option<String>,
@@ -88,5 +92,6 @@ pub struct UpdateMileageEntryRequest {
     pub task_id: Option<Uuid>,
     pub notes: Option<String>,
     pub is_billable: Option<bool>,
+    #[validate(custom(function = crate::validation::validate_rate_per_mile))]
     pub rate_per_mile: Option<Decimal>,
 }

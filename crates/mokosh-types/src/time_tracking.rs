@@ -67,6 +67,7 @@ pub struct UpsertWorkTypeRequest {
     pub description: Option<String>,
     #[serde(default = "crate::default_true")]
     pub default_billable: bool,
+    #[validate(custom(function = crate::validation::validate_rate))]
     pub default_rate: Option<Decimal>,
     #[serde(default = "crate::default_true")]
     pub is_active: bool,
@@ -143,6 +144,7 @@ pub struct CreateTimeEntryRequest {
     pub notes: Option<String>,
     #[serde(default = "crate::default_true")]
     pub is_billable: bool,
+    #[validate(custom(function = crate::validation::validate_rate))]
     pub hourly_rate: Option<Decimal>,
 }
 
@@ -159,6 +161,7 @@ pub struct UpdateTimeEntryRequest {
     pub task_id: Option<Uuid>,
     pub notes: Option<String>,
     pub is_billable: Option<bool>,
+    #[validate(custom(function = crate::validation::validate_rate))]
     pub hourly_rate: Option<Decimal>,
 }
 
