@@ -25,6 +25,7 @@ pub mod mileage_tracking;
 pub mod tenants;
 pub mod tickets;
 pub mod time_tracking;
+pub mod validation;
 
 /// Shared serde default: `#[serde(default = "crate::default_true")]`.
 /// Several request DTOs treat a missing boolean flag as `true`; this is

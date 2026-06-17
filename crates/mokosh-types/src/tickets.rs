@@ -370,6 +370,10 @@ pub struct CreateTicketRequest {
     pub sla_id: Option<Uuid>,
     pub scheduled_start: Option<DateTime<Utc>>,
     pub scheduled_end: Option<DateTime<Utc>>,
+    /// `tickets.estimated_hours` is `DECIMAL(10, 2)`, so the value must fit in
+    /// `[0, 99_999_999.99]`; reject out-of-range (and `NaN`/`Infinity`, which
+    /// fail the bound comparison) before Postgres overflows to a raw 500.
+    #[validate(range(min = 0.0, max = 99_999_999.99))]
     pub estimated_hours: Option<f64>,
     #[serde(default = "crate::default_true")]
     pub is_billable: bool,
@@ -399,6 +403,9 @@ pub struct UpdateTicketRequest {
     pub sla_id: Option<Uuid>,
     pub scheduled_start: Option<DateTime<Utc>>,
     pub scheduled_end: Option<DateTime<Utc>>,
+    /// See `CreateTicketRequest::estimated_hours`: bound to the
+    /// `DECIMAL(10, 2)` column so an oversized value is a clean 422, not a 500.
+    #[validate(range(min = 0.0, max = 99_999_999.99))]
     pub estimated_hours: Option<f64>,
     pub is_billable: Option<bool>,
     pub billing_status: Option<BillingStatus>,

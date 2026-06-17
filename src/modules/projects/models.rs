@@ -112,6 +112,7 @@ pub struct CreateProjectRequest {
     pub budget_amount: Option<Decimal>,
     #[serde(default = "default_tm")]
     pub billing_method: String,
+    #[validate(custom(function = mokosh_types::validation::validate_rate))]
     pub hourly_rate: Option<Decimal>,
     #[serde(default = "default_true")]
     pub is_billable: bool,
@@ -147,6 +148,7 @@ pub struct UpdateProjectRequest {
     #[validate(custom(function = crate::utils::validation::validate_budget_amount))]
     pub budget_amount: Option<Decimal>,
     pub billing_method: Option<String>,
+    #[validate(custom(function = mokosh_types::validation::validate_rate))]
     pub hourly_rate: Option<Decimal>,
     pub is_billable: Option<bool>,
 }
@@ -272,6 +274,7 @@ pub struct CreateTaskRequest {
     #[serde(default = "default_medium")]
     pub priority: String,
     pub assigned_to_id: Option<Uuid>,
+    #[validate(custom(function = mokosh_types::validation::validate_hours))]
     pub estimated_hours: Option<Decimal>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
@@ -292,6 +295,7 @@ pub struct UpdateTaskRequest {
     pub phase_id: Option<Uuid>,
     pub priority: Option<String>,
     pub assigned_to_id: Option<Uuid>,
+    #[validate(custom(function = mokosh_types::validation::validate_hours))]
     pub estimated_hours: Option<Decimal>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
