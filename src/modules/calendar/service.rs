@@ -1174,6 +1174,218 @@ impl CalendarService {
             on_call,
         })
     }
+
+    // ========================================================================
+    // PMS-403 scheduling templates
+    // ========================================================================
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_templates(
+        &self,
+        tenant_id: TenantId,
+        filter: &SchedulingTemplateFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<SchedulingTemplateResponse>, u64)> {
+        let mut conditions = vec!["tenant_id = $1".to_string()];
+        let mut idx = 2;
+        if filter.kind.is_some() {
+            conditions.push(format!("kind = ${idx}"));
+            idx += 1;
+        }
+        let where_clause = conditions.join(" AND ");
+        let limit_placeholder = idx;
+        let offset_placeholder = idx + 1;
+        let query = format!(
+            r#"SELECT id, name, kind, appointment_type, duration_minutes,
+                      travel_before_minutes, travel_after_minutes,
+                      default_title, default_location, default_ticket_id, notes,
+                      created_at, updated_at
+               FROM scheduling_templates WHERE {where_clause}
+               ORDER BY name
+               LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
+        );
+        let count_query = format!("SELECT COUNT(*) FROM scheduling_templates WHERE {where_clause}");
+        let mut q = sqlx::query_as::<_, SchedulingTemplateRow>(&query).bind(tenant_id);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+        if let Some(v) = &filter.kind {
+            q = q.bind(v);
+            cq = cq.bind(v);
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+        let total = cq.fetch_one(&mut *tx).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_template(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<SchedulingTemplateResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, SchedulingTemplateRow>(
+            r#"SELECT id, name, kind, appointment_type, duration_minutes,
+                      travel_before_minutes, travel_after_minutes,
+                      default_title, default_location, default_ticket_id, notes,
+                      created_at, updated_at
+               FROM scheduling_templates WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("SchedulingTemplate".to_string()))?;
+        Ok(row.into())
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_template(
+        &self,
+        tenant_id: TenantId,
+        request: &CreateSchedulingTemplateRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<SchedulingTemplateResponse> {
+        // A linked ticket from the request body must belong to this tenant.
+        self.validate_fk_opt(tenant_id, "tickets", request.default_ticket_id)
+            .await?;
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"INSERT INTO scheduling_templates (
+                id, tenant_id, name, kind, appointment_type, duration_minutes,
+                travel_before_minutes, travel_after_minutes,
+                default_title, default_location, default_ticket_id, notes
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(&request.name)
+        .bind(&request.kind)
+        .bind(&request.appointment_type)
+        .bind(request.duration_minutes)
+        .bind(request.travel_before_minutes)
+        .bind(request.travel_after_minutes)
+        .bind(&request.default_title)
+        .bind(&request.default_location)
+        .bind(request.default_ticket_id)
+        .bind(&request.notes)
+        .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM scheduling_templates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "scheduling_templates",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_template(tenant_id, id).await
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_template(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpdateSchedulingTemplateRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<SchedulingTemplateResponse> {
+        // A re-linked ticket must belong to this tenant.
+        self.validate_fk_opt(tenant_id, "tickets", request.default_ticket_id)
+            .await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM scheduling_templates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if before.is_none() {
+            return Err(AppError::NotFound("SchedulingTemplate".to_string()));
+        }
+        sqlx::query(
+            r#"UPDATE scheduling_templates SET
+                name = COALESCE($3, name),
+                kind = COALESCE($4, kind),
+                appointment_type = COALESCE($5, appointment_type),
+                duration_minutes = COALESCE($6, duration_minutes),
+                travel_before_minutes = COALESCE($7, travel_before_minutes),
+                travel_after_minutes = COALESCE($8, travel_after_minutes),
+                default_title = COALESCE($9, default_title),
+                default_location = COALESCE($10, default_location),
+                default_ticket_id = COALESCE($11, default_ticket_id),
+                notes = COALESCE($12, notes),
+                updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(&request.kind)
+        .bind(&request.appointment_type)
+        .bind(request.duration_minutes)
+        .bind(request.travel_before_minutes)
+        .bind(request.travel_after_minutes)
+        .bind(&request.default_title)
+        .bind(&request.default_location)
+        .bind(request.default_ticket_id)
+        .bind(&request.notes)
+        .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM scheduling_templates t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "scheduling_templates",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_template(tenant_id, id).await
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_template(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query("DELETE FROM scheduling_templates WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("SchedulingTemplate".to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// Normalise a stored `recurrence_rule` and parse it as an `RRuleSet`
@@ -1478,6 +1690,43 @@ impl From<OnCallRow> for OnCallScheduleResponse {
             rotation_type: r.rotation_type,
             rotation_config: r.rotation_config,
             is_active: r.is_active.unwrap_or(true),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SchedulingTemplateRow {
+    id: Uuid,
+    name: String,
+    kind: String,
+    appointment_type: String,
+    duration_minutes: i32,
+    travel_before_minutes: i32,
+    travel_after_minutes: i32,
+    default_title: Option<String>,
+    default_location: Option<String>,
+    default_ticket_id: Option<Uuid>,
+    notes: Option<String>,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+}
+
+impl From<SchedulingTemplateRow> for SchedulingTemplateResponse {
+    fn from(r: SchedulingTemplateRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            kind: r.kind,
+            appointment_type: r.appointment_type,
+            duration_minutes: r.duration_minutes,
+            travel_before_minutes: r.travel_before_minutes,
+            travel_after_minutes: r.travel_after_minutes,
+            default_title: r.default_title,
+            default_location: r.default_location,
+            default_ticket_id: r.default_ticket_id,
+            notes: r.notes,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         }
     }
 }
