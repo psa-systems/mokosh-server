@@ -530,7 +530,7 @@ impl AuthService {
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
-                   date_format_string, role,
+                   date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at
@@ -893,9 +893,10 @@ impl AuthService {
             r#"
             INSERT INTO users (
                 id, tenant_id, email, first_name, last_name, phone, mobile,
-                title, role, timezone, date_format_string, status
+                title, role, timezone, date_format_string, theme_base_mode,
+                theme_accent_id, status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending')
             "#,
         )
         .bind(user_id)
@@ -909,6 +910,8 @@ impl AuthService {
         .bind(request.role.as_str())
         .bind(&timezone)
         .bind(&request.date_format_string)
+        .bind(&request.theme_base_mode)
+        .bind(&request.theme_accent_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1071,11 +1074,18 @@ impl AuthService {
         if request.date_format_string.is_some() {
             updates.push(format!("date_format_string = ${}", param_idx));
             // Invariant: every conditional update advances `param_idx` so
-            // the next field added below is numbered correctly.
-            // `date_format_string` is the last field today, so this
-            // increment is currently unread (`#[allow(unused_assignments)]`
-            // on the fn); keep it so the pattern stays copy-paste safe
-            // (PMS-197).
+            // the next field added below is numbered correctly (PMS-197).
+            param_idx += 1;
+        }
+        if request.theme_base_mode.is_some() {
+            updates.push(format!("theme_base_mode = ${}", param_idx));
+            param_idx += 1;
+        }
+        if request.theme_accent_id.is_some() {
+            updates.push(format!("theme_accent_id = ${}", param_idx));
+            // `theme_accent_id` is the last field today, so this increment
+            // is currently unread (`#[allow(unused_assignments)]` on the
+            // fn); keep it so the pattern stays copy-paste safe (PMS-197).
             param_idx += 1;
         }
 
@@ -1137,6 +1147,12 @@ impl AuthService {
         }
         if let Some(ref date_format_string) = request.date_format_string {
             query_builder = query_builder.bind(date_format_string);
+        }
+        if let Some(ref theme_base_mode) = request.theme_base_mode {
+            query_builder = query_builder.bind(theme_base_mode);
+        }
+        if let Some(ref theme_accent_id) = request.theme_accent_id {
+            query_builder = query_builder.bind(theme_accent_id);
         }
 
         // Mutation + audit row in one transaction: snapshot the row
@@ -1533,7 +1549,7 @@ impl AuthService {
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
-                   date_format_string, role,
+                   date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at
@@ -1615,7 +1631,7 @@ impl AuthService {
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
-                   date_format_string, role,
+                   date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at
@@ -1732,7 +1748,7 @@ impl AuthService {
             r#"
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
-                   date_format_string, role,
+                   date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at
@@ -2012,6 +2028,8 @@ struct UserRow {
     timezone: String,
     locale: String,
     date_format_string: Option<String>,
+    theme_base_mode: Option<String>,
+    theme_accent_id: Option<String>,
     role: String,
     status: String,
     email_verified_at: Option<chrono::DateTime<Utc>>,
@@ -2042,6 +2060,8 @@ impl From<UserRow> for User {
             timezone: row.timezone,
             locale: row.locale,
             date_format_string: row.date_format_string,
+            theme_base_mode: row.theme_base_mode,
+            theme_accent_id: row.theme_accent_id,
             role: UserRole::from_str(&row.role).unwrap_or_default(),
             status: UserStatus::from_str(&row.status).unwrap_or_default(),
             email_verified_at: row.email_verified_at,

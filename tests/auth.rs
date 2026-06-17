@@ -54,6 +54,118 @@ async fn login_then_me_happy_path(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-410: theme preferences round-trip on PUT/GET /me
+// ============================================================================
+
+/// PMS-410: `PUT /api/v1/auth/me` persists `theme_base_mode` +
+/// `theme_accent_id`; `GET /me` reads them back; omitting one field on a
+/// later PUT leaves it unchanged (conditional UPDATE builder); an invalid
+/// `theme_base_mode` is rejected with 422 by the custom validator.
+#[sqlx::test]
+async fn update_me_theme_prefs_round_trip(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Defaults are NULL before any update.
+    let me = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me request");
+    let body: serde_json::Value = me.json().await.expect("/me body is JSON");
+    assert!(
+        body["theme_base_mode"].is_null(),
+        "theme_base_mode defaults to null when unset"
+    );
+    assert!(
+        body["theme_accent_id"].is_null(),
+        "theme_accent_id defaults to null when unset"
+    );
+
+    // PUT both fields; the response echoes the new values.
+    let put = app
+        .client
+        .put(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "theme_base_mode": "dark",
+            "theme_accent_id": "ocean",
+        }))
+        .send()
+        .await
+        .expect("send PUT /me with theme prefs");
+    assert_eq!(
+        put.status(),
+        reqwest::StatusCode::OK,
+        "PUT /me with valid theme prefs should succeed"
+    );
+    let put_body: serde_json::Value = put.json().await.expect("PUT /me body is JSON");
+    assert_eq!(put_body["theme_base_mode"].as_str(), Some("dark"));
+    assert_eq!(put_body["theme_accent_id"].as_str(), Some("ocean"));
+
+    // GET /me reads the persisted values back.
+    let me2 = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me request after update");
+    let body2: serde_json::Value = me2.json().await.expect("/me body is JSON");
+    assert_eq!(
+        body2["theme_base_mode"].as_str(),
+        Some("dark"),
+        "/me must reflect the persisted theme_base_mode"
+    );
+    assert_eq!(
+        body2["theme_accent_id"].as_str(),
+        Some("ocean"),
+        "/me must reflect the persisted theme_accent_id"
+    );
+
+    // PUT only one field: the omitted field must stay unchanged (the
+    // conditional UPDATE builder only touches supplied fields).
+    let put2 = app
+        .client
+        .put(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "theme_base_mode": "light" }))
+        .send()
+        .await
+        .expect("send PUT /me with one theme field");
+    assert_eq!(put2.status(), reqwest::StatusCode::OK);
+    let put2_body: serde_json::Value = put2.json().await.expect("PUT /me body is JSON");
+    assert_eq!(
+        put2_body["theme_base_mode"].as_str(),
+        Some("light"),
+        "theme_base_mode updates to the supplied value"
+    );
+    assert_eq!(
+        put2_body["theme_accent_id"].as_str(),
+        Some("ocean"),
+        "theme_accent_id is unchanged when omitted from the PUT body"
+    );
+
+    // An invalid base mode is rejected with 422 by the custom validator.
+    let bad = app
+        .client
+        .put(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "theme_base_mode": "neon" }))
+        .send()
+        .await
+        .expect("send PUT /me with invalid theme_base_mode");
+    assert_eq!(
+        bad.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "an invalid theme_base_mode must be rejected with 422"
+    );
+}
+
+// ============================================================================
 // PMS-4 AC1: list_users pagination + filter
 // ============================================================================
 
