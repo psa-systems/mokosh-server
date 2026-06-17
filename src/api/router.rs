@@ -326,7 +326,10 @@ pub fn create_api_router(
             Method::OPTIONS,
         ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
-        .allow_credentials(true);
+        .allow_credentials(true)
+        // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
+        // re-issue an OPTIONS before every credentialed request (PMS-389).
+        .max_age(std::time::Duration::from_secs(600));
 
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
