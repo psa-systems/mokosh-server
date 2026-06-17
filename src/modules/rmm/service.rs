@@ -386,6 +386,65 @@ impl RmmService {
         })
     }
 
+    /// `GET`-style fetch of a single device mapping. Returns 404 when
+    /// the row does not exist in the caller's tenant. Used by
+    /// [`Self::update_device_mapping`] to return post-update state.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_device_mapping(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<RmmDeviceMappingResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<DevMapRow> = sqlx::query_as(
+            r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
+                      device_name, last_seen, sync_status
+               FROM rmm_device_mappings WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.map(Into::into)
+            .ok_or_else(|| AppError::NotFound("RmmDeviceMapping".to_string()))
+    }
+
+    /// `PUT /api/v1/rmm/device-mappings/{id}`. Missing fields on the
+    /// request leave the existing column value untouched (COALESCE),
+    /// matching the connection update semantics. `rmm_connection_id` is
+    /// not editable. The returned row reflects post-update state.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_device_mapping(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpdateRmmDeviceMappingRequest,
+    ) -> AppResult<RmmDeviceMappingResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query(
+            r#"UPDATE rmm_device_mappings SET
+                 rmm_device_id = COALESCE($1, rmm_device_id),
+                 asset_id = COALESCE($2, asset_id),
+                 company_id = COALESCE($3, company_id),
+                 device_name = COALESCE($4, device_name)
+               WHERE tenant_id = $5 AND id = $6"#,
+        )
+        .bind(request.rmm_device_id.as_deref())
+        .bind(request.asset_id)
+        .bind(request.company_id)
+        .bind(request.device_name.as_deref())
+        .bind(tenant_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("RmmDeviceMapping".to_string()));
+        }
+        tx.commit().await?;
+        self.get_device_mapping(tenant_id, id).await
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_device_mapping(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -515,6 +574,71 @@ impl RmmService {
             queue_id: request.queue_id,
             is_active: request.is_active,
         })
+    }
+
+    /// `GET`-style fetch of a single alert rule. Returns 404 when the
+    /// row does not exist in the caller's tenant. Used by
+    /// [`Self::update_alert_rule`] to return post-update state.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_alert_rule(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<RmmAlertRuleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<AlertRuleRow> = sqlx::query_as(
+            r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
+                      assign_to_id, queue_id, is_active, ticket_template, suppression_rules
+               FROM rmm_alert_rules WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.map(Into::into)
+            .ok_or_else(|| AppError::NotFound("RmmAlertRule".to_string()))
+    }
+
+    /// `PUT /api/v1/rmm/alert-rules/{id}`. Missing fields on the request
+    /// leave the existing column value untouched (COALESCE), matching the
+    /// connection update semantics. `rmm_connection_id` is not editable.
+    /// The returned row reflects post-update state.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_alert_rule(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpdateRmmAlertRuleRequest,
+    ) -> AppResult<RmmAlertRuleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query(
+            r#"UPDATE rmm_alert_rules SET
+                 name = COALESCE($1, name),
+                 alert_type = COALESCE($2, alert_type),
+                 auto_create_ticket = COALESCE($3, auto_create_ticket),
+                 assign_to_id = COALESCE($4, assign_to_id),
+                 queue_id = COALESCE($5, queue_id),
+                 ticket_template = COALESCE($6, ticket_template),
+                 is_active = COALESCE($7, is_active)
+               WHERE tenant_id = $8 AND id = $9"#,
+        )
+        .bind(request.name.as_deref())
+        .bind(request.alert_type.as_deref())
+        .bind(request.auto_create_ticket)
+        .bind(request.assign_to_id)
+        .bind(request.queue_id)
+        .bind(request.ticket_template.as_ref())
+        .bind(request.is_active)
+        .bind(tenant_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("RmmAlertRule".to_string()));
+        }
+        tx.commit().await?;
+        self.get_alert_rule(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
