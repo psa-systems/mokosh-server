@@ -75,7 +75,8 @@ fn demo_contact(
     title: &str,
 ) -> CreateContactRequest {
     CreateContactRequest {
-        company_id,
+        company_id: Some(company_id),
+        company_name: None,
         first_name: first_name.to_string(),
         last_name: last_name.to_string(),
         email: Some(email.to_string()),

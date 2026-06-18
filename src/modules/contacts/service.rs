@@ -874,8 +874,21 @@ impl ContactService {
         request: &CreateContactRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Contact> {
-        // Verify company exists
-        self.get_company(tenant_id, request.company_id).await?;
+        // PMS-402: only verify a CRM company exists when one is linked. A
+        // freeform or company-less contact skips the existence check.
+        if let Some(company_id) = request.company_id {
+            self.get_company(tenant_id, company_id).await?;
+        }
+
+        // PMS-402: the stored freeform name is mutually exclusive with the FK.
+        // When company_id is set, the CRM name is authoritative (resolved via
+        // the read-side join), so persist NULL; otherwise store the freeform
+        // label. An empty freeform string normalizes to NULL.
+        let stored_company_name: Option<&str> = if request.company_id.is_some() {
+            None
+        } else {
+            request.company_name.as_deref().filter(|s| !s.is_empty())
+        };
 
         let contact_id = Uuid::new_v4();
         let timezone = request
@@ -890,17 +903,18 @@ impl ContactService {
         sqlx::query(
             r#"
             INSERT INTO contacts (
-                id, tenant_id, company_id, first_name, last_name, email,
+                id, tenant_id, company_id, company_name, first_name, last_name, email,
                 phone, mobile, fax, title, department, contact_type,
                 preferred_contact_method, timezone, custom_fields, tags, notes
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
             )
             "#,
         )
         .bind(contact_id)
         .bind(tenant_id)
         .bind(request.company_id)
+        .bind(stored_company_name)
         .bind(&request.first_name)
         .bind(&request.last_name)
         .bind(&request.email)
@@ -975,7 +989,7 @@ impl ContactService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ContactRow>(
             r#"
-            SELECT c.id, c.tenant_id, c.company_id, co.name AS company_name,
+            SELECT c.id, c.tenant_id, c.company_id, COALESCE(co.name, c.company_name) AS company_name,
                    c.first_name, c.last_name, c.email,
                    c.phone, c.mobile, c.fax, c.title, c.department, c.contact_type,
                    c.is_portal_user, c.portal_user_id, c.preferred_contact_method,
@@ -1059,7 +1073,7 @@ impl ContactService {
 
         let query = format!(
             r#"
-            SELECT c.id, c.tenant_id, c.company_id, co.name AS company_name,
+            SELECT c.id, c.tenant_id, c.company_id, COALESCE(co.name, c.company_name) AS company_name,
                    c.first_name, c.last_name, c.email,
                    c.phone, c.mobile, c.fax, c.title, c.department, c.contact_type,
                    c.is_portal_user, c.portal_user_id, c.preferred_contact_method,
@@ -1127,7 +1141,7 @@ impl ContactService {
 
         let rows = sqlx::query_as::<_, ContactRow>(
             r#"
-            SELECT c.id, c.tenant_id, c.company_id, co.name AS company_name,
+            SELECT c.id, c.tenant_id, c.company_id, COALESCE(co.name, c.company_name) AS company_name,
                    c.first_name, c.last_name, c.email,
                    c.phone, c.mobile, c.fax, c.title, c.department, c.contact_type,
                    c.is_portal_user, c.portal_user_id, c.preferred_contact_method,
@@ -1187,8 +1201,26 @@ impl ContactService {
         let mut updates = vec!["updated_at = NOW()".to_string()];
         let mut param_idx = 3;
 
+        // PMS-402: the FK and the freeform name are mutually exclusive.
+        // Setting company_id makes the CRM name authoritative, so clear the
+        // stored freeform name in the same statement (no bind needed, it is a
+        // literal NULL). Otherwise, an explicit company_name is persisted
+        // (empty string normalizes to NULL via `stored_company_name` below).
+        let stored_company_name: Option<Option<&str>> = if request.company_id.is_some() {
+            None
+        } else {
+            request
+                .company_name
+                .as_deref()
+                .map(|s| if s.is_empty() { None } else { Some(s) })
+        };
+
         if request.company_id.is_some() {
             updates.push(format!("company_id = ${param_idx}"));
+            param_idx += 1;
+            updates.push("company_name = NULL".to_string());
+        } else if stored_company_name.is_some() {
+            updates.push(format!("company_name = ${param_idx}"));
             param_idx += 1;
         }
         if request.first_name.is_some() {
@@ -1268,6 +1300,11 @@ impl ContactService {
 
         if let Some(cid) = request.company_id {
             q = q.bind(cid);
+        } else if let Some(name) = stored_company_name {
+            // PMS-402: bind the normalized freeform name ($param after the
+            // omitted company_id). `None` here means the caller passed an
+            // empty string to clear it.
+            q = q.bind(name);
         }
         if let Some(ref first_name) = request.first_name {
             q = q.bind(first_name);
@@ -1872,9 +1909,11 @@ struct CompanyRollupRow {
 struct ContactRow {
     id: Uuid,
     tenant_id: Uuid,
-    company_id: Uuid,
-    // PMS-334: resolved from the LEFT JOIN to companies in the read
-    // queries; populates Contact.company_name so the API DTO carries it.
+    // PMS-402: nullable; None for a freeform or company-less contact.
+    company_id: Option<Uuid>,
+    // PMS-334 / PMS-402: resolved via COALESCE(co.name, c.company_name) in
+    // the read queries, so it carries the joined CRM name when company_id is
+    // set and the stored freeform value otherwise.
     company_name: Option<String>,
     first_name: String,
     last_name: String,
