@@ -889,6 +889,132 @@ async fn create_task_audit_failure_rolls_back_the_task(pool: PgPool) {
     assert_eq!(audit_count, 0, "no create audit row survives the rollback");
 }
 
+/// PMS-399: a cancelled project rejects task and phase creation with 409, the
+/// status check runs before any insert, and a missing project is 404. An active
+/// project still accepts both children (the guard scopes strictly to the
+/// create/attach paths and never blocks an open project).
+#[sqlx::test]
+async fn cancelled_project_rejects_task_and_phase_creation(pool: PgPool) {
+    let probe = pool.clone();
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Cancelled Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    let status_id = first_task_status(&app, &token).await;
+
+    // A cancelled project.
+    let cancelled: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Dead Project", "company_id": company, "status": "cancelled" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let cancelled_id = cancelled["id"].as_str().expect("project id").to_string();
+
+    // Task creation against it is rejected with 409.
+    let task = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{cancelled_id}/tasks"),
+        serde_json::json!({ "title": "Should not exist", "status_id": status_id }),
+    )
+    .await;
+    assert_eq!(
+        task.status(),
+        reqwest::StatusCode::CONFLICT,
+        "creating a task on a cancelled project must 409"
+    );
+
+    // Phase creation against it is rejected with 409.
+    let phase = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{cancelled_id}/phases"),
+        serde_json::json!({ "name": "Should not exist", "sort_order": 1 }),
+    )
+    .await;
+    assert_eq!(
+        phase.status(),
+        reqwest::StatusCode::CONFLICT,
+        "creating a phase on a cancelled project must 409"
+    );
+
+    // The status check runs before the insert: neither child row landed.
+    let cancelled_uuid = Uuid::parse_str(&cancelled_id).unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE project_id = $1")
+        .bind(cancelled_uuid)
+        .fetch_one(&probe)
+        .await
+        .expect("count tasks");
+    assert_eq!(task_count, 0, "no task row inserted on a cancelled project");
+    let phase_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM project_phases WHERE project_id = $1")
+            .bind(cancelled_uuid)
+            .fetch_one(&probe)
+            .await
+            .expect("count phases");
+    assert_eq!(
+        phase_count, 0,
+        "no phase row inserted on a cancelled project"
+    );
+
+    // A missing project is a 404, not a 409.
+    let missing_id = Uuid::new_v4();
+    let missing = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{missing_id}/tasks"),
+        serde_json::json!({ "title": "Orphan", "status_id": status_id }),
+    )
+    .await;
+    assert_eq!(
+        missing.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "creating a task on a non-existent project must 404"
+    );
+
+    // An active project still accepts both children (guard does not over-block).
+    let active: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Live Project", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let active_id = active["id"].as_str().expect("project id").to_string();
+    let ok_task = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{active_id}/tasks"),
+        serde_json::json!({ "title": "Real work", "status_id": status_id }),
+    )
+    .await;
+    assert!(
+        ok_task.status().is_success(),
+        "an active project still accepts task creation, got {}",
+        ok_task.status()
+    );
+    let ok_phase = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{active_id}/phases"),
+        serde_json::json!({ "name": "Design", "sort_order": 1 }),
+    )
+    .await;
+    assert!(
+        ok_phase.status().is_success(),
+        "an active project still accepts phase creation, got {}",
+        ok_phase.status()
+    );
+}
+
 // ============================================================================
 // PMS-322: project_types lookup table + CRUD.
 // ============================================================================
