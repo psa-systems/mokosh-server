@@ -354,6 +354,33 @@ impl ProjectsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// PMS-399: pre-flight guard for the child-create/attach paths. A task or
+    /// phase must not be attached to a project whose `status = 'cancelled'`
+    /// (British spelling, matching the migration 007 CHECK set). Runs inside
+    /// the caller's tenant-scoped tx so the status read and the subsequent
+    /// INSERT share one transaction (the RLS GUC is set for both). A missing
+    /// row is a 404; a cancelled project is a 409.
+    async fn ensure_project_open(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        project_id: Uuid,
+    ) -> AppResult<()> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM projects WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(project_id)
+                .fetch_optional(tx)
+                .await?;
+        match status {
+            None => Err(AppError::NotFound("Project".to_string())),
+            Some(s) if s == "cancelled" => Err(AppError::Conflict(
+                "Cannot add items to a cancelled project".to_string(),
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_project_phase(
         &self,
@@ -364,6 +391,8 @@ impl ProjectsService {
     ) -> AppResult<ProjectPhaseResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        self.ensure_project_open(&mut tx, tenant_id, project_id)
+            .await?; // &mut tx auto-derefs to &mut PgConnection
         sqlx::query(
             r#"INSERT INTO project_phases (id, tenant_id, project_id, name, description, sort_order, start_date, end_date, status)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
@@ -843,6 +872,8 @@ impl ProjectsService {
             }
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        self.ensure_project_open(&mut tx, tenant_id, project_id)
+            .await?; // &mut tx auto-derefs to &mut PgConnection
         sqlx::query(
             r#"INSERT INTO tasks (id, tenant_id, project_id, phase_id, parent_task_id, title,
                                   description, status_id, priority, assigned_to_id,
