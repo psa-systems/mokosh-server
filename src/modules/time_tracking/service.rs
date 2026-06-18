@@ -736,7 +736,11 @@ impl TimeTrackingService {
         let anchor = monday_anchor(week_start);
         let week_end = anchor + chrono::Duration::days(7);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+        // RETURNING the rows that actually transitioned (approval_status was
+        // 'pending') gives us exactly the set to consume hours for, and the
+        // `pending` guard makes re-approval idempotent: a second call returns
+        // no rows, so consume_hours is not double-counted (PMS-405).
+        let approved = sqlx::query_as::<_, ConsumeRow>(
             r#"
             UPDATE time_entries
             SET approval_status = 'approved',
@@ -756,6 +760,7 @@ impl TimeTrackingService {
               AND date     >= $3
               AND date      < $4
               AND approval_status = 'pending'
+            RETURNING contract_id, duration_minutes, date, is_billable
             "#,
         )
         .bind(tenant_id)
@@ -763,10 +768,66 @@ impl TimeTrackingService {
         .bind(anchor)
         .bind(week_end)
         .bind(approver_id)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
+
+        // PMS-405: approval is the consumption point. For every entry that
+        // just flipped to approved and is billable against a contract, draw
+        // its hours from the contract's block-hours balance for the period
+        // covering the entry date. Hours past the included allotment become
+        // a non-zero overage on the returned ConsumeOutcome (persisted via
+        // the debited contract_hour_balances row).
+        self.consume_approved_hours(tenant_id, &approved).await?;
+
         self.week_summary(tenant_id, user_id, anchor).await
+    }
+
+    /// Draw approved billable hours against their contracts' block-hours
+    /// balances (PMS-405). Runs after the approval commit so each
+    /// [`ContractsService::consume_hours`] manages its own transaction.
+    /// Non-billable entries and entries without a `contract_id` are skipped.
+    async fn consume_approved_hours(
+        &self,
+        tenant_id: TenantId,
+        approved: &[ConsumeRow],
+    ) -> AppResult<()> {
+        let contracts = crate::modules::contracts::ContractsService::new(self.db.clone());
+        for entry in approved {
+            let Some(contract_id) = entry.contract_id else {
+                continue;
+            };
+            if !entry.is_billable.unwrap_or(false) {
+                continue;
+            }
+            // duration_minutes -> Decimal hours (minutes / 60).
+            let hours = Decimal::from(entry.duration_minutes) / Decimal::from(60);
+            if hours <= Decimal::ZERO {
+                continue;
+            }
+            // Period is anchored on the entry's date (midnight UTC).
+            let when = entry
+                .date
+                .and_hms_opt(0, 0, 0)
+                .map(|naive| naive.and_utc())
+                .unwrap_or_else(Utc::now);
+            let outcome = contracts
+                .consume_hours(tenant_id, contract_id, hours, when)
+                .await?;
+            if outcome.overage_hours > Decimal::ZERO {
+                // The overage is persisted in the debited balance row; surface
+                // it here so the recurring-invoice path / a follow-up can bill
+                // it (PMS-405). At minimum it is not silently dropped.
+                tracing::info!(
+                    contract_id = %contract_id,
+                    overage_hours = %outcome.overage_hours,
+                    overage_amount = %outcome.overage_amount,
+                    balance_id = %outcome.balance_id,
+                    "time approval produced contract hour overage"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Reject every pending entry in the user's week with a reason. Manager+
@@ -1527,6 +1588,16 @@ fn resolve_billing(
         None
     };
     (rate, total)
+}
+
+/// Minimal projection of a time entry that just transitioned to approved,
+/// used to drive contract hour consumption (PMS-405).
+#[derive(sqlx::FromRow)]
+struct ConsumeRow {
+    contract_id: Option<Uuid>,
+    duration_minutes: i32,
+    date: NaiveDate,
+    is_billable: Option<bool>,
 }
 
 #[derive(sqlx::FromRow)]
