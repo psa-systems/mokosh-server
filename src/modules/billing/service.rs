@@ -1,7 +1,9 @@
 //! Billing service. Endpoints land incrementally across PMS-33.
 
 use crate::modules::auth::TenantId;
-use chrono::{DateTime, Months, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+
+use crate::modules::contracts::service::CycleStep;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -2222,24 +2224,13 @@ struct RecurringItemRow {
     unit_price: Decimal,
 }
 
-/// Number of whole months in one billing period for the given cycle.
-/// `None` for `one_time` / unknown cycles (the caller skips them).
-fn cycle_months(billing_cycle: &str) -> Option<u32> {
-    match billing_cycle {
-        "monthly" => Some(1),
-        "quarterly" => Some(3),
-        "annually" => Some(12),
-        // `one_time` is filtered out upstream; treat any other value as
-        // non-recurring so an unexpected cycle never bills.
-        _ => None,
-    }
-}
-
 /// Compute the current billing period `[period_start, period_end]` for a
 /// contract, anchored at `start_date` and stepped by the `billing_cycle`
 /// length, such that `period_start <= today` and `today <= period_end`.
 ///
 /// Periods tile forward from `start_date` with no gaps:
+///   weekly   : start, start+7d, start+14d, ...
+///   bi_weekly: start, start+14d, ...
 ///   monthly  : start, start+1mo, start+2mo, ...
 ///   quarterly: start, start+3mo, ...
 ///   annually : start, start+12mo, ...
@@ -2248,9 +2239,11 @@ fn cycle_months(billing_cycle: &str) -> Option<u32> {
 /// Returns `None` when `today < start_date` (no period has begun yet) or
 /// the cycle is non-recurring / unknown.
 ///
-/// Month arithmetic uses `chrono::Months`, which clamps end-of-month
-/// overflow (e.g. Jan 31 + 1 month -> Feb 28/29), so a contract that
-/// starts on the 31st still produces one period per cycle.
+/// Sub-month cycles (`weekly`/`bi_weekly`) step by whole days via
+/// `chrono::Days`; month-or-longer cycles step via `chrono::Months`,
+/// which clamps end-of-month overflow (e.g. Jan 31 + 1 month ->
+/// Feb 28/29), so a contract that starts on the 31st still produces one
+/// period per cycle (PMS-404).
 fn current_billing_period(
     billing_cycle: &str,
     start_date: NaiveDate,
@@ -2259,10 +2252,7 @@ fn current_billing_period(
     if today < start_date {
         return None;
     }
-    let step = cycle_months(billing_cycle)?;
-    if step == 0 {
-        return None;
-    }
+    let step = CycleStep::from_cycle(billing_cycle)?;
 
     // Walk forward from start_date one cycle at a time until the next
     // boundary would pass `today`. Bounded by the number of cycles
@@ -2270,23 +2260,17 @@ fn current_billing_period(
     // even on clamped month math.
     let mut period_start = start_date;
     loop {
-        let next = period_start.checked_add_months(Months::new(step))?;
+        let next = step.advance(period_start)?;
+        if next <= period_start {
+            // Overflow / non-advancing guard: stop walking.
+            return None;
+        }
         if next > today {
             // `period_end` is the day before the next period starts.
             let period_end = next.pred_opt().unwrap_or(next);
             return Some((period_start, period_end));
         }
         period_start = next;
-        // Defensive guard against a pathological non-advancing step
-        // (cannot happen for step >= 1, but keeps the loop provably
-        // terminating).
-        if period_start > today {
-            let period_end = period_start
-                .checked_add_months(Months::new(step))
-                .and_then(|d| d.pred_opt())
-                .unwrap_or(period_start);
-            return Some((period_start, period_end));
-        }
     }
 }
 

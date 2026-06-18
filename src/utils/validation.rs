@@ -171,7 +171,14 @@ pub fn validate_contract_status(value: &str) -> Result<(), ValidationError> {
 /// carrying an out-of-set value is rejected with a 422 at the request layer
 /// instead of hitting the constraint and surfacing as a 500 DATABASE_ERROR
 /// (PMS-337).
-pub const BILLING_CYCLES: [&str; 4] = ["monthly", "quarterly", "annually", "one_time"];
+pub const BILLING_CYCLES: [&str; 6] = [
+    "monthly",
+    "quarterly",
+    "annually",
+    "one_time",
+    "weekly",
+    "bi_weekly",
+];
 
 /// Validate a billing cycle against the set the DB CHECK constraint allows.
 /// The `billing_cycle` field deserializes as a free `String`, so an unknown
@@ -522,9 +529,12 @@ mod tests {
         assert!(validate_billing_cycle("quarterly").is_ok());
         assert!(validate_billing_cycle("annually").is_ok());
         assert!(validate_billing_cycle("one_time").is_ok());
+        // PMS-404: sub-month cycles are now accepted.
+        assert!(validate_billing_cycle("weekly").is_ok());
+        assert!(validate_billing_cycle("bi_weekly").is_ok());
         // Values that passed deserialization but caused a 500 before.
-        assert!(validate_billing_cycle("weekly").is_err());
         assert!(validate_billing_cycle("yearly").is_err());
+        assert!(validate_billing_cycle("biweekly").is_err());
         assert!(validate_billing_cycle("").is_err());
     }
 
