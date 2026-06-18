@@ -310,13 +310,19 @@ async fn approving_time_consumes_contract_hours_with_overage(pool: PgPool) {
     .await;
 
     let work_type = seed_work_type(&pool).await;
-    let (user, _, _) =
-        common::seed_user(&pool, tenant, "tt-405@example.com", "technician").await;
+    let (user, _, _) = common::seed_user(&pool, tenant, "tt-405@example.com", "technician").await;
 
     // Two billable entries (8h + 5h = 13h) against the contract, plus one
     // non-billable entry that must NOT consume, all in the same week.
     seed_time_entry(
-        &pool, user, company, work_type, Some(contract), monday, 480, true,
+        &pool,
+        user,
+        company,
+        work_type,
+        Some(contract),
+        monday,
+        480,
+        true,
     )
     .await;
     seed_time_entry(
@@ -401,12 +407,18 @@ async fn approving_time_within_allotment_decrements_balance(pool: PgPool) {
     )
     .await;
     let work_type = seed_work_type(&pool).await;
-    let (user, _, _) =
-        common::seed_user(&pool, tenant, "tt-405b@example.com", "technician").await;
+    let (user, _, _) = common::seed_user(&pool, tenant, "tt-405b@example.com", "technician").await;
 
     // 4 billable hours against a 10h allotment.
     seed_time_entry(
-        &pool, user, company, work_type, Some(contract), monday, 240, true,
+        &pool,
+        user,
+        company,
+        work_type,
+        Some(contract),
+        monday,
+        240,
+        true,
     )
     .await;
 
