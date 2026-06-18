@@ -945,12 +945,11 @@ async fn cancelled_project_rejects_task_and_phase_creation(pool: PgPool) {
 
     // The status check runs before the insert: neither child row landed.
     let cancelled_uuid = Uuid::parse_str(&cancelled_id).unwrap();
-    let task_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE project_id = $1")
-            .bind(cancelled_uuid)
-            .fetch_one(&probe)
-            .await
-            .expect("count tasks");
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE project_id = $1")
+        .bind(cancelled_uuid)
+        .fetch_one(&probe)
+        .await
+        .expect("count tasks");
     assert_eq!(task_count, 0, "no task row inserted on a cancelled project");
     let phase_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM project_phases WHERE project_id = $1")
