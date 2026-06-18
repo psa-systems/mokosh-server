@@ -213,6 +213,13 @@ pub struct CurrentUser {
     /// accent. Capped server-side at 32 chars.
     #[serde(default)]
     pub theme_accent_id: Option<String>,
+    /// PMS-413: the tenant's own-company id, used by the SPA to attribute
+    /// general / overhead time entries (no customer to bill). Tenant-scoped
+    /// (same for every user in the tenant). `None` only on a tenant that
+    /// predates the backfill and has not yet been provisioned; the default
+    /// `None` keeps old responses / fixtures deserialising cleanly.
+    #[serde(default)]
+    pub own_company_id: Option<Uuid>,
 }
 
 impl CurrentUser {
@@ -271,6 +278,12 @@ pub struct User {
     /// `first_name` and `last_name`. See migration
     /// `046_users_profile_completed_at.sql`.
     pub profile_completed_at: Option<DateTime<Utc>>,
+    /// PMS-413: the owning tenant's own-company id (a tenant-level attribute
+    /// surfaced on the user payload so the SPA reads it without an extra
+    /// round-trip). Populated by a correlated subquery against `tenants` in the
+    /// user-load queries. See [`CurrentUser::own_company_id`].
+    #[serde(default)]
+    pub own_company_id: Option<Uuid>,
 }
 
 impl User {
@@ -289,6 +302,7 @@ impl User {
             date_format_string: self.date_format_string.clone(),
             theme_base_mode: self.theme_base_mode.clone(),
             theme_accent_id: self.theme_accent_id.clone(),
+            own_company_id: self.own_company_id,
         }
     }
 }
@@ -563,6 +577,12 @@ pub struct UserResponse {
     /// `true` once first + last name were confirmed via onboarding.
     /// SPAs gate their non-onboarding routes on this.
     pub profile_completed: bool,
+    /// PMS-413: the owning tenant's own-company id. Returned on
+    /// `GET /api/v1/auth/me` (which serialises this type) so the SPA can
+    /// attribute general / overhead time entries without an extra round-trip.
+    /// See [`CurrentUser::own_company_id`].
+    #[serde(default)]
+    pub own_company_id: Option<Uuid>,
 }
 
 impl From<User> for UserResponse {
@@ -587,6 +607,7 @@ impl From<User> for UserResponse {
             last_login_at: user.last_login_at,
             created_at: user.created_at,
             profile_completed: user.profile_completed_at.is_some(),
+            own_company_id: user.own_company_id,
         }
     }
 }
@@ -765,6 +786,7 @@ mod tests {
             date_format_string: None,
             theme_base_mode: None,
             theme_accent_id: None,
+            own_company_id: None,
         };
         let tenant_id = user.tenant_id;
 
@@ -789,6 +811,7 @@ mod tests {
             date_format_string: None,
             theme_base_mode: None,
             theme_accent_id: None,
+            own_company_id: None,
         };
         let tenant_id = user.tenant_id;
         let state = AuthState::authenticated(user, tenant_id);
@@ -813,6 +836,7 @@ mod tests {
             date_format_string: None,
             theme_base_mode: None,
             theme_accent_id: None,
+            own_company_id: None,
         };
 
         assert_eq!(user.full_name(), "John Doe");
@@ -833,6 +857,7 @@ mod tests {
             date_format_string: None,
             theme_base_mode: None,
             theme_accent_id: None,
+            own_company_id: None,
         };
 
         assert_eq!(user.initials(), "JD");
@@ -856,6 +881,7 @@ mod tests {
             date_format_string: None,
             theme_base_mode: None,
             theme_accent_id: None,
+            own_company_id: None,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
@@ -880,6 +906,7 @@ mod tests {
             date_format_string: None,
             theme_base_mode: None,
             theme_accent_id: None,
+            own_company_id: None,
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);

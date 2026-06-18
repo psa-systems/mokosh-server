@@ -100,6 +100,10 @@ pub fn current_user_from_at_jwt(v: &VerifiedAtJwt) -> CurrentUser {
         date_format_string: None,
         theme_base_mode: None,
         theme_accent_id: None,
+        // PMS-413: the lazy middleware view carries no tenant-level own-company
+        // lookup. The SPA reads the authoritative value from
+        // `GET /api/v1/auth/me`, which hits the DB. `None` here is harmless.
+        own_company_id: None,
     }
 }
 

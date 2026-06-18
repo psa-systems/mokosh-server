@@ -1202,3 +1202,79 @@ async fn company_address_validation(pool: PgPool) {
         ok.status()
     );
 }
+
+/// PMS-413: an `internal` own-company is excluded from the default
+/// `GET /contacts/companies` customer list (so it never appears as a fake
+/// client in pickers), but a direct lookup by id still resolves it.
+#[sqlx::test]
+async fn internal_company_hidden_from_list_but_resolvable_by_id(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+
+    // Seed one real client and one internal own-company directly. The API
+    // exposes no path to create an internal company, which is intended.
+    let client_id = create_company_row(&pool, "Acme Client", "client").await;
+    let internal_id = create_company_row(&pool, "Tenant Own Co", "internal").await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Default list: client visible, internal hidden.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contacts/companies"))
+        .query(&[("per_page", "50")])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list companies");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("list JSON");
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.contains(&client_id),
+        "client company appears in the list"
+    );
+    assert!(
+        !ids.contains(&internal_id),
+        "internal own-company must NOT appear in the default customer list"
+    );
+
+    // Lookup by id still resolves the internal company.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{internal_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get internal company");
+    assert_eq!(
+        get_resp.status(),
+        reqwest::StatusCode::OK,
+        "internal company resolves by id"
+    );
+    let got: serde_json::Value = get_resp.json().await.expect("get JSON");
+    assert_eq!(got["company_type"].as_str(), Some("internal"));
+}
+
+/// Insert a company row of a given `company_type` directly under the default
+/// tenant; returns its id as a string. Used to seed an `internal` company,
+/// which the API has no create path for.
+async fn create_company_row(pool: &PgPool, name: &str, company_type: &str) -> String {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO companies (id, tenant_id, name, company_type) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(name)
+    .bind(company_type)
+    .execute(pool)
+    .await
+    .expect("insert company row");
+    id.to_string()
+}

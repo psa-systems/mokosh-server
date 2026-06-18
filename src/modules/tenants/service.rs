@@ -156,6 +156,10 @@ impl TenantService {
         // Copy default configuration from default tenant
         self.copy_default_config(tenant_id).await?;
 
+        // PMS-413: every tenant gets an internal "own company" so general /
+        // overhead time entries have a stable company_id. Idempotent.
+        self.ensure_own_company(tenant_id).await?;
+
         // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
         // is the same minted id, bridged via `from_trusted`.
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
@@ -213,7 +217,13 @@ impl TenantService {
 
         // Lookup/config set (ticket statuses/priorities/queues/types/...).
         // Idempotent: copy_default_config early-returns when already seeded.
-        self.copy_default_config(tenant_id).await
+        self.copy_default_config(tenant_id).await?;
+
+        // PMS-413: a tenant a user lands in off the bunyip placement path (an
+        // org tenant created via auth/SSO, or a manually-created tenant) may
+        // never have run create_tenant, so ensure its own-company here too.
+        // Idempotent: a no-op once own_company_id is set.
+        self.ensure_own_company(tenant_id).await
     }
 
     /// Find-or-provision the `personal` tenant owned by `owner_id` (PMS-244).
@@ -276,6 +286,9 @@ impl TenantService {
                 .await?;
                 tx.commit().await?;
                 self.copy_default_config(id).await?;
+                // PMS-413: give the personal tenant its internal own-company so
+                // general / overhead time logging works out of the box.
+                self.ensure_own_company(id).await?;
                 tracing::info!(tenant_id = %id, owner_id = %owner_id, "provisioned personal tenant");
                 Ok(id)
             }
@@ -542,6 +555,78 @@ impl TenantService {
     // delegate to SettingsService (see modules/tenants/routes.rs)
     // so there is one canonical writer for `module_config`. The
     // duplicate methods were removed.
+
+    /// Idempotently ensure `tenant_id` has an `internal` "own company" and that
+    /// `tenants.own_company_id` points at it (PMS-413).
+    ///
+    /// A general / overhead time entry has no customer to bill, so the SPA needs
+    /// a stable company id to send; this is it. Created once per tenant, named
+    /// after the tenant. Mirrors the backfill in migration `062`: it only
+    /// creates + links when `own_company_id` is still NULL, so a re-run (or a
+    /// tenant already backfilled by the migration) is a no-op.
+    ///
+    /// SAFETY (PMS-285): runs on the provisioning paths (`create_tenant`,
+    /// `ensure_personal_tenant`, `ensure_default_config`). The `tenants` row is
+    /// the RLS-exempt isolation root and the `companies` insert is RLS-covered,
+    /// so the whole unit runs under the new tenant's GUC tx (`begin_with_tenant`)
+    /// so the companies WITH CHECK policy passes; the `tenants` update is exempt
+    /// regardless. The guard + single tx keep concurrent provisioning races
+    /// converging on one own-company.
+    pub async fn ensure_own_company(&self, tenant_id: Uuid) -> AppResult<()> {
+        // Cheap guard so the already-provisioned common case skips the write tx.
+        // `tenants` is RLS-exempt, so this reads safely on the app pool.
+        let already_linked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tenants WHERE id = $1 AND own_company_id IS NOT NULL)",
+        )
+        .bind(tenant_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if already_linked {
+            return Ok(());
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Re-read the tenant name + own_company_id under the tx so a concurrent
+        // provisioner that won the race is observed (the WHERE guard below then
+        // updates nothing). The tenant always exists on these paths.
+        let row: Option<(String, Option<Uuid>)> =
+            sqlx::query_as("SELECT name, own_company_id FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let (tenant_name, existing) = match row {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        if existing.is_some() {
+            return Ok(());
+        }
+
+        let company_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO companies (id, tenant_id, name, company_type, status) \
+             VALUES ($1, $2, $3, 'internal', 'active')",
+        )
+        .bind(company_id)
+        .bind(tenant_id)
+        .bind(&tenant_name)
+        .execute(&mut *tx)
+        .await?;
+
+        // Link only while still NULL so a concurrent winner is not clobbered.
+        sqlx::query(
+            "UPDATE tenants SET own_company_id = $2, updated_at = NOW() \
+             WHERE id = $1 AND own_company_id IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
 
     /// Seed a freshly provisioned tenant with the full default set of
     /// user-editable lookup / configuration rows, scoped to that tenant.

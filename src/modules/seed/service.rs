@@ -201,11 +201,13 @@ impl SeedService {
 
     async fn tenant_has_companies(&self, tenant_id: Uuid) -> AppResult<bool> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1)")
-                .bind(tenant_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1 \
+                 AND company_type <> 'internal')",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
         Ok(exists)
     }
 

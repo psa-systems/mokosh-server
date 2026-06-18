@@ -999,3 +999,76 @@ async fn time_entry_response_carries_work_item_names(pool: PgPool) {
         .expect("project entry listed");
     assert_eq!(listed_project["task_title"].as_str(), Some("Build"));
 }
+
+/// PMS-413: a general / overhead time entry can be created against the
+/// tenant's own-company id (no ticket, no project). The migration 062 backfill
+/// sets `tenants.own_company_id` for the default tenant, so it is available
+/// without going through tenant provisioning. The entry classifies as
+/// `general` and points at the own-company.
+#[sqlx::test]
+async fn general_time_entry_against_own_company(pool: PgPool) {
+    let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+
+    // The own-company id the SPA would read from /auth/me, here from the row
+    // the migration backfilled.
+    let own_company_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read default tenant own_company_id");
+    let own_company_id = own_company_id.expect("default tenant backfilled with an own-company");
+
+    let app = common::boot(pool).await;
+    let admin_token = common::login(&app, &admin_email, &admin_pw).await;
+
+    let work_types: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/work-types"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("list work types")
+        .json()
+        .await
+        .expect("work types JSON");
+    let work_type_id = work_types["data"][0]["id"]
+        .as_str()
+        .expect("seed has at least one work type")
+        .to_string();
+
+    // General entry: own-company, no ticket/project. work_category derives to
+    // "general".
+    let resp = app
+        .client
+        .post(app.url("/api/v1/time-entries"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "user_id": admin_id,
+            "date": "2026-06-18",
+            "duration_minutes": 30,
+            "work_type_id": work_type_id,
+            "company_id": own_company_id,
+            "notes": "Internal planning",
+        }))
+        .send()
+        .await
+        .expect("create general time entry");
+    let status = resp.status();
+    let text = resp.text().await.expect("entry body");
+    assert!(
+        status.is_success(),
+        "general entry should 2xx, got {status} body={text}"
+    );
+    let entry: serde_json::Value = serde_json::from_str(&text).expect("entry JSON");
+    assert_eq!(
+        entry["company_id"].as_str(),
+        Some(own_company_id.to_string().as_str()),
+        "entry attributed to the own-company"
+    );
+    assert_eq!(
+        entry["work_category"].as_str(),
+        Some("general"),
+        "entry classifies as general"
+    );
+}
