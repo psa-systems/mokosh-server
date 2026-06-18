@@ -31,9 +31,9 @@ async fn company_count(pool: &PgPool, tenant: Uuid) -> i64 {
         "SELECT COUNT(*) FROM companies WHERE tenant_id = $1 AND company_type <> 'internal'",
     )
     .bind(tenant)
-        .fetch_one(pool)
-        .await
-        .expect("count companies")
+    .fetch_one(pool)
+    .await
+    .expect("count companies")
 }
 
 async fn contact_count(pool: &PgPool, tenant: Uuid) -> i64 {
