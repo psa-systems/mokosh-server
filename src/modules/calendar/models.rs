@@ -264,6 +264,89 @@ pub struct DispatchResponse {
     pub on_call: Vec<OnCallNowResponse>,
 }
 
+// ============================================================================
+// Scheduling templates (PMS-403)
+// ============================================================================
+
+/// A reusable, named scheduling shape. Two kinds: `dispatch` (on-site work,
+/// with optional pre/post travel buffers) and `calendar` (client interactions
+/// and status updates). A template carries a default duration, type, travel
+/// buffers and optional defaults so the frontend can pre-fill an appointment
+/// from `template + start_time`. The template is not itself an appointment and
+/// has no fixed start time. `tenant_id` is intentionally omitted from the wire
+/// shape (the row is already tenant-scoped server-side).
+#[derive(Debug, Clone, Serialize)]
+pub struct SchedulingTemplateResponse {
+    pub id: Uuid,
+    pub name: String,
+    /// `dispatch` | `calendar`.
+    pub kind: String,
+    /// `ticket` | `project` | `meeting` | `other` (mirrors the appointments
+    /// CHECK so the type carries straight onto the pre-filled appointment).
+    pub appointment_type: String,
+    pub duration_minutes: i32,
+    pub travel_before_minutes: i32,
+    pub travel_after_minutes: i32,
+    pub default_title: Option<String>,
+    pub default_location: Option<String>,
+    pub default_ticket_id: Option<Uuid>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateSchedulingTemplateRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: String,
+    #[validate(custom(function = crate::utils::validation::validate_scheduling_template_kind))]
+    pub kind: String,
+    #[serde(default = "default_other")]
+    pub appointment_type: String,
+    #[validate(range(min = 1))]
+    pub duration_minutes: i32,
+    #[serde(default)]
+    #[validate(range(min = 0))]
+    pub travel_before_minutes: i32,
+    #[serde(default)]
+    #[validate(range(min = 0))]
+    pub travel_after_minutes: i32,
+    #[validate(length(max = 255))]
+    pub default_title: Option<String>,
+    pub default_location: Option<String>,
+    pub default_ticket_id: Option<Uuid>,
+    pub notes: Option<String>,
+}
+
+/// Partial PUT: every field optional, mirroring `UpdateAppointmentRequest`.
+/// A field left out keeps its stored value (`COALESCE` in the service).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateSchedulingTemplateRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: Option<String>,
+    #[validate(custom(function = crate::utils::validation::validate_scheduling_template_kind))]
+    pub kind: Option<String>,
+    pub appointment_type: Option<String>,
+    #[validate(range(min = 1))]
+    pub duration_minutes: Option<i32>,
+    #[validate(range(min = 0))]
+    pub travel_before_minutes: Option<i32>,
+    #[validate(range(min = 0))]
+    pub travel_after_minutes: Option<i32>,
+    pub default_title: Option<String>,
+    pub default_location: Option<String>,
+    pub default_ticket_id: Option<Uuid>,
+    pub notes: Option<String>,
+}
+
+/// List filter: narrow to one `kind` so the frontend can fetch only dispatch
+/// or only calendar templates.
+#[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
+pub struct SchedulingTemplateFilter {
+    #[validate(length(max = 20))]
+    pub kind: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -604,6 +604,12 @@ pub struct TicketFilter {
     pub contact_id: Option<Uuid>,
     pub assigned_to_id: Option<Uuid>,
     pub team_id: Option<Uuid>,
+    /// PMS-406: "my teams" convenience scope. When `Some(true)` the list
+    /// is restricted to tickets whose `team_id` is one of the calling
+    /// user's `team_members` rows, so the TV-view frontend does not have
+    /// to resolve the caller's team ids itself. Resolved server-side from
+    /// the authenticated caller; ignored on the portal path (no user).
+    pub my_teams: Option<bool>,
     /// PMS-344: filter tickets by the asset they reference. The asset
     /// detail page consumes this to render a Related Tickets section
     /// (`GET /api/v1/tickets?asset_id=<uuid>`).

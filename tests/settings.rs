@@ -106,6 +106,53 @@ async fn tenant_setting_unknown_category_accepted_with_warn(pool: PgPool) {
     );
 }
 
+/// PMS-396 AC1: the `time_tracking/max_hours_per_day` cap accepts an integer in
+/// 1..=24 and 422s on out-of-range or non-integer values.
+#[sqlx::test]
+async fn max_hours_per_day_value_validation(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let put = |value: serde_json::Value| {
+        let app = &app;
+        let token = &token;
+        async move {
+            app.client
+                .put(app.url("/api/v1/settings/time_tracking/max_hours_per_day"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "value": value }))
+                .send()
+                .await
+                .expect("send max_hours_per_day put")
+        }
+    };
+
+    // 0 is out of range (a day cap of zero is nonsensical).
+    assert_eq!(
+        put(serde_json::json!(0)).await.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "0 hours must 422"
+    );
+    // 25 exceeds a real 24-hour day.
+    assert_eq!(
+        put(serde_json::json!(25)).await.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "25 hours must 422"
+    );
+    // A non-integer value is rejected.
+    assert_eq!(
+        put(serde_json::json!("eighteen")).await.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "non-integer must 422"
+    );
+    // 18 is a valid overtime-shop cap.
+    assert!(
+        put(serde_json::json!(18)).await.status().is_success(),
+        "18 hours must be accepted"
+    );
+}
+
 #[sqlx::test]
 async fn get_settings_by_category_lists_only_that_category(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;

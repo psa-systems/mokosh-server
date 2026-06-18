@@ -82,7 +82,8 @@ impl ProjectsService {
                    COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
                              WHERE te.project_id = projects.id
                                AND te.approval_status = 'approved'), 0) AS actual_amount,
-                   billing_method, hourly_rate, is_billable, created_at, updated_at
+                   billing_method, hourly_rate, is_billable, default_due_business_days,
+                   created_at, updated_at
             FROM projects WHERE {where_clause}
             ORDER BY {order_by} LIMIT $2 OFFSET $3
             "#
@@ -126,14 +127,14 @@ impl ProjectsService {
                 id, tenant_id, name, description, project_number, company_id,
                 contract_id, project_type, project_type_id, status, project_manager_id, start_date,
                 target_end_date, actual_end_date, budget_hours, budget_amount, billing_method,
-                hourly_rate, is_billable
+                hourly_rate, is_billable, default_due_business_days
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
                 -- Resolve the lookup id from the legacy string so new rows
                 -- carry project_type_id too (PMS-322); NULL if the tenant has
                 -- no matching type row.
                 (SELECT id FROM project_types WHERE tenant_id = $2 AND name = $8),
-                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
             )
             "#,
         )
@@ -155,6 +156,7 @@ impl ProjectsService {
         .bind(&request.billing_method)
         .bind(request.hourly_rate)
         .bind(request.is_billable)
+        .bind(request.default_due_business_days)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -198,7 +200,8 @@ impl ProjectsService {
                    COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
                              WHERE te.project_id = projects.id
                                AND te.approval_status = 'approved'), 0) AS actual_amount,
-                   billing_method, hourly_rate, is_billable, created_at, updated_at
+                   billing_method, hourly_rate, is_billable, default_due_business_days,
+                   created_at, updated_at
             FROM projects WHERE tenant_id = $1 AND id = $2
             "#,
         )
@@ -245,6 +248,7 @@ impl ProjectsService {
                 billing_method = COALESCE($12, billing_method),
                 hourly_rate = COALESCE($13, hourly_rate),
                 is_billable = COALESCE($14, is_billable),
+                default_due_business_days = COALESCE($15, default_due_business_days),
                 updated_at = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -263,6 +267,7 @@ impl ProjectsService {
         .bind(&request.billing_method)
         .bind(request.hourly_rate)
         .bind(request.is_billable)
+        .bind(request.default_due_business_days)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -349,6 +354,33 @@ impl ProjectsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// PMS-399: pre-flight guard for the child-create/attach paths. A task or
+    /// phase must not be attached to a project whose `status = 'cancelled'`
+    /// (British spelling, matching the migration 007 CHECK set). Runs inside
+    /// the caller's tenant-scoped tx so the status read and the subsequent
+    /// INSERT share one transaction (the RLS GUC is set for both). A missing
+    /// row is a 404; a cancelled project is a 409.
+    async fn ensure_project_open(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        project_id: Uuid,
+    ) -> AppResult<()> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM projects WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(project_id)
+                .fetch_optional(tx)
+                .await?;
+        match status {
+            None => Err(AppError::NotFound("Project".to_string())),
+            Some(s) if s == "cancelled" => Err(AppError::Conflict(
+                "Cannot add items to a cancelled project".to_string(),
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_project_phase(
         &self,
@@ -359,6 +391,8 @@ impl ProjectsService {
     ) -> AppResult<ProjectPhaseResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        self.ensure_project_open(&mut tx, tenant_id, project_id)
+            .await?; // &mut tx auto-derefs to &mut PgConnection
         sqlx::query(
             r#"INSERT INTO project_phases (id, tenant_id, project_id, name, description, sort_order, start_date, end_date, status)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
@@ -803,20 +837,43 @@ impl ProjectsService {
         ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
         let id = Uuid::new_v4();
-        // PMS-345: when no due date is given, fall back to the tenant-wide
-        // standard due date (today + N business days; N = 0 disables it).
+        // PMS-345: when no due date is given, fall back to the standard due
+        // date (today + N business days; N = 0 disables it). The offset is
+        // sourced from the project first - its `default_due_business_days`
+        // override (where a value of 0 disables the default for this project)
+        // wins; a NULL override inherits the tenant-wide
+        // `scheduling/default_due_business_days` setting.
         let due_date = match request.due_date {
             Some(d) => Some(d),
             None => {
-                let n =
-                    crate::modules::settings::read_default_due_business_days(&self.db, tenant_id)
-                        .await?;
+                let project_override: Option<i16> = {
+                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                    sqlx::query_scalar(
+                        "SELECT default_due_business_days FROM projects WHERE tenant_id = $1 AND id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten()
+                };
+                let n = match project_override {
+                    Some(v) => v.max(0) as u32,
+                    None => {
+                        crate::modules::settings::read_default_due_business_days(
+                            &self.db, tenant_id,
+                        )
+                        .await?
+                    }
+                };
                 (n > 0).then(|| {
                     crate::utils::datetime::add_business_days(chrono::Utc::now().date_naive(), n)
                 })
             }
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        self.ensure_project_open(&mut tx, tenant_id, project_id)
+            .await?; // &mut tx auto-derefs to &mut PgConnection
         sqlx::query(
             r#"INSERT INTO tasks (id, tenant_id, project_id, phase_id, parent_task_id, title,
                                   description, status_id, priority, assigned_to_id,
@@ -911,6 +968,27 @@ impl ProjectsService {
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
+
+        // PMS-398: a partial PUT can invert the start/due range against the
+        // stored row even when the request alone passes the per-request
+        // validator (which only sees the fields the caller supplied). Combine
+        // each requested value with the stored one (request wins, else the
+        // `before` snapshot) and reject an inverted effective range before the
+        // UPDATE runs, mirroring the appointment range guard (PMS-343).
+        let stored_date = |key: &str| -> Option<chrono::NaiveDate> {
+            before
+                .as_ref()
+                .and_then(|b| b.get(key))
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        };
+        let effective_start = request.start_date.or_else(|| stored_date("start_date"));
+        let effective_due = request.due_date.or_else(|| stored_date("due_date"));
+        if !task_dates_ok(effective_start, effective_due) {
+            return Err(AppError::BadRequest(
+                "Due date must be on or after the start date".to_string(),
+            ));
+        }
 
         // When the new status is completed, stamp completed_at; clearing
         // back to non-completed clears it. Two reads (status flag check)
@@ -1115,6 +1193,7 @@ struct ProjectRow {
     billing_method: Option<String>,
     hourly_rate: Option<Decimal>,
     is_billable: Option<bool>,
+    default_due_business_days: Option<i16>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -1145,6 +1224,7 @@ impl From<ProjectRow> for ProjectResponse {
                 .unwrap_or_else(|| "time_and_materials".into()),
             hourly_rate: r.hourly_rate,
             is_billable: r.is_billable.unwrap_or(true),
+            default_due_business_days: r.default_due_business_days,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

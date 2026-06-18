@@ -40,10 +40,20 @@ impl ReportsService {
     /// UTC day (PMS-360); otherwise a ticket created at 23:30 Pacific lands in
     /// tomorrow's UTC bar and the chart disagrees with every other "today"
     /// surface.
+    ///
+    /// PMS-406: `team_id`, when `Some`, scopes every aggregate to a single
+    /// team via a parameterized `AND ... team_id = $n`, so the full-screen
+    /// TV-view dashboard can request a team-scoped KPI set. The tenant
+    /// predicate stays the unconditional first condition; team scoping is
+    /// strictly additive. Absent the param, output is unchanged (tenant
+    /// only). A cross-tenant team id is harmless here: every query is
+    /// already tenant-scoped, so a foreign team matches no rows and yields
+    /// zeros rather than leaking another tenant's data.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dashboard(
         &self,
         tenant_id: TenantId,
+        team_id: Option<Uuid>,
         user_tz: &str,
     ) -> AppResult<DashboardResponse> {
         let tz_name = mokosh_types::datetime::canonical_tz_name(user_tz);
@@ -51,47 +61,70 @@ impl ReportsService {
         // Rust so the bound and the SQL bucket agree on which zone they mean.
         let window_start = mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz)
             - chrono::Duration::days(30);
+        // Optional team-scope fragment. `qualifier` is the column prefix
+        // (`t.` where the query aliases tickets, empty otherwise); `idx` is
+        // the next free placeholder for each query. Empty string when no
+        // team is requested, so the base queries are byte-for-byte unchanged.
+        let team_clause = |qualifier: &str, idx: usize| -> String {
+            match team_id {
+                Some(_) => format!(" AND {qualifier}team_id = ${idx}"),
+                None => String::new(),
+            }
+        };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let open_by_priority: Vec<(String, i64)> = sqlx::query_as(
+        let open_sql = format!(
             r#"SELECT tp.name, COUNT(*)::bigint
                FROM tickets t
                INNER JOIN ticket_statuses ts ON t.status_id = ts.id
                INNER JOIN ticket_priorities tp ON t.priority_id = tp.id
-               WHERE t.tenant_id = $1 AND ts.is_closed = FALSE
+               WHERE t.tenant_id = $1 AND ts.is_closed = FALSE{team}
                GROUP BY tp.name ORDER BY tp.name"#,
-        )
-        .bind(tenant_id)
-        .fetch_all(&mut *tx)
-        .await?;
+            team = team_clause("t.", 2),
+        );
+        let mut open_q = sqlx::query_as::<_, (String, i64)>(&open_sql).bind(tenant_id);
+        if let Some(team_id) = team_id {
+            open_q = open_q.bind(team_id);
+        }
+        let open_by_priority: Vec<(String, i64)> = open_q.fetch_all(&mut *tx).await?;
 
-        let sla_warnings: i64 = sqlx::query_scalar(
+        let warn_sql = format!(
             r#"SELECT COUNT(*)::bigint FROM tickets
                WHERE tenant_id = $1 AND sla_due_date < NOW() + INTERVAL '2 hours'
-                 AND sla_due_date > NOW() AND closed_at IS NULL"#,
-        )
-        .bind(tenant_id)
-        .fetch_one(&mut *tx)
-        .await?;
+                 AND sla_due_date > NOW() AND closed_at IS NULL{team}"#,
+            team = team_clause("", 2),
+        );
+        let mut warn_q = sqlx::query_scalar::<_, i64>(&warn_sql).bind(tenant_id);
+        if let Some(team_id) = team_id {
+            warn_q = warn_q.bind(team_id);
+        }
+        let sla_warnings: i64 = warn_q.fetch_one(&mut *tx).await?;
 
-        let sla_breached: i64 = sqlx::query_scalar(
+        let breach_sql = format!(
             r#"SELECT COUNT(*)::bigint FROM tickets
-               WHERE tenant_id = $1 AND sla_due_date < NOW() AND closed_at IS NULL"#,
-        )
-        .bind(tenant_id)
-        .fetch_one(&mut *tx)
-        .await?;
+               WHERE tenant_id = $1 AND sla_due_date < NOW() AND closed_at IS NULL{team}"#,
+            team = team_clause("", 2),
+        );
+        let mut breach_q = sqlx::query_scalar::<_, i64>(&breach_sql).bind(tenant_id);
+        if let Some(team_id) = team_id {
+            breach_q = breach_q.bind(team_id);
+        }
+        let sla_breached: i64 = breach_q.fetch_one(&mut *tx).await?;
 
-        let trend: Vec<(NaiveDate, i64)> = sqlx::query_as(
+        let trend_sql = format!(
             r#"SELECT ((created_at AT TIME ZONE $2)::date) AS d, COUNT(*)::bigint
                FROM tickets WHERE tenant_id = $1
-                 AND (created_at AT TIME ZONE $2)::date >= $3
+                 AND (created_at AT TIME ZONE $2)::date >= $3{team}
                GROUP BY d ORDER BY d"#,
-        )
-        .bind(tenant_id)
-        .bind(tz_name)
-        .bind(window_start)
-        .fetch_all(&mut *tx)
-        .await?;
+            team = team_clause("", 4),
+        );
+        let mut trend_q = sqlx::query_as::<_, (NaiveDate, i64)>(&trend_sql)
+            .bind(tenant_id)
+            .bind(tz_name)
+            .bind(window_start);
+        if let Some(team_id) = team_id {
+            trend_q = trend_q.bind(team_id);
+        }
+        let trend: Vec<(NaiveDate, i64)> = trend_q.fetch_all(&mut *tx).await?;
 
         Ok(DashboardResponse {
             open_by_priority: open_by_priority

@@ -391,6 +391,10 @@ impl TicketService {
             binds,
         } = build_ticket_filter_sql(
             filter,
+            // No authenticated caller is threaded into this lower-level
+            // lister; the `my_teams` scope is applied via
+            // `list_ticket_responses` instead (PMS-406).
+            None,
             "NOT EXISTS (SELECT 1 FROM ticket_statuses s \
              WHERE s.id = t.status_id AND s.is_closed = TRUE)",
         );
@@ -1977,7 +1981,9 @@ impl TicketService {
             company_id: Some(company_id),
             ..Default::default()
         };
-        self.list_ticket_responses(tenant_id, &filter, pagination)
+        // Portal path has no `users` caller (identity is a `contacts`
+        // row) and never sets `my_teams`, so pass `None` (PMS-406).
+        self.list_ticket_responses(tenant_id, None, &filter, pagination)
             .await
     }
 
@@ -2029,9 +2035,18 @@ impl TicketService {
     pub async fn list_ticket_responses(
         &self,
         tenant_id: TenantId,
+        caller_id: Option<Uuid>,
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketResponse>, u64)> {
+        // PMS-406: reject a `team_id` that does not belong to this tenant
+        // before binding it, so a caller cannot probe another tenant's
+        // team ids; cross-tenant ids 4xx rather than silently returning an
+        // empty (tenant-only) list. Mirrors the `validate_fk` guard used
+        // on ticket writes.
+        self.validate_fk_opt(tenant_id, "teams", filter.team_id)
+            .await?;
+
         let offset = pagination.offset() as i32;
         let limit = pagination.limit() as i32;
 
@@ -2043,7 +2058,7 @@ impl TicketService {
             data_where,
             count_where,
             binds,
-        } = build_ticket_filter_sql(filter, "ts.is_closed = FALSE");
+        } = build_ticket_filter_sql(filter, caller_id, "ts.is_closed = FALSE");
         let order_by = pagination.order_by(
             "t.created_at",
             &["created_at", "updated_at", "sla_due_date", "priority_id"],
@@ -2123,8 +2138,17 @@ struct TicketFilterSql {
 /// read today; it is kept so a future placeholder filter added below
 /// stays correctly numbered (the previously-missing increment was the
 /// latent bug PMS-197 called out).
+///
+/// `caller_id` is the authenticated user behind the request, used only by
+/// the PMS-406 `my_teams` scope to resolve the caller's team membership;
+/// `None` on paths with no user (e.g. portal), where `my_teams` is never
+/// set anyway.
 #[allow(unused_assignments)]
-fn build_ticket_filter_sql(filter: &TicketFilter, is_open_fragment: &str) -> TicketFilterSql {
+fn build_ticket_filter_sql(
+    filter: &TicketFilter,
+    caller_id: Option<Uuid>,
+    is_open_fragment: &str,
+) -> TicketFilterSql {
     let mut data_conds = vec!["t.tenant_id = $1".to_string()];
     let mut count_conds = vec!["t.tenant_id = $1".to_string()];
     let mut data_idx = 4;
@@ -2187,6 +2211,37 @@ fn build_ticket_filter_sql(filter: &TicketFilter, is_open_fragment: &str) -> Tic
         data_idx += 1;
         count_idx += 1;
         binds.push(TicketFilterBind::Id(asset_id));
+    }
+    // PMS-406: scope tickets to a single team. The IT / HR / service-vendor
+    // split is modeled as distinct `teams` rows, not a hardcoded enum, so
+    // this is the mechanism the TV-view dashboard uses to show only one
+    // team's tickets. Cross-tenant ids are rejected by the caller's
+    // `validate_fk` before we get here, so binding is safe.
+    if let Some(team_id) = filter.team_id {
+        data_conds.push(format!("t.team_id = ${data_idx}"));
+        count_conds.push(format!("t.team_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(team_id));
+    }
+    // PMS-406: "my teams" scope. Restrict to tickets whose team is one the
+    // caller belongs to, resolved via a correlated subquery so only the
+    // caller id (a single Uuid) needs binding rather than a resolved array.
+    // No-op without an authenticated caller (the portal path never sets it).
+    if filter.my_teams == Some(true) {
+        if let Some(caller_id) = caller_id {
+            data_conds.push(format!(
+                "t.team_id IN (SELECT tm.team_id FROM team_members tm \
+                 WHERE tm.tenant_id = $1 AND tm.user_id = ${data_idx})"
+            ));
+            count_conds.push(format!(
+                "t.team_id IN (SELECT tm.team_id FROM team_members tm \
+                 WHERE tm.tenant_id = $1 AND tm.user_id = ${count_idx})"
+            ));
+            data_idx += 1;
+            count_idx += 1;
+            binds.push(TicketFilterBind::Id(caller_id));
+        }
     }
     // The remaining conditions are literal SQL (no placeholders, no
     // binds), so they do not touch the indices.

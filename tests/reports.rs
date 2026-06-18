@@ -399,7 +399,7 @@ async fn dashboard_is_tenant_scoped(pool: PgPool) {
 
     let reports = ReportsService::new(Database::from_pool(pool.clone()));
     let dash = reports
-        .dashboard(TenantId::from_trusted(tenant_a), "UTC")
+        .dashboard(TenantId::from_trusted(tenant_a), None, "UTC")
         .await
         .expect("dashboard");
 
@@ -444,7 +444,7 @@ async fn dashboard_trend_buckets_in_user_timezone(pool: PgPool) {
     let reports = ReportsService::new(Database::from_pool(pool.clone()));
 
     let utc_dash = reports
-        .dashboard(TenantId::from_trusted(tenant), "UTC")
+        .dashboard(TenantId::from_trusted(tenant), None, "UTC")
         .await
         .expect("utc dashboard");
     let utc_days: Vec<_> = utc_dash.ticket_trend_30d.iter().map(|d| d.date).collect();
@@ -455,7 +455,7 @@ async fn dashboard_trend_buckets_in_user_timezone(pool: PgPool) {
     );
 
     let la_dash = reports
-        .dashboard(TenantId::from_trusted(tenant), "America/Los_Angeles")
+        .dashboard(TenantId::from_trusted(tenant), None, "America/Los_Angeles")
         .await
         .expect("la dashboard");
     let la_days: Vec<_> = la_dash.ticket_trend_30d.iter().map(|d| d.date).collect();

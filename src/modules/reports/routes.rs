@@ -130,11 +130,23 @@ async fn list_reports(
     ]))
 }
 
+/// PMS-406: `team_id` scopes the dashboard aggregates to a single team so
+/// the full-screen TV-view dashboard can request a team-scoped KPI set.
+#[derive(Deserialize)]
+struct DashboardQ {
+    team_id: Option<Uuid>,
+}
+
 async fn dashboard(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
+    Query(q): Query<DashboardQ>,
 ) -> AppResult<Json<DashboardResponse>> {
-    Ok(Json(s.service.dashboard(u.tenant(), &u.timezone).await?))
+    Ok(Json(
+        s.service
+            .dashboard(u.tenant(), q.team_id, &u.timezone)
+            .await?,
+    ))
 }
 
 async fn tickets_report(
@@ -221,6 +233,8 @@ struct ExportQ {
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
     company_id: Option<Uuid>,
+    /// PMS-406: team-scope the dashboard export, mirroring the JSON route.
+    team_id: Option<Uuid>,
 }
 
 fn default_csv() -> String {
@@ -245,7 +259,11 @@ async fn export_report(
         )));
     }
     let csv = match report.as_str() {
-        "dashboard" => csv_for_dashboard(&s.service.dashboard(u.tenant(), &u.timezone).await?),
+        "dashboard" => csv_for_dashboard(
+            &s.service
+                .dashboard(u.tenant(), q.team_id, &u.timezone)
+                .await?,
+        ),
         "tickets" => csv_for_tickets(&s.service.tickets(u.tenant(), q.from, q.to).await?),
         "time" => csv_for_time(&s.service.time(u.tenant(), q.from, q.to).await?),
         "billing" => {

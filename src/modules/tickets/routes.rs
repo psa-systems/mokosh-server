@@ -71,7 +71,7 @@ async fn list_tickets(
     filter.validate()?;
     let (responses, total) = state
         .ticket_service
-        .list_ticket_responses(user.tenant(), &filter, &pagination)
+        .list_ticket_responses(user.tenant(), Some(user.id), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         responses,

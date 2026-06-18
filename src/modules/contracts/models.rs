@@ -260,7 +260,7 @@ mod tests {
         assert!(bad_status.validate().is_err());
 
         let mut bad_cycle = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
-        bad_cycle.billing_cycle = "weekly".into();
+        bad_cycle.billing_cycle = "biweekly".into();
         assert!(bad_cycle.validate().is_err());
     }
 
@@ -270,6 +270,15 @@ mod tests {
         req.status = "active".into();
         req.billing_cycle = "quarterly".into();
         assert!(req.validate().is_ok());
+
+        // PMS-404: sub-month cycles are now accepted.
+        let mut weekly = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
+        weekly.billing_cycle = "weekly".into();
+        assert!(weekly.validate().is_ok());
+
+        let mut bi_weekly = base_request(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None);
+        bi_weekly.billing_cycle = "bi_weekly".into();
+        assert!(bi_weekly.validate().is_ok());
     }
 
     fn base_update() -> UpdateContractRequest {
@@ -298,13 +307,22 @@ mod tests {
         assert!(bad_status.validate().is_err());
 
         let mut bad_cycle = base_update();
-        bad_cycle.billing_cycle = Some("weekly".into());
+        bad_cycle.billing_cycle = Some("biweekly".into());
         assert!(bad_cycle.validate().is_err());
 
         let mut ok = base_update();
         ok.status = Some("renewed".into());
         ok.billing_cycle = Some("annually".into());
         assert!(ok.validate().is_ok());
+
+        // PMS-404: sub-month cycles are now accepted.
+        let mut weekly = base_update();
+        weekly.billing_cycle = Some("weekly".into());
+        assert!(weekly.validate().is_ok());
+
+        let mut bi_weekly = base_update();
+        bi_weekly.billing_cycle = Some("bi_weekly".into());
+        assert!(bi_weekly.validate().is_ok());
     }
 }
 

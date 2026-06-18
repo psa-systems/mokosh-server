@@ -326,6 +326,14 @@ impl TimeTrackingService {
             Some(rule) => apply_rounding(raw, &rule),
             None => raw,
         };
+        // PMS-396: reject when this entry would push the user's total for the
+        // date over the tenant's per-day cap. The SUM runs inside `tx` so it is
+        // consistent with the INSERT below.
+        let cap_minutes =
+            crate::modules::settings::read_max_minutes_per_day(&self.db, tenant_id).await?;
+        let existing =
+            day_minutes_excluding(&mut *tx, tenant_id, request.user_id, request.date, None).await?;
+        enforce_day_cap(existing, duration, cap_minutes)?;
         let (hourly_rate, total) = resolve_billing(
             request.hourly_rate,
             request.is_billable,
@@ -457,6 +465,17 @@ impl TimeTrackingService {
             request.ticket_id,
             request.project_id,
         )?;
+        // PMS-396: enforce the per-day cap against the TARGET day (the entry may
+        // be moving to a different date), excluding this row from the day sum so
+        // an in-place edit is measured against its peers, not itself. The SUM
+        // runs inside `tx` for consistency with the UPDATE.
+        let target_date = request.date.unwrap_or(current.date);
+        let cap_minutes =
+            crate::modules::settings::read_max_minutes_per_day(&self.db, tenant_id).await?;
+        let existing =
+            day_minutes_excluding(&mut *tx, tenant_id, current.user_id, target_date, Some(id))
+                .await?;
+        enforce_day_cap(existing, duration, cap_minutes)?;
         let affected = sqlx::query(
             r#"
             UPDATE time_entries SET
@@ -717,7 +736,11 @@ impl TimeTrackingService {
         let anchor = monday_anchor(week_start);
         let week_end = anchor + chrono::Duration::days(7);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+        // RETURNING the rows that actually transitioned (approval_status was
+        // 'pending') gives us exactly the set to consume hours for, and the
+        // `pending` guard makes re-approval idempotent: a second call returns
+        // no rows, so consume_hours is not double-counted (PMS-405).
+        let approved = sqlx::query_as::<_, ConsumeRow>(
             r#"
             UPDATE time_entries
             SET approval_status = 'approved',
@@ -737,6 +760,7 @@ impl TimeTrackingService {
               AND date     >= $3
               AND date      < $4
               AND approval_status = 'pending'
+            RETURNING contract_id, duration_minutes, date, is_billable
             "#,
         )
         .bind(tenant_id)
@@ -744,10 +768,66 @@ impl TimeTrackingService {
         .bind(anchor)
         .bind(week_end)
         .bind(approver_id)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
+
+        // PMS-405: approval is the consumption point. For every entry that
+        // just flipped to approved and is billable against a contract, draw
+        // its hours from the contract's block-hours balance for the period
+        // covering the entry date. Hours past the included allotment become
+        // a non-zero overage on the returned ConsumeOutcome (persisted via
+        // the debited contract_hour_balances row).
+        self.consume_approved_hours(tenant_id, &approved).await?;
+
         self.week_summary(tenant_id, user_id, anchor).await
+    }
+
+    /// Draw approved billable hours against their contracts' block-hours
+    /// balances (PMS-405). Runs after the approval commit so each
+    /// [`ContractsService::consume_hours`] manages its own transaction.
+    /// Non-billable entries and entries without a `contract_id` are skipped.
+    async fn consume_approved_hours(
+        &self,
+        tenant_id: TenantId,
+        approved: &[ConsumeRow],
+    ) -> AppResult<()> {
+        let contracts = crate::modules::contracts::ContractsService::new(self.db.clone());
+        for entry in approved {
+            let Some(contract_id) = entry.contract_id else {
+                continue;
+            };
+            if !entry.is_billable.unwrap_or(false) {
+                continue;
+            }
+            // duration_minutes -> Decimal hours (minutes / 60).
+            let hours = Decimal::from(entry.duration_minutes) / Decimal::from(60);
+            if hours <= Decimal::ZERO {
+                continue;
+            }
+            // Period is anchored on the entry's date (midnight UTC).
+            let when = entry
+                .date
+                .and_hms_opt(0, 0, 0)
+                .map(|naive| naive.and_utc())
+                .unwrap_or_else(Utc::now);
+            let outcome = contracts
+                .consume_hours(tenant_id, contract_id, hours, when)
+                .await?;
+            if outcome.overage_hours > Decimal::ZERO {
+                // The overage is persisted in the debited balance row; surface
+                // it here so the recurring-invoice path / a follow-up can bill
+                // it (PMS-405). At minimum it is not silently dropped.
+                tracing::info!(
+                    contract_id = %contract_id,
+                    overage_hours = %outcome.overage_hours,
+                    overage_amount = %outcome.overage_amount,
+                    balance_id = %outcome.balance_id,
+                    "time approval produced contract hour overage"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Reject every pending entry in the user's week with a reason. Manager+
@@ -1360,6 +1440,55 @@ fn derive_work_category(
     }
 }
 
+/// Sum a user's already-logged minutes for one calendar date, optionally
+/// excluding a single entry (the row being edited). The SUM is read through the
+/// caller's tenant-scoped executor so it stays consistent with the INSERT/UPDATE
+/// in the same transaction (PMS-396). `exclude_id` of `None` matches every row.
+async fn day_minutes_excluding<'e, E>(
+    exec: E,
+    tenant_id: TenantId,
+    user_id: Uuid,
+    date: NaiveDate,
+    exclude_id: Option<Uuid>,
+) -> AppResult<i64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let sum: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(duration_minutes), 0)::bigint
+        FROM time_entries
+        WHERE tenant_id = $1 AND user_id = $2 AND date = $3
+          AND ($4::uuid IS NULL OR id <> $4)
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(date)
+    .bind(exclude_id)
+    .fetch_one(exec)
+    .await?;
+    Ok(sum)
+}
+
+/// Reject when adding `new_minutes` to a day that already holds `existing` would
+/// exceed the per-day `cap_minutes` (PMS-396). The error names the cap in hours
+/// and the minutes still available for the day before this entry.
+fn enforce_day_cap(existing: i64, new_minutes: i32, cap_minutes: i32) -> AppResult<()> {
+    let total = existing + new_minutes as i64;
+    if total > cap_minutes as i64 {
+        let remaining = (cap_minutes as i64 - existing).max(0);
+        return Err(AppError::BadRequest(format!(
+            "Day total would exceed the {}h/day cap ({} minutes); this entry of {} minutes leaves {} minutes for the day",
+            cap_minutes / 60,
+            cap_minutes,
+            new_minutes,
+            remaining
+        )));
+    }
+    Ok(())
+}
+
 /// Anchor a date to the Monday of its ISO week.
 fn monday_anchor(d: NaiveDate) -> NaiveDate {
     d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64)
@@ -1459,6 +1588,16 @@ fn resolve_billing(
         None
     };
     (rate, total)
+}
+
+/// Minimal projection of a time entry that just transitioned to approved,
+/// used to drive contract hour consumption (PMS-405).
+#[derive(sqlx::FromRow)]
+struct ConsumeRow {
+    contract_id: Option<Uuid>,
+    duration_minutes: i32,
+    date: NaiveDate,
+    is_billable: Option<bool>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1673,6 +1812,28 @@ mod tests {
     fn rounding_zero_increment_is_floor_only() {
         assert_eq!(apply_rounding(7, &rule(0, 15, "up")), 15);
         assert_eq!(apply_rounding(40, &rule(0, 15, "up")), 40);
+    }
+
+    #[test]
+    fn enforce_day_cap_allows_up_to_and_rejects_over() {
+        // Exactly at the cap is allowed (8h existing + 16h new == 24h).
+        assert!(enforce_day_cap(8 * 60, 16 * 60, 24 * 60).is_ok());
+        // One minute over the cap is rejected.
+        let err = enforce_day_cap(8 * 60, 16 * 60 + 1, 24 * 60).unwrap_err();
+        match err {
+            AppError::BadRequest(msg) => {
+                // Message names the cap (in hours) and the remaining minutes.
+                assert!(msg.contains("24h/day"), "msg names the cap: {msg}");
+                assert!(
+                    msg.contains("960 minutes for the day"),
+                    "msg names remaining: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        // An 18h cap rejects a day reaching 19h.
+        assert!(enforce_day_cap(18 * 60, 60, 18 * 60).is_err());
+        assert!(enforce_day_cap(17 * 60, 60, 18 * 60).is_ok());
     }
 
     #[test]

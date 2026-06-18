@@ -332,3 +332,25 @@ pub async fn read_default_due_business_days(db: &Database, tenant_id: TenantId) 
         .map(|n| n.min(365) as u32)
         .unwrap_or(0))
 }
+
+/// Read the tenant-wide per-day cap on a user's logged time, in minutes
+/// (`time_tracking/max_hours_per_day`), defaulting to `24 * 60` when unset
+/// (PMS-396). The stored value is whole hours in `1..=24` (enforced by
+/// `validate_setting_value`); this clamps defensively in case a row was written
+/// before validation existed. Free function so `TimeTrackingService` can read
+/// the cap without a dependency on `SettingsService`.
+pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> AppResult<i32> {
+    let mut tx = db.begin_with_tenant(tenant_id).await?;
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'time_tracking' AND key = 'max_hours_per_day'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let hours = value
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 24))
+        .unwrap_or(24);
+    Ok((hours as i32) * 60)
+}

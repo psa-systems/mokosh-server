@@ -123,6 +123,13 @@ pub fn validate_setting_value(
                 "expected an integer in 0..=365 (0 disables the default due date)",
             )),
         },
+        // PMS-396: per-tenant cap on a user's total logged time for a single
+        // calendar date, in whole hours. A day cannot exceed 24 real hours, so
+        // the range is 1..=24; the cap defaults to 24 when unset.
+        ("time_tracking", "max_hours_per_day") => match value.as_u64() {
+            Some(n) if (1..=24).contains(&n) => Ok(()),
+            _ => Err(bad("value", "expected an integer in 1..=24")),
+        },
         // Unknown (category, key): accept with a warning so a future SPA
         // experiment doesn't require a server change before the
         // validator can be taught the shape.

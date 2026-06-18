@@ -61,6 +61,17 @@ pub fn calendar_routes(service: CalendarService) -> Router {
             put(update_on_call).delete(delete_on_call),
         )
         .route("/on-call/now", get(on_call_now))
+        // PMS-403 scheduling templates
+        .route(
+            "/scheduling-templates",
+            get(list_templates).post(create_template),
+        )
+        .route(
+            "/scheduling-templates/{id}",
+            get(get_template)
+                .put(update_template)
+                .delete(delete_template),
+        )
         .with_state(state)
 }
 
@@ -332,4 +343,69 @@ async fn on_call_now(
     RequireCalendar { user: u, .. }: RequireCalendar,
 ) -> AppResult<Json<Vec<OnCallNowResponse>>> {
     Ok(Json(s.service.on_call_now(u.tenant()).await?))
+}
+
+// ============================================================================
+// PMS-403 scheduling templates
+// ============================================================================
+
+async fn list_templates(
+    State(s): State<CalendarRouterState>,
+    RequireCalendar { user: u, .. }: RequireCalendar,
+    Query(f): Query<SchedulingTemplateFilter>,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<SchedulingTemplateResponse>>> {
+    f.validate()?;
+    let (items, total) = s
+        .service
+        .list_templates(u.tenant(), &f, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
+}
+
+async fn create_template(
+    State(s): State<CalendarRouterState>,
+    RequireCalendar { user: u, .. }: RequireCalendar,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(req): Json<CreateSchedulingTemplateRequest>,
+) -> AppResult<Json<SchedulingTemplateResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.create_template(u.tenant(), &req, &ctx).await?,
+    ))
+}
+
+async fn get_template(
+    State(s): State<CalendarRouterState>,
+    RequireCalendar { user: u, .. }: RequireCalendar,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<SchedulingTemplateResponse>> {
+    Ok(Json(s.service.get_template(u.tenant(), id).await?))
+}
+
+async fn update_template(
+    State(s): State<CalendarRouterState>,
+    RequireCalendar { user: u, .. }: RequireCalendar,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateSchedulingTemplateRequest>,
+) -> AppResult<Json<SchedulingTemplateResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service
+            .update_template(u.tenant(), id, &req, &ctx)
+            .await?,
+    ))
+}
+
+async fn delete_template(
+    State(s): State<CalendarRouterState>,
+    RequireCalendar { user: u, .. }: RequireCalendar,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    s.service.delete_template(u.tenant(), id).await
 }
