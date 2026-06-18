@@ -48,6 +48,33 @@ async fn seed_block_contract(pool: &PgPool, company_id: Uuid, start: NaiveDate) 
     id
 }
 
+/// Insert a `block_hours` contract starting `start` with an explicit
+/// `billing_cycle` (PMS-404: exercises sub-month cycles end to end,
+/// including the DB CHECK constraint that must accept the value).
+async fn seed_block_contract_with_cycle(
+    pool: &PgPool,
+    company_id: Uuid,
+    start: NaiveDate,
+    billing_cycle: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO contracts
+           (id, tenant_id, contract_number, name, company_id, contract_type, status,
+            start_date, billing_cycle)
+           VALUES ($1, $2, 'C-002', 'Weekly Block', $3, 'block_hours', 'active', $4, $5)"#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(start)
+    .bind(billing_cycle)
+    .execute(pool)
+    .await
+    .expect("seed cycle contract");
+    id
+}
+
 /// Insert the contract's `block_hours` item.
 #[allow(clippy::too_many_arguments)]
 async fn seed_block_item(
@@ -121,6 +148,98 @@ async fn consume_within_allotment_debits_balance(pool: PgPool) {
     .expect("balance row");
     assert_eq!(used, common::dec("4"));
     assert_eq!(remaining, common::dec("6"));
+}
+
+/// PMS-404: a `weekly` contract is accepted by the DB CHECK constraint and
+/// `consume_hours` buckets into a contiguous 7-day window anchored on
+/// `start_date`. Two consumes 9 days apart land in different weekly
+/// balance rows: [Jan 1, Jan 7] and [Jan 8, Jan 14].
+#[sqlx::test]
+async fn consume_weekly_buckets_into_seven_day_windows(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_block_contract_with_cycle(&pool, company, start, "weekly").await;
+    seed_block_item(
+        &pool,
+        contract,
+        common::dec("10"),
+        common::dec("200"),
+        false,
+        None,
+    )
+    .await;
+
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+
+    // Jan 5 falls in the first 7-day window [Jan 1, Jan 7].
+    let week1 = Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).unwrap();
+    let out1 = svc
+        .consume_hours(TenantId::from_trusted(tenant), contract, common::dec("3"), week1)
+        .await
+        .expect("consume week1");
+    let (p1_start, p1_end): (NaiveDate, NaiveDate) = sqlx::query_as(
+        "SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1",
+    )
+    .bind(out1.balance_id)
+    .fetch_one(&pool)
+    .await
+    .expect("week1 balance");
+    assert_eq!(p1_start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+    assert_eq!(p1_end, NaiveDate::from_ymd_opt(2026, 1, 7).unwrap());
+
+    // Jan 10 falls in the second 7-day window [Jan 8, Jan 14] -> new row.
+    let week2 = Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap();
+    let out2 = svc
+        .consume_hours(TenantId::from_trusted(tenant), contract, common::dec("2"), week2)
+        .await
+        .expect("consume week2");
+    assert_ne!(out1.balance_id, out2.balance_id, "distinct weekly periods");
+    let (p2_start, p2_end): (NaiveDate, NaiveDate) = sqlx::query_as(
+        "SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1",
+    )
+    .bind(out2.balance_id)
+    .fetch_one(&pool)
+    .await
+    .expect("week2 balance");
+    assert_eq!(p2_start, NaiveDate::from_ymd_opt(2026, 1, 8).unwrap());
+    assert_eq!(p2_end, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
+}
+
+/// PMS-404: a `bi_weekly` contract is accepted by the DB CHECK constraint
+/// and `consume_hours` buckets into a 14-day window anchored on
+/// `start_date`: Jan 10 falls in the first window [Jan 1, Jan 14].
+#[sqlx::test]
+async fn consume_bi_weekly_buckets_into_fourteen_day_windows(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_block_contract_with_cycle(&pool, company, start, "bi_weekly").await;
+    seed_block_item(
+        &pool,
+        contract,
+        common::dec("10"),
+        common::dec("200"),
+        false,
+        None,
+    )
+    .await;
+
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+    let when = Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap();
+    let out = svc
+        .consume_hours(TenantId::from_trusted(tenant), contract, common::dec("3"), when)
+        .await
+        .expect("consume bi_weekly");
+    let (p_start, p_end): (NaiveDate, NaiveDate) = sqlx::query_as(
+        "SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1",
+    )
+    .bind(out.balance_id)
+    .fetch_one(&pool)
+    .await
+    .expect("bi_weekly balance");
+    assert_eq!(p_start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+    assert_eq!(p_end, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
 }
 
 #[sqlx::test]

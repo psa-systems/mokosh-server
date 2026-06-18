@@ -1,7 +1,7 @@
 //! Contracts service.
 
 use crate::modules::auth::TenantId;
-use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Days, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -16,6 +16,44 @@ use super::models::*;
 /// Bounds the row-lock footprint and audit-row count per commit so the
 /// lifecycle sweep never holds a long table-wide lock (PMS-194).
 const EXPIRE_BATCH: i64 = 200;
+
+/// One billing-period step, expressed in the unit the cycle requires
+/// (PMS-404). Sub-month cycles (`weekly`, `bi_weekly`) advance by whole
+/// days; month-or-longer cycles advance by whole months so end-of-month
+/// overflow clamps (e.g. Jan 31 + 1 month -> Feb 28/29).
+///
+/// Shared by both period calculators that anchor on a contract's
+/// `start_date`: [`ContractsService::period_for`] (hour-balance windows)
+/// and `current_billing_period` in the billing service (invoice anchors).
+#[derive(Clone, Copy)]
+pub(crate) enum CycleStep {
+    Days(u64),
+    Months(u32),
+}
+
+impl CycleStep {
+    /// Map a `billing_cycle` token to its recurring step. Returns `None`
+    /// for `one_time` and any unknown value, which callers treat as
+    /// non-recurring.
+    pub(crate) fn from_cycle(billing_cycle: &str) -> Option<Self> {
+        match billing_cycle {
+            "weekly" => Some(CycleStep::Days(7)),
+            "bi_weekly" => Some(CycleStep::Days(14)),
+            "monthly" => Some(CycleStep::Months(1)),
+            "quarterly" => Some(CycleStep::Months(3)),
+            "annually" => Some(CycleStep::Months(12)),
+            _ => None,
+        }
+    }
+
+    /// Advance `date` by one step, returning `None` on date overflow.
+    pub(crate) fn advance(self, date: NaiveDate) -> Option<NaiveDate> {
+        match self {
+            CycleStep::Days(d) => date.checked_add_days(Days::new(d)),
+            CycleStep::Months(m) => date.checked_add_months(Months::new(m)),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ContractsService {
@@ -1182,12 +1220,18 @@ impl ContractsService {
     ///
     /// Periods are contiguous, non-overlapping windows of the cycle
     /// length starting at `anchor`:
+    ///   * `weekly`    -> 7-day windows
+    ///   * `bi_weekly` -> 14-day windows
     ///   * `monthly`   -> 1-month windows
     ///   * `quarterly` -> 3-month windows
     ///   * `annually`  -> 12-month windows
     ///   * `one_time` (and any unknown value) -> a single open window
     ///     starting at `anchor` and ending far in the future, so a
     ///     one-shot block draws from one balance row forever.
+    ///
+    /// Sub-month cycles (`weekly`/`bi_weekly`) step by whole days via
+    /// [`chrono::Days`]; month-or-longer cycles step via
+    /// [`chrono::Months`] so end-of-month overflow clamps (PMS-404).
     ///
     /// `period_end` is the last day of the window (the day before the
     /// next window's start), matching the DATE columns' inclusive
@@ -1197,12 +1241,10 @@ impl ContractsService {
         billing_cycle: &str,
         when: NaiveDate,
     ) -> (NaiveDate, NaiveDate) {
-        let step_months: u32 = match billing_cycle {
-            "monthly" => 1,
-            "quarterly" => 3,
-            "annually" => 12,
+        let step = match CycleStep::from_cycle(billing_cycle) {
+            Some(step) => step,
             // one_time / unknown: a single window from the anchor.
-            _ => {
+            None => {
                 let end = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap_or(anchor);
                 return (anchor, end);
             }
@@ -1213,9 +1255,7 @@ impl ContractsService {
         // caller still gets a deterministic, anchored range.
         let mut start = anchor;
         loop {
-            let next = start
-                .checked_add_months(Months::new(step_months))
-                .unwrap_or(start);
+            let next = step.advance(start).unwrap_or(start);
             if next <= start {
                 // Overflow guard: stop walking, treat as open window.
                 let end = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap_or(start);
