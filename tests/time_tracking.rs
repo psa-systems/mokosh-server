@@ -395,6 +395,7 @@ fn create_minutes(
         task_id: None,
         company_id,
         notes: None,
+        work_category: None,
         is_billable: true,
         hourly_rate: None,
     }
@@ -410,6 +411,7 @@ fn duration_only_update(minutes: i32) -> UpdateTimeEntryRequest {
         work_type_id: None,
         ticket_id: None,
         project_id: None,
+        work_category: None,
         task_id: None,
         notes: None,
         is_billable: None,
