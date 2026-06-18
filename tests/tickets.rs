@@ -15,6 +15,7 @@
 
 mod common;
 
+use chrono::DateTime;
 use sqlx::PgPool;
 
 /// Assert a ticket DTO carries its JOINed name/color fields populated from
@@ -384,6 +385,205 @@ async fn ticket_history_humanises_status_id_field(pool: PgPool) {
     assert!(
         edit["timestamp"].as_str().is_some(),
         "history entry must carry a timestamp"
+    );
+}
+
+/// Fetch a seeded lookup row by name from a paginated lookup endpoint and
+/// return its id as a string. Panics if the named row is absent.
+async fn lookup_id_by_name(app: &common::TestApp, token: &str, path: &str, name: &str) -> String {
+    let body: serde_json::Value = app
+        .client
+        .get(app.url(path))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("fetch lookups")
+        .json()
+        .await
+        .expect("lookups JSON");
+    body["data"]
+        .as_array()
+        .expect("lookups data")
+        .iter()
+        .find(|row| row["name"].as_str() == Some(name))
+        .and_then(|row| row["id"].as_str())
+        .unwrap_or_else(|| panic!("seeded lookup {name} not found at {path}"))
+        .to_string()
+}
+
+/// PMS-359: the ticket detail page edits status / priority / assignee inline
+/// by PUTting each change to `PUT /api/v1/tickets/{id}`. This pins the
+/// server side of that workflow end to end:
+///
+///   - each field edit persists and is echoed back on the re-fetched DTO
+///     (AC: "controls persist on change"),
+///   - the per-record change-history feed records a distinct entry for the
+///     status, priority, and assignee change with the actor's timestamp
+///     (AC: "change-history feed shows entries for status / priority /
+///     assignee changes"),
+///   - changing priority recalculates the SLA due date (AC: "SLA
+///     recalculation triggers when priority changes"). The seed's default
+///     "Standard SLA" policy targets 24h resolution for Medium and 8h for
+///     High (migrations/023_seed_data.sql), so promoting Medium -> High must
+///     pull the due date earlier,
+///   - the write is gated on authentication (AC: "must be logged in"); an
+///     unauthenticated PUT is rejected.
+#[sqlx::test]
+async fn ticket_inline_status_priority_assignee_edits_persist_audit_and_recalc_sla(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // CREATE: defaults to the seeded "Medium" priority, whose default-SLA
+    // target is 24h resolution, so the create response carries a non-null
+    // sla_due_date we can later assert shrinks.
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Mailbox migration stuck",
+            "company_id": company_id,
+            "description": "Cutover paused at 80%.",
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket")
+        .json()
+        .await
+        .expect("create ticket JSON");
+    let ticket_id = created["id"].as_str().expect("ticket id").to_string();
+    assert_eq!(created["priority"]["name"].as_str(), Some("Medium"));
+    let initial_sla_due = created["sla_due_date"]
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .expect("create must set an SLA due date from the seeded Medium target");
+
+    // Resolve the target lookup ids by name from the seeded lookups.
+    let in_progress_id =
+        lookup_id_by_name(&app, &token, "/api/v1/tickets/statuses", "In Progress").await;
+    let high_priority_id =
+        lookup_id_by_name(&app, &token, "/api/v1/tickets/priorities", "High").await;
+
+    // EDIT 1: status -> In Progress.
+    let after_status: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "status_id": in_progress_id }))
+        .send()
+        .await
+        .expect("PUT status")
+        .json()
+        .await
+        .expect("status PUT JSON");
+    assert_eq!(
+        after_status["status"]["name"].as_str(),
+        Some("In Progress"),
+        "status edit must persist"
+    );
+
+    // EDIT 2: priority -> High. This must recalculate the SLA due date down
+    // from the 24h Medium target to the 8h High target.
+    let after_priority: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "priority_id": high_priority_id }))
+        .send()
+        .await
+        .expect("PUT priority")
+        .json()
+        .await
+        .expect("priority PUT JSON");
+    assert_eq!(
+        after_priority["priority"]["name"].as_str(),
+        Some("High"),
+        "priority edit must persist"
+    );
+    let new_sla_due = after_priority["sla_due_date"]
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .expect("priority edit must leave an SLA due date set");
+    assert!(
+        new_sla_due < initial_sla_due,
+        "raising priority Medium -> High must shorten the SLA due date: \
+         was {initial_sla_due}, now {new_sla_due}"
+    );
+
+    // EDIT 3: assignee -> the seeded admin.
+    let after_assign: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "assigned_to_id": admin_id }))
+        .send()
+        .await
+        .expect("PUT assignee")
+        .json()
+        .await
+        .expect("assignee PUT JSON");
+    assert_eq!(
+        after_assign["assigned_to_id"].as_str(),
+        Some(admin_id.to_string().as_str()),
+        "assignee edit must persist"
+    );
+    assert!(
+        after_assign["assigned_to_name"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "assignee edit must resolve assigned_to_name from the users JOIN"
+    );
+
+    // CHANGE HISTORY: the feed must carry a distinct update entry for each of
+    // the three field changes, each with a timestamp.
+    let hist: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/audit-log/entity/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get ticket history")
+        .json()
+        .await
+        .expect("history JSON");
+    let entries = hist["data"].as_array().expect("history has data");
+    let has_field_entry = |field: &str| {
+        entries.iter().any(|e| {
+            e["action"].as_str() == Some("update")
+                && e["timestamp"].as_str().is_some()
+                && e["changed_fields"]
+                    .as_array()
+                    .is_some_and(|f| f.iter().any(|v| v.as_str() == Some(field)))
+        })
+    };
+    assert!(
+        has_field_entry("status"),
+        "history must record the status change"
+    );
+    assert!(
+        has_field_entry("priority"),
+        "history must record the priority change"
+    );
+    assert!(
+        has_field_entry("assigned to"),
+        "history must record the assignee change"
+    );
+
+    // PERMISSION GATE: an unauthenticated edit is rejected (must be logged in).
+    let unauth = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .json(&serde_json::json!({ "status_id": in_progress_id }))
+        .send()
+        .await
+        .expect("send unauthenticated PUT");
+    assert_eq!(
+        unauth.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "an unauthenticated ticket edit must be 401"
     );
 }
 
