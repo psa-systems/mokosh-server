@@ -175,33 +175,41 @@ async fn consume_weekly_buckets_into_seven_day_windows(pool: PgPool) {
     // Jan 5 falls in the first 7-day window [Jan 1, Jan 7].
     let week1 = Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).unwrap();
     let out1 = svc
-        .consume_hours(TenantId::from_trusted(tenant), contract, common::dec("3"), week1)
+        .consume_hours(
+            TenantId::from_trusted(tenant),
+            contract,
+            common::dec("3"),
+            week1,
+        )
         .await
         .expect("consume week1");
-    let (p1_start, p1_end): (NaiveDate, NaiveDate) = sqlx::query_as(
-        "SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1",
-    )
-    .bind(out1.balance_id)
-    .fetch_one(&pool)
-    .await
-    .expect("week1 balance");
+    let (p1_start, p1_end): (NaiveDate, NaiveDate) =
+        sqlx::query_as("SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1")
+            .bind(out1.balance_id)
+            .fetch_one(&pool)
+            .await
+            .expect("week1 balance");
     assert_eq!(p1_start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
     assert_eq!(p1_end, NaiveDate::from_ymd_opt(2026, 1, 7).unwrap());
 
     // Jan 10 falls in the second 7-day window [Jan 8, Jan 14] -> new row.
     let week2 = Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap();
     let out2 = svc
-        .consume_hours(TenantId::from_trusted(tenant), contract, common::dec("2"), week2)
+        .consume_hours(
+            TenantId::from_trusted(tenant),
+            contract,
+            common::dec("2"),
+            week2,
+        )
         .await
         .expect("consume week2");
     assert_ne!(out1.balance_id, out2.balance_id, "distinct weekly periods");
-    let (p2_start, p2_end): (NaiveDate, NaiveDate) = sqlx::query_as(
-        "SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1",
-    )
-    .bind(out2.balance_id)
-    .fetch_one(&pool)
-    .await
-    .expect("week2 balance");
+    let (p2_start, p2_end): (NaiveDate, NaiveDate) =
+        sqlx::query_as("SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1")
+            .bind(out2.balance_id)
+            .fetch_one(&pool)
+            .await
+            .expect("week2 balance");
     assert_eq!(p2_start, NaiveDate::from_ymd_opt(2026, 1, 8).unwrap());
     assert_eq!(p2_end, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
 }
@@ -228,16 +236,20 @@ async fn consume_bi_weekly_buckets_into_fourteen_day_windows(pool: PgPool) {
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
     let when = Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap();
     let out = svc
-        .consume_hours(TenantId::from_trusted(tenant), contract, common::dec("3"), when)
+        .consume_hours(
+            TenantId::from_trusted(tenant),
+            contract,
+            common::dec("3"),
+            when,
+        )
         .await
         .expect("consume bi_weekly");
-    let (p_start, p_end): (NaiveDate, NaiveDate) = sqlx::query_as(
-        "SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1",
-    )
-    .bind(out.balance_id)
-    .fetch_one(&pool)
-    .await
-    .expect("bi_weekly balance");
+    let (p_start, p_end): (NaiveDate, NaiveDate) =
+        sqlx::query_as("SELECT period_start, period_end FROM contract_hour_balances WHERE id = $1")
+            .bind(out.balance_id)
+            .fetch_one(&pool)
+            .await
+            .expect("bi_weekly balance");
     assert_eq!(p_start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
     assert_eq!(p_end, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
 }
