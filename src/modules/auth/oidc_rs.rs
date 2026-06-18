@@ -48,6 +48,15 @@ pub struct AtClaims {
 /// Subset of bunyip-api's `/oauth2/userinfo` response. The RS calls this on
 /// first sight of a new `sub` to resolve `email` for JIT-provisioning a row in
 /// `public.users` (the `at+jwt` itself does NOT carry an email claim).
+///
+/// BUNYIP-141 (slice C of BUNYIP-103) adds the optional `given_name`,
+/// `family_name`, and `phone_number` standard OIDC claims. Bunyip emits them
+/// only when the access token's scope set contains `profile` (names) or
+/// `phone`, AND the user has filled them in on bunyip. NULL columns
+/// serialize as absent keys (no empty strings) per BUNYIP-140, so `Option`
+/// shape is correct for every branch the JIT path needs to consider:
+///   - key absent (None): scope not requested or column empty -> fall back
+///   - key present + non-empty: real value to seed into mokosh's row
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserInfo {
     pub sub: String,
@@ -61,6 +70,17 @@ pub struct UserInfo {
     /// as unverified) instead of failing; `userinfo_email_verified_contract`
     /// below pins the expected shape.
     pub email_verified: Option<bool>,
+    /// BUNYIP-141: standard `profile` scope claims. None on absent / empty.
+    #[serde(default)]
+    pub given_name: Option<String>,
+    #[serde(default)]
+    pub family_name: Option<String>,
+    /// BUNYIP-141: standard `phone` scope claim. Mokosh PSA does not request
+    /// `phone` today (PMS does not use phone numbers per BUNYIP-103), but
+    /// honour the wire shape so a future env change does not need a code
+    /// change here. None on absent / empty.
+    #[serde(default)]
+    pub phone_number: Option<String>,
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
