@@ -470,3 +470,86 @@ async fn create_tenant_sets_org_kind(pool: PgPool) {
         .expect("read kind");
     assert_eq!(kind, "org", "create_tenant provisions an org-kind tenant");
 }
+
+/// PMS-413: `create_tenant` also provisions an `internal` own-company named
+/// after the tenant and points `tenants.own_company_id` at it.
+#[sqlx::test]
+async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "PMS-413 Org".into(),
+        slug: "pms413-org".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-pms413@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Pms413".into(),
+    };
+
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant must succeed");
+
+    let own_company_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+            .bind(tenant.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read own_company_id");
+    let own_company_id = own_company_id.expect("own_company_id is set after provisioning");
+
+    let (name, company_type): (String, String) =
+        sqlx::query_as("SELECT name, company_type FROM companies WHERE id = $1 AND tenant_id = $2")
+            .bind(own_company_id)
+            .bind(tenant.id)
+            .fetch_one(&pool)
+            .await
+            .expect("own-company row exists");
+    assert_eq!(company_type, "internal", "own-company is type internal");
+    assert_eq!(name, "PMS-413 Org", "own-company is named after the tenant");
+}
+
+/// PMS-413: a tenant provisioned off the PSA create path (e.g. a manually
+/// inserted org tenant a bunyip user lands in) gets an own-company when
+/// `ensure_default_config` runs, and a second run is a no-op (one company).
+#[sqlx::test]
+async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) {
+    // A tenant inserted directly, bypassing create_tenant: no own_company yet.
+    let (tenant_id, _user_id, _email, _password) =
+        common::seed_tenant_with_admin(&pool, "pms413-backfill").await;
+
+    let pre: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read own_company_id pre");
+    assert!(pre.is_none(), "directly-seeded tenant starts with no own-company");
+
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    svc.ensure_default_config(tenant_id)
+        .await
+        .expect("first ensure_default_config");
+    svc.ensure_default_config(tenant_id)
+        .await
+        .expect("second ensure_default_config (idempotent)");
+
+    let own_company_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read own_company_id post");
+    assert!(own_company_id.is_some(), "own-company set after backfill");
+
+    let internal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM companies WHERE tenant_id = $1 AND company_type = 'internal'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count internal companies");
+    assert_eq!(internal_count, 1, "exactly one own-company, even after two runs");
+}

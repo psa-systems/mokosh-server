@@ -533,7 +533,8 @@ impl AuthService {
                    date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at, profile_completed_at
+                   created_at, updated_at, profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
             FROM users
             WHERE tenant_id = $1 AND email = $2
             "#,
@@ -1552,7 +1553,8 @@ impl AuthService {
                    date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at, profile_completed_at
+                   created_at, updated_at, profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
             FROM users
             WHERE {data_where}
             ORDER BY {order_by}
@@ -1634,7 +1636,8 @@ impl AuthService {
                    date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at, profile_completed_at
+                   created_at, updated_at, profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
             FROM users
             WHERE id = $1 AND tenant_id = $2
             "#,
@@ -1751,7 +1754,8 @@ impl AuthService {
                    date_format_string, theme_base_mode, theme_accent_id, role,
                    status, email_verified_at, last_login_at, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at, profile_completed_at
+                   created_at, updated_at, profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
             FROM users
             WHERE tenant_id = $1 AND email = $2
             "#,
@@ -2041,6 +2045,10 @@ struct UserRow {
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     profile_completed_at: Option<chrono::DateTime<Utc>>,
+    // PMS-413: the owning tenant's own-company id, pulled in by a correlated
+    // subquery against `tenants` in each user-load query (tenant-scoped, not a
+    // `users` column).
+    own_company_id: Option<Uuid>,
 }
 
 #[cfg(feature = "server")]
@@ -2073,6 +2081,7 @@ impl From<UserRow> for User {
             created_at: row.created_at,
             updated_at: row.updated_at,
             profile_completed_at: row.profile_completed_at,
+            own_company_id: row.own_company_id,
         }
     }
 }

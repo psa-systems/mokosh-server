@@ -255,6 +255,11 @@ pub enum CompanyType {
     Prospect,
     Vendor,
     Partner,
+    /// The tenant's own company (PMS-413). Auto-created on tenant
+    /// provisioning and pointed at by `tenants.own_company_id`. Used to
+    /// attribute general / overhead time entries that have no customer.
+    /// Excluded from the default customer-facing company list.
+    Internal,
 }
 
 impl CompanyType {
@@ -264,6 +269,7 @@ impl CompanyType {
             "prospect" => Some(Self::Prospect),
             "vendor" => Some(Self::Vendor),
             "partner" => Some(Self::Partner),
+            "internal" => Some(Self::Internal),
             _ => None,
         }
     }
@@ -274,6 +280,7 @@ impl CompanyType {
             Self::Prospect => "prospect",
             Self::Vendor => "vendor",
             Self::Partner => "partner",
+            Self::Internal => "internal",
         }
     }
 }

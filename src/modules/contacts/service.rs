@@ -345,6 +345,13 @@ impl ContactService {
             count_conds.push(format!("company_type = ${count_idx}"));
             data_idx += 1;
             count_idx += 1;
+        } else {
+            // PMS-413: the default customer list excludes the tenant's internal
+            // own-company so it never appears as a fake client in pickers. An
+            // explicit `company_type=internal` filter (above branch) still
+            // surfaces it, and lookup-by-id (`get_company`) is unaffected.
+            data_conds.push("company_type <> 'internal'".to_string());
+            count_conds.push("company_type <> 'internal'".to_string());
         }
         if filter.status.is_some() {
             data_conds.push(format!("status = ${data_idx}"));
