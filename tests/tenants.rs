@@ -526,7 +526,10 @@ async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) 
             .fetch_one(&pool)
             .await
             .expect("read own_company_id pre");
-    assert!(pre.is_none(), "directly-seeded tenant starts with no own-company");
+    assert!(
+        pre.is_none(),
+        "directly-seeded tenant starts with no own-company"
+    );
 
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     svc.ensure_default_config(tenant_id)
@@ -551,5 +554,8 @@ async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) 
     .fetch_one(&pool)
     .await
     .expect("count internal companies");
-    assert_eq!(internal_count, 1, "exactly one own-company, even after two runs");
+    assert_eq!(
+        internal_count, 1,
+        "exactly one own-company, even after two runs"
+    );
 }

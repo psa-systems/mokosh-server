@@ -1235,7 +1235,10 @@ async fn internal_company_hidden_from_list_but_resolvable_by_id(pool: PgPool) {
         .iter()
         .filter_map(|c| c["id"].as_str().map(str::to_string))
         .collect();
-    assert!(ids.contains(&client_id), "client company appears in the list");
+    assert!(
+        ids.contains(&client_id),
+        "client company appears in the list"
+    );
     assert!(
         !ids.contains(&internal_id),
         "internal own-company must NOT appear in the default customer list"
@@ -1263,13 +1266,15 @@ async fn internal_company_hidden_from_list_but_resolvable_by_id(pool: PgPool) {
 /// which the API has no create path for.
 async fn create_company_row(pool: &PgPool, name: &str, company_type: &str) -> String {
     let id = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO companies (id, tenant_id, name, company_type) VALUES ($1, $2, $3, $4)")
-        .bind(id)
-        .bind(common::DEFAULT_TENANT_ID)
-        .bind(name)
-        .bind(company_type)
-        .execute(pool)
-        .await
-        .expect("insert company row");
+    sqlx::query(
+        "INSERT INTO companies (id, tenant_id, name, company_type) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(name)
+    .bind(company_type)
+    .execute(pool)
+    .await
+    .expect("insert company row");
     id.to_string()
 }

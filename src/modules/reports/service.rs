@@ -421,7 +421,7 @@ impl ReportsService {
         let (companies_total, companies_active): (i64, i64) = sqlx::query_as(
             r#"SELECT COUNT(*)::bigint,
                       COUNT(*) FILTER (WHERE status = 'active')::bigint
-               FROM companies WHERE tenant_id = $1"#,
+               FROM companies WHERE tenant_id = $1 AND company_type <> 'internal'"#,
         )
         .bind(tenant_id)
         .fetch_one(&mut *tx)
