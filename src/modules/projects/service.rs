@@ -938,6 +938,27 @@ impl ProjectsService {
                 .fetch_optional(&mut *tx)
                 .await?;
 
+        // PMS-398: a partial PUT can invert the start/due range against the
+        // stored row even when the request alone passes the per-request
+        // validator (which only sees the fields the caller supplied). Combine
+        // each requested value with the stored one (request wins, else the
+        // `before` snapshot) and reject an inverted effective range before the
+        // UPDATE runs, mirroring the appointment range guard (PMS-343).
+        let stored_date = |key: &str| -> Option<chrono::NaiveDate> {
+            before
+                .as_ref()
+                .and_then(|b| b.get(key))
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        };
+        let effective_start = request.start_date.or_else(|| stored_date("start_date"));
+        let effective_due = request.due_date.or_else(|| stored_date("due_date"));
+        if !task_dates_ok(effective_start, effective_due) {
+            return Err(AppError::BadRequest(
+                "Due date must be on or after the start date".to_string(),
+            ));
+        }
+
         // When the new status is completed, stamp completed_at; clearing
         // back to non-completed clears it. Two reads (status flag check)
         // would be more correct but require a join; we instead infer

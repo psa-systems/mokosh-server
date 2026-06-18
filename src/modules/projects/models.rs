@@ -277,7 +277,51 @@ pub struct TaskResponse {
     pub sort_order: i32,
 }
 
+/// A task's `due_date` must be on or after its `start_date` (PMS-398):
+/// inverted (negative-duration) ranges are rejected. Equality is allowed (a
+/// single-day task is valid). A `None` on either side means "unbounded on that
+/// end" and is always accepted. Shared by the create and update request
+/// validators (and the update service path) so every entry point enforces the
+/// same rule. Mirrors `appointment_range_ok` (PMS-343) and the contract date
+/// range check (PMS-306).
+pub(crate) fn task_dates_ok(start: Option<NaiveDate>, due: Option<NaiveDate>) -> bool {
+    match (start, due) {
+        (Some(start), Some(due)) => start <= due,
+        _ => true,
+    }
+}
+
+/// Cross-field check for `CreateTaskRequest`: an inverted start/due range is
+/// rejected with a 422 at the request layer. The error is re-keyed onto
+/// `due_date` so the SPA renders it inline against that field rather than as a
+/// generic banner (PMS-364).
+fn validate_create_task_dates(req: &CreateTaskRequest) -> Result<(), validator::ValidationError> {
+    if !task_dates_ok(req.start_date, req.due_date) {
+        return Err(crate::utils::validation::cross_field_error(
+            "task_dates_inverted",
+            "due_date",
+            "Due date must be on or after the start date",
+        ));
+    }
+    Ok(())
+}
+
+/// Cross-field check for `UpdateTaskRequest`. A partial PUT that supplies both
+/// dates is validated the same way as a create; one-sided updates fall through
+/// to the service layer, which combines the request values with the stored row.
+fn validate_update_task_dates(req: &UpdateTaskRequest) -> Result<(), validator::ValidationError> {
+    if !task_dates_ok(req.start_date, req.due_date) {
+        return Err(crate::utils::validation::cross_field_error(
+            "task_dates_inverted",
+            "due_date",
+            "Due date must be on or after the start date",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[validate(schema(function = validate_create_task_dates))]
 pub struct CreateTaskRequest {
     #[validate(length(min = 1, max = 255))]
     pub title: String,
@@ -301,6 +345,7 @@ fn default_medium() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[validate(schema(function = validate_update_task_dates))]
 pub struct UpdateTaskRequest {
     #[validate(length(min = 1, max = 255))]
     pub title: Option<String>,
@@ -314,4 +359,43 @@ pub struct UpdateTaskRequest {
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,
     pub sort_order: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
+    }
+
+    #[test]
+    fn task_dates_ok_both_none() {
+        assert!(task_dates_ok(None, None));
+    }
+
+    #[test]
+    fn task_dates_ok_only_start() {
+        assert!(task_dates_ok(Some(d(2026, 6, 18)), None));
+    }
+
+    #[test]
+    fn task_dates_ok_only_due() {
+        assert!(task_dates_ok(None, Some(d(2026, 6, 18))));
+    }
+
+    #[test]
+    fn task_dates_ok_equal() {
+        assert!(task_dates_ok(Some(d(2026, 6, 18)), Some(d(2026, 6, 18))));
+    }
+
+    #[test]
+    fn task_dates_ok_valid_ordered() {
+        assert!(task_dates_ok(Some(d(2026, 6, 18)), Some(d(2026, 6, 20))));
+    }
+
+    #[test]
+    fn task_dates_ok_inverted() {
+        assert!(!task_dates_ok(Some(d(2026, 6, 20)), Some(d(2026, 6, 18))));
+    }
 }
