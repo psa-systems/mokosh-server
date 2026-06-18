@@ -681,6 +681,166 @@ async fn contact_crud_happy_path(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-402: freeform company on contacts (nullable company_id + company_name)
+// ============================================================================
+
+/// A contact created with a freeform `company_name` and no `company_id`
+/// round-trips: create returns the typed company name and a null
+/// `company_id`, and a subsequent GET surfaces the same. Backs the read-side
+/// `COALESCE(co.name, c.company_name)` projection and the nullable FK.
+#[sqlx::test]
+async fn freeform_company_contact_round_trips(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // CREATE with a freeform company and NO company_id.
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_name": "Bob's Plumbing",
+            "first_name": "Bob",
+            "last_name": "Smith",
+        }))
+        .send()
+        .await
+        .expect("send create freeform contact");
+    assert!(
+        create_resp.status().is_success(),
+        "create freeform contact should 2xx, got {}",
+        create_resp.status()
+    );
+    let created: serde_json::Value = create_resp.json().await.expect("create JSON");
+    let contact_id = created["id"].as_str().expect("contact has id").to_string();
+    assert_eq!(
+        created["company_name"].as_str(),
+        Some("Bob's Plumbing"),
+        "freeform company_name should surface on create"
+    );
+    assert!(
+        created["company_id"].is_null(),
+        "freeform contact should have a null company_id, got {:?}",
+        created["company_id"]
+    );
+
+    // GET surfaces the freeform name and a null company_id.
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get freeform contact")
+        .json()
+        .await
+        .expect("get JSON");
+    assert_eq!(got["company_name"].as_str(), Some("Bob's Plumbing"));
+    assert!(got["company_id"].is_null());
+
+    // A contact with neither company_id nor company_name is also valid.
+    let bare_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "first_name": "Lone",
+            "last_name": "Person",
+        }))
+        .send()
+        .await
+        .expect("send create bare contact");
+    assert!(
+        bare_resp.status().is_success(),
+        "bare contact (no company) should 2xx, got {}",
+        bare_resp.status()
+    );
+    let bare: serde_json::Value = bare_resp.json().await.expect("bare JSON");
+    assert!(bare["company_id"].is_null());
+    assert!(bare["company_name"].is_null());
+
+    // Supplying BOTH a company_id and a non-empty company_name is rejected.
+    let company_id = create_company(&app, &token, "Acme").await;
+    let both_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "company_name": "Acme Typed",
+            "first_name": "Clash",
+            "last_name": "Case",
+        }))
+        .send()
+        .await
+        .expect("send conflicting contact");
+    assert_eq!(
+        both_resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "supplying both company_id and company_name should 422"
+    );
+}
+
+/// Updating a freeform contact to point at a real CRM company clears the
+/// stored freeform name; the read side then surfaces the CRM name and a
+/// non-null company_id.
+#[sqlx::test]
+async fn updating_freeform_to_fk_clears_freeform_name(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Start freeform.
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_name": "Typed Co",
+            "first_name": "Mover",
+            "last_name": "Upper",
+        }))
+        .send()
+        .await
+        .expect("send create")
+        .json()
+        .await
+        .expect("create JSON");
+    let contact_id = created["id"].as_str().expect("id").to_string();
+
+    // Link to a real CRM company.
+    let company_id = create_company(&app, &token, "Real CRM Co").await;
+    let put_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company_id }))
+        .send()
+        .await
+        .expect("send link update");
+    assert!(
+        put_resp.status().is_success(),
+        "linking to a CRM company should 2xx, got {}",
+        put_resp.status()
+    );
+
+    // Re-GET: CRM name wins, company_id is set, freeform name was cleared.
+    let reget: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send re-get")
+        .json()
+        .await
+        .expect("re-get JSON");
+    assert_eq!(reget["company_name"].as_str(), Some("Real CRM Co"));
+    assert_eq!(reget["company_id"].as_str(), Some(company_id.as_str()));
+}
+
+// ============================================================================
 // PMS-17 AC2: create_portal_access flips is_portal_user
 // ============================================================================
 

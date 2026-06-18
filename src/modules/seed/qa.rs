@@ -740,7 +740,8 @@ fn qa_contacts_for(company_id: Uuid, idx: usize) -> Vec<CreateContactRequest> {
         .map(|j| {
             let (first, last, title, ctype, method) = people[(idx + j) % people.len()];
             CreateContactRequest {
-                company_id,
+                company_id: Some(company_id),
+                company_name: None,
                 first_name: format!("QA-{first}"),
                 last_name: format!("{last}{idx}{j}"),
                 email: Some(format!(

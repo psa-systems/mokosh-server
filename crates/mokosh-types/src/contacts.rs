@@ -51,6 +51,46 @@ fn validate_company_name(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validate a freeform company name (PMS-402). Applied to the inner value of
+/// an `Option<String>` field (validator skips it when the field is `None`). An
+/// empty string is accepted: on the update path `Some("")` means "clear the
+/// stored freeform name". Any other value must satisfy the same not-blank /
+/// no-control-character rules as a CRM company name.
+fn validate_company_name_opt(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_company_name(value)
+}
+
+/// Reject supplying BOTH a `company_id` and a non-empty freeform
+/// `company_name` at once (PMS-402). The two are mutually exclusive: a contact
+/// either links to a CRM company or carries a typed-in label, never both. An
+/// empty `company_name` string counts as "not supplied" here.
+fn validate_company_link_exclusive(
+    company_id: Option<Uuid>,
+    company_name: &Option<String>,
+) -> Result<(), ValidationError> {
+    let has_freeform = company_name.as_deref().is_some_and(|s| !s.is_empty());
+    if company_id.is_some() && has_freeform {
+        return Err(ValidationError::new("company_id_and_name_both_set"));
+    }
+    Ok(())
+}
+
+/// Struct-level guard for `CreateContactRequest` (PMS-402): a contact may link
+/// a CRM `company_id` OR carry a freeform `company_name`, never both.
+fn validate_create_company_link(req: &CreateContactRequest) -> Result<(), ValidationError> {
+    validate_company_link_exclusive(req.company_id, &req.company_name)
+}
+
+/// Struct-level guard for `UpdateContactRequest` (PMS-402): same mutual
+/// exclusion as create. Setting a `company_id` while also passing a non-empty
+/// `company_name` in the same request is rejected.
+fn validate_update_company_link(req: &UpdateContactRequest) -> Result<(), ValidationError> {
+    validate_company_link_exclusive(req.company_id, &req.company_name)
+}
+
 /// Validate a website as an http(s) URL. An empty string is treated as "no
 /// value" and accepted; any other value must use an `http`/`https` scheme and
 /// carry a host. The scheme allowlist blocks `javascript:`/`data:` URLs that
@@ -588,10 +628,15 @@ impl ContactStatus {
 pub struct Contact {
     pub id: Uuid,
     pub tenant_id: Uuid,
-    pub company_id: Uuid,
-    /// Name of the linked company, resolved via a LEFT JOIN in the read
-    /// queries (PMS-334). `None` only when the company row is missing;
-    /// `company_id` is NOT NULL so this is populated in practice.
+    /// Optional link to a CRM `companies` row (PMS-402). `None` when the
+    /// contact carries a freeform `company_name` instead, or no company at
+    /// all (a bare name plus phone).
+    pub company_id: Option<Uuid>,
+    /// The contact's company name for display. Holds EITHER the joined CRM
+    /// name (when `company_id` is set, resolved via a LEFT JOIN in the read
+    /// queries, PMS-334) OR the stored freeform value (when `company_id` is
+    /// `None`, PMS-402). Surfaced through `COALESCE(co.name, c.company_name)`
+    /// so a single authoritative string reaches every consumer.
     #[serde(default)]
     pub company_name: Option<String>,
     pub first_name: String,
@@ -625,8 +670,17 @@ impl Contact {
 
 /// Create contact request
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[validate(schema(function = validate_create_company_link))]
 pub struct CreateContactRequest {
-    pub company_id: Uuid,
+    /// Optional link to an existing CRM company (PMS-402). Mutually exclusive
+    /// with a non-empty `company_name`; supplying both is rejected (422).
+    #[serde(default)]
+    pub company_id: Option<Uuid>,
+    /// Optional freeform company label typed by the user (PMS-402). Used when
+    /// the contact's company is not (yet) a CRM `companies` row.
+    #[serde(default)]
+    #[validate(length(max = 255), custom(function = "validate_company_name_opt"))]
+    pub company_name: Option<String>,
     #[validate(length(min = 1, max = 100))]
     pub first_name: String,
     #[validate(length(min = 1, max = 100))]
@@ -662,8 +716,16 @@ pub struct CreateContactRequest {
 
 /// Update contact request
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[validate(schema(function = validate_update_company_link))]
 pub struct UpdateContactRequest {
     pub company_id: Option<Uuid>,
+    /// Freeform company label (PMS-402). `Some("")` clears the stored
+    /// freeform name; a non-empty value sets it. Setting `company_id` in the
+    /// same (or any later) request clears the stored freeform name, since the
+    /// CRM name then becomes authoritative. `None` leaves it unchanged.
+    #[serde(default)]
+    #[validate(length(max = 255), custom(function = "validate_company_name_opt"))]
+    pub company_name: Option<String>,
     #[validate(length(min = 1, max = 100))]
     pub first_name: Option<String>,
     #[validate(length(min = 1, max = 100))]
@@ -722,7 +784,9 @@ impl From<Contact> for ContactSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ContactResponse {
     pub id: Uuid,
-    pub company_id: Uuid,
+    /// Optional CRM company link (PMS-402); `None` for a freeform or
+    /// company-less contact.
+    pub company_id: Option<Uuid>,
     pub company_name: Option<String>,
     pub first_name: String,
     pub last_name: String,
@@ -1120,5 +1184,110 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    // ========================================================================
+    // PMS-402: freeform company on contacts
+    // ========================================================================
+
+    /// Build a `CreateContactRequest` from a body that omits `company_id`,
+    /// so freeform / company-less cases can be exercised (the `contact_req`
+    /// helper always injects a `company_id`).
+    fn contact_req_raw(body: serde_json::Value) -> CreateContactRequest {
+        let mut full = serde_json::json!({
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+        });
+        if let serde_json::Value::Object(extra) = body {
+            for (k, v) in extra {
+                full[k] = v;
+            }
+        }
+        serde_json::from_value(full).expect("contact request deserializes")
+    }
+
+    #[test]
+    fn freeform_company_name_only_is_valid() {
+        let req = contact_req_raw(serde_json::json!({ "company_name": "Acme Plumbing" }));
+        assert!(req.company_id.is_none());
+        assert_eq!(req.company_name.as_deref(), Some("Acme Plumbing"));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn fk_company_id_only_is_valid() {
+        let req = contact_req(serde_json::json!({}));
+        assert!(req.company_id.is_some());
+        assert!(req.company_name.is_none());
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn neither_company_id_nor_name_is_valid() {
+        let req = contact_req_raw(serde_json::json!({}));
+        assert!(req.company_id.is_none());
+        assert!(req.company_name.is_none());
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn both_company_id_and_name_is_rejected() {
+        let req = contact_req(serde_json::json!({ "company_name": "Acme" }));
+        assert!(req.company_id.is_some());
+        assert_eq!(req.company_name.as_deref(), Some("Acme"));
+        assert!(
+            req.validate().is_err(),
+            "supplying both company_id and a non-empty company_name must be rejected"
+        );
+    }
+
+    #[test]
+    fn company_id_with_empty_name_is_valid() {
+        // An empty freeform string counts as "not supplied", so it does not
+        // collide with the FK.
+        let req = contact_req(serde_json::json!({ "company_name": "" }));
+        assert!(req.company_id.is_some());
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn blank_freeform_company_name_is_rejected() {
+        // A whitespace-only freeform name is not a real name.
+        let req = contact_req_raw(serde_json::json!({ "company_name": "   " }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn control_chars_in_freeform_company_name_rejected() {
+        let req = contact_req_raw(serde_json::json!({ "company_name": "Acme\u{1}" }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn update_accepts_freeform_company_name() {
+        let req: UpdateContactRequest =
+            serde_json::from_value(serde_json::json!({ "company_name": "Beta LLC" }))
+                .expect("update deserializes");
+        assert_eq!(req.company_name.as_deref(), Some("Beta LLC"));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn update_empty_company_name_clears_and_validates() {
+        let req: UpdateContactRequest =
+            serde_json::from_value(serde_json::json!({ "company_name": "" }))
+                .expect("update deserializes");
+        assert_eq!(req.company_name.as_deref(), Some(""));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn update_rejects_both_company_id_and_name() {
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "company_id": "00000000-0000-0000-0000-000000000000",
+            "company_name": "Acme",
+        }))
+        .expect("update deserializes");
+        assert!(req.validate().is_err());
     }
 }
