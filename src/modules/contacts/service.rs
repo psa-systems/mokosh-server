@@ -125,7 +125,8 @@ impl ContactService {
         // closes the TOCTOU race between two concurrent creates.
         let name_taken: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM companies \
-             WHERE tenant_id = $1 AND lower(btrim(name)) = lower(btrim($2)))",
+             WHERE tenant_id = $1 AND company_type <> 'internal' \
+             AND lower(btrim(name)) = lower(btrim($2)))",
         )
         .bind(tenant_id)
         .bind(&request.name)
@@ -672,7 +673,7 @@ impl ContactService {
         if let Some(ref name) = request.name {
             let name_taken: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM companies \
-                 WHERE tenant_id = $1 AND id <> $2 \
+                 WHERE tenant_id = $1 AND id <> $2 AND company_type <> 'internal' \
                  AND lower(btrim(name)) = lower(btrim($3)))",
             )
             .bind(tenant_id)
