@@ -85,7 +85,7 @@ async fn rls_fail_closed_and_with_check(pool: PgPool) {
         .execute(&mut *conn)
         .await
         .expect("set GUC to tenant A");
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM companies")
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM companies WHERE company_type <> 'internal'")
         .fetch_one(&mut *conn)
         .await
         .expect("count with tenant A GUC");

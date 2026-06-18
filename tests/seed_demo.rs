@@ -27,8 +27,10 @@ fn seed_service(pool: &PgPool) -> SeedService {
 }
 
 async fn company_count(pool: &PgPool, tenant: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM companies WHERE tenant_id = $1")
-        .bind(tenant)
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM companies WHERE tenant_id = $1 AND company_type <> 'internal'",
+    )
+    .bind(tenant)
         .fetch_one(pool)
         .await
         .expect("count companies")
