@@ -112,19 +112,27 @@ jobs:
           fetch-depth: 0
 
       # No Node setup step: the opensuse-base runner image ships nodejs24, so
-      # node/npm/npx resolve from PATH. Using the preinstalled runtime avoids a
+      # the runtime is already on disk. Using the preinstalled nodejs avoids a
       # redundant Node download and the /tmp/toolcache workaround that
       # actions/setup-node needed on this image.
+      #
+      # PMS-429: invoke the VERSIONED binaries (node24/npm24/npx24) rather than
+      # the unversioned node/npm/npx. On this image the bare `npm` is the
+      # nodejs-common alternatives wrapper, which dispatches to
+      # `/usr/bin/npm-default`; that target is absent on the runner, so `npm ci`
+      # died with `/usr/bin/npm-default: No such file or directory` (exit 255).
+      # The nodejs24/npm24 packages provide /usr/bin/node24, /usr/bin/npm24 and
+      # /usr/bin/npx24 directly, bypassing the broken alternatives indirection.
 
       - name: Install dependencies
-        run: npm ci
+        run: npm24 ci
 
       - name: Install Playwright browser
         # --with-deps shells out to apt-get, which the OpenSUSE runner does
         # not have. The runner image carries the X / GTK / NSS libs Chromium
         # needs already; if a future image trims them down, add a `zypper
         # install -y` step here for the missing sonames.
-        run: npx playwright install chromium
+        run: npx24 playwright install chromium
 
       # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
       # dispatched commit is unlikely to be what prod currently serves, so the
@@ -133,14 +141,14 @@ jobs:
       # dispatch.
       - name: Wait for deploy to serve this commit (push / staging dispatch)
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
-        run: node scripts/wait-for-deploy.mjs
+        run: node24 scripts/wait-for-deploy.mjs
 
       - name: Verify deployment is reachable (pull_request / production dispatch)
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
-        run: node scripts/health-check.mjs
+        run: node24 scripts/health-check.mjs
 
       - name: Run E2E suite
-        run: npx playwright test
+        run: npx24 playwright test
 
       - name: Upload Playwright report and traces
         if: failure()
