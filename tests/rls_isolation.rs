@@ -41,6 +41,18 @@ async fn rls_fail_closed_and_with_check(pool: PgPool) {
         .await
         .expect("seed company under tenant A");
 
+    // How many companies tenant A legitimately owns. Beyond the probe above,
+    // seed migrations may create a per-tenant internal "own company" (PMS-413
+    // migration 062), so capture the owner-visible count here rather than
+    // hard-coding 1 - all of these rows belong to tenant A and must be visible
+    // under the matching GUC.
+    let tenant_a_companies: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM companies WHERE tenant_id = $1")
+            .bind(tenant_a)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("count tenant A companies as owner");
+
     // Create the unprivileged application role and grant it table access.
     sqlx::query(&format!(
         "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"
@@ -91,8 +103,8 @@ async fn rls_fail_closed_and_with_check(pool: PgPool) {
             .await
             .expect("count with tenant A GUC");
     assert_eq!(
-        count, 1,
-        "the matching GUC must expose exactly tenant A's row"
+        count, tenant_a_companies,
+        "the matching GUC must expose exactly tenant A's rows"
     );
 
     // 3) WITH CHECK: a write whose tenant_id != the GUC is rejected.
