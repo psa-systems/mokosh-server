@@ -53,6 +53,10 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Cap build parallelism
+        # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
+        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
+
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`
         # binaries) plus the lib unit tests, so new suites are picked up
