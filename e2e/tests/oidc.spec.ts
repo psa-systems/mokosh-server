@@ -16,8 +16,23 @@ import { env } from '../lib/env';
 // covered indirectly by every other api test, so this test is here to
 // assert the full OP token-flow contract against staging, not to
 // exercise mokosh's RS path.
+//
+// PMS-435: quarantined (`test.fixme`) - blocked on a server-side bunyip bug,
+// not an e2e cookie-forwarding defect. The PMS-434 diagnostic run (#2098)
+// proved the OP session cookie is captured and replayed correctly: setup
+// logged `KEEP .a8n.systems#bunyip_op_session` and persisted all three OP
+// cookies (`access_token, refresh_token, bunyip_op_session`) to
+// `op-state.json`, and `oidcTest` loads that storageState into the request
+// context. Despite the session cookie being present on the right domain,
+// `/oauth2/authorize` still 302s to `/login` with no `state`, so the test
+// fails at the `state` assertion ("state mismatch", received null). That
+// bounce is bunyip's COOKIE_DOMAIN / `bunyip_op_session` scoping issue tracked
+// in BUNYIP-146, not a mokosh-server regression - every other api test and
+// staging health pass. Quarantine (same convention as auth.spec.ts / PMS-148)
+// so this external blocker stops gating unrelated PRs; un-fixme when
+// BUNYIP-146 ships.
 test.describe('OIDC token flow', () => {
-  test('authorize -> token -> userinfo -> refresh', async ({ request }) => {
+  test.fixme('authorize -> token -> userinfo -> refresh', async ({ request }) => {
     const oidc = await discoverOidc(request, env.opBaseURL);
     const pkce = makePkce();
     const state = randomToken();
