@@ -91,17 +91,21 @@ async fn rls_fail_closed_and_with_check(pool: PgPool) {
     assert_eq!(count, 0, "an unset GUC must expose zero rows (fail-closed)");
 
     // 2) With the matching GUC the row becomes visible (the policy is not a
-    //    blanket deny).
+    //    blanket deny). RLS filters purely by tenant_id, not company_type, so
+    //    the matching GUC exposes every tenant-A row - including the internal
+    //    own-company (PMS-413 migration 062). Count without a company_type
+    //    filter so this read mirrors the owner-visible count captured above; an
+    //    asymmetric `<> 'internal'` predicate here would undercount and fail
+    //    even though RLS is behaving correctly.
     sqlx::query("SELECT set_config('app.current_tenant', $1, false)")
         .bind(tenant_a.to_string())
         .execute(&mut *conn)
         .await
         .expect("set GUC to tenant A");
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM companies WHERE company_type <> 'internal'")
-            .fetch_one(&mut *conn)
-            .await
-            .expect("count with tenant A GUC");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM companies")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count with tenant A GUC");
     assert_eq!(
         count, tenant_a_companies,
         "the matching GUC must expose exactly tenant A's rows"

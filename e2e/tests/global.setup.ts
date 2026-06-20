@@ -228,6 +228,41 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     const d = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
     return opCookieDomains.has(d);
   });
+
+  // Full cookie inventory by NAME, marking which were kept vs dropped by the
+  // domain filter. The persisted-count line below only reports a number, which
+  // hides the failure mode where authorize 302s to login because bunyip's
+  // OP-session cookie was set on a host outside `opCookieDomains` and got
+  // dropped here - so the captured set is non-empty but missing the one cookie
+  // `/oauth2/authorize` actually gates on (bunyip PR #67). Logging name+domain+
+  // kept/dropped makes that diagnosable from the run output alone instead of
+  // requiring the trace zip. Names only (no values) so secrets stay out of logs.
+  const keptKeys = new Set(opCookies.map((c) => `${c.domain}${c.path}#${c.name}`));
+  const cookieInventory = allCookies
+    .map((c) => {
+      const key = `${c.domain}${c.path}#${c.name}`;
+      return `${keptKeys.has(key) ? 'KEEP' : 'drop'} ${c.domain}#${c.name}`;
+    })
+    .join('\n    ');
+  console.log(
+    `[setup] OP cookie inventory (KEEP = matched ${[...opCookieDomains].join('/')}):\n    ${cookieInventory || '(no cookies)'}`,
+  );
+  // The one cookie `/oauth2/authorize` gates on. Bunyip names it
+  // `bunyip_op_session` (bunyip-domain middleware/auth.rs OP_SESSION_COOKIE)
+  // and scopes it by the OP's `COOKIE_DOMAIN` env (host-only when empty). If it
+  // is not in the kept set, authorize will 302 to /login and oidc.spec.ts fails
+  // with "state mismatch" - so call it out loudly rather than burying it in the
+  // inventory. WARN (not throw): the 21 bearer-auth specs do not need this
+  // cookie, so a miss must not block the rest of the suite.
+  const OP_SESSION_COOKIE = 'bunyip_op_session';
+  if (!opCookies.some((c) => c.name === OP_SESSION_COOKIE)) {
+    const onAnyHost = allCookies.some((c) => c.name === OP_SESSION_COOKIE);
+    console.warn(
+      `[setup] WARNING: ${OP_SESSION_COOKIE} not in the persisted OP set` +
+        `${onAnyHost ? ' (present in the browser but on a domain outside the filter - check COOKIE_DOMAIN vs opBaseURL)' : ' (not set by login at all - check the OP login/SSO step)'}.` +
+        ` oidc.spec.ts authorize will 302 to /login.`,
+    );
+  }
   if (opCookies.length === 0) {
     throw new Error(
       `No OP cookies matched ${[...opCookieDomains].join(', ')} after login. ` +
@@ -240,7 +275,9 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     JSON.stringify({ cookies: opCookies, origins: [] }, null, 2),
   );
   console.log(
-    `[setup] persisted ${opCookies.length} OP cookie(s) (${[...opCookieDomains].join(', ')}) to ${OP_STORAGE_STATE_FILE}`,
+    `[setup] persisted ${opCookies.length} OP cookie(s) [${opCookies
+      .map((c) => c.name)
+      .join(', ')}] (${[...opCookieDomains].join(', ')}) to ${OP_STORAGE_STATE_FILE}`,
   );
 });
 
