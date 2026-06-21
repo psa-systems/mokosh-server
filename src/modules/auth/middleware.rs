@@ -568,11 +568,15 @@ pub async fn place_bunyip_user(
     }
 
     // Resolve the local shadow row, JIT-creating it on first sight. A brand-new
-    // invited user is seeded with the invite's role.
+    // invited user is seeded with the invite's role; otherwise the user owns
+    // their own single-tenant Mokosh world (PMS-447) so the JIT default is
+    // `Admin`, not `Technician`. The Bunyip-role reconciliation below still
+    // runs and promotes to `SuperAdmin` if the at+jwt carries the platform
+    // admin claim.
     let initial_role = invite
         .as_ref()
         .and_then(|i| UserRole::from_str(&i.role))
-        .unwrap_or_default();
+        .unwrap_or(UserRole::Admin);
     let mut user = match auth_service.get_user_by_id(target, sub).await {
         Ok(user) => user,
         Err(_) => {
@@ -649,31 +653,31 @@ pub async fn place_bunyip_user(
 }
 
 /// Translate Bunyip's system role (the `bunyip_role` claim) into mokosh's
-/// effective role on the Bunyip RS path (PMS-172).
+/// effective role on the Bunyip RS path (PMS-172, revised for the
+/// single-tenancy posture in PMS-447).
 ///
-/// Bunyip is the SSO / identity manager and governs only the top role:
-/// - `admin`      -> mokosh `super_admin` (authoritative).
-/// - `subscriber` -> the user's locally-assigned mokosh role, EXCEPT that
-///   `super_admin` is Bunyip-exclusive, so a stale / locally-set `super_admin`
-///   is clamped down to `admin`.
-/// - any other / unknown value -> treated like `subscriber` (never elevates,
-///   still clamps a stale `super_admin`), so a future Bunyip role can't
-///   silently grant super_admin before mokosh learns to map it.
+/// After PMS-447 each Mokosh tenant has exactly one user (the owner), so a
+/// signed-in Bunyip user IS the admin of their own world by construction:
+/// - `admin`      -> mokosh `super_admin` (platform-level, cross-tenant; the
+///   only role that is genuinely Bunyip-exclusive).
+/// - `subscriber` -> mokosh `admin` (single-tenancy floor). A stale local
+///   `super_admin` clamps down to `admin`; anything lower than `admin`
+///   (Technician, Manager, etc.) upgrades up to `admin`.
+/// - any other / unknown value -> treated like `subscriber`. A future Bunyip
+///   role can't silently grant super_admin before mokosh learns to map it,
+///   but it still satisfies the single-tenancy floor.
 /// - absent claim (`None`) -> keep the local role unchanged. Back-compatible:
-///   mokosh can ship before Bunyip emits the claim, and the legacy HS256 /
-///   standalone paths (which never carry the claim) are unaffected.
+///   the legacy HS256 / standalone paths (which never carry the claim) are
+///   unaffected.
 fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> UserRole {
     match bunyip_role {
         None => local,
         Some("admin") => UserRole::SuperAdmin,
         Some(_) => {
-            // subscriber (or an unknown future value): super_admin is
-            // Bunyip-exclusive, everything below it is mokosh-internal.
-            if local == UserRole::SuperAdmin {
-                UserRole::Admin
-            } else {
-                local
-            }
+            // PMS-447: subscriber (or unknown future role) -> tenant admin.
+            // super_admin is Bunyip-exclusive, so a stale local super_admin
+            // clamps down to admin; anything else rises to admin.
+            UserRole::Admin
         }
     }
 }
@@ -753,7 +757,11 @@ mod tests {
     }
 
     #[test]
-    fn subscriber_uses_local_role() {
+    fn subscriber_floors_local_role_to_tenant_admin() {
+        // PMS-447: every signed-in Bunyip user owns their single-tenant Mokosh
+        // world, so a `subscriber` claim always floors at `Admin` regardless
+        // of the stored local role - tenant-internal demotions below admin
+        // (Technician, Manager, etc.) do not survive token reconciliation.
         for local in [
             UserRole::Technician,
             UserRole::Dispatcher,
@@ -762,7 +770,10 @@ mod tests {
             UserRole::Manager,
             UserRole::Admin,
         ] {
-            assert_eq!(effective_role_from_bunyip(Some("subscriber"), local), local);
+            assert_eq!(
+                effective_role_from_bunyip(Some("subscriber"), local),
+                UserRole::Admin
+            );
         }
     }
 
@@ -777,12 +788,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_bunyip_role_does_not_elevate_and_clamps_super_admin() {
+    fn unknown_bunyip_role_floors_to_admin_and_clamps_super_admin() {
         // A future / unrecognized Bunyip role must not silently grant
-        // super_admin, and must still strip a stale local super_admin.
+        // super_admin, but it still satisfies the PMS-447 single-tenancy
+        // floor: the signed-in user is an admin in their own Mokosh.
         assert_eq!(
             effective_role_from_bunyip(Some("owner"), UserRole::Technician),
-            UserRole::Technician
+            UserRole::Admin
         );
         assert_eq!(
             effective_role_from_bunyip(Some("owner"), UserRole::SuperAdmin),
