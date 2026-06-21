@@ -624,7 +624,23 @@ pub async fn place_bunyip_user(
             );
         }
     }
-    let effective = effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role);
+    // PMS-447 follow-up: gate the single-tenancy `subscriber -> Admin` floor on
+    // invite absence. The PMS-447 floor assumes the signed-in user owns their
+    // own one-person Mokosh tenant; that premise breaks for a user accepting a
+    // role-bearing invite into a SHARED org tenant, where the inviting admin's
+    // chosen role (e.g. `manager`) is a deliberate least-privilege grant.
+    // Silently flooring it up to `admin` would be an unintended elevation that
+    // contradicts the invite. On the invite path the invite role stands; only
+    // a platform-level Bunyip `admin` claim (genuinely cross-tenant) still
+    // overrides to `super_admin`. Non-invite placements keep the PMS-447 floor.
+    let effective = if invite.is_some() {
+        match claims.bunyip_role.as_deref() {
+            Some("admin") => UserRole::SuperAdmin,
+            _ => user.role,
+        }
+    } else {
+        effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role)
+    };
     if effective != user.role {
         // Role transitions are security-relevant; log every one (fires only on
         // change, so low volume) so an elevation/demotion is observable even
