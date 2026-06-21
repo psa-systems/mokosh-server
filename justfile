@@ -1,10 +1,108 @@
-# Mokosh Server - Task Runner
+# General Task Runner
 
 compose_file := "compose.dev.yml"
 
 # List available recipes
 default:
     @just --list
+
+# -- Hooks ------------------------------------------------------------------
+
+# Install the git pre-commit hook (run once per fresh clone). Writes a stub at .git/hooks/pre-commit that execs `just pre-commit`. Bypass with `git commit --no-verify`.
+[group: 'hooks']
+install-hooks:
+    #!/usr/bin/env nu
+    let hook = ".git/hooks/pre-commit"
+    # Remove first so a leftover symlink from an older install does not get
+    # written through to its target file. `try` swallows the not-found case.
+    try { rm $hook }
+    "#!/usr/bin/env sh\nexec just pre-commit\n" | save $hook
+    ^chmod +x $hook
+    print $"Wrote ($hook) -> just pre-commit"
+
+# Mirrors check.yml one-to-one so a green hook means a green Check run. The
+# Postgres-backed suite is NOT run here; use `just test-integration` (mirrors
+# integration.yml) for that. PMS-267.
+# Run the fast, database-free checks inside the dev compose `server` container.
+[group: 'hooks']
+pre-commit: ensure-env
+    #!/usr/bin/env nu
+    print "\n[pre-commit] cargo fmt --all --check"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo fmt --all --check
+    print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --all-targets -- -D warnings
+    print "\n[pre-commit] cargo check --all-targets"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --all-targets
+    print "\n[pre-commit] unit tests"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --lib
+    print "\n[pre-commit] doc tests"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --doc
+    print "\n[pre-commit] all checks passed"
+
+# -- Checks ----------------------------------------------------------------------
+
+# Umbrella check: build + clippy + fmt + docker builder stage.
+[group: 'check']
+check: check-compile check-clippy check-fmt check-migrations
+
+# Enforce unique migration prefixes (PMS-198). Fails if two migrations
+# share a numeric prefix (sqlx keys its ledger on that prefix).
+[group: 'check']
+check-migrations:
+    nu scripts/check-migration-prefixes.nu
+
+# Check compilation
+[group: 'check']
+check-compile:
+    cargo check --all-targets
+
+# Run clippy lints
+[group: 'check']
+check-clippy:
+    cargo clippy --all-targets
+
+# Check formatting
+[group: 'check']
+check-fmt:
+    cargo fmt --all --check
+
+# Format code
+[group: 'format']
+fmt:
+    cargo fmt --all
+
+# Run tests
+[group: 'test']
+test:
+    cargo test
+
+# Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
+# this omits `--no-deps`, so the compose `postgres` dependency starts; the
+# `server` dev service already exports a usable DATABASE_URL. PMS-267.
+# Run the Postgres-backed integration suite in the dev compose `server` container.
+[group: 'test']
+test-integration: ensure-env
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --tests -- --test-threads=4
+
+# Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
+# pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
+[group: 'test']
+test-e2e *args:
+    cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test {{args}}
+
+# Build release binaries
+[group: 'build']
+build:
+    cargo build --release --bins
+
+# Build OCI image for validation (builder stage)
+[group: 'check']
+check-docker:
+    #!/usr/bin/env nu
+    let git_hash = (^git rev-parse --short=12 HEAD | str trim)
+    let git_describe = (^git describe --tags --always --dirty | str trim)
+    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
+    docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
 # Create .env from the committed .env.example if missing
 [private]
@@ -183,69 +281,6 @@ infisical-bootstrap: ensure-env
         cargo run --quiet --bin mokosh-bootstrap -- bootstrap-infisical
     }
 
-# Run all checks (compile, clippy, fmt, migration prefixes)
-[group: 'check']
-check: check-compile check-clippy check-fmt check-migrations
-
-# Enforce unique migration prefixes (PMS-198). Fails if two migrations
-# share a numeric prefix (sqlx keys its ledger on that prefix).
-[group: 'check']
-check-migrations:
-    nu scripts/check-migration-prefixes.nu
-
-# Check compilation
-[group: 'check']
-check-compile:
-    cargo check --all-targets
-
-# Run clippy lints
-[group: 'check']
-check-clippy:
-    cargo clippy --all-targets
-
-# Check formatting
-[group: 'check']
-check-fmt:
-    cargo fmt --all --check
-
-# Format code
-[group: 'format']
-fmt:
-    cargo fmt --all
-
-# Run tests
-[group: 'test']
-test:
-    cargo test
-
-# Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
-# this omits `--no-deps`, so the compose `postgres` dependency starts; the
-# `server` dev service already exports a usable DATABASE_URL. PMS-267.
-# Run the Postgres-backed integration suite in the dev compose `server` container.
-[group: 'test']
-test-integration: ensure-env
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --tests -- --test-threads=4
-
-# Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
-# pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
-[group: 'test']
-test-e2e *args:
-    cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test {{args}}
-
-# Build release binaries
-[group: 'build']
-build:
-    cargo build --release --bins
-
-# Build OCI image for validation (builder stage)
-[group: 'check']
-check-docker:
-    #!/usr/bin/env nu
-    let git_hash = (^git rev-parse --short=12 HEAD | str trim)
-    let git_describe = (^git describe --tags --always --dirty | str trim)
-    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
-    docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
-
 # Build OCI image
 [group: 'build']
 build-docker:
@@ -265,7 +300,7 @@ migrate-run:
 migrate-create name:
     sqlx migrate add {{ name }}
 
-# ── Cleanup ──────────────────────────────────────────────────────────────────
+# -- Cleanup ------------------------------------------------------------------
 
 # Tear down this repo's dev footprint: stop both dev stacks (LAN-IP compose.dev.yml and the SSO overlay compose.dev-sso.yml) with their default network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
 [group: 'cleanup']
@@ -314,26 +349,30 @@ dev-clean-all: dev-clean
     docker buildx prune --force
     print "dev-clean-all: done"
 
-# ── Release ──────────────────────────────────────────────────────────────────
+# -- Release ------------------------------------------------------------------
 
-# Create a release: bump version, push branch, print PR link
+# Create a release: bump major (vx.0.0), minor (v0.x.0), or hotfix (v0.0.x), push the branch, and open the PR via fj.
+# After the PR merges, the create-release workflow creates the tag and release automatically.
 [group: 'release']
 create-release bump:
     #!/usr/bin/env nu
     let bump = "{{ bump }}"
 
+    # Abort if there are uncommitted changes
     let status = git status --porcelain | str trim
     if ($status | is-not-empty) {
         print $"(ansi red)Working tree is dirty. Please stash or commit your changes first.(ansi reset)"
         exit 1
     }
 
+    # Switch to main if not already there
     let branch = git branch --show-current | str trim
     if $branch != "main" {
         print $"Switching from ($branch) to main..."
         git checkout main
     }
 
+    # Pull latest changes
     git pull --rebase origin main
 
     let current = (open Cargo.toml | get package.version | split row "." | each { into int })
@@ -359,6 +398,7 @@ create-release bump:
     git add Cargo.toml
     git commit --signoff --message $"Release ($tag)"
 
+    # Push release branch
     git push --set-upstream origin $release_branch
 
     # Open the release PR via fj. Body lives in a tempfile so the
@@ -368,7 +408,7 @@ create-release bump:
         $"Automated release PR for ($tag)."
         ""
         $"After merge, `.forgejo/workflows/create-release.yml` tags and publishes ($tag) to the Generic Packages registry."
-    ] | str join "\n" | save --append $body_file
+    ] | str join "\n" | save --force $body_file
     let fj_result = (^fj --host dev.a8n.run pr create $"Release ($tag)" --body-file $body_file | complete)
     rm $body_file
     if $fj_result.exit_code != 0 {
@@ -378,7 +418,8 @@ create-release bump:
     }
 
     # `fj pr create` prints `created pull request #N: <title>` on success.
-    # Parse the number out and build the PR URL from `origin`.
+    # Parse the number out and build the PR URL from `origin` so the user
+    # gets a clickable link instead of just the fj line.
     let pr_num = (
         $fj_result.stdout
         | str trim
@@ -400,35 +441,3 @@ create-release bump:
     }
     print $"After merging, the create-release workflow will tag and release ($tag) automatically."
 
-# ── Hooks ──────────────────────────────────────────────────────────────────
-
-# Install the git pre-commit hook (run once per fresh clone). Writes a stub at .git/hooks/pre-commit that execs `just pre-commit`. Bypass with `git commit --no-verify`.
-[group: 'hooks']
-install-hooks:
-    #!/usr/bin/env nu
-    let hook = ".git/hooks/pre-commit"
-    # Remove first so a leftover symlink from an older install does not get
-    # written through to its target file. `try` swallows the not-found case.
-    try { rm $hook }
-    "#!/usr/bin/env sh\nexec just pre-commit\n" | save $hook
-    ^chmod +x $hook
-    print $"Wrote ($hook) -> just pre-commit"
-
-# Mirrors check.yml one-to-one so a green hook means a green Check run. The
-# Postgres-backed suite is NOT run here; use `just test-integration` (mirrors
-# integration.yml) for that. PMS-267.
-# Run the fast, database-free checks inside the dev compose `server` container.
-[group: 'hooks']
-pre-commit: ensure-env
-    #!/usr/bin/env nu
-    print "\n[pre-commit] cargo fmt --all --check"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo fmt --all --check
-    print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --all-targets -- -D warnings
-    print "\n[pre-commit] cargo check --all-targets"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --all-targets
-    print "\n[pre-commit] unit tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --lib
-    print "\n[pre-commit] doc tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --doc
-    print "\n[pre-commit] all checks passed"

@@ -1657,6 +1657,20 @@ impl AuthService {
     /// whose `sub` doesn't yet match a local row. The local `users.id` is set
     /// to `sub` so subsequent requests resolve via `get_user_by_id` without
     /// another userinfo round-trip. See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md §3.3.
+    ///
+    /// BUNYIP-141 (slice C of BUNYIP-103): `given_name` and `family_name`
+    /// hints come from the bunyip `/oauth2/userinfo` response when the user
+    /// consented to the `profile` scope. Both are optional:
+    /// - `Some(non-empty)`: seed the column with the claim value on insert.
+    /// - `None` or empty: fall back to `synthetic_name_from_email`.
+    ///
+    /// Subsequent JIT runs (the `ON CONFLICT DO UPDATE` branch) refresh only
+    /// `email` and `updated_at`. They do NOT overwrite `first_name` /
+    /// `last_name` so a tenant admin (or the user themselves on a future
+    /// /profile screen) can edit those fields without their next login
+    /// silently reverting them. Bunyip's stance is that mokosh names are
+    /// tenant-local once seeded; the bunyip column is the seed source, not
+    /// an authoritative mirror.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_user_from_oidc(
         &self,
@@ -1664,16 +1678,25 @@ impl AuthService {
         tenant_id: Uuid,
         email: &str,
         role: UserRole,
+        given_name_hint: Option<&str>,
+        family_name_hint: Option<&str>,
     ) -> AppResult<User> {
-        // `users.first_name` and `users.last_name` are NOT NULL. Bunyip's
-        // at+jwt deliberately doesn't carry name claims (RFC 9068), and
-        // /oauth2/userinfo only resolves `email`, so on first JIT insert
-        // we have nothing better to seed with. Derive a placeholder from
-        // the email local-part so the row satisfies the schema; the user
-        // can edit their real name from Settings whenever they like, and
-        // a later refresh of userinfo (or an explicit profile sync) can
-        // overwrite this default.
+        // Use the bunyip claim hints when both are present and non-empty;
+        // fall back to the email-derived placeholder otherwise. `users.
+        // first_name` / `last_name` are NOT NULL, so an empty hint must
+        // never reach the INSERT - the synthetic helper always returns
+        // non-empty strings (its tests pin that contract).
+        let first_hint = given_name_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let last_hint = family_name_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let (default_first, default_last) = synthetic_name_from_email(email);
+        let seed_first = first_hint.unwrap_or(default_first);
+        let seed_last = last_hint.unwrap_or(default_last);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
@@ -1692,8 +1715,8 @@ impl AuthService {
         .bind(tenant_id)
         .bind(email)
         .bind(role.as_str())
-        .bind(&default_first)
-        .bind(&default_last)
+        .bind(&seed_first)
+        .bind(&seed_last)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
