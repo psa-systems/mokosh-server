@@ -101,13 +101,6 @@ jobs:
       E2E_OP_BASE_URL: ${{ inputs.environment == 'production' && secrets.OIDC_ISSUER_PRODUCTION || secrets.OIDC_ISSUER_STAGING }}
       E2E_TOTP_SECRET: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TOTP_SECRET || secrets.E2E_STAGING_TOTP_SECRET }}
       E2E_FOREIGN_COMPANY_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_FOREIGN_COMPANY_ID || secrets.E2E_STAGING_FOREIGN_COMPANY_ID }}
-      # The opensuse-base runner does not grant write access to the default
-      # /opt/hostedtoolcache, so actions/setup-node fails when it tries to
-      # cache the downloaded Node tarball. Point the tool cache at a path the
-      # runner can write. ${{ runner.* }} cannot be referenced from job-env
-      # (Forgejo schema rejects it: the runner context is not yet bound),
-      # so use a fixed path under /tmp.
-      RUNNER_TOOL_CACHE: /tmp/toolcache
 
     steps:
       - name: Clone the repository
@@ -118,24 +111,32 @@ jobs:
           # clone would stop at depth 1 and the walk would miss or fail.
           fetch-depth: 0
 
-      - name: Prepare tool cache directory
-        # Absolute path; default working-directory (e2e/) is irrelevant.
-        run: mkdir -p "$RUNNER_TOOL_CACHE"
-
-      - name: Set up Node.js
-        uses: https://code.forgejo.org/actions/setup-node@v4
-        with:
-          node-version: 20
+      # No Node setup step: the opensuse-base runner image ships nodejs24, so
+      # the runtime is already on disk. Using the preinstalled nodejs avoids a
+      # redundant Node download and the /tmp/toolcache workaround that
+      # actions/setup-node needed on this image.
+      #
+      # PMS-429 / PMS-462: pick the JS binaries that actually exist on this
+      # image. The runtime is `/usr/bin/node24` (the bare `node`/`npm`/`npx`
+      # are libalternatives wrappers that dispatch to a `*-default` target,
+      # and `/usr/bin/npm-default` is absent, so bare `npm ci` died with
+      # `/usr/bin/npm-default: No such file or directory`, exit 255). PMS-429
+      # tried versioned `npm24`/`npx24`, but those binaries are NOT installed
+      # (only nodejs24 is), so the job died with `npm24: command not found`,
+      # exit 127. npm is not packaged on this image at all; the JS package
+      # manager that IS present is corepack (it provisions npm 11.x on demand),
+      # so run npm/npx through `corepack npm` / `corepack npx`. Node scripts
+      # keep using the concrete `node24` binary.
 
       - name: Install dependencies
-        run: npm ci
+        run: corepack npm ci
 
       - name: Install Playwright browser
         # --with-deps shells out to apt-get, which the OpenSUSE runner does
         # not have. The runner image carries the X / GTK / NSS libs Chromium
         # needs already; if a future image trims them down, add a `zypper
         # install -y` step here for the missing sonames.
-        run: npx playwright install chromium
+        run: corepack npx playwright install chromium
 
       # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
       # dispatched commit is unlikely to be what prod currently serves, so the
@@ -144,14 +145,14 @@ jobs:
       # dispatch.
       - name: Wait for deploy to serve this commit (push / staging dispatch)
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
-        run: node scripts/wait-for-deploy.mjs
+        run: node24 scripts/wait-for-deploy.mjs
 
       - name: Verify deployment is reachable (pull_request / production dispatch)
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
-        run: node scripts/health-check.mjs
+        run: node24 scripts/health-check.mjs
 
       - name: Run E2E suite
-        run: npx playwright test
+        run: corepack npx playwright test
 
       - name: Upload Playwright report and traces
         if: failure()
