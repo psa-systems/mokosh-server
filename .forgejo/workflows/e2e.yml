@@ -116,23 +116,27 @@ jobs:
       # redundant Node download and the /tmp/toolcache workaround that
       # actions/setup-node needed on this image.
       #
-      # PMS-429: invoke the VERSIONED binaries (node24/npm24/npx24) rather than
-      # the unversioned node/npm/npx. On this image the bare `npm` is the
-      # nodejs-common alternatives wrapper, which dispatches to
-      # `/usr/bin/npm-default`; that target is absent on the runner, so `npm ci`
-      # died with `/usr/bin/npm-default: No such file or directory` (exit 255).
-      # The nodejs24/npm24 packages provide /usr/bin/node24, /usr/bin/npm24 and
-      # /usr/bin/npx24 directly, bypassing the broken alternatives indirection.
+      # PMS-429 / PMS-462: pick the JS binaries that actually exist on this
+      # image. The runtime is `/usr/bin/node24` (the bare `node`/`npm`/`npx`
+      # are libalternatives wrappers that dispatch to a `*-default` target,
+      # and `/usr/bin/npm-default` is absent, so bare `npm ci` died with
+      # `/usr/bin/npm-default: No such file or directory`, exit 255). PMS-429
+      # tried versioned `npm24`/`npx24`, but those binaries are NOT installed
+      # (only nodejs24 is), so the job died with `npm24: command not found`,
+      # exit 127. npm is not packaged on this image at all; the JS package
+      # manager that IS present is corepack (it provisions npm 11.x on demand),
+      # so run npm/npx through `corepack npm` / `corepack npx`. Node scripts
+      # keep using the concrete `node24` binary.
 
       - name: Install dependencies
-        run: npm24 ci
+        run: corepack npm ci
 
       - name: Install Playwright browser
         # --with-deps shells out to apt-get, which the OpenSUSE runner does
         # not have. The runner image carries the X / GTK / NSS libs Chromium
         # needs already; if a future image trims them down, add a `zypper
         # install -y` step here for the missing sonames.
-        run: npx24 playwright install chromium
+        run: corepack npx playwright install chromium
 
       # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
       # dispatched commit is unlikely to be what prod currently serves, so the
@@ -148,7 +152,7 @@ jobs:
         run: node24 scripts/health-check.mjs
 
       - name: Run E2E suite
-        run: npx24 playwright test
+        run: corepack npx playwright test
 
       - name: Upload Playwright report and traces
         if: failure()
