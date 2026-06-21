@@ -16,8 +16,23 @@ import { env } from '../lib/env';
 // covered indirectly by every other api test, so this test is here to
 // assert the full OP token-flow contract against staging, not to
 // exercise mokosh's RS path.
+//
+// PMS-435: quarantined (`test.fixme`) - blocked on a server-side bunyip bug,
+// not an e2e cookie-forwarding defect. The PMS-434 diagnostic run (#2098)
+// proved the OP session cookie is captured and replayed correctly: setup
+// logged `KEEP .a8n.systems#bunyip_op_session` and persisted all three OP
+// cookies (`access_token, refresh_token, bunyip_op_session`) to
+// `op-state.json`, and `oidcTest` loads that storageState into the request
+// context. Despite the session cookie being present on the right domain,
+// `/oauth2/authorize` still 302s to `/login` with no `state`, so the test
+// fails at the `state` assertion ("state mismatch", received null). That
+// bounce is bunyip's COOKIE_DOMAIN / `bunyip_op_session` scoping issue tracked
+// in BUNYIP-146, not a mokosh-server regression - every other api test and
+// staging health pass. Quarantine (same convention as auth.spec.ts / PMS-148)
+// so this external blocker stops gating unrelated PRs; un-fixme when
+// BUNYIP-146 ships.
 test.describe('OIDC token flow', () => {
-  test('authorize -> token -> userinfo -> refresh', async ({ request }) => {
+  test.fixme('authorize -> token -> userinfo -> refresh', async ({ request }) => {
     const oidc = await discoverOidc(request, env.opBaseURL);
     const pkce = makePkce();
     const state = randomToken();
@@ -70,6 +85,32 @@ test.describe('OIDC token flow', () => {
     const location = authRes.headers()['location'];
     expect(location, 'authorize 3xx had no Location header').toBeTruthy();
     const redirected = new URL(location, env.opBaseURL);
+
+    // When authorize 3xx-redirects WITHOUT a `code`, it bounced to an
+    // interstitial instead of the registered redirect_uri. A /login and a
+    // /consent bounce share the exact same signature (top-level `state`,
+    // `code`, and `error` all absent, because the original params live nested
+    // inside `return_to`), so the bare "state mismatch" assertion below cannot
+    // tell them apart. Name the actual destination here:
+    //   - `/login`   => bunyip rejected the bunyip_op_session cookie (session
+    //                   missing / expired / revoked).
+    //   - `/consent` => session is valid, but a requested scope is not in
+    //                   granted_scopes for this (user, client). Since BUNYIP-140
+    //                   scopes only reach granted_scopes via /oauth2/consent, a
+    //                   non-interactive client that never visited the consent
+    //                   screen (e.g. offline_access not pre-granted) lands here.
+    // Surface path + param KEYS only; values are redacted because the nested
+    // return_to echoes state/nonce. See BUNYIP-146.
+    if (!redirected.searchParams.get('code')) {
+      const paramKeys = [...redirected.searchParams.keys()].join(',') || '(none)';
+      throw new Error(
+        `authorize did not return an authorization code; it redirected to ` +
+          `${redirected.origin}${redirected.pathname} ` +
+          `(param keys: ${paramKeys}; error=${redirected.searchParams.get('error') ?? 'none'}). ` +
+          `A /login target => the bunyip_op_session cookie was not accepted; a /consent target => ` +
+          `the session is valid but a requested scope is not granted for this client (BUNYIP-146).`,
+      );
+    }
     expect(
       redirected.searchParams.get('error'),
       `authorize returned error=${redirected.searchParams.get('error')}`,

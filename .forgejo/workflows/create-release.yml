@@ -4,6 +4,18 @@
 # Extracts the version from the branch name, generates a changelog from
 # git log between the previous tag and HEAD, and creates the release
 # (with tag) via the Forgejo API.
+#
+# Why the gate moved from the job to each step:
+# Forgejo Actions fires this workflow on every PR-closed event targeting
+# `main`, but only a `release/v*` head ref should actually publish a
+# release. When the job-level `if` evaluated false (the typical case),
+# the whole workflow concluded as `skipped`, which the Forgejo repo
+# status badge counted as "not success" - the repo appeared red even
+# though every other workflow on the merge commit was green. Gate the
+# real work on a `Gate` step's output so the job always has at least
+# one step that succeeds and the workflow concludes as `success`
+# whether or not a release publishes.
+
 name: Create release
 
 on:
@@ -16,20 +28,32 @@ on:
 jobs:
   create-release:
     name: Create release from merged PR
-    if: >-
-      github.event.pull_request.merged == true
-      && startsWith(github.event.pull_request.head.ref, 'release/v')
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
     permissions:
       contents: write
 
     steps:
+      - name: Gate (release-branch merges only)
+        id: gate
+        shell: bash
+        run: |
+          if [[ "${{ github.event.pull_request.merged }}" == "true" \
+            && "${{ github.event.pull_request.head.ref }}" == release/v* ]]; then
+            echo "do_release=true" >> "$GITHUB_OUTPUT"
+            echo "This is a release-branch merge; will publish."
+          else
+            echo "do_release=false" >> "$GITHUB_OUTPUT"
+            echo "Not a release-branch merge; no release will be published."
+          fi
+
       - name: Clone the repository
+        if: steps.gate.outputs.do_release == 'true'
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Create release
+        if: steps.gate.outputs.do_release == 'true'
         shell: nu {0}
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_PAT }}
@@ -43,7 +67,7 @@ jobs:
             let prev = ($prev_tag.stdout | str trim)
             ^git log --oneline $"($prev)..HEAD" | str trim
           } else {
-            # No previous tag — include all commits
+            # No previous tag - include all commits
             ^git log --oneline | str trim
           }
 
