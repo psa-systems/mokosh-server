@@ -95,6 +95,8 @@ async fn invited_user_lands_in_inviting_tenant_with_invite_role(pool: PgPool) {
         sub,
         Some("joiner@example.com".to_string()),
         true,
+        None,
+        None,
         &claims(sub, Some("subscriber")),
     )
     .await;
@@ -130,6 +132,8 @@ async fn uninvited_user_gets_their_own_personal_tenant(pool: PgPool) {
         sub,
         Some("solo@example.com".to_string()),
         true,
+        None,
+        None,
         &claims(sub, None),
     )
     .await
@@ -165,6 +169,8 @@ async fn two_uninvited_users_are_isolated_in_distinct_tenants(pool: PgPool) {
             sub,
             Some(em.to_string()),
             true,
+            None,
+            None,
             &claims(sub, None),
         )
         .await
@@ -205,6 +211,8 @@ async fn non_admin_stuck_in_default_tenant_is_backfilled_out(pool: PgPool) {
         sub,
         Some("stuck@example.com".to_string()),
         true,
+        None,
+        None,
         &claims(sub, Some("subscriber")),
     )
     .await
@@ -253,6 +261,8 @@ async fn super_admin_in_default_tenant_stays(pool: PgPool) {
         sub,
         Some("infra-admin@example.com".to_string()),
         true,
+        None,
+        None,
         &claims(sub, None),
     )
     .await
@@ -297,6 +307,8 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
         sub,
         Some("pending@example.com".to_string()),
         false,
+        None,
+        None,
         &claims(sub, None),
     )
     .await
@@ -351,6 +363,8 @@ async fn placement_seeds_off_psa_target_tenant_so_tickets_create(pool: PgPool) {
         sub,
         Some("offpsa@example.com".to_string()),
         true,
+        None,
+        None,
         &claims(sub, Some("admin")),
     )
     .await
