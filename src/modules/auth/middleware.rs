@@ -465,6 +465,13 @@ async fn ensure_user_from_bunyip(
         .as_ref()
         .and_then(|i| i.email_verified)
         .unwrap_or(false);
+    // BUNYIP-141: standard profile claims off the same userinfo round-trip.
+    // Bunyip emits them only when the at+jwt's scope set covers `profile`
+    // AND the bunyip-side column is non-NULL (BUNYIP-140); absent here means
+    // either "scope not requested" or "user has not filled it in", in both
+    // cases the JIT path falls back to `synthetic_name_from_email`.
+    let given_name = info.as_ref().and_then(|i| i.given_name.clone());
+    let family_name = info.as_ref().and_then(|i| i.family_name.clone());
 
     place_bunyip_user(
         auth_service,
@@ -473,6 +480,8 @@ async fn ensure_user_from_bunyip(
         sub,
         email,
         email_verified,
+        given_name,
+        family_name,
         claims,
     )
     .await
@@ -486,6 +495,13 @@ async fn ensure_user_from_bunyip(
 /// the `AuthState`. Split out of [`ensure_user_from_bunyip`] (which owns the
 /// verifier / userinfo call) so this placement logic is integration-testable
 /// without a live OIDC verifier.
+// BUNYIP-141: `place_bunyip_user`'s arg count is one over clippy's default
+// threshold (8 vs 7) because each `email_verified` / `given_name` /
+// `family_name` value is read straight off the userinfo response and bundling
+// them into a synthetic struct would force every call site (production + 7
+// integration tests) to construct that struct from the same fields. Suppress
+// here rather than refactor; the surface is internal to the auth module.
+#[allow(clippy::too_many_arguments)]
 pub async fn place_bunyip_user(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -493,6 +509,8 @@ pub async fn place_bunyip_user(
     sub: uuid::Uuid,
     email: Option<String>,
     email_verified: bool,
+    given_name: Option<String>,
+    family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
 ) -> Option<AuthState> {
     let placement = auth_service.find_user_placement(sub).await.ok().flatten();
@@ -592,8 +610,19 @@ pub async fn place_bunyip_user(
                 (Some(em), true) => em,
                 _ => format!("{sub}@unresolved.invalid"),
             };
+            // BUNYIP-141: hand the userinfo profile claims to the JIT path
+            // so a bunyip-provisioned user lands with their real name on
+            // first sight. Both are Option<String>; None falls back to
+            // `synthetic_name_from_email` inside the service.
             auth_service
-                .upsert_user_from_oidc(sub, target, &email_for_insert, initial_role)
+                .upsert_user_from_oidc(
+                    sub,
+                    target,
+                    &email_for_insert,
+                    initial_role,
+                    given_name.as_deref(),
+                    family_name.as_deref(),
+                )
                 .await
                 .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
                 .ok()?

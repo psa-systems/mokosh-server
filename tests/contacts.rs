@@ -322,9 +322,17 @@ async fn company_rejects_duplicate_name(pool: PgPool) {
         "duplicate company name should 409"
     );
 
-    // No row was inserted: only the original "Acme" remains.
-    let names = search_company_names(&app, &token, "acme").await;
-    assert_eq!(names, vec!["Acme".to_string()], "no duplicate row inserted");
+    // No row was inserted: exactly one company named "Acme" exists. The
+    // substring search also matches the auto-seeded "Acme Corporation (Demo)"
+    // company (PMS-157 first-visit demo seeding), so filter to the exact name
+    // to isolate this assertion from demo data rather than asserting against
+    // the whole result set.
+    let acme_count = search_company_names(&app, &token, "acme")
+        .await
+        .into_iter()
+        .filter(|name| name == "Acme")
+        .count();
+    assert_eq!(acme_count, 1, "no duplicate row inserted");
 
     // A genuinely different name still creates fine.
     let second_id = create_company(&app, &token, "Beta").await;
