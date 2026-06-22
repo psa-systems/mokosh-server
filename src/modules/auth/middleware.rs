@@ -653,14 +653,13 @@ pub async fn place_bunyip_user(
             );
         }
     }
-    // PMS-447 follow-up: gate the single-tenancy `subscriber -> Admin` floor on
-    // invite absence. The PMS-447 floor assumes the signed-in user owns their
-    // own one-person Mokosh tenant; that premise breaks for a user accepting a
-    // role-bearing invite into a SHARED org tenant, where the inviting admin's
-    // chosen role (e.g. `manager`) is a deliberate least-privilege grant.
-    // Silently flooring it up to `admin` would be an unintended elevation that
-    // contradicts the invite. On the invite path the invite role stands; only
-    // a platform-level Bunyip `admin` claim (genuinely cross-tenant) still
+    // PMS-458: an explicit invite role is the inviting admin's deliberate,
+    // least-privilege grant into a SHARED org tenant. The PMS-447 single-tenancy
+    // admin floor assumes the signed-in user owns their own one-person tenant,
+    // which is false for an invited joiner, so that floor must NOT silently
+    // elevate the invite role (e.g. `manager` -> `admin`). When this placement
+    // is consuming a fresh invite the invite role stands as-is; only a
+    // platform-level Bunyip `admin` claim (genuinely cross-tenant) still
     // overrides to `super_admin`. Non-invite placements keep the PMS-447 floor.
     let effective = if invite.is_some() {
         match claims.bunyip_role.as_deref() {
