@@ -5,10 +5,30 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
-/// Phase 1 only recognises `ticket.created`. The string-typed
-/// representation lets Phase 2 widen the surface without a wire
-/// change.
+/// The set of recognised trigger names. The data model carries the
+/// event as a VARCHAR so future surfaces (e.g. `time_entry.created`,
+/// `invoice.paid`) can land without a schema migration; the service
+/// gates which ones the executor knows how to fire.
 pub const TRIGGER_TICKET_CREATED: &str = "ticket.created";
+/// PMS-448 phase 2: fires when a ticket's `status_id` moves.
+/// Conditions can match on the new ticket dimensions plus
+/// `from_status_id` / `to_status_id` so a rule can target only
+/// "moved into 'in-progress'" (route to a senior tech) or "moved
+/// into 'closed'" (auto-add a follow-up note).
+pub const TRIGGER_TICKET_STATUS_CHANGED: &str = "ticket.status_changed";
+/// PMS-448 phase 2: fires when a ticket's `priority_id` moves.
+/// Same shape as status_changed: conditions add `from_priority_id`
+/// / `to_priority_id` so a rule can react specifically to escalations.
+pub const TRIGGER_TICKET_PRIORITY_CHANGED: &str = "ticket.priority_changed";
+
+/// Service-side allow-list of triggers the Phase 2 executor knows
+/// how to fire. Anything else is rejected at create-rule time so
+/// an operator does not silently land a never-firing rule.
+pub const RECOGNISED_TRIGGERS: &[&str] = &[
+    TRIGGER_TICKET_CREATED,
+    TRIGGER_TICKET_STATUS_CHANGED,
+    TRIGGER_TICKET_PRIORITY_CHANGED,
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowRuleResponse {

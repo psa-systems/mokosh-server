@@ -488,9 +488,12 @@ impl TicketService {
         ctx: &AuditCtx,
     ) -> AppResult<Ticket> {
         let ticket = self.get_ticket(tenant_id, ticket_id).await?;
-        // Captured for a future "status changed" automation trigger;
-        // the F11 wiring only fires the generic OnUpdate today.
-        let _old_status_id = ticket.status_id;
+        // Captured for the PMS-448 phase 2 transition triggers. The
+        // executor runs at the bottom of the tx (before commit) so
+        // that any logged rule firing commits atomically with the
+        // status/priority change.
+        let old_status_id = ticket.status_id;
+        let old_priority_id = ticket.priority_id;
 
         // PSA audit: validate any foreign id being set so an update cannot
         // re-link this ticket to another tenant's rows. Option fields are
@@ -656,6 +659,49 @@ impl TicketService {
                 after,
             )
             .await?;
+        }
+
+        // PMS-448 phase 2: fire transition triggers. Each runs in
+        // this same transaction so a logged rule firing commits
+        // atomically with the underlying transition. Both
+        // executors only LOG the matching rules to
+        // `workflow_rule_runs`; mutating actions on transitions are
+        // Phase 3.
+        if let Some(new_status_id) = request.status_id {
+            if new_status_id != old_status_id {
+                crate::modules::workflows::WorkflowExecutor::run_ticket_status_changed(
+                    &mut tx,
+                    tenant_id.get(),
+                    crate::modules::workflows::TicketStatusChangedContext {
+                        ticket_id,
+                        from_status_id: old_status_id,
+                        to_status_id: new_status_id,
+                        priority_id: request.priority_id.unwrap_or(ticket.priority_id),
+                        queue_id: request.queue_id.unwrap_or(ticket.queue_id),
+                        company_id: ticket.company_id,
+                        type_id: request.type_id.or(ticket.type_id),
+                    },
+                )
+                .await?;
+            }
+        }
+        if let Some(new_priority_id) = request.priority_id {
+            if new_priority_id != old_priority_id {
+                crate::modules::workflows::WorkflowExecutor::run_ticket_priority_changed(
+                    &mut tx,
+                    tenant_id.get(),
+                    crate::modules::workflows::TicketPriorityChangedContext {
+                        ticket_id,
+                        from_priority_id: old_priority_id,
+                        to_priority_id: new_priority_id,
+                        status_id: request.status_id.unwrap_or(ticket.status_id),
+                        queue_id: request.queue_id.unwrap_or(ticket.queue_id),
+                        company_id: ticket.company_id,
+                        type_id: request.type_id.or(ticket.type_id),
+                    },
+                )
+                .await?;
+            }
         }
         tx.commit().await?;
 

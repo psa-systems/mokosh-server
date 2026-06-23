@@ -1,17 +1,21 @@
-//! PMS-448 phase 1: ticket.created workflow rules.
+//! PMS-448: workflow rules.
 //!
-//! A focused executor that runs operator-defined rules against
-//! freshly-created tickets in-transaction. Rules carry structured
-//! `conditions` (priority / queue / company / source / type) and
-//! structured `actions` (assign, reprioritise, tag, add internal
-//! note). Phase 2 will generalise to additional triggers; the
-//! data model is already shaped to support it.
+//! Operator-defined rules that fire in-transaction on ticket
+//! lifecycle events. Phase 1 ships `ticket.created` (with mutating
+//! actions: assign, reprioritise, tag, add internal note). Phase 2
+//! adds `ticket.status_changed` and `ticket.priority_changed`
+//! triggers; both LOG matching rules to `workflow_rule_runs` so the
+//! operator audit trail captures the firings. Mutating actions on
+//! transitions are scoped for Phase 3 once the SPA rule builder
+//! matures.
 
 mod executor;
 mod models;
 mod routes;
 mod service;
 
-pub use executor::{TicketCreateContext, WorkflowExecutor};
+pub use executor::{
+    TicketCreateContext, TicketPriorityChangedContext, TicketStatusChangedContext, WorkflowExecutor,
+};
 pub use routes::{workflow_routes, WorkflowsRouterState};
 pub use service::WorkflowsService;
