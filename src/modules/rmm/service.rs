@@ -794,6 +794,8 @@ impl RmmService {
                 custom_fields: serde_json::json!({}),
                 tags: vec![],
                 source_kb_article_id: None,
+                email_message_id: None,
+                email_thread_id: None,
             };
             // RMM ingest is a background path (no AuditCtx extractor);
             // attribute the auto-created ticket to the system actor.

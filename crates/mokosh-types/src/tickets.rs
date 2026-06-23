@@ -391,6 +391,20 @@ pub struct CreateTicketRequest {
     /// not cascade-delete tickets that referenced it.
     #[serde(default)]
     pub source_kb_article_id: Option<Uuid>,
+    /// PMS-450: opaque per-tenant Message-Id of the inbound email
+    /// that originated this ticket. Set by the email-intake handler;
+    /// the regular agent / portal create paths leave it `None`. The
+    /// partial unique index on (tenant_id, email_message_id) catches
+    /// concurrent dedup races at the DB layer.
+    #[validate(length(max = 255))]
+    #[serde(default)]
+    pub email_message_id: Option<String>,
+    /// PMS-450: thread/conversation identifier (e.g. Microsoft Graph
+    /// `conversationId`). Optional; nullable on the table. Phase 1
+    /// only stores it for future threading lookups.
+    #[validate(length(max = 255))]
+    #[serde(default)]
+    pub email_thread_id: Option<String>,
 }
 
 /// Update ticket request

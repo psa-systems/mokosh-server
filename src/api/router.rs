@@ -24,6 +24,7 @@ use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
+use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
@@ -128,6 +129,11 @@ pub fn create_api_router(
     let search_service = SearchService::new(db.pool().clone());
     // PMS-453: per-user saved dashboards.
     let dashboards_service = DashboardsService::new(db.pool().clone());
+    // PMS-450: email-to-ticket intake. Holds a TicketService clone so
+    // the intake handler can reuse the full ticket-create flow
+    // (audit + SLA assignment + ticket-number generation) without
+    // duplicating the INSERT.
+    let email_intake_service = EmailIntakeService::new(db.pool().clone(), ticket_service.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
     // SLA service shares the notifications dispatcher so the
@@ -259,6 +265,12 @@ pub fn create_api_router(
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
         // report delivery follows under the same ticket).
         .merge(dashboard_routes(dashboards_service))
+        // PMS-450: email-to-ticket intake. Authenticates via a
+        // tenant-scoped bearer (`tenant_intake_tokens`), NOT the
+        // user-auth middleware, so the gateway has no `users` row
+        // to attribute the request to. The route handler extracts
+        // the bearer directly from the request headers.
+        .merge(email_intake_routes(email_intake_service))
         // Settings: tenant settings + module configs. PMS-114.
         .merge(settings_routes(settings_service.clone()))
         // Audit log read. PMS-118.

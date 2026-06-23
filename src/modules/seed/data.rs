@@ -142,6 +142,8 @@ pub fn demo_tickets(company_id: Uuid, contact_id: Uuid) -> Vec<CreateTicketReque
             custom_fields: serde_json::Value::Null,
             tags: vec!["demo".to_string()],
             source_kb_article_id: None,
+            email_message_id: None,
+            email_thread_id: None,
         })
         .collect()
 }
