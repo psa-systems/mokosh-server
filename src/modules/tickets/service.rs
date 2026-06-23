@@ -272,6 +272,25 @@ impl TicketService {
             after,
         )
         .await?;
+        // PMS-448: run operator-defined `ticket.created` workflow
+        // rules inside the same transaction so an action that
+        // reassigns the ticket commits atomically with the ticket
+        // row. The executor swallows per-rule failures (they land
+        // in `workflow_rule_runs.error` for the SPA to surface), so
+        // a misconfigured rule cannot abort a legitimate create.
+        crate::modules::workflows::WorkflowExecutor::run_ticket_created(
+            &mut tx,
+            tenant_id.get(),
+            crate::modules::workflows::TicketCreateContext {
+                ticket_id,
+                priority_id,
+                queue_id,
+                company_id: request.company_id,
+                source: request.source.as_str().to_string(),
+                type_id: request.type_id,
+            },
+        )
+        .await?;
         tx.commit().await?;
 
         // Calculate and set SLA due dates
