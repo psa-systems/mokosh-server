@@ -29,12 +29,13 @@ pub fn dashboard_routes(service: DashboardsService) -> Router {
     Router::new()
         .route("/dashboards", get(list).post(create))
         // `/dashboards/default` is hit on every app boot to land the
-        // user on their pinned layout; declare it BEFORE `/:id` so the
-        // string `default` is not parsed as a UUID path segment and
-        // 404'd.
+        // user on their pinned layout; declare it BEFORE `/{id}` so
+        // the string `default` is not parsed as a UUID path segment
+        // and 404'd. Axum 0.8 uses brace capture syntax; the older
+        // `:id` form panics at router build.
         .route("/dashboards/default", get(get_default))
         .route(
-            "/dashboards/:id",
+            "/dashboards/{id}",
             get(get_one).patch(update).delete(delete_one),
         )
         .with_state(state)
