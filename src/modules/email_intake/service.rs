@@ -5,7 +5,14 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::models::{EmailIntakeRequest, EmailIntakeResponse};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use rand::RngCore;
+
+use super::models::{
+    CreateIntakeTokenRequest, CreatedIntakeTokenResponse, EmailIntakeRequest, EmailIntakeResponse,
+    IntakeTokenResponse,
+};
 use crate::modules::auth::TenantId;
 use crate::modules::tickets::TicketService;
 use crate::utils::error::{AppError, AppResult};
@@ -247,6 +254,111 @@ impl EmailIntakeService {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    // --- PMS-450 phase 2: admin-facing intake-token CRUD --------------------
+
+    /// List every intake token (active + revoked) for the caller's
+    /// tenant. Operator-facing surface, so includes revoked rows
+    /// (the operator wants to confirm they revoked the right one);
+    /// the auth-resolving `resolve_token` path keeps filtering them.
+    pub async fn list_tokens(&self, tenant_id: TenantId) -> AppResult<Vec<IntakeTokenResponse>> {
+        let rows = sqlx::query_as::<_, IntakeTokenRow>(
+            "SELECT id, kind, label, last_used_at, created_at, revoked_at \
+             FROM tenant_intake_tokens \
+             WHERE tenant_id = $1 \
+             ORDER BY revoked_at NULLS FIRST, created_at DESC",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Mint a new bearer for the caller's tenant. Returns the
+    /// plaintext token EXACTLY ONCE in the response; only the
+    /// SHA-256 hash hits the DB. Re-fetching the row later yields
+    /// the metadata-only `IntakeTokenResponse`. Rotation = revoke +
+    /// mint a fresh one; there is no update endpoint.
+    pub async fn create_token(
+        &self,
+        tenant_id: TenantId,
+        req: CreateIntakeTokenRequest,
+    ) -> AppResult<CreatedIntakeTokenResponse> {
+        if req.kind != "email_intake" {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported kind='{}'. Phase 2 only accepts 'email_intake'.",
+                req.kind,
+            )));
+        }
+        // 32 random bytes URL-safe base64-encoded gives ~43 chars of
+        // bearer with 256 bits of entropy. Matches the OIDC client-
+        // secret minting pattern in mokosh-bootstrap.rs (PMS-122).
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let plaintext = URL_SAFE_NO_PAD.encode(bytes);
+        let hash = sha256_hex(plaintext.as_bytes());
+
+        let row: IntakeTokenRow = sqlx::query_as(
+            "INSERT INTO tenant_intake_tokens (tenant_id, kind, token_hash, label) \
+             VALUES ($1, $2, $3, $4) \
+             RETURNING id, kind, label, last_used_at, created_at, revoked_at",
+        )
+        .bind(tenant_id)
+        .bind(&req.kind)
+        .bind(&hash)
+        .bind(&req.label)
+        .fetch_one(&self.pool)
+        .await?;
+        let metadata: IntakeTokenResponse = row.into();
+        Ok(CreatedIntakeTokenResponse {
+            token_metadata: metadata,
+            token: plaintext,
+        })
+    }
+
+    /// Revoke a token by setting `revoked_at = NOW()`. Idempotent:
+    /// a re-revoke of an already-revoked row is a no-op (does not
+    /// move the timestamp), and a missing id surfaces as 404 so the
+    /// SPA can confirm the row really existed.
+    pub async fn revoke_token(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let rows = sqlx::query(
+            "UPDATE tenant_intake_tokens \
+                 SET revoked_at = COALESCE(revoked_at, NOW()) \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            return Err(AppError::NotFound("IntakeToken".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct IntakeTokenRow {
+    id: Uuid,
+    kind: String,
+    label: String,
+    last_used_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+impl From<IntakeTokenRow> for IntakeTokenResponse {
+    fn from(r: IntakeTokenRow) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            label: r.label,
+            last_used_at: r.last_used_at,
+            created_at: r.created_at,
+            revoked_at: r.revoked_at,
+        }
     }
 }
 
