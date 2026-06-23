@@ -32,6 +32,7 @@ use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::reports::{reports_routes, ReportsService};
 use crate::modules::rmm::{rmm_routes, RmmService};
+use crate::modules::saved_reports::{saved_reports_routes, SavedReportsService};
 use crate::modules::search::{search_routes, SearchService};
 use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
@@ -124,6 +125,8 @@ pub fn create_api_router(
     let invitations_service =
         Arc::new(InvitationsService::new(db.clone()).with_app_url(client_origin.clone()));
     let reports_service = ReportsService::new(db.clone());
+    // PMS-457: saved-report definitions (Phase 1).
+    let saved_reports_service = SavedReportsService::new(db.pool().clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.pool().clone());
     // PMS-453: per-user saved dashboards.
@@ -254,6 +257,9 @@ pub fn create_api_router(
         .merge(rmm_routes(rmm_service))
         // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
         .merge(reports_routes(reports_service))
+        // PMS-457: saved custom-report definitions (Phase 1; the
+        // execution runtime ships separately as Phase 2).
+        .merge(saved_reports_routes(saved_reports_service))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
