@@ -13,6 +13,11 @@ pub struct AssetTypeResponse {
     pub icon: Option<String>,
     pub parent_type_id: Option<Uuid>,
     pub is_active: bool,
+    /// PMS-456: ITIL CI class tag (hardware / software / service /
+    /// network / document / location, or a tenant-coined value).
+    /// Opt-in; types created before this column shipped surface as
+    /// `None` and the SPA renders them as "Unclassified".
+    pub itil_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -23,6 +28,12 @@ pub struct UpsertAssetTypeRequest {
     pub parent_type_id: Option<Uuid>,
     #[serde(default = "default_true")]
     pub is_active: bool,
+    // PMS-456: optional ITIL CI classification. Free-text VARCHAR(50)
+    // so a tenant can coin a new category without a schema migration;
+    // the SPA offers the standard ITIL classes as suggestions.
+    #[validate(length(max = 50))]
+    #[serde(default)]
+    pub itil_category: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -68,6 +79,10 @@ pub struct AssetResponse {
     pub installed_date: Option<NaiveDate>,
     pub department: Option<String>,
     pub in_transit_ticket_id: Option<Uuid>,
+    /// PMS-456: per-CI lifecycle position (planned / in_service /
+    /// retired, or a tenant-coined value). `None` for assets created
+    /// before the column shipped; the SPA renders `None` as "Unknown".
+    pub itil_lifecycle_stage: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -117,6 +132,12 @@ pub struct CreateAssetRequest {
     #[validate(length(max = 100))]
     pub department: Option<String>,
     pub in_transit_ticket_id: Option<Uuid>,
+    // PMS-456: optional ITIL CI lifecycle stage. Free-text VARCHAR(50)
+    // so a tenant can coin a stage without a migration. The SPA
+    // suggests planned / in_service / retired.
+    #[validate(length(max = 50))]
+    #[serde(default)]
+    pub itil_lifecycle_stage: Option<String>,
 }
 
 fn default_active() -> String {
@@ -151,6 +172,12 @@ pub struct UpdateAssetRequest {
     #[validate(length(max = 100))]
     pub department: Option<String>,
     pub in_transit_ticket_id: Option<Uuid>,
+    // PMS-456: optional ITIL CI lifecycle stage. None leaves the
+    // column untouched (matches the rest of the partial-update
+    // pattern on this DTO).
+    #[validate(length(max = 50))]
+    #[serde(default)]
+    pub itil_lifecycle_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -40,7 +40,7 @@ impl AssetsService {
                 .await?;
 
         let rows = sqlx::query_as::<_, AssetTypeRow>(
-            r#"SELECT id, name, icon, parent_type_id, is_active
+            r#"SELECT id, name, icon, parent_type_id, is_active, itil_category
                FROM asset_types WHERE tenant_id = $1 ORDER BY name
                LIMIT $2 OFFSET $3"#,
         )
@@ -62,8 +62,9 @@ impl AssetsService {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            r#"INSERT INTO asset_types (id, tenant_id, name, icon, parent_type_id, is_active)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+            r#"INSERT INTO asset_types
+                   (id, tenant_id, name, icon, parent_type_id, is_active, itil_category)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -71,6 +72,7 @@ impl AssetsService {
         .bind(&request.icon)
         .bind(request.parent_type_id)
         .bind(request.is_active)
+        .bind(&request.itil_category)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -98,6 +100,7 @@ impl AssetsService {
             icon: request.icon.clone(),
             parent_type_id: request.parent_type_id,
             is_active: request.is_active,
+            itil_category: request.itil_category.clone(),
         })
     }
 
@@ -111,7 +114,7 @@ impl AssetsService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE asset_types SET name = $3, icon = $4, parent_type_id = $5,
-                   is_active = $6, updated_at = NOW()
+                   is_active = $6, itil_category = $7, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
@@ -120,6 +123,7 @@ impl AssetsService {
         .bind(&request.icon)
         .bind(request.parent_type_id)
         .bind(request.is_active)
+        .bind(&request.itil_category)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -133,6 +137,7 @@ impl AssetsService {
             icon: request.icon.clone(),
             parent_type_id: request.parent_type_id,
             is_active: request.is_active,
+            itil_category: request.itil_category.clone(),
         })
     }
 
@@ -217,6 +222,8 @@ impl AssetsService {
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
                       a.installed_date, a.department, a.in_transit_ticket_id,
+                      -- PMS-456: per-CI lifecycle stage. Free-text VARCHAR(50).
+                      a.itil_lifecycle_stage,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -265,9 +272,10 @@ impl AssetsService {
                                     site_id, contact_id, status, manufacturer, model, serial_number,
                                     purchase_date, purchase_price, warranty_expiry, end_of_life,
                                     assigned_user_id, ip_address, hostname, mac_address,
-                                    installed_date, department, in_transit_ticket_id)
+                                    installed_date, department, in_transit_ticket_id,
+                                    itil_lifecycle_stage)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-                       $17, NULLIF($18,'')::inet, $19, $20, $21, $22, $23)"#,
+                       $17, NULLIF($18,'')::inet, $19, $20, $21, $22, $23, $24)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -292,6 +300,7 @@ impl AssetsService {
         .bind(request.installed_date)
         .bind(&request.department)
         .bind(request.in_transit_ticket_id)
+        .bind(&request.itil_lifecycle_stage)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -334,6 +343,7 @@ impl AssetsService {
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
                       a.installed_date, a.department, a.in_transit_ticket_id,
+                      a.itil_lifecycle_stage,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -393,6 +403,7 @@ impl AssetsService {
                 installed_date = COALESCE($20, installed_date),
                 department = COALESCE($21, department),
                 in_transit_ticket_id = COALESCE($22, in_transit_ticket_id),
+                itil_lifecycle_stage = COALESCE($23, itil_lifecycle_stage),
                 updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -418,6 +429,7 @@ impl AssetsService {
         .bind(request.installed_date)
         .bind(&request.department)
         .bind(request.in_transit_ticket_id)
+        .bind(&request.itil_lifecycle_stage)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1041,6 +1053,7 @@ struct AssetTypeRow {
     icon: Option<String>,
     parent_type_id: Option<Uuid>,
     is_active: Option<bool>,
+    itil_category: Option<String>,
 }
 
 impl From<AssetTypeRow> for AssetTypeResponse {
@@ -1051,6 +1064,7 @@ impl From<AssetTypeRow> for AssetTypeResponse {
             icon: r.icon,
             parent_type_id: r.parent_type_id,
             is_active: r.is_active.unwrap_or(true),
+            itil_category: r.itil_category,
         }
     }
 }
@@ -1086,6 +1100,8 @@ struct AssetRow {
     installed_date: Option<chrono::NaiveDate>,
     department: Option<String>,
     in_transit_ticket_id: Option<Uuid>,
+    // PMS-456: ITIL CI lifecycle stage.
+    itil_lifecycle_stage: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1117,6 +1133,7 @@ impl From<AssetRow> for AssetResponse {
             installed_date: r.installed_date,
             department: r.department,
             in_transit_ticket_id: r.in_transit_ticket_id,
+            itil_lifecycle_stage: r.itil_lifecycle_stage,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
