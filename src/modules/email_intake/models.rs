@@ -1,5 +1,6 @@
 //! PMS-450: email-intake DTOs.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
@@ -59,4 +60,52 @@ pub struct EmailIntakeResponse {
     /// reply (Phase 1: returns the existing id; Phase 2: adds a
     /// comment).
     pub threaded: bool,
+}
+
+/// PMS-450 phase 2: admin-listable intake token. The plaintext is
+/// NEVER on this DTO - only the SHA-256 hash hits the DB and the
+/// plaintext lives only on the create response. List + get rows
+/// surface the metadata an operator needs to revoke a stale token
+/// confidently.
+#[derive(Debug, Clone, Serialize)]
+pub struct IntakeTokenResponse {
+    pub id: Uuid,
+    pub kind: String,
+    pub label: String,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateIntakeTokenRequest {
+    /// What surface the token authenticates against. Phase 2 only
+    /// recognises `email_intake`; the service rejects anything else
+    /// with 400 so an admin does not silently create a never-used
+    /// token. The column is VARCHAR(50) so future surfaces
+    /// (rmm-intake, billing-webhook) can land without a migration.
+    #[validate(length(min = 1, max = 50))]
+    pub kind: String,
+    /// Operator-facing label ("Cloudron mail hook", "Helpdesk inbox
+    /// forwarder"). Mandatory because a list of unlabelled tokens
+    /// becomes a UUID guessing game at revocation time.
+    #[validate(length(min = 1, max = 200))]
+    pub label: String,
+}
+
+/// Returned by `POST /api/v1/intake-tokens`. The `token` field
+/// carries the plaintext bearer the operator must copy into their
+/// mail gateway IMMEDIATELY; it is never recoverable - only the
+/// SHA-256 hash is stored on the DB and the list endpoint surfaces
+/// metadata, not the secret. A subsequent GET on the same id will
+/// have no `token` field at all (see `IntakeTokenResponse`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatedIntakeTokenResponse {
+    /// The row metadata, same shape as the list endpoint returns.
+    #[serde(flatten)]
+    pub token_metadata: IntakeTokenResponse,
+    /// The PLAINTEXT bearer. Shown exactly once. The SPA must
+    /// surface this in a copy-to-clipboard modal with a "you cannot
+    /// see this again" warning.
+    pub token: String,
 }
