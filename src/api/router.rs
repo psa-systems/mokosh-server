@@ -41,6 +41,7 @@ use crate::modules::sla::{sla_routes, SlaService};
 use crate::modules::tenants::{tenant_routes, TenantService};
 use crate::modules::tickets::{ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
+use crate::modules::workflows::{workflow_routes, WorkflowsService};
 use crate::version::VersionInfo;
 use crate::version_check::version_check;
 
@@ -128,6 +129,8 @@ pub fn create_api_router(
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.pool().clone());
+    // PMS-448: ticket.created workflow rule executor + CRUD.
+    let workflows_service = WorkflowsService::new(db.pool().clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.pool().clone());
     // PMS-453: per-user saved dashboards.
@@ -266,6 +269,8 @@ pub fn create_api_router(
         // PMS-457: saved custom-report definitions (Phase 1; the
         // execution runtime ships separately as Phase 2).
         .merge(saved_reports_routes(saved_reports_service))
+        // PMS-448: workflow-rule CRUD + per-ticket run timeline.
+        .merge(workflow_routes(workflows_service))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
