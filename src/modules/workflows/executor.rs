@@ -26,6 +26,40 @@ pub struct TicketCreateContext {
     pub type_id: Option<Uuid>,
 }
 
+/// PMS-448 phase 2: status-transition context. Carries the
+/// transition's source + destination so a rule can match
+/// "moved into 'closed'" without also firing on an admin nudge
+/// that just bumped some other column. Conditions evaluation reuses
+/// the same key matcher; `from_status_id` and `to_status_id` are
+/// the two new keys on this trigger.
+#[derive(Debug, Clone)]
+pub struct TicketStatusChangedContext {
+    pub ticket_id: Uuid,
+    pub from_status_id: Uuid,
+    pub to_status_id: Uuid,
+    /// Resolved at the call site - the current values on the row
+    /// post-update. Used so a rule can compose status + priority +
+    /// queue filters (e.g. "moved into closed AND priority high").
+    pub priority_id: Uuid,
+    pub queue_id: Uuid,
+    pub company_id: Uuid,
+    pub type_id: Option<Uuid>,
+}
+
+/// PMS-448 phase 2: priority-transition context. Same shape as
+/// status but with `from_priority_id` / `to_priority_id` as the
+/// two new condition keys.
+#[derive(Debug, Clone)]
+pub struct TicketPriorityChangedContext {
+    pub ticket_id: Uuid,
+    pub from_priority_id: Uuid,
+    pub to_priority_id: Uuid,
+    pub status_id: Uuid,
+    pub queue_id: Uuid,
+    pub company_id: Uuid,
+    pub type_id: Option<Uuid>,
+}
+
 /// Pure-function entry point. Pulls every active `ticket.created`
 /// rule for the tenant, evaluates conditions in priority order, and
 /// applies matching actions. Errors are logged per-rule and do not
@@ -75,6 +109,168 @@ impl WorkflowExecutor {
         }
         Ok(())
     }
+
+    /// PMS-448 phase 2: fires after a successful status transition.
+    /// Caller wraps the UPDATE and this call in one transaction so
+    /// any future mutating action commits atomically with the
+    /// transition. Phase 2 only LOGS matching rules to
+    /// `workflow_rule_runs` (the operator audit trail); mutating
+    /// actions on transitions are scoped for Phase 3 so the surface
+    /// stays auditable without surprises while the SPA's rule
+    /// builder matures.
+    pub async fn run_ticket_status_changed(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: Uuid,
+        ctx: TicketStatusChangedContext,
+    ) -> AppResult<()> {
+        log_matching_rules(
+            tx,
+            tenant_id,
+            "ticket.status_changed",
+            ctx.ticket_id,
+            |cond| matches_status_changed(cond, &ctx),
+        )
+        .await
+    }
+
+    /// PMS-448 phase 2: fires after a successful priority
+    /// transition. Same logging-only posture as
+    /// `run_ticket_status_changed`.
+    pub async fn run_ticket_priority_changed(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: Uuid,
+        ctx: TicketPriorityChangedContext,
+    ) -> AppResult<()> {
+        log_matching_rules(
+            tx,
+            tenant_id,
+            "ticket.priority_changed",
+            ctx.ticket_id,
+            |cond| matches_priority_changed(cond, &ctx),
+        )
+        .await
+    }
+}
+
+/// Phase 2 transition-trigger executor: pull active rules for the
+/// given trigger, evaluate conditions with the caller-supplied
+/// matcher, and audit-log every match into `workflow_rule_runs`.
+/// Generic over the matcher so each trigger keeps its own context
+/// shape (status-transition keys vs priority-transition keys); the
+/// iteration + insert is shared.
+async fn log_matching_rules<F>(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: Uuid,
+    trigger_event: &str,
+    entity_id: Uuid,
+    mut matches: F,
+) -> AppResult<()>
+where
+    F: FnMut(&serde_json::Value) -> bool,
+{
+    let rules: Vec<RuleRow> = sqlx::query_as(
+        "SELECT id, conditions, actions \
+         FROM workflow_rules \
+         WHERE tenant_id = $1 \
+           AND trigger_event = $2 \
+           AND is_active = true \
+         ORDER BY priority ASC, created_at ASC",
+    )
+    .bind(tenant_id)
+    .bind(trigger_event)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for rule in rules {
+        if !matches(&rule.conditions) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO workflow_rule_runs \
+                 (tenant_id, rule_id, entity_type, entity_id, applied_actions, error) \
+             VALUES ($1, $2, 'tickets', $3, $4, NULL)",
+        )
+        .bind(tenant_id)
+        .bind(rule.id)
+        .bind(entity_id)
+        .bind(&rule.actions)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Conditions matcher for `ticket.status_changed`. Adds two new
+/// keys on top of the create-context matcher's surface:
+///   - `from_status_id`: list of statuses the ticket transitioned
+///     FROM. Lets a rule narrow to "leaving open".
+///   - `to_status_id`: list of statuses the ticket transitioned
+///     TO. Lets a rule narrow to "entering closed".
+///
+/// Other keys (priority_id / queue_id / company_id / type_id) match
+/// against the ticket's current (post-update) values so a rule can
+/// compose "moved into closed AND company X".
+fn matches_status_changed(
+    conditions: &serde_json::Value,
+    ctx: &TicketStatusChangedContext,
+) -> bool {
+    let Some(map) = conditions.as_object() else {
+        return false;
+    };
+    if map.is_empty() {
+        return true;
+    }
+    for (key, value) in map {
+        let Some(arr) = value.as_array() else {
+            return false;
+        };
+        let ok = match key.as_str() {
+            "from_status_id" => uuid_in_array(arr, ctx.from_status_id),
+            "to_status_id" => uuid_in_array(arr, ctx.to_status_id),
+            "priority_id" => uuid_in_array(arr, ctx.priority_id),
+            "queue_id" => uuid_in_array(arr, ctx.queue_id),
+            "company_id" => uuid_in_array(arr, ctx.company_id),
+            "type_id" => ctx.type_id.is_some_and(|t| uuid_in_array(arr, t)),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Conditions matcher for `ticket.priority_changed`. Same shape as
+/// the status-changed matcher with `from_priority_id` /
+/// `to_priority_id` as the two new keys.
+fn matches_priority_changed(
+    conditions: &serde_json::Value,
+    ctx: &TicketPriorityChangedContext,
+) -> bool {
+    let Some(map) = conditions.as_object() else {
+        return false;
+    };
+    if map.is_empty() {
+        return true;
+    }
+    for (key, value) in map {
+        let Some(arr) = value.as_array() else {
+            return false;
+        };
+        let ok = match key.as_str() {
+            "from_priority_id" => uuid_in_array(arr, ctx.from_priority_id),
+            "to_priority_id" => uuid_in_array(arr, ctx.to_priority_id),
+            "status_id" => uuid_in_array(arr, ctx.status_id),
+            "queue_id" => uuid_in_array(arr, ctx.queue_id),
+            "company_id" => uuid_in_array(arr, ctx.company_id),
+            "type_id" => ctx.type_id.is_some_and(|t| uuid_in_array(arr, t)),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(sqlx::FromRow)]

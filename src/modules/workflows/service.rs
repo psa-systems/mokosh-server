@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::models::{
     CreateWorkflowRuleRequest, UpdateWorkflowRuleRequest, WorkflowRuleResponse,
-    WorkflowRuleRunResponse, TRIGGER_TICKET_CREATED,
+    WorkflowRuleRunResponse, RECOGNISED_TRIGGERS,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -126,12 +126,15 @@ impl WorkflowsService {
         user_id: Uuid,
         req: CreateWorkflowRuleRequest,
     ) -> AppResult<WorkflowRuleResponse> {
-        // Phase 1 enforces a single recognised trigger so an operator
-        // does not silently create a rule that never fires.
-        if req.trigger_event != TRIGGER_TICKET_CREATED {
+        // Reject unrecognised triggers so an operator does not
+        // silently create a rule that never fires. The Phase 2
+        // allow-list covers `ticket.created`, `ticket.status_changed`,
+        // and `ticket.priority_changed`.
+        if !RECOGNISED_TRIGGERS.contains(&req.trigger_event.as_str()) {
             return Err(AppError::BadRequest(format!(
-                "Unsupported trigger_event='{}'. Phase 1 only accepts '{TRIGGER_TICKET_CREATED}'",
+                "Unsupported trigger_event='{}'. Recognised: {}",
                 req.trigger_event,
+                RECOGNISED_TRIGGERS.join(", "),
             )));
         }
         let id: Uuid = sqlx::query_scalar(
