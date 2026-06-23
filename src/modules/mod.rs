@@ -3,6 +3,7 @@
 //! This module contains all the business logic modules for Mokosh Server.
 //! Each module is designed to be a discrete unit with its own API.
 
+pub mod approvals;
 pub mod assets;
 pub mod audit;
 pub mod auth;
