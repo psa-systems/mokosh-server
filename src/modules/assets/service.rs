@@ -211,9 +211,16 @@ impl AssetsService {
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
                       a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
+                      -- PMS-454: CMDB expansion columns. INET cast to text so the
+                      -- sqlx FromRow target stays String. Assigned-user name is
+                      -- resolved via the same join pattern company_name uses.
+                      a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
+                      a.ip_address::text AS ip_address, a.hostname, a.mac_address,
+                      a.installed_date, a.department, a.in_transit_ticket_id,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
+               LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
                WHERE {where_clause} ORDER BY a.name
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
             limit_idx = idx,
@@ -249,11 +256,18 @@ impl AssetsService {
     ) -> AppResult<AssetResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-454: INSERT now carries the eight CMDB-expansion columns.
+        // `ip_address` is text on the wire; Postgres ::inet cast at write
+        // time validates the format and rejects garbage. NULL on any
+        // omitted field keeps the column at the schema default.
         sqlx::query(
             r#"INSERT INTO assets (id, tenant_id, asset_tag, name, asset_type_id, company_id,
                                     site_id, contact_id, status, manufacturer, model, serial_number,
-                                    purchase_date, purchase_price, warranty_expiry, end_of_life)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+                                    purchase_date, purchase_price, warranty_expiry, end_of_life,
+                                    assigned_user_id, ip_address, hostname, mac_address,
+                                    installed_date, department, in_transit_ticket_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                       $17, NULLIF($18,'')::inet, $19, $20, $21, $22, $23)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -271,6 +285,13 @@ impl AssetsService {
         .bind(request.purchase_price)
         .bind(request.warranty_expiry)
         .bind(request.end_of_life)
+        .bind(request.assigned_user_id)
+        .bind(request.ip_address.as_deref().unwrap_or(""))
+        .bind(&request.hostname)
+        .bind(&request.mac_address)
+        .bind(request.installed_date)
+        .bind(&request.department)
+        .bind(request.in_transit_ticket_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -310,9 +331,13 @@ impl AssetsService {
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
                       a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
+                      a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
+                      a.ip_address::text AS ip_address, a.hostname, a.mac_address,
+                      a.installed_date, a.department, a.in_transit_ticket_id,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
+               LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
                WHERE a.tenant_id = $1 AND a.id = $2"#,
         )
         .bind(tenant_id)
@@ -341,6 +366,11 @@ impl AssetsService {
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
+        // PMS-454: UPDATE covers the eight CMDB-expansion columns. Each
+        // `COALESCE($n, ...)` leaves the existing value alone when the
+        // SPA omits the field in a partial PUT. The IP arrives as text
+        // and is `::inet` cast at write time so a bad value raises a
+        // 400 rather than silently corrupting the column.
         let n = sqlx::query(
             r#"UPDATE assets SET
                 asset_tag = COALESCE($3, asset_tag),
@@ -356,6 +386,13 @@ impl AssetsService {
                 purchase_price = COALESCE($13, purchase_price),
                 warranty_expiry = COALESCE($14, warranty_expiry),
                 end_of_life = COALESCE($15, end_of_life),
+                assigned_user_id = COALESCE($16, assigned_user_id),
+                ip_address = COALESCE(NULLIF($17, '')::inet, ip_address),
+                hostname = COALESCE($18, hostname),
+                mac_address = COALESCE($19, mac_address),
+                installed_date = COALESCE($20, installed_date),
+                department = COALESCE($21, department),
+                in_transit_ticket_id = COALESCE($22, in_transit_ticket_id),
                 updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -374,6 +411,13 @@ impl AssetsService {
         .bind(request.purchase_price)
         .bind(request.warranty_expiry)
         .bind(request.end_of_life)
+        .bind(request.assigned_user_id)
+        .bind(request.ip_address.as_deref().unwrap_or(""))
+        .bind(&request.hostname)
+        .bind(&request.mac_address)
+        .bind(request.installed_date)
+        .bind(&request.department)
+        .bind(request.in_transit_ticket_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1031,6 +1075,17 @@ struct AssetRow {
     purchase_price: Option<Decimal>,
     warranty_expiry: Option<chrono::NaiveDate>,
     end_of_life: Option<chrono::NaiveDate>,
+    // PMS-454: CMDB expansion columns. The IP comes back as String
+    // because the SELECT casts INET to text - sqlx's INET type pulls in
+    // the `ipnetwork` feature and the SPA reads it as a string anyway.
+    assigned_user_id: Option<Uuid>,
+    assigned_user_name: Option<String>,
+    ip_address: Option<String>,
+    hostname: Option<String>,
+    mac_address: Option<String>,
+    installed_date: Option<chrono::NaiveDate>,
+    department: Option<String>,
+    in_transit_ticket_id: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1054,6 +1109,14 @@ impl From<AssetRow> for AssetResponse {
             purchase_price: r.purchase_price,
             warranty_expiry: r.warranty_expiry,
             end_of_life: r.end_of_life,
+            assigned_user_id: r.assigned_user_id,
+            assigned_user_name: r.assigned_user_name,
+            ip_address: r.ip_address,
+            hostname: r.hostname,
+            mac_address: r.mac_address,
+            installed_date: r.installed_date,
+            department: r.department,
+            in_transit_ticket_id: r.in_transit_ticket_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

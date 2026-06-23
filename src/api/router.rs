@@ -23,6 +23,7 @@ use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
+use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
@@ -125,6 +126,8 @@ pub fn create_api_router(
     let reports_service = ReportsService::new(db.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.pool().clone());
+    // PMS-453: per-user saved dashboards.
+    let dashboards_service = DashboardsService::new(db.pool().clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
     // SLA service shares the notifications dispatcher so the
@@ -253,6 +256,9 @@ pub fn create_api_router(
         .merge(reports_routes(reports_service))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
+        // PMS-453: per-user saved dashboards (Phase 1; scheduled
+        // report delivery follows under the same ticket).
+        .merge(dashboard_routes(dashboards_service))
         // Settings: tenant settings + module configs. PMS-114.
         .merge(settings_routes(settings_service.clone()))
         // Audit log read. PMS-118.
