@@ -31,6 +31,7 @@ use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::reports::{reports_routes, ReportsService};
 use crate::modules::rmm::{rmm_routes, RmmService};
+use crate::modules::search::{search_routes, SearchService};
 use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
@@ -122,6 +123,8 @@ pub fn create_api_router(
     let invitations_service =
         Arc::new(InvitationsService::new(db.clone()).with_app_url(client_origin.clone()));
     let reports_service = ReportsService::new(db.clone());
+    // MAPPS-298: cross-entity tenant-scoped search.
+    let search_service = SearchService::new(db.pool().clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
     // SLA service shares the notifications dispatcher so the
@@ -248,6 +251,8 @@ pub fn create_api_router(
         .merge(rmm_routes(rmm_service))
         // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
         .merge(reports_routes(reports_service))
+        // MAPPS-298: cross-entity tenant-scoped global search.
+        .merge(search_routes(search_service))
         // Settings: tenant settings + module configs. PMS-114.
         .merge(settings_routes(settings_service.clone()))
         // Audit log read. PMS-118.

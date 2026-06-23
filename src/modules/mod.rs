@@ -18,6 +18,7 @@ pub mod portal;
 pub mod projects;
 pub mod reports;
 pub mod rmm;
+pub mod search;
 pub mod seed;
 pub mod settings;
 pub mod sla;
