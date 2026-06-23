@@ -52,6 +52,22 @@ pub struct AssetResponse {
     pub purchase_price: Option<Decimal>,
     pub warranty_expiry: Option<NaiveDate>,
     pub end_of_life: Option<NaiveDate>,
+    // PMS-454: CMDB expansion fields.
+    pub assigned_user_id: Option<Uuid>,
+    /// Resolved display name for `assigned_user_id` (first_name + last_name),
+    /// surfaced so the SPA renders "Issued to Alice Smith" without an extra
+    /// `/auth/users` lookup. `None` when the asset is unassigned, the user
+    /// was deleted, or the assigned user has not yet completed onboarding.
+    pub assigned_user_name: Option<String>,
+    /// Primary IP rendered as a string ("10.1.2.3" / "fe80::1") so the
+    /// SPA does not have to special-case INET. Stored as INET on the
+    /// server side so a malformed value is rejected at write time.
+    pub ip_address: Option<String>,
+    pub hostname: Option<String>,
+    pub mac_address: Option<String>,
+    pub installed_date: Option<NaiveDate>,
+    pub department: Option<String>,
+    pub in_transit_ticket_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -87,6 +103,20 @@ pub struct CreateAssetRequest {
     pub purchase_price: Option<Decimal>,
     pub warranty_expiry: Option<NaiveDate>,
     pub end_of_life: Option<NaiveDate>,
+    // PMS-454: CMDB expansion fields. Each is optional so the create
+    // path does not break for existing callers; the server applies its
+    // column defaults when omitted.
+    pub assigned_user_id: Option<Uuid>,
+    #[validate(length(max = 45))]
+    pub ip_address: Option<String>,
+    #[validate(length(max = 255))]
+    pub hostname: Option<String>,
+    #[validate(length(max = 50))]
+    pub mac_address: Option<String>,
+    pub installed_date: Option<NaiveDate>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    pub in_transit_ticket_id: Option<Uuid>,
 }
 
 fn default_active() -> String {
@@ -108,6 +138,19 @@ pub struct UpdateAssetRequest {
     pub purchase_price: Option<Decimal>,
     pub warranty_expiry: Option<NaiveDate>,
     pub end_of_life: Option<NaiveDate>,
+    // PMS-454: CMDB expansion fields. Each optional so a partial PUT
+    // only touches the fields the SPA actually sends.
+    pub assigned_user_id: Option<Uuid>,
+    #[validate(length(max = 45))]
+    pub ip_address: Option<String>,
+    #[validate(length(max = 255))]
+    pub hostname: Option<String>,
+    #[validate(length(max = 50))]
+    pub mac_address: Option<String>,
+    pub installed_date: Option<NaiveDate>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    pub in_transit_ticket_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
