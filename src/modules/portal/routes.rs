@@ -19,12 +19,12 @@ use validator::Validate;
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::service::PortalAuthService;
 use super::{
-    CreatePortalTicketRequest, CurrentContact, PortalLoginRequest, PortalLoginResponse,
-    PortalSetupPasswordRequest,
+    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalLoginRequest,
+    PortalLoginResponse, PortalSetupPasswordRequest,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
-use crate::modules::tickets::{TicketResponse, TicketService};
+use crate::modules::tickets::{TicketNoteResponse, TicketResponse, TicketService};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -65,6 +65,16 @@ pub fn portal_routes(
         .route("/auth/me", get(me))
         .route("/tickets", get(list_tickets).post(create_ticket))
         .route("/tickets/{ticket_id}", get(get_ticket))
+        // PMS-449: portal ticket comments. GET lists `note_type='public'`
+        // notes (internal / resolution / time_entry are filtered server-
+        // side). POST accepts a fresh contact-authored comment that the
+        // service stamps with `created_by_contact_id` while keeping
+        // `created_by_id` pointed at a fallback admin (the column is NOT
+        // NULL; the FK is to `users`, not `contacts`).
+        .route(
+            "/tickets/{ticket_id}/notes",
+            get(list_ticket_notes).post(create_ticket_note),
+        )
         .route("/invoices", get(list_invoices))
         .route("/invoices/{invoice_id}", get(get_invoice))
         .route("/kb", get(list_kb))
@@ -264,4 +274,76 @@ async fn create_ticket(
         )
         .await?;
     Ok(Json(resp))
+}
+
+/// PMS-449: list the public comments on one of the contact's own
+/// company's tickets. Server-side filters by `note_type='public'` so
+/// internal agent back-channel never leaks to the customer. Cross-
+/// company access surfaces as 404 (same posture as `get_ticket`).
+async fn list_ticket_notes(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(ticket_id): Path<Uuid>,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
+    // SAFETY (PMS-261/PMS-449): verified contact-JWT claims, not user input.
+    // The service scopes by both tenant and company, so a guessed ticket id
+    // from another company yields the same 404 a missing one would.
+    let (notes, total) = state
+        .tickets
+        .list_portal_ticket_notes(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.company_id,
+            ticket_id,
+            &pagination,
+        )
+        .await?;
+    let responses: Vec<TicketNoteResponse> = notes
+        .into_iter()
+        .map(|n| TicketNoteResponse {
+            id: n.id,
+            note_type: n.note_type,
+            content: n.content,
+            is_email_sent: n.is_email_sent,
+            created_by_id: n.created_by_id,
+            created_by_name: n.created_by_name.unwrap_or_default(),
+            created_at: n.created_at,
+        })
+        .collect();
+    Ok(Json(PaginatedResponse::from_params(
+        responses,
+        &pagination,
+        total,
+    )))
+}
+
+/// PMS-449: portal contact adds a comment on one of their own
+/// company's tickets. `note_type` is forced to `public` server-
+/// side; the customer cannot accidentally write an internal note.
+async fn create_ticket_note(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(ticket_id): Path<Uuid>,
+    Json(request): Json<CreatePortalTicketNoteRequest>,
+) -> AppResult<Json<TicketNoteResponse>> {
+    request.validate()?;
+    let note = state
+        .tickets
+        .create_portal_ticket_note(
+            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.company_id,
+            contact.id,
+            ticket_id,
+            request.content,
+        )
+        .await?;
+    Ok(Json(TicketNoteResponse {
+        id: note.id,
+        note_type: note.note_type,
+        content: note.content,
+        is_email_sent: note.is_email_sent,
+        created_by_id: note.created_by_id,
+        created_by_name: note.created_by_name.unwrap_or_default(),
+        created_at: note.created_at,
+    }))
 }

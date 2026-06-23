@@ -74,6 +74,18 @@ pub struct CreatePortalTicketRequest {
     pub type_id: Option<Uuid>,
 }
 
+/// PMS-449: portal-side body for adding a comment to one of the
+/// contact's own company's tickets. Intentionally narrower than the
+/// agent-side `CreateNoteRequest`: a customer cannot choose
+/// `note_type` (server forces `public`) or trigger an outbound email
+/// (the agent path's `send_email` is not exposed here - the
+/// notifications dispatcher fans out on its own rules).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreatePortalTicketNoteRequest {
+    #[validate(length(min = 1, max = 10_000, message = "Comment is required (1-10000 chars)"))]
+    pub content: String,
+}
+
 /// `POST /api/v1/portal/auth/setup-password` request body. The customer
 /// lands here from the emailed `/portal/set-password?token=...` link
 /// (PMS-136). `token` is the single-use setup token (`{contact_id}.{secret}`);
