@@ -382,6 +382,15 @@ pub struct CreateTicketRequest {
     pub custom_fields: serde_json::Value,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// PMS-452: KB article the ticket was opened FROM. The SPA's
+    /// article surface offers an "Open ticket about this article"
+    /// affordance that pre-fills the form and stamps this column,
+    /// so downstream reporting can answer "which articles drive the
+    /// most tickets" - i.e. where the docs are failing the user.
+    /// `ON DELETE SET NULL` on the FK so retiring an article does
+    /// not cascade-delete tickets that referenced it.
+    #[serde(default)]
+    pub source_kb_article_id: Option<Uuid>,
 }
 
 /// Update ticket request

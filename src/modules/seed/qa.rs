@@ -819,6 +819,7 @@ fn qa_ticket(
         asset_id: None,
         custom_fields: serde_json::Value::Null,
         tags: vec![QA_TAG.to_string()],
+        source_kb_article_id: None,
     }
 }
 

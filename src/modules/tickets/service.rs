@@ -213,10 +213,11 @@ impl TicketService {
                 company_id, contact_id, site_id, assigned_to_id, team_id,
                 contract_id, sla_id, scheduled_start, scheduled_end,
                 estimated_hours, is_billable, asset_id, custom_fields, tags,
-                created_by_id
+                created_by_id, source_kb_article_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
+                $27
             )
             "#,
         )
@@ -246,6 +247,7 @@ impl TicketService {
         .bind(&request.custom_fields)
         .bind(&request.tags)
         .bind(user_id)
+        .bind(request.source_kb_article_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1951,6 +1953,7 @@ impl TicketService {
             asset_id: None,
             custom_fields: serde_json::Value::Null,
             tags: vec![],
+            source_kb_article_id: None,
         };
         // Portal flow has no AuditCtx extractor (portal auth identity is a
         // `contacts` row, not a `users` row); attribute to the system actor.
