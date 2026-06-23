@@ -15,6 +15,7 @@ use tower_http::{
 };
 
 use crate::db::Database;
+use crate::modules::approvals::{approval_routes, ApprovalsService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::at_jwt::AtJwtVerifier;
@@ -137,6 +138,8 @@ pub fn create_api_router(
     // (audit + SLA assignment + ticket-number generation) without
     // duplicating the INSERT.
     let email_intake_service = EmailIntakeService::new(db.pool().clone(), ticket_service.clone());
+    // PMS-451: per-ticket approval requests.
+    let approvals_service = ApprovalsService::new(db.pool().clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
     // SLA service shares the notifications dispatcher so the
@@ -277,6 +280,9 @@ pub fn create_api_router(
         // to attribute the request to. The route handler extracts
         // the bearer directly from the request headers.
         .merge(email_intake_routes(email_intake_service))
+        // PMS-451: ticket approvals (per-ticket list + create, caller's
+        // pending queue, decide, cancel).
+        .merge(approval_routes(approvals_service))
         // Settings: tenant settings + module configs. PMS-114.
         .merge(settings_routes(settings_service.clone()))
         // Audit log read. PMS-118.
