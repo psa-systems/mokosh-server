@@ -2007,6 +2007,165 @@ impl TicketService {
         Ok(resp)
     }
 
+    /// PMS-449: list `public` notes on a ticket the portal contact's
+    /// company owns. `internal` / `resolution` / `time_entry` notes
+    /// are filtered server-side so the customer never sees agent
+    /// back-channel discussion. Cross-company access surfaces as 404
+    /// (same posture as `get_portal_ticket`), so a guessed ticket id
+    /// in another company yields the same response as a missing one.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_portal_ticket_notes(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        ticket_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketNote>, u64)> {
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ticket_notes \
+             WHERE tenant_id = $1 AND ticket_id = $2 AND note_type = 'public'",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        // The author name resolution prefers the contact (portal-
+        // originated) and falls back to the user (agent-originated).
+        // COALESCE on the joined first/last strings so a deleted
+        // contact or user surfaces as None without panicking the
+        // FromRow target.
+        let rows = sqlx::query_as::<_, TicketNoteRow>(
+            r#"
+            SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
+                   n.is_email_sent, n.email_sent_at, n.created_by_id, n.created_at, n.updated_at,
+                   COALESCE(
+                       NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
+                       NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                   ) AS created_by_name
+            FROM ticket_notes n
+            LEFT JOIN users u ON n.created_by_id = u.id
+            LEFT JOIN contacts c ON n.created_by_contact_id = c.id
+            WHERE n.tenant_id = $1 AND n.ticket_id = $2 AND n.note_type = 'public'
+            ORDER BY n.created_at ASC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok((
+            rows.into_iter().map(Into::into).collect(),
+            total.try_into().unwrap_or(0),
+        ))
+    }
+
+    /// PMS-449: portal contact posts a new comment onto their own
+    /// company's ticket. Mirrors `create_portal_ticket`'s
+    /// attribution pattern - `created_by_id` falls back to the first
+    /// admin/manager in the tenant (the FK is still NOT NULL), and
+    /// `created_by_contact_id` carries the real author so the SPA
+    /// renders the comment as customer-originated. Bumps the
+    /// ticket's `first_response_at` like the agent-add path so SLA
+    /// math sees the customer reply.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_portal_ticket_note(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Uuid,
+        ticket_id: Uuid,
+        content: String,
+    ) -> AppResult<TicketNote> {
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await?;
+        let fallback_creator: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
+             AND role IN ('super_admin', 'admin', 'manager') \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let fallback_creator = fallback_creator.ok_or(AppError::Configuration(
+            "Cannot accept portal note: tenant has no admin/manager user to attribute it to".into(),
+        ))?;
+        let note_id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO ticket_notes
+                (id, tenant_id, ticket_id, note_type, content, created_by_id, created_by_contact_id)
+            VALUES ($1, $2, $3, 'public', $4, $5, $6)
+            "#,
+        )
+        .bind(note_id)
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(&content)
+        .bind(fallback_creator)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        // Mirror the agent add_note path: bump the ticket's
+        // updated_at and stamp first_response_at if not yet set. The
+        // customer comment counts as activity even though
+        // last_updated_by_id stays the fallback admin (the column
+        // points at `users`, not `contacts`).
+        sqlx::query(
+            "UPDATE tickets SET updated_at = NOW(), \
+                                  first_response_at = COALESCE(first_response_at, NOW()) \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // Fetch the inserted row through the list path so the
+        // returned DTO carries the resolved `created_by_name`.
+        let pagination = PaginationParams {
+            page: 1,
+            per_page: 200,
+            sort: None,
+            sort_dir: "asc".to_string(),
+        };
+        let (rows, _) = self
+            .list_portal_ticket_notes(tenant_id, company_id, ticket_id, &pagination)
+            .await?;
+        rows.into_iter()
+            .find(|n| n.id == note_id)
+            .ok_or(AppError::NotFound("TicketNote".to_string()))
+    }
+
+    /// Verify the ticket belongs to the portal contact's company within the
+    /// caller's tenant. Surfaces 404 on miss to avoid confirming the existence
+    /// of another company's ticket.
+    async fn assert_portal_ticket_visible(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        ticket_id: Uuid,
+    ) -> AppResult<()> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM tickets WHERE tenant_id = $1 AND id = $2 AND company_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(company_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if row.is_none() {
+            return Err(AppError::NotFound("Ticket".to_string()));
+        }
+        Ok(())
+    }
+
     /// Fetch a fully-joined ticket response. Audit F3: the previous
     /// route-side construction populated `status.name`, `priority.name`,
     /// queue/company/contact/assigned/created-by names with empty
