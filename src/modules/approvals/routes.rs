@@ -25,11 +25,13 @@ pub fn approval_routes(service: ApprovalsService) -> Router {
         service: Arc::new(service),
     };
     Router::new()
-        // Per-ticket list + create. Mounted under `/tickets/:ticket_id`
+        // Per-ticket list + create. Mounted under `/tickets/{ticket_id}`
         // so the SPA's ticket detail page hits one prefix for both
-        // the timeline read and the "Request approval" submit.
+        // the timeline read and the "Request approval" submit. Axum
+        // 0.8 dropped the leading-colon capture syntax in favour of
+        // braces; using `:ticket_id` here panics at router build.
         .route(
-            "/tickets/:ticket_id/approvals",
+            "/tickets/{ticket_id}/approvals",
             get(list_for_ticket).post(create_for_ticket),
         )
         // Caller's pending decision queue. Used by the SPA's top bar
@@ -38,8 +40,8 @@ pub fn approval_routes(service: ApprovalsService) -> Router {
         // Decision + cancel paths. Cancel is DELETE because the row
         // remains in the DB with status='cancelled'; this matches the
         // soft-delete posture across the rest of the API.
-        .route("/approvals/:id/decision", post(decide))
-        .route("/approvals/:id", delete(cancel))
+        .route("/approvals/{id}/decision", post(decide))
+        .route("/approvals/{id}", delete(cancel))
         .with_state(state)
 }
 
