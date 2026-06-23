@@ -820,6 +820,8 @@ fn qa_ticket(
         custom_fields: serde_json::Value::Null,
         tags: vec![QA_TAG.to_string()],
         source_kb_article_id: None,
+        email_message_id: None,
+        email_thread_id: None,
     }
 }
 

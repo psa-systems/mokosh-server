@@ -11,6 +11,7 @@ pub mod calendar;
 pub mod contacts;
 pub mod contracts;
 pub mod dashboards;
+pub mod email_intake;
 pub mod invitations;
 pub mod knowledge_base;
 pub mod mileage_tracking;
