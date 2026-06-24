@@ -10,10 +10,12 @@ use axum::{
 use uuid::Uuid;
 use validator::Validate;
 
+use serde::Deserialize;
+
 use super::models::*;
-use super::service::AssetsService;
+use super::service::{AssetsService, ImpactDirection};
 use crate::modules::auth::{RequireAdmin, RequireAssets, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -50,6 +52,10 @@ pub fn assets_routes(service: AssetsService) -> Router {
             "/asset-relationships/{id}",
             axum::routing::delete(delete_asset_relationship),
         )
+        // PMS-475: CI impact graph traversal. Walks asset_relationships
+        // recursively to answer "if I retire this database, what
+        // services break?" - the SPA's CI Map tab consumes it.
+        .route("/assets/{id}/impact", get(get_asset_impact))
         // PMS-76 configuration items
         .route(
             "/assets/{id}/configuration-items",
@@ -215,6 +221,67 @@ async fn delete_asset_relationship(
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_asset_relationship(u.tenant(), id).await
+}
+
+/// PMS-475: query string for `GET /assets/{id}/impact`. Both fields
+/// are optional; `direction` defaults to `both` and `depth` defaults
+/// to the per-tenant `ci/impact_max_depth` setting (which the service
+/// reads). The service clamps `depth` against that setting and the
+/// hard server ceiling of 10.
+#[derive(Debug, Deserialize)]
+struct ImpactQuery {
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    depth: Option<u32>,
+}
+
+async fn get_asset_impact(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Path(id): Path<Uuid>,
+    Query(q): Query<ImpactQuery>,
+) -> AppResult<Json<AssetImpactResponse>> {
+    let direction = match q.direction.as_deref().unwrap_or("both") {
+        "upstream" => ImpactDirection::Upstream,
+        "downstream" => ImpactDirection::Downstream,
+        "both" => ImpactDirection::Both,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Unknown direction='{other}'; expected upstream | downstream | both",
+            )));
+        }
+    };
+    // 10 = the absolute server ceiling. The per-tenant setting clamps
+    // further inside the service.
+    let depth = q.depth.unwrap_or(10);
+    let (effective_depth, rows) = s
+        .service
+        .compute_impact_graph(u.tenant(), id, direction, depth)
+        .await?;
+    let nodes: Vec<AssetImpactNode> = rows
+        .into_iter()
+        .map(|r| AssetImpactNode {
+            asset_id: r.asset_id,
+            name: r.name,
+            parent_asset_id: r.parent_asset_id,
+            child_asset_id: r.child_asset_id,
+            relationship_type: r.relationship_type,
+            direction: r.direction,
+            depth: r.depth as u32,
+        })
+        .collect();
+    Ok(Json(AssetImpactResponse {
+        root_asset_id: id,
+        depth: effective_depth,
+        direction: match direction {
+            ImpactDirection::Upstream => "upstream",
+            ImpactDirection::Downstream => "downstream",
+            ImpactDirection::Both => "both",
+        }
+        .to_string(),
+        nodes,
+    }))
 }
 
 async fn list_configuration_items(

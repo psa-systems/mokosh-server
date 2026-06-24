@@ -582,6 +582,75 @@ impl AssetsService {
         })
     }
 
+    /// PMS-475: walk `asset_relationships` recursively from
+    /// `asset_id` to build the CI impact-graph the SPA's CI Map tab
+    /// renders. `direction` selects upstream (callers / dependents),
+    /// downstream (dependencies / hosted), or both. `requested_depth`
+    /// is clamped against the per-tenant
+    /// `ci/impact_max_depth` setting and the server hard ceiling
+    /// (10), so the caller cannot ask for a deeper traversal than
+    /// the tenant configured. Cycles are bounded by the depth cap;
+    /// the CTE visits each (asset_id, edge) pair up to `depth` times,
+    /// which is acceptable for the modest CMDB sizes this surface
+    /// targets.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, asset_id = %asset_id))]
+    pub async fn compute_impact_graph(
+        &self,
+        tenant_id: TenantId,
+        asset_id: Uuid,
+        direction: ImpactDirection,
+        requested_depth: u32,
+    ) -> AppResult<(u32, Vec<ImpactNodeRow>)> {
+        // Confirm the asset exists in this tenant before we walk -
+        // a 404 on the root keeps the SPA's "asset not found" copy
+        // consistent with the GET /assets/{id} response and avoids
+        // returning an empty-but-200 graph when the user typed a
+        // wrong id.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM assets WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(asset_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Err(AppError::NotFound("Asset".into()));
+        }
+        let tenant_cap =
+            crate::modules::settings::read_ci_impact_max_depth(&mut tx, tenant_id.get()).await?;
+        let depth = requested_depth.clamp(1, 10).min(tenant_cap);
+
+        let mut nodes: Vec<ImpactNodeRow> = Vec::new();
+        if matches!(
+            direction,
+            ImpactDirection::Downstream | ImpactDirection::Both
+        ) {
+            let rows = sqlx::query_as::<_, ImpactNodeRow>(DOWNSTREAM_CTE)
+                .bind(tenant_id)
+                .bind(asset_id)
+                .bind(depth as i32)
+                .fetch_all(&mut *tx)
+                .await?;
+            nodes.extend(rows.into_iter().map(|n| ImpactNodeRow {
+                direction: "downstream".into(),
+                ..n
+            }));
+        }
+        if matches!(direction, ImpactDirection::Upstream | ImpactDirection::Both) {
+            let rows = sqlx::query_as::<_, ImpactNodeRow>(UPSTREAM_CTE)
+                .bind(tenant_id)
+                .bind(asset_id)
+                .bind(depth as i32)
+                .fetch_all(&mut *tx)
+                .await?;
+            nodes.extend(rows.into_iter().map(|n| ImpactNodeRow {
+                direction: "upstream".into(),
+                ..n
+            }));
+        }
+        Ok((depth, nodes))
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_asset_relationship(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1147,6 +1216,95 @@ struct RelRow {
     child_asset_id: Uuid,
     relationship_type: String,
 }
+
+/// PMS-475: traversal direction for [`AssetsService::compute_impact_graph`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImpactDirection {
+    /// Walk parent_asset_id => child_asset_id (what this asset is
+    /// hosted by / depends on / is connected to).
+    Downstream,
+    /// Walk child_asset_id => parent_asset_id (what depends on this
+    /// asset).
+    Upstream,
+    /// Union of both halves.
+    Both,
+}
+
+/// One walked edge of the impact graph. Maps 1:1 onto
+/// `AssetImpactNode` in the route layer.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ImpactNodeRow {
+    pub asset_id: Uuid,
+    pub name: String,
+    pub parent_asset_id: Uuid,
+    pub child_asset_id: Uuid,
+    pub relationship_type: String,
+    pub depth: i32,
+    /// Stamped by the service after the SELECT lands; the CTE itself
+    /// does not know whether it ran for the upstream or downstream
+    /// half of `Both`. Defaults to empty in the FromRow.
+    #[sqlx(default)]
+    pub direction: String,
+}
+
+/// Downstream traversal: seed with every relationship whose parent is
+/// the root, then recurse by joining each step's child as the next
+/// step's parent. `depth = 1` for the seed; cap is enforced by the
+/// `depth < $3` predicate.
+const DOWNSTREAM_CTE: &str = "
+    WITH RECURSIVE downstream AS (
+        SELECT r.child_asset_id AS asset_id,
+               r.parent_asset_id,
+               r.child_asset_id,
+               r.relationship_type,
+               1 AS depth
+        FROM asset_relationships r
+        WHERE r.tenant_id = $1 AND r.parent_asset_id = $2
+        UNION ALL
+        SELECT r.child_asset_id,
+               r.parent_asset_id,
+               r.child_asset_id,
+               r.relationship_type,
+               d.depth + 1
+        FROM asset_relationships r
+        JOIN downstream d ON r.parent_asset_id = d.asset_id
+        WHERE r.tenant_id = $1 AND d.depth < $3
+    )
+    SELECT d.asset_id, a.name, d.parent_asset_id, d.child_asset_id,
+           d.relationship_type, d.depth
+    FROM downstream d
+    JOIN assets a ON a.id = d.asset_id AND a.tenant_id = $1
+    ORDER BY d.depth ASC, a.name ASC
+";
+
+/// Upstream traversal: seed with every relationship whose child is
+/// the root, then recurse by joining each step's parent as the next
+/// step's child. Mirror image of the downstream CTE.
+const UPSTREAM_CTE: &str = "
+    WITH RECURSIVE upstream AS (
+        SELECT r.parent_asset_id AS asset_id,
+               r.parent_asset_id,
+               r.child_asset_id,
+               r.relationship_type,
+               1 AS depth
+        FROM asset_relationships r
+        WHERE r.tenant_id = $1 AND r.child_asset_id = $2
+        UNION ALL
+        SELECT r.parent_asset_id,
+               r.parent_asset_id,
+               r.child_asset_id,
+               r.relationship_type,
+               u.depth + 1
+        FROM asset_relationships r
+        JOIN upstream u ON r.child_asset_id = u.asset_id
+        WHERE r.tenant_id = $1 AND u.depth < $3
+    )
+    SELECT u.asset_id, a.name, u.parent_asset_id, u.child_asset_id,
+           u.relationship_type, u.depth
+    FROM upstream u
+    JOIN assets a ON a.id = u.asset_id AND a.tenant_id = $1
+    ORDER BY u.depth ASC, a.name ASC
+";
 
 impl From<RelRow> for AssetRelationshipResponse {
     fn from(r: RelRow) -> Self {
