@@ -307,6 +307,7 @@ async fn list_ticket_notes(
             is_email_sent: n.is_email_sent,
             created_by_id: n.created_by_id,
             created_by_name: n.created_by_name.unwrap_or_default(),
+            created_by_contact_id: n.created_by_contact_id,
             created_at: n.created_at,
         })
         .collect();
@@ -344,6 +345,7 @@ async fn create_ticket_note(
         is_email_sent: note.is_email_sent,
         created_by_id: note.created_by_id,
         created_by_name: note.created_by_name.unwrap_or_default(),
+        created_by_contact_id: note.created_by_contact_id,
         created_at: note.created_at,
     }))
 }

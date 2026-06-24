@@ -14,6 +14,6 @@ mod service;
 pub use automation::AutomationEngine;
 pub use models::*;
 #[cfg(feature = "server")]
-pub use routes::ticket_routes;
+pub use routes::{contact_notes_routes, ticket_routes};
 #[cfg(feature = "server")]
 pub use service::TicketService;

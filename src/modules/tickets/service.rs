@@ -1022,7 +1022,9 @@ impl TicketService {
         let row = sqlx::query_as::<_, TicketNoteRow>(
             r#"
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
-                   n.is_email_sent, n.email_sent_at, n.created_by_id, n.created_at, n.updated_at,
+                   n.is_email_sent, n.email_sent_at, n.created_by_id,
+                   n.created_by_contact_id,
+                   n.created_at, n.updated_at,
                    u.first_name || ' ' || u.last_name as created_by_name
             FROM ticket_notes n
             LEFT JOIN users u ON n.created_by_id = u.id
@@ -1058,7 +1060,9 @@ impl TicketService {
         let rows = sqlx::query_as::<_, TicketNoteRow>(
             r#"
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
-                   n.is_email_sent, n.email_sent_at, n.created_by_id, n.created_at, n.updated_at,
+                   n.is_email_sent, n.email_sent_at, n.created_by_id,
+                   n.created_by_contact_id,
+                   n.created_at, n.updated_at,
                    u.first_name || ' ' || u.last_name as created_by_name
             FROM ticket_notes n
             LEFT JOIN users u ON n.created_by_id = u.id
@@ -2109,7 +2113,9 @@ impl TicketService {
         let rows = sqlx::query_as::<_, TicketNoteRow>(
             r#"
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
-                   n.is_email_sent, n.email_sent_at, n.created_by_id, n.created_at, n.updated_at,
+                   n.is_email_sent, n.email_sent_at, n.created_by_id,
+                   n.created_by_contact_id,
+                   n.created_at, n.updated_at,
                    COALESCE(
                        NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
                        NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
@@ -2124,6 +2130,58 @@ impl TicketService {
         )
         .bind(tenant_id)
         .bind(ticket_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok((
+            rows.into_iter().map(Into::into).collect(),
+            total.try_into().unwrap_or(0),
+        ))
+    }
+
+    /// PMS-468 / PMS-449 phase 2: list every `note_type='public'`
+    /// row authored by a specific contact across all of that
+    /// tenant's tickets. Powers the agent UI "show me all comments
+    /// from this customer" feed. The partial index on
+    /// `(tenant_id, created_by_contact_id)` from migration 069 makes
+    /// this one index scan per call.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_notes_by_contact(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<TicketNote>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ticket_notes \
+             WHERE tenant_id = $1 AND created_by_contact_id = $2 AND note_type = 'public'",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let rows = sqlx::query_as::<_, TicketNoteRow>(
+            r#"
+            SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
+                   n.is_email_sent, n.email_sent_at, n.created_by_id,
+                   n.created_by_contact_id,
+                   n.created_at, n.updated_at,
+                   COALESCE(
+                       NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
+                       NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                   ) AS created_by_name
+            FROM ticket_notes n
+            LEFT JOIN users u ON n.created_by_id = u.id
+            LEFT JOIN contacts c ON n.created_by_contact_id = c.id
+            WHERE n.tenant_id = $1 AND n.created_by_contact_id = $2 AND n.note_type = 'public'
+            ORDER BY n.created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
@@ -2734,6 +2792,7 @@ struct TicketNoteRow {
     is_email_sent: bool,
     email_sent_at: Option<chrono::DateTime<Utc>>,
     created_by_id: Uuid,
+    created_by_contact_id: Option<Uuid>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     created_by_name: Option<String>,
@@ -2752,6 +2811,7 @@ impl From<TicketNoteRow> for TicketNote {
             email_sent_at: row.email_sent_at,
             created_by_id: row.created_by_id,
             created_by_name: row.created_by_name,
+            created_by_contact_id: row.created_by_contact_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
