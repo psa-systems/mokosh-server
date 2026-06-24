@@ -342,3 +342,200 @@ pub struct ExecuteReportResponse {
     /// relying on JSON-object key order.
     pub aliases: Vec<String>,
 }
+
+// PMS-478: schedule machinery ------------------------------------------------
+
+use super::models::{
+    CreateScheduledReportRequest, ScheduledReportResponse, UpdateScheduledReportRequest,
+};
+
+#[derive(Debug, FromRow)]
+struct ScheduleRow {
+    id: Uuid,
+    saved_report_id: Uuid,
+    user_id: Uuid,
+    cron_expr: String,
+    channel: String,
+    format: String,
+    recipient_email: Option<String>,
+    is_active: bool,
+    last_run_at: Option<DateTime<Utc>>,
+    next_run_at: DateTime<Utc>,
+    last_error: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<ScheduleRow> for ScheduledReportResponse {
+    fn from(r: ScheduleRow) -> Self {
+        Self {
+            id: r.id,
+            saved_report_id: r.saved_report_id,
+            user_id: r.user_id,
+            cron_expr: r.cron_expr,
+            channel: r.channel,
+            format: r.format,
+            recipient_email: r.recipient_email,
+            is_active: r.is_active,
+            last_run_at: r.last_run_at,
+            next_run_at: r.next_run_at,
+            last_error: r.last_error,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+const SCHEDULE_SELECT: &str = "
+    id, saved_report_id, user_id, cron_expr, channel, format,
+    recipient_email, is_active, last_run_at, next_run_at, last_error,
+    created_at, updated_at
+";
+
+impl SavedReportsService {
+    /// PMS-478: create a schedule against a saved report. Reuses the
+    /// `get` visibility rule (author OR shared) so a private report
+    /// can only be scheduled by its owner. `next_run_at` is computed
+    /// from the cron expression with NOW as the anchor; a freshly-
+    /// created schedule fires on its first cron tick after creation.
+    pub async fn schedule_create(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        saved_report_id: Uuid,
+        req: CreateScheduledReportRequest,
+    ) -> AppResult<ScheduledReportResponse> {
+        // Visibility check via the existing `get`. Surfaces 404 for a
+        // private report the caller cannot see, same shape as the
+        // SPA's other report endpoints.
+        let _ = self.get(tenant_id, user_id, saved_report_id).await?;
+        let next_run = compute_next_run(&req.cron_expr, Utc::now())?;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scheduled_reports \
+                 (tenant_id, saved_report_id, user_id, cron_expr, \
+                  recipient_email, is_active, next_run_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             RETURNING id",
+        )
+        .bind(tenant_id)
+        .bind(saved_report_id)
+        .bind(user_id)
+        .bind(&req.cron_expr)
+        .bind(&req.recipient_email)
+        .bind(req.is_active)
+        .bind(next_run)
+        .fetch_one(&self.pool)
+        .await?;
+        self.schedule_get(tenant_id, id).await
+    }
+
+    pub async fn schedule_list(
+        &self,
+        tenant_id: Uuid,
+        saved_report_id: Uuid,
+    ) -> AppResult<Vec<ScheduledReportResponse>> {
+        let sql = format!(
+            "SELECT {SCHEDULE_SELECT} FROM scheduled_reports \
+             WHERE tenant_id = $1 AND saved_report_id = $2 \
+             ORDER BY created_at DESC",
+        );
+        let rows = sqlx::query_as::<_, ScheduleRow>(&sql)
+            .bind(tenant_id)
+            .bind(saved_report_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn schedule_get(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> AppResult<ScheduledReportResponse> {
+        let sql = format!(
+            "SELECT {SCHEDULE_SELECT} FROM scheduled_reports \
+             WHERE tenant_id = $1 AND id = $2",
+        );
+        let row = sqlx::query_as::<_, ScheduleRow>(&sql)
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::NotFound("ScheduledReport".into()))?;
+        Ok(row.into())
+    }
+
+    /// PATCH a schedule. Only the owner may mutate it; another
+    /// viewer (who can see the parent shared report) gets 404 - keeps
+    /// the response shape uniform with `update` on the parent.
+    pub async fn schedule_update(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        id: Uuid,
+        req: UpdateScheduledReportRequest,
+    ) -> AppResult<ScheduledReportResponse> {
+        // Re-compute next_run_at when the cron expression changes;
+        // leave it alone otherwise so a Pause -> Resume cycle does
+        // not skip ahead in cadence beyond what NOW would produce.
+        let new_next: Option<DateTime<Utc>> = match req.cron_expr.as_deref() {
+            Some(expr) => Some(compute_next_run(expr, Utc::now())?),
+            None => None,
+        };
+        let rows = sqlx::query(
+            "UPDATE scheduled_reports SET \
+                 cron_expr       = COALESCE($4, cron_expr), \
+                 next_run_at     = COALESCE($5, next_run_at), \
+                 recipient_email = COALESCE($6, recipient_email), \
+                 is_active       = COALESCE($7, is_active), \
+                 updated_at      = NOW() \
+             WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(user_id)
+        .bind(req.cron_expr)
+        .bind(new_next)
+        .bind(req.recipient_email)
+        .bind(req.is_active)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            return Err(AppError::NotFound("ScheduledReport".into()));
+        }
+        self.schedule_get(tenant_id, id).await
+    }
+
+    pub async fn schedule_delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
+        let rows = sqlx::query(
+            "DELETE FROM scheduled_reports \
+             WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            return Err(AppError::NotFound("ScheduledReport".into()));
+        }
+        Ok(())
+    }
+}
+
+/// PMS-478: parse + advance a cron expression. Returns the next
+/// firing instant strictly after `anchor`. Used both on create (anchor
+/// = NOW; the first firing happens at the next cron tick after creation)
+/// and inside the worker (anchor = `last_run_at` so a backlogged
+/// schedule catches up cleanly).
+pub(crate) fn compute_next_run(expr: &str, anchor: DateTime<Utc>) -> AppResult<DateTime<Utc>> {
+    use std::str::FromStr;
+    let schedule = cron::Schedule::from_str(expr)
+        .map_err(|e| AppError::BadRequest(format!("Invalid cron expression: {e}")))?;
+    schedule
+        .after(&anchor)
+        .next()
+        .ok_or_else(|| AppError::Internal(format!("Cron '{expr}' has no future firings")))
+}

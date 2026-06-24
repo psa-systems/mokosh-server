@@ -11,7 +11,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 use validator::Validate;
 
-use super::models::{CreateSavedReportRequest, SavedReportResponse, UpdateSavedReportRequest};
+use super::models::{
+    CreateSavedReportRequest, CreateScheduledReportRequest, SavedReportResponse,
+    ScheduledReportResponse, UpdateSavedReportRequest, UpdateScheduledReportRequest,
+};
 use super::service::{ExecuteReportResponse, ReportScope, SavedReportsService};
 use crate::modules::auth::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
@@ -37,6 +40,20 @@ pub fn saved_reports_routes(service: SavedReportsService) -> Router {
         // overrides stay on the query string for sharable pagination
         // links.
         .route("/reports/saved/{id}/execute", axum::routing::post(execute))
+        // PMS-478: schedule machinery. List + create live under the
+        // parent report; per-schedule mutation hangs off a flat path
+        // so a SPA "pause this schedule" PATCH does not need the
+        // parent id in the URL.
+        .route(
+            "/reports/saved/{id}/schedules",
+            get(list_schedules).post(create_schedule),
+        )
+        .route(
+            "/reports/schedules/{schedule_id}",
+            get(get_schedule)
+                .patch(update_schedule)
+                .delete(delete_schedule),
+        )
         .with_state(state)
 }
 
@@ -146,4 +163,68 @@ async fn execute(
         .execute(u.tenant_id, u.id, id, q.page, q.per_page)
         .await?;
     Ok(Json(resp))
+}
+
+// PMS-478: schedule handlers ------------------------------------------------
+
+async fn list_schedules(
+    State(s): State<SavedReportsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<ScheduledReportResponse>>> {
+    // Visibility check on the parent report so a private report's
+    // schedules do not leak to a tenant member who cannot see the
+    // parent. The schedule_list method itself is tenant-scoped; this
+    // adds the report-level visibility guard.
+    let _ = s.service.get(u.tenant_id, u.id, id).await?;
+    let rows = s.service.schedule_list(u.tenant_id, id).await?;
+    Ok(Json(rows))
+}
+
+async fn create_schedule(
+    State(s): State<SavedReportsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CreateScheduledReportRequest>,
+) -> AppResult<Json<ScheduledReportResponse>> {
+    req.validate().map_err(AppError::from)?;
+    let row = s
+        .service
+        .schedule_create(u.tenant_id, u.id, id, req)
+        .await?;
+    Ok(Json(row))
+}
+
+async fn get_schedule(
+    State(s): State<SavedReportsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(schedule_id): Path<Uuid>,
+) -> AppResult<Json<ScheduledReportResponse>> {
+    let row = s.service.schedule_get(u.tenant_id, schedule_id).await?;
+    Ok(Json(row))
+}
+
+async fn update_schedule(
+    State(s): State<SavedReportsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(schedule_id): Path<Uuid>,
+    Json(req): Json<UpdateScheduledReportRequest>,
+) -> AppResult<Json<ScheduledReportResponse>> {
+    req.validate().map_err(AppError::from)?;
+    let row = s
+        .service
+        .schedule_update(u.tenant_id, u.id, schedule_id, req)
+        .await?;
+    Ok(Json(row))
+}
+
+async fn delete_schedule(
+    State(s): State<SavedReportsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(schedule_id): Path<Uuid>,
+) -> AppResult<Json<serde_json::Value>> {
+    s.service
+        .schedule_delete(u.tenant_id, u.id, schedule_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
 }
