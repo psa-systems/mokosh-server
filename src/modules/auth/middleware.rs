@@ -286,6 +286,32 @@ impl RoleRequirement for AdminRoles {
     }
 }
 
+/// PMS-479: `RequireAdmin` + `RequireAuth` collapsed into one
+/// extractor. Saves the `RequireAuth(u): RequireAuth, _admin: RequireAdmin`
+/// pair from spelling out the role guard alongside the user grab
+/// every admin-gated handler had to spell out before. Yields the
+/// `CurrentUser` directly via `RequireAdminUser(user): RequireAdminUser`.
+#[derive(Clone)]
+pub struct RequireAdminUser(pub CurrentUser);
+
+impl<S> axum::extract::FromRequestParts<S> for RequireAdminUser
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Delegate to RequireAdmin so the role list stays a single
+        // source of truth. Unwrap the tuple to drop the PhantomData
+        // tail; consumers only ever want the user.
+        let RequireRole(user, _) = RequireAdmin::from_request_parts(parts, state).await?;
+        Ok(Self(user))
+    }
+}
+
 /// Super-admin role requirement. The narrowest gate: only the platform
 /// operator role, never a tenant `admin`. Use it for cross-tenant
 /// administrative surfaces (e.g. the `/tenants` CRUD routes) so the

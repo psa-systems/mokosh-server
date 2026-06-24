@@ -35,6 +35,20 @@ pub struct CurrentContact {
     pub last_name: String,
 }
 
+impl CurrentContact {
+    /// PMS-479: wrap the verified `tenant_id` claim into a
+    /// `TenantId` so portal handlers do not have to spell out
+    /// `crate::modules::auth::TenantId::from_trusted(contact.tenant_id)`
+    /// at every service call. The seam is the same: a portal session
+    /// is a verified JWT, the wrapped UUID is a server-side trust
+    /// boundary, and `from_trusted` is the sanctioned bridge - this
+    /// helper just makes the call site one term instead of three.
+    #[cfg(feature = "server")]
+    pub fn tenant(&self) -> crate::modules::auth::TenantId {
+        crate::modules::auth::TenantId::from_trusted(self.tenant_id)
+    }
+}
+
 /// `POST /api/v1/portal/auth/login` request body. `tenant_slug` is
 /// required because `contacts.email` is only unique within a tenant.
 /// A portal hosted at e.g. `portal.acme.example.com` should supply the

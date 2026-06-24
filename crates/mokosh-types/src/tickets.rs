@@ -349,8 +349,17 @@ pub struct Ticket {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Create ticket request
-#[derive(Debug, Clone, Deserialize, Validate)]
+/// Create ticket request.
+///
+/// PMS-479: `Default` is derived so internal struct-literal callers
+/// (rmm intake, email intake, seed data, tests) can spell out only
+/// the fields they care about and trail `..Default::default()` for
+/// everything else. A future PR that adds a new optional field then
+/// does not break any of those call sites - they keep the new field
+/// at its default value automatically. The HTTP path still goes
+/// through `Deserialize + Validate`, which enforces the non-empty
+/// title + present company_id at the boundary.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
 pub struct CreateTicketRequest {
     #[validate(length(min = 1, max = 500))]
     pub title: String,
