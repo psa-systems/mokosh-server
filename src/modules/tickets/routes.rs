@@ -24,6 +24,21 @@ pub struct TicketRouterState {
     pub ticket_service: Arc<TicketService>,
 }
 
+/// PMS-468: build a sibling router for the agent "all comments
+/// from this contact" feed. Mounted at `/api/v1/contacts/{id}/notes`
+/// alongside the main contacts router so the path matches the SPA's
+/// contact-detail URL. Returns the TicketService-backed router as a
+/// standalone `Router` because the contacts module's router state
+/// holds the ContactService, not the TicketService.
+pub fn contact_notes_routes(ticket_service: TicketService) -> Router {
+    let state = TicketRouterState {
+        ticket_service: Arc::new(ticket_service),
+    };
+    Router::new()
+        .route("/contacts/{contact_id}/notes", get(list_contact_notes))
+        .with_state(state)
+}
+
 /// Create the ticket router
 pub fn ticket_routes(ticket_service: TicketService) -> Router {
     let state = TicketRouterState {
@@ -183,10 +198,48 @@ async fn get_ticket_notes(
             is_email_sent: n.is_email_sent,
             created_by_id: n.created_by_id,
             created_by_name: n.created_by_name.unwrap_or_default(),
+            created_by_contact_id: n.created_by_contact_id,
             created_at: n.created_at,
         })
         .collect();
 
+    Ok(Json(PaginatedResponse::from_params(
+        responses,
+        &pagination,
+        total,
+    )))
+}
+
+/// PMS-468: agent UI "all comments from this contact" feed. Returns
+/// every `note_type='public'` note authored by the contact (i.e.
+/// `created_by_contact_id = $contact_id`) across the tenant's
+/// tickets, paginated. Tenant-scoped so a contact in another tenant
+/// cannot be queried by a guessed UUID; admin guard kept off since
+/// every authenticated user already needs ticket-list access to
+/// reach the contact detail page that calls this.
+async fn list_contact_notes(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(contact_id): Path<Uuid>,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
+    let (notes, total) = state
+        .ticket_service
+        .list_notes_by_contact(user.tenant(), contact_id, &pagination)
+        .await?;
+    let responses: Vec<TicketNoteResponse> = notes
+        .into_iter()
+        .map(|n| TicketNoteResponse {
+            id: n.id,
+            note_type: n.note_type,
+            content: n.content,
+            is_email_sent: n.is_email_sent,
+            created_by_id: n.created_by_id,
+            created_by_name: n.created_by_name.unwrap_or_default(),
+            created_by_contact_id: n.created_by_contact_id,
+            created_at: n.created_at,
+        })
+        .collect();
     Ok(Json(PaginatedResponse::from_params(
         responses,
         &pagination,
@@ -215,6 +268,7 @@ async fn add_note(
         is_email_sent: note.is_email_sent,
         created_by_id: note.created_by_id,
         created_by_name: note.created_by_name.unwrap_or_else(|| user.full_name()),
+        created_by_contact_id: note.created_by_contact_id,
         created_at: note.created_at,
     }))
 }

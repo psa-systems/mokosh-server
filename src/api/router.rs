@@ -40,7 +40,7 @@ use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
 use crate::modules::tenants::{tenant_routes, TenantService};
-use crate::modules::tickets::{ticket_routes, TicketService};
+use crate::modules::tickets::{contact_notes_routes, ticket_routes, TicketService};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::modules::workflows::{workflow_routes, WorkflowsService};
 use crate::version::VersionInfo;
@@ -227,7 +227,12 @@ pub fn create_api_router(
         // explanation. Removed and documented (PMS-20).
         .nest("/contacts", contact_routes(contact_service.clone()))
         // Ticketing
-        .nest("/tickets", ticket_routes(ticket_service))
+        .nest("/tickets", ticket_routes(ticket_service.clone()))
+        // PMS-468: agent "all comments from this contact" feed. The
+        // route lives on the tickets module (TicketService owns the
+        // notes surface) but mounts at the top level so its path
+        // matches the SPA's `/contacts/{id}/notes` URL.
+        .merge(contact_notes_routes(ticket_service))
         // Time tracking: time-entries, timesheets, timers, rounding,
         // work-types. PMS-43.
         .merge(time_tracking_routes(time_tracking_service))

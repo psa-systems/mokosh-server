@@ -554,6 +554,13 @@ pub struct TicketNote {
     pub email_sent_at: Option<DateTime<Utc>>,
     pub created_by_id: Uuid,
     pub created_by_name: Option<String>,
+    /// PMS-468 / PMS-449 phase 2: when populated, the note was
+    /// originated by a portal contact (not an agent user). The SPA
+    /// uses `created_by_contact_id.is_some()` to render "Customer:"
+    /// vs "Agent:" attribution instead of the lossy heuristic on
+    /// `created_by_name`.
+    #[serde(default)]
+    pub created_by_contact_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -579,6 +586,12 @@ pub struct TicketNoteResponse {
     pub is_email_sent: bool,
     pub created_by_id: Uuid,
     pub created_by_name: String,
+    /// PMS-468 / PMS-449 phase 2: when populated, the note was
+    /// originated by a portal contact. SPA reads this to distinguish
+    /// customer vs agent comments without the prior heuristic on the
+    /// display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_contact_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
