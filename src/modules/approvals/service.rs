@@ -1,16 +1,27 @@
-//! PMS-451: ticket approvals service.
+//! PMS-451 phase 1 + PMS-470 phase 2: approvals service.
+//!
+//! Phase 1 shipped per-ticket sign-off; phase 2 widens the surface to
+//! `(target, entity_id)` so change_requests / quotes / time_entries
+//! share the same request / decide / cancel machinery. Existing
+//! `list_for_ticket` / `create` (ticket-only) call sites stay
+//! compile-compatible as thin wrappers over the generic
+//! `(target, entity_id)` variants.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use super::models::{ApprovalResponse, CreateApprovalRequest, DecideApprovalRequest};
+use super::models::{
+    ApprovalResponse, ApprovalTarget, CreateApprovalRequest, DecideApprovalRequest,
+};
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, FromRow)]
 struct ApprovalRow {
     id: Uuid,
-    ticket_id: Uuid,
+    target: String,
+    entity_id: Uuid,
+    ticket_id: Option<Uuid>,
     requested_by_id: Uuid,
     requested_by_name: Option<String>,
     approver_user_id: Option<Uuid>,
@@ -29,6 +40,8 @@ impl From<ApprovalRow> for ApprovalResponse {
     fn from(r: ApprovalRow) -> Self {
         Self {
             id: r.id,
+            target: r.target,
+            entity_id: r.entity_id,
             ticket_id: r.ticket_id,
             requested_by_id: r.requested_by_id,
             requested_by_name: r.requested_by_name,
@@ -49,7 +62,7 @@ impl From<ApprovalRow> for ApprovalResponse {
 /// Shared SELECT clause used by list / get / mutating returns so a
 /// schema-evolved field surfaces in every read path with one edit.
 const SELECT_FIELDS: &str = "
-    a.id, a.ticket_id, a.requested_by_id,
+    a.id, a.target, a.entity_id, a.ticket_id, a.requested_by_id,
     NULLIF(TRIM(CONCAT(rb.first_name, ' ', rb.last_name)), '') AS requested_by_name,
     a.approver_user_id,
     NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS approver_user_name,
@@ -75,29 +88,41 @@ impl ApprovalsService {
         Self { pool }
     }
 
-    pub async fn list_for_ticket(
+    /// PMS-470: expose the underlying pool so the route layer can run
+    /// its own parent-existence checks against tables this service
+    /// doesn't own (`time_entries`, future `change_requests` /
+    /// `quotes`). The pool reference is read-only at the type level
+    /// because PgPool is `Clone` and the caller can only run queries.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// PMS-470: list approvals for any `(target, entity_id)` parent.
+    /// The legacy `list_for_ticket(ticket_id)` is a thin wrapper.
+    pub async fn list_for_entity(
         &self,
         tenant_id: Uuid,
-        ticket_id: Uuid,
+        target: ApprovalTarget,
+        entity_id: Uuid,
     ) -> AppResult<Vec<ApprovalResponse>> {
         let q = format!(
             "SELECT {SELECT_FIELDS} \
              FROM ticket_approvals a {SELECT_JOINS} \
-             WHERE a.tenant_id = $1 AND a.ticket_id = $2 \
+             WHERE a.tenant_id = $1 AND a.target = $2 AND a.entity_id = $3 \
              ORDER BY a.requested_at DESC",
         );
         let rows = sqlx::query_as::<_, ApprovalRow>(&q)
             .bind(tenant_id)
-            .bind(ticket_id)
+            .bind(target.as_str())
+            .bind(entity_id)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Pending approval queue for the given user. Surfaces every
-    /// pending row where the user is the named approver OR the user
-    /// holds the assigned role (caller supplies `roles_held` so the
-    /// service stays role-source-agnostic).
+    /// Pending approval queue for the given user. PMS-470 widens it
+    /// to span every target; the SPA can filter client-side or via a
+    /// future `?target=` query param.
     pub async fn pending_for_user(
         &self,
         tenant_id: Uuid,
@@ -121,15 +146,21 @@ impl ApprovalsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    pub async fn create(
+    /// PMS-470: create an approval against any `(target, entity_id)`.
+    /// The route layer enforces parent-entity existence in the
+    /// caller's tenant before calling in - this service trusts the
+    /// parent and only validates the approver XOR and writes the row.
+    /// `legacy_ticket_id` is set ONLY when target is Ticket so the
+    /// legacy `ticket_id` column stays populated for phase-1 reads;
+    /// for non-ticket targets it lands NULL.
+    pub async fn create_for_entity(
         &self,
         tenant_id: Uuid,
-        ticket_id: Uuid,
+        target: ApprovalTarget,
+        entity_id: Uuid,
         requested_by_id: Uuid,
         req: CreateApprovalRequest,
     ) -> AppResult<ApprovalResponse> {
-        // XOR check at the application layer so the 422 carries a
-        // useful field-level message before reaching the DB CHECK.
         let by_user = req.approver_user_id.is_some();
         let by_role = req.approver_role.is_some();
         if by_user == by_role {
@@ -137,26 +168,21 @@ impl ApprovalsService {
                 "Set exactly one of approver_user_id or approver_role".into(),
             ));
         }
-        // Confirm the ticket belongs to the caller's tenant; without
-        // this a caller could request approval on someone else's
-        // ticket if they guessed the UUID.
-        let ticket_owned: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM tickets WHERE id = $1 AND tenant_id = $2")
-                .bind(ticket_id)
-                .bind(tenant_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        if ticket_owned.is_none() {
-            return Err(AppError::NotFound("Ticket not found".into()));
-        }
+        let legacy_ticket_id: Option<Uuid> = match target {
+            ApprovalTarget::Ticket => Some(entity_id),
+            _ => None,
+        };
         let insert = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO ticket_approvals \
-                 (tenant_id, ticket_id, requested_by_id, approver_user_id, approver_role, notes) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+                 (tenant_id, target, entity_id, ticket_id, requested_by_id, \
+                  approver_user_id, approver_role, notes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              RETURNING id",
         )
         .bind(tenant_id)
-        .bind(ticket_id)
+        .bind(target.as_str())
+        .bind(entity_id)
+        .bind(legacy_ticket_id)
         .bind(requested_by_id)
         .bind(req.approver_user_id)
         .bind(&req.approver_role)
@@ -204,8 +230,6 @@ impl ApprovalsService {
             }
         };
         let mut tx = self.pool.begin().await?;
-        // Pull the row + approver scope so we can authorise without a
-        // second round trip.
         let scope: Option<(String, Option<Uuid>, Option<String>)> = sqlx::query_as(
             "SELECT status, approver_user_id, approver_role \
              FROM ticket_approvals \
@@ -273,5 +297,51 @@ impl ApprovalsService {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Phase-1 wrappers: keep the existing ticket-only signatures
+    // compile-compatible so consumers that only know about tickets do
+    // not have to rewrite. New code should call the polymorphic
+    // `_for_entity` variants directly.
+    // ----------------------------------------------------------------
+
+    pub async fn list_for_ticket(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+    ) -> AppResult<Vec<ApprovalResponse>> {
+        self.list_for_entity(tenant_id, ApprovalTarget::Ticket, ticket_id)
+            .await
+    }
+
+    /// PMS-470: phase-1 ticket-only create wrapper. Confirms the
+    /// ticket exists in the caller's tenant (mirrors the pre-phase-2
+    /// guard) before delegating to the generic
+    /// `create_for_entity(Ticket, ticket_id)`.
+    pub async fn create(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        requested_by_id: Uuid,
+        req: CreateApprovalRequest,
+    ) -> AppResult<ApprovalResponse> {
+        let ticket_owned: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM tickets WHERE id = $1 AND tenant_id = $2")
+                .bind(ticket_id)
+                .bind(tenant_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if ticket_owned.is_none() {
+            return Err(AppError::NotFound("Ticket not found".into()));
+        }
+        self.create_for_entity(
+            tenant_id,
+            ApprovalTarget::Ticket,
+            ticket_id,
+            requested_by_id,
+            req,
+        )
+        .await
     }
 }
