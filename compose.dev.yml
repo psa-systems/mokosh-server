@@ -132,7 +132,8 @@ services:
       POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
       POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
       # PMS-285: passwords for the split request-serving roles, provisioned by
-      # the entrypoint below so `just dev` boots with RLS active at runtime.
+      # scripts/pg-init.sh (mounted into /docker-entrypoint-initdb.d below) on
+      # first volume init so `just dev` boots with RLS active at runtime.
       MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}
       MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:-mokosh_app_dev}
       # Postgres 18 changed the default PGDATA from /var/lib/postgresql/
@@ -148,83 +149,17 @@ services:
       - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PG_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # PMS-488: RLS role split + untrusted-extension bootstrap. The postgres
+      # image runs this once on a fresh volume, as the superuser over the
+      # trusted local socket and before the TCP listener opens, so the roles
+      # and extensions exist before the server connects. See scripts/pg-init.sh
+      # for the rationale and the dropped password-drift behaviour.
+      - ./scripts/pg-init.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 10
-    # The postgres image only honours POSTGRES_PASSWORD on first
-    # volume init; subsequent runs against an existing volume keep
-    # whatever password was baked in originally. With dev volumes
-    # shared across session-rebuilds, that password regularly drifts
-    # from the current env value and the server fails to connect
-    # ("password authentication failed for user 'postgres'"). The
-    # entrypoint wrapper below runs the normal docker-entrypoint
-    # in the background, waits for the unix socket to come up
-    # (peer-trusted for the postgres user inside the container),
-    # idempotently `ALTER USER`s the password back to
-    # `$POSTGRES_PASSWORD`, then waits on the postgres process for
-    # the foreground. First-init paths still go through the standard
-    # docker-entrypoint flow; this only fixes the "existing volume,
-    # drifted password" case.
-    entrypoint:
-      - sh
-      - -c
-      - |
-        set -e
-        docker-entrypoint.sh postgres &
-        pg_pid=$$!
-        # Wait for the unix socket (not TCP) so the ALTER below
-        # uses peer-trust, sidestepping the very password we want
-        # to reset.
-        until pg_isready -U "$$POSTGRES_USER" -h /var/run/postgresql -q 2>/dev/null; do
-            sleep 1
-        done
-        psql -U "$$POSTGRES_USER" -h /var/run/postgresql -d "$$POSTGRES_DB" \
-            -c "ALTER USER \"$$POSTGRES_USER\" WITH PASSWORD '$$POSTGRES_PASSWORD'" \
-            || echo "[entrypoint] ALTER USER failed (socket not trust-mode?); continuing"
-        # PMS-285: provision the split DB roles idempotently. `mokosh_migrator`
-        # (BYPASSRLS) runs migrations/bootstrap; `mokosh_app` (NOBYPASSRLS) is
-        # the request-serving role. CREATE is allowed to fail on an existing
-        # role (|| true), then ALTER reconciles the password/attributes. The
-        # ALTER DEFAULT PRIVILEGES lines make every table the migrator creates
-        # in later migrations auto-grant to mokosh_app, so the order (provision
-        # before the server runs migrations) is what matters, not pre-existing
-        # tables. Peer-trusted via the unix socket, like the ALTER USER above.
-        P="psql -U $$POSTGRES_USER -h /var/run/postgresql -d $$POSTGRES_DB -q"
-        $$P -c "CREATE ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD '$$MOKOSH_MIGRATOR_PASSWORD'" 2>/dev/null || true
-        $$P -c "ALTER ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD '$$MOKOSH_MIGRATOR_PASSWORD'" || echo "[entrypoint] alter mokosh_migrator failed; continuing"
-        $$P -c "CREATE ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '$$MOKOSH_APP_PASSWORD'" 2>/dev/null || true
-        $$P -c "ALTER ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '$$MOKOSH_APP_PASSWORD'" || echo "[entrypoint] alter mokosh_app failed; continuing"
-        $$P -c "GRANT ALL ON SCHEMA public TO mokosh_migrator" || true
-        $$P -c "GRANT CONNECT ON DATABASE \"$$POSTGRES_DB\" TO mokosh_app" || true
-        $$P -c "GRANT USAGE ON SCHEMA public TO mokosh_app" || true
-        $$P -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mokosh_app" || true
-        $$P -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mokosh_app" || true
-        $$P -c "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO mokosh_app" || true
-        $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mokosh_app" || true
-        $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO mokosh_app" || true
-        $$P -c "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO mokosh_app" || true
-        # Pre-create the extensions the migrations need. The public-schema
-        # migrations want uuid-ossp + pg_trgm (migration 002); the mokosh-auth
-        # subsystem migrations also want citext + pgcrypto. These extensions are
-        # untrusted, so only a superuser can CREATE them; the unprivileged
-        # mokosh_migrator that runs both migration sets cannot. Every migration
-        # uses CREATE EXTENSION IF NOT EXISTS, so once they exist here the
-        # migration step is a no-op. Done as POSTGRES_USER (superuser) over the
-        # socket, like the role provisioning above.
-        $$P -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"" || echo "[entrypoint] create extension uuid-ossp failed; continuing"
-        $$P -c "CREATE EXTENSION IF NOT EXISTS pg_trgm" || echo "[entrypoint] create extension pg_trgm failed; continuing"
-        $$P -c "CREATE EXTENSION IF NOT EXISTS citext" || echo "[entrypoint] create extension citext failed; continuing"
-        $$P -c "CREATE EXTENSION IF NOT EXISTS pgcrypto" || echo "[entrypoint] create extension pgcrypto failed; continuing"
-        # The mokosh-auth bootstrap (which runs as mokosh_migrator, see
-        # main.rs try_bootstrap_sso -> migrator_pool) does CREATE SCHEMA
-        # mokosh_auth. CREATE SCHEMA needs the CREATE privilege on the database,
-        # which a plain BYPASSRLS role lacks; grant it so the auth schema and
-        # its tables are created + owned by mokosh_migrator.
-        $$P -c "GRANT CREATE ON DATABASE \"$$POSTGRES_DB\" TO mokosh_migrator" || echo "[entrypoint] grant create-on-db to mokosh_migrator failed; continuing"
-        echo "[entrypoint] mokosh_migrator / mokosh_app roles provisioned"
-        wait "$$pg_pid"
 
   # Mailpit captures every outgoing email locally. mokosh-server points
   # SMTP_HOST=mailpit in the dev env (see the server service below); the
@@ -268,7 +203,8 @@ services:
       # cross-tenant workers; MOKOSH_APP_DATABASE_URL connects as the
       # unprivileged `mokosh_app` (NOBYPASSRLS) used for every request-serving
       # query, so a forgotten `WHERE tenant_id` filter fail-closes to zero rows.
-      # Both roles are provisioned by the postgres service entrypoint.
+      # Both roles are provisioned by the postgres initdb.d script
+      # (scripts/pg-init.sh) on first volume init.
       DATABASE_URL: postgres://mokosh_migrator:${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
       MOKOSH_APP_DATABASE_URL: postgres://mokosh_app:${MOKOSH_APP_PASSWORD:-mokosh_app_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
 
