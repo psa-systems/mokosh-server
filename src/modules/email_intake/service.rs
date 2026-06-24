@@ -10,8 +10,8 @@ use base64::Engine;
 use rand::RngCore;
 
 use super::models::{
-    CreateIntakeTokenRequest, CreatedIntakeTokenResponse, EmailIntakeRequest, EmailIntakeResponse,
-    IntakeTokenResponse,
+    CreateIntakeTokenRequest, CreatedIntakeTokenResponse, EmailIntakeLogResponse,
+    EmailIntakeRequest, EmailIntakeResponse, IntakeTokenResponse,
 };
 use crate::modules::auth::TenantId;
 use crate::modules::tickets::TicketService;
@@ -97,6 +97,21 @@ impl EmailIntakeService {
         tenant_id: TenantId,
         req: EmailIntakeRequest,
     ) -> AppResult<EmailIntakeResponse> {
+        // PMS-469: log the raw payload BEFORE any matching so even a
+        // hard error has an audit row to debug from. The row id is
+        // threaded into `intake_inner` and UPDATEd at the tail with
+        // `ticket_id` (success) or `error` (failure).
+        let log_id = self.record_intake_log(tenant_id, &req).await?;
+        let result = self.intake_inner(tenant_id, &req).await;
+        self.finalise_intake_log(log_id, &result).await?;
+        result
+    }
+
+    async fn intake_inner(
+        &self,
+        tenant_id: TenantId,
+        req: &EmailIntakeRequest,
+    ) -> AppResult<EmailIntakeResponse> {
         // Step 1: dedup.
         if let Some((id, number)) = self.find_by_message_id(tenant_id, &req.message_id).await? {
             return Ok(EmailIntakeResponse {
@@ -105,37 +120,54 @@ impl EmailIntakeService {
                 created: false,
                 deduplicated: true,
                 threaded: false,
+                comment_added: false,
             });
         }
-        // Step 2: thread by References / In-Reply-To.
+        // Step 2: thread by References / In-Reply-To. PMS-469 phase 2:
+        // when we hit, append the body as a `public` note on the
+        // matched ticket attributed (via `created_by_contact_id`) to
+        // the resolved sender contact. The note's `created_by_id`
+        // (NOT NULL FK on users) falls back to a tenant admin -
+        // email-intake has no agent identity, so attribution mirrors
+        // the create path's "first active admin" pattern.
         if !req.references.is_empty() {
             if let Some((id, number)) = self.find_by_references(tenant_id, &req.references).await? {
+                let resolved_contact = self
+                    .resolve_or_create_contact(tenant_id, req)
+                    .await
+                    .ok()
+                    .flatten();
+                let comment_added = if let Some((contact_id, _)) = resolved_contact {
+                    self.append_reply_comment(tenant_id, id, contact_id, req)
+                        .await
+                        .is_ok()
+                } else {
+                    false
+                };
                 return Ok(EmailIntakeResponse {
                     ticket_id: id,
                     ticket_number: number,
                     created: false,
                     deduplicated: false,
                     threaded: true,
+                    comment_added,
                 });
             }
         }
-        // Step 3: contact lookup (case-insensitive). Email-intake has
-        // no portal-like identity to associate the ticket with; the
-        // From: address is the only signal.
-        let from = req.from_email.to_lowercase();
-        let contact_row: Option<(Uuid, Uuid)> = sqlx::query_as(
-            "SELECT id, company_id FROM contacts \
-             WHERE tenant_id = $1 AND lower(email) = $2 LIMIT 1",
-        )
-        .bind(tenant_id)
-        .bind(&from)
-        .fetch_optional(&self.pool)
-        .await?;
-        let (contact_id, company_id) = contact_row.ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "No contact found for from_email='{from}'; the sender must exist as a tenant contact before email-intake can create a ticket",
-            ))
-        })?;
+        // Step 3: contact lookup (case-insensitive) + PMS-469 auto-
+        // create fallback. The Phase 1 posture (422 on unknown sender)
+        // is preserved when no fallback company is configured; when
+        // the `email_intake/default_company_id` setting is set, a new
+        // contact is inserted under that company before the create.
+        let (contact_id, company_id) = self
+            .resolve_or_create_contact(tenant_id, req)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "No contact found for from_email='{from}'; the sender must exist as a tenant contact before email-intake can create a ticket. Configure tenant_settings(email_intake/default_company_id) to auto-create contacts under a fallback company.",
+                    from = req.from_email.to_lowercase(),
+                ))
+            })?;
         // Step 4: creator (first admin/manager). Mirrors the portal
         // ticket path - the FK on `tickets.created_by_id` is NOT NULL
         // and email-intake has no agent identity to attribute to.
@@ -156,7 +188,7 @@ impl EmailIntakeService {
         // prologue carries the From: display name + address so the
         // agent reading the ticket immediately knows who sent it,
         // even when the contact record is missing fields.
-        let description = build_description(&req);
+        let description = build_description(req);
         let create_req = mokosh_types::tickets::CreateTicketRequest {
             title: req.subject.clone(),
             description: Some(description),
@@ -195,6 +227,7 @@ impl EmailIntakeService {
                 created: true,
                 deduplicated: false,
                 threaded: false,
+                comment_added: false,
             }),
             Err(e) => {
                 // The partial unique index on (tenant_id,
@@ -215,12 +248,182 @@ impl EmailIntakeService {
                             created: false,
                             deduplicated: true,
                             threaded: false,
+                            comment_added: false,
                         });
                     }
                 }
                 Err(e)
             }
         }
+    }
+
+    /// PMS-469: contact lookup that auto-creates when the per-tenant
+    /// `email_intake/default_company_id` setting is configured. Returns
+    /// `Ok(Some((contact_id, company_id)))` on lookup-or-create,
+    /// `Ok(None)` when the setting is unset AND no existing contact
+    /// matches. Errors surface only on SQL failures.
+    async fn resolve_or_create_contact(
+        &self,
+        tenant_id: TenantId,
+        req: &EmailIntakeRequest,
+    ) -> AppResult<Option<(Uuid, Uuid)>> {
+        let from = req.from_email.to_lowercase();
+        let existing: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT id, company_id FROM contacts \
+             WHERE tenant_id = $1 AND lower(email) = $2 LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(&from)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(pair) = existing {
+            return Ok(Some(pair));
+        }
+        let default_company = crate::modules::settings::read_email_intake_default_company(
+            &self.pool,
+            tenant_id.get(),
+        )
+        .await?;
+        let Some(company_id) = default_company else {
+            return Ok(None);
+        };
+        let (first, last) = split_display_name(req.from_name.as_deref());
+        let contact_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO contacts \
+                 (id, tenant_id, company_id, first_name, last_name, email, contact_type) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'primary')",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(first)
+        .bind(last)
+        .bind(&from)
+        .execute(&self.pool)
+        .await?;
+        Ok(Some((contact_id, company_id)))
+    }
+
+    /// PMS-469: append the reply body to the matched ticket as a
+    /// `note_type='public'` row attributed to the sender contact.
+    /// `created_by_id` (NOT NULL FK on users) falls back to the
+    /// tenant's first active admin/manager - email-intake has no
+    /// agent identity. The SPA renders Customer when
+    /// `created_by_contact_id IS NOT NULL`, so the attribution is
+    /// surfaced even though a user row also hangs off the note.
+    async fn append_reply_comment(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        contact_id: Uuid,
+        req: &EmailIntakeRequest,
+    ) -> AppResult<()> {
+        let creator: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users \
+             WHERE tenant_id = $1 AND status = 'active' \
+               AND role IN ('super_admin', 'admin', 'manager') \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(creator) = creator else {
+            return Err(AppError::Configuration(
+                "Cannot append reply comment: tenant has no admin/manager user to attribute to"
+                    .into(),
+            ));
+        };
+        let content = req
+            .body_text
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("(reply body empty)");
+        sqlx::query(
+            "INSERT INTO ticket_notes \
+                 (tenant_id, ticket_id, note_type, content, created_by_id, created_by_contact_id) \
+             VALUES ($1, $2, 'public', $3, $4, $5)",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(content)
+        .bind(creator)
+        .bind(contact_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// PMS-469: insert the `email_intake_log` row at the top of the
+    /// flow with the raw payload. The row is later UPDATEd via
+    /// `finalise_intake_log` with `ticket_id` (success) or `error`
+    /// (failure) so an admin filter by `ticket_id IS NULL` plus
+    /// `error IS NOT NULL` surfaces the recent failures.
+    async fn record_intake_log(
+        &self,
+        tenant_id: TenantId,
+        req: &EmailIntakeRequest,
+    ) -> AppResult<Uuid> {
+        let log_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO email_intake_log \
+                 (tenant_id, message_id, raw_headers, raw_body_text, raw_body_html) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(tenant_id)
+        .bind(&req.message_id)
+        .bind(&req.raw_headers)
+        .bind(req.body_text.as_deref())
+        .bind(req.body_html.as_deref())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(log_id)
+    }
+
+    /// PMS-469: settle the in-flight log row. On success, stamp
+    /// `ticket_id`. On failure, stamp `error` (truncated to fit the
+    /// TEXT column safely). Best-effort: a failed UPDATE here is
+    /// logged but does NOT mask the original intake outcome.
+    async fn finalise_intake_log(
+        &self,
+        log_id: Uuid,
+        result: &AppResult<EmailIntakeResponse>,
+    ) -> AppResult<()> {
+        let (ticket_id, error): (Option<Uuid>, Option<String>) = match result {
+            Ok(resp) => (Some(resp.ticket_id), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let r = sqlx::query("UPDATE email_intake_log SET ticket_id = $1, error = $2 WHERE id = $3")
+            .bind(ticket_id)
+            .bind(error)
+            .bind(log_id)
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = r {
+            tracing::warn!(?e, %log_id, "failed to finalise email_intake_log row");
+        }
+        Ok(())
+    }
+
+    /// PMS-469: read one log row for the admin GET endpoint. Tenant-
+    /// scoped so an admin cannot read another tenant's log even with
+    /// a guessed UUID.
+    pub async fn get_intake_log(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<EmailIntakeLogResponse> {
+        let row: Option<IntakeLogRow> = sqlx::query_as(
+            "SELECT id, tenant_id, message_id, ticket_id, raw_headers, \
+                    raw_body_text, raw_body_html, received_at, error \
+             FROM email_intake_log \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Into::into)
+            .ok_or(AppError::NotFound("EmailIntakeLog".into()))
     }
 
     async fn find_by_message_id(
@@ -391,6 +594,52 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+/// Split a `From: "First Last" <addr>` display name into a
+/// (first_name, last_name) pair for the auto-create contact path.
+/// Empty / whitespace-only inputs fall back to ("Contact", "")
+/// because `contacts.first_name` is NOT NULL.
+fn split_display_name(raw: Option<&str>) -> (String, String) {
+    let trimmed = raw.map(|s| s.trim()).unwrap_or("");
+    if trimmed.is_empty() {
+        return ("Contact".into(), String::new());
+    }
+    match trimmed.split_once(' ') {
+        Some((first, rest)) if !rest.trim().is_empty() => {
+            (first.to_string(), rest.trim().to_string())
+        }
+        _ => (trimmed.to_string(), String::new()),
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct IntakeLogRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    message_id: String,
+    ticket_id: Option<Uuid>,
+    raw_headers: serde_json::Value,
+    raw_body_text: Option<String>,
+    raw_body_html: Option<String>,
+    received_at: DateTime<Utc>,
+    error: Option<String>,
+}
+
+impl From<IntakeLogRow> for EmailIntakeLogResponse {
+    fn from(r: IntakeLogRow) -> Self {
+        Self {
+            id: r.id,
+            tenant_id: r.tenant_id,
+            message_id: r.message_id,
+            ticket_id: r.ticket_id,
+            raw_headers: r.raw_headers,
+            raw_body_text: r.raw_body_text,
+            raw_body_html: r.raw_body_html,
+            received_at: r.received_at,
+            error: r.error,
+        }
+    }
 }
 
 fn is_unique_violation(err: &AppError) -> bool {

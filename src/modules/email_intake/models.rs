@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+/// Optional structured headers carried alongside the parsed fields.
+/// PMS-469: the email-intake log audit table persists these verbatim
+/// so a malformed sender can be debugged post-hoc without recovering
+/// the raw payload from the gateway side. Phase 1 ignored the field
+/// entirely; senders that omit it land an empty object.
+type RawHeaders = serde_json::Value;
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct EmailIntakeRequest {
     /// RFC 5322 Message-Id of the inbound email, headers included
@@ -37,11 +44,20 @@ pub struct EmailIntakeRequest {
     pub body_html: Option<String>,
     /// Concatenation of `In-Reply-To` + `References` headers. If any
     /// matches an existing ticket's `email_message_id`, the intake
-    /// treats this as a reply and returns the existing ticket
-    /// instead of creating a new one. Phase 2 will turn the reply
-    /// into a comment on that ticket.
+    /// treats this as a reply and (PMS-469) appends the body to that
+    /// ticket as a `note_type='public'` row attributed to the
+    /// matched sender contact.
     #[serde(default)]
     pub references: Vec<String>,
+    /// PMS-469: structured header bag persisted into `email_intake_log`
+    /// for debugging. Treated as opaque JSON; the gateway can ship
+    /// whatever subset is convenient. Defaults to `{}` when absent.
+    #[serde(default = "default_empty_object")]
+    pub raw_headers: RawHeaders,
+}
+
+fn default_empty_object() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,9 +73,32 @@ pub struct EmailIntakeResponse {
     pub deduplicated: bool,
     /// True when a `references` header matched a prior ticket's
     /// Message-Id and the intake was routed to that ticket as a
-    /// reply (Phase 1: returns the existing id; Phase 2: adds a
-    /// comment).
+    /// reply. PMS-469 phase 2 adds the reply as a public comment on
+    /// the matched ticket; see `comment_added` for whether the
+    /// comment actually landed.
     pub threaded: bool,
+    /// PMS-469: true when threading hit AND the reply body was
+    /// appended to the matched ticket as a `note_type='public'` row
+    /// attributed to the matched sender contact. False when threading
+    /// did not hit, or when no contact could be resolved for the
+    /// sender so the note had no Customer to attribute to.
+    #[serde(default)]
+    pub comment_added: bool,
+}
+
+/// PMS-469 phase 2: the audit row for one inbound email-intake. The
+/// admin GET /email-intake-log/{id} endpoint serialises one of these.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailIntakeLogResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub message_id: String,
+    pub ticket_id: Option<Uuid>,
+    pub raw_headers: serde_json::Value,
+    pub raw_body_text: Option<String>,
+    pub raw_body_html: Option<String>,
+    pub received_at: DateTime<Utc>,
+    pub error: Option<String>,
 }
 
 /// PMS-450 phase 2: admin-listable intake token. The plaintext is

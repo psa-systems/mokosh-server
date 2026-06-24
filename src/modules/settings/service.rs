@@ -354,3 +354,25 @@ pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> App
         .unwrap_or(24);
     Ok((hours as i32) * 60)
 }
+
+/// PMS-469: read the fallback `companies.id` that the email-intake
+/// service should use when auto-creating contacts for unknown
+/// senders. `Ok(None)` when unset (or malformed) - the caller treats
+/// that as "preserve the Phase 1 422-on-unknown-sender posture".
+/// Reads off a `PgPool` so the email-intake flow does not have to
+/// thread its outer connection through.
+pub async fn read_email_intake_default_company(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+) -> AppResult<Option<Uuid>> {
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'email_intake' AND key = 'default_company_id'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(value
+        .and_then(|v| v.as_str().map(str::to_string))
+        .and_then(|s| Uuid::parse_str(&s).ok()))
+}

@@ -18,8 +18,8 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::models::{
-    CreateIntakeTokenRequest, CreatedIntakeTokenResponse, EmailIntakeRequest, EmailIntakeResponse,
-    IntakeTokenResponse,
+    CreateIntakeTokenRequest, CreatedIntakeTokenResponse, EmailIntakeLogResponse,
+    EmailIntakeRequest, EmailIntakeResponse, IntakeTokenResponse,
 };
 use super::service::EmailIntakeService;
 use crate::modules::auth::{RequireAdmin, RequireAuth};
@@ -42,6 +42,10 @@ pub fn email_intake_routes(service: EmailIntakeService) -> Router {
         // create tickets as anyone in this tenant".
         .route("/intake-tokens", get(list_tokens).post(create_token))
         .route("/intake-tokens/{id}", axum::routing::delete(revoke_token))
+        // PMS-469: admin-only audit-log read. The row is written by
+        // every email-intake call regardless of outcome so the admin
+        // can debug "gateway sent the email, no ticket appeared".
+        .route("/email-intake-log/{id}", get(get_intake_log))
         .with_state(state)
 }
 
@@ -120,6 +124,25 @@ async fn revoke_token(
         )
         .await?;
     Ok(Json(serde_json::json!({ "revoked": true })))
+}
+
+/// `GET /api/v1/email-intake-log/{id}`. Admin-only. Returns the
+/// audit row for one inbound intake (raw headers + body, the
+/// resulting ticket id if any, the error string if the flow failed).
+async fn get_intake_log(
+    State(s): State<EmailIntakeRouterState>,
+    RequireAuth(u): RequireAuth,
+    _admin: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<EmailIntakeLogResponse>> {
+    let row = s
+        .service
+        .get_intake_log(
+            crate::modules::auth::TenantId::from_trusted(u.tenant_id),
+            id,
+        )
+        .await?;
+    Ok(Json(row))
 }
 
 /// Pull `Authorization: Bearer <token>` out of the request headers
