@@ -342,6 +342,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     scheduler.register(calendar_reminder_worker, std::time::Duration::from_secs(60));
+
+    // PMS-478: scheduled-report worker. Ticks every 60s; the cadence
+    // matches the cron-expression granularity (cron crate parses
+    // minute-level fields, so a sub-minute tick adds nothing). The
+    // worker enqueues `email` notifications which the dispatcher
+    // (5s tick) flushes to SMTP.
+    let scheduled_reports_worker =
+        mokosh_server::modules::saved_reports::ScheduledReportsWorker::new(
+            db.clone(),
+            std::sync::Arc::new(
+                mokosh_server::modules::saved_reports::SavedReportsService::new(db.pool().clone()),
+            ),
+        );
+    scheduler.register(scheduled_reports_worker, std::time::Duration::from_secs(60));
     let _scheduler_handles = scheduler.start();
 
     let psa_router = create_api_router(
