@@ -45,3 +45,47 @@ pub struct UpdateSavedDashboardRequest {
     /// row to true). Omitted: untouched.
     pub is_default: Option<bool>,
 }
+
+/// PMS-471: one scheduled delivery for a saved dashboard. The owner
+/// (`user_id`) is the visibility identity for the materialise call,
+/// and the default recipient when `recipient_email` is null.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledDashboardResponse {
+    pub id: Uuid,
+    pub dashboard_id: Uuid,
+    pub user_id: Uuid,
+    pub cron_expr: String,
+    pub channel: String,
+    pub recipient_email: Option<String>,
+    pub is_active: bool,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateScheduledDashboardRequest {
+    #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]
+    pub cron_expr: String,
+    /// Override the owning user's email as the delivery target. Null
+    /// = deliver to the owner's `users.email`.
+    #[validate(email, length(max = 255))]
+    pub recipient_email: Option<String>,
+    #[serde(default = "default_true_active")]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateScheduledDashboardRequest {
+    #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]
+    pub cron_expr: Option<String>,
+    #[validate(email, length(max = 255))]
+    pub recipient_email: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+fn default_true_active() -> bool {
+    true
+}

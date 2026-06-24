@@ -356,6 +356,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
     scheduler.register(scheduled_reports_worker, std::time::Duration::from_secs(60));
+
+    // PMS-471: scheduled-dashboard worker. Same shape as the
+    // scheduled-report worker above but ranges over `scheduled_dashboards`
+    // and renders a text snapshot of the dashboard layout.
+    let scheduled_dashboards_worker =
+        mokosh_server::modules::dashboards::ScheduledDashboardsWorker::new(
+            db.clone(),
+            std::sync::Arc::new(mokosh_server::modules::dashboards::DashboardsService::new(
+                db.pool().clone(),
+            )),
+        );
+    scheduler.register(
+        scheduled_dashboards_worker,
+        std::time::Duration::from_secs(60),
+    );
     let _scheduler_handles = scheduler.start();
 
     let psa_router = create_api_router(
