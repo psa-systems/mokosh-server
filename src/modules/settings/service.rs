@@ -400,3 +400,27 @@ pub async fn read_ci_impact_max_depth(
         .map(|n| n.clamp(1, 10) as u32)
         .unwrap_or(5))
 }
+
+/// Read the per-tenant cycle cap for mutating workflow rules on
+/// transition triggers (`workflows/rule_max_depth`, PMS-467). Defaults
+/// to 3 when the row is absent; clamps to 1..=10 defensively in case a
+/// row predates the validator. Takes a raw `PgConnection` so the
+/// workflow executor can read it from inside its own transaction
+/// without nesting a second `begin_with_tenant` (which would deadlock
+/// on the `app.current_tenant` GUC SET).
+pub async fn read_workflow_rule_max_depth(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: Uuid,
+) -> AppResult<u32> {
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'workflows' AND key = 'rule_max_depth'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 10) as u32)
+        .unwrap_or(3))
+}

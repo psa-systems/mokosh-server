@@ -150,6 +150,14 @@ pub fn validate_setting_value(
             Some(n) if (1..=10).contains(&n) => Ok(()),
             _ => Err(bad("value", "expected an integer in 1..=10")),
         },
+        // PMS-467: cycle cap for mutating workflow rules on transition
+        // triggers. 1 disables nested rule firing entirely; the upper
+        // bound is 10 so a typo cannot let a tenant DOS itself with a
+        // status-flipping rule. Default is 3 when unset.
+        ("workflows", "rule_max_depth") => match value.as_u64() {
+            Some(n) if (1..=10).contains(&n) => Ok(()),
+            _ => Err(bad("value", "expected an integer in 1..=10")),
+        },
         // Unknown (category, key): accept with a warning so a future SPA
         // experiment doesn't require a server change before the
         // validator can be taught the shape.
