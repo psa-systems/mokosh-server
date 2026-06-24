@@ -4,10 +4,11 @@
 //! lifecycle events. Phase 1 ships `ticket.created` (with mutating
 //! actions: assign, reprioritise, tag, add internal note). Phase 2
 //! adds `ticket.status_changed` and `ticket.priority_changed`
-//! triggers; both LOG matching rules to `workflow_rule_runs` so the
-//! operator audit trail captures the firings. Mutating actions on
-//! transitions are scoped for Phase 3 once the SPA rule builder
-//! matures.
+//! triggers, log-only at first. PMS-467 / phase 3 promotes the
+//! transition triggers to mutating: `set_status_id` / `set_priority_id`
+//! actions cascade into the matching transition trigger at the next
+//! depth level, bounded by the per-tenant `workflows/rule_max_depth`
+//! cap (default 3).
 
 mod executor;
 mod models;
