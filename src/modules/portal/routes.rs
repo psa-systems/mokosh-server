@@ -133,11 +133,7 @@ async fn list_invoices(
     // KB feed note below for the full rationale).
     let (items, total) = state
         .billing
-        .list_invoices(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
-            &filter,
-            &pagination,
-        )
+        .list_invoices(contact.tenant(), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -161,10 +157,7 @@ async fn get_invoice(
     // (see KB feed note below). The company scope is enforced in code afterward.
     let invoice = state
         .billing
-        .get_invoice(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
-            invoice_id,
-        )
+        .get_invoice(contact.tenant(), invoice_id)
         .await?;
     if invoice.company_id != contact.company_id {
         return Err(crate::utils::error::AppError::NotFound(
@@ -192,11 +185,7 @@ async fn list_kb(
     // until the portal surface gets its own scoping pass.
     let (items, total) = state
         .kb
-        .list_portal_articles_for_company(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
-            contact.company_id,
-            &pagination,
-        )
+        .list_portal_articles_for_company(contact.tenant(), contact.company_id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -218,11 +207,7 @@ async fn get_ticket(
     // contact can only read its own company's ticket within its own tenant.
     let resp = state
         .tickets
-        .get_portal_ticket(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
-            contact.company_id,
-            ticket_id,
-        )
+        .get_portal_ticket(contact.tenant(), contact.company_id, ticket_id)
         .await?;
     Ok(Json(resp))
 }
@@ -238,11 +223,7 @@ async fn list_tickets(
     // contact's own company within its own tenant.
     let (tickets, total) = state
         .tickets
-        .list_portal_tickets(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
-            contact.company_id,
-            &pagination,
-        )
+        .list_portal_tickets(contact.tenant(), contact.company_id, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         tickets,
@@ -264,7 +245,7 @@ async fn create_ticket(
     let resp = state
         .tickets
         .create_portal_ticket(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.tenant(),
             contact.company_id,
             contact.id,
             request.title,
@@ -291,12 +272,7 @@ async fn list_ticket_notes(
     // from another company yields the same 404 a missing one would.
     let (notes, total) = state
         .tickets
-        .list_portal_ticket_notes(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
-            contact.company_id,
-            ticket_id,
-            &pagination,
-        )
+        .list_portal_ticket_notes(contact.tenant(), contact.company_id, ticket_id, &pagination)
         .await?;
     let responses: Vec<TicketNoteResponse> = notes
         .into_iter()
@@ -331,7 +307,7 @@ async fn create_ticket_note(
     let note = state
         .tickets
         .create_portal_ticket_note(
-            crate::modules::auth::TenantId::from_trusted(contact.tenant_id),
+            contact.tenant(),
             contact.company_id,
             contact.id,
             ticket_id,

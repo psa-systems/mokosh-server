@@ -2007,26 +2007,11 @@ impl TicketService {
             description,
             priority_id,
             type_id,
-            category_id: None,
-            queue_id: None,
             source: TicketSource::Portal,
             company_id,
             contact_id: Some(contact_id),
-            site_id: None,
-            assigned_to_id: None,
-            team_id: None,
-            contract_id: None,
-            sla_id: None,
-            scheduled_start: None,
-            scheduled_end: None,
-            estimated_hours: None,
             is_billable: false,
-            asset_id: None,
-            custom_fields: serde_json::Value::Null,
-            tags: vec![],
-            source_kb_article_id: None,
-            email_message_id: None,
-            email_thread_id: None,
+            ..Default::default()
         };
         // Portal flow has no AuditCtx extractor (portal auth identity is a
         // `contacts` row, not a `users` row); attribute to the system actor.

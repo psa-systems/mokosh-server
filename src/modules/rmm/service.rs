@@ -774,28 +774,12 @@ impl RmmService {
             let req = CreateTicketRequest {
                 title: title.clone(),
                 description: Some(description.clone()),
-                priority_id: None,
-                type_id: None,
-                category_id: None,
                 queue_id: rule.queue_id,
                 source: TicketSource::Rmm,
                 company_id,
-                contact_id: None,
-                site_id: None,
                 assigned_to_id: rule.assign_to_id,
-                team_id: None,
-                contract_id: None,
-                sla_id: None,
-                scheduled_start: None,
-                scheduled_end: None,
-                estimated_hours: None,
                 is_billable: false,
-                asset_id: None,
-                custom_fields: serde_json::json!({}),
-                tags: vec![],
-                source_kb_article_id: None,
-                email_message_id: None,
-                email_thread_id: None,
+                ..Default::default()
             };
             // RMM ingest is a background path (no AuditCtx extractor);
             // attribute the auto-created ticket to the system actor.

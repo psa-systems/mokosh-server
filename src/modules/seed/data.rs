@@ -12,7 +12,7 @@ use mokosh_types::contacts::{
     CompanyStatus, CompanyType, ContactType, CreateCompanyRequest, CreateContactRequest,
     PreferredContactMethod,
 };
-use mokosh_types::tickets::{CreateTicketRequest, TicketSource};
+use mokosh_types::tickets::CreateTicketRequest;
 
 /// The sample client company. Names are obviously-fake so an operator can
 /// tell demo rows from real data at a glance.
@@ -122,28 +122,11 @@ pub fn demo_tickets(company_id: Uuid, contact_id: Uuid) -> Vec<CreateTicketReque
         .map(|(title, description)| CreateTicketRequest {
             title: title.to_string(),
             description: Some(description.to_string()),
-            priority_id: None,
-            type_id: None,
-            category_id: None,
-            queue_id: None,
-            source: TicketSource::default(),
             company_id,
             contact_id: Some(contact_id),
-            site_id: None,
-            assigned_to_id: None,
-            team_id: None,
-            contract_id: None,
-            sla_id: None,
-            scheduled_start: None,
-            scheduled_end: None,
-            estimated_hours: None,
             is_billable: true,
-            asset_id: None,
-            custom_fields: serde_json::Value::Null,
             tags: vec!["demo".to_string()],
-            source_kb_article_id: None,
-            email_message_id: None,
-            email_thread_id: None,
+            ..Default::default()
         })
         .collect()
 }

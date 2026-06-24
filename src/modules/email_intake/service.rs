@@ -192,28 +192,12 @@ impl EmailIntakeService {
         let create_req = mokosh_types::tickets::CreateTicketRequest {
             title: req.subject.clone(),
             description: Some(description),
-            priority_id: None,
-            type_id: None,
-            category_id: None,
-            queue_id: None,
             source: mokosh_types::tickets::TicketSource::Email,
             company_id,
             contact_id: Some(contact_id),
-            site_id: None,
-            assigned_to_id: None,
-            team_id: None,
-            contract_id: None,
-            sla_id: None,
-            scheduled_start: None,
-            scheduled_end: None,
-            estimated_hours: None,
             is_billable: false,
-            asset_id: None,
-            custom_fields: serde_json::Value::Null,
-            tags: vec![],
-            source_kb_article_id: None,
             email_message_id: Some(req.message_id.clone()),
-            email_thread_id: None,
+            ..Default::default()
         };
         let ctx = crate::modules::audit::AuditCtx::system(tenant_id.get());
         match self

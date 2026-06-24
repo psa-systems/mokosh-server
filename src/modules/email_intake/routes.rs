@@ -22,7 +22,7 @@ use super::models::{
     EmailIntakeRequest, EmailIntakeResponse, IntakeTokenResponse,
 };
 use super::service::EmailIntakeService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::RequireAdminUser;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -75,8 +75,7 @@ async fn intake(
 /// audit + revoke.
 async fn list_tokens(
     State(s): State<EmailIntakeRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
 ) -> AppResult<Json<Vec<IntakeTokenResponse>>> {
     let rows = s
         .service
@@ -92,8 +91,7 @@ async fn list_tokens(
 /// this" copy.
 async fn create_token(
     State(s): State<EmailIntakeRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Json(req): Json<CreateIntakeTokenRequest>,
 ) -> AppResult<Json<CreatedIntakeTokenResponse>> {
     req.validate().map_err(AppError::from)?;
@@ -113,8 +111,7 @@ async fn create_token(
 /// token and when".
 async fn revoke_token(
     State(s): State<EmailIntakeRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
     s.service
@@ -131,8 +128,7 @@ async fn revoke_token(
 /// resulting ticket id if any, the error string if the flow failed).
 async fn get_intake_log(
     State(s): State<EmailIntakeRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<EmailIntakeLogResponse>> {
     let row = s

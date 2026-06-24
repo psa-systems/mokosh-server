@@ -15,7 +15,7 @@ use super::models::{
     WorkflowRuleRunResponse,
 };
 use super::service::WorkflowsService;
-use crate::modules::auth::{RequireAdmin, RequireAuth};
+use crate::modules::auth::RequireAdminUser;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -47,16 +47,14 @@ pub fn workflow_routes(service: WorkflowsService) -> Router {
 
 async fn list(
     State(s): State<WorkflowsRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
 ) -> AppResult<Json<Vec<WorkflowRuleResponse>>> {
     Ok(Json(s.service.list(u.tenant_id).await?))
 }
 
 async fn get_one(
     State(s): State<WorkflowsRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<WorkflowRuleResponse>> {
     Ok(Json(s.service.get(u.tenant_id, id).await?))
@@ -64,8 +62,7 @@ async fn get_one(
 
 async fn create(
     State(s): State<WorkflowsRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Json(req): Json<CreateWorkflowRuleRequest>,
 ) -> AppResult<Json<WorkflowRuleResponse>> {
     req.validate().map_err(AppError::from)?;
@@ -74,8 +71,7 @@ async fn create(
 
 async fn update(
     State(s): State<WorkflowsRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateWorkflowRuleRequest>,
 ) -> AppResult<Json<WorkflowRuleResponse>> {
@@ -85,8 +81,7 @@ async fn update(
 
 async fn delete_one(
     State(s): State<WorkflowsRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
     s.service.delete(u.tenant_id, id).await?;
@@ -98,8 +93,7 @@ async fn delete_one(
 /// surfacing which rule fired indirectly reveals them.
 async fn list_ticket_runs(
     State(s): State<WorkflowsRouterState>,
-    RequireAuth(u): RequireAuth,
-    _admin: RequireAdmin,
+    RequireAdminUser(u): RequireAdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<WorkflowRuleRunResponse>>> {
     Ok(Json(

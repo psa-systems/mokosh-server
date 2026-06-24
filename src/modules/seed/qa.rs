@@ -795,13 +795,9 @@ fn qa_ticket(
         title: format!("{QA_PREFIX}#{:02} {}", i + 1, titles[i % titles.len()]),
         description: Some("QA walkthrough seed ticket. Demonstrates list/filter/sort.".to_string()),
         priority_id,
-        type_id: None,
-        category_id: None,
-        queue_id: None,
         source: sources[i % sources.len()],
         company_id,
         contact_id: Some(contact_id),
-        site_id: None,
         // Assign roughly two thirds of tickets so the "unassigned" filter has
         // rows too.
         assigned_to_id: if i.is_multiple_of(3) {
@@ -809,19 +805,10 @@ fn qa_ticket(
         } else {
             Some(user_id)
         },
-        team_id: None,
-        contract_id: None,
-        sla_id: None,
-        scheduled_start: None,
-        scheduled_end: None,
         estimated_hours: Some(1.0 + (i % 4) as f64),
         is_billable: i.is_multiple_of(2),
-        asset_id: None,
-        custom_fields: serde_json::Value::Null,
         tags: vec![QA_TAG.to_string()],
-        source_kb_article_id: None,
-        email_message_id: None,
-        email_thread_id: None,
+        ..Default::default()
     }
 }
 
