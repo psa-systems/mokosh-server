@@ -142,6 +142,14 @@ pub fn validate_setting_value(
                 "expected a UUID string referencing companies.id",
             )),
         },
+        // PMS-475: per-tenant ceiling for the CI impact-graph
+        // traversal. Hard server-side cap is 10; the validator
+        // accepts the same range so a typo cannot blow the query
+        // plan. Default is 5 when the row is absent.
+        ("ci", "impact_max_depth") => match value.as_u64() {
+            Some(n) if (1..=10).contains(&n) => Ok(()),
+            _ => Err(bad("value", "expected an integer in 1..=10")),
+        },
         // Unknown (category, key): accept with a warning so a future SPA
         // experiment doesn't require a server change before the
         // validator can be taught the shape.

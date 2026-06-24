@@ -376,3 +376,27 @@ pub async fn read_email_intake_default_company(
         .and_then(|v| v.as_str().map(str::to_string))
         .and_then(|s| Uuid::parse_str(&s).ok()))
 }
+
+/// PMS-475: read the per-tenant ceiling for the CI impact-graph
+/// traversal (`ci/impact_max_depth`). Defaults to 5 when the row is
+/// absent; clamps to 1..=10 defensively so a row that predates the
+/// validator cannot blow the query plan. The route handler applies
+/// the caller-supplied `depth` query param as a separate upper
+/// bound, so the effective walk depth is
+/// `min(query_depth, this_setting, hard_ceiling)`.
+pub async fn read_ci_impact_max_depth(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: Uuid,
+) -> AppResult<u32> {
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'ci' AND key = 'impact_max_depth'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 10) as u32)
+        .unwrap_or(5))
+}

@@ -195,6 +195,40 @@ pub struct CreateAssetRelationshipRequest {
     pub relationship_type: String,
 }
 
+/// PMS-475: one node in the CI impact-graph response. The route
+/// flattens upstream + downstream edges into the same shape so the
+/// SPA renders them with a uniform card without branching on
+/// direction. `parent_asset_id` is the "upstream side" of the edge
+/// (the asset the child depends on / is hosted by / is connected
+/// to), and `asset_id` is the resolved-from side - which one is the
+/// root asset varies with `direction`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetImpactNode {
+    pub asset_id: Uuid,
+    pub name: String,
+    pub parent_asset_id: Uuid,
+    pub child_asset_id: Uuid,
+    pub relationship_type: String,
+    /// "upstream" | "downstream". `both` direction returns nodes
+    /// from each half stamped with their own discriminator.
+    pub direction: String,
+    /// 1 = direct neighbour of the root, growing by one per hop.
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetImpactResponse {
+    /// The asset that the traversal anchored on.
+    pub root_asset_id: Uuid,
+    /// Effective depth applied to the walk after clamping the
+    /// caller's `depth` query param against the per-tenant
+    /// `ci/impact_max_depth` setting and the hard server ceiling
+    /// (10). Surfaced so the SPA can render "truncated at depth N".
+    pub depth: u32,
+    pub direction: String,
+    pub nodes: Vec<AssetImpactNode>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigurationItemResponse {
     pub id: Uuid,
