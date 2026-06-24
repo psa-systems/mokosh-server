@@ -1,14 +1,19 @@
-//! PMS-453 (Phase 1): saved dashboards.
+//! PMS-453: saved dashboards + scheduled delivery.
 //!
-//! Per-user dashboard definitions: a name + a JSONB `layout` blob the
-//! SPA reads to know which widgets to mount and in what positions.
-//! Phase 2 (scheduled report delivery) is parked as a follow-up under
-//! the same ticket; it needs a separate `scheduled_reports` table plus
-//! a worker, and the work doesn't need to land in the same PR.
+//! Phase 1 shipped per-user dashboard definitions (`saved_dashboards`).
+//! Phase 2b (PMS-471) adds the scheduled-delivery surface: a user can
+//! mark a saved dashboard "deliver this weekly to my email" and a
+//! background worker materialises a snapshot at the cron tick,
+//! handing an `email` row to the existing notifications
+//! DispatcherWorker for SMTP send + retry. The SPA widget render
+//! (phase 2a) is in flight separately; the worker's "materialise"
+//! step today is a text summary that gets richer once 2a lands.
 
 mod models;
 mod routes;
 mod service;
+pub mod worker;
 
 pub use routes::{dashboard_routes, DashboardsRouterState};
 pub use service::DashboardsService;
+pub use worker::ScheduledDashboardsWorker;
