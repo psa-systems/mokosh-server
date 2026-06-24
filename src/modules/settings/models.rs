@@ -130,6 +130,18 @@ pub fn validate_setting_value(
             Some(n) if (1..=24).contains(&n) => Ok(()),
             _ => Err(bad("value", "expected an integer in 1..=24")),
         },
+        // PMS-469: company-id used to land a contact auto-created when an
+        // unknown-sender intake arrives. Unset (or NULL) preserves the
+        // Phase 1 "unknown sender => 422" posture. The companies row
+        // itself is validated by the email_intake service at use time;
+        // here we only check the value shape.
+        ("email_intake", "default_company_id") => match value.as_str() {
+            Some(s) if Uuid::parse_str(s).is_ok() => Ok(()),
+            _ => Err(bad(
+                "value",
+                "expected a UUID string referencing companies.id",
+            )),
+        },
         // Unknown (category, key): accept with a warning so a future SPA
         // experiment doesn't require a server change before the
         // validator can be taught the shape.
