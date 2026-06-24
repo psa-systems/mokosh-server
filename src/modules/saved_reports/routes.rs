@@ -12,7 +12,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::models::{CreateSavedReportRequest, SavedReportResponse, UpdateSavedReportRequest};
-use super::service::{ReportScope, SavedReportsService};
+use super::service::{ExecuteReportResponse, ReportScope, SavedReportsService};
 use crate::modules::auth::RequireAuth;
 use crate::utils::error::{AppError, AppResult};
 
@@ -31,7 +31,28 @@ pub fn saved_reports_routes(service: SavedReportsService) -> Router {
             "/reports/saved/{id}",
             get(get_one).patch(update).delete(delete_one),
         )
+        // PMS-477: execute a saved report. POST (not GET) because
+        // execution is not cacheable and the SPA will eventually
+        // POST overrides on the URL-shape blob; ?page=&per_page=
+        // overrides stay on the query string for sharable pagination
+        // links.
+        .route("/reports/saved/{id}/execute", axum::routing::post(execute))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ExecuteQuery {
+    #[serde(default = "default_page")]
+    page: u32,
+    #[serde(default = "default_per_page")]
+    per_page: u32,
+}
+
+fn default_page() -> u32 {
+    1
+}
+fn default_per_page() -> u32 {
+    100
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -106,4 +127,23 @@ async fn delete_one(
 ) -> AppResult<Json<serde_json::Value>> {
     s.service.delete(u.tenant_id, u.id, id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+/// PMS-477: execute the saved report and return the materialised
+/// rows. The service's `get` step enforces the per-user visibility
+/// rule (author OR shared), so a caller cannot execute a private
+/// report they did not author. Compiler errors (unsupported entity,
+/// unknown column, malformed filter value) surface as 400 naming
+/// the offender.
+async fn execute(
+    State(s): State<SavedReportsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(id): Path<Uuid>,
+    Query(q): Query<ExecuteQuery>,
+) -> AppResult<Json<ExecuteReportResponse>> {
+    let resp = s
+        .service
+        .execute(u.tenant_id, u.id, id, q.page, q.per_page)
+        .await?;
+    Ok(Json(resp))
 }
