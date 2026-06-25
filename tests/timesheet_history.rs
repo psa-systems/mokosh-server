@@ -26,14 +26,15 @@ fn tenant() -> TenantId {
 }
 
 fn page() -> PaginationParams {
-    // `PaginationParams::default()` zeroes `per_page` (Rust's `Default`
-    // bypasses the serde `default_per_page` of 25), and the service
-    // clamps `per_page` to `[1, 100]` - so a `..Default::default()`
-    // here would silently `LIMIT 1` and the multi-row assertions
-    // below would only see the newest week. Spell the values out.
+    // `PaginationParams` derives `Default`, so `::default()` yields
+    // `per_page = 0`; `per_page()` then clamps that to 1, capping the
+    // listing at `LIMIT 1`. The serde defaults (page=1, per_page=25)
+    // only fire when deserializing a query string, not here, so build
+    // a full page explicitly. Without this the `status=all` range
+    // assertion below silently sees only the newest week.
     PaginationParams {
         page: 1,
-        per_page: 25,
+        per_page: 100,
         sort: None,
         sort_dir: "desc".to_string(),
     }
