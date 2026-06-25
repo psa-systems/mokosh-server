@@ -3,6 +3,8 @@
 //! Core service desk functionality for issue tracking and resolution.
 
 #[cfg(feature = "server")]
+pub mod attachments;
+#[cfg(feature = "server")]
 mod automation;
 mod models;
 #[cfg(feature = "server")]
@@ -10,6 +12,10 @@ mod routes;
 #[cfg(feature = "server")]
 mod service;
 
+#[cfg(feature = "server")]
+pub use attachments::{
+    agent_attachment_routes, portal_attachment_routes, AttachmentConfig, AttachmentService,
+};
 #[cfg(feature = "server")]
 pub use automation::AutomationEngine;
 pub use models::*;

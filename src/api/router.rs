@@ -40,7 +40,10 @@ use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
 use crate::modules::tenants::{tenant_routes, TenantService};
-use crate::modules::tickets::{contact_notes_routes, ticket_routes, TicketService};
+use crate::modules::tickets::{
+    agent_attachment_routes, contact_notes_routes, portal_attachment_routes, ticket_routes,
+    AttachmentConfig, AttachmentService, TicketService,
+};
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::modules::workflows::{workflow_routes, WorkflowsService};
 use crate::version::VersionInfo;
@@ -228,6 +231,13 @@ pub fn create_api_router(
         .nest("/contacts", contact_routes(contact_service.clone()))
         // Ticketing
         .nest("/tickets", ticket_routes(ticket_service.clone()))
+        // PMS-483: ticket-note attachment upload / download / delete.
+        // Merged at the top level so its `/tickets/{id}/notes/...`
+        // path nests cleanly under the existing ticket tree.
+        .merge(agent_attachment_routes(AttachmentService::new(
+            db.pool().clone(),
+            AttachmentConfig::from_env(),
+        )))
         // PMS-468: agent "all comments from this contact" feed. The
         // route lives on the tickets module (TicketService owns the
         // notes surface) but mounts at the top level so its path
@@ -350,6 +360,13 @@ pub fn create_api_router(
             portal_kb_service,
             portal_billing_service,
         ))
+        // PMS-483: portal-side ticket-note attachments. Same routes as
+        // the agent surface, but behind `RequirePortalAuth` and
+        // company-scoped via the contact's authenticated `company_id`.
+        .merge(portal_attachment_routes(AttachmentService::new(
+            db.pool().clone(),
+            AttachmentConfig::from_env(),
+        )))
         // PMS-298: same envelope normalization for the portal surface.
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
