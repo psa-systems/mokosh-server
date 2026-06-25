@@ -17,6 +17,7 @@ The suite shares ONE E2E account and ONE tenant, and login is rate-limited to **
 | `preflight` | `tests/preflight.setup.ts` | none | Aggregates EVERY missing required env var into one fail-loud error before anything runs (`lib/env.ts::preflightRequiredEnv`). A misconfigured CI names all gaps in one round trip instead of dying one var at a time. |
 | `setup` | `tests/global.setup.ts` | logs in ONCE | Drives the SPA login in a real browser (TOTP-aware), captures the bunyip-issued bearer to `.auth/token.txt`, the OP session cookies to `.auth/op-state.json`, and the cross-tenant canary id to `.auth/foreign-company.txt`. Depends on `preflight`. |
 | `auth-ui` | `tests/auth.spec.ts` | ANONYMOUS | Drives the SPA login form in a fresh browser and asserts on URL transitions (login leaves `/login`, logout returns to it). DOM-only, no API probe. Depends on `preflight`, NOT `setup` (its own login + logout must not invalidate the shared API token). Currently `test.fixme` (PMS-148). |
+| `form-ui` | `tests/form-validation.spec.ts` | ANONYMOUS | Browser-driven form-validation coverage (PMS-518 AC7): drives the SPA create forms and asserts every missing required field flags at once (per-field inline + banner) with no navigation. DOM-only (the FormGuard validation is client-side). Does its own `loginViaSpa`. Depends on `preflight`. Currently `test.fixme` (needs the FormGuard SPA deployed + PMS-148). |
 | `api` | `tests/{tickets,contacts,oidc,time-tracking,projects,billing,contracts,calendar,sla,assets,knowledge-base,notifications,settings,audit,reports,rmm,dispatch}.spec.ts` | request context | No browser. Bearer header for PSA-API specs, replayed OP cookies for `oidc.spec.ts`. Depends on `setup`. |
 
 When you add a spec file to the `api` project you MUST widen the `testMatch` regex in `playwright.config.ts`, or it silently never runs.
@@ -115,6 +116,7 @@ Runnable specs assert now; quarantined specs are `test.fixme` with their blocker
 | --- | --- | --- |
 | `tests/auth.spec.ts` (logout) | `test.fixme` | PMS-148: after the PMS-142 fix merged, post-merge CI exposed a separate failure where the auth-ui login deterministically stalls when run after `setup` finishes (submit click no-ops, URL stays on `/login`). Bunyip's BUNYIP-53 `/logout` fix IS deployed; this is a different problem. |
 | `tests/oidc.spec.ts` (OP token flow) | `test.fixme` | PMS-435 / BUNYIP-146: the diagnostic run proved `bunyip_op_session` is captured, persisted on the right domain, and replayed, yet `/oauth2/authorize` still 302s to `/login` with no `state`. Root cause is bunyip's `COOKIE_DOMAIN` / `bunyip_op_session` scoping, not an e2e forwarding defect. Un-fixme when BUNYIP-146 ships. |
+| `tests/form-validation.spec.ts` (PMS-518 / AC7) | `test.fixme` | Needs BOTH: (1) the target's mokosh-apps SPA to include the PMS-518 `FormGuard` migration (merged to mokosh-apps `main` AND staging redeployed - on an older SPA the assertions fail), and (2) the browser-login path green (shares `loginViaSpa`, blocked by the PMS-148 stall). Un-fixme once both hold. |
 
 The PSA-API specs (tickets, contacts, and the 14 PMS-155 module specs) run and assert.
 
