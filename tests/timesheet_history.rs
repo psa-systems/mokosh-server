@@ -26,7 +26,17 @@ fn tenant() -> TenantId {
 }
 
 fn page() -> PaginationParams {
-    PaginationParams::default()
+    // `PaginationParams::default()` zeroes `per_page` (Rust's `Default`
+    // bypasses the serde `default_per_page` of 25), and the service
+    // clamps `per_page` to `[1, 100]` - so a `..Default::default()`
+    // here would silently `LIMIT 1` and the multi-row assertions
+    // below would only see the newest week. Spell the values out.
+    PaginationParams {
+        page: 1,
+        per_page: 25,
+        sort: None,
+        sort_dir: "desc".to_string(),
+    }
 }
 
 async fn seeded_work_type(pool: &PgPool) -> Uuid {
