@@ -13,21 +13,23 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // driving the page, not an API request context. It exercises the deployed
 // mokosh-apps SPA on the target environment.
 //
-// PMS-519 verification status: the PMS-521 consent fix landed, so `setup` and
-// this spec's shared `loginViaSpa` now log in (the OP consent screen is
-// clicked through). The first un-fixme run (#364 / run 2528) still failed
-// here - the `Create Ticket` button never appeared on `/tickets/new` - but the
-// spec carried NO diagnostics, so the failure mode (did the page bounce back to
-// /login after the hard `goto` reboot of the WASM app? did it render an OLD SPA
-// without the FormGuard build? did the button name differ?) was invisible. fj
-// cannot download the Playwright trace artifact, so the diagnostics are folded
-// INTO the thrown error (`attachPageDiagnostics`) the way `auth.spec.ts` does -
-// the next run's log carries the currentUrl + urlTrail + request list.
+// NAVIGATION MUST BE IN-APP (router link clicks), NOT `page.goto`. A hard
+// `goto('/tickets/new')` reboots the WASM app, which wipes the in-memory bearer;
+// the app then silently re-auths from the persisted OP cookies and its
+// `/auth/callback` lands on the DEFAULT route (`/dashboard`), dropping the
+// deep-linked path entirely. PMS-519 run 2531 proved this: after
+// `goto('/tickets/new')` the page sat on `/dashboard` and `Create Ticket` never
+// appeared. Clicking the sidebar + list-page router `Link`s keeps the single
+// WASM instance alive, so the bearer survives and the requested route renders.
+// (The deep-link-drops-route behaviour is a separate SPA bug, tracked apart
+// from this spec.)
 //
-// `auth.spec.ts` is re-`fixme`'d (its remaining red is the PMS-148 logout
-// redirect, a separate bug) so this spec runs ALONE in the `form-ui` project:
-// that drops the suite back to two logins (setup + form-ui), well under the
-// 5/min/email cap that rate-limited the earlier two-spec run's retry.
+// `attachPageDiagnostics` folds the URL trail + request list into any thrown
+// error - fj cannot download the Playwright trace artifact, so this is the only
+// way to see the failure mode in CI logs. `auth.spec.ts` is `test.fixme` (its
+// remaining red is the PMS-148 logout redirect), so this spec runs ALONE in the
+// `form-ui` project: two logins total (setup + form-ui), under the 5/min/email
+// cap.
 test.describe('form validation (PMS-518 / AC7)', () => {
   // ONE test, ONE login. The suite is rate-limited to 5 logins/min/email
   // (src/modules/auth/routes.rs); `setup` already spends one, so both forms are
@@ -39,11 +41,14 @@ test.describe('form validation (PMS-518 / AC7)', () => {
       await loginViaSpa(page);
 
       // --- new-ticket: an empty submit flags every required field at once ---
-      // A hard `goto` reboots the WASM SPA; wait for it to settle (it silently
-      // re-auths from the persisted OP cookies) before asserting on the form.
-      await page.goto('/tickets/new');
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      await page.getByRole('button', { name: 'Create Ticket', exact: true }).click();
+      // In-app nav: sidebar Tickets -> list "New Ticket" -> the create form.
+      // `.first()` guards against the list page rendering the New-Ticket
+      // affordance twice (header action + empty-state CTA).
+      await page.locator('a[href="/tickets"]').first().click();
+      await page.locator('a[href="/tickets/new"]').first().click();
+      const createTicket = page.getByRole('button', { name: 'Create Ticket', exact: true });
+      await createTicket.waitFor({ state: 'visible', timeout: 15_000 });
+      await createTicket.click();
 
       // The PMS-514/518 fix: every missing required field reports together -
       // Title and Description in their own inline slots, Company in the
@@ -64,9 +69,11 @@ test.describe('form validation (PMS-518 / AC7)', () => {
       await expect(page.getByText('Description is required.')).toBeVisible();
 
       // --- new-contact: an empty submit flags both name fields at once ---
-      await page.goto('/contacts/new');
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      await page.getByRole('button', { name: 'Create Contact', exact: true }).click();
+      await page.locator('a[href="/contacts"]').first().click();
+      await page.locator('a[href="/contacts/new"]').first().click();
+      const createContact = page.getByRole('button', { name: 'Create Contact', exact: true });
+      await createContact.waitFor({ state: 'visible', timeout: 15_000 });
+      await createContact.click();
 
       // First and Last name each get their own inline error (PMS-518 split the
       // old single shared "First and last name are required." banner message).
