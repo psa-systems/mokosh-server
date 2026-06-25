@@ -38,7 +38,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
-use crate::modules::portal::middleware::RequirePortalAuth;
+use crate::modules::portal::{
+    portal_auth_middleware, PortalAuthMiddleware, PortalAuthService, RequirePortalAuth,
+};
 use crate::utils::error::{AppError, AppResult};
 
 /// Default size cap when `ATTACHMENT_MAX_BYTES` is unset. 25 MiB
@@ -397,10 +399,24 @@ pub fn agent_attachment_routes(service: AttachmentService) -> Router {
         .with_state(state)
 }
 
-pub fn portal_attachment_routes(service: AttachmentService) -> Router {
+pub fn portal_attachment_routes(
+    service: AttachmentService,
+    portal_auth_service: PortalAuthService,
+) -> Router {
     let state = AttachmentsRouterState {
         service: Arc::new(service),
     };
+    // PMS-483 follow-up: the portal sub-router's `RequirePortalAuth`
+    // extractor relies on the `portal_auth_middleware` layer to decode
+    // the Bearer token and stash the resulting `CurrentContact` into
+    // request extensions. `portal_routes` applies that layer to its
+    // own routes; merging this router into the portal tree does NOT
+    // inherit it (layers are per-Router in axum), so without spelling
+    // it out here every portal upload / list / download / delete
+    // would 401 before reaching the handler. Build the same middleware
+    // off a separate `PortalAuthService` clone (cheap - the service is
+    // pool + jwt_secret) and layer it onto this sub-router.
+    let mw = PortalAuthMiddleware::new(portal_auth_service);
     Router::new()
         .route(
             "/tickets/{ticket_id}/notes/{note_id}/attachments",
@@ -411,6 +427,10 @@ pub fn portal_attachment_routes(service: AttachmentService) -> Router {
             get(download_portal).delete(delete_portal),
         )
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            mw,
+            portal_auth_middleware,
+        ))
 }
 
 async fn list_agent(

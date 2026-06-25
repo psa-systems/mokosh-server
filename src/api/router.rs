@@ -349,6 +349,11 @@ pub fn create_api_router(
     // so this surface runs its own auth middleware (mounted inside
     // `portal_routes`) and never sees `AuthMiddleware` / `AuthState`.
     let portal_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
+    // PMS-483: `portal_attachment_routes` needs its own clone of the
+    // service so it can build the same `portal_auth_middleware` layer
+    // independently (the layer is per-Router in axum, not inherited
+    // from the merged-into parent).
+    let portal_attachment_auth_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
     let portal_ticket_service = TicketService::new(db.clone());
     let portal_kb_service = KbService::new(db.clone());
     let portal_billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
@@ -363,10 +368,14 @@ pub fn create_api_router(
         // PMS-483: portal-side ticket-note attachments. Same routes as
         // the agent surface, but behind `RequirePortalAuth` and
         // company-scoped via the contact's authenticated `company_id`.
-        .merge(portal_attachment_routes(AttachmentService::new(
-            db.pool().clone(),
-            AttachmentConfig::from_env(),
-        )))
+        // The portal auth middleware is layered inside this builder
+        // because `.merge` does NOT inherit the parent router's layers
+        // - without that, every portal upload would 401 before the
+        // handler.
+        .merge(portal_attachment_routes(
+            AttachmentService::new(db.pool().clone(), AttachmentConfig::from_env()),
+            portal_attachment_auth_service,
+        ))
         // PMS-298: same envelope normalization for the portal surface.
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
