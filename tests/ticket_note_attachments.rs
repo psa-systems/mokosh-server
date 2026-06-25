@@ -119,10 +119,17 @@ async fn seed_contact(pool: &PgPool, company_id: Uuid) -> (Uuid, String, String)
 }
 
 async fn portal_login(app: &common::TestApp, email: &str, password: &str) -> String {
+    // `PortalLoginRequest` requires `tenant_slug` because `contacts.email`
+    // is only unique within a tenant (`src/modules/portal/models.rs`).
+    // The default tenant seeded in migration 002 has slug "default".
     let resp = app
         .client
         .post(app.url("/api/v1/portal/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({
+            "tenant_slug": "default",
+            "email": email,
+            "password": password,
+        }))
         .send()
         .await
         .expect("portal login");
