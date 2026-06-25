@@ -71,6 +71,12 @@ pub enum AppError {
     #[error("File error: {0}")]
     File(String),
 
+    /// Request body too large. 413 Payload Too Large; used by the
+    /// PMS-483 attachment upload surface to reject oversize blobs
+    /// before they hit disk.
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
     /// Email error
     #[error("Email error: {0}")]
     Email(String),
@@ -178,6 +184,7 @@ impl AppError {
             Self::Email(_) => 500,
             Self::Payment(_) => 402,
             Self::Integration(_) => 502,
+            Self::PayloadTooLarge(_) => 413,
         }
     }
 
@@ -201,6 +208,7 @@ impl AppError {
             Self::Email(_) => "EMAIL_ERROR",
             Self::Payment(_) => "PAYMENT_ERROR",
             Self::Integration(_) => "INTEGRATION_ERROR",
+            Self::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
         }
     }
 }
