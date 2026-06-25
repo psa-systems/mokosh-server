@@ -53,20 +53,46 @@ export async function loginViaSpa(page: Page): Promise<void> {
     await fillTotpStep(page);
   }
 
-  // The SPA + hub navigate fully out of the /login path family on success.
-  // Match anything that starts with /login (not just `/login` or `/login/`)
-  // so multi-step flows like `/login/2fa`, `/login/mfa`, `/login/recovery`,
-  // etc are still treated as IN the login flow. A previous CI run got past
-  // a narrower check while sitting on `/login/2fa` and then thrashed for
-  // 30s trying to capture a bearer that no successful login had produced.
-  await expect
-    .poll(() => new URL(page.url()).pathname, {
-      timeout: 30_000,
-      message:
-        'SPA login never navigated away from the /login flow ' +
-        '(still on /login, /login/2fa, /login/mfa, or similar)',
-    })
-    .not.toMatch(/^\/login(\/|$)/);
+  // The SPA + hub navigate fully out of the /login path family on success - but
+  // the OP first routes the post-2FA authorize through `/oauth2/consent` when the
+  // E2E account has un-granted scopes (PMS-521: `profile` is in the request and
+  // the account had not consented to it, so authorize 302s to consent and loops
+  // forever, the token exchange never fires, and setup captures no bearer). Click
+  // Allow there so the grant is POSTed and persists server-side; subsequent
+  // authorize calls then skip consent and the SPA completes login. Mirrors
+  // bunyip's e2e `driveConsent` and `bunyip-web/src/handlers/consent.rs` (the
+  // Allow control is `button[name="action"][value="allow"]`).
+  //
+  // Match anything under /login (multi-step flows like /login/2fa, /login/mfa,
+  // /login/recovery) as STILL in the login flow. A previous CI run got past a
+  // narrower check while sitting on /login/2fa and thrashed for 30s capturing a
+  // bearer no successful login had produced.
+  const deadline = Date.now() + 30_000;
+  let lastPath = '';
+  for (;;) {
+    lastPath = new URL(page.url()).pathname;
+    if (/^\/oauth2\/consent(\/|$)/.test(lastPath)) {
+      const allow = page
+        .locator('button[name="action"][value="allow"]')
+        .or(page.getByRole('button', { name: /^(allow|authorize|approve)$/i }))
+        .first();
+      await allow.click({ timeout: 10_000 }).catch(() => {});
+      await page.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => {});
+      continue;
+    }
+    if (!/^\/login(\/|$)/.test(lastPath)) {
+      return; // out of /login and past any consent -> in the app
+    }
+    if (Date.now() > deadline) {
+      break;
+    }
+    await page.waitForTimeout(250);
+  }
+  throw new Error(
+    'SPA login never navigated away from the /login or /oauth2/consent flow ' +
+      `(30s timeout; last path: ${lastPath}). If stuck on /oauth2/consent the ` +
+      'Allow control may have moved - check bunyip-web/src/handlers/consent.rs.',
+  );
 }
 
 // Compute the current TOTP code from E2E_TOTP_SECRET (RFC 6238, 30s window,
