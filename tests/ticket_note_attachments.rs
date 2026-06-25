@@ -77,6 +77,22 @@ async fn seed_ticket_and_note(pool: &PgPool, admin_id: Uuid, company_id: Uuid) -
     (ticket_id, note_id)
 }
 
+/// Insert a uniquely-named company on the default tenant. The shared
+/// `common::seed_company` helper hard-codes "Acme Co" and trips the
+/// per-tenant `(tenant_id, lower(name))` unique index when called
+/// twice in the same test, so the cross-company test rolls its own.
+async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed company");
+    id
+}
+
 async fn seed_contact(pool: &PgPool, company_id: Uuid) -> (Uuid, String, String) {
     let id = Uuid::new_v4();
     let email = format!("portal-{id}@example.com");
@@ -233,8 +249,8 @@ async fn oversize_upload_returns_413(pool: PgPool) {
 async fn portal_upload_visible_to_agent_blocked_for_sibling(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
-    let company_a = common::seed_company(&pool).await;
-    let company_b = common::seed_company(&pool).await;
+    let company_a = seed_company_named(&pool, "Acme Alpha").await;
+    let company_b = seed_company_named(&pool, "Beta Industries").await;
     let (ticket_id, note_id) = seed_ticket_and_note(&pool, admin_id, company_a).await;
     let (contact_a_id, contact_a_email, contact_a_pw) = seed_contact(&pool, company_a).await;
     let (_contact_b_id, contact_b_email, contact_b_pw) = seed_contact(&pool, company_b).await;
