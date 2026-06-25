@@ -12,16 +12,15 @@ import { loginViaSpa } from '../lib/login';
 // driving the page, not an API request context. It exercises the deployed
 // mokosh-apps SPA on the target environment.
 //
-// QUARANTINED (`test.describe.fixme`) until BOTH hold:
-//   1. The target's mokosh-apps SPA includes the FormGuard migration (PMS-518
-//      merged to mokosh-apps `main` AND staging has redeployed that build). On an
-//      older SPA these assertions fail - the old forms either short-circuit to a
-//      single error or never validate. Confirm the served SPA bundle is at/after
-//      the PMS-518 merges (see the `[setup] spaBundles` diagnostic).
-//   2. The browser-driven SPA login path is green. `auth.spec.ts` is currently
-//      `test.fixme` for the PMS-148 post-setup login stall, and this spec shares
-//      that `loginViaSpa`. Un-fixme once PMS-148 is resolved and (1) has landed.
-test.describe.fixme('form validation (PMS-518 / AC7)', () => {
+// Un-fixme'd in PMS-519 now that its two preconditions are believed met: (1) the
+// PMS-518 FormGuard migration is fully merged to mokosh-apps `main` (so staging
+// serves it after its redeploy), and (2) PMS-148 (the post-`setup` browser-login
+// stall this spec's `loginViaSpa` shares) is resolved. If the CI run against
+// staging shows a login stall, PMS-148 has regressed; if it shows the OLD
+// single-error / no-validation behaviour, the staging SPA has not yet redeployed
+// the FormGuard build (check the `[setup] spaBundles` diagnostic) - re-`fixme`
+// either way and re-open the relevant blocker.
+test.describe('form validation (PMS-518 / AC7)', () => {
   // ONE test, ONE login. The suite is rate-limited to 5 logins/min/email
   // (src/modules/auth/routes.rs) and `setup` + `auth-ui` already spend logins,
   // so both forms are exercised in a single test rather than a login-per-test

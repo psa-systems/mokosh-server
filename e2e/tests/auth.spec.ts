@@ -25,9 +25,14 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // auth-ui project's login deterministically stalls when run after the
 // `setup` project finishes: the form submit click no-op's (no POST in
 // the request log), URL stuck at the hub `/login`. Setup's login in the
-// same run succeeds. Tracking the diagnostic-first plan in PMS-148.
+// same run succeeds.
+//
+// PMS-519: PMS-148 is now marked Done, so this is un-fixme'd to confirm the
+// post-`setup` login stall is actually gone on staging (the same precondition
+// the form-validation spec needs). If this run stalls again, PMS-148 has
+// regressed - re-`fixme` here and re-open PMS-148.
 test.describe('auth login / session', () => {
-  test.fixme('login + logout round-trip', async ({ page }) => {
+  test('login + logout round-trip', async ({ page }) => {
     const diag = attachPageDiagnostics(page);
 
     try {
