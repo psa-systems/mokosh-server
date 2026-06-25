@@ -60,6 +60,19 @@ export default defineConfig({
       dependencies: ['preflight'],
       use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
     },
+    // 2b. Browser-driven form-validation coverage (PMS-518 AC7). Drives the SPA
+    //     create forms and asserts the per-field inline errors / no-navigation
+    //     behaviour. Like auth-ui it does its own SPA login and asserts on the
+    //     DOM (the validation is client-side, never reaching an API). Depends on
+    //     `preflight` only so a misconfigured CI fails clean. The spec is
+    //     currently `test.fixme` (see tests/form-validation.spec.ts for the
+    //     un-fixme conditions: staging serving the FormGuard SPA + PMS-148).
+    {
+      name: 'form-ui',
+      testMatch: /form-validation\.spec\.ts$/,
+      dependencies: ['preflight'],
+      use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
+    },
     // 3. Request-context API coverage. The lib/fixtures.ts custom `test`
     //    fixture loads the bearer token written by `setup` and attaches it
     //    via extraHTTPHeaders on every request. Uses the API host, not the
