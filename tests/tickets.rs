@@ -1353,3 +1353,107 @@ async fn ticket_team_scope_filter(pool: sqlx::PgPool) {
         "a team_id outside the caller's tenant must be rejected, got {status}"
     );
 }
+
+#[sqlx::test]
+async fn list_filters_by_contact_id(pool: PgPool) {
+    // MAPPS-311: the SQL builder previously ignored `filter.contact_id`,
+    // so the SPA's contact-detail "Recent Tickets" rail rendered every
+    // tenant ticket instead of the contact's. Pin the round-trip.
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+
+    // Two contacts under the same company; only contact_a will be linked
+    // to the ticket. contact_b is the negative case.
+    let contact_a = uuid::Uuid::new_v4();
+    let contact_b = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name) \
+         VALUES ($1, $2, $3, 'Alice', 'Anchor'), ($4, $2, $3, 'Bob', 'Backup')",
+    )
+    .bind(contact_a)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(contact_b)
+    .execute(&pool)
+    .await
+    .expect("seed contacts");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Ticket tied to contact_a.
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Printer offline",
+            "company_id": company_id,
+            "contact_id": contact_a,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket");
+    assert!(
+        create_resp.status().is_success(),
+        "create should 2xx; got {}",
+        create_resp.status()
+    );
+    let created: serde_json::Value = create_resp.json().await.expect("create json");
+    let ticket_id = created["id"].as_str().expect("ticket id").to_string();
+
+    let list_for = |contact: uuid::Uuid| {
+        let url = app.url(&format!("/api/v1/tickets?contact_id={contact}"));
+        let client = app.client.clone();
+        let token = token.clone();
+        async move {
+            client
+                .get(url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .expect("list tickets")
+                .json::<serde_json::Value>()
+                .await
+                .expect("list json")
+        }
+    };
+
+    // contact_a returns the ticket.
+    let body = list_for(contact_a).await;
+    let items_a = body["data"].as_array().expect("list data");
+    let got_a: Vec<&str> = items_a.iter().filter_map(|t| t["id"].as_str()).collect();
+    assert_eq!(
+        got_a,
+        vec![ticket_id.as_str()],
+        "contact_a filter must return only the linked ticket; got {got_a:?}"
+    );
+
+    // contact_b returns nothing.
+    let body = list_for(contact_b).await;
+    let items_b = body["data"].as_array().expect("list data");
+    assert!(
+        items_b.is_empty(),
+        "contact_b filter must return no rows; got {items_b:?}"
+    );
+
+    // No filter at all returns the ticket (so we know the dataset is non-empty).
+    let no_filter: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list all")
+        .json()
+        .await
+        .expect("list all json");
+    let items_all = no_filter["data"].as_array().expect("list data");
+    assert!(
+        items_all
+            .iter()
+            .any(|t| t["id"].as_str() == Some(ticket_id.as_str())),
+        "unfiltered list must include the seeded ticket"
+    );
+}

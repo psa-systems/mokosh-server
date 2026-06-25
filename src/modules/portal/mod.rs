@@ -12,7 +12,7 @@ pub mod models;
 pub mod routes;
 pub mod service;
 
-pub use middleware::{portal_auth_middleware, RequirePortalAuth};
+pub use middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 pub use models::*;
 pub use routes::portal_routes;
 pub use service::PortalAuthService;

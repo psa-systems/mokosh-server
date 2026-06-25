@@ -205,7 +205,8 @@ tempfile = "3"
 # login JSON body and attach it via `.bearer_auth(&token)` on each call,
 # so no cookie jar is required (the legacy AuthMiddleware authenticates
 # from `Authorization: Bearer ...`, not from a cookie).
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# `multipart` is on for the PMS-483 attachment-upload integration tests.
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
 # Drive #[sqlx::test] from this crate's test binaries. The macro reads
 # DATABASE_URL and provisions a fresh database per test invocation. The
 # `rust_decimal` feature lets test fixtures bind `Decimal` money columns
