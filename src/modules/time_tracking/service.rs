@@ -548,6 +548,45 @@ impl TimeTrackingService {
         filter: &TimesheetFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TimesheetSummaryResponse>, u64)> {
+        // PMS-506: validate the status filter once up front so a
+        // malformed query parameter 422s before the SQL even builds.
+        let status_filter = match filter.status.as_deref().map(str::trim) {
+            None | Some("") | Some("all") => None,
+            Some("pending") => Some("pending"),
+            Some("approved") => Some("approved"),
+            Some("rejected") => Some("rejected"),
+            Some(other) => {
+                return Err(AppError::BadRequest(format!(
+                    "unknown timesheet status filter `{other}`; expected one of pending | approved | rejected | all",
+                )));
+            }
+        };
+
+        // PMS-506: resolve the date span. `from`/`to` (Monday-aligned
+        // inclusive range) override the legacy `week` field; missing
+        // `to` defaults to `from` so a single-week call still works.
+        // Cap the span at 26 weeks to keep the scan bounded.
+        const MAX_RANGE_WEEKS: i64 = 26;
+        let date_span = if let Some(from_anchor) = filter.from {
+            let from = monday_anchor(from_anchor);
+            let to_anchor = filter.to.unwrap_or(from_anchor);
+            let to = monday_anchor(to_anchor);
+            if to < from {
+                return Err(AppError::BadRequest(
+                    "`to` must be on or after `from`".to_string(),
+                ));
+            }
+            let span_weeks = (to - from).num_days() / 7 + 1;
+            if span_weeks > MAX_RANGE_WEEKS {
+                return Err(AppError::BadRequest(format!(
+                    "timesheet range capped at {MAX_RANGE_WEEKS} weeks; got {span_weeks}"
+                )));
+            }
+            Some((from, to))
+        } else {
+            None
+        };
+
         // Anchor week_start to Monday. Postgres DATE_TRUNC('week', ...)
         // does ISO week (Monday-start) by default.
         let mut conditions = vec!["tenant_id = $1".to_string()];
@@ -556,7 +595,17 @@ impl TimeTrackingService {
             conditions.push(format!("user_id = ${idx}"));
             idx += 1;
         }
-        if filter.week.is_some() {
+        if let Some((_, _)) = date_span {
+            // Inclusive range scan: `date >= from` AND
+            // `date < to + 7d` so the week that contains `to` is
+            // included.
+            conditions.push(format!(
+                "date >= ${idx}::date \
+                 AND date < (${}::date + INTERVAL '7 days')::date",
+                idx + 1
+            ));
+            idx += 2;
+        } else if filter.week.is_some() {
             conditions.push(format!(
                 "date >= DATE_TRUNC('week', ${idx}::date)::date \
                  AND date < (DATE_TRUNC('week', ${idx}::date) + INTERVAL '7 days')::date"
@@ -564,6 +613,29 @@ impl TimeTrackingService {
             idx += 1;
         }
         let where_clause = conditions.join(" AND ");
+        // HAVING filter on the rolled status. Cheaper than a subquery
+        // because the GROUP BY already exists; nothing to do when
+        // status_filter is None.
+        let having_clause = if status_filter.is_some() {
+            "HAVING CASE \
+                 WHEN BOOL_OR(approval_status = 'rejected') THEN 'rejected' \
+                 WHEN BOOL_AND(approval_status = 'approved') THEN 'approved' \
+                 WHEN BOOL_OR(approval_status = 'pending') THEN 'pending' \
+                 ELSE 'draft' \
+             END = $"
+                .to_string()
+                + &idx.to_string()
+        } else {
+            String::new()
+        };
+        let status_placeholder = if status_filter.is_some() {
+            let p = idx;
+            idx += 1;
+            Some(p)
+        } else {
+            None
+        };
+        let _ = status_placeholder; // already substituted into having_clause
         let limit_placeholder = idx;
         let offset_placeholder = idx + 1;
         let query = format!(
@@ -580,15 +652,30 @@ impl TimeTrackingService {
                     WHEN BOOL_AND(approval_status = 'approved') THEN 'approved'
                     WHEN BOOL_OR(approval_status = 'pending') THEN 'pending'
                     ELSE 'draft'
-                END AS approval_status
+                END AS approval_status,
+                -- PMS-506: surface the decision audit so the history
+                -- view can label "Approved by X on Y" / "Rejected
+                -- because Z". approve_week / reject_week run a single
+                -- UPDATE per week, so approved_at + approved_by_id +
+                -- rejection_reason are identical across the rolled
+                -- rows; take the most-recent non-NULL via ARRAY_AGG +
+                -- FILTER.
+                MAX(approved_at) AS decided_at,
+                (ARRAY_AGG(approved_by_id) FILTER (WHERE approved_by_id IS NOT NULL))[1]
+                    AS decided_by_id,
+                (ARRAY_AGG(rejection_reason) FILTER (
+                    WHERE rejection_reason IS NOT NULL AND rejection_reason <> ''
+                ))[1] AS rejection_reason
             FROM time_entries
             WHERE {where_clause}
             GROUP BY user_id, DATE_TRUNC('week', date)
+            {having_clause}
             ORDER BY week_start DESC, user_id
             LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}
             "#
         );
-        // Count distinct (user_id, week) groups matching the same WHERE.
+        // Count distinct (user_id, week) groups matching the same WHERE
+        // + HAVING.
         let count_query = format!(
             r#"
             SELECT COUNT(*) FROM (
@@ -596,6 +683,7 @@ impl TimeTrackingService {
                 FROM time_entries
                 WHERE {where_clause}
                 GROUP BY user_id, DATE_TRUNC('week', date)
+                {having_clause}
             ) AS s
             "#
         );
@@ -605,9 +693,18 @@ impl TimeTrackingService {
             q = q.bind(uid);
             cq = cq.bind(uid);
         }
-        if let Some(w) = filter.week {
+        if let Some((from, to)) = date_span {
+            // Bound to twice: the WHERE substitutes both `${idx}` (from)
+            // and `${idx+1}` (to) so each binding consumes one slot.
+            q = q.bind(from).bind(to);
+            cq = cq.bind(from).bind(to);
+        } else if let Some(w) = filter.week {
             q = q.bind(w);
             cq = cq.bind(w);
+        }
+        if let Some(s) = status_filter {
+            q = q.bind(s);
+            cq = cq.bind(s);
         }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q
@@ -887,6 +984,9 @@ impl TimeTrackingService {
         let filter = TimesheetFilter {
             user_id: Some(user_id),
             week: Some(anchor),
+            status: None,
+            from: None,
+            to: None,
         };
         // A single user_id+week pair yields at most one row; the default
         // pagination window is more than enough.
@@ -904,6 +1004,9 @@ impl TimeTrackingService {
                 billable_minutes: 0,
                 entry_count: 0,
                 approval_status: "draft".to_string(),
+                decided_by_id: None,
+                decided_at: None,
+                rejection_reason: None,
             }))
     }
 
@@ -1700,6 +1803,10 @@ struct TimesheetRow {
     billable_minutes: i64,
     entry_count: i64,
     approval_status: String,
+    // PMS-506: rolled decision audit. NULL on pending weeks.
+    decided_at: Option<chrono::DateTime<chrono::Utc>>,
+    decided_by_id: Option<Uuid>,
+    rejection_reason: Option<String>,
 }
 
 impl From<TimesheetRow> for TimesheetSummaryResponse {
@@ -1711,6 +1818,9 @@ impl From<TimesheetRow> for TimesheetSummaryResponse {
             billable_minutes: r.billable_minutes,
             entry_count: r.entry_count,
             approval_status: r.approval_status,
+            decided_by_id: r.decided_by_id,
+            decided_at: r.decided_at,
+            rejection_reason: r.rejection_reason,
         }
     }
 }

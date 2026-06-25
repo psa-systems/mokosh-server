@@ -203,12 +203,42 @@ pub struct TimesheetSummaryResponse {
     /// visibly distinct from a never-touched one. Add a `submitted` state
     /// post-M1 if approval needs a true draft/submitted boundary.
     pub approval_status: String,
+    /// PMS-506: user_id of the reviewer who decided the week (set on
+    /// approve_week / reject_week; NULL while pending). Approve and
+    /// reject both run a single UPDATE against every entry in the
+    /// week, so the reviewer id is identical across the rolled rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_id: Option<Uuid>,
+    /// PMS-506: timestamp the week was approved or rejected (NULL
+    /// while pending). Lets the history view label "Approved by X on Y".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// PMS-506: rejection reason carried through from
+    /// reject_week (NULL for approved / pending rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct TimesheetFilter {
     pub user_id: Option<Uuid>,
     pub week: Option<NaiveDate>,
+    /// PMS-506: rolled approval status filter. One of
+    /// `pending | approved | rejected | all`. Missing / `all` returns
+    /// every status. Validated server-side; unknown values are 422.
+    #[serde(default)]
+    #[validate(length(min = 1, max = 16))]
+    pub status: Option<String>,
+    /// PMS-506: inclusive Monday-aligned start of a multi-week range.
+    /// When `from` is set the `week` field is ignored and the scan
+    /// covers `[from, to]`. Server caps the span at 26 weeks.
+    #[serde(default)]
+    pub from: Option<NaiveDate>,
+    /// PMS-506: inclusive Monday-aligned end of a multi-week range.
+    /// When `to` is unset but `from` is, `to` defaults to `from`
+    /// (single-week behaviour). Server caps the span at 26 weeks.
+    #[serde(default)]
+    pub to: Option<NaiveDate>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
