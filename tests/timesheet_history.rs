@@ -26,7 +26,18 @@ fn tenant() -> TenantId {
 }
 
 fn page() -> PaginationParams {
-    PaginationParams::default()
+    // `PaginationParams` derives `Default`, so `::default()` yields
+    // `per_page = 0`; `per_page()` then clamps that to 1, capping the
+    // listing at `LIMIT 1`. The serde defaults (page=1, per_page=25)
+    // only fire when deserializing a query string, not here, so build
+    // a full page explicitly. Without this the `status=all` range
+    // assertion below silently sees only the newest week.
+    PaginationParams {
+        page: 1,
+        per_page: 100,
+        sort: None,
+        sort_dir: "desc".to_string(),
+    }
 }
 
 async fn seeded_work_type(pool: &PgPool) -> Uuid {
