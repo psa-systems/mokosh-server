@@ -1,12 +1,10 @@
-//! PMS-451 phase 1 + PMS-470 phase 2: HTTP routes for approvals.
+//! PMS-451 phase 1 + PMS-470 phase 2 + PMS-484: HTTP routes for approvals.
 //!
-//! Phase 1 mounted `/tickets/{ticket_id}/approvals`. Phase 2 keeps
-//! that path identical and adds `/time-entries/{entity_id}/approvals`
-//! (the only second parent table that exists today). Routes for
-//! `/change-requests/...` and `/quotes/...` are wired but skip the
-//! parent-existence check until those tables land - tracked under a
-//! follow-up ticket so the server side is ready when the schemas
-//! catch up.
+//! Phase 1 mounted `/tickets/{ticket_id}/approvals`. Phase 2 added
+//! `/time-entries/{entity_id}/approvals`. PMS-484 fleshes out the
+//! remaining two prefixes - `/change-requests/...` and `/quotes/...` -
+//! now that migration 078 ships the minimal `change_requests` and
+//! `quotes` parent tables `assert_parent_exists` needs.
 
 use std::sync::Arc;
 
@@ -41,14 +39,11 @@ pub fn approval_routes(service: ApprovalsService) -> Router {
             "/tickets/{ticket_id}/approvals",
             get(list_for_ticket).post(create_for_ticket),
         )
-        // PMS-470: polymorphic per-entity prefixes. The handler
-        // resolves the prefix into an `ApprovalTarget` and funnels
-        // into the same service surface. time_entries is the only
-        // non-ticket parent table that exists today; the
-        // change_request / quote handlers stay registered so the SPA
-        // can adopt the URL shape early, but the parent-existence
-        // check short-circuits to 501 until the parent tables land
-        // (tracked under the PMS-470 follow-up).
+        // PMS-470 + PMS-484: polymorphic per-entity prefixes. The
+        // handler resolves the prefix into an `ApprovalTarget` and
+        // funnels into the same service surface. All four parent
+        // tables (tickets, time_entries, change_requests, quotes) are
+        // live as of PMS-484 migration 078.
         .route(
             "/time-entries/{entity_id}/approvals",
             get(list_for_time_entry).post(create_for_time_entry),
@@ -124,50 +119,70 @@ async fn create_for_time_entry(
     Ok(Json(row))
 }
 
-/// PMS-470 follow-up: change_requests parent table does not exist
-/// yet. The route is mounted so the SPA can pin the URL shape but
-/// it returns 501 until the schema catches up.
+/// PMS-484: list approvals on a change_request. Tenant-scoped via the
+/// `change_requests` lookup so a guessed UUID returns 404 instead of
+/// an empty 200 (mirrors the ticket / time_entry route posture).
 async fn list_for_change_request(
-    State(_s): State<ApprovalsRouterState>,
-    RequireAuth(_u): RequireAuth,
-    Path(_entity_id): Path<Uuid>,
+    State(s): State<ApprovalsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(entity_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<ApprovalResponse>>> {
-    Err(AppError::BadRequest(
-        "change_requests parent table is not yet defined; tracked as a PMS-470 follow-up".into(),
-    ))
+    assert_parent_exists(&s, "change_requests", u.tenant_id, entity_id).await?;
+    let rows = s
+        .service
+        .list_for_entity(u.tenant_id, ApprovalTarget::ChangeRequest, entity_id)
+        .await?;
+    Ok(Json(rows))
 }
 
 async fn create_for_change_request(
-    State(_s): State<ApprovalsRouterState>,
-    RequireAuth(_u): RequireAuth,
-    Path(_entity_id): Path<Uuid>,
-    Json(_req): Json<CreateApprovalRequest>,
+    State(s): State<ApprovalsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(entity_id): Path<Uuid>,
+    Json(req): Json<CreateApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {
-    Err(AppError::BadRequest(
-        "change_requests parent table is not yet defined; tracked as a PMS-470 follow-up".into(),
-    ))
+    req.validate().map_err(AppError::from)?;
+    assert_parent_exists(&s, "change_requests", u.tenant_id, entity_id).await?;
+    let row = s
+        .service
+        .create_for_entity(
+            u.tenant_id,
+            ApprovalTarget::ChangeRequest,
+            entity_id,
+            u.id,
+            req,
+        )
+        .await?;
+    Ok(Json(row))
 }
 
-/// PMS-470 follow-up: same posture as change_requests.
+/// PMS-484: list approvals on a quote. Same posture as change_request.
 async fn list_for_quote(
-    State(_s): State<ApprovalsRouterState>,
-    RequireAuth(_u): RequireAuth,
-    Path(_entity_id): Path<Uuid>,
+    State(s): State<ApprovalsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(entity_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<ApprovalResponse>>> {
-    Err(AppError::BadRequest(
-        "quotes parent table is not yet defined; tracked as a PMS-470 follow-up".into(),
-    ))
+    assert_parent_exists(&s, "quotes", u.tenant_id, entity_id).await?;
+    let rows = s
+        .service
+        .list_for_entity(u.tenant_id, ApprovalTarget::Quote, entity_id)
+        .await?;
+    Ok(Json(rows))
 }
 
 async fn create_for_quote(
-    State(_s): State<ApprovalsRouterState>,
-    RequireAuth(_u): RequireAuth,
-    Path(_entity_id): Path<Uuid>,
-    Json(_req): Json<CreateApprovalRequest>,
+    State(s): State<ApprovalsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Path(entity_id): Path<Uuid>,
+    Json(req): Json<CreateApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {
-    Err(AppError::BadRequest(
-        "quotes parent table is not yet defined; tracked as a PMS-470 follow-up".into(),
-    ))
+    req.validate().map_err(AppError::from)?;
+    assert_parent_exists(&s, "quotes", u.tenant_id, entity_id).await?;
+    let row = s
+        .service
+        .create_for_entity(u.tenant_id, ApprovalTarget::Quote, entity_id, u.id, req)
+        .await?;
+    Ok(Json(row))
 }
 
 async fn pending_for_caller(

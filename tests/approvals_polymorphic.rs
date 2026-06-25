@@ -1,14 +1,16 @@
-//! PMS-470 / PMS-451 phase 2: integration test for polymorphic
-//! approvals.
+//! PMS-470 / PMS-451 phase 2 + PMS-484: integration test for
+//! polymorphic approvals.
 //!
-//! Pins three guarantees:
+//! Pins these guarantees:
 //!   - A time_entry approval round-trips through the
 //!     `/time-entries/{id}/approvals` surface and surfaces in the
 //!     caller's `/approvals/pending` queue with `target='time_entry'`.
 //!   - The phase-1 ticket-scoped surface keeps returning rows with
 //!     `target='ticket'` and the new `entity_id` field populated.
-//!   - The change_requests and quotes placeholder routes 400 with a
-//!     "parent table not defined" message (tracked under follow-up).
+//!   - PMS-484: A change_request approval round-trips through
+//!     `/change-requests/{id}/approvals` and a quote approval through
+//!     `/quotes/{id}/approvals`. Both call paths reject an unknown
+//!     entity id with 404 (tenant-scoped existence check).
 
 mod common;
 
@@ -208,13 +210,126 @@ async fn ticket_approval_carries_target_and_entity_id(pool: PgPool) {
     );
 }
 
+async fn seed_change_request(pool: &PgPool, admin_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO change_requests
+           (id, tenant_id, title, summary, requested_by_id, status)
+           VALUES ($1, $2, 'Failover plan', 'Cut over DB to replica', $3, 'submitted')"#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(admin_id)
+    .execute(pool)
+    .await
+    .expect("seed change_request");
+    id
+}
+
+async fn seed_quote(pool: &PgPool, admin_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO quotes
+           (id, tenant_id, title, summary, requested_by_id, total_cents, currency, status)
+           VALUES ($1, $2, 'Q1 hosting', 'Tier-2 monthly', $3, 30000, 'USD', 'submitted')"#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(admin_id)
+    .execute(pool)
+    .await
+    .expect("seed quote");
+    id
+}
+
+async fn round_trip_for(prefix: &str, entity_id: Uuid, app: &common::TestApp, token: &str) {
+    let create_resp = app
+        .client
+        .post(app.url(&format!("/api/v1/{prefix}/{entity_id}/approvals")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "approver_role": "super_admin",
+            "notes": "sign off",
+        }))
+        .send()
+        .await
+        .expect("create approval");
+    assert!(
+        create_resp.status().is_success(),
+        "{prefix} create should 2xx; got {}",
+        create_resp.status()
+    );
+    let row: Value = create_resp.json().await.expect("body");
+    let expected_target = match prefix {
+        "change-requests" => "change_request",
+        "quotes" => "quote",
+        other => other,
+    };
+    assert_eq!(row["target"], expected_target);
+    assert_eq!(
+        row["entity_id"].as_str().map(str::to_string),
+        Some(entity_id.to_string())
+    );
+    let approval_id = Uuid::parse_str(row["id"].as_str().unwrap()).unwrap();
+
+    let list_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/{prefix}/{entity_id}/approvals")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list approvals");
+    assert!(list_resp.status().is_success());
+    let listed: Value = list_resp.json().await.expect("list body");
+    assert!(
+        listed
+            .as_array()
+            .map(|a| a
+                .iter()
+                .any(|r| r["id"].as_str() == Some(approval_id.to_string().as_str())))
+            .unwrap_or(false),
+        "list must include the approval; got {listed:?}"
+    );
+
+    let decide_resp = app
+        .client
+        .post(app.url(&format!("/api/v1/approvals/{approval_id}/decision")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "decision": "approve" }))
+        .send()
+        .await
+        .expect("decide");
+    assert!(decide_resp.status().is_success());
+    let decided: Value = decide_resp.json().await.expect("decide body");
+    assert_eq!(decided["status"], "approved");
+    assert_eq!(decided["target"], expected_target);
+}
+
 #[sqlx::test]
-async fn placeholder_targets_return_400(pool: PgPool) {
+async fn change_request_approval_round_trip(pool: PgPool) {
+    let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+    let cr = seed_change_request(&pool, admin_id).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &admin_email, &admin_pw).await;
+    round_trip_for("change-requests", cr, &app, &token).await;
+}
+
+#[sqlx::test]
+async fn quote_approval_round_trip(pool: PgPool) {
+    let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+    let quote = seed_quote(&pool, admin_id).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &admin_email, &admin_pw).await;
+    round_trip_for("quotes", quote, &app, &token).await;
+}
+
+#[sqlx::test]
+async fn unknown_parent_returns_404(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &admin_email, &admin_pw).await;
 
-    for prefix in ["change-requests", "quotes"] {
+    for prefix in ["change-requests", "quotes", "time-entries"] {
         let resp = app
             .client
             .get(app.url(&format!(
@@ -223,11 +338,11 @@ async fn placeholder_targets_return_400(pool: PgPool) {
             .bearer_auth(&token)
             .send()
             .await
-            .expect("placeholder GET");
+            .expect("unknown parent GET");
         assert_eq!(
             resp.status().as_u16(),
-            400,
-            "{prefix} placeholder must 400; got {}",
+            404,
+            "{prefix} unknown parent must 404; got {}",
             resp.status()
         );
     }
