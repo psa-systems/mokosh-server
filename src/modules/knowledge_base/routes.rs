@@ -53,6 +53,13 @@ pub fn kb_routes(service: KbService) -> Router {
         .route("/kb/articles/{id}/helpful", post(mark_helpful))
         .route("/kb/articles/{id}/not_helpful", post(mark_not_helpful))
         .route("/kb/articles/{id}/vote", get(get_article_vote))
+        // PMS-485: "Top ticket-driving articles" widget on the KB
+        // landing page. Tenant-scoped GROUP BY over tickets joined
+        // to kb_articles on the PMS-452 `source_kb_article_id` FK.
+        .route(
+            "/kb/top-ticket-driving-articles",
+            get(list_top_ticket_driving_articles),
+        )
         // The portal-visible feed lives on the portal tree at
         // `GET /api/v1/portal/kb`, behind `PortalAuthMiddleware` /
         // `RequirePortalAuth` and scoped to the authenticated contact's
@@ -230,5 +237,31 @@ async fn get_article_vote(
 ) -> AppResult<Json<KbArticleFeedbackResponse>> {
     Ok(Json(
         s.service.get_article_vote(u.tenant(), id, u.id).await?,
+    ))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TopTicketDrivingQuery {
+    /// Days to look back; defaults to 90, capped at 365 to keep the
+    /// scan bounded on long-lived tenants.
+    #[serde(default)]
+    pub days: Option<i64>,
+    /// Row cap; defaults to 20, max 100.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+async fn list_top_ticket_driving_articles(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    Query(q): Query<TopTicketDrivingQuery>,
+) -> AppResult<Json<Vec<TopTicketDrivingArticleRow>>> {
+    let days = q.days.unwrap_or(90).clamp(1, 365);
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let since = chrono::Utc::now() - chrono::Duration::days(days);
+    Ok(Json(
+        s.service
+            .list_top_ticket_driving_articles(u.tenant(), since, limit)
+            .await?,
     ))
 }

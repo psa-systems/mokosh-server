@@ -129,6 +129,16 @@ pub struct KbArticleVersionResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// PMS-485: row in the "Top ticket-driving articles" widget. One row
+/// per published KB article, ordered by descending `ticket_count` over
+/// the configurable `since` window.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopTicketDrivingArticleRow {
+    pub id: Uuid,
+    pub title: String,
+    pub ticket_count: i64,
+}
+
 /// Returned by the helpful / not_helpful feedback endpoints so the portal
 /// (or agent UI) can render the updated tallies without a follow-up GET.
 ///

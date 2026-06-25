@@ -903,6 +903,45 @@ impl KbService {
         .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
+
+    /// PMS-485: list KB articles ordered by how many tickets cite them
+    /// as `source_kb_article_id`, restricted to the tenant + a recency
+    /// window (`since`). The partial index added in PMS-452 migration
+    /// 068 (`(tenant_id, source_kb_article_id) WHERE
+    /// source_kb_article_id IS NOT NULL`) keeps the predicate selective.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, limit, since = ?since))]
+    pub async fn list_top_ticket_driving_articles(
+        &self,
+        tenant_id: TenantId,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> AppResult<Vec<TopTicketDrivingArticleRow>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, String, i64)> = sqlx::query_as(
+            r#"SELECT a.id, a.title, COUNT(t.id)::bigint AS ticket_count
+               FROM tickets t
+               JOIN kb_articles a ON a.id = t.source_kb_article_id
+               WHERE t.tenant_id = $1
+                 AND t.source_kb_article_id IS NOT NULL
+                 AND t.created_at >= $2
+               GROUP BY a.id, a.title
+               ORDER BY ticket_count DESC, a.title ASC
+               LIMIT $3"#,
+        )
+        .bind(tenant_id)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, title, ticket_count)| TopTicketDrivingArticleRow {
+                id,
+                title,
+                ticket_count,
+            })
+            .collect())
+    }
 }
 
 #[derive(sqlx::FromRow)]
