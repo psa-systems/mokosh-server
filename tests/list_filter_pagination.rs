@@ -108,6 +108,7 @@ async fn timesheets_list_handles_every_filter_combination(pool: PgPool) {
         TimesheetFilter {
             user_id: Some(id),
             week: Some(d(2026, 6, 1)),
+            ..Default::default()
         },
     ];
     for (i, filter) in combos.iter().enumerate() {
