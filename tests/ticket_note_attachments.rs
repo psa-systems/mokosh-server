@@ -99,9 +99,12 @@ async fn seed_contact(pool: &PgPool, company_id: Uuid) -> (Uuid, String, String)
     let password = "portal-password-12345".to_string();
     let password_hash =
         mokosh_server::utils::crypto::hash_password(&password).expect("hash portal password");
+    // `portal_enabled` is on the companies table; the contacts flag is
+    // `is_portal_user` (migrations/004_contacts.sql:81). PMS-483 follow-up
+    // CI report: the previous seed referenced the wrong column name.
     sqlx::query(
         r#"INSERT INTO contacts
-           (id, tenant_id, company_id, email, first_name, last_name, portal_password_hash, portal_enabled)
+           (id, tenant_id, company_id, email, first_name, last_name, portal_password_hash, is_portal_user)
            VALUES ($1, $2, $3, $4, 'Port', 'Al', $5, true)"#,
     )
     .bind(id)
