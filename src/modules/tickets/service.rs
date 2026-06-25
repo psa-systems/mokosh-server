@@ -2470,6 +2470,18 @@ fn build_ticket_filter_sql(
         count_idx += 1;
         binds.push(TicketFilterBind::Id(company_id));
     }
+    // MAPPS-311: contact-scoped ticket list. The contact-detail page
+    // already sends `?contact_id={id}` for its "Recent Tickets" rail;
+    // the SQL builder previously ignored the field, so the rail
+    // rendered the whole tenant's recent tickets instead of the
+    // contact's. Branch mirrors the other scalar-Id filters.
+    if let Some(contact_id) = filter.contact_id {
+        data_conds.push(format!("t.contact_id = ${data_idx}"));
+        count_conds.push(format!("t.contact_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(contact_id));
+    }
     if let Some(assigned_to_id) = filter.assigned_to_id {
         data_conds.push(format!("t.assigned_to_id = ${data_idx}"));
         count_conds.push(format!("t.assigned_to_id = ${count_idx}"));
