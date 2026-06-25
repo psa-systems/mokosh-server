@@ -42,10 +42,15 @@ test.describe('form validation (PMS-518 / AC7)', () => {
 
       // --- new-ticket: an empty submit flags every required field at once ---
       // In-app nav: sidebar Tickets -> list "New Ticket" -> the create form.
-      // `.first()` guards against the list page rendering the New-Ticket
-      // affordance twice (header action + empty-state CTA).
-      await page.locator('a[href="/tickets"]').first().click();
-      await page.locator('a[href="/tickets/new"]').first().click();
+      // `:visible` is load-bearing: the layout renders the sidebar TWICE - a
+      // mobile drawer (`lg:hidden`, so `display:none` at the Desktop Chrome
+      // 1280px viewport) that is DOM-first, and the desktop sidebar
+      // (`hidden lg:flex`, visible). A bare `.first()` grabbed the hidden
+      // drawer and timed out (run 2534). `:visible` picks the desktop instance;
+      // `.first()` then guards the list page rendering the New-X affordance
+      // twice (header action + empty-state CTA).
+      await page.locator('a[href="/tickets"]:visible').first().click();
+      await page.locator('a[href="/tickets/new"]:visible').first().click();
       const createTicket = page.getByRole('button', { name: 'Create Ticket', exact: true });
       await createTicket.waitFor({ state: 'visible', timeout: 15_000 });
       await createTicket.click();
@@ -69,8 +74,8 @@ test.describe('form validation (PMS-518 / AC7)', () => {
       await expect(page.getByText('Description is required.')).toBeVisible();
 
       // --- new-contact: an empty submit flags both name fields at once ---
-      await page.locator('a[href="/contacts"]').first().click();
-      await page.locator('a[href="/contacts/new"]').first().click();
+      await page.locator('a[href="/contacts"]:visible').first().click();
+      await page.locator('a[href="/contacts/new"]:visible').first().click();
       const createContact = page.getByRole('button', { name: 'Create Contact', exact: true });
       await createContact.waitFor({ state: 'visible', timeout: 15_000 });
       await createContact.click();
