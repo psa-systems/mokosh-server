@@ -129,7 +129,7 @@ jobs:
         # apt-get, which Leap does not have. This step is a fast no-op when the
         # project's @playwright/test version matches the image's pre-baked
         # revision; it self-heals if the two ever drift.
-        run: bunx playwright install chromium firefox webkit
+        run: bun x playwright install chromium firefox webkit
 
       # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
       # dispatched commit is unlikely to be what prod currently serves, so the
@@ -145,7 +145,7 @@ jobs:
         run: node24 scripts/health-check.mjs
 
       - name: Run E2E suite
-        run: bunx playwright test
+        run: bun x playwright test
 
       - name: Upload Playwright report and traces
         if: failure()
