@@ -404,3 +404,78 @@ async fn placement_seeds_off_psa_target_tenant_so_tickets_create(pool: PgPool) {
         "ticket received a sequenced number"
     );
 }
+
+/// MAPPS-329: Bunyip-onboarded users (BUNYIP-206 guarantees first + last name
+/// are present on every fresh signup) should not have to re-type the same name
+/// on mokosh's `/onboarding/profile`. The placement now stamps
+/// `profile_completed_at` when both name claims arrive non-empty, so the
+/// SPA's AuthGuard sees `profile_completed = true` from `/auth/me` and lets
+/// the user land directly on the dashboard.
+#[sqlx::test]
+async fn name_claims_stamp_profile_completed_at(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("named@example.com".to_string()),
+        true,
+        Some("a contributor".to_string()),
+        Some("a contributor".to_string()),
+        &claims(sub, None),
+    )
+    .await
+    .expect("placed");
+
+    let (tenant, _) = user_tenant_role(&pool, sub).await;
+    let completed_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT profile_completed_at FROM users WHERE id = $1")
+            .bind(sub)
+            .fetch_one(&pool)
+            .await
+            .expect("read user");
+    assert!(
+        completed_at.is_some(),
+        "name claims present -> profile_completed_at stamped on INSERT"
+    );
+
+    let _ = tenant;
+}
+
+/// MAPPS-329: the inverse - a placement with NO name claims (legacy bunyip
+/// user, magic-link signup pre-BUNYIP-206, etc.) leaves `profile_completed_at`
+/// NULL so the existing mokosh `/onboarding/profile` page kicks in as the
+/// fallback for that user.
+#[sqlx::test]
+async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("anon@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("placed");
+
+    let completed_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT profile_completed_at FROM users WHERE id = $1")
+            .bind(sub)
+            .fetch_one(&pool)
+            .await
+            .expect("read user");
+    assert!(
+        completed_at.is_none(),
+        "no name claims -> profile_completed_at stays NULL, SPA still gates"
+    );
+}

@@ -1694,19 +1694,43 @@ impl AuthService {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        // MAPPS-329: when both hints came in non-empty, the user already
+        // entered their first + last name in Bunyip (BUNYIP-206 forces it
+        // pre-signup), so the mokosh `/onboarding/profile` page would just
+        // re-collect the same data. Stamp `profile_completed_at` on first
+        // INSERT so the AuthGuard never bounces the user there. Hints
+        // missing -> seed_name falls back to the email-derived placeholder
+        // AND `profile_completed_at` stays NULL so the existing onboarding
+        // page kicks in as the fallback.
+        let names_complete = first_hint.is_some() && last_hint.is_some();
         let (default_first, default_last) = synthetic_name_from_email(email);
         let seed_first = first_hint.unwrap_or(default_first);
         let seed_last = last_hint.unwrap_or(default_last);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // `COALESCE` on UPDATE keeps a pre-existing `profile_completed_at`
+        // intact (legacy user who already completed mokosh-side onboarding
+        // pre-MAPPS-329 - the timestamp stands). On INSERT, when
+        // `names_complete`, the `$7` arg is `Some(NOW())`-equivalent (we
+        // bind a fresh `Utc::now()`); otherwise `None` so the column stays
+        // NULL and the SPA's fallback onboarding page gates.
+        let profile_completed_at = if names_complete {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
         sqlx::query(
             r#"
             INSERT INTO users (
                 id, tenant_id, email, role, status, email_verified_at, timezone,
-                first_name, last_name
+                first_name, last_name, profile_completed_at
             )
-            VALUES ($1, $2, $3, $4, 'active', NOW(), 'UTC', $5, $6)
+            VALUES ($1, $2, $3, $4, 'active', NOW(), 'UTC', $5, $6, $7)
             ON CONFLICT (id) DO UPDATE SET
                 email = EXCLUDED.email,
+                profile_completed_at = COALESCE(
+                    users.profile_completed_at,
+                    EXCLUDED.profile_completed_at
+                ),
                 updated_at = NOW()
             WHERE users.tenant_id = EXCLUDED.tenant_id
             "#,
@@ -1717,6 +1741,7 @@ impl AuthService {
         .bind(role.as_str())
         .bind(&seed_first)
         .bind(&seed_last)
+        .bind(profile_completed_at)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
