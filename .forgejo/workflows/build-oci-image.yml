@@ -25,6 +25,15 @@ on:
   # Manual trigger so we can force a fresh :latest publish without
   # waiting for a code change that happens to hit the path filter.
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build, compute tags and print every registry action without pushing"
+        type: boolean
+        default: true
+      simulate_tag:
+        description: "Version like v9.9.9 to exercise the release publish path; empty exercises latest"
+        type: string
+        default: ""
 
 jobs:
   build-and-push:
@@ -62,12 +71,37 @@ jobs:
           $"REGISTRY_USER=($owner)\n" | save --append $env.GITHUB_ENV
           $"IMAGE_REGISTRY=($env.REGISTRY_PROVIDER)/($owner)\n" | save --append $env.GITHUB_ENV
 
-      - name: Get image tags
-        id: get-tags
+      - name: Resolve publish mode, train and tag
+        id: resolve
         shell: nu {0}
         run: |
-          let tags = (^nu oci-build/get-tags.nu --joined)
-          $"tags=($tags)\n" | save --append $env.GITHUB_OUTPUT
+          # Derive the publish mode from the trigger, never from git describe:
+          # a tag ref -> release (push :vX.Y.Z only), a main push -> latest
+          # (push :latest only), a manual run -> dry-run. A release commit fires
+          # BOTH the main-push and the tag-push events; resolving disjoint tags
+          # per trigger is what stops the two runs from racing to overwrite the
+          # same :latest tag (governance GOV-13).
+          let event = "${{ github.event_name }}"
+          let ref_type = "${{ github.ref_type }}"
+          let ref_name = "${{ github.ref_name }}"
+          let simulate_tag = "${{ inputs.simulate_tag }}"
+          let mode = if $event == "workflow_dispatch" {
+            "dry-run"
+          } else if $ref_type == "tag" {
+            "release"
+          } else {
+            "latest"
+          }
+          # A manual run only mutates the registry if dry_run is explicitly false;
+          # the input defaults to true, and push events always publish for real.
+          let dry_run = ($event == "workflow_dispatch" and "${{ inputs.dry_run }}" != "false")
+          let r = (^nu oci-build/get-tags.nu --mode $mode --ref-name $ref_name --simulate-tag $simulate_tag --json | from json)
+          $"mode=($r.mode)\n" | save --append $env.GITHUB_OUTPUT
+          $"train=($r.train)\n" | save --append $env.GITHUB_OUTPUT
+          $"tag=($r.tag)\n" | save --append $env.GITHUB_OUTPUT
+          $"describe=($r.describe)\n" | save --append $env.GITHUB_OUTPUT
+          $"dry_run=($dry_run)\n" | save --append $env.GITHUB_OUTPUT
+          print $"mode=($r.mode) train=($r.train) tag=($r.tag) describe=($r.describe) dry_run=($dry_run)"
 
       # Resolve the version metadata that build.rs expects on its env. The
       # .git tree is not copied into the Docker build context (see
@@ -110,11 +144,11 @@ jobs:
       - name: Build and push mokosh-server image
         shell: nu {0}
         run: |
-          let tags_str = "${{ steps.get-tags.outputs.tags }}"
-          let tags = ($tags_str | split row ",")
+          let tag = "${{ steps.resolve.outputs.tag }}"
+          let dry_run = ("${{ steps.resolve.outputs.dry_run }}" == "true")
           let image = "mokosh-server"
           let registry = $env.IMAGE_REGISTRY
-          let tag_args = ($tags | each {|tag| [-t $"($registry)/($image):($tag)"]} | flatten)
+          let tag_args = [-t $"($registry)/($image):($tag)"]
           # Cache to the runner's built-in Actions cache server (type=gha),
           # keyed by ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN from the
           # runtime-env step above. type=registry round-tripped ~1.7 GiB over
@@ -124,7 +158,11 @@ jobs:
           # mode=max keeps the dependency-build layer; ignore-error keeps a
           # cache hiccup (or a disabled runner cache) from failing the build.
           let cache_to = "type=gha,mode=max,ignore-error=true"
-          print $"Building and pushing ($image) with tags: ($tags_str)"
+          # A dry-run builds locally and pushes nothing (no cache export either,
+          # so a simulated run never mutates the shared cache).
+          let push_args = if $dry_run { [--load] } else { [--push --cache-to $cache_to] }
+          let action = if $dry_run { "[dry-run] WOULD build and push" } else { "Building and pushing" }
+          print $"($action) ($image) with tag: ($tag)"
           # The unused GIT_SHA build-arg the previous step passed was a no-op:
           # the Dockerfile reads MOKOSH_GIT_HASH / MOKOSH_GIT_DESCRIBE /
           # MOKOSH_BUILD_DATE / SOURCE_DATE_EPOCH, which build.rs exports as
@@ -135,15 +173,14 @@ jobs:
             "--build-arg" $"MOKOSH_BUILD_DATE=($env.MOKOSH_BUILD_DATE)"
             "--build-arg" $"SOURCE_DATE_EPOCH=($env.SOURCE_DATE_EPOCH)"
           ]
-          ^docker buildx build --push --cache-from $cache_from --cache-to $cache_to ...$build_args ...$tag_args -f oci-build/Dockerfile .
+          ^docker buildx build ...$push_args --cache-from $cache_from ...$build_args ...$tag_args -f oci-build/Dockerfile .
 
       - name: Print image URLs
         shell: nu {0}
         run: |
-          let tags_str = "${{ steps.get-tags.outputs.tags }}"
-          let tags = ($tags_str | split row ",")
+          let tag = "${{ steps.resolve.outputs.tag }}"
+          let dry_run = ("${{ steps.resolve.outputs.dry_run }}" == "true")
+          let prefix = if $dry_run { "[dry-run] WOULD push image to" } else { "Image pushed to" }
           let image = "mokosh-server"
           let registry = $env.IMAGE_REGISTRY
-          for tag in $tags {
-            print $"Image pushed to ($registry)/($image):($tag)"
-          }
+          print $"($prefix) ($registry)/($image):($tag)"
