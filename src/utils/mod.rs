@@ -5,6 +5,8 @@ pub mod datetime;
 pub mod email;
 pub mod error;
 pub mod pagination;
+#[cfg(feature = "server")]
+pub mod security_headers;
 pub mod validation;
 
 // Re-exports
