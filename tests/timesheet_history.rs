@@ -60,6 +60,8 @@ fn entry_req(
         start_time: None,
         end_time: None,
         duration_minutes: Some(60),
+        worked_minutes: None,
+        billable_minutes: None,
         work_type_id,
         ticket_id: None,
         project_id: None,

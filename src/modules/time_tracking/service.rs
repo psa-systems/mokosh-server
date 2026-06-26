@@ -176,8 +176,13 @@ impl TimeTrackingService {
     // PMS-44 / PMS-45 time entries
     // ========================================================================
 
-    /// Compute duration_minutes from start/end if not supplied.
+    /// Compute the worked minutes for an entry. Precedence (PMS-395):
+    /// explicit `worked_minutes` > `duration_minutes` > derived from
+    /// (start, end). This is the actual time spent and is never rounded.
     fn compute_minutes(request: &CreateTimeEntryRequest) -> AppResult<i32> {
+        if let Some(m) = request.worked_minutes {
+            return Ok(m);
+        }
         if let Some(m) = request.duration_minutes {
             return Ok(m);
         }
@@ -253,6 +258,7 @@ impl TimeTrackingService {
         let query = format!(
             r#"
             SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
+                   te.worked_minutes, te.billable_minutes,
                    te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
                    te.approval_status, te.work_category, te.created_at, te.updated_at,
@@ -321,34 +327,41 @@ impl TimeTrackingService {
             request.project_id,
         )?;
 
-        let raw = Self::compute_minutes(request)?;
-        let duration = match default_rounding_rule(&mut *tx, tenant_id).await? {
-            Some(rule) => apply_rounding(raw, &rule),
-            None => raw,
+        // PMS-395: worked time is the unrounded actual time and is stored
+        // as-is. Rounding now derives only the billable figure (unless the
+        // caller supplies one explicitly), so the worked figure is never
+        // mutated to fit the billing increment.
+        let worked = Self::compute_minutes(request)?;
+        let rounding = default_rounding_rule(&mut *tx, tenant_id).await?;
+        let billable = match request.billable_minutes {
+            Some(b) => b,
+            None => derive_billable_minutes(worked, request.is_billable, rounding.as_ref()),
         };
-        // PMS-396: reject when this entry would push the user's total for the
-        // date over the tenant's per-day cap. The SUM runs inside `tx` so it is
-        // consistent with the INSERT below.
+        // PMS-396: reject when this entry would push the user's worked total
+        // for the date over the tenant's per-day cap. The SUM runs inside `tx`
+        // so it is consistent with the INSERT below.
         let cap_minutes =
             crate::modules::settings::read_max_minutes_per_day(&self.db, tenant_id).await?;
         let existing =
             day_minutes_excluding(&mut *tx, tenant_id, request.user_id, request.date, None).await?;
-        enforce_day_cap(existing, duration, cap_minutes)?;
+        enforce_day_cap(existing, worked, cap_minutes)?;
+        // total_amount is priced on billable minutes, not worked minutes.
         let (hourly_rate, total) = resolve_billing(
             request.hourly_rate,
             request.is_billable,
             &defaults,
-            duration,
+            billable,
         );
         let id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO time_entries (
                 id, tenant_id, user_id, date, start_time, end_time,
-                duration_minutes, work_type_id, ticket_id, project_id,
+                duration_minutes, worked_minutes, billable_minutes,
+                work_type_id, ticket_id, project_id,
                 company_id, notes, is_billable, hourly_rate, total_amount, task_id,
                 work_category
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             "#,
         )
         .bind(id)
@@ -357,7 +370,9 @@ impl TimeTrackingService {
         .bind(request.date)
         .bind(request.start_time)
         .bind(request.end_time)
-        .bind(duration)
+        .bind(worked)
+        .bind(worked)
+        .bind(billable)
         .bind(request.work_type_id)
         .bind(request.ticket_id)
         .bind(request.project_id)
@@ -402,6 +417,7 @@ impl TimeTrackingService {
         let row = sqlx::query_as::<_, TimeEntryRow>(
             r#"
             SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
+                   te.worked_minutes, te.billable_minutes,
                    te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
                    te.approval_status, te.work_category, te.created_at, te.updated_at,
@@ -432,7 +448,13 @@ impl TimeTrackingService {
         let current = self.get_time_entry(tenant_id, id).await?;
         let start = request.start_time.or(current.start_time);
         let end = request.end_time.or(current.end_time);
-        let duration = if let Some(d) = request.duration_minutes {
+        let is_billable = request.is_billable.unwrap_or(current.is_billable);
+        // PMS-395: worked time precedence - explicit `worked_minutes` >
+        // `duration_minutes` > derived (start, end) > the entry's current
+        // worked figure. This is the actual time spent and is never rounded.
+        let worked = if let Some(w) = request.worked_minutes {
+            w
+        } else if let Some(d) = request.duration_minutes {
             d
         } else if let (Some(s), Some(e)) = (start, end) {
             let m = (e - s).num_minutes();
@@ -443,10 +465,9 @@ impl TimeTrackingService {
             }
             m as i32
         } else {
-            current.duration_minutes
+            current.worked_minutes
         };
         let hourly_rate = request.hourly_rate.or(current.hourly_rate);
-        let total = hourly_rate.map(|r| r * Decimal::from(duration) / Decimal::from(60));
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Write-side tenant validation on update, mirroring create_time_entry:
@@ -465,17 +486,35 @@ impl TimeTrackingService {
             request.ticket_id,
             request.project_id,
         )?;
+        // PMS-395: resolve billable minutes. An explicit value wins; otherwise
+        // preserve any previously-stored value so a partial edit does not wipe
+        // a hand-set billable figure; failing both, default to the rounded
+        // worked time for billable entries (0 for non-billable).
+        let billable = match request.billable_minutes.or(current.billable_minutes) {
+            Some(b) => b,
+            None => {
+                let rounding = default_rounding_rule(&mut *tx, tenant_id).await?;
+                derive_billable_minutes(worked, is_billable, rounding.as_ref())
+            }
+        };
+        // total_amount is priced on billable minutes, only when billable.
+        let total = if is_billable {
+            hourly_rate.map(|r| r * Decimal::from(billable) / Decimal::from(60))
+        } else {
+            None
+        };
         // PMS-396: enforce the per-day cap against the TARGET day (the entry may
         // be moving to a different date), excluding this row from the day sum so
         // an in-place edit is measured against its peers, not itself. The SUM
-        // runs inside `tx` for consistency with the UPDATE.
+        // runs inside `tx` for consistency with the UPDATE. The cap is on worked
+        // (actual) time, not billed time.
         let target_date = request.date.unwrap_or(current.date);
         let cap_minutes =
             crate::modules::settings::read_max_minutes_per_day(&self.db, tenant_id).await?;
         let existing =
             day_minutes_excluding(&mut *tx, tenant_id, current.user_id, target_date, Some(id))
                 .await?;
-        enforce_day_cap(existing, duration, cap_minutes)?;
+        enforce_day_cap(existing, worked, cap_minutes)?;
         let affected = sqlx::query(
             r#"
             UPDATE time_entries SET
@@ -483,6 +522,8 @@ impl TimeTrackingService {
                 start_time        = $4,
                 end_time          = $5,
                 duration_minutes  = $6,
+                worked_minutes    = $16,
+                billable_minutes  = $17,
                 work_type_id      = COALESCE($7, work_type_id),
                 ticket_id         = $8,
                 project_id        = $9,
@@ -501,7 +542,7 @@ impl TimeTrackingService {
         .bind(request.date)
         .bind(start)
         .bind(end)
-        .bind(duration)
+        .bind(worked)
         .bind(request.work_type_id)
         .bind(request.ticket_id)
         .bind(request.project_id)
@@ -511,6 +552,8 @@ impl TimeTrackingService {
         .bind(total)
         .bind(request.task_id)
         .bind(&work_category)
+        .bind(worked)
+        .bind(billable)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -643,9 +686,17 @@ impl TimeTrackingService {
             SELECT
                 user_id,
                 DATE_TRUNC('week', date)::date AS week_start,
-                SUM(duration_minutes)::bigint AS total_minutes,
-                SUM(CASE WHEN is_billable THEN duration_minutes ELSE 0 END)::bigint
-                    AS billable_minutes,
+                -- PMS-395: total_minutes sums worked (actual) time;
+                -- billable_minutes sums the independent billed figure. Both
+                -- fall back to duration_minutes for legacy rows that predate
+                -- the worked/billable backfill.
+                SUM(COALESCE(worked_minutes, duration_minutes))::bigint AS total_minutes,
+                SUM(COALESCE(
+                    billable_minutes,
+                    CASE WHEN is_billable
+                         THEN COALESCE(worked_minutes, duration_minutes)
+                         ELSE 0 END
+                ))::bigint AS billable_minutes,
                 COUNT(*)::bigint AS entry_count,
                 CASE
                     WHEN BOOL_OR(approval_status = 'rejected') THEN 'rejected'
@@ -1642,6 +1693,24 @@ fn apply_rounding(raw_minutes: i32, rule: &RoundingParams) -> i32 {
     }
 }
 
+/// Derive the billable minutes for an entry when the caller does not supply
+/// them (PMS-395). Preserves the pre-change behavior: a billable entry bills
+/// the rounded worked time, a non-billable entry bills 0. Rounding only ever
+/// touches this figure now, never the stored worked minutes.
+fn derive_billable_minutes(
+    worked_minutes: i32,
+    is_billable: bool,
+    rounding: Option<&RoundingParams>,
+) -> i32 {
+    if !is_billable {
+        return 0;
+    }
+    match rounding {
+        Some(rule) => apply_rounding(worked_minutes, rule),
+        None => worked_minutes,
+    }
+}
+
 /// Tenant default rounding rule, if one is configured. `None` => identity
 /// (raw minutes, no rounding). Missing-rule = identity is a deliberate M1
 /// choice; tracked as debt, not a silent gap.
@@ -1736,6 +1805,8 @@ struct TimeEntryRow {
     start_time: Option<chrono::NaiveTime>,
     end_time: Option<chrono::NaiveTime>,
     duration_minutes: i32,
+    worked_minutes: Option<i32>,
+    billable_minutes: Option<i32>,
     work_type_id: Uuid,
     ticket_id: Option<Uuid>,
     project_id: Option<Uuid>,
@@ -1765,6 +1836,11 @@ impl From<TimeEntryRow> for TimeEntryResponse {
             start_time: r.start_time,
             end_time: r.end_time,
             duration_minutes: r.duration_minutes,
+            // PMS-395: legacy rows that predate the backfill have NULL
+            // worked_minutes; fall back to the duration so the worked figure
+            // is always present.
+            worked_minutes: r.worked_minutes.unwrap_or(r.duration_minutes),
+            billable_minutes: r.billable_minutes,
             work_type_id: r.work_type_id,
             ticket_id: r.ticket_id,
             project_id: r.project_id,
