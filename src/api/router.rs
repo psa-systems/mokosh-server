@@ -40,6 +40,7 @@ use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
 use crate::modules::tenants::{tenant_routes, TenantService};
+use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
     agent_attachment_routes, contact_notes_routes, portal_attachment_routes, ticket_routes,
     AttachmentConfig, AttachmentService, TicketService,
@@ -135,6 +136,8 @@ pub fn create_api_router(
     let saved_reports_service = SavedReportsService::new(db.pool().clone());
     // PMS-448: ticket.created workflow rule executor + CRUD.
     let workflows_service = WorkflowsService::new(db.pool().clone());
+    // PMS-448 AC4: admin-authored ticket templates (new-ticket pre-fills).
+    let ticket_templates_service = TicketTemplatesService::new(db.pool().clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.pool().clone());
     // PMS-453: per-user saved dashboards.
@@ -297,6 +300,8 @@ pub fn create_api_router(
         .merge(saved_reports_routes(saved_reports_service))
         // PMS-448: workflow-rule CRUD + per-ticket run timeline.
         .merge(workflow_routes(workflows_service))
+        // PMS-448 AC4: ticket-template CRUD (new-ticket pre-fills).
+        .merge(ticket_template_routes(ticket_templates_service))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
