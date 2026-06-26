@@ -16,8 +16,8 @@
 //! [`is_subcommand`]) it runs the task and exits instead of serving. Each
 //! feature keeps its original env-var contract and fail-closed guards.
 //!
-//! `provision-roles` is intentionally NOT here: it moves into normal server
-//! startup under PMS-489, a separate issue.
+//! `provision-roles` is intentionally NOT here: it moved into normal server
+//! startup under PMS-489 (see [`crate::db::provision`]).
 
 use std::path::PathBuf;
 
