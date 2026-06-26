@@ -11,8 +11,6 @@
 //! In-memory state only; will not survive a server restart and does
 //! not coordinate across replicas. Acceptable for the single-process
 //! deployment; horizontal scale needs a Redis-backed store.
-//!
-//! Modelled on `crates/mokosh-auth-http/src/rate_limit.rs:270-310`.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;

@@ -122,8 +122,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Environment
 dotenvy = "0.15"
 
-# Email. Lettre powers the host-crate `Mailer` (utils/email.rs); the
-# SSO subsystem keeps its own LettreMailer in crates/mokosh-auth-http.
+# Email. Lettre powers the host-crate `Mailer` (utils/email.rs).
 lettre = { workspace = true }
 async-trait = { workspace = true }
 secrecy = { workspace = true }
