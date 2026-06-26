@@ -88,6 +88,20 @@ jobs:
           $"SOURCE_DATE_EPOCH=($source_date_epoch)\n" | save --append $env.GITHUB_ENV
           print $"git_hash=($git_hash) git_describe=($git_describe) build_date=($build_date)"
 
+      - name: Set up buildx builder
+        # The `docker-container` driver is required for any cache export;
+        # the default `docker` driver only carries inline metadata, which
+        # misses the dependency-build layer (governance CI.md, GOV-20).
+        run: docker buildx create --name container-builder --driver docker-container --use
+
+      - name: Export Actions runtime env for buildx gha cache
+        # A raw `docker buildx build` (unlike docker/build-push-action) does
+        # not auto-inject the gha cache backend's env, and ACTIONS_RUNTIME_TOKEN
+        # is masked from run: steps. This action re-exports ACTIONS_CACHE_URL /
+        # ACTIONS_RUNTIME_TOKEN into GITHUB_ENV so the build step's `type=gha`
+        # cache can reach act_runner's cache server (needs runner cache.enabled).
+        uses: https://github.com/crazy-max/ghaction-github-runtime@v3
+
       - name: Log in to container registry
         shell: nu {0}
         run: |
@@ -101,7 +115,15 @@ jobs:
           let image = "mokosh-server"
           let registry = $env.IMAGE_REGISTRY
           let tag_args = ($tags | each {|tag| [-t $"($registry)/($image):($tag)"]} | flatten)
-          let cache_from = $"type=registry,ref=($registry)/($image):latest"
+          # Cache to the runner's built-in Actions cache server (type=gha),
+          # keyed by ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN from the
+          # runtime-env step above. type=registry round-tripped ~1.7 GiB over
+          # the WAN every build and 499'd on slow-upload runners; type=gha
+          # talks to act_runner's on-LAN cache server instead (governance GOV-20).
+          let cache_from = "type=gha"
+          # mode=max keeps the dependency-build layer; ignore-error keeps a
+          # cache hiccup (or a disabled runner cache) from failing the build.
+          let cache_to = "type=gha,mode=max,ignore-error=true"
           print $"Building and pushing ($image) with tags: ($tags_str)"
           # The unused GIT_SHA build-arg the previous step passed was a no-op:
           # the Dockerfile reads MOKOSH_GIT_HASH / MOKOSH_GIT_DESCRIBE /
@@ -113,7 +135,7 @@ jobs:
             "--build-arg" $"MOKOSH_BUILD_DATE=($env.MOKOSH_BUILD_DATE)"
             "--build-arg" $"SOURCE_DATE_EPOCH=($env.SOURCE_DATE_EPOCH)"
           ]
-          ^docker buildx build --push --cache-from $cache_from --cache-to type=inline ...$build_args ...$tag_args -f oci-build/Dockerfile .
+          ^docker buildx build --push --cache-from $cache_from --cache-to $cache_to ...$build_args ...$tag_args -f oci-build/Dockerfile .
 
       - name: Print image URLs
         shell: nu {0}
