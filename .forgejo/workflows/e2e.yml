@@ -65,7 +65,7 @@ concurrency:
 jobs:
   e2e:
     name: Playwright against staging
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
     defaults:
       run:
@@ -111,32 +111,25 @@ jobs:
           # clone would stop at depth 1 and the walk would miss or fail.
           fetch-depth: 0
 
-      # No Node setup step: the opensuse-base runner image ships nodejs24, so
-      # the runtime is already on disk. Using the preinstalled nodejs avoids a
-      # redundant Node download and the /tmp/toolcache workaround that
-      # actions/setup-node needed on this image.
-      #
-      # PMS-429 / PMS-462: pick the JS binaries that actually exist on this
-      # image. The runtime is `/usr/bin/node24` (the bare `node`/`npm`/`npx`
-      # are libalternatives wrappers that dispatch to a `*-default` target,
-      # and `/usr/bin/npm-default` is absent, so bare `npm ci` died with
-      # `/usr/bin/npm-default: No such file or directory`, exit 255). PMS-429
-      # tried versioned `npm24`/`npx24`, but those binaries are NOT installed
-      # (only nodejs24 is), so the job died with `npm24: command not found`,
-      # exit 127. npm is not packaged on this image at all; the JS package
-      # manager that IS present is corepack (it provisions npm 11.x on demand),
-      # so run npm/npx through `corepack npm` / `corepack npx`. Node scripts
-      # keep using the concrete `node24` binary.
+      # No Node setup step: the opensuse-dev runner image (PMS-423) ships
+      # nodejs24 and bun, so the runtime is already on disk. Using the
+      # preinstalled toolchain avoids a redundant Node download and the
+      # /tmp/toolcache workaround that actions/setup-node needed on this image.
+      # The suite standardises on bun for dependency install and Playwright
+      # invocation; Node scripts run on the concrete `node24` binary.
 
       - name: Install dependencies
-        run: corepack npm ci
+        run: bun install --frozen-lockfile
 
-      - name: Install Playwright browser
-        # --with-deps shells out to apt-get, which the OpenSUSE runner does
-        # not have. The runner image carries the X / GTK / NSS libs Chromium
-        # needs already; if a future image trims them down, add a `zypper
-        # install -y` step here for the missing sonames.
-        run: corepack npx playwright install chromium
+      - name: Install Playwright browsers
+        # The opensuse-dev image pre-bakes the @playwright/test 1.60.0 browser
+        # binaries (chromium, firefox, webkit) plus every system library they
+        # need (via zypper, with the Ubuntu-only libs WebKit wants vendored
+        # under /usr/local/lib/playwright). No --with-deps: it shells out to
+        # apt-get, which Leap does not have. This step is a fast no-op when the
+        # project's @playwright/test version matches the image's pre-baked
+        # revision; it self-heals if the two ever drift.
+        run: bunx playwright install chromium firefox webkit
 
       # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
       # dispatched commit is unlikely to be what prod currently serves, so the
@@ -152,7 +145,7 @@ jobs:
         run: node24 scripts/health-check.mjs
 
       - name: Run E2E suite
-        run: corepack npx playwright test
+        run: bunx playwright test
 
       - name: Upload Playwright report and traces
         if: failure()
