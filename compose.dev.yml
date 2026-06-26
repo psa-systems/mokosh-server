@@ -1,7 +1,9 @@
 ---
 
 # Development environment for Mokosh Server.
-# Usage: docker compose up   (COMPOSE_FILE=compose.dev.yml is set in .env)
+# Usage: just dev   (brings up the Traefik-routed stack; COMPOSE_FILE is
+# compose.dev.yml). PMS-511 folded the former SSO overlay in here, so the
+# Traefik-routed `*.a8n.run` stack is now the only dev stack.
 #
 # Naming convention (see ~/.claude/CLAUDE.md):
 # - Project name `dev-mokosh` namespaces every resource under the
@@ -19,18 +21,19 @@
 #   adjacent to its parent in alphabetical listings.
 #
 # This stack contains the Mokosh API server plus its secrets-management
-# infrastructure (Infisical + its Postgres + Valkey). The Mokosh client
-# apps run separately (see ../mokosh-clients) and reach the API on its
-# published port (MOKOSH_HOST_BIND_IP:MOKOSH_PORT) and Infisical on its
-# published loopback port (127.0.0.1:28002).
+# infrastructure (Infisical + its Postgres + Valkey, behind the `infisical`
+# profile). The Mokosh client apps run separately (see ../mokosh-clients) and
+# reach the API through Traefik at https://${USER}-mokosh-api.a8n.run.
 #
-# The Mokosh API server runs as the `server` service, reachable inside
-# the compose network as `server:${MOKOSH_PORT}` and on the host at
-# `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PORT}`. The host bind targets a
-# private LAN interface (e.g. br0/eth0) instead of 127.0.0.1 so other
-# Docker containers on the host can reach it; the private IP is not
-# routable from the public internet on a VPS.
+# The Mokosh API server runs as the `server` service, reachable inside the
+# compose network as `server:${MOKOSH_PORT}`. It publishes no LAN-IP host
+# port: the shared Traefik (on the external `traefik-public` network) is the
+# sole ingress and terminates TLS via Let's Encrypt, routing
+# https://${USER}-mokosh-api.a8n.run to the container's $MOKOSH_PORT (see the
+# server's `labels` below).
 #
+# MOKOSH_HOST_BIND_IP is still discovered by `just dev` because postgres and
+# mailpit publish host ports for host-side tooling (sqlx-cli, the mail UI).
 # Discover the host IP with:
 #   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
 #
@@ -234,16 +237,39 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - run `just dev` (which copies .env.dev to .env)}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
 
-      # mokosh-auth (SSO / OIDC) configuration. The server boots without
-      # SSO if these are missing (legacy auth still serves /api/v1/*) so
-      # the optional `:-` form is intentional. Generate the keypair with
-      # `scripts/gen-oidc-key.sh`; the script writes into ./secrets which
-      # is mounted read-only into the container at /app/secrets below.
-      MOKOSH_AUTH_ISSUER: ${MOKOSH_AUTH_ISSUER:-}
-      MOKOSH_AUTH_COOKIE_DOMAIN: ${MOKOSH_AUTH_COOKIE_DOMAIN:-}
-      MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: ${MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH:-}
-      MOKOSH_AUTH_JWT_ACTIVE_KID: ${MOKOSH_AUTH_JWT_ACTIVE_KID:-}
-      MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: ${MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR:-}
+      # mokosh-auth (SSO / OIDC) configuration, pinned to the per-developer
+      # `*.a8n.run` Traefik routes. `just dev` runs `ensure-oidc-keys` to
+      # generate the keypair via `scripts/gen-oidc-key.sh`; the script writes
+      # into ./secrets which is mounted read-only into the container at
+      # /app/secrets below.
+      #
+      # mokosh-server keeps its OWN issuer identity for its (now-unused) OP
+      # endpoints; token validation is done by the RS verifier below, NOT this.
+      MOKOSH_AUTH_ISSUER: https://${USER}-mokosh-api.a8n.run
+      # RS verifier (the bunyip-as-OP path). OIDC_ISSUER must equal the token
+      # `iss` AND bunyip's advertised discovery issuer; OIDC_AUDIENCE must equal
+      # the `audience` on the mokosh-apps oauth_clients row in bunyip-api.
+      OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
+      OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
+      # Cross-subdomain SSO: cookies span every *.a8n.run app this user
+      # might add later. Mirrors saas / dmarc-reporter behaviour.
+      MOKOSH_AUTH_COOKIE_DOMAIN: .a8n.run
+      # Keys live in ./secrets, mounted at /app/secrets:ro above. The RS path
+      # fetches bunyip's keys over JWKS, so no cross-service key copy is needed.
+      MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: /app/secrets/dev-key.pem
+      MOKOSH_AUTH_JWT_ACTIVE_KID: dev-key
+      MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: /app/secrets
+      # Account-management email links (invites, password reset, signup
+      # complete) land on bunyip - it owns the user-account surface. See
+      # docs/bunyip/07-sso-redirect-bridge.md.
+      MOKOSH_ACCEPT_BASE_URL: http://${USER}-bunyip.a8n.run
+      # Universal sign-in URL. /oauth2/authorize 302s unauthenticated users
+      # here with ?return_to=<authorize_query> so bunyip's login is the only
+      # sign-in screen any RP ever uses. See docs/bunyip/07-sso-redirect-bridge.md.
+      MOKOSH_AUTH_LOGIN_URL: https://${USER}-bunyip.a8n.run/login
+      # Enable public self-signup. Dev defaults on so we can smoke-test the
+      # flow. See docs/mokosh-auth/10-memberships-and-self-signup.md.
+      MOKOSH_PUBLIC_SIGNUP_ENABLED: "true"
       MOKOSH_AUTH_DATA_ENCRYPTION_KEY: ${MOKOSH_AUTH_DATA_ENCRYPTION_KEY:-}
       MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV: ${MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV:-}
       MOKOSH_AUTH_DATA_KEY_VERSION: ${MOKOSH_AUTH_DATA_KEY_VERSION:-1}
@@ -275,12 +301,35 @@ services:
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:
       - private
-    ports:
-      # Host port 4302 by default so the client dev stack can keep host
-      # 4301 for the SPA + Dioxus dev-server proxy. Container port is
-      # MOKOSH_PORT (4301) - the API itself still listens on 4301 inside
-      # the network.
-      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_API_HOST_PORT:-4302}:${MOKOSH_PORT}"
+      - traefik-public
+    # Traefik is the sole ingress for the dev stack; the server publishes no
+    # LAN-IP host port. Routing and Let's Encrypt TLS termination come from the
+    # shared Traefik via the labels below. (postgres still publishes its host
+    # port for sqlx-cli; see that service.)
+    #
+    # List (sequence) syntax is REQUIRED here, not the usual map syntax.
+    # Docker Compose interpolates ${USER} inside string VALUES but NOT
+    # inside map KEYS (verified on Compose v2.40). The router name lives
+    # in the label key, so map syntax leaves a literal `${USER}` in the
+    # router name, Traefik rejects it, and the host never routes (default
+    # cert + 404). In list form the whole "key=value" is one string value,
+    # so ${USER} in the router name interpolates correctly.
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=network-traefik-public
+      - traefik.http.routers.mokosh-api-${USER}.rule=Host(`${USER}-mokosh-api.a8n.run`)
+      - traefik.http.routers.mokosh-api-${USER}.entrypoints=nebula-secure
+      - traefik.http.routers.mokosh-api-${USER}.tls.certresolver=cert-cloudflare
+      - traefik.http.services.mokosh-api-${USER}.loadbalancer.server.port=${MOKOSH_PORT}
+    # The bunyip-as-OP RS verifier (oidc_rs.rs) fetches
+    # `${OIDC_ISSUER}/.well-known/openid-configuration`, but inside the
+    # container the issuer host resolves to the box's PUBLIC edge (self-signed
+    # cert + 404 on the OP path). Pin it to the LOCAL Traefik on the shared
+    # network, which serves the OP with a valid Let's Encrypt cert. Override
+    # BUNYIP_OP_TRAEFIK_IP in .env on a box whose Traefik publishes
+    # nebula-secure on a different IP.
+    extra_hosts:
+      - "${USER}-bunyip-api.a8n.run:${BUNYIP_OP_TRAEFIK_IP:-172.30.0.11}"
     volumes:
       - ./src:/app/src
       - ./crates:/app/crates
@@ -322,3 +371,8 @@ volumes:
 networks:
   private:
     name: dev-mokosh-private-${USER:?USER missing - run via just dev}
+  # Shared Traefik ingress network. Genuinely external (owned by the Traefik
+  # stack), so compose attaches rather than creates it; it must already exist.
+  traefik-public:
+    name: network-traefik-public
+    external: true

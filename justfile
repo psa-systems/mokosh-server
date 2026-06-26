@@ -110,10 +110,10 @@ check-docker:
 ensure-env:
     @test -f .env || cp .env.example .env
 
-# Bring up the dev stack (mokosh-server + Postgres + Valkey (no Infisical — use just dev-infisical)). Trailing args go to `docker compose up` (e.g. --detach).
-[doc("Start the dev stack in Docker. Trailing args go to `docker compose up` (e.g. --detach).")]
+# Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical — use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
+[doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
 [group: 'dev']
-dev *args: ensure-env
+dev *args: ensure-env ensure-oidc-keys
     #!/usr/bin/env nu
     let bind_ip = (
         sys net
@@ -158,54 +158,8 @@ ensure-oidc-keys:
     fi
     bash ./scripts/gen-oidc-key.sh dev-key
 
-# Per-developer Traefik-routed instance for SSO testing.
-#   API:  https://{USER}-mokosh-api.a8n.run
-# Run `just dev-sso` here AND in mokosh-apps to get both ends up.
-# Each per-developer stack gets its OWN private network,
-# `dev-mokosh-private-${USER}`, matching the name compose.dev.yml
-# assigns. The dev-sso overlay marks that network external (it only
-# ATTACHES rather than owning it), so compose will not create it. We
-# create it defensively here (idempotent: skipped if it already
-# exists). The name MUST match the base/overlay name or the server
-# lands on a different network than Postgres and crash-loops on DB
-# connect. Without this step a clean host would have nothing to attach
-# to and `docker compose up` would error.
-[private]
-ensure-private-network:
-    @docker network inspect dev-mokosh-private-${USER} >/dev/null 2>&1 || docker network create dev-mokosh-private-${USER} >/dev/null
-
-[doc("Start the SSO dev stack (Traefik-routed at *.a8n.run)")]
-[group: 'dev']
-dev-sso: ensure-env ensure-oidc-keys ensure-private-network
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml up --build --detach
-    @echo ""
-    @echo "Mokosh API (OIDC IdP):"
-    @echo "  https://{{env('USER')}}-mokosh-api.a8n.run"
-    @echo "  https://{{env('USER')}}-mokosh-api.a8n.run/.well-known/openid-configuration"
-    @echo ""
-    @echo "Next:"
-    @echo "  1. (cd ../mokosh-apps && just dev-sso)"
-    @echo "  2. just register-client     # registers mokosh-apps-web in oauth_clients"
-    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-apps/.env to the printed UUID"
-
-# Stop the SSO dev stack.
-[doc("Stop the SSO dev stack")]
-[group: 'dev']
-dev-sso-down: ensure-env
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down
-
-# Bring the SSO dev stack down and back up. Useful after pulling a
-# code change or editing compose env vars: `down` waits for containers
-# to fully terminate before `dev-sso` starts the fresh ones, so the
-# rebuild picks up the new state. `down` is synchronous (docker
-# compose down blocks until removal completes) and `dev-sso` uses
-# `--detach`, so this returns once the new stack is up.
-[doc("Stop the dev stack and start dev-sso fresh.")]
-[group: 'dev']
-restart: down dev-sso
-
 # Register mokosh-apps as a public OIDC client. Run once after
-# `just dev-sso` is up. Prints the client_id UUID; copy it into
+# `just dev` is up. Prints the client_id UUID; copy it into
 # mokosh-apps/.env as MOKOSH_OIDC_CLIENT_ID.
 [doc("Register bunyip-web as a public OIDC client (one-shot, idempotent on (name))")]
 register-bunyip-client: ensure-env
@@ -214,10 +168,10 @@ register-bunyip-client: ensure-env
     let api_origin = $"https://($user)-mokosh-api.a8n.run"
     let hub_origin = $"https://($user)-bunyip.a8n.run"
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=bunyip-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($hub_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($hub_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
+    docker compose --file {{ compose_file }} exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=bunyip-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($hub_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($hub_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
 
 # Register lets-chat as a confidential OIDC client. Run once after
-# `just dev-sso` is up. Prints the client_id UUID + client_secret;
+# `just dev` is up. Prints the client_id UUID + client_secret;
 # capture both:
 #   client_id     -> lets-chat/.env LETS_CHAT_SSO_CLIENT_ID
 #   client_secret -> lets-chat/.env LETS_CHAT_SSO_CLIENT_SECRET (gitignored)
@@ -230,7 +184,7 @@ register-lets-chat-client: ensure-env
     let api_origin = $"https://($user)-mokosh-api.a8n.run"
     let chat_origin = $"https://($user)-chat.a8n.run"
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/default/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
+    docker compose --file {{ compose_file }} exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/default/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
 
 [doc("Register mokosh-apps as a public OIDC client (one-shot, idempotent on (name))")]
 register-client: ensure-env
@@ -244,23 +198,14 @@ register-client: ensure-env
     # exported to the host shell (compose reads it for interpolation),
     # so we hardcode the in-network URL here as the canonical fallback.
     let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=PSA-Mokosh-Clients" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=PSA tools for the day-to-day" --env $"MOKOSH_CLIENT_ICON_URL=($app_origin)/assets/icon.svg" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
+    docker compose --file {{ compose_file }} exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=PSA-Mokosh-Clients" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=PSA tools for the day-to-day" --env $"MOKOSH_CLIENT_ICON_URL=($app_origin)/assets/icon.svg" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
 
-# Stop everything this repo runs (both LAN-IP and SSO modes), regardless
-# of which `just dev*` you started with. Volumes preserved.
-# `--remove-orphans` cleans up containers from one compose file that the
-# other file does not declare (e.g. the SSO postgres if you only ran
-# `just dev` historically).
-[doc("Stop the entire dev stack (LAN-IP and SSO modes). Volumes preserved.")]
-[group: 'dev']
-down: ensure-env
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
-
-# Stop the dev stack (compose.dev.yml). Volumes preserved.
+# Stop the dev stack. Volumes preserved. `--remove-orphans` cleans up any
+# stray containers left over from an older multi-file layout.
 [doc("Stop the dev stack (volumes preserved)")]
 [group: 'dev']
-dev-down: ensure-env
-    docker compose --file {{ compose_file }} down
+down: ensure-env
+    docker compose --file {{ compose_file }} down --remove-orphans
 
 # Bootstrap Infisical for the dev stack (run once after `just dev`).
 [doc("Bootstrap Infisical for the dev stack (run once after `just dev`)")]
@@ -302,11 +247,11 @@ migrate-create name:
 
 # -- Cleanup ------------------------------------------------------------------
 
-# Tear down this repo's dev footprint: stop both dev stacks (LAN-IP compose.dev.yml and the SSO overlay compose.dev-sso.yml) with their default network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
 [group: 'cleanup']
 dev-clean: ensure-env
     #!/usr/bin/env nu
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
+    docker compose --file {{ compose_file }} down --remove-orphans
     let suffix = $env.USER
     let vols = [
         $"dev-mokosh-postgres-data-($suffix)"
