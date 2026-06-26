@@ -54,6 +54,14 @@ fn env_allows_dev_secrets(environment: &str) -> bool {
     matches!(environment, "development" | "dev" | "test")
 }
 
+/// True when `s` is exactly 64 ASCII hex characters - the canonical
+/// `ENCRYPTION_KEY` form (32 bytes, hex-encoded) required outside dev/test
+/// (PMS-498). A raw 32-byte key is ambiguous and weaker to mistype, so it is
+/// accepted only in dev/test.
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Resolve a secret env var, refusing the dev fallback outside dev/test.
 /// In dev/test an unset var falls back to `dev_value`. In every other
 /// environment an unset var - or one explicitly set to `dev_value` - is a
@@ -113,6 +121,19 @@ impl AppConfig {
         // silently serving with a publicly-known JWT_SECRET / ENCRYPTION_KEY.
         let jwt_secret = resolve_secret("JWT_SECRET", &environment, DEV_JWT_SECRET)?;
         let encryption_key = resolve_secret("ENCRYPTION_KEY", &environment, DEV_ENCRYPTION_KEY)?;
+
+        // PMS-498: outside dev/test the at-rest AES-256-GCM key must be the
+        // unambiguous 64-hex form. resolve_secret already refuses an unset var
+        // or the dev sentinel here; this additionally rejects a raw-ASCII or
+        // mistyped key so production/staging cannot boot on a weak at-rest key.
+        if !env_allows_dev_secrets(&environment) && !is_hex64(&encryption_key) {
+            return Err(format!(
+                "ENCRYPTION_KEY must be a 64-character hex string in the '{environment}' \
+                 environment (32 bytes, hex-encoded); only development/dev/test accept a raw \
+                 32-byte key."
+            )
+            .into());
+        }
 
         Ok(Self {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -579,6 +600,23 @@ mod tests {
                 "{env} must NOT allow dev secrets"
             );
         }
+    }
+
+    // PMS-498: outside dev/test the ENCRYPTION_KEY must be the 64-hex form.
+    #[test]
+    fn is_hex64_accepts_only_64_hex_chars() {
+        assert!(is_hex64(&"ab".repeat(32)), "64 hex chars must be accepted");
+        assert!(is_hex64(&"00".repeat(32)));
+        assert!(!is_hex64(&"ab".repeat(31)), "63 chars too short");
+        assert!(!is_hex64(&"ab".repeat(33)), "66 chars too long");
+        assert!(
+            !is_hex64("32-byte-key-for-dev-only-change!"),
+            "raw 32-byte dev key is not 64 hex"
+        );
+        assert!(
+            !is_hex64(&"zz".repeat(32)),
+            "64 non-hex chars must be rejected"
+        );
     }
 
     // Use a per-test unique var name so the env mutation cannot collide with
