@@ -38,6 +38,58 @@ pub struct AppConfig {
     pub oauth_super_admin_emails: Vec<String>,
 }
 
+/// Dev-only fallback for `JWT_SECRET`. Accepted only in dev/test
+/// environments; in any other environment its presence (or an unset
+/// `JWT_SECRET`) is a fatal boot error (PMS-499).
+const DEV_JWT_SECRET: &str = "development-secret-change-in-production";
+/// Dev-only fallback for `ENCRYPTION_KEY`. Same production guard as
+/// [`DEV_JWT_SECRET`] (PMS-499).
+const DEV_ENCRYPTION_KEY: &str = "32-byte-key-for-dev-only-change!";
+
+/// True for the environments that may use the hardcoded dev fallbacks.
+/// Anything else (staging, production, or an unrecognized value) fails
+/// safe: it must supply real secrets. Mirrors [`AppConfig::is_dev_or_test`]
+/// but works on the raw env string before the struct is built.
+fn env_allows_dev_secrets(environment: &str) -> bool {
+    matches!(environment, "development" | "dev" | "test")
+}
+
+/// Resolve a secret env var, refusing the dev fallback outside dev/test.
+/// In dev/test an unset var falls back to `dev_value`. In every other
+/// environment an unset var - or one explicitly set to `dev_value` - is a
+/// fatal boot error, consistent with the other fail-loud startup checks
+/// (SMTP/Google/migrations) (PMS-499).
+fn resolve_secret(
+    var_name: &str,
+    environment: &str,
+    dev_value: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match std::env::var(var_name) {
+        Ok(value) if !value.is_empty() => {
+            if value == dev_value && !env_allows_dev_secrets(environment) {
+                return Err(format!(
+                    "{var_name} is set to the known dev fallback value, which is refused in the \
+                     '{environment}' environment. Set a real secret (only development/dev/test \
+                     accept the dev default)."
+                )
+                .into());
+            }
+            Ok(value)
+        }
+        _ => {
+            if env_allows_dev_secrets(environment) {
+                Ok(dev_value.to_string())
+            } else {
+                Err(format!(
+                    "{var_name} is unset but required in the '{environment}' environment; the \
+                     hardcoded dev fallback is only accepted in development/dev/test."
+                )
+                .into())
+            }
+        }
+    }
+}
+
 impl AppConfig {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         dotenvy::dotenv().ok();
@@ -52,6 +104,16 @@ impl AppConfig {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let environment =
+            std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
+
+        // PMS-499: refuse the hardcoded dev fallbacks for the auth/crypto
+        // secrets outside dev/test. Resolved before the struct is built so a
+        // production/staging/unknown environment fails loud at boot rather than
+        // silently serving with a publicly-known JWT_SECRET / ENCRYPTION_KEY.
+        let jwt_secret = resolve_secret("JWT_SECRET", &environment, DEV_JWT_SECRET)?;
+        let encryption_key = resolve_secret("ENCRYPTION_KEY", &environment, DEV_ENCRYPTION_KEY)?;
+
         Ok(Self {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
@@ -64,22 +126,20 @@ impl AppConfig {
                 .unwrap_or_else(|_| {
                     "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
                 }),
-            jwt_secret: std::env::var("JWT_SECRET")
-                .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
+            jwt_secret,
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()
                 .unwrap_or(8080),
-            environment: std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
+            environment,
             base_url: std::env::var("BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
             run_migrations: std::env::var("RUN_MIGRATIONS")
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .unwrap_or(true),
-            encryption_key: std::env::var("ENCRYPTION_KEY")
-                .unwrap_or_else(|_| "32-byte-key-for-dev-only-change!".to_string()),
+            encryption_key,
             client_origin: std::env::var("CLIENT_ORIGIN")
                 .unwrap_or_else(|_| "http://localhost:4301".to_string()),
             cors_origins: std::env::var("CORS_ORIGIN")
@@ -494,6 +554,65 @@ async fn try_bootstrap_sso(pool: sqlx::PgPool) -> Result<SsoSetup, Box<dyn std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PMS-499: the dev fallbacks for JWT_SECRET / ENCRYPTION_KEY are only
+    // allowed in dev/test. Every other environment must supply a real secret.
+    #[test]
+    fn env_allows_dev_secrets_only_in_dev_test() {
+        for env in ["development", "dev", "test"] {
+            assert!(
+                env_allows_dev_secrets(env),
+                "{env} should allow dev secrets"
+            );
+        }
+        for env in ["production", "staging", "prod", "", "Development", "qa"] {
+            assert!(
+                !env_allows_dev_secrets(env),
+                "{env} must NOT allow dev secrets"
+            );
+        }
+    }
+
+    // Use a per-test unique var name so the env mutation cannot collide with
+    // sibling tests running in the same process.
+    #[test]
+    fn resolve_secret_dev_env_falls_back() {
+        let var = "PMS499_TEST_DEV_FALLBACK";
+        std::env::remove_var(var);
+        let got = resolve_secret(var, "development", "the-dev-value").unwrap();
+        assert_eq!(got, "the-dev-value");
+    }
+
+    #[test]
+    fn resolve_secret_prod_unset_is_fatal() {
+        let var = "PMS499_TEST_PROD_UNSET";
+        std::env::remove_var(var);
+        assert!(
+            resolve_secret(var, "production", "the-dev-value").is_err(),
+            "unset secret in production must error"
+        );
+    }
+
+    #[test]
+    fn resolve_secret_prod_dev_value_is_fatal() {
+        let var = "PMS499_TEST_PROD_DEVVAL";
+        std::env::set_var(var, "the-dev-value");
+        let result = resolve_secret(var, "production", "the-dev-value");
+        std::env::remove_var(var);
+        assert!(
+            result.is_err(),
+            "explicit dev fallback in production must error"
+        );
+    }
+
+    #[test]
+    fn resolve_secret_prod_real_value_ok() {
+        let var = "PMS499_TEST_PROD_REAL";
+        std::env::set_var(var, "a-real-production-secret");
+        let result = resolve_secret(var, "production", "the-dev-value");
+        std::env::remove_var(var);
+        assert_eq!(result.unwrap(), "a-real-production-secret");
+    }
 
     // PMS-289: the fatal-vs-degrade decision hinges on this intent detector -
     // none of the MOKOSH_AUTH_* env set means "SSO off, run legacy" (degrade);
