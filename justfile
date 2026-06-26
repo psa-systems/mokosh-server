@@ -104,11 +104,63 @@ check-docker:
     let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
     docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
-# Create .env from the committed .env.example if missing
+# Create .env from the committed .env.example if missing, generating a strong
+# random value for every self-owned secret so a generic password never lands in
+# .env (PMS-490). Only the create path generates; an existing .env is left
+# untouched, so the recipe stays idempotent as a dependency of other recipes.
+# Third-party credentials (Google, Stripe, Twilio, Slack, Infisical client) stay
+# empty placeholders because they cannot be generated. Passwords that get
+# interpolated into postgres:// URLs are hex (URL-safe alphanumeric); the URL
+# lines are rebuilt from the same generated values so host-side tools (sqlx-cli)
+# stay consistent with the container roles compose provisions from the knobs.
 [private]
 [group: 'hooks']
 ensure-env:
-    @test -f .env || cp .env.example .env
+    #!/usr/bin/env nu
+    if ('.env' | path exists) { return }
+    # Self-owned secrets. DB passwords are hex (URL-safe, >= 24 chars) so they
+    # interpolate raw into postgres:// URLs; ENCRYPTION_KEY = 64 hex (32 bytes);
+    # JWT_SECRET = 64 hex (256-bit); INFISICAL_ENCRYPTION_KEY = 32 hex (16 bytes);
+    # INFISICAL_AUTH_SECRET = base64 of 32 random bytes.
+    let pg_password = (^openssl rand -hex 24 | str trim)
+    let migrator_password = (^openssl rand -hex 24 | str trim)
+    let app_password = (^openssl rand -hex 24 | str trim)
+    let jwt_secret = (^openssl rand -hex 32 | str trim)
+    let encryption_key = (^openssl rand -hex 32 | str trim)
+    let infisical_pg_password = (^openssl rand -hex 24 | str trim)
+    let infisical_encryption_key = (^openssl rand -hex 16 | str trim)
+    let infisical_auth_secret = (^openssl rand -base64 32 | str trim)
+    # Scalar KEY=value replacements plus URL lines rebuilt from the same passwords.
+    let overrides = {
+        MOKOSH_PG_PASSWORD: $pg_password
+        MOKOSH_MIGRATOR_PASSWORD: $migrator_password
+        MOKOSH_APP_PASSWORD: $app_password
+        JWT_SECRET: $jwt_secret
+        ENCRYPTION_KEY: $encryption_key
+        INFISICAL_PG_PASSWORD: $infisical_pg_password
+        INFISICAL_ENCRYPTION_KEY: $infisical_encryption_key
+        INFISICAL_AUTH_SECRET: $infisical_auth_secret
+        DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
+        MOKOSH_ADMIN_DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
+        MOKOSH_APP_DATABASE_URL: $"postgres://mokosh_app:($app_password)@localhost:5433/mokosh"
+        INFISICAL_DB_CONNECTION_URI: $"postgres://infisical:($infisical_pg_password)@infisical-postgres:5432/infisical"
+    }
+    let keys = ($overrides | columns)
+    let rendered = (
+        open .env.example --raw
+        | lines
+        | each {|line|
+            let key = ($line | split row '=' | get 0?)
+            if ($key != null) and ($key in $keys) {
+                $"($key)=($overrides | get $key)"
+            } else {
+                $line
+            }
+        }
+        | str join "\n"
+    )
+    $"($rendered)\n" | save .env
+    print "ensure-env: created .env with freshly generated self-owned secrets"
 
 # Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical — use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
 [doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
