@@ -218,6 +218,69 @@ impl AttachmentService {
         bytes: Vec<u8>,
         uploader: Uploader,
     ) -> AppResult<AttachmentResponse> {
+        let (uploaded_by_id, created_by_contact_id) = uploader.row_columns();
+        self.insert_blob(
+            tenant_id,
+            ticket_id,
+            Some(note_id),
+            file_name,
+            mime_type,
+            bytes,
+            uploaded_by_id,
+            created_by_contact_id,
+        )
+        .await
+    }
+
+    /// PMS-450 AC3: persist an inbound email attachment. Unlike the
+    /// agent / portal upload paths this allows a NULL `note_id` (an
+    /// attachment on a freshly-created email ticket hangs off the
+    /// ticket, not a note) and attributes authorship to the sender
+    /// contact via `created_by_contact_id`. Reuses the same on-disk
+    /// blob layout, sanitisation, and size cap as the interactive
+    /// uploads so the download / delete surface treats the row
+    /// identically.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_email_attachment(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        note_id: Option<Uuid>,
+        contact_id: Uuid,
+        file_name: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+    ) -> AppResult<AttachmentResponse> {
+        self.insert_blob(
+            tenant_id,
+            ticket_id,
+            note_id,
+            file_name,
+            mime_type,
+            bytes,
+            None,
+            Some(contact_id),
+        )
+        .await
+    }
+
+    /// Shared blob path for every attachment origin: enforce the size
+    /// cap, write the bytes to `{dir}/{tenant}/{uuid}`, then insert the
+    /// metadata row. The two authorship columns are passed through
+    /// verbatim so each caller sets the column that matches its origin
+    /// (agent -> `uploaded_by_id`, portal / email -> `created_by_contact_id`).
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_blob(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        note_id: Option<Uuid>,
+        file_name: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+        uploaded_by_id: Option<Uuid>,
+        created_by_contact_id: Option<Uuid>,
+    ) -> AppResult<AttachmentResponse> {
         let size = bytes.len();
         if size as u64 > self.config.max_bytes {
             return Err(AppError::PayloadTooLarge(format!(
@@ -237,7 +300,6 @@ impl AttachmentService {
             .map_err(|e| AppError::Internal(format!("could not write attachment: {e}")))?;
         let storage_path = path.to_string_lossy().to_string();
 
-        let (uploaded_by_id, created_by_contact_id) = uploader.row_columns();
         let safe_name = sanitize_filename(&file_name);
         let safe_mime = sanitize_mime_type(&mime_type);
 
