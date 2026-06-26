@@ -18,7 +18,6 @@ use crate::db::Database;
 use crate::modules::approvals::{approval_routes, ApprovalsService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_routes, AuditService};
-use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
@@ -52,10 +51,8 @@ use crate::version_check::version_check;
 
 /// Create the main API router with all routes.
 ///
-/// When `at_jwt` is `Some`, PSA endpoints accept access tokens minted by
-/// `mokosh-auth` (EdDSA `at+jwt`) in addition to the legacy HS256
-/// cookie. Pass `None` to run with legacy auth only (e.g. dev environments
-/// where SSO env vars are not configured).
+/// PSA endpoints authenticate via the bunyip-as-OP Resource-Server path
+/// (`bunyip_verifier`, when `Some`) and the legacy HS256 cookie path.
 #[allow(clippy::too_many_arguments)]
 pub fn create_api_router(
     db: Database,
@@ -65,7 +62,6 @@ pub fn create_api_router(
     cors_origins: Vec<String>,
     super_admin_emails: Vec<String>,
     cookie_secure: bool,
-    at_jwt: Option<AtJwtVerifier>,
     bunyip_verifier: Option<crate::modules::auth::oidc_rs::Verifier>,
     mailer: Arc<dyn crate::utils::email::Mailer>,
     // 32-byte AES-256-GCM key. Used for at-rest encryption of any
@@ -170,13 +166,10 @@ pub fn create_api_router(
     let settings_service = Arc::new(SettingsService::new(db.clone()));
     let audit_service = AuditService::new(db.clone());
 
-    // Create auth middleware. The at+jwt verifier (when present) is
-    // attached so the same middleware can authenticate either kind of
-    // bearer token.
+    // Create auth middleware. The bunyip Resource-Server verifier (when
+    // present) is attached so the middleware can authenticate bunyip-minted
+    // bearer tokens alongside legacy HS256 cookies.
     let mut auth_middleware = AuthMiddleware::new(auth_service.clone());
-    if let Some(v) = at_jwt {
-        auth_middleware = auth_middleware.with_at_jwt(v);
-    }
     if let Some(v) = bunyip_verifier {
         auth_middleware = auth_middleware.with_bunyip(v);
         // PMS-244: the bunyip path resolves the user's tenant from Mokosh's own

@@ -113,7 +113,7 @@ ensure-env:
 # Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical — use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
 [doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
 [group: 'dev']
-dev *args: ensure-env ensure-oidc-keys
+dev *args: ensure-env
     #!/usr/bin/env nu
     let bind_ip = (
         sys net
@@ -144,61 +144,6 @@ dev *args: ensure-env ensure-oidc-keys
 [group: 'dev']
 dev-infisical *args: ensure-env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
-
-# Generate the dev OIDC Ed25519 keypair (kid=dev-key) if missing.
-# Each per-developer instance must generate its own; the repo does not
-# ship private keys (see secrets/ in .gitignore). Without these the
-# server crash-loops with "Failed to read OIDC private key".
-[private]
-ensure-oidc-keys:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -f secrets/dev-key.pem ] && [ -f secrets/dev-key.pub.pem ]; then
-        exit 0
-    fi
-    bash ./scripts/gen-oidc-key.sh dev-key
-
-# Register mokosh-apps as a public OIDC client. Run once after
-# `just dev` is up. Prints the client_id UUID; copy it into
-# mokosh-apps/.env as MOKOSH_OIDC_CLIENT_ID.
-[doc("Register bunyip-web as a public OIDC client (one-shot, idempotent on (name))")]
-register-bunyip-client: ensure-env
-    #!/usr/bin/env nu
-    let user = $env.USER
-    let api_origin = $"https://($user)-mokosh-api.a8n.run"
-    let hub_origin = $"https://($user)-bunyip.a8n.run"
-    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=bunyip-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($hub_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($hub_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
-
-# Register lets-chat as a confidential OIDC client. Run once after
-# `just dev` is up. Prints the client_id UUID + client_secret;
-# capture both:
-#   client_id     -> lets-chat/.env LETS_CHAT_SSO_CLIENT_ID
-#   client_secret -> lets-chat/.env LETS_CHAT_SSO_CLIENT_SECRET (gitignored)
-# The secret cannot be retrieved later, only rotated. Lose it = re-run
-# this recipe + update .env.
-[doc("Register lets-chat as a confidential OIDC client (one-shot, idempotent on (name))")]
-register-lets-chat-client: ensure-env
-    #!/usr/bin/env nu
-    let user = $env.USER
-    let api_origin = $"https://($user)-mokosh-api.a8n.run"
-    let chat_origin = $"https://($user)-chat.a8n.run"
-    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/default/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
-
-[doc("Register mokosh-apps as a public OIDC client (one-shot, idempotent on (name))")]
-register-client: ensure-env
-    #!/usr/bin/env nu
-    let user = $env.USER
-    let api_origin = $"https://($user)-mokosh-api.a8n.run"
-    let app_origin = $"https://($user)-mokosh.a8n.run"
-    # In-network DNS: the postgres compose service is reachable at the
-    # short name `postgres` from inside any container on the private
-    # network. The DATABASE_URL_IN_CONTAINER value in .env is not
-    # exported to the host shell (compose reads it for interpolation),
-    # so we hardcode the in-network URL here as the canonical fallback.
-    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=PSA-Mokosh-Clients" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=PSA tools for the day-to-day" --env $"MOKOSH_CLIENT_ICON_URL=($app_origin)/assets/icon.svg" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-server -- clients register
 
 # Stop the dev stack. Volumes preserved. `--remove-orphans` cleans up any
 # stray containers left over from an older multi-file layout.

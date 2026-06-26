@@ -4,7 +4,7 @@
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use crate::totp::base32_encode;
+use super::totp::base32_encode;
 
 pub const RECOVERY_CODE_COUNT: usize = 10;
 pub const RECOVERY_CODE_BYTES: usize = 10;
