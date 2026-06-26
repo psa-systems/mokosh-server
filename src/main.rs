@@ -38,6 +38,17 @@ pub struct AppConfig {
     pub oauth_super_admin_emails: Vec<String>,
 }
 
+/// The convenience JWT signing secret baked in for dev/test. Outside
+/// dev/test this exact value (or no secret at all) is a fatal boot error:
+/// shipping it to staging/production lets anyone forge session cookies.
+const DEV_JWT_SECRET: &str = "development-secret-change-in-production";
+
+/// Minimum acceptable `JWT_SECRET` length outside dev/test. An HS256 key
+/// shorter than the 32-byte SHA-256 output is below the algorithm's own
+/// security margin, so a too-short secret fails loud alongside the unset /
+/// dev-default cases.
+const MIN_JWT_SECRET_LEN: usize = 32;
+
 impl AppConfig {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         dotenvy::dotenv().ok();
@@ -52,7 +63,12 @@ impl AppConfig {
             .filter(|s| !s.is_empty())
             .collect();
 
-        Ok(Self {
+        // Track whether JWT_SECRET was supplied so the production guard below
+        // can tell "unset" (falls back to the dev sentinel) apart from an
+        // explicit-but-weak value, and report each distinctly.
+        let jwt_secret_env = std::env::var("JWT_SECRET").ok();
+
+        let config = Self {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
             }),
@@ -64,8 +80,9 @@ impl AppConfig {
                 .unwrap_or_else(|_| {
                     "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
                 }),
-            jwt_secret: std::env::var("JWT_SECRET")
-                .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
+            jwt_secret: jwt_secret_env
+                .clone()
+                .unwrap_or_else(|| DEV_JWT_SECRET.to_string()),
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
@@ -96,11 +113,70 @@ impl AppConfig {
                         .unwrap_or_else(|_| "http://localhost:4301".to_string())]
                 }),
             oauth_super_admin_emails,
-        })
+        };
+
+        config.validate_jwt_secret(jwt_secret_env.is_some())?;
+
+        Ok(config)
     }
 
     pub fn is_production(&self) -> bool {
         self.environment == "production"
+    }
+
+    /// Refuse to boot a non-dev/test server with a missing, dev-default, or
+    /// too-short `JWT_SECRET`. Dev/test keep the convenience default; every
+    /// other environment (staging, production, or any unrecognized value)
+    /// must supply a real secret, consistent with the fail-loud treatment of
+    /// ENCRYPTION_KEY/SMTP/CORS/migrations (PMS-497).
+    ///
+    /// `jwt_secret_set` is whether `JWT_SECRET` was present in the env, so an
+    /// unset secret (it falls back to the dev sentinel) reports differently
+    /// from one explicitly pinned to the sentinel. `is_production()` is wired
+    /// in here as the label for the strictest environment so the method gates
+    /// the secret rather than sitting dead.
+    fn validate_jwt_secret(&self, jwt_secret_set: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // Dev/test run over the baked-in default by design; nothing to enforce.
+        if self.is_dev_or_test() {
+            return Ok(());
+        }
+
+        let env_label = if self.is_production() {
+            "production"
+        } else {
+            "non-dev environment"
+        };
+
+        if !jwt_secret_set {
+            return Err(format!(
+                "JWT_SECRET is unset in {env_label} (ENVIRONMENT={}); refusing to boot with the \
+                 built-in dev default. Set JWT_SECRET to a unique secret of at least \
+                 {MIN_JWT_SECRET_LEN} bytes.",
+                self.environment
+            )
+            .into());
+        }
+
+        if self.jwt_secret == DEV_JWT_SECRET {
+            return Err(format!(
+                "JWT_SECRET is the built-in dev default in {env_label} (ENVIRONMENT={}); refusing \
+                 to boot. Set JWT_SECRET to a unique secret of at least {MIN_JWT_SECRET_LEN} bytes.",
+                self.environment
+            )
+            .into());
+        }
+
+        if self.jwt_secret.len() < MIN_JWT_SECRET_LEN {
+            return Err(format!(
+                "JWT_SECRET is too short in {env_label} (ENVIRONMENT={}): {} bytes, need at least \
+                 {MIN_JWT_SECRET_LEN}.",
+                self.environment,
+                self.jwt_secret.len()
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Dev/test environments run over plain HTTP, where browsers drop
@@ -523,5 +599,73 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    // PMS-497: a config carrying the given environment + secret, with the
+    // remaining fields set to harmless dev defaults so the JWT_SECRET guard
+    // can be exercised in isolation (no env-var mutation, no DB).
+    fn cfg(environment: &str, jwt_secret: &str) -> AppConfig {
+        AppConfig {
+            database_url: String::new(),
+            app_database_url: String::new(),
+            jwt_secret: jwt_secret.to_string(),
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            environment: environment.to_string(),
+            base_url: String::new(),
+            run_migrations: false,
+            encryption_key: String::new(),
+            client_origin: String::new(),
+            cors_origins: vec![],
+            oauth_super_admin_emails: vec![],
+        }
+    }
+
+    #[test]
+    fn dev_test_keep_the_dev_default_secret() {
+        for env in ["development", "dev", "test"] {
+            assert!(
+                cfg(env, DEV_JWT_SECRET).validate_jwt_secret(false).is_ok(),
+                "{env} must boot with the unset/dev-default secret"
+            );
+        }
+    }
+
+    #[test]
+    fn production_rejects_unset_secret() {
+        // jwt_secret_set = false => JWT_SECRET was never supplied.
+        assert!(cfg("production", DEV_JWT_SECRET)
+            .validate_jwt_secret(false)
+            .is_err());
+    }
+
+    #[test]
+    fn production_rejects_explicit_dev_default_secret() {
+        assert!(cfg("production", DEV_JWT_SECRET)
+            .validate_jwt_secret(true)
+            .is_err());
+    }
+
+    #[test]
+    fn production_rejects_too_short_secret() {
+        let short = "x".repeat(MIN_JWT_SECRET_LEN - 1);
+        assert!(cfg("production", &short).validate_jwt_secret(true).is_err());
+    }
+
+    #[test]
+    fn production_accepts_strong_secret() {
+        let strong = "a".repeat(MIN_JWT_SECRET_LEN);
+        assert!(cfg("production", &strong).validate_jwt_secret(true).is_ok());
+    }
+
+    #[test]
+    fn staging_is_guarded_like_production() {
+        // Any value not in {development,dev,test} fails safe: an unrecognized
+        // "staging" env still rejects the dev default.
+        assert!(cfg("staging", DEV_JWT_SECRET)
+            .validate_jwt_secret(false)
+            .is_err());
+        let strong = "b".repeat(MIN_JWT_SECRET_LEN);
+        assert!(cfg("staging", &strong).validate_jwt_secret(true).is_ok());
     }
 }
