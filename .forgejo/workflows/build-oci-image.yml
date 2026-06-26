@@ -28,7 +28,7 @@ on:
 
 jobs:
   build-and-push:
-    name: Build and push mokosh-api image
+    name: Build and push mokosh-server image
     # Only main and version tags publish the production image. workflow_dispatch
     # from a feature branch must not overwrite :latest, so gate the job on the
     # ref in addition to the push-trigger branch filter above.
