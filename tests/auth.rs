@@ -315,12 +315,12 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
         .await
         .expect("mfa setup JSON");
     let secret_b32 = setup["secret"].as_str().expect("secret in mfa setup");
-    let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32).expect("decode mfa secret");
+    let secret = mokosh_server::utils::totp::base32_decode(secret_b32).expect("decode mfa secret");
 
     // Compute the TOTP code immediately before sending (no awaits between
     // here and `.send()`) so the 30-second step cannot roll over in the
     // gap and push the code outside the server's +-1 step verify window.
-    let code_now = mokosh_auth_crypto::totp::code_at(&secret, Utc::now());
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
     let enable_resp = app
         .client
         .post(app.url("/api/v1/auth/me/mfa/enable"))
@@ -356,7 +356,7 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
 
     // Submit a fresh TOTP code (recomputed because the 30-second step
     // may have rolled over between calls).
-    let code_now = mokosh_auth_crypto::totp::code_at(&secret, Utc::now());
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
     let resp2 = app
         .client
         .post(app.url("/api/v1/auth/login"))
@@ -396,8 +396,8 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
         .await
         .expect("mfa setup JSON");
     let secret_b32 = setup["secret"].as_str().expect("secret");
-    let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32).expect("decode mfa secret");
-    let code_now = mokosh_auth_crypto::totp::code_at(&secret, Utc::now());
+    let secret = mokosh_server::utils::totp::base32_decode(secret_b32).expect("decode mfa secret");
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
 
     let enable_json: serde_json::Value = app
         .client

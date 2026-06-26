@@ -207,7 +207,6 @@ async fn boot_with_db(pool: PgPool, db: Database, app_pool: Option<PgPool>) -> T
         vec!["http://localhost".into()],
         Vec::new(),
         false, // cookie_secure: irrelevant for bearer-token tests
-        None,  // at_jwt verifier disabled in tests
         None,  // bunyip RS verifier disabled in tests
         mailer,
         encryption_key,

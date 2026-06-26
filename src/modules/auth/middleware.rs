@@ -7,7 +7,6 @@ use axum::{
 };
 use std::sync::Arc;
 
-use super::at_jwt::{current_user_from_at_jwt, AtJwtVerifier};
 use super::oidc_rs::Verifier as BunyipVerifier;
 use super::{AuthService, AuthState, CurrentUser, UserRole};
 use crate::utils::error::AppError;
@@ -16,12 +15,6 @@ use crate::utils::error::AppError;
 #[derive(Clone)]
 pub struct AuthMiddleware {
     pub auth_service: Arc<AuthService>,
-    /// Optional `at+jwt` verifier. When set, the middleware tries
-    /// EdDSA verification against `mokosh-auth`'s key set first and
-    /// only falls back to the legacy HS256 path when the token is not
-    /// recognisable as an `at+jwt`. This is how PSA endpoints accept
-    /// access tokens minted by SSO during the transition window.
-    pub at_jwt: Option<AtJwtVerifier>,
     /// Optional Resource-Server verifier for the bunyip-as-OP cutover.
     /// When set, the middleware verifies Bearer tokens against bunyip-api's
     /// JWKS first; on success it JIT-mirrors the (sub, email) into the local
@@ -40,18 +33,10 @@ impl AuthMiddleware {
     pub fn new(auth_service: AuthService) -> Self {
         Self {
             auth_service: Arc::new(auth_service),
-            at_jwt: None,
             bunyip: None,
             tenants: None,
             invitations: None,
         }
-    }
-
-    /// Attach an `at+jwt` verifier. Call this once at startup with the
-    /// `OidcKeySet` returned from `mokosh_auth::bootstrap`.
-    pub fn with_at_jwt(mut self, verifier: AtJwtVerifier) -> Self {
-        self.at_jwt = Some(verifier);
-        self
     }
 
     /// Attach the bunyip-as-OP Resource-Server verifier. Call this at startup
@@ -85,10 +70,9 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Extract Bearer token from Authorization header. When SSO is
-    // enabled we try at+jwt first (EdDSA, signed by mokosh-auth);
-    // failing that we fall back to the legacy HS256 path. The fallback
-    // is what keeps existing sessions working during transition.
+    // Extract Bearer token from Authorization header. The bunyip-as-OP
+    // Resource-Server path is tried first; failing that we fall back to the
+    // legacy HS256 cookie path. The fallback keeps existing sessions working.
     let auth_state = match bearer(&request) {
         Some(token) => {
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
@@ -112,17 +96,8 @@ pub async fn auth_middleware(
             };
             if let Some(state) = from_bunyip {
                 state
-            } else if let Some(verified) = auth_middleware
-                .at_jwt
-                .as_ref()
-                .and_then(|v| v.try_verify(token))
-            {
-                // 2. Legacy SSO at+jwt path (mokosh-auth IdP - transitional).
-                let tenant_id = verified.tenant_id;
-                let user = current_user_from_at_jwt(&verified);
-                AuthState::authenticated(user, tenant_id)
             } else {
-                // 3. Legacy HS256 cookie path. Only an `access` token is a
+                // 2. Legacy HS256 cookie path. Only an `access` token is a
                 // valid Bearer credential; `decode_token` runs
                 // `Validation::default()` and does not assert `typ`, so a
                 // `typ:"refresh"` token would otherwise be accepted here.
