@@ -1,0 +1,16 @@
+# Pin the Rust toolchain to the EXACT patch version baked into the
+# `rust-builder-*:v1.0.1-rust1.94-trixie` image used by the dev container and the
+# Dockerfiles (rustc 1.94.1 / rustfmt 1.8.0). This keeps the rustfmt/clippy that
+# `just check`, the `just pre-commit` hook, and CI run identical, so formatting
+# done in the dev container always passes CI.
+#
+# rustfmt/clippy output is version-sensitive: an unpinned CI runner with a newer
+# rustfmt silently rejected dev-container-clean code on 2026-06-18 (PMS-399,
+# PMS-404, PMS-405). Pinning the exact patch removes that drift.
+#
+# MUST be bumped in lockstep with the `rust-builder-*` image tag. When the image
+# moves to a newer rust, update `channel` here in the same PR and fix any
+# newly-promoted clippy/rustfmt lints alongside it.
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
