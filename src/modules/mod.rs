@@ -27,6 +27,7 @@ pub mod seed;
 pub mod settings;
 pub mod sla;
 pub mod tenants;
+pub mod ticket_templates;
 pub mod tickets;
 pub mod time_tracking;
 pub mod workflows;
