@@ -143,7 +143,15 @@ pub fn create_api_router(
     // the intake handler can reuse the full ticket-create flow
     // (audit + SLA assignment + ticket-number generation) without
     // duplicating the INSERT.
-    let email_intake_service = EmailIntakeService::new(db.pool().clone(), ticket_service.clone());
+    // PMS-450 AC3: the intake service stores inbound attachments via the
+    // shared `ticket_attachments` blob path, so it holds its own
+    // `AttachmentService` (same env-driven dir + size cap as the agent /
+    // portal upload routes).
+    let email_intake_service = EmailIntakeService::new(
+        db.pool().clone(),
+        ticket_service.clone(),
+        AttachmentService::new(db.pool().clone(), AttachmentConfig::from_env()),
+    );
     // PMS-451: per-ticket approval requests.
     let approvals_service = ApprovalsService::new(db.pool().clone());
     let rmm_service =
