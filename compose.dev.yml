@@ -134,11 +134,10 @@ services:
       POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
       POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
       POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
-      # PMS-285: passwords for the split request-serving roles, provisioned by
-      # scripts/pg-init.sh (mounted into /docker-entrypoint-initdb.d below) on
-      # first volume init so `just dev` boots with RLS active at runtime.
-      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}
-      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:-mokosh_app_dev}
+      # PMS-489: the split request-serving roles (mokosh_migrator / mokosh_app)
+      # are no longer provisioned by a postgres initdb.d script. The server
+      # self-provisions them at startup from MOKOSH_ADMIN_DATABASE_URL (the
+      # POSTGRES_USER superuser), so postgres only needs its own superuser env.
       # Postgres 18 changed the default PGDATA from /var/lib/postgresql/
       # data to /var/lib/postgresql/<major>/docker. We pin it back into
       # the named volume so state survives container recreates regardless
@@ -152,12 +151,6 @@ services:
       - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PG_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # PMS-488: RLS role split + untrusted-extension bootstrap. The postgres
-      # image runs this once on a fresh volume, as the superuser over the
-      # trusted local socket and before the TCP listener opens, so the roles
-      # and extensions exist before the server connects. See scripts/pg-init.sh
-      # for the rationale and the dropped password-drift behaviour.
-      - ./scripts/pg-init.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -206,10 +199,15 @@ services:
       # cross-tenant workers; MOKOSH_APP_DATABASE_URL connects as the
       # unprivileged `mokosh_app` (NOBYPASSRLS) used for every request-serving
       # query, so a forgotten `WHERE tenant_id` filter fail-closes to zero rows.
-      # Both roles are provisioned by the postgres initdb.d script
-      # (scripts/pg-init.sh) on first volume init.
+      # PMS-489: the server self-provisions both roles at startup. On first boot
+      # mokosh_migrator cannot connect, so the server uses MOKOSH_ADMIN_DATABASE_URL
+      # (the postgres superuser) to CREATE the roles with MOKOSH_MIGRATOR_PASSWORD /
+      # MOKOSH_APP_PASSWORD, then closes that pool. Subsequent boots skip it.
       DATABASE_URL: postgres://mokosh_migrator:${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
       MOKOSH_APP_DATABASE_URL: postgres://mokosh_app:${MOKOSH_APP_PASSWORD:-mokosh_app_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_ADMIN_DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:-postgres}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}
+      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:-mokosh_app_dev}
 
       # Outbound email. Dev defaults point at the mailpit service
       # alongside this one; messages land in http://localhost:8025.

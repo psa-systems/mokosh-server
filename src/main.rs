@@ -210,6 +210,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AppConfig::from_env().expect("Failed to load configuration");
 
+    // PMS-489: self-provision the split DB roles (mokosh_migrator / mokosh_app)
+    // from MOKOSH_ADMIN_DATABASE_URL on first boot, before connecting the
+    // request pools. Skipped entirely when the migrator role already logs in,
+    // so prod can drop the admin credentials after the first start. Supersedes
+    // scripts/pg-init.sh and the removed `mokosh-bootstrap provision-roles`
+    // step - one mechanism, identical in dev and prod, env-driven.
+    mokosh_server::db::provision::provision_roles(&config.database_url).await?;
+
     let db = Database::new(&config.app_database_url, &config.database_url).await?;
 
     // A migration failure is fatal: exit non-zero rather than serve a
