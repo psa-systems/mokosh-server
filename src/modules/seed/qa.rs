@@ -920,6 +920,8 @@ fn qa_time_entries(
                 start_time: None,
                 end_time: None,
                 duration_minutes: Some(minutes),
+                worked_minutes: None,
+                billable_minutes: None,
                 work_type_id,
                 ticket_id: if link_to_project {
                     None
