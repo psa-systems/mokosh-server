@@ -44,6 +44,26 @@ impl UserRole {
         matches!(self, Self::SuperAdmin | Self::Admin | Self::Manager)
     }
 
+    /// Privilege rank used to enforce a role ceiling when one user grants a
+    /// role to another (PMS-503). A caller may only grant roles whose rank is
+    /// `<=` their own, so `super_admin` (the only rank-3 role) can only be
+    /// granted by an existing `super_admin`.
+    pub fn privilege_rank(&self) -> u8 {
+        match self {
+            Self::SuperAdmin => 3,
+            Self::Admin => 2,
+            Self::Manager => 1,
+            Self::Technician | Self::Dispatcher | Self::Sales | Self::Finance => 0,
+        }
+    }
+
+    /// Whether a caller holding `self` may grant `target` to another user.
+    /// Enforces the role ceiling from PMS-503: a role may only be granted by
+    /// a caller of equal or higher privilege.
+    pub fn can_grant(&self, target: Self) -> bool {
+        self.privilege_rank() >= target.privilege_rank()
+    }
+
     /// Check if this role can view financial data
     pub fn can_view_financials(&self) -> bool {
         matches!(
@@ -710,6 +730,24 @@ mod tests {
         assert!(UserRole::Manager.can_manage_users());
         assert!(!UserRole::Technician.can_manage_users());
         assert!(!UserRole::Sales.can_manage_users());
+    }
+
+    #[test]
+    fn test_user_role_can_grant_ceiling() {
+        // super_admin may only be granted by an existing super_admin (PMS-503).
+        assert!(UserRole::SuperAdmin.can_grant(UserRole::SuperAdmin));
+        assert!(!UserRole::Admin.can_grant(UserRole::SuperAdmin));
+        assert!(!UserRole::Manager.can_grant(UserRole::SuperAdmin));
+
+        // A caller may grant roles at or below their own rank.
+        assert!(UserRole::Admin.can_grant(UserRole::Admin));
+        assert!(UserRole::Admin.can_grant(UserRole::Manager));
+        assert!(UserRole::Admin.can_grant(UserRole::Technician));
+        assert!(UserRole::SuperAdmin.can_grant(UserRole::Finance));
+
+        // A caller may not grant a role above their own rank.
+        assert!(!UserRole::Manager.can_grant(UserRole::Admin));
+        assert!(!UserRole::Technician.can_grant(UserRole::Manager));
     }
 
     #[test]

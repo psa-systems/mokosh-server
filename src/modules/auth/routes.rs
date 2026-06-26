@@ -455,6 +455,15 @@ async fn create_user(
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
 
+    // Role ceiling (PMS-503): a caller may only create a user whose role is at
+    // or below their own privilege. Without this an `admin` could mint a
+    // `super_admin` (a platform-level account with cross-tenant access).
+    if !user.role.can_grant(request.role) {
+        return Err(AppError::Forbidden(
+            "Cannot create a user with a role above your own".to_string(),
+        ));
+    }
+
     request.validate()?;
 
     let new_user = state
