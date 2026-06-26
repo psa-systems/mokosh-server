@@ -132,11 +132,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_cli(&args).await;
     }
 
+    // PMS-504 (M14): do not hardcode debug logging in every environment.
+    // Honor RUST_LOG (the dev stack sets `info,mokosh_server=debug`) and fall
+    // back to `info` when it is unset so production runs at info, not debug.
+    // This also stops tower_http from logging request URIs (query strings can
+    // carry OAuth `code`/`state`) at info by default (PMS-504 L13).
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mokosh_server=debug".parse().unwrap())
-                .add_directive("tower_http=debug".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 

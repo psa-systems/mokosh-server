@@ -129,7 +129,12 @@ pub fn verify(secret: &[u8], code: &str, now: DateTime<Utc>, window: i64) -> Opt
     }
     let t = now.timestamp() / TOTP_STEP_SECS;
     for delta in -window..=window {
-        if format_code(step(secret, t + delta)) == code {
+        // Constant-time compare so a timing side-channel cannot reveal how
+        // many leading digits of a guess matched the expected code.
+        if constant_time_eq::constant_time_eq(
+            format_code(step(secret, t + delta)).as_bytes(),
+            code.as_bytes(),
+        ) {
             return Some(t + delta);
         }
     }
