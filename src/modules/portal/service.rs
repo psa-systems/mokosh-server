@@ -34,8 +34,10 @@ impl PortalAuthService {
     }
 
     /// Verify (tenant_slug, email, password) against the contacts table
-    /// and issue a portal JWT on success. Returns 401 on any failure
-    /// path so the surface stays enumeration-resistant.
+    /// and issue a portal JWT on success. Returns 401 on any credential
+    /// failure so the surface stays enumeration-resistant, and 429
+    /// (`AppError::RateLimited`) when the account is in a lockout window
+    /// from repeated failures (PMS-501).
     #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip_all)]
     pub async fn login(&self, request: &PortalLoginRequest) -> AppResult<PortalLoginResponse> {
@@ -48,10 +50,13 @@ impl PortalAuthService {
             String,
             bool,
             Option<String>,
+            i32,
+            Option<DateTime<Utc>>,
         )> = sqlx::query_as(
             r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email, c.first_name,
-                       c.last_name, c.is_portal_user, c.portal_password_hash
+                       c.last_name, c.is_portal_user, c.portal_password_hash,
+                       c.portal_failed_login_count, c.portal_locked_until
                 FROM contacts c
                 INNER JOIN tenants t ON c.tenant_id = t.id
                 WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
@@ -70,11 +75,29 @@ impl PortalAuthService {
         .fetch_optional(self.db.migrator_pool())
         .await?;
 
-        let Some((id, tenant_id, company_id, email, first_name, last_name, is_portal_user, hash)) =
-            row
+        let Some((
+            id,
+            tenant_id,
+            company_id,
+            email,
+            first_name,
+            last_name,
+            is_portal_user,
+            hash,
+            failed_count,
+            locked_until,
+        )) = row
         else {
             return Err(AppError::Unauthorized);
         };
+
+        // PMS-501: persistent account lockout. If the contact is inside an
+        // active backoff window, reject before spending an Argon2 verify so
+        // the lockout actually cuts the attacker's guess rate (and survives a
+        // process restart, unlike the in-memory limiter).
+        if locked_until.is_some_and(|until| until > Utc::now()) {
+            return Err(AppError::RateLimited);
+        }
 
         if !is_portal_user {
             return Err(AppError::Unauthorized);
@@ -83,6 +106,8 @@ impl PortalAuthService {
             return Err(AppError::Unauthorized);
         };
         if !verify_password(&request.password, &hash)? {
+            // PMS-501: record the failure and (re)arm the lockout window.
+            self.register_failed_login(id, failed_count).await?;
             return Err(AppError::Unauthorized);
         }
 
@@ -90,8 +115,13 @@ impl PortalAuthService {
         // separate `contacts`-identity plane with portal isolation deferred.
         // Targets the just-authenticated contact by primary key; migrator pool
         // because `contacts` is RLS-covered and the portal plane sets no GUC.
+        // PMS-501: a successful login clears the failed-attempt counter and any
+        // lockout so a later legitimate sign-in is never penalised.
         sqlx::query(
-            "UPDATE contacts SET portal_last_login_at = NOW(), updated_at = NOW() WHERE id = $1",
+            "UPDATE contacts \
+             SET portal_last_login_at = NOW(), portal_failed_login_count = 0, \
+                 portal_locked_until = NULL, updated_at = NOW() \
+             WHERE id = $1",
         )
         .bind(id)
         .execute(self.db.migrator_pool())
@@ -127,6 +157,27 @@ impl PortalAuthService {
                 last_name,
             },
         })
+    }
+
+    /// PMS-501: persist one more failed portal login for `contact_id` and
+    /// arm the exponential-backoff lockout once the failures cross the
+    /// threshold (see [`lockout_until`]). Runs on the migrator pool for the
+    /// same reason the login lookup does: the portal plane sets no RLS GUC
+    /// and `contacts` is RLS-covered, so the app pool would write closed.
+    async fn register_failed_login(&self, contact_id: Uuid, prior_count: i32) -> AppResult<()> {
+        let new_count = prior_count.saturating_add(1);
+        let locked_until = lockout_until(new_count, Utc::now());
+        sqlx::query(
+            "UPDATE contacts \
+             SET portal_failed_login_count = $1, portal_locked_until = $2, updated_at = NOW() \
+             WHERE id = $3",
+        )
+        .bind(new_count)
+        .bind(locked_until)
+        .bind(contact_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
     }
 
     /// Re-read a contact's display names from the `contacts` row. The
@@ -290,4 +341,86 @@ fn parse_contact_bound_token(token: &str) -> Option<(Uuid, &str)> {
     }
     let contact_id = Uuid::parse_str(id).ok()?;
     Some((contact_id, secret))
+}
+
+/// PMS-501: exponential-backoff lockout schedule for portal logins.
+///
+/// The first [`LOCKOUT_THRESHOLD`] consecutive failures only tick the
+/// counter (legitimate users fat-finger a password a few times). Each
+/// failure at or beyond the threshold locks the account for a doubling
+/// window starting at [`LOCKOUT_BASE_SECONDS`] and capped at
+/// [`LOCKOUT_MAX_SECONDS`], measured from `now`:
+///
+/// | failed_count | lock window |
+/// |--------------|-------------|
+/// | 1..=4        | none        |
+/// | 5            | 30s         |
+/// | 6            | 60s         |
+/// | 7            | 120s        |
+/// | ...          | ...         |
+/// | 12+          | 3600s (cap) |
+///
+/// Returns `None` while under the threshold (no lockout yet).
+fn lockout_until(failed_count: i32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    /// Failures tolerated before any lockout arms.
+    const LOCKOUT_THRESHOLD: i32 = 5;
+    /// Lock window for the first threshold-crossing failure.
+    const LOCKOUT_BASE_SECONDS: i64 = 30;
+    /// Ceiling on a single lock window.
+    const LOCKOUT_MAX_SECONDS: i64 = 3600;
+
+    if failed_count < LOCKOUT_THRESHOLD {
+        return None;
+    }
+    // Exponent capped so the shift cannot overflow; the value is clamped to
+    // the max window anyway, so a larger exponent buys nothing.
+    let exp = (failed_count - LOCKOUT_THRESHOLD).min(20) as u32;
+    let secs = LOCKOUT_BASE_SECONDS
+        .checked_shl(exp)
+        .unwrap_or(LOCKOUT_MAX_SECONDS)
+        .min(LOCKOUT_MAX_SECONDS);
+    Some(now + Duration::seconds(secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_lockout_under_threshold() {
+        let now = Utc::now();
+        for count in 0..5 {
+            assert!(
+                lockout_until(count, now).is_none(),
+                "count {count} should not lock"
+            );
+        }
+    }
+
+    #[test]
+    fn lockout_arms_at_threshold() {
+        let now = Utc::now();
+        let until = lockout_until(5, now).expect("5th failure locks");
+        assert_eq!((until - now).num_seconds(), 30);
+    }
+
+    #[test]
+    fn lockout_window_doubles() {
+        let now = Utc::now();
+        assert_eq!((lockout_until(6, now).unwrap() - now).num_seconds(), 60);
+        assert_eq!((lockout_until(7, now).unwrap() - now).num_seconds(), 120);
+        assert_eq!((lockout_until(8, now).unwrap() - now).num_seconds(), 240);
+    }
+
+    #[test]
+    fn lockout_window_is_capped() {
+        let now = Utc::now();
+        // Far past the doubling sequence: still clamped to the 1h ceiling,
+        // and a huge count must not panic on shift overflow.
+        assert_eq!((lockout_until(50, now).unwrap() - now).num_seconds(), 3600);
+        assert_eq!(
+            (lockout_until(i32::MAX, now).unwrap() - now).num_seconds(),
+            3600
+        );
+    }
 }

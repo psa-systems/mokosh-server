@@ -650,3 +650,90 @@ async fn portal_protected_routes_require_auth_and_never_501(pool: PgPool) {
         );
     }
 }
+
+/// Read the persistent portal lockout columns for a contact (PMS-501).
+async fn read_lockout(
+    pool: &PgPool,
+    contact_id: Uuid,
+) -> (i32, Option<chrono::DateTime<chrono::Utc>>) {
+    sqlx::query_as(
+        "SELECT portal_failed_login_count, portal_locked_until FROM contacts WHERE id = $1",
+    )
+    .bind(contact_id)
+    .fetch_one(pool)
+    .await
+    .expect("read portal lockout columns")
+}
+
+// PMS-501: repeated failed portal logins persist a failed-attempt counter
+// and arm a temporary account lockout, so a brute-force run is throttled
+// in a way that survives a process restart (the in-memory limiter alone
+// does not).
+#[sqlx::test]
+async fn portal_login_locks_account_after_repeated_failures(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    let contact = seed_portal_contact(&pool, company, "victim@acme.example").await;
+    let app = common::boot(pool).await;
+
+    // Five wrong-password attempts. The first five reach the service (the
+    // per-account in-memory quota is 5/min); the fifth crosses the lockout
+    // threshold and arms `portal_locked_until`.
+    for _ in 0..5 {
+        let resp = portal_login(&app, "victim@acme.example", "wrong-password").await;
+        assert!(
+            matches!(
+                resp.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::TOO_MANY_REQUESTS
+            ),
+            "a failed attempt is 401 or 429, got {}",
+            resp.status()
+        );
+    }
+
+    // The durable lockout state is recorded on the contact row.
+    let (count, locked_until) = read_lockout(&app.pool, contact).await;
+    assert!(count >= 5, "failed counter persisted, got {count}");
+    let locked_until = locked_until.expect("lockout window armed");
+    assert!(
+        locked_until > chrono::Utc::now(),
+        "lockout window is in the future"
+    );
+
+    // Even the correct password is now rejected (not a 2xx) while the
+    // account is locked / rate-limited.
+    let blocked = portal_login(&app, "victim@acme.example", PORTAL_PASSWORD).await;
+    assert!(
+        !blocked.status().is_success(),
+        "correct password must not succeed during lockout, got {}",
+        blocked.status()
+    );
+}
+
+// PMS-501: a handful of failures below the threshold does not lock, and a
+// successful login clears the failed-attempt counter so a legitimate user
+// is never penalised for an earlier typo.
+#[sqlx::test]
+async fn portal_login_success_resets_failed_counter(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    let contact = seed_portal_contact(&pool, company, "user@acme.example").await;
+    let app = common::boot(pool).await;
+
+    // Two wrong attempts: counts but does not lock (threshold is 5).
+    for _ in 0..2 {
+        let resp = portal_login(&app, "user@acme.example", "wrong-password").await;
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let (count, locked_until) = read_lockout(&app.pool, contact).await;
+    assert_eq!(count, 2, "two failures counted");
+    assert!(locked_until.is_none(), "under threshold: no lockout");
+
+    // A correct login succeeds and clears the counter.
+    let ok = portal_login(&app, "user@acme.example", PORTAL_PASSWORD).await;
+    assert!(ok.status().is_success(), "correct password should 2xx");
+    let (count, locked_until) = read_lockout(&app.pool, contact).await;
+    assert_eq!(count, 0, "successful login resets the counter");
+    assert!(
+        locked_until.is_none(),
+        "successful login clears any lockout"
+    );
+}
