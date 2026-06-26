@@ -48,30 +48,35 @@ export default defineConfig({
       dependencies: ['preflight'],
       use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
     },
-    // 2. Browser-driven auth/session coverage. Does not depend on `setup`
-    //    (it does its own SPA login so its logout assertion never
-    //    invalidates the API token) but does depend on `preflight` so it
-    //    fails clean on a misconfigured CI. Drives the SPA form and asserts
-    //    on URL transitions, not request-context API state. Uses the SPA
-    //    host the human-facing app is served on.
+    // 2. Browser-driven coverage across all three engines (PMS-423). Each
+    //    project runs the SPA-driven specs - auth/session (`auth.spec.ts`) and
+    //    form-validation (`form-validation.spec.ts`, PMS-518 AC7) - against a
+    //    different browser the opensuse-dev runner pre-bakes (chromium /
+    //    firefox / webkit). These specs do their own SPA login, so they never
+    //    invalidate the API token and do not depend on `setup`; they depend on
+    //    `preflight` only so a misconfigured CI fails clean. They drive the SPA
+    //    form and assert on the DOM / URL transitions, not request-context API
+    //    state, and use the SPA host the human-facing app is served on. Both
+    //    specs are currently `test.fixme` (see tests/auth.spec.ts and
+    //    tests/form-validation.spec.ts for the un-fixme conditions), so the
+    //    per-email login rate limit (5/min) is not yet a cross-browser concern.
     {
-      name: 'auth-ui',
-      testMatch: /auth\.spec\.ts$/,
+      name: 'chromium',
+      testMatch: /(auth|form-validation)\.spec\.ts$/,
       dependencies: ['preflight'],
       use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
     },
-    // 2b. Browser-driven form-validation coverage (PMS-518 AC7). Drives the SPA
-    //     create forms and asserts the per-field inline errors / no-navigation
-    //     behaviour. Like auth-ui it does its own SPA login and asserts on the
-    //     DOM (the validation is client-side, never reaching an API). Depends on
-    //     `preflight` only so a misconfigured CI fails clean. The spec is
-    //     currently `test.fixme` (see tests/form-validation.spec.ts for the
-    //     un-fixme conditions: staging serving the FormGuard SPA + PMS-148).
     {
-      name: 'form-ui',
-      testMatch: /form-validation\.spec\.ts$/,
+      name: 'firefox',
+      testMatch: /(auth|form-validation)\.spec\.ts$/,
       dependencies: ['preflight'],
-      use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
+      use: { ...devices['Desktop Firefox'], baseURL: env.baseURL },
+    },
+    {
+      name: 'webkit',
+      testMatch: /(auth|form-validation)\.spec\.ts$/,
+      dependencies: ['preflight'],
+      use: { ...devices['Desktop Safari'], baseURL: env.baseURL },
     },
     // 3. Request-context API coverage. The lib/fixtures.ts custom `test`
     //    fixture loads the bearer token written by `setup` and attaches it

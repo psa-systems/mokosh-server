@@ -232,10 +232,10 @@ impl AuthService {
                     .mfa_secret
                     .as_ref()
                     .ok_or_else(|| AppError::Internal("MFA enabled without secret".to_string()))?;
-                let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32)
+                let secret = crate::utils::totp::base32_decode(secret_b32)
                     .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
                 // +-1 step (30s) tolerance handles modest clock skew.
-                if mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+                if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
                     return Err(AppError::Unauthorized);
                 }
             } else {
@@ -1224,8 +1224,8 @@ impl AuthService {
             return Err(AppError::Conflict("MFA is already enabled".to_string()));
         }
 
-        let secret = mokosh_auth_crypto::totp::generate_secret();
-        let secret_b32 = mokosh_auth_crypto::totp::base32_encode(&secret);
+        let secret = crate::utils::totp::generate_secret();
+        let secret_b32 = crate::utils::totp::base32_encode(&secret);
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -1240,8 +1240,7 @@ impl AuthService {
         tx.commit().await?;
 
         let label = format!("Mokosh:{}", user.email);
-        let provisioning_uri =
-            mokosh_auth_crypto::totp::provisioning_uri(&secret_b32, &label, "Mokosh");
+        let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, "Mokosh");
 
         Ok(crate::modules::auth::models::MfaSetupResponse {
             secret: secret_b32,
@@ -1268,13 +1267,13 @@ impl AuthService {
         let secret_b32 = user.mfa_secret.as_ref().ok_or_else(|| {
             AppError::BadRequest("MFA enrollment has not been started".to_string())
         })?;
-        let secret = mokosh_auth_crypto::totp::base32_decode(secret_b32)
+        let secret = crate::utils::totp::base32_decode(secret_b32)
             .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
-        if mokosh_auth_crypto::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+        if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
             return Err(AppError::BadRequest("Invalid MFA code".to_string()));
         }
 
-        let recovery_codes = mokosh_auth_crypto::recovery::generate_set();
+        let recovery_codes = crate::utils::recovery::generate_set();
         let hashes: Vec<String> = recovery_codes
             .iter()
             .map(|c| recovery_code_hex_hash(c))
@@ -2212,13 +2211,13 @@ fn sha256_hex(input: &str) -> String {
 }
 
 /// Hex SHA-256 of the canonical MFA recovery code form. Mirrors
-/// `mokosh_auth_crypto::recovery::hash_code` but returns lowercase hex
-/// so the hash fits a `TEXT[]` column instead of `BYTEA[]`. Reusing the
-/// crypto crate's `hash_code` keeps canonicalisation (strip whitespace
-/// + hyphens, uppercase) consistent across SSO and legacy paths.
+/// `crate::utils::recovery::hash_code` but returns lowercase hex
+/// so the hash fits a `TEXT[]` column instead of `BYTEA[]`. Reusing
+/// `recovery::hash_code` keeps canonicalisation (strip whitespace
+/// + hyphens, uppercase) consistent with code generation.
 #[cfg(feature = "server")]
 fn recovery_code_hex_hash(code: &str) -> String {
-    let raw = mokosh_auth_crypto::recovery::hash_code(code);
+    let raw = crate::utils::recovery::hash_code(code);
     let mut out = String::with_capacity(raw.len() * 2);
     for b in raw {
         use std::fmt::Write;

@@ -362,6 +362,8 @@ fn create_req(
         start_time: None,
         end_time: None,
         duration_minutes: Some(60),
+        worked_minutes: None,
+        billable_minutes: None,
         work_type_id,
         ticket_id: None,
         project_id: None,
@@ -389,6 +391,8 @@ fn create_minutes(
         start_time: None,
         end_time: None,
         duration_minutes: Some(minutes),
+        worked_minutes: None,
+        billable_minutes: None,
         work_type_id,
         ticket_id: None,
         project_id: None,
@@ -408,6 +412,8 @@ fn duration_only_update(minutes: i32) -> UpdateTimeEntryRequest {
         start_time: None,
         end_time: None,
         duration_minutes: Some(minutes),
+        worked_minutes: None,
+        billable_minutes: None,
         work_type_id: None,
         ticket_id: None,
         project_id: None,
@@ -426,6 +432,8 @@ fn notes_only_update(notes: &str) -> UpdateTimeEntryRequest {
         start_time: None,
         end_time: None,
         duration_minutes: None,
+        worked_minutes: None,
+        billable_minutes: None,
         work_type_id: None,
         ticket_id: None,
         project_id: None,
@@ -746,6 +754,95 @@ async fn create_honors_configured_lower_cap(pool: PgPool) {
     assert!(
         matches!(err, AppError::BadRequest(_)),
         "19h total against an 18h cap must be BadRequest, got {err:?}"
+    );
+}
+
+/// PMS-395 AC6: an entry can be created where billable_minutes exceeds
+/// worked_minutes (a minimum increment billed across clients), and both the
+/// split and the billed-on-billable total round-trip through a read.
+#[sqlx::test]
+async fn billable_minutes_can_exceed_worked_and_round_trips(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    // 6 minutes of actual patching, billed as a 15-minute minimum.
+    let mut req = create_minutes(
+        user_id,
+        work_type_id,
+        company_id,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        6,
+    );
+    req.worked_minutes = Some(6);
+    req.billable_minutes = Some(15);
+
+    let created = svc
+        .create_time_entry(tenant, &req, &actx())
+        .await
+        .expect("create entry with billable > worked");
+    assert_eq!(created.worked_minutes, 6, "worked time is the actual 6 min");
+    assert_eq!(
+        created.billable_minutes,
+        Some(15),
+        "billable time is the supplied 15-min minimum, above worked"
+    );
+    // Priced on billable minutes, not worked: 15 min @ $150/hr = $37.50.
+    assert_eq!(
+        created.total_amount,
+        Some(rust_decimal::Decimal::new(3750, 2)),
+        "total is billed on billable minutes (15), not worked (6)"
+    );
+
+    // Round-trips through a fresh read.
+    let read = svc
+        .get_time_entry(tenant, created.id)
+        .await
+        .expect("read back the entry");
+    assert_eq!(read.worked_minutes, 6);
+    assert_eq!(read.billable_minutes, Some(15));
+}
+
+/// PMS-395 AC8: omitting billable_minutes on create preserves the pre-change
+/// behavior - billable defaults to the rounded worked time for a billable
+/// entry - while the stored worked figure is left unrounded (AC3).
+#[sqlx::test]
+async fn omitted_billable_defaults_to_rounded_worked(pool: PgPool) {
+    let (user_id, _, _) = seed_technician(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    // 20 worked minutes, billable omitted. The seed 'Standard Rounding' rule
+    // (15-min increment, round up) bills 30; worked stays the raw 20.
+    let req = create_minutes(
+        user_id,
+        work_type_id,
+        company_id,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        20,
+    );
+    let created = svc
+        .create_time_entry(tenant, &req, &actx())
+        .await
+        .expect("create entry with billable omitted");
+    assert_eq!(
+        created.worked_minutes, 20,
+        "worked figure is NOT mutated by rounding"
+    );
+    assert_eq!(
+        created.billable_minutes,
+        Some(30),
+        "billable defaults to the rounded worked time (20 -> 30)"
+    );
+    // 30 billable min @ $150/hr = $75.00.
+    assert_eq!(
+        created.total_amount,
+        Some(rust_decimal::Decimal::new(7500, 2)),
+        "total priced on the rounded billable minutes"
     );
 }
 

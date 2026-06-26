@@ -18,7 +18,6 @@ use crate::db::Database;
 use crate::modules::approvals::{approval_routes, ApprovalsService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_routes, AuditService};
-use crate::modules::auth::at_jwt::AtJwtVerifier;
 use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
@@ -40,6 +39,7 @@ use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
 use crate::modules::tenants::{tenant_routes, TenantService};
+use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
     agent_attachment_routes, contact_notes_routes, portal_attachment_routes, ticket_routes,
     AttachmentConfig, AttachmentService, TicketService,
@@ -51,10 +51,8 @@ use crate::version_check::version_check;
 
 /// Create the main API router with all routes.
 ///
-/// When `at_jwt` is `Some`, PSA endpoints accept access tokens minted by
-/// `mokosh-auth` (EdDSA `at+jwt`) in addition to the legacy HS256
-/// cookie. Pass `None` to run with legacy auth only (e.g. dev environments
-/// where SSO env vars are not configured).
+/// PSA endpoints authenticate via the bunyip-as-OP Resource-Server path
+/// (`bunyip_verifier`, when `Some`) and the legacy HS256 cookie path.
 #[allow(clippy::too_many_arguments)]
 pub fn create_api_router(
     db: Database,
@@ -64,7 +62,6 @@ pub fn create_api_router(
     cors_origins: Vec<String>,
     super_admin_emails: Vec<String>,
     cookie_secure: bool,
-    at_jwt: Option<AtJwtVerifier>,
     bunyip_verifier: Option<crate::modules::auth::oidc_rs::Verifier>,
     mailer: Arc<dyn crate::utils::email::Mailer>,
     // 32-byte AES-256-GCM key. Used for at-rest encryption of any
@@ -135,6 +132,8 @@ pub fn create_api_router(
     let saved_reports_service = SavedReportsService::new(db.pool().clone());
     // PMS-448: ticket.created workflow rule executor + CRUD.
     let workflows_service = WorkflowsService::new(db.pool().clone());
+    // PMS-448 AC4: admin-authored ticket templates (new-ticket pre-fills).
+    let ticket_templates_service = TicketTemplatesService::new(db.pool().clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.pool().clone());
     // PMS-453: per-user saved dashboards.
@@ -167,13 +166,10 @@ pub fn create_api_router(
     let settings_service = Arc::new(SettingsService::new(db.clone()));
     let audit_service = AuditService::new(db.clone());
 
-    // Create auth middleware. The at+jwt verifier (when present) is
-    // attached so the same middleware can authenticate either kind of
-    // bearer token.
+    // Create auth middleware. The bunyip Resource-Server verifier (when
+    // present) is attached so the middleware can authenticate bunyip-minted
+    // bearer tokens alongside legacy HS256 cookies.
     let mut auth_middleware = AuthMiddleware::new(auth_service.clone());
-    if let Some(v) = at_jwt {
-        auth_middleware = auth_middleware.with_at_jwt(v);
-    }
     if let Some(v) = bunyip_verifier {
         auth_middleware = auth_middleware.with_bunyip(v);
         // PMS-244: the bunyip path resolves the user's tenant from Mokosh's own
@@ -297,6 +293,8 @@ pub fn create_api_router(
         .merge(saved_reports_routes(saved_reports_service))
         // PMS-448: workflow-rule CRUD + per-ticket run timeline.
         .merge(workflow_routes(workflows_service))
+        // PMS-448 AC4: ticket-template CRUD (new-ticket pre-fills).
+        .merge(ticket_template_routes(ticket_templates_service))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled

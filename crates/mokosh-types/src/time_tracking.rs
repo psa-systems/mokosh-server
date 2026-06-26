@@ -86,7 +86,18 @@ pub struct TimeEntryResponse {
     pub date: NaiveDate,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
+    /// Worked (actual) time. Canonical going forward and never mutated by
+    /// rounding (PMS-395). Currently tracks `duration_minutes`.
     pub duration_minutes: i32,
+    /// PMS-395: actual time spent on the entry. Mirror of `duration_minutes`
+    /// during the one-release overlap; reports treat this as canonical.
+    pub worked_minutes: i32,
+    /// PMS-395: time billed, independent of `worked_minutes`. Can exceed
+    /// worked time (minimum increments, one update billed across several
+    /// clients) or fall below it (internal absorption). `total_amount` is
+    /// priced on this figure. NULL only for legacy rows that predate the
+    /// backfill, in which case clients fall back to the rounded worked time.
+    pub billable_minutes: Option<i32>,
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
@@ -141,6 +152,18 @@ pub struct CreateTimeEntryRequest {
     /// of the per-tenant day cap (PMS-396).
     #[validate(range(min = 1, max = 1440))]
     pub duration_minutes: Option<i32>,
+    /// PMS-395: worked (actual) minutes. When supplied it takes precedence
+    /// over `duration_minutes` / (start, end) as the worked figure. Capped
+    /// at 1440 (24h) like `duration_minutes`.
+    #[validate(range(min = 1, max = 1440))]
+    #[serde(default)]
+    pub worked_minutes: Option<i32>,
+    /// PMS-395: billed minutes. When omitted the service defaults it to the
+    /// rounded worked time for billable entries (pre-change behavior), 0 for
+    /// non-billable. May legitimately exceed worked time. Capped at 1440.
+    #[validate(range(min = 0, max = 1440))]
+    #[serde(default)]
+    pub billable_minutes: Option<i32>,
     pub work_type_id: Uuid,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
@@ -169,6 +192,17 @@ pub struct UpdateTimeEntryRequest {
     /// regardless of the per-tenant day cap (PMS-396).
     #[validate(range(min = 1, max = 1440))]
     pub duration_minutes: Option<i32>,
+    /// PMS-395: worked (actual) minutes. Takes precedence over
+    /// `duration_minutes` / (start, end) when supplied.
+    #[validate(range(min = 1, max = 1440))]
+    #[serde(default)]
+    pub worked_minutes: Option<i32>,
+    /// PMS-395: billed minutes. When omitted the existing value is preserved;
+    /// if none was ever set it defaults to the rounded worked time for
+    /// billable entries. `total_amount` is recomputed from this figure.
+    #[validate(range(min = 0, max = 1440))]
+    #[serde(default)]
+    pub billable_minutes: Option<i32>,
     pub work_type_id: Option<Uuid>,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
@@ -191,7 +225,12 @@ pub struct UpdateTimeEntryRequest {
 pub struct TimesheetSummaryResponse {
     pub user_id: Uuid,
     pub week_start: NaiveDate,
+    /// PMS-395: sum of `worked_minutes` (actual time) across the week's
+    /// entries, falling back to `duration_minutes` for legacy rows.
     pub total_minutes: i64,
+    /// PMS-395: sum of `billable_minutes` (time billed) across the week's
+    /// entries. No longer just the worked time of billable-flagged entries:
+    /// it can diverge from `total_minutes` per entry.
     pub billable_minutes: i64,
     pub entry_count: i64,
     /// Week-level rollup of per-entry approval_status: "rejected" if any
