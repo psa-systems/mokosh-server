@@ -119,6 +119,19 @@ impl AppConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // PMS-494: operator subcommands fold into this binary. When argv's first
+    // token selects one (`mokosh-server bootstrap-infisical|clients|qa-seed|
+    // qa-teardown`), run that one-shot task and exit instead of starting the
+    // long-running HTTP server. The server path continues below otherwise.
+    let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .map(String::as_str)
+        .is_some_and(mokosh_server::cli::is_subcommand)
+    {
+        return run_cli(&args).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -401,6 +414,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    Ok(())
+}
+
+/// Run an operator subcommand folded into this binary (PMS-494) and exit,
+/// mapping any error to a non-zero process exit. Mirrors the old
+/// `mokosh-bootstrap` CLI: load `.env.infisical` then `.env` so credentials can
+/// be read from the environment without exporting them onto the command line,
+/// and use a plain `info`-default tracing filter (not the server's `debug`
+/// one). Dispatch lives in [`mokosh_server::cli`].
+async fn run_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = dotenvy::from_filename(".env.infisical");
+    let _ = dotenvy::dotenv();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    if let Err(e) = mokosh_server::cli::run(args).await {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
     Ok(())
 }
 
