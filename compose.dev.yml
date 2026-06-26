@@ -32,8 +32,10 @@
 # https://${USER}-mokosh-api.a8n.run to the container's $MOKOSH_PORT (see the
 # server's `labels` below).
 #
-# MOKOSH_HOST_BIND_IP is still discovered by `just dev` because postgres and
-# mailpit publish host ports for host-side tooling (sqlx-cli, the mail UI).
+# MOKOSH_HOST_BIND_IP is still discovered by `just dev` for the server's
+# BASE_URL. It is deliberately NOT used to publish any host port: postgres and
+# mailpit publish on loopback only (PMS-496), so host-side tooling (sqlx-cli,
+# the mail UI) reaches them via localhost while the LAN/internet cannot.
 # Discover the host IP with:
 #   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
 #
@@ -124,8 +126,8 @@ services:
 
   # PostgreSQL database for the Mokosh API server (the app's primary
   # store, separate from Infisical's). Reachable in-network as
-  # `postgres:5432` and on the host as
-  # `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT}` for sqlx-cli.
+  # `postgres:5432` and on the host as `127.0.0.1:${MOKOSH_PG_HOST_PORT}`
+  # (loopback only, PMS-496) for sqlx-cli.
   postgres:
     container_name: dev-mokosh-postgres-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/_/postgres
@@ -133,7 +135,9 @@ services:
     environment:
       POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
       POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
-      POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
+      # PMS-496: no default. `just ensure-env` generates a per-host secret into
+      # .env; fail loudly here rather than silently booting with `postgres`.
+      POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:?MOKOSH_PG_PASSWORD missing - run `just dev` (ensure-env generates a per-host secret)}
       # PMS-489: the split request-serving roles (mokosh_migrator / mokosh_app)
       # are no longer provisioned by a postgres initdb.d script. The server
       # self-provisions them at startup from MOKOSH_ADMIN_DATABASE_URL (the
@@ -148,7 +152,18 @@ services:
     networks:
       - private
     ports:
-      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PG_HOST_PORT:-5433}:5432"
+      # PMS-496: published on LOOPBACK ONLY. host-side sqlx-cli (just
+      # migrate-run) connects via localhost:${MOKOSH_PG_HOST_PORT}; sibling
+      # containers reach this DB by in-network DNS `postgres:5432` and need no
+      # host publish at all. Do NOT reintroduce MOKOSH_HOST_BIND_IP here: that
+      # var is derived from the first non-loopback interface (which can be
+      # public), so binding the port to it exposed the app DB - and the
+      # BYPASSRLS mokosh_migrator role reachable through it - to the LAN/internet
+      # with weak default credentials. If a non-loopback bind is ever genuinely
+      # required, introduce an explicit private-IP env var with NO default
+      # (e.g. `${MOKOSH_PG_PRIVATE_BIND_IP:?...}`) and only after a host firewall
+      # is confirmed to deny 5432/5433 inbound on every non-loopback interface.
+      - "127.0.0.1:${MOKOSH_PG_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -203,11 +218,14 @@ services:
       # mokosh_migrator cannot connect, so the server uses MOKOSH_ADMIN_DATABASE_URL
       # (the postgres superuser) to CREATE the roles with MOKOSH_MIGRATOR_PASSWORD /
       # MOKOSH_APP_PASSWORD, then closes that pool. Subsequent boots skip it.
-      DATABASE_URL: postgres://mokosh_migrator:${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
-      MOKOSH_APP_DATABASE_URL: postgres://mokosh_app:${MOKOSH_APP_PASSWORD:-mokosh_app_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
-      MOKOSH_ADMIN_DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:-postgres}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
-      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}
-      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:-mokosh_app_dev}
+      # PMS-496: DB passwords carry no defaults. `just ensure-env` generates
+      # per-host secrets into .env; an unset value fails the stack loudly rather
+      # than silently provisioning the roles with `mokosh_*_dev` / `postgres`.
+      DATABASE_URL: postgres://mokosh_migrator:${MOKOSH_MIGRATOR_PASSWORD:?MOKOSH_MIGRATOR_PASSWORD missing - run `just dev` (ensure-env generates a per-host secret)}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_APP_DATABASE_URL: postgres://mokosh_app:${MOKOSH_APP_PASSWORD:?MOKOSH_APP_PASSWORD missing - run `just dev` (ensure-env generates a per-host secret)}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_ADMIN_DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:?MOKOSH_PG_PASSWORD missing - run `just dev` (ensure-env generates a per-host secret)}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:?MOKOSH_MIGRATOR_PASSWORD missing - run `just dev` (ensure-env generates a per-host secret)}
+      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:?MOKOSH_APP_PASSWORD missing - run `just dev` (ensure-env generates a per-host secret)}
 
       # Outbound email. Dev defaults point at the mailpit service
       # alongside this one; messages land in http://localhost:8025.
