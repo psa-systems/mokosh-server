@@ -124,8 +124,13 @@ services:
 
   # PostgreSQL database for the Mokosh API server (the app's primary
   # store, separate from Infisical's). Reachable in-network as
-  # `postgres:5432` and on the host as
-  # `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT}` for sqlx-cli.
+  # `postgres:5432` and on the host as `127.0.0.1:${MOKOSH_PG_HOST_PORT}`
+  # for sqlx-cli. The host publish is HARDCODED to loopback (never
+  # ${MOKOSH_HOST_BIND_IP}): the DB must never be reachable off-box. A
+  # prior LAN-IP bind put postgres:postgres on a public interface and it
+  # was compromised by the PG_MEM/"wog" botnet (RCE via SQL system()).
+  # App containers reach it over the `private` Docker network, not the
+  # host port, so loopback-only costs nothing.
   postgres:
     container_name: dev-mokosh-postgres-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/_/postgres
@@ -148,7 +153,7 @@ services:
     networks:
       - private
     ports:
-      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PG_HOST_PORT:-5433}:5432"
+      - "127.0.0.1:${MOKOSH_PG_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
