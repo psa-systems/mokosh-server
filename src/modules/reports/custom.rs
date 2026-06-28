@@ -115,7 +115,9 @@ const TIME: Source = Source {
     label: "Time entries",
     from: "FROM time_entries te \
            LEFT JOIN users u ON te.user_id = u.id \
-           LEFT JOIN work_types wt ON te.work_type_id = wt.id",
+           LEFT JOIN work_types wt ON te.work_type_id = wt.id \
+           LEFT JOIN projects pr ON te.project_id = pr.id \
+           LEFT JOIN contracts co ON te.contract_id = co.id",
     tenant_col: "te.tenant_id",
     date_col: Some("te.date"),
     dims: &[
@@ -144,6 +146,18 @@ const TIME: Source = Source {
             label: "Billable",
             sql: "CASE WHEN te.is_billable THEN 'Billable' ELSE 'Non-billable' END",
         },
+        // PMS-395: realization is reported per project and per contract, the
+        // two client/contract linkage columns on time_entries.
+        Dim {
+            key: "project",
+            label: "Project",
+            sql: "COALESCE(pr.name, '(no project)')",
+        },
+        Dim {
+            key: "contract",
+            label: "Contract",
+            sql: "COALESCE(co.name, '(no contract)')",
+        },
     ],
     measures: &[
         Measure {
@@ -160,6 +174,33 @@ const TIME: Source = Source {
             key: "hours",
             label: "Hours",
             sql: "ROUND(COALESCE(SUM(te.duration_minutes), 0)::numeric / 60, 2)",
+        },
+        // PMS-395: worked (actual) vs billed minutes, and the realization
+        // ratio (billed / worked) so reports can show over/under-billing per
+        // project and contract. Both sums fall back to duration_minutes for
+        // legacy rows that predate the worked/billable backfill.
+        Measure {
+            key: "worked_minutes",
+            label: "Worked minutes",
+            sql: "COALESCE(SUM(COALESCE(te.worked_minutes, te.duration_minutes)), 0)",
+        },
+        Measure {
+            key: "billable_minutes",
+            label: "Billable minutes",
+            sql: "COALESCE(SUM(COALESCE(te.billable_minutes, \
+                  CASE WHEN te.is_billable \
+                       THEN COALESCE(te.worked_minutes, te.duration_minutes) \
+                       ELSE 0 END)), 0)",
+        },
+        Measure {
+            key: "realization",
+            label: "Realization",
+            sql: "ROUND(\
+                  COALESCE(SUM(COALESCE(te.billable_minutes, \
+                      CASE WHEN te.is_billable \
+                           THEN COALESCE(te.worked_minutes, te.duration_minutes) \
+                           ELSE 0 END)), 0)::numeric \
+                  / NULLIF(SUM(COALESCE(te.worked_minutes, te.duration_minutes)), 0), 4)",
         },
         Measure {
             key: "amount",

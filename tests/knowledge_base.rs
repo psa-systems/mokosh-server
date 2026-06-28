@@ -1124,3 +1124,239 @@ async fn portal_feed_company_scoping(pool: PgPool) {
         "draft article must be hidden from the portal feed"
     );
 }
+
+/// Seed a ticket that cites `source_kb_article_id` (PMS-485), planted at
+/// `NOW() - age_days` so the `since` recency window can be exercised.
+/// The classification lookups (status/priority/queue) come from the
+/// default tenant, matching the `tests/reports.rs` seeding strategy; the
+/// ticket FKs do not enforce same-tenant lookups. Passing
+/// `source_article_id = None` plants a ticket with a NULL source, which
+/// the widget must exclude.
+async fn seed_ticket_for_article(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    company_id: uuid::Uuid,
+    created_by: uuid::Uuid,
+    number: &str,
+    source_article_id: Option<uuid::Uuid>,
+    age_days: i64,
+) {
+    let status_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_statuses WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("a ticket status");
+    let priority_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("a ticket priority");
+    let queue_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("a ticket queue");
+
+    sqlx::query(
+        r#"INSERT INTO tickets
+           (id, tenant_id, ticket_number, title, status_id, priority_id,
+            queue_id, company_id, created_by_id, source_kb_article_id,
+            created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                   NOW() - ($11 * INTERVAL '1 day'))"#,
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(number)
+    .bind("Seed ticket")
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(created_by)
+    .bind(source_article_id)
+    .bind(age_days as f64)
+    .execute(pool)
+    .await
+    .expect("seed ticket for article");
+}
+
+/// PMS-485: the "Top ticket-driving articles" widget endpoint
+/// (`GET /api/v1/kb/top-ticket-driving-articles`) returns one row per KB
+/// article, `{ id, title, ticket_count }`, ordered by descending count,
+/// scoped to the tenant and a recency window. Tickets with a NULL source
+/// and tickets older than the window are excluded.
+#[sqlx::test]
+async fn top_ticket_driving_articles_orders_by_count_and_respects_window(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Empty state: a tenant with no KB-sourced tickets returns [].
+    let empty_resp = app
+        .client
+        .get(app.url("/api/v1/kb/top-ticket-driving-articles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send top-ticket-driving (empty)");
+    assert_eq!(empty_resp.status(), reqwest::StatusCode::OK);
+    let empty: serde_json::Value = empty_resp.json().await.expect("empty JSON");
+    assert_eq!(
+        empty.as_array().map(|a| a.len()),
+        Some(0),
+        "fresh tenant should return an empty array, got {empty:?}"
+    );
+
+    // Two articles: A will be cited by 3 tickets, B by 1 (in-window).
+    let article_a = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Reset the router",
+            "slug": "reset-the-router",
+            "content": "Hold reset for ten seconds.",
+            "visibility": "public",
+            "status": "published",
+        }),
+    )
+    .await;
+    let article_a_id = article_a["id"].as_str().expect("article A id").to_string();
+    let article_b = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Flush the DNS cache",
+            "slug": "flush-dns-cache",
+            "content": "Run the flush command.",
+            "visibility": "public",
+            "status": "published",
+        }),
+    )
+    .await;
+    let article_b_id = article_b["id"].as_str().expect("article B id").to_string();
+
+    let a_uuid = uuid::Uuid::parse_str(&article_a_id).expect("A uuid");
+    let b_uuid = uuid::Uuid::parse_str(&article_b_id).expect("B uuid");
+
+    // Article A: three recent KB-sourced tickets.
+    for n in 0..3 {
+        seed_ticket_for_article(
+            &pool,
+            common::DEFAULT_TENANT_ID,
+            company_id,
+            admin_id,
+            &format!("A-{n}"),
+            Some(a_uuid),
+            1,
+        )
+        .await;
+    }
+    // Article B: one recent ticket, plus one ANCIENT (200 days) ticket that
+    // the default 90-day window must drop but a 365-day window must keep.
+    seed_ticket_for_article(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        company_id,
+        admin_id,
+        "B-recent",
+        Some(b_uuid),
+        1,
+    )
+    .await;
+    seed_ticket_for_article(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        company_id,
+        admin_id,
+        "B-ancient",
+        Some(b_uuid),
+        200,
+    )
+    .await;
+    // A ticket with no KB source must never appear in the widget.
+    seed_ticket_for_article(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        company_id,
+        admin_id,
+        "no-source",
+        None,
+        1,
+    )
+    .await;
+
+    // Default window (90 days): A=3, B=1, ordered by descending count.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/kb/top-ticket-driving-articles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send top-ticket-driving");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let rows: serde_json::Value = resp.json().await.expect("rows JSON");
+    let rows = rows.as_array().expect("response is an array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "exactly two cited articles in window: {rows:?}"
+    );
+
+    assert_eq!(rows[0]["id"].as_str(), Some(article_a_id.as_str()));
+    assert_eq!(rows[0]["title"].as_str(), Some("Reset the router"));
+    assert_eq!(
+        rows[0]["ticket_count"].as_i64(),
+        Some(3),
+        "article A should lead with 3 tickets"
+    );
+    assert_eq!(rows[1]["id"].as_str(), Some(article_b_id.as_str()));
+    assert_eq!(
+        rows[1]["ticket_count"].as_i64(),
+        Some(1),
+        "article B's ancient ticket must be outside the 90-day window"
+    );
+
+    // Widening the window to 365 days pulls B's ancient ticket back in.
+    let wide_resp = app
+        .client
+        .get(app.url("/api/v1/kb/top-ticket-driving-articles?days=365"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send top-ticket-driving (wide window)");
+    assert_eq!(wide_resp.status(), reqwest::StatusCode::OK);
+    let wide: serde_json::Value = wide_resp.json().await.expect("wide JSON");
+    let wide = wide.as_array().expect("wide response is an array");
+    let b_count = wide
+        .iter()
+        .find(|r| r["id"].as_str() == Some(article_b_id.as_str()))
+        .and_then(|r| r["ticket_count"].as_i64());
+    assert_eq!(
+        b_count,
+        Some(2),
+        "a 365-day window should count both of article B's tickets"
+    );
+
+    // The `limit` cap trims the result set.
+    let limited_resp = app
+        .client
+        .get(app.url("/api/v1/kb/top-ticket-driving-articles?limit=1"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send top-ticket-driving (limit=1)");
+    assert_eq!(limited_resp.status(), reqwest::StatusCode::OK);
+    let limited: serde_json::Value = limited_resp.json().await.expect("limited JSON");
+    let limited = limited.as_array().expect("limited response is an array");
+    assert_eq!(limited.len(), 1, "limit=1 returns a single row");
+    assert_eq!(
+        limited[0]["id"].as_str(),
+        Some(article_a_id.as_str()),
+        "the single row is the top driver (article A)"
+    );
+}

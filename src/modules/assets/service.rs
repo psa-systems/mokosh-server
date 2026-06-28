@@ -224,6 +224,7 @@ impl AssetsService {
                       a.installed_date, a.department, a.in_transit_ticket_id,
                       -- PMS-456: per-CI lifecycle stage. Free-text VARCHAR(50).
                       a.itil_lifecycle_stage,
+                      a.license_vendor, a.license_seat_count, a.license_expiry,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -273,9 +274,11 @@ impl AssetsService {
                                     purchase_date, purchase_price, warranty_expiry, end_of_life,
                                     assigned_user_id, ip_address, hostname, mac_address,
                                     installed_date, department, in_transit_ticket_id,
-                                    itil_lifecycle_stage)
+                                    itil_lifecycle_stage,
+                                    license_vendor, license_seat_count, license_expiry)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-                       $17, NULLIF($18,'')::inet, $19, $20, $21, $22, $23, $24)"#,
+                       $17, NULLIF($18,'')::inet, $19, $20, $21, $22, $23, $24,
+                       $25, $26, $27)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -301,6 +304,9 @@ impl AssetsService {
         .bind(&request.department)
         .bind(request.in_transit_ticket_id)
         .bind(&request.itil_lifecycle_stage)
+        .bind(&request.license_vendor)
+        .bind(request.license_seat_count)
+        .bind(request.license_expiry)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -344,6 +350,7 @@ impl AssetsService {
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
                       a.installed_date, a.department, a.in_transit_ticket_id,
                       a.itil_lifecycle_stage,
+                      a.license_vendor, a.license_seat_count, a.license_expiry,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -404,6 +411,9 @@ impl AssetsService {
                 department = COALESCE($21, department),
                 in_transit_ticket_id = COALESCE($22, in_transit_ticket_id),
                 itil_lifecycle_stage = COALESCE($23, itil_lifecycle_stage),
+                license_vendor = COALESCE($24, license_vendor),
+                license_seat_count = COALESCE($25, license_seat_count),
+                license_expiry = COALESCE($26, license_expiry),
                 updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -430,6 +440,9 @@ impl AssetsService {
         .bind(&request.department)
         .bind(request.in_transit_ticket_id)
         .bind(&request.itil_lifecycle_stage)
+        .bind(&request.license_vendor)
+        .bind(request.license_seat_count)
+        .bind(request.license_expiry)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1171,6 +1184,10 @@ struct AssetRow {
     in_transit_ticket_id: Option<Uuid>,
     // PMS-456: ITIL CI lifecycle stage.
     itil_lifecycle_stage: Option<String>,
+    // PMS-454: licence section (QA-expanded scope).
+    license_vendor: Option<String>,
+    license_seat_count: Option<i32>,
+    license_expiry: Option<chrono::NaiveDate>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1203,6 +1220,9 @@ impl From<AssetRow> for AssetResponse {
             department: r.department,
             in_transit_ticket_id: r.in_transit_ticket_id,
             itil_lifecycle_stage: r.itil_lifecycle_stage,
+            license_vendor: r.license_vendor,
+            license_seat_count: r.license_seat_count,
+            license_expiry: r.license_expiry,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

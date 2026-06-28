@@ -5,11 +5,13 @@
 //! is meant to be mounted at `/api/v1/portal` and wrapped in
 //! `portal_auth_middleware`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -17,15 +19,16 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
+use super::rate_limit::PortalLoginLimiter;
 use super::service::PortalAuthService;
 use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalLoginRequest,
-    PortalLoginResponse, PortalSetupPasswordRequest,
+    PortalSetupPasswordRequest,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::tickets::{TicketNoteResponse, TicketResponse, TicketService};
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -34,6 +37,12 @@ pub struct PortalRouterState {
     pub tickets: Arc<TicketService>,
     pub kb: Arc<KbService>,
     pub billing: Arc<BillingService>,
+    /// Layered (per-IP + per-(tenant_slug, email)) login rate limiter
+    /// (PMS-501). Lives for the lifetime of the router so quota state
+    /// survives across requests. The check runs inline at the top of the
+    /// `login` handler so the limiter can see both source IP and the
+    /// `(tenant_slug, email)` from the deserialized request body.
+    pub login_limiter: Arc<PortalLoginLimiter>,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
@@ -50,6 +59,7 @@ pub fn portal_routes(
         tickets: Arc::new(tickets),
         kb: Arc::new(kb),
         billing: Arc::new(billing),
+        login_limiter: PortalLoginLimiter::new(),
     };
     let mw = PortalAuthMiddleware::new(service);
 
@@ -85,13 +95,43 @@ pub fn portal_routes(
         ))
 }
 
+/// Portal login. Rate-limited per `(source IP, (tenant_slug, lowercased
+/// email))` at 20/min per IP + 5/min per account; over-quota returns 429
+/// with a `Retry-After` header (PMS-501). The check runs inline because
+/// tower middleware cannot read the JSON body without buffering it. A
+/// persistent failed-attempt lockout lives in `PortalAuthService::login`
+/// and surfaces here as `AppError::RateLimited` (429) as well.
 async fn login(
     State(state): State<PortalRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<PortalLoginRequest>,
-) -> AppResult<Json<PortalLoginResponse>> {
+) -> Result<Response, AppError> {
     request.validate()?;
+
+    if let Err(retry_after) =
+        state
+            .login_limiter
+            .check(addr.ip(), &request.tenant_slug, &request.email)
+    {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate_limited",
+                "message": "Too many login attempts, please try again later",
+                "retry_after_seconds": retry_after,
+            })),
+        )
+            .into_response();
+        let h = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+            h.insert(header::RETRY_AFTER, v);
+        }
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(resp);
+    }
+
     let resp = state.service.login(&request).await?;
-    Ok(Json(resp))
+    Ok(Json(resp).into_response())
 }
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {

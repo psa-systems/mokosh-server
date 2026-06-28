@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use rand::RngCore;
 
@@ -14,7 +14,7 @@ use super::models::{
     EmailIntakeRequest, EmailIntakeResponse, IntakeTokenResponse,
 };
 use crate::modules::auth::TenantId;
-use crate::modules::tickets::TicketService;
+use crate::modules::tickets::{AttachmentService, TicketService};
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, Clone)]
@@ -27,11 +27,16 @@ pub struct ResolvedTenantToken {
 pub struct EmailIntakeService {
     pool: PgPool,
     tickets: TicketService,
+    attachments: AttachmentService,
 }
 
 impl EmailIntakeService {
-    pub fn new(pool: PgPool, tickets: TicketService) -> Self {
-        Self { pool, tickets }
+    pub fn new(pool: PgPool, tickets: TicketService, attachments: AttachmentService) -> Self {
+        Self {
+            pool,
+            tickets,
+            attachments,
+        }
     }
 
     /// Resolve a presented bearer to its owning tenant. The bearer is
@@ -121,6 +126,7 @@ impl EmailIntakeService {
                 deduplicated: true,
                 threaded: false,
                 comment_added: false,
+                attachments_stored: 0,
             });
         }
         // Step 2: thread by References / In-Reply-To. PMS-469 phase 2:
@@ -137,12 +143,28 @@ impl EmailIntakeService {
                     .await
                     .ok()
                     .flatten();
-                let comment_added = if let Some((contact_id, _)) = resolved_contact {
-                    self.append_reply_comment(tenant_id, id, contact_id, req)
+                // PMS-450 AC3: the reply body becomes a public note and
+                // its attachments hang off that note (so the SPA renders
+                // them in the reply, not loose on the ticket). When no
+                // contact resolves, the note is skipped and so are its
+                // attachments - there is no Customer to attribute either to.
+                let (comment_added, attachments_stored) = if let Some((contact_id, _)) =
+                    resolved_contact
+                {
+                    match self
+                        .append_reply_comment(tenant_id, id, contact_id, req)
                         .await
-                        .is_ok()
+                    {
+                        Ok(note_id) => {
+                            let stored = self
+                                .store_attachments(tenant_id, id, Some(note_id), contact_id, req)
+                                .await;
+                            (true, stored)
+                        }
+                        Err(_) => (false, 0),
+                    }
                 } else {
-                    false
+                    (false, 0)
                 };
                 return Ok(EmailIntakeResponse {
                     ticket_id: id,
@@ -151,6 +173,7 @@ impl EmailIntakeService {
                     deduplicated: false,
                     threaded: true,
                     comment_added,
+                    attachments_stored,
                 });
             }
         }
@@ -205,14 +228,23 @@ impl EmailIntakeService {
             .create_ticket(tenant_id, creator, &create_req, &ctx)
             .await
         {
-            Ok(ticket) => Ok(EmailIntakeResponse {
-                ticket_id: ticket.id,
-                ticket_number: ticket.ticket_number,
-                created: true,
-                deduplicated: false,
-                threaded: false,
-                comment_added: false,
-            }),
+            Ok(ticket) => {
+                // PMS-450 AC3: store inbound attachments against the new
+                // ticket (note_id = None - they belong to the opening
+                // message, not a note). Attributed to the sender contact.
+                let attachments_stored = self
+                    .store_attachments(tenant_id, ticket.id, None, contact_id, req)
+                    .await;
+                Ok(EmailIntakeResponse {
+                    ticket_id: ticket.id,
+                    ticket_number: ticket.ticket_number,
+                    created: true,
+                    deduplicated: false,
+                    threaded: false,
+                    comment_added: false,
+                    attachments_stored,
+                })
+            }
             Err(e) => {
                 // The partial unique index on (tenant_id,
                 // email_message_id) catches a concurrent dedup race:
@@ -233,6 +265,7 @@ impl EmailIntakeService {
                             deduplicated: true,
                             threaded: false,
                             comment_added: false,
+                            attachments_stored: 0,
                         });
                     }
                 }
@@ -302,7 +335,7 @@ impl EmailIntakeService {
         ticket_id: Uuid,
         contact_id: Uuid,
         req: &EmailIntakeRequest,
-    ) -> AppResult<()> {
+    ) -> AppResult<Uuid> {
         let creator: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM users \
              WHERE tenant_id = $1 AND status = 'active' \
@@ -323,19 +356,74 @@ impl EmailIntakeService {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or("(reply body empty)");
-        sqlx::query(
+        let note_id: Uuid = sqlx::query_scalar(
             "INSERT INTO ticket_notes \
                  (tenant_id, ticket_id, note_type, content, created_by_id, created_by_contact_id) \
-             VALUES ($1, $2, 'public', $3, $4, $5)",
+             VALUES ($1, $2, 'public', $3, $4, $5) RETURNING id",
         )
         .bind(tenant_id)
         .bind(ticket_id)
         .bind(content)
         .bind(creator)
         .bind(contact_id)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        Ok(note_id)
+    }
+
+    /// PMS-450 AC3: decode and persist every inbound attachment to the
+    /// shared `ticket_attachments` blob path, attributed to the sender
+    /// contact. Best-effort per part: a base64 payload that fails to
+    /// decode, or a blob that exceeds the storage size cap, is logged
+    /// and skipped rather than failing the whole intake (the ticket /
+    /// reply must still land). Returns the count actually stored.
+    async fn store_attachments(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        note_id: Option<Uuid>,
+        contact_id: Uuid,
+        req: &EmailIntakeRequest,
+    ) -> u32 {
+        let mut stored = 0u32;
+        for att in &req.attachments {
+            let bytes = match STANDARD.decode(att.content_base64.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        %ticket_id, file_name = %att.file_name,
+                        "skipping email attachment: base64 decode failed: {e}"
+                    );
+                    continue;
+                }
+            };
+            let mime = att
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            match self
+                .attachments
+                .store_email_attachment(
+                    tenant_id.get(),
+                    ticket_id,
+                    note_id,
+                    contact_id,
+                    att.file_name.clone(),
+                    mime,
+                    bytes,
+                )
+                .await
+            {
+                Ok(_) => stored += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        %ticket_id, file_name = %att.file_name,
+                        "skipping email attachment: storage failed: {e}"
+                    );
+                }
+            }
+        }
+        stored
     }
 
     /// PMS-469: insert the `email_intake_log` row at the top of the

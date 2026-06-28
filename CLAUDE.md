@@ -31,31 +31,25 @@ just check-docker          # validate OCI image builder stage
 just build-docker          # build production OCI image (oci-build/Dockerfile)
 ```
 
-Single test: `cargo test -p <crate> <test_name>` (workspace), e.g. `cargo test -p mokosh-auth-crypto totp::tests::generates_valid_code`.
+Single test: `cargo test -p <crate> <test_name>` (workspace), e.g. `cargo test -p mokosh-server utils::totp::tests::rfc6238_vector`.
 
-### Dev stacks
+### Dev stack
 
-Two compose layouts, mutually exclusive in practice:
+A single Traefik-routed dev stack (PMS-511 folded the former SSO overlay into `compose.dev.yml`):
 
 ```
-just dev                   # LAN-IP stack: mokosh-server + Infisical + Postgres + Valkey on br0/eth0
-just dev-down              # stop LAN-IP stack (volumes preserved)
+just dev                   # Traefik-routed stack at https://${USER}-mokosh-api.a8n.run (mokosh-server + Postgres + mailpit)
+just dev-infisical         # opt-in: Infisical + its Postgres (compose profile: infisical)
+just down                  # stop the dev stack, remove orphans (volumes preserved)
 just dev-clean             # stop + wipe volumes + remove .env (keeps .env.infisical)
-just infisical-bootstrap   # one-time after `just dev`, fills INFISICAL_* in .env
-
-just dev-sso               # Traefik-routed per-developer SSO stack at *.a8n.run (requires OIDC keys)
-just dev-sso-down
-just down                  # stop BOTH stacks, remove orphans (volumes preserved)
-just restart               # down + dev-sso
-
-just register-client       # register PSA-Mokosh-Clients (public OIDC, after dev-sso up)
-just register-bunyip-client
-just register-lets-chat-client
+just infisical-bootstrap   # one-time after `just dev-infisical`, fills INFISICAL_* in .env
 ```
 
-`just dev` rewrites `MOKOSH_HOST_BIND_IP` and `USER` in `.env` each run, discovering the LAN IP from `sys net | where name =~ 'eth0|br0'`. First run copies `.env.dev` to `.env`.
+OIDC client registration recipes (`register-client`, etc.) were removed with mokosh-auth in PMS-295: bunyip is the sole OP and owns its own client registry, so RPs register with bunyip, not mokosh.
 
-`just dev-sso` requires Ed25519 keypair at `secrets/dev-key.pem` + `secrets/dev-key.pub.pem`; auto-generated via `scripts/gen-oidc-key.sh dev-key` (each dev machine generates its own; not committed).
+`just dev` rewrites `MOKOSH_HOST_BIND_IP` and `USER` in `.env` each run (the LAN IP, discovered from `sys net | where name =~ 'eth0|br0'`, still drives the published `postgres`/`mailpit` host ports for sqlx-cli and the mail UI; the `server` itself is ingress-only via Traefik). First run copies `.env.dev` to `.env`.
+
+`just dev` requires the shared external `network-traefik-public` to already exist. (Before PMS-295 it also needed a local Ed25519 keypair for mokosh-auth's OP signing; that subsystem is gone, so no key material is provisioned now. The bunyip-as-OP Resource-Server path verifies tokens against bunyip's JWKS over the network.)
 
 ## Architecture
 
@@ -63,50 +57,39 @@ just register-lets-chat-client
 
 ```
 src/
-  main.rs               mokosh-server entrypoint: AppConfig::from_env, bootstrap SSO, build router
+  main.rs               mokosh-server entrypoint: AppConfig::from_env, build router
   lib.rs                library crate root
   api/router.rs         create_api_router: nests every module under /api/v1, wires middleware + CORS
-  bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, clients register
+  bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown
   db/                   Database wrapper around sqlx::PgPool
   infisical/            Infisical HTTP client + first-run bootstrap
   modules/<name>/       Feature modules (see "Modules" below)
   utils/                error, email (Mailer trait + SmtpMailer/LogMailer), crypto, validation, pagination
   version.rs            VersionInfo (build-time git hash/describe via build.rs)
 
-crates/                 Workspace members for the SSO/auth subsystem
+crates/                 Workspace members: google-oauth-flow, mokosh-types, build-metadata
 migrations/             SQLx migrations, embedded at compile time via sqlx::migrate!
 oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
-compose.dev.yml         LAN-IP dev stack
-compose.dev-sso.yml     Traefik overlay for per-developer SSO
+compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
 .forgejo/workflows/     CI (Forgejo)
 dev-docs/               codebase-state.md is the authoritative module/route catalog
 ```
 
-### Auth: three independent mechanisms (PMS-291)
+### Auth: two independent mechanisms (PMS-295)
 
-The server accepts up to three independent auth paths in parallel; failing to mount one does NOT disable the others:
+bunyip-as-OP is the only OP. PMS-295 removed mokosh-auth (mechanism 2, mokosh's own OIDC OP) entirely; the server now accepts two independent auth paths in parallel, and failing to mount one does NOT disable the other:
 
-1. **Bunyip-as-OP Resource-Server** (`src/modules/auth/oidc_rs.rs`): mokosh verifies bunyip-issued `at+jwt` Bearer tokens against bunyip's JWKS. Configured by `OIDC_ISSUER` + `OIDC_AUDIENCE`. This is the path the mokosh-apps SPA and the E2E suite actually use; tokens come from `api.<tld>` = bunyip.
-2. **mokosh-auth (mokosh's own OIDC OP)** (`crates/mokosh-auth*`): a full second IdP run by mokosh itself - EdDSA `at+jwt`, OAuth client registry, federation, recovery codes, TOTP, trusted devices. `crates/mokosh-auth` is the umbrella crate; `main.rs` calls `try_bootstrap_sso`. On success the SSO router is merged into the PSA router AND its key set is passed to `AuthMiddleware::with_at_jwt(...)`. Requires: `MOKOSH_AUTH_ISSUER`, `MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH`, `MOKOSH_AUTH_JWT_ACTIVE_KID`, `MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR`, `MOKOSH_AUTH_DATA_ENCRYPTION_KEY`. The Ed25519 keypair (`<kid>.pem` + `<kid>.pub.pem`) must already exist in the configured `MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH` / `MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR` BEFORE first start; PMS-289 makes a missing key set a fatal boot error rather than a silent WARN.
-3. **Legacy HS256 cookie auth** (`src/modules/auth/`): JWT in cookie, Argon2 password hashing, session rows in `user_sessions`. Used by the original PSA endpoints. `AuthMiddleware` decodes the cookie into an `AuthState`. Routes opt in via `RequireAuth` / `RequireRole` / `RequireAdmin` / `RequireManager` / `RequireFinance` extractors.
+1. **Bunyip-as-OP Resource-Server** (`src/modules/auth/oidc_rs.rs`): mokosh verifies bunyip-issued `at+jwt` Bearer tokens against bunyip's JWKS. Configured by `OIDC_ISSUER` + `OIDC_AUDIENCE`. This is the path the mokosh-apps SPA and the E2E suite actually use; tokens come from `api.<tld>` = bunyip. Mokosh holds no signing key and exposes no `/oauth2/*` endpoints.
+2. **Legacy HS256 cookie auth** (`src/modules/auth/`): JWT in cookie, Argon2 password hashing, session rows in `user_sessions`. Used by the original PSA endpoints. `AuthMiddleware` decodes the cookie into an `AuthState`. Routes opt in via `RequireAuth` / `RequireRole` / `RequireAdmin` / `RequireManager` / `RequireFinance` extractors. TOTP (RFC 6238) + MFA recovery codes for this path live in `src/utils/totp.rs` + `src/utils/recovery.rs` (relocated from the removed `mokosh-auth-crypto` crate in PMS-295).
 
-**Posture decision (PMS-291)**: c-01 (staging) and nc-01 (production) currently run **all three** (interim path B from PMS-292 - keys provisioned, mechanism 2 mounted). The end-state is to drop mechanism 2 entirely (bunyip-as-OP only); tracked in PMS-295 as a follow-up. Until that lands, removing `MOKOSH_AUTH_*` from the env is a viable rollback only if the keys are also removed from `MOKOSH_AUTH_JWT_*` paths.
+**History (PMS-291 / PMS-292 / PMS-289)**: mokosh-auth was a configured-but-unused second IdP (`crates/mokosh-auth*`). PMS-289 made a misconfigured mokosh-auth a fatal boot error, which took staging+prod down (PMS-292 restored service by provisioning keys - interim path B). PMS-295 is the path-A follow-up: tear mokosh-auth out so `MOKOSH_AUTH_*` env, the `crates/mokosh-auth*` workspace members, and the `mokosh-server-secrets` volume all go away. The server boots fine with no `MOKOSH_AUTH_*` env present.
 
-Auth workspace crates:
+Remaining auth-adjacent workspace crate:
 
 ```
-mokosh-auth-core         Domain model, IDs, time, repository traits, policy
-mokosh-auth-crypto       AEAD, Ed25519 keys, Argon2 passwords, TOTP (RFC 6238), recovery codes, opaque tokens
-mokosh-auth-storage      Postgres repos: client, session, refresh, code, signup, invite, tenant, user, etc.
-mokosh-auth-oidc         /authorize, /token, /userinfo, /.well-known/openid-configuration, RP-initiated logout
-mokosh-auth-federation   External IdP federation
-mokosh-auth-http         Axum router, handlers, extractors, cookies, rate limit, LettreMailer (separate from host Mailer)
-mokosh-auth              Umbrella: re-exports + bootstrap + AuthConfig
 google-oauth-flow        Reusable Google OAuth popup/code-exchange client (used by legacy /auth/google routes)
 ```
-
-The host crate also imports `mokosh-auth-crypto` directly so the legacy login flow can verify TOTP without duplicating that primitive.
 
 ### Routing model
 
