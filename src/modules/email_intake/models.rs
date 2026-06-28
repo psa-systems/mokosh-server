@@ -54,6 +54,37 @@ pub struct EmailIntakeRequest {
     /// whatever subset is convenient. Defaults to `{}` when absent.
     #[serde(default = "default_empty_object")]
     pub raw_headers: RawHeaders,
+    /// PMS-450 AC3: inbound MIME attachments. The gateway decodes the
+    /// MIME parts and ships each as base64 so the JSON payload stays
+    /// transport-safe. Stored against the created ticket (or the reply
+    /// note on a threading hit) via the shared `ticket_attachments`
+    /// blob path. Defaults to an empty list; a body with no attachments
+    /// is unchanged from the Phase 1 shape.
+    #[serde(default)]
+    #[validate(nested)]
+    pub attachments: Vec<EmailIntakeAttachment>,
+}
+
+/// PMS-450 AC3: one inbound email attachment. The bytes ride on the
+/// JSON payload as standard (padded) base64; the service decodes and
+/// hands them to `AttachmentService`, which enforces the same on-disk
+/// layout and size cap as the interactive upload paths.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct EmailIntakeAttachment {
+    /// Original filename from the MIME part's `Content-Disposition`.
+    /// Sanitised again at the storage boundary, so a hostile name
+    /// cannot escape the per-tenant directory.
+    #[validate(length(min = 1, max = 255))]
+    pub file_name: String,
+    /// MIME type from the part's `Content-Type`. Optional; the storage
+    /// layer falls back to `application/octet-stream` when absent.
+    #[validate(length(max = 100))]
+    pub mime_type: Option<String>,
+    /// Standard base64 (with padding, RFC 4648) of the raw bytes. The
+    /// service rejects a part whose payload does not decode rather than
+    /// failing the whole intake.
+    #[validate(length(min = 1))]
+    pub content_base64: String,
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -84,6 +115,13 @@ pub struct EmailIntakeResponse {
     /// sender so the note had no Customer to attribute to.
     #[serde(default)]
     pub comment_added: bool,
+    /// PMS-450 AC3: count of inbound attachments persisted to the
+    /// ticket (create path) or the reply note (threading path). Best-
+    /// effort: a part that fails to decode or exceeds the size cap is
+    /// skipped and not counted, so this can be less than the number of
+    /// `attachments` the gateway sent.
+    #[serde(default)]
+    pub attachments_stored: u32,
 }
 
 /// PMS-469 phase 2: the audit row for one inbound email-intake. The

@@ -83,6 +83,11 @@ pub struct AssetResponse {
     /// retired, or a tenant-coined value). `None` for assets created
     /// before the column shipped; the SPA renders `None` as "Unknown".
     pub itil_lifecycle_stage: Option<String>,
+    // PMS-454: licence section (QA-expanded scope). `None` for assets
+    // that carry no licence (the common case for hardware).
+    pub license_vendor: Option<String>,
+    pub license_seat_count: Option<i32>,
+    pub license_expiry: Option<NaiveDate>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -138,6 +143,13 @@ pub struct CreateAssetRequest {
     #[validate(length(max = 50))]
     #[serde(default)]
     pub itil_lifecycle_stage: Option<String>,
+    // PMS-454: licence section (QA-expanded scope). Each optional so the
+    // create path stays unchanged for callers that omit it.
+    #[validate(length(max = 150))]
+    pub license_vendor: Option<String>,
+    #[validate(range(min = 0))]
+    pub license_seat_count: Option<i32>,
+    pub license_expiry: Option<NaiveDate>,
 }
 
 fn default_active() -> String {
@@ -178,6 +190,13 @@ pub struct UpdateAssetRequest {
     #[validate(length(max = 50))]
     #[serde(default)]
     pub itil_lifecycle_stage: Option<String>,
+    // PMS-454: licence section (QA-expanded scope). None leaves each
+    // column untouched on a partial PUT.
+    #[validate(length(max = 150))]
+    pub license_vendor: Option<String>,
+    #[validate(range(min = 0))]
+    pub license_seat_count: Option<i32>,
+    pub license_expiry: Option<NaiveDate>,
 }
 
 #[derive(Debug, Clone, Serialize)]

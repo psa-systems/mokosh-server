@@ -5,16 +5,23 @@
 # git log between the previous tag and HEAD, and creates the release
 # (with tag) via the Forgejo API.
 #
-# Why the gate moved from the job to each step:
+# Why the work is split into a gate job and a publish job:
 # Forgejo Actions fires this workflow on every PR-closed event targeting
 # `main`, but only a `release/v*` head ref should actually publish a
-# release. When the job-level `if` evaluated false (the typical case),
-# the whole workflow concluded as `skipped`, which the Forgejo repo
-# status badge counted as "not success" - the repo appeared red even
-# though every other workflow on the merge commit was green. Gate the
-# real work on a `Gate` step's output so the job always has at least
-# one step that succeeds and the workflow concludes as `success`
-# whether or not a release publishes.
+# release. A separate `gate` job always runs and succeeds, so the
+# workflow always has at least one successful job and concludes as
+# `success` whether or not a release publishes - the repo status badge
+# stays green even on non-release merges. Only the `create-release` job
+# carries the `contents: write` token, and it runs solely when the gate
+# says so, so the write permission is never granted to the gate's
+# (data-only) evaluation of attacker-controlled PR fields.
+#
+# Security: values under `github.event.*` (notably the PR head ref) are
+# attacker-controlled and are NEVER interpolated into shell/script text.
+# They are passed through the `env:` mapping and referenced as shell /
+# Nushell variables ($HEAD_REF / $env.HEAD_REF) so they are treated as
+# data, not code. The head ref is additionally validated against a
+# strict `^release/v[0-9.]+$` pattern before any release is published.
 
 name: Create release
 
@@ -26,19 +33,22 @@ on:
       - main
 
 jobs:
-  create-release:
-    name: Create release from merged PR
+  gate:
+    name: Gate (release-branch merges only)
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
     permissions:
-      contents: write
-
+      contents: read
+    outputs:
+      do_release: ${{ steps.gate.outputs.do_release }}
     steps:
       - name: Gate (release-branch merges only)
         id: gate
         shell: bash
+        env:
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          if [[ "${{ github.event.pull_request.merged }}" == "true" \
-            && "${{ github.event.pull_request.head.ref }}" == release/v* ]]; then
+          if [[ "$PR_MERGED" == "true" && "$HEAD_REF" =~ ^release/v[0-9.]+$ ]]; then
             echo "do_release=true" >> "$GITHUB_OUTPUT"
             echo "This is a release-branch merge; will publish."
           else
@@ -46,19 +56,27 @@ jobs:
             echo "Not a release-branch merge; no release will be published."
           fi
 
+  create-release:
+    name: Create release from merged PR
+    needs: gate
+    if: needs.gate.outputs.do_release == 'true'
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    permissions:
+      contents: write
+
+    steps:
       - name: Clone the repository
-        if: steps.gate.outputs.do_release == 'true'
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Create release
-        if: steps.gate.outputs.do_release == 'true'
         shell: nu {0}
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_PAT }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          let branch = "${{ github.event.pull_request.head.ref }}"
+          let branch = $env.HEAD_REF
           let tag = ($branch | str replace "release/" "")
 
           # Build changelog from commits since the previous tag

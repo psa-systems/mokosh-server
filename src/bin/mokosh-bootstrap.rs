@@ -56,42 +56,6 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        // `mokosh-bootstrap provision-roles` (PMS-285) creates the split DB
-        // roles - `mokosh_migrator` (BYPASSRLS, owns the schema / runs DDL) and
-        // `mokosh_app` (NOSUPERUSER NOBYPASSRLS, the request-serving role) - and
-        // grants `mokosh_app` read/write on existing + future objects. Run once
-        // with privileged creds (it already runs with elevated rights for the
-        // other subcommands). Idempotent: re-running only reconciles grants.
-        Some("provision-roles") => match run_provision_roles().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {:#}", e);
-                ExitCode::FAILURE
-            }
-        },
-        // `mokosh-bootstrap clients register` registers a new OAuth/OIDC
-        // client in mokosh_auth.oauth_clients. The form in argv is
-        // intentional: future client subcommands (`list`, `disable`,
-        // `rotate-secret`) slot in alongside without churn.
-        Some("clients") => match args.get(2).map(String::as_str) {
-            Some("register") => match run_clients_register().await {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {:#}", e);
-                    ExitCode::FAILURE
-                }
-            },
-            Some(other) => {
-                eprintln!("error: unknown clients subcommand '{}'\n", other);
-                print_help();
-                ExitCode::FAILURE
-            }
-            None => {
-                eprintln!("error: `clients` requires a subcommand\n");
-                print_help();
-                ExitCode::FAILURE
-            }
-        },
         // `mokosh-bootstrap qa-seed --tenant <uuid>` loads the QA walkthrough
         // dataset (PMS-331) into a tenant explicitly marked QA. `qa-teardown`
         // removes it. Both fail closed against any non-QA / production tenant.
@@ -131,8 +95,6 @@ USAGE:
 
 SUBCOMMANDS:
     bootstrap-infisical    First-run setup of a fresh Infisical instance.
-    provision-roles        Create the split DB roles (mokosh_migrator / mokosh_app).
-    clients register       Register a new OAuth/OIDC client in mokosh_auth.
     qa-seed                Seed the QA walkthrough dataset into a QA-marked tenant (PMS-331).
     qa-teardown            Remove the QA walkthrough dataset from a QA-marked tenant.
     --version, -V          Print version information and exit.
@@ -143,29 +105,6 @@ ENVIRONMENT (qa-seed / qa-teardown):
                            The tenant MUST be marked QA first (fail closed, refuses production):
                              UPDATE tenants SET settings = jsonb_set(COALESCE(settings,'{{}}'::jsonb),
                                '{{is_qa}}', 'true'::jsonb, true) WHERE id = '<qa-tenant-id>';
-
-ENVIRONMENT (provision-roles):
-    DATABASE_URL                  (required) Privileged Postgres URL (BYPASSRLS / superuser).
-    MOKOSH_MIGRATOR_PASSWORD      (required) Password to set on the mokosh_migrator role.
-    MOKOSH_APP_PASSWORD           (required) Password to set on the mokosh_app role.
-
-ENVIRONMENT (clients register):
-    DATABASE_URL                     (required) Postgres URL for mokosh_auth.
-    MOKOSH_CLIENT_NAME               (required) Human-readable client name.
-    MOKOSH_CLIENT_TYPE               public | confidential (default: confidential).
-    MOKOSH_CLIENT_REDIRECT_URIS      (required) Comma-separated redirect URIs.
-    MOKOSH_CLIENT_POST_LOGOUT_URIS   Comma-separated post-logout URIs.
-    MOKOSH_CLIENT_BACKCHANNEL_URI    Optional back-channel logout URL.
-    MOKOSH_CLIENT_LIFECYCLE_URI      Optional lifecycle event URL.
-    MOKOSH_CLIENT_SCOPES             Space-separated scopes (default: openid email offline_access).
-    MOKOSH_CLIENT_GRANT_TYPES        Space-separated grants (default: authorization_code refresh_token).
-    MOKOSH_CLIENT_AUTH_METHOD        none | client_secret_basic | client_secret_post
-                                     (default: client_secret_basic for confidential, none for public).
-    MOKOSH_CLIENT_AUDIENCE           (required) Audience for issued access tokens.
-    MOKOSH_CLIENT_TENANT_ID          Optional UUID; omit for platform-wide client.
-    MOKOSH_CLIENT_DESCRIPTION        Optional short blurb shown by the Bunyip app launcher.
-    MOKOSH_CLIENT_ICON_URL           Optional icon URL shown by the Bunyip app launcher.
-    MOKOSH_CLIENT_ACCESS_TOKEN_TTL   Access-token lifetime in seconds (60-3600, default 600).
 
 ENVIRONMENT (bootstrap-infisical):
     INFISICAL_ADMIN_EMAIL          (required) Admin user email.
@@ -241,92 +180,6 @@ async fn run_bootstrap_infisical() -> anyhow::Result<()> {
     Ok(())
 }
 
-// --- provision-roles (PMS-285) -------------------------------------------
-
-/// Create / reconcile the two-role split that activates RLS at runtime:
-///
-/// - `mokosh_migrator` (`LOGIN BYPASSRLS`) owns the schema and runs DDL / seed
-///   / system-shared writes. Migrations and bootstrap connect as it.
-/// - `mokosh_app` (`LOGIN NOSUPERUSER NOBYPASSRLS`) is the request-serving
-///   role. It is granted read/write on every existing table, sequence and
-///   function, plus `ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator` so
-///   objects created by future migrations are auto-granted. It owns nothing.
-///
-/// Idempotent: roles are created only if absent; passwords and grants are
-/// always reconciled. Connect with privileged creds (`DATABASE_URL`).
-async fn run_provision_roles() -> anyhow::Result<()> {
-    use sqlx::postgres::PgPoolOptions;
-
-    let database_url = require_env("DATABASE_URL")?;
-    let migrator_password = require_env("MOKOSH_MIGRATOR_PASSWORD")?;
-    let app_password = require_env("MOKOSH_APP_PASSWORD")?;
-
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&database_url)
-        .await?;
-
-    let db_name: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(&pool)
-        .await?;
-
-    // Role names are fixed identifiers (no injection surface). Passwords are
-    // interpolated as SQL string literals - utility statements (CREATE/ALTER
-    // ROLE) cannot take bind parameters - so escape single quotes by doubling.
-    let migrator_pw = sql_quote(&migrator_password);
-    let app_pw = sql_quote(&app_password);
-    let db = quote_ident(&db_name);
-
-    // CREATE ROLE is not idempotent, so guard each with a DO block; ALTER ROLE
-    // afterwards reconciles the password + attributes on an existing role.
-    let stmts: Vec<String> = vec![
-        format!(
-            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mokosh_migrator') \
-             THEN CREATE ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD {migrator_pw}; END IF; END $do$"
-        ),
-        format!("ALTER ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD {migrator_pw}"),
-        format!(
-            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mokosh_app') \
-             THEN CREATE ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {app_pw}; END IF; END $do$"
-        ),
-        format!("ALTER ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {app_pw}"),
-        // The migrator owns/creates schema objects.
-        "GRANT ALL ON SCHEMA public TO mokosh_migrator".to_string(),
-        // The app role: connect + use the schema, read/write existing objects.
-        format!("GRANT CONNECT ON DATABASE {db} TO mokosh_app"),
-        "GRANT USAGE ON SCHEMA public TO mokosh_app".to_string(),
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mokosh_app"
-            .to_string(),
-        "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mokosh_app".to_string(),
-        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO mokosh_app".to_string(),
-        // Future objects created by the migrator are auto-granted to the app.
-        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
-         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mokosh_app"
-            .to_string(),
-        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
-         GRANT USAGE, SELECT ON SEQUENCES TO mokosh_app"
-            .to_string(),
-        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
-         GRANT EXECUTE ON FUNCTIONS TO mokosh_app"
-            .to_string(),
-    ];
-
-    for stmt in &stmts {
-        sqlx::query(stmt)
-            .execute(&pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("provision-roles step failed ({e}): {stmt}"))?;
-    }
-
-    println!("Roles provisioned.");
-    println!("  mokosh_migrator: LOGIN BYPASSRLS (owns schema, runs migrations/bootstrap)");
-    println!("  mokosh_app:      LOGIN NOSUPERUSER NOBYPASSRLS (request-serving, owns nothing)");
-    println!("  database:        {db_name}");
-    println!();
-    println!("Point DATABASE_URL at mokosh_migrator and MOKOSH_APP_DATABASE_URL at mokosh_app.");
-    Ok(())
-}
-
 // --- qa-seed / qa-teardown (PMS-331) -------------------------------------
 
 /// Drive the on-demand QA walkthrough dataset seed / teardown. `subcommand` is
@@ -377,16 +230,6 @@ fn parse_tenant_arg(args: &[String]) -> anyhow::Result<uuid::Uuid> {
         .map_err(|_| anyhow::anyhow!("invalid tenant id '{raw}': expected a UUID"))
 }
 
-/// Quote a string as a single-quoted SQL literal, doubling embedded quotes.
-fn sql_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// Quote an SQL identifier, doubling embedded double-quotes.
-fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
-
 fn require_env(key: &str) -> anyhow::Result<String> {
     std::env::var(key).map_err(|_| {
         anyhow::anyhow!(
@@ -394,162 +237,4 @@ fn require_env(key: &str) -> anyhow::Result<String> {
             key
         )
     })
-}
-
-// --- clients register ----------------------------------------------------
-
-async fn run_clients_register() -> anyhow::Result<()> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use rand::RngCore;
-    use sqlx::postgres::PgPoolOptions;
-
-    let database_url = require_env("DATABASE_URL")?;
-    let name = require_env("MOKOSH_CLIENT_NAME")?;
-    let client_type =
-        std::env::var("MOKOSH_CLIENT_TYPE").unwrap_or_else(|_| "confidential".to_string());
-    if !matches!(client_type.as_str(), "public" | "confidential") {
-        anyhow::bail!("MOKOSH_CLIENT_TYPE must be 'public' or 'confidential'");
-    }
-
-    let redirect_uris = parse_csv(&require_env("MOKOSH_CLIENT_REDIRECT_URIS")?);
-    if redirect_uris.is_empty() {
-        anyhow::bail!("MOKOSH_CLIENT_REDIRECT_URIS must list at least one URI");
-    }
-    for u in &redirect_uris {
-        url::Url::parse(u).map_err(|e| anyhow::anyhow!("invalid redirect URI `{}`: {}", u, e))?;
-    }
-
-    let post_logout_uris = std::env::var("MOKOSH_CLIENT_POST_LOGOUT_URIS")
-        .map(|s| parse_csv(&s))
-        .unwrap_or_default();
-    let backchannel = std::env::var("MOKOSH_CLIENT_BACKCHANNEL_URI")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let lifecycle = std::env::var("MOKOSH_CLIENT_LIFECYCLE_URI")
-        .ok()
-        .filter(|s| !s.is_empty());
-
-    let scopes = std::env::var("MOKOSH_CLIENT_SCOPES")
-        .unwrap_or_else(|_| "openid email offline_access".to_string());
-    let scope_vec: Vec<String> = scopes.split_whitespace().map(String::from).collect();
-    let grants = std::env::var("MOKOSH_CLIENT_GRANT_TYPES")
-        .unwrap_or_else(|_| "authorization_code refresh_token".to_string());
-    let grant_vec: Vec<String> = grants.split_whitespace().map(String::from).collect();
-
-    let auth_method =
-        std::env::var("MOKOSH_CLIENT_AUTH_METHOD").unwrap_or_else(|_| match client_type.as_str() {
-            "public" => "none".to_string(),
-            _ => "client_secret_basic".to_string(),
-        });
-    if !matches!(
-        auth_method.as_str(),
-        "none" | "client_secret_basic" | "client_secret_post"
-    ) {
-        anyhow::bail!(
-            "MOKOSH_CLIENT_AUTH_METHOD must be one of: none, client_secret_basic, client_secret_post"
-        );
-    }
-    // Public clients must use `none`; confidential must use a secret-based method.
-    match (client_type.as_str(), auth_method.as_str()) {
-        ("public", "none") => {}
-        ("public", _) => anyhow::bail!("public clients must use auth_method=none"),
-        ("confidential", "none") => {
-            anyhow::bail!("confidential clients must use a secret-based auth_method")
-        }
-        _ => {}
-    }
-
-    let audience = require_env("MOKOSH_CLIENT_AUDIENCE")?;
-    let description = std::env::var("MOKOSH_CLIENT_DESCRIPTION")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let icon_url = std::env::var("MOKOSH_CLIENT_ICON_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let access_token_ttl: Option<i32> = match std::env::var("MOKOSH_CLIENT_ACCESS_TOKEN_TTL") {
-        Ok(s) if !s.is_empty() => Some(
-            s.parse()
-                .map_err(|e| anyhow::anyhow!("MOKOSH_CLIENT_ACCESS_TOKEN_TTL: {}", e))?,
-        ),
-        _ => None,
-    };
-    let tenant_id = std::env::var("MOKOSH_CLIENT_TENANT_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<uuid::Uuid>())
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("MOKOSH_CLIENT_TENANT_ID: {}", e))?;
-
-    // Generate identifiers + (for confidential) a secret.
-    let client_id = uuid::Uuid::new_v4();
-    let (raw_secret, secret_hash) = if client_type == "confidential" {
-        let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
-        let raw = URL_SAFE_NO_PAD.encode(bytes);
-        let hash = mokosh_auth::crypto::hash_password(&raw)
-            .map_err(|e| anyhow::anyhow!("hash_password: {}", e))?;
-        (Some(raw), Some(hash))
-    } else {
-        (None, None)
-    };
-
-    // Connect and INSERT.
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&database_url)
-        .await?;
-
-    // `COALESCE($16, access_token_ttl_seconds)` keeps the DB
-    // default (600) intact when the env var is unset, so the new
-    // column does not silently widen the lifetime on omitted calls.
-    sqlx::query(
-        "INSERT INTO mokosh_auth.oauth_clients
-            (client_id, tenant_id, client_secret_hash, client_type, name,
-             redirect_uris, post_logout_redirect_uris, backchannel_logout_uri,
-             lifecycle_event_uri, allowed_scopes, allowed_grant_types,
-             token_endpoint_auth_method, audience, description, icon_url,
-             access_token_ttl_seconds)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                 COALESCE($16, 600))",
-    )
-    .bind(client_id)
-    .bind(tenant_id)
-    .bind(&secret_hash)
-    .bind(&client_type)
-    .bind(&name)
-    .bind(&redirect_uris)
-    .bind(&post_logout_uris)
-    .bind(&backchannel)
-    .bind(&lifecycle)
-    .bind(&scope_vec)
-    .bind(&grant_vec)
-    .bind(&auth_method)
-    .bind(&audience)
-    .bind(&description)
-    .bind(&icon_url)
-    .bind(access_token_ttl)
-    .execute(&pool)
-    .await?;
-
-    println!("Client registered.");
-    println!("  client_id:      {}", client_id);
-    println!("  name:           {}", name);
-    println!("  type:           {}", client_type);
-    println!("  redirect_uris:  {}", redirect_uris.join(", "));
-    println!("  scopes:         {}", scope_vec.join(" "));
-    println!("  audience:       {}", audience);
-    if let Some(secret) = raw_secret {
-        println!();
-        println!("  client_secret:  {}", secret);
-        println!("  ^ Save this now. The hash is in the database; the raw value");
-        println!("    will not be shown again.");
-    }
-    Ok(())
-}
-
-fn parse_csv(s: &str) -> Vec<String> {
-    s.split(',')
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .collect()
 }

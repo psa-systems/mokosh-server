@@ -1,7 +1,9 @@
 ---
 
 # Development environment for Mokosh Server.
-# Usage: docker compose up   (COMPOSE_FILE=compose.dev.yml is set in .env)
+# Usage: just dev   (brings up the Traefik-routed stack; COMPOSE_FILE is
+# compose.dev.yml). PMS-511 folded the former SSO overlay in here, so the
+# Traefik-routed `*.a8n.run` stack is now the only dev stack.
 #
 # Naming convention (see ~/.claude/CLAUDE.md):
 # - Project name `dev-mokosh` namespaces every resource under the
@@ -19,18 +21,19 @@
 #   adjacent to its parent in alphabetical listings.
 #
 # This stack contains the Mokosh API server plus its secrets-management
-# infrastructure (Infisical + its Postgres + Valkey). The Mokosh client
-# apps run separately (see ../mokosh-clients) and reach the API on its
-# published port (MOKOSH_HOST_BIND_IP:MOKOSH_PORT) and Infisical on its
-# published loopback port (127.0.0.1:28002).
+# infrastructure (Infisical + its Postgres + Valkey, behind the `infisical`
+# profile). The Mokosh client apps run separately (see ../mokosh-clients) and
+# reach the API through Traefik at https://${USER}-mokosh-api.a8n.run.
 #
-# The Mokosh API server runs as the `server` service, reachable inside
-# the compose network as `server:${MOKOSH_PORT}` and on the host at
-# `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PORT}`. The host bind targets a
-# private LAN interface (e.g. br0/eth0) instead of 127.0.0.1 so other
-# Docker containers on the host can reach it; the private IP is not
-# routable from the public internet on a VPS.
+# The Mokosh API server runs as the `server` service, reachable inside the
+# compose network as `server:${MOKOSH_PORT}`. It publishes no LAN-IP host
+# port: the shared Traefik (on the external `traefik-public` network) is the
+# sole ingress and terminates TLS via Let's Encrypt, routing
+# https://${USER}-mokosh-api.a8n.run to the container's $MOKOSH_PORT (see the
+# server's `labels` below).
 #
+# MOKOSH_HOST_BIND_IP is still discovered by `just dev` because postgres and
+# mailpit publish host ports for host-side tooling (sqlx-cli, the mail UI).
 # Discover the host IP with:
 #   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
 #
@@ -131,11 +134,10 @@ services:
       POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
       POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
       POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:-postgres}
-      # PMS-285: passwords for the split request-serving roles, provisioned by
-      # scripts/pg-init.sh (mounted into /docker-entrypoint-initdb.d below) on
-      # first volume init so `just dev` boots with RLS active at runtime.
-      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}
-      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:-mokosh_app_dev}
+      # PMS-489: the split request-serving roles (mokosh_migrator / mokosh_app)
+      # are no longer provisioned by a postgres initdb.d script. The server
+      # self-provisions them at startup from MOKOSH_ADMIN_DATABASE_URL (the
+      # POSTGRES_USER superuser), so postgres only needs its own superuser env.
       # Postgres 18 changed the default PGDATA from /var/lib/postgresql/
       # data to /var/lib/postgresql/<major>/docker. We pin it back into
       # the named volume so state survives container recreates regardless
@@ -149,12 +151,6 @@ services:
       - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PG_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # PMS-488: RLS role split + untrusted-extension bootstrap. The postgres
-      # image runs this once on a fresh volume, as the superuser over the
-      # trusted local socket and before the TCP listener opens, so the roles
-      # and extensions exist before the server connects. See scripts/pg-init.sh
-      # for the rationale and the dropped password-drift behaviour.
-      - ./scripts/pg-init.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -203,10 +199,15 @@ services:
       # cross-tenant workers; MOKOSH_APP_DATABASE_URL connects as the
       # unprivileged `mokosh_app` (NOBYPASSRLS) used for every request-serving
       # query, so a forgotten `WHERE tenant_id` filter fail-closes to zero rows.
-      # Both roles are provisioned by the postgres initdb.d script
-      # (scripts/pg-init.sh) on first volume init.
+      # PMS-489: the server self-provisions both roles at startup. On first boot
+      # mokosh_migrator cannot connect, so the server uses MOKOSH_ADMIN_DATABASE_URL
+      # (the postgres superuser) to CREATE the roles with MOKOSH_MIGRATOR_PASSWORD /
+      # MOKOSH_APP_PASSWORD, then closes that pool. Subsequent boots skip it.
       DATABASE_URL: postgres://mokosh_migrator:${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
       MOKOSH_APP_DATABASE_URL: postgres://mokosh_app:${MOKOSH_APP_PASSWORD:-mokosh_app_dev}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_ADMIN_DATABASE_URL: postgres://${MOKOSH_PG_USER:-postgres}:${MOKOSH_PG_PASSWORD:-postgres}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:-mokosh_migrator_dev}
+      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:-mokosh_app_dev}
 
       # Outbound email. Dev defaults point at the mailpit service
       # alongside this one; messages land in http://localhost:8025.
@@ -234,23 +235,14 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - run `just dev` (which copies .env.dev to .env)}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
 
-      # mokosh-auth (SSO / OIDC) configuration. The server boots without
-      # SSO if these are missing (legacy auth still serves /api/v1/*) so
-      # the optional `:-` form is intentional. Generate the keypair with
-      # `scripts/gen-oidc-key.sh`; the script writes into ./secrets which
-      # is mounted read-only into the container at /app/secrets below.
-      MOKOSH_AUTH_ISSUER: ${MOKOSH_AUTH_ISSUER:-}
-      MOKOSH_AUTH_COOKIE_DOMAIN: ${MOKOSH_AUTH_COOKIE_DOMAIN:-}
-      MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH: ${MOKOSH_AUTH_JWT_PRIVATE_KEY_PATH:-}
-      MOKOSH_AUTH_JWT_ACTIVE_KID: ${MOKOSH_AUTH_JWT_ACTIVE_KID:-}
-      MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR: ${MOKOSH_AUTH_JWT_PUBLIC_KEYS_DIR:-}
-      MOKOSH_AUTH_DATA_ENCRYPTION_KEY: ${MOKOSH_AUTH_DATA_ENCRYPTION_KEY:-}
-      MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV: ${MOKOSH_AUTH_DATA_ENCRYPTION_KEY_PREV:-}
-      MOKOSH_AUTH_DATA_KEY_VERSION: ${MOKOSH_AUTH_DATA_KEY_VERSION:-1}
-      MOKOSH_AUTH_ACCESS_TOKEN_TTL: ${MOKOSH_AUTH_ACCESS_TOKEN_TTL:-600}
-      MOKOSH_AUTH_REFRESH_TOKEN_TTL: ${MOKOSH_AUTH_REFRESH_TOKEN_TTL:-2592000}
-      MOKOSH_AUTH_REFRESH_IDLE_TTL: ${MOKOSH_AUTH_REFRESH_IDLE_TTL:-1209600}
-      MOKOSH_AUTH_OP_SESSION_TTL: ${MOKOSH_AUTH_OP_SESSION_TTL:-604800}
+      # bunyip-as-OP Resource-Server verifier (the sole OP after PMS-295,
+      # which removed mokosh-auth / mechanism 2). OIDC_ISSUER must equal the
+      # token `iss` AND bunyip's advertised discovery issuer; OIDC_AUDIENCE
+      # must equal the `audience` on the mokosh-apps oauth_clients row in
+      # bunyip-api. The RS path fetches bunyip's keys over JWKS, so mokosh
+      # holds no local signing key and exposes no /oauth2/* endpoints.
+      OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
+      OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
 
       # Google OAuth login. Consumed by the google-oauth-flow workspace
       # crate (Config::from_env()). The two secrets are required; the
@@ -275,12 +267,35 @@ services:
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:
       - private
-    ports:
-      # Host port 4302 by default so the client dev stack can keep host
-      # 4301 for the SPA + Dioxus dev-server proxy. Container port is
-      # MOKOSH_PORT (4301) - the API itself still listens on 4301 inside
-      # the network.
-      - "${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_API_HOST_PORT:-4302}:${MOKOSH_PORT}"
+      - traefik-public
+    # Traefik is the sole ingress for the dev stack; the server publishes no
+    # LAN-IP host port. Routing and Let's Encrypt TLS termination come from the
+    # shared Traefik via the labels below. (postgres still publishes its host
+    # port for sqlx-cli; see that service.)
+    #
+    # List (sequence) syntax is REQUIRED here, not the usual map syntax.
+    # Docker Compose interpolates ${USER} inside string VALUES but NOT
+    # inside map KEYS (verified on Compose v2.40). The router name lives
+    # in the label key, so map syntax leaves a literal `${USER}` in the
+    # router name, Traefik rejects it, and the host never routes (default
+    # cert + 404). In list form the whole "key=value" is one string value,
+    # so ${USER} in the router name interpolates correctly.
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=network-traefik-public
+      - traefik.http.routers.mokosh-api-${USER}.rule=Host(`${USER}-mokosh-api.a8n.run`)
+      - traefik.http.routers.mokosh-api-${USER}.entrypoints=nebula-secure
+      - traefik.http.routers.mokosh-api-${USER}.tls.certresolver=cert-cloudflare
+      - traefik.http.services.mokosh-api-${USER}.loadbalancer.server.port=${MOKOSH_PORT}
+    # The bunyip-as-OP RS verifier (oidc_rs.rs) fetches
+    # `${OIDC_ISSUER}/.well-known/openid-configuration`, but inside the
+    # container the issuer host resolves to the box's PUBLIC edge (self-signed
+    # cert + 404 on the OP path). Pin it to the LOCAL Traefik on the shared
+    # network, which serves the OP with a valid Let's Encrypt cert. Override
+    # BUNYIP_OP_TRAEFIK_IP in .env on a box whose Traefik publishes
+    # nebula-secure on a different IP.
+    extra_hosts:
+      - "${USER}-bunyip-api.a8n.run:${BUNYIP_OP_TRAEFIK_IP:-172.30.0.11}"
     volumes:
       - ./src:/app/src
       - ./crates:/app/crates
@@ -292,10 +307,6 @@ services:
       # cannot find the file, and fails the workspace compile.
       - ./build.rs:/app/build.rs
       - ./migrations:/app/migrations
-      # OIDC signing keys generated by scripts/gen-oidc-key.sh. Mounted
-      # read-only so a container compromise cannot exfiltrate or rotate
-      # them in place.
-      - ./secrets:/app/secrets:ro
       - server-target:/app/target
     depends_on:
       postgres:
@@ -305,7 +316,7 @@ services:
       # CLI does), and Infisical is now opt-in behind the `infisical`
       # compose profile. A hard depends_on a profiled-out service makes
       # compose reject the whole project ("depends on undefined service
-      # infisical") for every `just dev` / `just dev-sso` / `just down`.
+      # infisical") for every `just dev` / `just down`.
       mailpit:
         # No healthcheck on mailpit; it accepts SMTP from cold start.
         # Wait for the container to be running, not healthy.
@@ -322,3 +333,8 @@ volumes:
 networks:
   private:
     name: dev-mokosh-private-${USER:?USER missing - run via just dev}
+  # Shared Traefik ingress network. Genuinely external (owned by the Traefik
+  # stack), so compose attaches rather than creates it; it must already exist.
+  traefik-public:
+    name: network-traefik-public
+    external: true

@@ -104,14 +104,66 @@ check-docker:
     let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
     docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
-# Create .env from the committed .env.example if missing
+# Create .env from the committed .env.example if missing, generating a strong
+# random value for every self-owned secret so a generic password never lands in
+# .env (PMS-490). Only the create path generates; an existing .env is left
+# untouched, so the recipe stays idempotent as a dependency of other recipes.
+# Third-party credentials (Google, Stripe, Twilio, Slack, Infisical client) stay
+# empty placeholders because they cannot be generated. Passwords that get
+# interpolated into postgres:// URLs are hex (URL-safe alphanumeric); the URL
+# lines are rebuilt from the same generated values so host-side tools (sqlx-cli)
+# stay consistent with the container roles compose provisions from the knobs.
 [private]
 [group: 'hooks']
 ensure-env:
-    @test -f .env || cp .env.example .env
+    #!/usr/bin/env nu
+    if ('.env' | path exists) { return }
+    # Self-owned secrets. DB passwords are hex (URL-safe, >= 24 chars) so they
+    # interpolate raw into postgres:// URLs; ENCRYPTION_KEY = 64 hex (32 bytes);
+    # JWT_SECRET = 64 hex (256-bit); INFISICAL_ENCRYPTION_KEY = 32 hex (16 bytes);
+    # INFISICAL_AUTH_SECRET = base64 of 32 random bytes.
+    let pg_password = (^openssl rand -hex 24 | str trim)
+    let migrator_password = (^openssl rand -hex 24 | str trim)
+    let app_password = (^openssl rand -hex 24 | str trim)
+    let jwt_secret = (^openssl rand -hex 32 | str trim)
+    let encryption_key = (^openssl rand -hex 32 | str trim)
+    let infisical_pg_password = (^openssl rand -hex 24 | str trim)
+    let infisical_encryption_key = (^openssl rand -hex 16 | str trim)
+    let infisical_auth_secret = (^openssl rand -base64 32 | str trim)
+    # Scalar KEY=value replacements plus URL lines rebuilt from the same passwords.
+    let overrides = {
+        MOKOSH_PG_PASSWORD: $pg_password
+        MOKOSH_MIGRATOR_PASSWORD: $migrator_password
+        MOKOSH_APP_PASSWORD: $app_password
+        JWT_SECRET: $jwt_secret
+        ENCRYPTION_KEY: $encryption_key
+        INFISICAL_PG_PASSWORD: $infisical_pg_password
+        INFISICAL_ENCRYPTION_KEY: $infisical_encryption_key
+        INFISICAL_AUTH_SECRET: $infisical_auth_secret
+        DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
+        MOKOSH_ADMIN_DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
+        MOKOSH_APP_DATABASE_URL: $"postgres://mokosh_app:($app_password)@localhost:5433/mokosh"
+        INFISICAL_DB_CONNECTION_URI: $"postgres://infisical:($infisical_pg_password)@infisical-postgres:5432/infisical"
+    }
+    let keys = ($overrides | columns)
+    let rendered = (
+        open .env.example --raw
+        | lines
+        | each {|line|
+            let key = ($line | split row '=' | get 0?)
+            if ($key != null) and ($key in $keys) {
+                $"($key)=($overrides | get $key)"
+            } else {
+                $line
+            }
+        }
+        | str join "\n"
+    )
+    $"($rendered)\n" | save .env
+    print "ensure-env: created .env with freshly generated self-owned secrets"
 
-# Bring up the dev stack (mokosh-server + Postgres + Valkey (no Infisical — use just dev-infisical)). Trailing args go to `docker compose up` (e.g. --detach).
-[doc("Start the dev stack in Docker. Trailing args go to `docker compose up` (e.g. --detach).")]
+# Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical — use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
+[doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
 [group: 'dev']
 dev *args: ensure-env
     #!/usr/bin/env nu
@@ -145,122 +197,12 @@ dev *args: ensure-env
 dev-infisical *args: ensure-env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
 
-# Generate the dev OIDC Ed25519 keypair (kid=dev-key) if missing.
-# Each per-developer instance must generate its own; the repo does not
-# ship private keys (see secrets/ in .gitignore). Without these the
-# server crash-loops with "Failed to read OIDC private key".
-[private]
-ensure-oidc-keys:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -f secrets/dev-key.pem ] && [ -f secrets/dev-key.pub.pem ]; then
-        exit 0
-    fi
-    bash ./scripts/gen-oidc-key.sh dev-key
-
-# Per-developer Traefik-routed instance for SSO testing.
-#   API:  https://{USER}-mokosh-api.a8n.run
-# Run `just dev-sso` here AND in mokosh-apps to get both ends up.
-# Each per-developer stack gets its OWN private network,
-# `dev-mokosh-private-${USER}`, matching the name compose.dev.yml
-# assigns. The dev-sso overlay marks that network external (it only
-# ATTACHES rather than owning it), so compose will not create it. We
-# create it defensively here (idempotent: skipped if it already
-# exists). The name MUST match the base/overlay name or the server
-# lands on a different network than Postgres and crash-loops on DB
-# connect. Without this step a clean host would have nothing to attach
-# to and `docker compose up` would error.
-[private]
-ensure-private-network:
-    @docker network inspect dev-mokosh-private-${USER} >/dev/null 2>&1 || docker network create dev-mokosh-private-${USER} >/dev/null
-
-[doc("Start the SSO dev stack (Traefik-routed at *.a8n.run)")]
-[group: 'dev']
-dev-sso: ensure-env ensure-oidc-keys ensure-private-network
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml up --build --detach
-    @echo ""
-    @echo "Mokosh API (OIDC IdP):"
-    @echo "  https://{{env('USER')}}-mokosh-api.a8n.run"
-    @echo "  https://{{env('USER')}}-mokosh-api.a8n.run/.well-known/openid-configuration"
-    @echo ""
-    @echo "Next:"
-    @echo "  1. (cd ../mokosh-apps && just dev-sso)"
-    @echo "  2. just register-client     # registers mokosh-apps-web in oauth_clients"
-    @echo "  3. Set MOKOSH_OIDC_CLIENT_ID in mokosh-apps/.env to the printed UUID"
-
-# Stop the SSO dev stack.
-[doc("Stop the SSO dev stack")]
-[group: 'dev']
-dev-sso-down: ensure-env
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down
-
-# Bring the SSO dev stack down and back up. Useful after pulling a
-# code change or editing compose env vars: `down` waits for containers
-# to fully terminate before `dev-sso` starts the fresh ones, so the
-# rebuild picks up the new state. `down` is synchronous (docker
-# compose down blocks until removal completes) and `dev-sso` uses
-# `--detach`, so this returns once the new stack is up.
-[doc("Stop the dev stack and start dev-sso fresh.")]
-[group: 'dev']
-restart: down dev-sso
-
-# Register mokosh-apps as a public OIDC client. Run once after
-# `just dev-sso` is up. Prints the client_id UUID; copy it into
-# mokosh-apps/.env as MOKOSH_OIDC_CLIENT_ID.
-[doc("Register bunyip-web as a public OIDC client (one-shot, idempotent on (name))")]
-register-bunyip-client: ensure-env
-    #!/usr/bin/env nu
-    let user = $env.USER
-    let api_origin = $"https://($user)-mokosh-api.a8n.run"
-    let hub_origin = $"https://($user)-bunyip.a8n.run"
-    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=bunyip-web" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($hub_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($hub_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
-
-# Register lets-chat as a confidential OIDC client. Run once after
-# `just dev-sso` is up. Prints the client_id UUID + client_secret;
-# capture both:
-#   client_id     -> lets-chat/.env LETS_CHAT_SSO_CLIENT_ID
-#   client_secret -> lets-chat/.env LETS_CHAT_SSO_CLIENT_SECRET (gitignored)
-# The secret cannot be retrieved later, only rotated. Lose it = re-run
-# this recipe + update .env.
-[doc("Register lets-chat as a confidential OIDC client (one-shot, idempotent on (name))")]
-register-lets-chat-client: ensure-env
-    #!/usr/bin/env nu
-    let user = $env.USER
-    let api_origin = $"https://($user)-mokosh-api.a8n.run"
-    let chat_origin = $"https://($user)-chat.a8n.run"
-    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=lets-chat" --env "MOKOSH_CLIENT_TYPE=confidential" --env "MOKOSH_CLIENT_AUTH_METHOD=client_secret_basic" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($chat_origin)/auth/sso/default/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($chat_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email profile" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=Real-time team chat" --env $"MOKOSH_CLIENT_ICON_URL=($chat_origin)/static/lets-chat.png" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
-
-[doc("Register mokosh-apps as a public OIDC client (one-shot, idempotent on (name))")]
-register-client: ensure-env
-    #!/usr/bin/env nu
-    let user = $env.USER
-    let api_origin = $"https://($user)-mokosh-api.a8n.run"
-    let app_origin = $"https://($user)-mokosh.a8n.run"
-    # In-network DNS: the postgres compose service is reachable at the
-    # short name `postgres` from inside any container on the private
-    # network. The DATABASE_URL_IN_CONTAINER value in .env is not
-    # exported to the host shell (compose reads it for interpolation),
-    # so we hardcode the in-network URL here as the canonical fallback.
-    let database_url = ($env.DATABASE_URL_IN_CONTAINER? | default "postgres://postgres:postgres@postgres:5432/mokosh")
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml exec --env $"DATABASE_URL=($database_url)" --env "MOKOSH_CLIENT_NAME=PSA-Mokosh-Clients" --env "MOKOSH_CLIENT_TYPE=public" --env $"MOKOSH_CLIENT_REDIRECT_URIS=($app_origin)/auth/callback" --env $"MOKOSH_CLIENT_POST_LOGOUT_URIS=($app_origin)/" --env "MOKOSH_CLIENT_SCOPES=openid email offline_access" --env "MOKOSH_CLIENT_GRANT_TYPES=authorization_code refresh_token" --env "MOKOSH_CLIENT_AUTH_METHOD=none" --env $"MOKOSH_CLIENT_AUDIENCE=($api_origin)" --env "MOKOSH_CLIENT_DESCRIPTION=PSA tools for the day-to-day" --env $"MOKOSH_CLIENT_ICON_URL=($app_origin)/assets/icon.svg" --env "MOKOSH_CLIENT_ACCESS_TOKEN_TTL=1800" server cargo run --quiet --bin mokosh-bootstrap -- clients register
-
-# Stop everything this repo runs (both LAN-IP and SSO modes), regardless
-# of which `just dev*` you started with. Volumes preserved.
-# `--remove-orphans` cleans up containers from one compose file that the
-# other file does not declare (e.g. the SSO postgres if you only ran
-# `just dev` historically).
-[doc("Stop the entire dev stack (LAN-IP and SSO modes). Volumes preserved.")]
-[group: 'dev']
-down: ensure-env
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
-
-# Stop the dev stack (compose.dev.yml). Volumes preserved.
+# Stop the dev stack. Volumes preserved. `--remove-orphans` cleans up any
+# stray containers left over from an older multi-file layout.
 [doc("Stop the dev stack (volumes preserved)")]
 [group: 'dev']
-dev-down: ensure-env
-    docker compose --file {{ compose_file }} down
+down: ensure-env
+    docker compose --file {{ compose_file }} down --remove-orphans
 
 # Bootstrap Infisical for the dev stack (run once after `just dev`).
 [doc("Bootstrap Infisical for the dev stack (run once after `just dev`)")]
@@ -278,7 +220,7 @@ infisical-bootstrap: ensure-env
         {}
     }
     with-env $envs {
-        cargo run --quiet --bin mokosh-bootstrap -- bootstrap-infisical
+        cargo run --quiet --bin mokosh-server -- bootstrap-infisical
     }
 
 # Build OCI image
@@ -302,11 +244,11 @@ migrate-create name:
 
 # -- Cleanup ------------------------------------------------------------------
 
-# Tear down this repo's dev footprint: stop both dev stacks (LAN-IP compose.dev.yml and the SSO overlay compose.dev-sso.yml) with their default network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
 [group: 'cleanup']
 dev-clean: ensure-env
     #!/usr/bin/env nu
-    docker compose --file {{ compose_file }} --file compose.dev-sso.yml down --remove-orphans
+    docker compose --file {{ compose_file }} down --remove-orphans
     let suffix = $env.USER
     let vols = [
         $"dev-mokosh-postgres-data-($suffix)"

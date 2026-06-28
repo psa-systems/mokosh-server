@@ -2,13 +2,6 @@
 resolver = "2"
 members = [
     ".",
-    "crates/mokosh-auth-core",
-    "crates/mokosh-auth-crypto",
-    "crates/mokosh-auth-storage",
-    "crates/mokosh-auth-oidc",
-    "crates/mokosh-auth-federation",
-    "crates/mokosh-auth-http",
-    "crates/mokosh-auth",
     # main added this crate for the Google OAuth popup flow.
     "crates/google-oauth-flow",
     # Shared DTOs between mokosh-server and mokosh-clients (PMS-129).
@@ -85,13 +78,6 @@ name = "mokosh_server"
 path = "src/lib.rs"
 
 [dependencies]
-# SSO / OIDC subsystem (workspace-internal, replaces legacy HS256 auth)
-mokosh-auth = { path = "crates/mokosh-auth" }
-# TOTP primitives (RFC 6238) live in the auth-crypto workspace member.
-# Reused here so the legacy HS256 auth flow can verify TOTP codes
-# without pulling in a redundant external crate.
-mokosh-auth-crypto = { path = "crates/mokosh-auth-crypto" }
-
 # Axum HTTP server
 axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
 tower = { version = "0.5", features = ["full"] }
@@ -136,8 +122,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Environment
 dotenvy = "0.15"
 
-# Email. Lettre powers the host-crate `Mailer` (utils/email.rs); the
-# SSO subsystem keeps its own LettreMailer in crates/mokosh-auth-http.
+# Email. Lettre powers the host-crate `Mailer` (utils/email.rs).
 lettre = { workspace = true }
 async-trait = { workspace = true }
 secrecy = { workspace = true }
@@ -152,6 +137,9 @@ aes-gcm = "0.10"
 base64 = "0.22"
 rand = "0.9"
 hmac = "0.12"
+# SHA-1 is required only by the RFC 6238 TOTP primitive (utils::totp),
+# relocated here from the removed mokosh-auth-crypto crate (PMS-295).
+sha1 = "0.10"
 sha2 = "0.10"
 constant_time_eq = "0.3"
 
