@@ -62,10 +62,7 @@ const MIN_JWT_SECRET_LEN: usize = 32;
 /// Outside dev/test, reject a `JWT_SECRET` below the HS256 32-byte security
 /// margin. `resolve_secret` already rejected the unset / dev-default cases
 /// (PMS-499); this adds the length floor (PMS-497).
-fn check_jwt_secret_len(
-    secret: &str,
-    environment: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn check_jwt_secret_len(secret: &str, environment: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !env_allows_dev_secrets(environment) && secret.len() < MIN_JWT_SECRET_LEN {
         return Err(format!(
             "JWT_SECRET must be at least {MIN_JWT_SECRET_LEN} bytes in the '{environment}' \
@@ -200,70 +197,11 @@ impl AppConfig {
                         .unwrap_or_else(|_| "http://localhost:4301".to_string())]
                 }),
             oauth_super_admin_emails,
-        };
-
-        config.validate_jwt_secret(jwt_secret_env.is_some())?;
-
-        Ok(config)
+        })
     }
 
     pub fn is_production(&self) -> bool {
         self.environment == "production"
-    }
-
-    /// Refuse to boot a non-dev/test server with a missing, dev-default, or
-    /// too-short `JWT_SECRET`. Dev/test keep the convenience default; every
-    /// other environment (staging, production, or any unrecognized value)
-    /// must supply a real secret, consistent with the fail-loud treatment of
-    /// ENCRYPTION_KEY/SMTP/CORS/migrations (PMS-497).
-    ///
-    /// `jwt_secret_set` is whether `JWT_SECRET` was present in the env, so an
-    /// unset secret (it falls back to the dev sentinel) reports differently
-    /// from one explicitly pinned to the sentinel. `is_production()` is wired
-    /// in here as the label for the strictest environment so the method gates
-    /// the secret rather than sitting dead.
-    fn validate_jwt_secret(&self, jwt_secret_set: bool) -> Result<(), Box<dyn std::error::Error>> {
-        // Dev/test run over the baked-in default by design; nothing to enforce.
-        if self.is_dev_or_test() {
-            return Ok(());
-        }
-
-        let env_label = if self.is_production() {
-            "production"
-        } else {
-            "non-dev environment"
-        };
-
-        if !jwt_secret_set {
-            return Err(format!(
-                "JWT_SECRET is unset in {env_label} (ENVIRONMENT={}); refusing to boot with the \
-                 built-in dev default. Set JWT_SECRET to a unique secret of at least \
-                 {MIN_JWT_SECRET_LEN} bytes.",
-                self.environment
-            )
-            .into());
-        }
-
-        if self.jwt_secret == DEV_JWT_SECRET {
-            return Err(format!(
-                "JWT_SECRET is the built-in dev default in {env_label} (ENVIRONMENT={}); refusing \
-                 to boot. Set JWT_SECRET to a unique secret of at least {MIN_JWT_SECRET_LEN} bytes.",
-                self.environment
-            )
-            .into());
-        }
-
-        if self.jwt_secret.len() < MIN_JWT_SECRET_LEN {
-            return Err(format!(
-                "JWT_SECRET is too short in {env_label} (ENVIRONMENT={}): {} bytes, need at least \
-                 {MIN_JWT_SECRET_LEN}.",
-                self.environment,
-                self.jwt_secret.len()
-            )
-            .into());
-        }
-
-        Ok(())
     }
 
     /// Dev/test environments run over plain HTTP, where browsers drop
