@@ -56,11 +56,14 @@ test.describe('form validation (PMS-518 / AC7)', () => {
       await createTicket.click();
 
       // The PMS-514/518 fix: every missing required field reports together -
-      // Title and Description in their own inline slots, Company in the
-      // form-level banner (the CompanyPicker has no inline slot).
+      // Title, Description, and Company each in their own inline slot. MAPPS-322
+      // routed the missing-company error into the CompanyPicker's own inline
+      // slot (it now takes an `error:` prop), so it reads "Company is required."
+      // from the shared `Rule::Required` message - matching the Title/Description
+      // copy - instead of the old form-level "Please pick a company first." banner.
       await expect(page.getByText('Title is required.')).toBeVisible();
       await expect(page.getByText('Description is required.')).toBeVisible();
-      await expect(page.getByText('Please pick a company first.')).toBeVisible();
+      await expect(page.getByText('Company is required.')).toBeVisible();
 
       // No POST / no navigation - the guard blocked the submit, so we are still
       // on the create form.
