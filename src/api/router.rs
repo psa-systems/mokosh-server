@@ -422,6 +422,14 @@ pub fn create_api_router(
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(cors)
+        // PMS-388: security response headers (HSTS, nosniff, frame-deny,
+        // Referrer-Policy, Permissions-Policy, CSP) on every response -
+        // the API, the portal API, and the `not_a_frontend` fallback. App-level
+        // parity with bunyip-api's `SecurityHeaders`, per the 2026-06-17 standup
+        // decision to keep this out of the shared Traefik layer.
+        .layer(middleware::from_fn(
+            crate::utils::security_headers::security_headers,
+        ))
 }
 
 /// Fallback handler for any path outside `/api/v1/*`. Renders a small
