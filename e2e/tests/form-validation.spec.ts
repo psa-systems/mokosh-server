@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { loginViaSpa } from '../lib/login';
 import { attachPageDiagnostics } from '../lib/page-diagnostics';
 
@@ -30,6 +30,19 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // remaining red is the PMS-148 logout redirect), so this spec runs ALONE in the
 // `form-ui` project: two logins total (setup + form-ui), under the 5/min/email
 // cap.
+// In-app sidebar/list navigation. Firefox paints the post-WASM-nav DOM more
+// slowly than Chromium/WebKit, so a bare `.click()` on its default action
+// timeout could miss the link before it rendered (PMS-543, run 2782:
+// `a[href="/tickets"]` "never visible" on firefox while chromium/webkit pass).
+// Wait for the `:visible` instance explicitly first - the same 15s visibility
+// wait the Create buttons below already use. The `:visible` + `.first()`
+// semantics are unchanged (see the load-bearing note inside the test).
+async function navClick(page: Page, href: string): Promise<void> {
+  const link = page.locator(`a[href="${href}"]:visible`).first();
+  await link.waitFor({ state: 'visible', timeout: 15_000 });
+  await link.click();
+}
+
 test.describe('form validation (PMS-518 / AC7)', () => {
   // ONE test, ONE login. The suite is rate-limited to 5 logins/min/email
   // (src/modules/auth/routes.rs); `setup` already spends one, so both forms are
@@ -49,8 +62,8 @@ test.describe('form validation (PMS-518 / AC7)', () => {
       // drawer and timed out (run 2534). `:visible` picks the desktop instance;
       // `.first()` then guards the list page rendering the New-X affordance
       // twice (header action + empty-state CTA).
-      await page.locator('a[href="/tickets"]:visible').first().click();
-      await page.locator('a[href="/tickets/new"]:visible').first().click();
+      await navClick(page, '/tickets');
+      await navClick(page, '/tickets/new');
       const createTicket = page.getByRole('button', { name: 'Create Ticket', exact: true });
       await createTicket.waitFor({ state: 'visible', timeout: 15_000 });
       await createTicket.click();
@@ -77,8 +90,8 @@ test.describe('form validation (PMS-518 / AC7)', () => {
       await expect(page.getByText('Description is required.')).toBeVisible();
 
       // --- new-contact: an empty submit flags both name fields at once ---
-      await page.locator('a[href="/contacts"]:visible').first().click();
-      await page.locator('a[href="/contacts/new"]:visible').first().click();
+      await navClick(page, '/contacts');
+      await navClick(page, '/contacts/new');
       const createContact = page.getByRole('button', { name: 'Create Contact', exact: true });
       await createContact.waitFor({ state: 'visible', timeout: 15_000 });
       await createContact.click();
