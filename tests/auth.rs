@@ -478,6 +478,169 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-502: second-factor anti-replay + per-account attempt lockout
+// ============================================================================
+
+/// Enroll + enable TOTP MFA for the just-logged-in admin and return the
+/// decoded shared secret. Mirrors the setup half of
+/// `mfa_challenge_happy_path`.
+async fn enroll_and_enable_mfa(app: &common::TestApp, token: &str) -> Vec<u8> {
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send mfa setup")
+        .json()
+        .await
+        .expect("mfa setup JSON");
+    let secret_b32 = setup["secret"].as_str().expect("secret in mfa setup");
+    let secret = mokosh_server::utils::totp::base32_decode(secret_b32).expect("decode mfa secret");
+
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let enable_resp = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "code": code_now }))
+        .send()
+        .await
+        .expect("send mfa enable");
+    assert!(
+        enable_resp.status().is_success(),
+        "enable mfa should succeed, got {}",
+        enable_resp.status()
+    );
+    secret
+}
+
+/// PMS-502 anti-replay: a TOTP code accepted once cannot be replayed while
+/// it is still inside its +/-1 verify window. The first login consumes the
+/// code's step; a second login with the SAME code is rejected.
+#[sqlx::test]
+async fn mfa_totp_code_cannot_be_replayed(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let secret = enroll_and_enable_mfa(&app, &token).await;
+
+    // Capture one code and use it to log in successfully.
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let ok = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": code,
+        }))
+        .send()
+        .await
+        .expect("send first mfa login");
+    assert_eq!(
+        ok.status(),
+        reqwest::StatusCode::OK,
+        "fresh TOTP code logs in"
+    );
+
+    // Replay the very same code: the step has been consumed, so even though
+    // the code is still inside its +/-1 window the login must fail.
+    let replay = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": code,
+        }))
+        .send()
+        .await
+        .expect("send replay mfa login");
+    assert_eq!(
+        replay.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "replaying an already-accepted TOTP code must fail"
+    );
+}
+
+/// PMS-502 lockout: repeated wrong second-factor codes arm a persistent
+/// per-account lockout (`users.mfa_locked_until`), independent of the
+/// in-memory login limiter, that rejects further attempts with 429 even
+/// when a correct code is finally supplied.
+#[sqlx::test]
+async fn mfa_failed_codes_lock_account(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let secret = enroll_and_enable_mfa(&app, &token).await;
+
+    // A code that is deliberately not the current valid one.
+    let valid = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let bad = if valid == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+
+    // Three wrong codes crosses the threshold and arms the lockout.
+    for i in 0..3 {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/auth/login"))
+            .json(&serde_json::json!({
+                "email": email,
+                "password": password,
+                "mfa_code": bad,
+            }))
+            .send()
+            .await
+            .expect("send bad mfa login");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "wrong code attempt {i} returns 401"
+        );
+    }
+
+    // The lockout is persisted on the user row (survives a restart / works
+    // across replicas), not just held in the in-memory limiter.
+    let (failed, locked_until): (i32, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT mfa_failed_attempts, mfa_locked_until FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read mfa lockout state");
+    assert!(
+        failed >= 3,
+        "failed-attempt counter persisted, got {failed}"
+    );
+    assert!(
+        locked_until.is_some_and(|until| until > Utc::now()),
+        "lockout window armed and in the future"
+    );
+
+    // Even a correct code is now rejected with 429 while the lockout holds.
+    let fresh = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let locked = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": fresh,
+        }))
+        .send()
+        .await
+        .expect("send post-lock mfa login");
+    assert_eq!(
+        locked.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "a correct code is still rejected while the account is locked"
+    );
+}
+
+// ============================================================================
 // Negative pins + AC2 rate limit
 // ============================================================================
 
