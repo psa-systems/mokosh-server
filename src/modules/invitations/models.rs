@@ -39,12 +39,13 @@ pub struct PendingInvite {
 pub struct CreateInvitationRequest {
     #[validate(email)]
     pub email: String,
-    /// One of [`INVITABLE_ROLES`]; defaults to `technician`. Validated in the
-    /// service (a custom set check rather than a derive).
+    /// One of [`INVITABLE_ROLES`]; defaults to `admin` (MAPPS-330: every Mokosh
+    /// user is the admin of their own world). Validated in the service (a custom
+    /// set check rather than a derive).
     #[serde(default = "default_role")]
     pub role: String,
 }
 
 fn default_role() -> String {
-    "technician".to_string()
+    "admin".to_string()
 }
