@@ -654,22 +654,11 @@ pub async fn place_bunyip_user(
             );
         }
     }
-    // PMS-458: an explicit invite role is the inviting admin's deliberate,
-    // least-privilege grant into a SHARED org tenant. The PMS-447 single-tenancy
-    // admin floor assumes the signed-in user owns their own one-person tenant,
-    // which is false for an invited joiner, so that floor must NOT silently
-    // elevate the invite role (e.g. `manager` -> `admin`). When this placement
-    // is consuming a fresh invite the invite role stands as-is; only a
-    // platform-level Bunyip `admin` claim (genuinely cross-tenant) still
-    // overrides to `super_admin`. Non-invite placements keep the PMS-447 floor.
-    let effective = if invite.is_some() {
-        match claims.bunyip_role.as_deref() {
-            Some("admin") => UserRole::SuperAdmin,
-            _ => user.role,
-        }
-    } else {
-        effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role)
-    };
+    // MAPPS-330: every Mokosh user is an admin of their own instance. The
+    // PMS-458 invite-respect branch (preserving least-privilege grants into
+    // SHARED org tenants) is removed: even invited joiners floor at `admin`,
+    // and a platform-level Bunyip `admin` claim still rises to `super_admin`.
+    let effective = effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role);
     if effective != user.role {
         // Role transitions are security-relevant; log every one (fires only on
         // change, so low volume) so an elevation/demotion is observable even
