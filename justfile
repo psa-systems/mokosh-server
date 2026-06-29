@@ -167,14 +167,30 @@ ensure-env:
 [group: 'dev']
 dev *args: ensure-env
     #!/usr/bin/env nu
-    let bind_ip = (
+    # Discover candidate IPv4 addresses on the LAN interfaces, then keep ONLY
+    # private (RFC1918) ones. On some hosts br0 carries a PUBLIC address, and a
+    # prior version bound dev services to it - exposing postgres:postgres to the
+    # internet, where it was popped by the PG_MEM botnet. Binding the host port
+    # to a public IP is never intended, so reject anything non-private and fall
+    # back to loopback. Containers still reach each other over the Docker network.
+    let candidates = (
         sys net
         | where name =~ 'eth0|br0'
         | get ip
         | flatten
         | where protocol == 'ipv4' and $it.loop == false
-        | get address.0
+        | get address
     )
+    let private = (
+        $candidates
+        | where (($it | str starts-with '10.')
+            or ($it =~ '^172\.(1[6-9]|2[0-9]|3[01])\.')
+            or ($it | str starts-with '192.168.'))
+    )
+    let bind_ip = (if ($private | is-empty) { '127.0.0.1' } else { $private | first })
+    if $bind_ip == '127.0.0.1' {
+        print 'WARNING: no private LAN IPv4 on eth0/br0 (interface may be public). Binding host ports to loopback only.'
+    }
     let user_name = (^whoami | str trim)
     print $"Binding mokosh-server host port to ($bind_ip) as user ($user_name)"
     let updated = (
