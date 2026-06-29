@@ -8,9 +8,10 @@
 --
 -- super_admin is left alone: it is Bunyip's platform-level role and is
 -- granted exclusively by reconciliation against the `bunyip_role = 'admin'`
--- claim, never by an invite or self-signup. deleted_at IS NULL guards
--- against re-animating soft-deleted rows.
+-- claim, never by an invite or self-signup. The `users` table carries no
+-- soft-delete column (`status` flips active / inactive / pending in place),
+-- and the runtime reconciliation runs against every row regardless of
+-- status, so the backfill scopes to role only and matches that surface.
 UPDATE users
 SET role = 'admin', updated_at = NOW()
-WHERE role NOT IN ('super_admin', 'admin')
-  AND deleted_at IS NULL;
+WHERE role NOT IN ('super_admin', 'admin');
