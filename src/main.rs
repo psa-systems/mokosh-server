@@ -54,6 +54,25 @@ fn env_allows_dev_secrets(environment: &str) -> bool {
     matches!(environment, "development" | "dev" | "test")
 }
 
+/// Minimum acceptable `JWT_SECRET` length outside dev/test. An HS256 key
+/// shorter than the 32-byte SHA-256 output is below the algorithm's own
+/// security margin (PMS-497).
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// Outside dev/test, reject a `JWT_SECRET` below the HS256 32-byte security
+/// margin. `resolve_secret` already rejected the unset / dev-default cases
+/// (PMS-499); this adds the length floor (PMS-497).
+fn check_jwt_secret_len(secret: &str, environment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !env_allows_dev_secrets(environment) && secret.len() < MIN_JWT_SECRET_LEN {
+        return Err(format!(
+            "JWT_SECRET must be at least {MIN_JWT_SECRET_LEN} bytes in the '{environment}' \
+             environment; only development/dev/test accept a shorter secret."
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// True when `s` is exactly 64 ASCII hex characters - the canonical
 /// `ENCRYPTION_KEY` form (32 bytes, hex-encoded) required outside dev/test
 /// (PMS-498). A raw 32-byte key is ambiguous and weaker to mistype, so it is
@@ -120,6 +139,7 @@ impl AppConfig {
         // production/staging/unknown environment fails loud at boot rather than
         // silently serving with a publicly-known JWT_SECRET / ENCRYPTION_KEY.
         let jwt_secret = resolve_secret("JWT_SECRET", &environment, DEV_JWT_SECRET)?;
+        check_jwt_secret_len(&jwt_secret, &environment)?;
         let encryption_key = resolve_secret("ENCRYPTION_KEY", &environment, DEV_ENCRYPTION_KEY)?;
 
         // PMS-498: outside dev/test the at-rest AES-256-GCM key must be the
@@ -571,5 +591,27 @@ mod tests {
         let result = resolve_secret(var, "production", "the-dev-value");
         std::env::remove_var(var);
         assert_eq!(result.unwrap(), "a-real-production-secret");
+    }
+
+    // PMS-497: outside dev/test a JWT_SECRET below the 32-byte HS256 margin is
+    // rejected; dev/test accept any length.
+    #[test]
+    fn jwt_secret_len_dev_test_accepts_short() {
+        for env in ["development", "dev", "test"] {
+            assert!(check_jwt_secret_len("short", env).is_ok());
+        }
+    }
+
+    #[test]
+    fn jwt_secret_len_prod_rejects_too_short() {
+        let short = "x".repeat(MIN_JWT_SECRET_LEN - 1);
+        assert!(check_jwt_secret_len(&short, "production").is_err());
+        assert!(check_jwt_secret_len(&short, "staging").is_err());
+    }
+
+    #[test]
+    fn jwt_secret_len_prod_accepts_long_enough() {
+        let ok = "a".repeat(MIN_JWT_SECRET_LEN);
+        assert!(check_jwt_secret_len(&ok, "production").is_ok());
     }
 }
