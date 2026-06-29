@@ -66,11 +66,14 @@ async fn user_tenant_role(pool: &PgPool, sub: Uuid) -> (Uuid, String) {
 }
 
 #[sqlx::test]
-async fn invited_user_lands_in_inviting_tenant_with_invite_role(pool: PgPool) {
+async fn invited_user_lands_in_inviting_tenant_as_admin(pool: PgPool) {
+    // MAPPS-330: every Mokosh user is an admin of their own instance, even
+    // when joining a shared org tenant via an invite. The invite still
+    // decides the TENANT placement, but the role floors at `admin` (PMS-458's
+    // invite-respect carveout is removed).
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
 
-    // An org tenant to invite into, with a pending invite for the joiner.
     let org = tenants
         .ensure_personal_tenant(Uuid::new_v4())
         .await
@@ -85,8 +88,6 @@ async fn invited_user_lands_in_inviting_tenant_with_invite_role(pool: PgPool) {
         .await
         .expect("invite");
 
-    // The joiner signs in via Bunyip with that verified email; `bunyip_role`
-    // is `subscriber`, which must NOT override the invite's mokosh role.
     let sub = Uuid::new_v4();
     let state = place_bunyip_user(
         &auth,
@@ -105,11 +106,10 @@ async fn invited_user_lands_in_inviting_tenant_with_invite_role(pool: PgPool) {
     let (tenant, role) = user_tenant_role(&pool, sub).await;
     assert_eq!(tenant, org, "invited user lands in the inviting tenant");
     assert_eq!(
-        role, "manager",
-        "invite role applied and survives the bunyip subscriber translation"
+        role, "admin",
+        "MAPPS-330: invite role floors at admin under the subscriber translation"
     );
 
-    // The invite is consumed (no longer pending).
     let still_pending: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM tenant_invitations WHERE tenant_id = $1 AND status = 'pending'",
     )

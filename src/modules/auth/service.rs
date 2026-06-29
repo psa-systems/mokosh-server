@@ -201,6 +201,21 @@ impl AuthService {
         // use) or a TOTP code. Absent both: signal mfa_required so the
         // SPA can prompt for the second factor.
         if user.mfa_enabled {
+            // PMS-502: persistent second-factor lockout. Read the per-account
+            // MFA attempt state once; if the account is inside an active
+            // backoff window, reject before checking any code so the lockout
+            // actually cuts the attacker's guess rate. Unlike the in-memory
+            // login limiter, this survives a process restart, coordinates
+            // across replicas (it lives in Postgres), and is budgeted
+            // independently of the password-attempt bucket.
+            let mfa_state = self.mfa_lockout_state(user.tenant_id, user.id).await?;
+            if mfa_state
+                .locked_until
+                .is_some_and(|until| until > Utc::now())
+            {
+                return Err(AppError::RateLimited);
+            }
+
             if let Some(rc) = request.recovery_code.as_deref() {
                 let candidate = recovery_code_hex_hash(rc);
                 let mut tx = self.db.begin_with_tenant(user.tenant_id).await?;
@@ -234,9 +249,30 @@ impl AuthService {
                     .ok_or_else(|| AppError::Internal("MFA enabled without secret".to_string()))?;
                 let secret = crate::utils::totp::base32_decode(secret_b32)
                     .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
-                // +-1 step (30s) tolerance handles modest clock skew.
-                if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
-                    return Err(AppError::Unauthorized);
+                // +-1 step (30s) tolerance handles modest clock skew. The
+                // verifier returns the matched step so we can enforce
+                // anti-replay (PMS-502).
+                match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
+                    // PMS-502 anti-replay: a captured code stays valid for its
+                    // whole +/-1 window, so only honour a step STRICTLY GREATER
+                    // than the last accepted one. The same code (or an earlier
+                    // still-live one) cannot be replayed.
+                    Some(step) if mfa_state.last_used_step.is_none_or(|last| step > last) => {
+                        self.record_mfa_success(user.tenant_id, user.id, step)
+                            .await?;
+                    }
+                    // Wrong code, or a replay of an already-spent step: count it
+                    // against the per-account cap and (re)arm the lockout, then
+                    // fail closed.
+                    _ => {
+                        self.register_failed_mfa(
+                            user.tenant_id,
+                            user.id,
+                            mfa_state.failed_attempts,
+                        )
+                        .await?;
+                        return Err(AppError::Unauthorized);
+                    }
                 }
             } else {
                 return Ok(LoginResponse {
@@ -1816,6 +1852,83 @@ impl AuthService {
         Ok(row.into())
     }
 
+    /// PMS-502: read the per-account second-factor lockout + anti-replay
+    /// state for `user_id`. Tenant-scoped (`begin_with_tenant`) like every
+    /// other `users` access on the login path so RLS is satisfied.
+    async fn mfa_lockout_state(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<MfaLockoutState> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: (i32, Option<chrono::DateTime<Utc>>, Option<i64>) = sqlx::query_as(
+            "SELECT mfa_failed_attempts, mfa_locked_until, mfa_last_used_step \
+             FROM users WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(MfaLockoutState {
+            failed_attempts: row.0,
+            locked_until: row.1,
+            last_used_step: row.2,
+        })
+    }
+
+    /// PMS-502: record one more failed (or replayed) second-factor code for
+    /// `user_id` and (re)arm the exponential-backoff lockout once the
+    /// failures cross the threshold (see [`mfa_lockout_until`]).
+    async fn register_failed_mfa(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        prior_count: i32,
+    ) -> AppResult<()> {
+        let new_count = prior_count.saturating_add(1);
+        let locked_until = mfa_lockout_until(new_count, Utc::now());
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE users \
+             SET mfa_failed_attempts = $1, mfa_locked_until = $2, updated_at = NOW() \
+             WHERE id = $3 AND tenant_id = $4",
+        )
+        .bind(new_count)
+        .bind(locked_until)
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// PMS-502: an accepted TOTP code advances the anti-replay watermark to
+    /// its step and clears the failed-attempt counter + lockout so a later
+    /// legitimate login is never penalised.
+    async fn record_mfa_success(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        used_step: i64,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE users \
+             SET mfa_last_used_step = $1, mfa_failed_attempts = 0, \
+                 mfa_locked_until = NULL, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(used_step)
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// PMS-138 backward-compat fallback: when the caller does not
     /// supply a tenant hint, resolve to the default tenant
     /// `Uuid::from_u128(1)`. This matches `OIDC_DEFAULT_TENANT_ID` in
@@ -2182,6 +2295,62 @@ struct SessionRow {
     created_at: chrono::DateTime<Utc>,
 }
 
+/// PMS-502: per-account second-factor lockout + anti-replay state, read from
+/// the `users` row at the top of the MFA branch in `login`.
+#[cfg(feature = "server")]
+struct MfaLockoutState {
+    /// Consecutive failed/replayed second-factor codes since the last accept.
+    failed_attempts: i32,
+    /// When set and in the future, the MFA code is rejected before it is
+    /// even checked.
+    locked_until: Option<chrono::DateTime<Utc>>,
+    /// TOTP step of the last accepted code; a new code must beat it.
+    last_used_step: Option<i64>,
+}
+
+/// PMS-502: exponential-backoff lockout schedule for failed second-factor
+/// codes. Mirrors the portal-login schedule
+/// (`portal::service::lockout_until`) but is STRICTER: a TOTP code is
+/// machine-generated, so it has none of the legitimate fat-finger budget a
+/// typed password does, and the lockout arms after fewer failures.
+///
+/// | failed_count | lock window |
+/// |--------------|-------------|
+/// | 1..=2        | none        |
+/// | 3            | 30s         |
+/// | 4            | 60s         |
+/// | 5            | 120s        |
+/// | ...          | ...         |
+/// | 10+          | 3600s (cap) |
+///
+/// Returns `None` while under the threshold (no lockout yet).
+#[cfg(feature = "server")]
+fn mfa_lockout_until(
+    failed_count: i32,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    /// Failed codes tolerated before any lockout arms. Lower than the
+    /// password threshold (5): a couple of mistypes is plausible, a third
+    /// failed second-factor code is suspicious.
+    const LOCKOUT_THRESHOLD: i32 = 3;
+    /// Lock window for the first threshold-crossing failure.
+    const LOCKOUT_BASE_SECONDS: i64 = 30;
+    /// Ceiling on a single lock window.
+    const LOCKOUT_MAX_SECONDS: i64 = 3600;
+
+    if failed_count < LOCKOUT_THRESHOLD {
+        return None;
+    }
+    // Exponent capped so the shift cannot overflow; the value is clamped to
+    // the max window anyway, so a larger exponent buys nothing.
+    let exp = (failed_count - LOCKOUT_THRESHOLD).min(20) as u32;
+    let secs = LOCKOUT_BASE_SECONDS
+        .checked_shl(exp)
+        .unwrap_or(LOCKOUT_MAX_SECONDS)
+        .min(LOCKOUT_MAX_SECONDS);
+    Some(now + Duration::seconds(secs))
+}
+
 /// Split a user-bound credential token of the form `{user_id}.{secret}` into
 /// its parts. Returns None if the shape is wrong or either half is empty. Lets
 /// password-reset / welcome-setup verification scope its lookup to the user the
@@ -2334,6 +2503,55 @@ mod tests {
         let token = format!("{uid}.a.b.c");
         let (_, secret) = parse_user_bound_token(&token).unwrap();
         assert_eq!(secret, "a.b.c");
+    }
+
+    // ── mfa_lockout_until (PMS-502) ────────────────────────────────────────
+
+    #[test]
+    fn mfa_no_lockout_under_threshold() {
+        let now = Utc::now();
+        for count in 0..3 {
+            assert!(
+                mfa_lockout_until(count, now).is_none(),
+                "count {count} should not lock the second factor"
+            );
+        }
+    }
+
+    #[test]
+    fn mfa_lockout_arms_at_threshold() {
+        let now = Utc::now();
+        let until = mfa_lockout_until(3, now).expect("3rd failed code locks");
+        assert_eq!((until - now).num_seconds(), 30);
+    }
+
+    #[test]
+    fn mfa_lockout_window_doubles() {
+        let now = Utc::now();
+        assert_eq!((mfa_lockout_until(4, now).unwrap() - now).num_seconds(), 60);
+        assert_eq!(
+            (mfa_lockout_until(5, now).unwrap() - now).num_seconds(),
+            120
+        );
+        assert_eq!(
+            (mfa_lockout_until(6, now).unwrap() - now).num_seconds(),
+            240
+        );
+    }
+
+    #[test]
+    fn mfa_lockout_window_is_capped() {
+        let now = Utc::now();
+        // Far past the doubling sequence: clamped to the 1h ceiling, and a
+        // huge count must not panic on shift overflow.
+        assert_eq!(
+            (mfa_lockout_until(50, now).unwrap() - now).num_seconds(),
+            3600
+        );
+        assert_eq!(
+            (mfa_lockout_until(i32::MAX, now).unwrap() - now).num_seconds(),
+            3600
+        );
     }
 
     #[test]
