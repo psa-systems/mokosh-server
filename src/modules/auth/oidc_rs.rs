@@ -173,6 +173,14 @@ pub struct Verifier {
     /// (thundering herd). Refresh logic re-checks the cache under this lock
     /// and skips the fetch if a peer already refreshed.
     refresh_lock: Arc<Mutex<()>>,
+    /// MAPPS-337: serialized timestamp of the last `force_refresh_jwks`
+    /// run. Any caller asking to force-refresh within
+    /// `force_refresh_cooldown_secs` of the last attempt gets a no-op
+    /// (cache miss falls through to `UnknownKid` -> Unauthorized) so a
+    /// junk-token spray cannot amplify into a fan-out against the OP's
+    /// JWKS endpoint. The existing `refresh_lock` coalesces concurrent
+    /// calls; this cooldown defends against sequential calls.
+    last_force_refresh: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
 #[derive(Debug)]
@@ -181,6 +189,13 @@ pub enum VerifyError {
     Malformed(String),
     /// Signature does not validate against any cached JWK.
     InvalidSignature,
+    /// MAPPS-337: header `kid` is not in the cached JWKS. Distinguished
+    /// from `InvalidSignature` so the retry path can force a JWKS refresh
+    /// only when there is reason to (a new key rotation), not on every
+    /// garbage-signature spray attack. Keeping these merged amplified
+    /// load against Bunyip's `/.well-known/jwks.json` under a junk-token
+    /// flood.
+    UnknownKid,
     /// `iss` claim mismatch.
     InvalidIssuer,
     /// `aud` claim mismatch.
@@ -198,6 +213,7 @@ impl std::fmt::Display for VerifyError {
         match self {
             VerifyError::Malformed(s) => write!(f, "malformed token: {s}"),
             VerifyError::InvalidSignature => write!(f, "invalid signature"),
+            VerifyError::UnknownKid => write!(f, "unknown kid"),
             VerifyError::InvalidIssuer => write!(f, "invalid issuer"),
             VerifyError::InvalidAudience => write!(f, "invalid audience"),
             VerifyError::Expired => write!(f, "token expired"),
@@ -209,16 +225,32 @@ impl std::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
+/// MAPPS-337: minimum time between two `force_refresh_jwks` calls. A
+/// genuine key rotation only happens every few months in practice; the
+/// 60s cooldown leaves room for legitimate rotations to be observed
+/// quickly while bounding the amplification factor of an attacker
+/// spraying tokens whose kid does not match the cached set.
+const FORCE_REFRESH_COOLDOWN_SECS: i64 = 60;
+
 impl Verifier {
     pub fn new(config: VerifierConfig) -> Self {
         Self {
             config,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                // MAPPS-337: the JWKS / discovery fetches are server-to-OP
+                // calls that MUST land on the configured issuer host. A
+                // misconfigured / hijacked DNS or a malicious 302 from
+                // the issuer could otherwise chase the redirect chain
+                // (up to 10 hops by default) into attacker-chosen
+                // territory. Refuse to follow redirects entirely; the
+                // legitimate OP serves the doc directly.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client build"),
             cache: Arc::new(RwLock::new(None)),
             refresh_lock: Arc::new(Mutex::new(())),
+            last_force_refresh: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -237,10 +269,13 @@ impl Verifier {
             .ok_or_else(|| VerifyError::Malformed("missing kid".into()))?;
 
         // First try with the cached JWKS; on unknown-kid, force a refresh and
-        // retry once.
+        // retry once. MAPPS-337: ONLY UnknownKid retries; an InvalidSignature
+        // for a known kid means the token is forged or corrupted and
+        // refreshing JWKS will not help, so do not amplify load against the
+        // OP's JWKS endpoint on every junk-token attempt.
         match self.try_validate(token, &kid).await {
             Ok(claims) => Ok(claims),
-            Err(VerifyError::InvalidSignature) => {
+            Err(VerifyError::UnknownKid) => {
                 self.force_refresh_jwks().await?;
                 self.try_validate(token, &kid).await
             }
@@ -277,11 +312,12 @@ impl Verifier {
         self.ensure_cache().await?;
         let guard = self.cache.read().await;
         let cache = guard.as_ref().expect("ensure_cache populated");
-        let key = cache
-            .keys
-            .get(kid)
-            .ok_or(VerifyError::InvalidSignature)?
-            .clone();
+        // MAPPS-337: missing kid surfaces as `UnknownKid`, not
+        // `InvalidSignature`. The retry-on-UnknownKid path in
+        // `verify_at_jwt` is the only place that triggers a JWKS
+        // force-refresh, so this signal is load-bearing for cache
+        // amplification defense.
+        let key = cache.keys.get(kid).ok_or(VerifyError::UnknownKid)?.clone();
         drop(guard);
 
         let mut validation = Validation::new(Algorithm::EdDSA);
@@ -328,7 +364,25 @@ impl Verifier {
     /// Force a refresh after a kid miss, but coalesce concurrent callers: if a
     /// peer already refreshed (the cache's `refreshed_at` advanced) while we
     /// waited for the lock, skip the redundant network fetch.
+    ///
+    /// MAPPS-337: also enforce a cooldown between sequential force-refresh
+    /// calls. The `refresh_lock` already coalesces concurrent calls, but
+    /// sequential calls (an attacker spraying tokens with novel kid
+    /// values over a window) would still hit the OP's JWKS endpoint
+    /// once per attempt. Skip the refresh when the last successful one
+    /// was less than `FORCE_REFRESH_COOLDOWN_SECS` ago and return
+    /// `Ok(())`; the caller's subsequent `try_validate` will see the
+    /// same cache, return `UnknownKid`, and the request fails closed
+    /// (Unauthorized) without any extra network IO.
     async fn force_refresh_jwks(&self) -> Result<(), VerifyError> {
+        {
+            let last = self.last_force_refresh.read().await;
+            if let Some(ts) = *last {
+                if (Utc::now() - ts).num_seconds() < FORCE_REFRESH_COOLDOWN_SECS {
+                    return Ok(());
+                }
+            }
+        }
         let before = {
             let guard = self.cache.read().await;
             guard.as_ref().map(|c| c.refreshed_at)
@@ -341,7 +395,11 @@ impl Verifier {
         if before != after {
             return Ok(());
         }
-        self.refresh_jwks().await
+        let result = self.refresh_jwks().await;
+        if result.is_ok() {
+            *self.last_force_refresh.write().await = Some(Utc::now());
+        }
+        result
     }
 
     async fn refresh_jwks(&self) -> Result<(), VerifyError> {
