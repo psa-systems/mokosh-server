@@ -140,7 +140,11 @@ impl std::fmt::Display for IndustryBackfillReport {
         if self.unmapped.is_empty() {
             write!(f, "no unmapped values remain")?;
         } else {
-            writeln!(f, "{} unmapped value(s) left for manual review:", self.unmapped.len())?;
+            writeln!(
+                f,
+                "{} unmapped value(s) left for manual review:",
+                self.unmapped.len()
+            )?;
             for (tenant, value, n) in &self.unmapped {
                 writeln!(f, "  tenant {tenant}: {n}x {value:?}")?;
             }
@@ -224,7 +228,11 @@ mod tests {
     fn variants_are_normalized_and_unique() {
         let mut seen = HashSet::new();
         for (variant, _) in INDUSTRY_MAP {
-            assert_eq!(*variant, variant.trim(), "variant {variant:?} is not trimmed");
+            assert_eq!(
+                *variant,
+                variant.trim(),
+                "variant {variant:?} is not trimmed"
+            );
             assert_eq!(
                 *variant,
                 variant.to_lowercase(),
