@@ -1971,6 +1971,14 @@ impl AuthService {
         let decoding_key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
+        // MAPPS-334: iss / aud pinning is deferred to the follow-up
+        // ticket; the mint side now stamps both, but flipping strict
+        // validation today would 401 every in-flight legacy token.
+        // `Validation::new` defaults `validate_aud = true` with no
+        // allowed-aud set, which would reject the newly-minted tokens
+        // outright with `InvalidAudience`. Disable it explicitly until
+        // the follow-up ticket pins the expected values.
+        validation.validate_aud = false;
         // Modest clock-skew tolerance, matching the Bunyip RS verifier
         // at `src/modules/auth/oidc_rs.rs`. 30s is a defensible default.
         validation.leeway = 30;
