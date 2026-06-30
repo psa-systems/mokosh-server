@@ -958,6 +958,36 @@ pub struct ContactFilter {
     pub tags: Option<String>,
 }
 
+/// PMS-583: which free-text contact field to pull distinct values for.
+/// A closed enum so the column name interpolated into the suggestion query
+/// is never user-controlled (the `q` term is always bound, never formatted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactSuggestField {
+    Title,
+    Department,
+}
+
+impl ContactSuggestField {
+    /// The whitelisted column this field maps to. Safe to interpolate.
+    pub fn column(&self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Department => "department",
+        }
+    }
+}
+
+/// PMS-583: query for `GET /contacts/field-values`. Returns the tenant's
+/// existing distinct values of `field` for the free-text autocomplete on the
+/// contact form (Title / Department). `q` is an optional substring filter.
+#[derive(Debug, Clone, Deserialize, validator::Validate)]
+pub struct ContactFieldValuesQuery {
+    pub field: ContactSuggestField,
+    #[validate(length(max = 100))]
+    pub q: Option<String>,
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -965,6 +995,26 @@ pub struct ContactFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PMS-583: the suggestion field enum maps only to whitelisted columns and
+    /// deserializes from the snake_case query value. This is the SQL-injection
+    /// guard for the `field-values` endpoint (the column is interpolated, so it
+    /// must never be user-controlled beyond these two variants).
+    #[test]
+    fn suggest_field_deserializes_and_maps_to_whitelisted_column() {
+        let title: ContactSuggestField =
+            serde_json::from_value(serde_json::json!("title")).unwrap();
+        let dept: ContactSuggestField =
+            serde_json::from_value(serde_json::json!("department")).unwrap();
+        assert_eq!(title.column(), "title");
+        assert_eq!(dept.column(), "department");
+        // Anything outside the closed set is rejected at deserialization.
+        assert!(serde_json::from_value::<ContactSuggestField>(serde_json::json!("email")).is_err());
+        assert!(
+            serde_json::from_value::<ContactSuggestField>(serde_json::json!("name; DROP TABLE"))
+                .is_err()
+        );
+    }
 
     /// Build a minimal valid `CreateCompanyRequest` from JSON, merging in the
     /// supplied overrides so each test only states the field it exercises.
