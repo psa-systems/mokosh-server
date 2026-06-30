@@ -10,11 +10,12 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    CompanyFilter, CompanyResponse, ContactFieldValuesQuery, ContactFilter, ContactResponse,
-    ContactService, CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
-    UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
+    CompanyFilter, CompanyIndustryResponse, CompanyResponse, ContactFieldValuesQuery,
+    ContactFilter, ContactResponse, ContactService, CreateCompanyRequest, CreateContactRequest,
+    CreateSiteRequest, SiteResponse, UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
+    UpsertCompanyIndustryRequest,
 };
-use crate::modules::auth::{RequireAuth, TenantScoped};
+use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -51,6 +52,16 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         .route("/contacts/{contact_id}", get(get_contact))
         .route("/contacts/{contact_id}", put(update_contact))
         .route("/contacts/{contact_id}", delete(delete_contact))
+        // Company industries lookup (PMS-601). Reads are open to any authed
+        // user (the company form's combobox needs them); writes are admin-only.
+        .route(
+            "/company-industries",
+            get(list_company_industries).post(create_company_industry),
+        )
+        .route(
+            "/company-industries/{id}",
+            put(update_company_industry).delete(delete_company_industry),
+        )
         // Sites
         .route("/sites", post(create_site))
         .route("/sites/{site_id}", get(get_site))
@@ -350,5 +361,67 @@ async fn delete_site(
     state
         .contact_service
         .delete_site(user.tenant(), site_id, &ctx)
+        .await
+}
+
+// ============================================================================
+// COMPANY-INDUSTRY LOOKUP HANDLERS (PMS-601)
+// ============================================================================
+
+async fn list_company_industries(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<CompanyIndustryResponse>>> {
+    let (rows, total) = state
+        .contact_service
+        .list_company_industries(user.tenant(), &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        rows,
+        &pagination,
+        total,
+    )))
+}
+
+async fn create_company_industry(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    _admin: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<UpsertCompanyIndustryRequest>,
+) -> AppResult<Json<CompanyIndustryResponse>> {
+    request.validate()?;
+    let row = state
+        .contact_service
+        .create_company_industry(user.tenant(), &request, &ctx)
+        .await?;
+    Ok(Json(row))
+}
+
+async fn update_company_industry(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    _admin: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpsertCompanyIndustryRequest>,
+) -> AppResult<Json<CompanyIndustryResponse>> {
+    request.validate()?;
+    let row = state
+        .contact_service
+        .update_company_industry(user.tenant(), id, &request)
+        .await?;
+    Ok(Json(row))
+}
+
+async fn delete_company_industry(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    _admin: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .contact_service
+        .delete_company_industry(user.tenant(), id)
         .await
 }

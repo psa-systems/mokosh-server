@@ -817,6 +817,20 @@ impl TenantService {
         .execute(&mut *tx)
         .await?;
 
+        // Company industries (PMS-601): the suggestion vocabulary for the
+        // company Industry combobox.
+        sqlx::query(
+            r#"
+            INSERT INTO company_industries (tenant_id, name, is_active)
+            SELECT $1, name, is_active
+            FROM company_industries WHERE tenant_id = $2
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
         // Time rounding rules
         sqlx::query(
             r#"
