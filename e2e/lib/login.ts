@@ -21,27 +21,7 @@ import { routes } from './api';
 export async function loginViaSpa(page: Page): Promise<void> {
   await page.goto('/login');
 
-  const form = page.locator('form').first();
-
-  const email = form
-    .locator(
-      'input[data-testid="email"], input[type="email"], input[name="email"], input[autocomplete="username"]',
-    )
-    .first();
-  const password = form
-    .locator(
-      'input[data-testid="password"], input[type="password"], input[name="password"], input[autocomplete="current-password"]',
-    )
-    .first();
-
-  await email.waitFor({ state: 'visible' });
-  await email.fill(env.email);
-  await password.fill(env.password);
-
-  await form
-    .getByRole('button', { name: /sign ?in|log ?in|continue|submit/i })
-    .first()
-    .click();
+  await submitCredentials(page);
 
   // Wait for the hub to land on the next page. /login/2fa is the expected
   // step for an MFA-enabled account; anything else (success or error) flows
@@ -92,6 +72,80 @@ export async function loginViaSpa(page: Page): Promise<void> {
     'SPA login never navigated away from the /login or /oauth2/consent flow ' +
       `(30s timeout; last path: ${lastPath}). If stuck on /oauth2/consent the ` +
       'Allow control may have moved - check bunyip-web/src/handlers/consent.rs.',
+  );
+}
+
+// Fill the bunyip hub's credential form and submit it, recovering from the
+// race where the server-rendered form re-renders (htmx / a redirect) between
+// `fill` and `click`. On chromium that race cleared the inputs, so the click
+// POSTed an EMPTY form; the hub rejected it and 302'd back to a fresh
+// `/login`, the SPA login never reached `/login/2fa`, and the helper polled a
+// never-submitted form until the 30s timeout (PMS-592, run 2871: `setup`
+// logged in fine on Desktop Chrome 2s earlier, then form-validation - same
+// helper, same engine - sat on a bare `/login`). firefox/webkit won the race
+// and passed. The guard: confirm the typed values survived right before
+// submitting, then confirm the credential step was actually consumed (the
+// password field leaves the DOM as the hub advances to 2FA / onward). If
+// either check fails, the form was re-rendered out from under us, so re-fill
+// the freshly-rendered form and submit again.
+async function submitCredentials(page: Page): Promise<void> {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const form = page.locator('form').first();
+    const email = form
+      .locator(
+        'input[data-testid="email"], input[type="email"], input[name="email"], input[autocomplete="username"]',
+      )
+      .first();
+    const password = form
+      .locator(
+        'input[data-testid="password"], input[type="password"], input[name="password"], input[autocomplete="current-password"]',
+      )
+      .first();
+
+    await email.waitFor({ state: 'visible', timeout: 15_000 });
+    await email.fill(env.email);
+    await password.fill(env.password);
+
+    // A re-render between the fills and the click would silently clear the
+    // inputs; submitting then POSTs an empty form. Verify the values stuck
+    // before clicking, and if they did not, re-fill on the next iteration.
+    const stuck = await Promise.all([
+      expect(email).toHaveValue(env.email, { timeout: 2_000 }),
+      expect(password).toHaveValue(env.password, { timeout: 2_000 }),
+    ]).then(
+      () => true,
+      () => false,
+    );
+    if (!stuck) {
+      continue;
+    }
+
+    await form
+      .getByRole('button', { name: /sign ?in|log ?in|continue|submit/i })
+      .first()
+      .click();
+
+    // A successful submit takes the hub off the credentials step, so the
+    // password field detaches (navigation to /login/2fa or onward). If the
+    // click was swallowed or the hub bounced back to a fresh credentials form,
+    // a visible password field remains and this times out - retry the
+    // fill+submit. `state: 'hidden'` resolves on both detach and invisibility,
+    // so it covers the navigate-away and the empty-re-render cases.
+    const advanced = await password
+      .waitFor({ state: 'hidden', timeout: 8_000 })
+      .then(
+        () => true,
+        () => false,
+      );
+    if (advanced) {
+      return;
+    }
+  }
+  throw new Error(
+    'SPA login could not get past the bunyip hub credentials step: the form ' +
+      'kept re-rendering with empty fields after submit (PMS-592). Check the ' +
+      'hub login markup / selectors in e2e/lib/login.ts.',
   );
 }
 
