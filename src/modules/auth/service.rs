@@ -333,6 +333,23 @@ impl AuthService {
     /// cancelled). Threaded into every session-minting path (password login,
     /// Google login, refresh) so a tenant suspension takes effect immediately
     /// instead of lingering until token expiry.
+    /// MAPPS-337: cheap public guard the auth middleware can run after
+    /// decoding a legacy HS256 access token. Loads the user, asserts
+    /// `status == Active`, and asserts the owning tenant is active.
+    /// Mirrors the checks `login()` runs at login time so a deactivated
+    /// user or tenant cannot keep authenticating until token expiry.
+    pub async fn ensure_user_and_tenant_active(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<()> {
+        let user = self.get_user_by_id(tenant_id, user_id).await?;
+        if user.status != UserStatus::Active {
+            return Err(AppError::Forbidden("Account is not active".to_string()));
+        }
+        self.ensure_tenant_active(user.tenant_id).await
+    }
+
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
         // The `tenants` table is the isolation root and is deliberately
         // excluded from RLS (see migration 038: `table_name != 'tenants'`), so

@@ -102,15 +102,34 @@ pub async fn auth_middleware(
                 // `Validation::default()` and does not assert `typ`, so a
                 // `typ:"refresh"` token would otherwise be accepted here.
                 // Guard it explicitly, mirroring `refresh_token()`.
+                //
+                // MAPPS-337: the legacy fallback previously authenticated a
+                // user as long as the JWT decoded and the row existed,
+                // ignoring `users.status` and the tenant's active state.
+                // A deactivated user or a suspended tenant kept working
+                // until token TTL. `ensure_user_and_tenant_active` mirrors
+                // the checks `login()` runs at login time so revocations
+                // take effect on the very next request.
                 match auth_middleware.auth_service.decode_token(token) {
-                    Ok(claims) if claims.typ == "access" => match auth_middleware
-                        .auth_service
-                        .get_user_by_id(claims.tid, claims.sub)
-                        .await
-                    {
-                        Ok(user) => AuthState::authenticated(user.to_current_user(), claims.tid),
-                        Err(_) => AuthState::default(),
-                    },
+                    Ok(claims) if claims.typ == "access" => {
+                        match auth_middleware
+                            .auth_service
+                            .ensure_user_and_tenant_active(claims.tid, claims.sub)
+                            .await
+                        {
+                            Ok(()) => match auth_middleware
+                                .auth_service
+                                .get_user_by_id(claims.tid, claims.sub)
+                                .await
+                            {
+                                Ok(user) => {
+                                    AuthState::authenticated(user.to_current_user(), claims.tid)
+                                }
+                                Err(_) => AuthState::default(),
+                            },
+                            Err(_) => AuthState::default(),
+                        }
+                    }
                     _ => AuthState::default(),
                 }
             }
