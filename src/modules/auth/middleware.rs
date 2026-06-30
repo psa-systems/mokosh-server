@@ -480,6 +480,29 @@ async fn ensure_user_from_bunyip(
     // gets their own `personal` tenant (self-signup). Email comes from
     // /oauth2/userinfo (the at+jwt carries no email claim).
     let info = verifier.userinfo(bearer).await;
+    // MAPPS-335: bind the userinfo response to the verified at+jwt by
+    // asserting `info.sub == claims.sub` before reading any other field.
+    // Without this guard a misbehaving / compromised /oauth2/userinfo
+    // response (load-balancing bug at the OP, attacker-influenced
+    // response, etc.) injects ANOTHER user's `email` / `email_verified` /
+    // `given_name` / `family_name` into the JIT row keyed on
+    // `claims.sub`. The at+jwt's signature is already validated; sub is
+    // the canonical join key. Drop the userinfo response (treat as
+    // unverified email + no name hints) on mismatch so we never JIT a
+    // wrong-identity row, but keep the request alive so a transient OP
+    // glitch does not 401 the user across the whole site.
+    let info = info.filter(|i| {
+        if i.sub == claims.sub {
+            true
+        } else {
+            tracing::warn!(
+                claims_sub = %claims.sub,
+                userinfo_sub = %i.sub,
+                "userinfo sub does not match at+jwt sub; dropping userinfo claims"
+            );
+            false
+        }
+    });
     let email = info.as_ref().and_then(|i| i.email.clone());
     let email_verified = info
         .as_ref()
@@ -620,12 +643,11 @@ pub async fn place_bunyip_user(
         Err(_) => {
             // Persist the IdP-supplied email on the JIT insert ONLY when the
             // IdP reports it verified, matching the Google path.
-            // `upsert_user_from_oidc` stamps `email_verified_at = NOW()`, so
-            // writing an unverified address here would falsely mark it
-            // verified and open an auto-link/capture path against the real
-            // owner. An unverified user is still self-signed-up (into their
-            // own isolated personal tenant) under a placeholder address; the
-            // real email is backfilled on a later login once verified.
+            // `upsert_user_from_oidc` (MAPPS-335) now binds
+            // `email_verified_at` to the actual `email_verified` flag, so
+            // an unverified address lands with NULL instead of NOW();
+            // writing the placeholder under `sub@unresolved.invalid` keeps
+            // the auto-link/capture path against the real owner closed.
             let email_for_insert = match (email.clone(), email_verified) {
                 (Some(em), true) => em,
                 _ => format!("{sub}@unresolved.invalid"),
@@ -642,6 +664,7 @@ pub async fn place_bunyip_user(
                     initial_role,
                     given_name.as_deref(),
                     family_name.as_deref(),
+                    email_verified,
                 )
                 .await
                 .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))

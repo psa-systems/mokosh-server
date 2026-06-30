@@ -1723,6 +1723,7 @@ impl AuthService {
     /// silently reverting them. Bunyip's stance is that mokosh names are
     /// tenant-local once seeded; the bunyip column is the seed source, not
     /// an authoritative mirror.
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_user_from_oidc(
         &self,
@@ -1732,6 +1733,14 @@ impl AuthService {
         role: UserRole,
         given_name_hint: Option<&str>,
         family_name_hint: Option<&str>,
+        // MAPPS-335: stamp `email_verified_at = NOW()` only when the IdP
+        // (Bunyip via `/oauth2/userinfo`) actually reports the email
+        // verified. Previously this column was unconditionally NOW(),
+        // including the placeholder `sub@unresolved.invalid` branch
+        // taken when `email_verified=false`. Downstream gates that read
+        // `email_verified_at IS NOT NULL` (invite consumption, certain
+        // admin paths) were getting a false positive.
+        email_verified: bool,
     ) -> AppResult<User> {
         // Use the bunyip claim hints when both are present and non-empty;
         // fall back to the email-derived placeholder otherwise. `users.
@@ -1770,15 +1779,29 @@ impl AuthService {
         } else {
             None
         };
+        // MAPPS-335: bind `email_verified_at` to the actual outcome
+        // reported by the IdP. The placeholder `sub@unresolved.invalid`
+        // branch passes `email_verified=false` and lands with a NULL
+        // column so downstream gates (invite consumption, admin paths)
+        // get the truthful answer.
+        let email_verified_at = if email_verified {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
         sqlx::query(
             r#"
             INSERT INTO users (
                 id, tenant_id, email, role, status, email_verified_at, timezone,
                 first_name, last_name, profile_completed_at
             )
-            VALUES ($1, $2, $3, $4, 'active', NOW(), 'UTC', $5, $6, $7)
+            VALUES ($1, $2, $3, $4, 'active', $8, 'UTC', $5, $6, $7)
             ON CONFLICT (id) DO UPDATE SET
                 email = EXCLUDED.email,
+                email_verified_at = COALESCE(
+                    users.email_verified_at,
+                    EXCLUDED.email_verified_at
+                ),
                 profile_completed_at = COALESCE(
                     users.profile_completed_at,
                     EXCLUDED.profile_completed_at
@@ -1794,6 +1817,7 @@ impl AuthService {
         .bind(&seed_first)
         .bind(&seed_last)
         .bind(profile_completed_at)
+        .bind(email_verified_at)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
