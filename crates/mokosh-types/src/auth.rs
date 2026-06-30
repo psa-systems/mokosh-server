@@ -703,8 +703,27 @@ pub struct JwtClaims {
     pub role: UserRole,
     /// Issued at
     pub iat: i64,
+    /// MAPPS-334: not before. Mirrors `iat` at mint time so the token's
+    /// intended start of validity is explicit. `#[serde(default)]` keeps
+    /// the deserializer compatible with tokens minted before this field
+    /// was added (no rolling-deploy 401 storm).
+    #[serde(default)]
+    pub nbf: i64,
     /// Expiration
     pub exp: i64,
+    /// MAPPS-334: token issuer. Set to the mokosh-server self-identifier
+    /// on mint so a future strict-validation flip can pin issuer +
+    /// audience and prevent cross-protocol token confusion against other
+    /// services that share `JWT_SECRET`. `#[serde(default)]` keeps
+    /// already-issued tokens deserializing during the rolling refresh
+    /// window. Strict-validation flip is a follow-up ticket once every
+    /// minted refresh token has rotated through (~30 days).
+    #[serde(default)]
+    pub iss: String,
+    /// MAPPS-334: token audience. Same shape as `iss`; future strict
+    /// validation will pin both. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub aud: String,
     /// Token type (access/refresh)
     pub typ: String,
     /// Session ID
