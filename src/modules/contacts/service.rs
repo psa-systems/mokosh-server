@@ -1130,6 +1130,51 @@ impl ContactService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// PMS-583: distinct non-empty values of a free-text contact field
+    /// (title / department) for this tenant, powering the free-text
+    /// autocomplete on the contact form. Ranked by frequency so the values
+    /// the team already uses most surface first, then alphabetically, and
+    /// capped at 20. `q`, when present, is a case-insensitive substring
+    /// filter. The column comes from a closed enum (`ContactSuggestField`),
+    /// so it is safe to interpolate; the user-supplied `q` is always bound.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn distinct_contact_field_values(
+        &self,
+        tenant_id: TenantId,
+        field: ContactSuggestField,
+        q: Option<&str>,
+    ) -> AppResult<Vec<String>> {
+        let column = field.column();
+        let sql = format!(
+            r#"
+            SELECT {column} AS value
+            FROM contacts
+            WHERE tenant_id = $1
+              AND {column} IS NOT NULL
+              AND {column} <> ''
+              AND ($2::text IS NULL OR {column} ILIKE $2)
+            GROUP BY {column}
+            ORDER BY COUNT(*) DESC, {column} ASC
+            LIMIT 20
+            "#
+        );
+
+        // Bound substring pattern; an empty/whitespace `q` means "no filter".
+        let pattern = q
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{s}%"));
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let values: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(tenant_id)
+            .bind(pattern)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        Ok(values)
+    }
+
     /// Get contacts for a company
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_contacts(

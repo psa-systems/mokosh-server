@@ -10,8 +10,8 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    CompanyFilter, CompanyResponse, ContactFilter, ContactResponse, ContactService,
-    CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
+    CompanyFilter, CompanyResponse, ContactFieldValuesQuery, ContactFilter, ContactResponse,
+    ContactService, CreateCompanyRequest, CreateContactRequest, CreateSiteRequest, SiteResponse,
     UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
 };
 use crate::modules::auth::{RequireAuth, TenantScoped};
@@ -44,6 +44,10 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         // Contacts
         .route("/contacts", get(list_contacts))
         .route("/contacts", post(create_contact))
+        // PMS-583: distinct title/department values for the free-text
+        // autocomplete. Static segment, so it resolves ahead of the
+        // `{contact_id}` route below.
+        .route("/contacts/field-values", get(list_contact_field_values))
         .route("/contacts/{contact_id}", get(get_contact))
         .route("/contacts/{contact_id}", put(update_contact))
         .route("/contacts/{contact_id}", delete(delete_contact))
@@ -210,6 +214,23 @@ async fn list_contacts(
     );
 
     Ok(Json(response))
+}
+
+/// PMS-583: distinct existing values of a free-text contact field (title /
+/// department) for this tenant, for the contact form's autocomplete. Returns
+/// a plain string list ranked by frequency, capped server-side.
+async fn list_contact_field_values(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<ContactFieldValuesQuery>,
+) -> AppResult<Json<Vec<String>>> {
+    query.validate()?;
+    let values = state
+        .contact_service
+        .distinct_contact_field_values(user.tenant(), query.field, query.q.as_deref())
+        .await?;
+
+    Ok(Json(values))
 }
 
 async fn create_contact(
