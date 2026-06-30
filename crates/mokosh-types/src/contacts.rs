@@ -988,6 +988,25 @@ pub struct ContactFieldValuesQuery {
     pub q: Option<String>,
 }
 
+/// PMS-601: a row in the tenant-scoped company-industry lookup that backs the
+/// company Industry combobox's suggestions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanyIndustryResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub is_active: bool,
+}
+
+/// PMS-601: create/update payload for a company-industry lookup row. One DTO
+/// for both, matching the asset-types `Upsert*` convention.
+#[derive(Debug, Clone, Deserialize, validator::Validate)]
+pub struct UpsertCompanyIndustryRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: String,
+    #[serde(default = "crate::default_true")]
+    pub is_active: bool,
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
