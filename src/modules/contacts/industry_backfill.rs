@@ -211,3 +211,40 @@ pub async fn normalize_company_industries(db: &Database) -> AppResult<IndustryBa
         unmapped,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::INDUSTRY_MAP;
+    use std::collections::HashSet;
+
+    /// Variant keys must already be lower-cased and trimmed (they are matched
+    /// against `lower(btrim(industry))`) and unique (a variant mapping to two
+    /// canonicals would be ambiguous).
+    #[test]
+    fn variants_are_normalized_and_unique() {
+        let mut seen = HashSet::new();
+        for (variant, _) in INDUSTRY_MAP {
+            assert_eq!(*variant, variant.trim(), "variant {variant:?} is not trimmed");
+            assert_eq!(
+                *variant,
+                variant.to_lowercase(),
+                "variant {variant:?} is not lower-cased"
+            );
+            assert!(seen.insert(*variant), "duplicate variant key {variant:?}");
+        }
+    }
+
+    /// Every canonical value must have its own lower-cased form as a variant,
+    /// so an existing value that differs only in case is normalized too.
+    #[test]
+    fn every_canonical_has_self_variant() {
+        let variants: HashSet<&str> = INDUSTRY_MAP.iter().map(|(v, _)| *v).collect();
+        for (_, canonical) in INDUSTRY_MAP {
+            let lc = canonical.to_lowercase();
+            assert!(
+                variants.contains(lc.as_str()),
+                "canonical {canonical:?} has no lower-cased self variant"
+            );
+        }
+    }
+}
