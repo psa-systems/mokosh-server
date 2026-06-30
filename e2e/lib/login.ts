@@ -88,8 +88,21 @@ export async function loginViaSpa(page: Page): Promise<void> {
 // password field leaves the DOM as the hub advances to 2FA / onward). If
 // either check fails, the form was re-rendered out from under us, so re-fill
 // the freshly-rendered form and submit again.
+//
+// PMS-595 (run 2874): the PMS-592 "verify the values stuck right before the
+// click" guard was still insufficient on chromium - the swap landed in the
+// window between the click and the POST being serialised, so the body still
+// went out empty and re-filling into a form that was mid-re-render lost the
+// next attempt the same way. Two changes close it: (1) let the form settle
+// before each fill (drain in-flight network from the hub's hydration / htmx
+// swap on a short budget, then give a synchronous client re-render a frame to
+// land) so we type into the form the hub will actually submit, not one a frame
+// from being replaced; and (2) treat the credential step as consumed on EITHER
+// the password field detaching OR the URL advancing into the 2FA step, since on
+// chromium the post-submit DOM teardown and the navigation do not always land
+// in the same order.
 async function submitCredentials(page: Page): Promise<void> {
-  const maxAttempts = 3;
+  const maxAttempts = 4;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const form = page.locator('form').first();
     const email = form
@@ -104,6 +117,15 @@ async function submitCredentials(page: Page): Promise<void> {
       .first();
 
     await email.waitFor({ state: 'visible', timeout: 15_000 });
+
+    // Let the form settle before filling. The hub form is server-rendered and
+    // chromium re-renders it (hydration / htmx swap) shortly after it first
+    // paints and again after a rejected submit; filling a form a frame from
+    // being replaced loses the input. Drain in-flight network on a short budget
+    // (the swap's fetch), then give a synchronous client re-render a frame.
+    await page.waitForLoadState('networkidle', { timeout: 3_000 }).catch(() => {});
+    await page.waitForTimeout(300);
+
     await email.fill(env.email);
     await password.fill(env.password);
 
@@ -126,18 +148,27 @@ async function submitCredentials(page: Page): Promise<void> {
       .first()
       .click();
 
-    // A successful submit takes the hub off the credentials step, so the
-    // password field detaches (navigation to /login/2fa or onward). If the
-    // click was swallowed or the hub bounced back to a fresh credentials form,
-    // a visible password field remains and this times out - retry the
-    // fill+submit. `state: 'hidden'` resolves on both detach and invisibility,
-    // so it covers the navigate-away and the empty-re-render cases.
-    const advanced = await password
-      .waitFor({ state: 'hidden', timeout: 8_000 })
-      .then(
+    // A successful submit takes the hub off the credentials step: the password
+    // field detaches (navigation to /login/2fa or onward) and the URL moves into
+    // the 2FA step. Accept EITHER signal - on chromium the post-submit DOM
+    // teardown and the navigation do not always land in the same order, and a
+    // transient empty re-render can briefly leave a visible password field while
+    // the navigation is already under way. `state: 'hidden'` resolves on both
+    // detach and invisibility, so it covers the navigate-away and the
+    // empty-re-render cases. If neither fires the submit was swallowed or the hub
+    // bounced back to a fresh credentials form, so retry the fill+submit; each
+    // boolean settles to `true` only on success and `false` only at its own
+    // timeout, so the race never resolves `false` early.
+    const advanced = await Promise.race([
+      password.waitFor({ state: 'hidden', timeout: 8_000 }).then(
         () => true,
         () => false,
-      );
+      ),
+      page.waitForURL(/\/login\/(2fa|mfa)(\/|$|\?)/, { timeout: 8_000 }).then(
+        () => true,
+        () => false,
+      ),
+    ]);
     if (advanced) {
       return;
     }
