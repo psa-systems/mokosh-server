@@ -73,6 +73,15 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // PMS-602: normalize existing free-text company industries to the
+        // canonical set across all tenants. Re-runnable / no-op-safe.
+        Some("normalize-company-industries") => match run_normalize_industries().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {:#}", e);
+                ExitCode::FAILURE
+            }
+        },
         Some("--help") | Some("-h") | None => {
             print_help();
             ExitCode::SUCCESS
@@ -97,6 +106,9 @@ SUBCOMMANDS:
     bootstrap-infisical    First-run setup of a fresh Infisical instance.
     qa-seed                Seed the QA walkthrough dataset into a QA-marked tenant (PMS-331).
     qa-teardown            Remove the QA walkthrough dataset from a QA-marked tenant.
+    normalize-company-industries
+                           Normalize existing free-text company industries to the canonical
+                           set across all tenants (PMS-602). Re-runnable; reports unmapped values.
     --version, -V          Print version information and exit.
 
 ENVIRONMENT (qa-seed / qa-teardown):
@@ -209,6 +221,26 @@ async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
 
     println!("{subcommand} complete for tenant {tenant_id}.");
     println!("  {report}");
+    Ok(())
+}
+
+/// PMS-602: rewrite existing free-text `companies.industry` values to the
+/// canonical set across every tenant. Cross-tenant operator task, so it
+/// connects the privileged `DATABASE_URL` (BYPASSRLS) as both pools like the QA
+/// tooling does.
+async fn run_normalize_industries() -> anyhow::Result<()> {
+    use mokosh_server::db::Database;
+
+    let database_url = require_env("DATABASE_URL")?;
+    let db = Database::new(&database_url, &database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to database: {e}"))?;
+
+    let report = mokosh_server::modules::contacts::normalize_company_industries(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("{report}");
     Ok(())
 }
 
