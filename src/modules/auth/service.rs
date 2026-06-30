@@ -4,7 +4,19 @@ use crate::modules::auth::TenantId;
 #[cfg(feature = "server")]
 use chrono::{Duration, Utc};
 #[cfg(feature = "server")]
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+
+/// MAPPS-334: mokosh-server self-issuer string stamped on every legacy
+/// HS256 access / refresh token. A future strict `decode_token` will
+/// pin `iss` to this value; today it is emitted at mint time so the flip
+/// is a no-op once the rolling refresh-TTL window has expired every
+/// legacy live token.
+pub const MOKOSH_JWT_ISSUER: &str = "mokosh-server";
+
+/// MAPPS-334: self-audience string stamped on every legacy HS256 token.
+/// Same migration shape as `MOKOSH_JWT_ISSUER`: minted now, validated
+/// strictly in a follow-up ticket.
+pub const MOKOSH_JWT_AUDIENCE: &str = "mokosh-server";
 #[cfg(feature = "server")]
 use std::sync::Arc;
 #[cfg(feature = "server")]
@@ -1942,10 +1954,26 @@ impl AuthService {
         hint.unwrap_or_else(|| Uuid::from_u128(1))
     }
 
-    /// Validate token and return claims
+    /// Validate token and return claims.
+    ///
+    /// MAPPS-334: explicit `Validation::new(Algorithm::HS256)` instead of
+    /// `Validation::default()`. The default already defaults to HS256, but
+    /// pinning the algorithm explicitly makes the protocol contract
+    /// readable + greppable and stops a future jsonwebtoken bump from
+    /// silently changing the default. `validate_exp` stays on; iss / aud
+    /// pinning is intentionally deferred to a follow-up ticket: enabling
+    /// it today would 401 every legacy access + refresh token in flight
+    /// (they were minted without iss / aud claims), forcing a re-login
+    /// storm. The mint side now emits iss / aud / nbf so the strict flip
+    /// becomes a no-op after a rolling refresh-TTL window has rotated
+    /// every live token.
     pub fn decode_token(&self, token: &str) -> AppResult<JwtClaims> {
         let decoding_key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
-        let validation = Validation::default();
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        // Modest clock-skew tolerance, matching the Bunyip RS verifier
+        // at `src/modules/auth/oidc_rs.rs`. 30s is a defensible default.
+        validation.leeway = 30;
 
         let token_data = decode::<JwtClaims>(token, &decoding_key, &validation)?;
 
@@ -2074,13 +2102,21 @@ impl AuthService {
         let access_expires = now + self.access_token_ttl;
         let refresh_expires = now + self.refresh_token_ttl;
 
+        // MAPPS-334: every freshly minted token now carries iss / aud / nbf
+        // so a future strict-validation flip is a no-op once the rolling
+        // refresh-TTL window has rotated every live legacy token.
+        let iss = MOKOSH_JWT_ISSUER.to_string();
+        let aud = MOKOSH_JWT_AUDIENCE.to_string();
         let access_claims = JwtClaims {
             sub: user.id,
             tid: user.tenant_id,
             email: user.email.clone(),
             role: user.role,
             iat: now.timestamp(),
+            nbf: now.timestamp(),
             exp: access_expires.timestamp(),
+            iss: iss.clone(),
+            aud: aud.clone(),
             typ: "access".to_string(),
             sid: session_id,
         };
@@ -2091,7 +2127,10 @@ impl AuthService {
             email: user.email.clone(),
             role: user.role,
             iat: now.timestamp(),
+            nbf: now.timestamp(),
             exp: refresh_expires.timestamp(),
+            iss,
+            aud,
             typ: "refresh".to_string(),
             sid: session_id,
         };
