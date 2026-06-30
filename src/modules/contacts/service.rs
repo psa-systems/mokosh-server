@@ -1175,6 +1175,116 @@ impl ContactService {
         Ok(values)
     }
 
+    // ========================================================================
+    // PMS-601: company-industry lookup CRUD. Backs the company Industry
+    // combobox's suggestions; admin-managed from the Settings hub. The unique
+    // (tenant_id, lower(name)) index keeps the list canonical - a duplicate
+    // insert/update surfaces as 409 via the AppError From<sqlx::Error> mapping.
+    // ========================================================================
+
+    /// List this tenant's industry lookup rows (paginated, alphabetical).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_company_industries(
+        &self,
+        tenant_id: TenantId,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<CompanyIndustryResponse>, u64)> {
+        let offset = pagination.offset() as i32;
+        let limit = pagination.limit() as i32;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM company_industries WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let rows: Vec<CompanyIndustryRow> = sqlx::query_as(
+            "SELECT id, name, is_active FROM company_industries \
+             WHERE tenant_id = $1 ORDER BY name LIMIT $2 OFFSET $3",
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// Create an industry. A duplicate name (case-insensitive) returns 409.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_company_industry(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertCompanyIndustryRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<CompanyIndustryResponse> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: CompanyIndustryRow = sqlx::query_as(
+            "INSERT INTO company_industries (id, tenant_id, name, is_active) \
+             VALUES ($1, $2, $3, $4) RETURNING id, name, is_active",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(request.name.trim())
+        .bind(request.is_active)
+        .fetch_one(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "company_industries",
+            Some(id),
+            None,
+            Some(serde_json::json!({ "name": row.name, "is_active": row.is_active })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    /// Update an industry's name / active flag. 404 if not in this tenant; a
+    /// duplicate name returns 409.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_company_industry(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpsertCompanyIndustryRequest,
+    ) -> AppResult<CompanyIndustryResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<CompanyIndustryRow> = sqlx::query_as(
+            "UPDATE company_industries SET name = $3, is_active = $4, updated_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2 RETURNING id, name, is_active",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(request.name.trim())
+        .bind(request.is_active)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = row.ok_or_else(|| AppError::NotFound("CompanyIndustry".to_string()))?;
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    /// Delete an industry. 404 if not in this tenant.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_company_industry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let res = sqlx::query("DELETE FROM company_industries WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(AppError::NotFound("CompanyIndustry".to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Get contacts for a company
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_contacts(
@@ -1853,6 +1963,24 @@ impl ContactService {
 // ============================================================================
 // DATABASE ROW TYPES
 // ============================================================================
+
+/// PMS-601: company-industry lookup row.
+#[derive(sqlx::FromRow)]
+struct CompanyIndustryRow {
+    id: Uuid,
+    name: String,
+    is_active: bool,
+}
+
+impl From<CompanyIndustryRow> for CompanyIndustryResponse {
+    fn from(r: CompanyIndustryRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            is_active: r.is_active,
+        }
+    }
+}
 
 #[derive(sqlx::FromRow)]
 struct CompanyRow {
