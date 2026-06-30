@@ -107,7 +107,9 @@ No middleware-level tenant scoping. Every service method takes `tenant_id: Uuid`
 
 ### Migrations
 
-Single big `001_initial_schema.sql` (~71 tables) plus a few small follow-ups. Embedded at compile time via `sqlx::migrate!`; `migrations/` must exist in the build context (both Dockerfiles copy it). On server start with `RUN_MIGRATIONS=true` (default) migrations run automatically.
+Per-feature files under `migrations/` (split from the original `001_initial_schema.sql` monolith in PMS-198). Embedded at compile time via `sqlx::migrate!`; `migrations/` must exist in the build context (both Dockerfiles copy it). On server start with `RUN_MIGRATIONS=true` (default) migrations run automatically.
+
+**Migrations are immutable once committed.** sqlx stores a SHA-384 checksum of each migration in `_sqlx_migrations` when it applies it, and re-verifies on every startup. Editing (or renaming/deleting) a migration that has already been applied to any database makes that database refuse to boot with `migration N was previously applied but has been modified` (this is exactly how v0.4.0 broke nc-01: `023_seed_data.sql` was edited after a build had applied it). To change schema or seed data, add a NEW migration with `just migrate-create <name>` - never edit an existing one. CI enforces this: `scripts/check-migration-immutability.nu` (wired into `.forgejo/workflows/check.yml`, DEV-395) fails any PR that modifies/renames/deletes a migration already on `main`, alongside `check-migration-prefixes.nu` (prefix uniqueness, PMS-198).
 
 ### Module status
 

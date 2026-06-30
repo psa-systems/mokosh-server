@@ -22,7 +22,11 @@ jobs:
 
     steps:
       - name: Clone the repository
+        # fetch-depth: 0 so the migration-immutability check can diff against
+        # origin/main's history (its merge-base with this branch). DEV-395.
         uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
@@ -41,6 +45,16 @@ jobs:
         shell: nu {0}
         run: |
           nu scripts/check-migration-prefixes.nu
+
+      - name: Migration immutability
+        # DEV-395: fail loud when a migration already committed on main is
+        # modified, renamed, or deleted. sqlx verifies applied-migration
+        # checksums on startup, so editing an applied migration makes every
+        # deployed database refuse to boot (this broke nc-01 on the v0.4.0
+        # deploy: 023_seed_data.sql was edited after it had been applied).
+        shell: nu {0}
+        run: |
+          nu scripts/check-migration-immutability.nu
 
       - name: Check formatting
         run: cargo fmt --all --check
