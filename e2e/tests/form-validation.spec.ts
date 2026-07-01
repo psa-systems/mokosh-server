@@ -44,6 +44,15 @@ async function navClick(page: Page, href: string): Promise<void> {
 }
 
 test.describe('form validation (PMS-518 / AC7)', () => {
+  // Quarantined on chromium: the headless chromium renderer dies post-login in
+  // CI ("Target page, context or browser has been closed") on the WASM SPA +
+  // data load, a resource-level crash that needs a runner-side fix (container
+  // /dev/shm / memory), tracked in PMS-592. firefox and webkit are stable and
+  // keep this coverage; un-skip chromium once the runner fix lands.
+  test.skip(
+    ({ browserName }) => browserName === 'chromium',
+    'chromium tab crash post-login in CI (PMS-592, runner-resource fix pending)',
+  );
   // ONE test, ONE login. The suite is rate-limited to 5 logins/min/email
   // (src/modules/auth/routes.rs); `setup` already spends one, so both forms are
   // exercised in a single test rather than a login-per-test beforeEach.
