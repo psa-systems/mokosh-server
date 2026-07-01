@@ -171,7 +171,11 @@ impl BusinessSchedule {
 /// (`"0"`=Sunday .. `"6"`=Saturday, the seeded shape) and lowercase
 /// three-letter names (`"mon"`..`"sun"`). Returns `None` for anything
 /// else so unknown keys are skipped.
-fn parse_weekday_key(key: &str) -> Option<Weekday> {
+///
+/// Exposed to the module (PMS-604) so the write-time schedule validator
+/// accepts exactly the key set this parser understands, keeping the two in
+/// lock-step rather than duplicating the mapping.
+pub(crate) fn parse_weekday_key(key: &str) -> Option<Weekday> {
     match key.trim() {
         "0" | "sun" | "sunday" => Some(Weekday::Sun),
         "1" | "mon" | "monday" => Some(Weekday::Mon),
@@ -209,7 +213,10 @@ fn parse_window(value: &serde_json::Value) -> Option<Window> {
 }
 
 /// Parse `"HH:MM"` or `"HH:MM:SS"` into a [`NaiveTime`].
-fn parse_hhmm(s: &str) -> Option<NaiveTime> {
+///
+/// Exposed to the module (PMS-604) so the write-time schedule validator
+/// accepts exactly the time formats this parser understands.
+pub(crate) fn parse_hhmm(s: &str) -> Option<NaiveTime> {
     NaiveTime::parse_from_str(s, "%H:%M")
         .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
         .ok()
