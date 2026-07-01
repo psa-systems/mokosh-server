@@ -2,7 +2,7 @@
 --
 -- Editable lookup tables are isolated per personal tenant and seeded at
 -- provisioning (see `TenantService::copy_default_config` and
--- `docs/rls-per-user-isolation.md`). A second, distinct class is reserved
+-- `dev-docs/rls-per-user-isolation.md`). A second, distinct class is reserved
 -- here for genuinely non-editable, globally shared rows (e.g. future system
 -- statuses, maintenance windows): a row with `tenant_id IS NULL` is "global /
 -- system-shared". It is readable by every tenant and writable only by a
@@ -61,7 +61,7 @@ END $$;
 -- unless the session explicitly sets `app.allow_system_writes = 'on'` (reserved
 -- for the migration / super-admin role). The application layer enforces the
 -- same rule before it would ever write a system row (documented in
--- `docs/rls-per-user-isolation.md`); this trigger is the DB backstop.
+-- `dev-docs/rls-per-user-isolation.md`); this trigger is the DB backstop.
 CREATE OR REPLACE FUNCTION mokosh_guard_system_shared_row()
 RETURNS TRIGGER AS $$
 DECLARE
