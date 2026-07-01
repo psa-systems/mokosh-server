@@ -1,5 +1,5 @@
 import { authenticator } from 'otplib';
-import { expect, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { env } from './env';
 import { routes } from './api';
 
@@ -75,6 +75,31 @@ export async function loginViaSpa(page: Page): Promise<void> {
   );
 }
 
+// Set a login input's value via a direct DOM assignment instead of Playwright
+// `fill()`. On the CI runner's headless chromium, `fill()` is a no-op on the
+// bunyip hub login inputs - the value never sticks, so the "re-render race"
+// guards below never had anything to submit and the credential step spun until
+// timeout (the real cause behind PMS-592 / PMS-595; proven by the BUNYIP-168
+// probe). A DOM `el.value = ...` assignment works and persists, and the native
+// hub form serializes each input's `.value` on submit, so a DOM-set value is
+// POSTed correctly. Retries in case the value lands in a form frame that is
+// about to be replaced.
+async function setInputValue(loc: Locator, value: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await loc.evaluate((el, v) => {
+      const input = el as HTMLInputElement;
+      input.value = v as string;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, value);
+    if ((await loc.inputValue()) === value) return;
+    await loc.page().waitForTimeout(200);
+  }
+  throw new Error(
+    `login field value did not stick after a DOM set (holds ${(await loc.inputValue()).length} chars, expected ${value.length})`,
+  );
+}
+
 // Fill the bunyip hub's credential form and submit it, recovering from the
 // race where the server-rendered form re-renders (htmx / a redirect) between
 // `fill` and `click`. On chromium that race cleared the inputs, so the click
@@ -126,8 +151,8 @@ async function submitCredentials(page: Page): Promise<void> {
     await page.waitForLoadState('networkidle', { timeout: 3_000 }).catch(() => {});
     await page.waitForTimeout(300);
 
-    await email.fill(env.email);
-    await password.fill(env.password);
+    await setInputValue(email, env.email);
+    await setInputValue(password, env.password);
 
     // A re-render between the fills and the click would silently clear the
     // inputs; submitting then POSTs an empty form. Verify the values stuck
@@ -199,7 +224,7 @@ async function fillTotpStep(page: Page): Promise<void> {
     )
     .first();
   await codeInput.waitFor({ state: 'visible', timeout: 10_000 });
-  await codeInput.fill(code);
+  await setInputValue(codeInput, code);
   await form
     .getByRole('button', { name: /verify|continue|submit|sign ?in|log ?in/i })
     .first()
