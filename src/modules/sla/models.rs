@@ -194,8 +194,10 @@ fn validate_schedule_window(day: &str, window: &serde_json::Value) -> Result<(),
             format!("schedule window for {day:?} needs string \"start\" and \"end\" times"),
         ));
     };
-    let (Some(start_t), Some(end_t)) = (super::clock::parse_hhmm(start), super::clock::parse_hhmm(end))
-    else {
+    let (Some(start_t), Some(end_t)) = (
+        super::clock::parse_hhmm(start),
+        super::clock::parse_hhmm(end),
+    ) else {
         return Err(json_shape_error(
             "invalid_schedule",
             format!("schedule window for {day:?} has an unparseable time; use HH:MM (e.g. 09:00)"),
@@ -317,5 +319,116 @@ mod tests {
     fn rejects_first_response_after_resolution() {
         // PMS-338: first_response_hours must not exceed resolution_hours.
         assert!(target(Some("8"), Some("4")).validate().is_err());
+    }
+
+    // ---- PMS-604: schedule JSON validation -----------------------------
+
+    #[test]
+    fn schedule_accepts_valid_and_empty_shapes() {
+        use serde_json::json;
+        // Empty means "no windows" -> engine runs 24/7. Both null and {} allowed.
+        assert!(validate_business_schedule(&serde_json::Value::Null).is_ok());
+        assert!(validate_business_schedule(&json!({})).is_ok());
+        // Numeric seeded shape (0=Sunday), null days and single-object windows.
+        assert!(validate_business_schedule(&json!({
+            "0": null,
+            "1": {"start": "08:00", "end": "17:00"},
+            "6": null
+        }))
+        .is_ok());
+        // Lowercase name keys with array (split-shift) windows and HH:MM:SS.
+        assert!(validate_business_schedule(&json!({
+            "mon": [{"start": "09:00", "end": "12:00"}, {"start": "13:00:00", "end": "17:00"}],
+            "sat": null
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn schedule_rejects_malformed_shapes() {
+        use serde_json::json;
+        // Top-level not an object.
+        assert!(validate_business_schedule(&json!("mon 9-5")).is_err());
+        assert!(validate_business_schedule(&json!([{"start": "09:00", "end": "17:00"}])).is_err());
+        // Unknown weekday key.
+        assert!(validate_business_schedule(&json!({"funday": null})).is_err());
+        // Day value that is neither null, object, nor array.
+        assert!(validate_business_schedule(&json!({"mon": "09:00-17:00"})).is_err());
+        // Missing end.
+        assert!(validate_business_schedule(&json!({"mon": {"start": "09:00"}})).is_err());
+        // Unparseable time.
+        assert!(
+            validate_business_schedule(&json!({"mon": {"start": "9am", "end": "5pm"}})).is_err()
+        );
+        // end <= start (zero-length / inverted window).
+        assert!(
+            validate_business_schedule(&json!({"mon": {"start": "17:00", "end": "09:00"}}))
+                .is_err()
+        );
+        assert!(
+            validate_business_schedule(&json!({"mon": {"start": "09:00", "end": "09:00"}}))
+                .is_err()
+        );
+        // One bad window inside an otherwise-valid array still fails.
+        assert!(validate_business_schedule(&json!({
+            "mon": [{"start": "09:00", "end": "12:00"}, {"start": "bad", "end": "17:00"}]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn schedule_error_keys_onto_schedule_field() {
+        // The full request validation surfaces the error on the `schedule`
+        // field so the frontend binds it inline (not a generic banner).
+        let req = UpsertBusinessHoursRequest {
+            name: "Weekday".into(),
+            timezone: default_utc(),
+            schedule: serde_json::json!({"mon": {"start": "17:00", "end": "09:00"}}),
+            is_default: false,
+        };
+        let errs = req.validate().unwrap_err();
+        assert!(errs.field_errors().contains_key("schedule"));
+    }
+
+    // ---- PMS-604: holiday JSON validation ------------------------------
+
+    #[test]
+    fn holidays_accept_valid_and_empty_shapes() {
+        use serde_json::json;
+        assert!(validate_holiday_list(&serde_json::Value::Null).is_ok());
+        assert!(validate_holiday_list(&json!([])).is_ok());
+        // Bare date strings.
+        assert!(validate_holiday_list(&json!(["2026-12-25", "2026-01-01"])).is_ok());
+        // {date, name} objects.
+        assert!(validate_holiday_list(&json!([
+            {"date": "2026-12-25", "name": "Christmas"},
+            {"date": "2026-07-04", "name": "Independence Day"}
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn holidays_reject_malformed_shapes() {
+        use serde_json::json;
+        // Not an array.
+        assert!(validate_holiday_list(&json!({"date": "2026-12-25"})).is_err());
+        assert!(validate_holiday_list(&json!("2026-12-25")).is_err());
+        // Entry is neither a string nor an object with a string date.
+        assert!(validate_holiday_list(&json!([123])).is_err());
+        assert!(validate_holiday_list(&json!([{"name": "no date"}])).is_err());
+        // Unparseable / impossible dates.
+        assert!(validate_holiday_list(&json!(["2026-13-01"])).is_err());
+        assert!(validate_holiday_list(&json!(["12/25/2026"])).is_err());
+        assert!(validate_holiday_list(&json!([{"date": "not-a-date"}])).is_err());
+    }
+
+    #[test]
+    fn holidays_error_keys_onto_holidays_field() {
+        let req = UpsertHolidayCalendarRequest {
+            name: "US".into(),
+            holidays: serde_json::json!(["12/25/2026"]),
+        };
+        let errs = req.validate().unwrap_err();
+        assert!(errs.field_errors().contains_key("holidays"));
     }
 }
