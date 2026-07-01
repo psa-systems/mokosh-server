@@ -223,7 +223,55 @@ pub struct UpsertHolidayCalendarRequest {
     #[validate(length(min = 1, max = 100))]
     pub name: String,
     #[serde(default)]
+    #[validate(custom(function = validate_holiday_list))]
     pub holidays: serde_json::Value,
+}
+
+/// Write-time validation of the `holidays` JSONB payload (PMS-604).
+///
+/// The strict counterpart of the tolerant [`super::clock::parse_holidays`]
+/// reader (which skips unparseable entries). A holiday the admin meant to
+/// exclude but mistyped would otherwise be stored and silently ignored, so the
+/// SLA clock would keep running on what should be a day off.
+///
+/// Accepted (matching the reader's documented shapes):
+/// - JSON `null` or an empty array: no holidays.
+/// - An array whose entries are each a bare `"YYYY-MM-DD"` string or a
+///   `{"date": "YYYY-MM-DD", ...}` object. Any other shape or an unparseable
+///   date is rejected with a 422 keyed onto the `holidays` field.
+fn validate_holiday_list(holidays: &serde_json::Value) -> Result<(), ValidationError> {
+    // Absent / explicitly empty: no holidays. Allowed.
+    if holidays.is_null() {
+        return Ok(());
+    }
+    let Some(items) = holidays.as_array() else {
+        return Err(json_shape_error(
+            "invalid_holidays",
+            "holidays must be a JSON array of \"YYYY-MM-DD\" strings or {date, name} objects"
+                .to_string(),
+        ));
+    };
+    for item in items {
+        let date_str = match item {
+            serde_json::Value::String(s) => Some(s.as_str()),
+            serde_json::Value::Object(_) => item.get("date").and_then(|v| v.as_str()),
+            _ => None,
+        };
+        let Some(date_str) = date_str else {
+            return Err(json_shape_error(
+                "invalid_holidays",
+                "each holiday must be a \"YYYY-MM-DD\" string or an object with a string \"date\""
+                    .to_string(),
+            ));
+        };
+        if chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").is_err() {
+            return Err(json_shape_error(
+                "invalid_holidays",
+                format!("holiday date {date_str:?} is not a valid YYYY-MM-DD date"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
