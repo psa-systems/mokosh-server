@@ -131,14 +131,22 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   await loginViaSpa(page);
   const postLoginUrl = page.url();
 
-  // Force the SPA to hit a data-loading route so we are not at the mercy of
-  // whichever landing page the post-login redirect happens to use. Either
-  // probe is fine - if one 404s the SPA still fires the auth'd request
-  // backing its router-level data fetch. Tolerate nav errors; the listener
-  // captures whatever requests fly past, regardless of HTTP status.
+  // The SPA keeps its bearer in WASM thread-local memory, so a full-page
+  // navigation (page.goto) reloads the WASM module and WIPES the token before
+  // any authed request can fire - the bearer-header backstop then never sees a
+  // request, and the primary body-read cannot recover a token a broken WASM
+  // fetch never surfaced. Stay on the live instance instead: give the landing
+  // route a beat to fire its own auth'd fetch, then, if nothing has carried a
+  // bearer yet, click a sidebar link so the SPA router fetches on the SAME
+  // WASM instance (in-app navigation, not a reload). The request listener
+  // above captures the first Authorization: Bearer either way.
+  await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
   for (const path of POST_LOGIN_PROBES) {
     if (token) break;
-    await page.goto(path, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    const link = page.locator(`a[href="${path}"]:visible`).first();
+    if ((await link.count()) === 0) continue;
+    await link.click({ timeout: 5_000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
   }
 
   try {
