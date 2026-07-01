@@ -46,17 +46,17 @@ export default defineConfig({
       name: 'setup',
       testMatch: /global\.setup\.ts$/,
       dependencies: ['preflight'],
-      // --disable-dev-shm-usage: CI runs headless chromium in a container
-      // whose /dev/shm defaults to 64 MB. The WASM SPA + post-login data load
-      // exhausts it and the tab crashes with "Target page, context or browser
-      // has been closed" (chromium only; firefox/webkit are unaffected). This
-      // flag routes chromium's shared memory to /tmp instead - the standard
-      // fix for that crash in CI (PMS-592).
-      use: {
-        ...devices['Desktop Chrome'],
-        baseURL: env.baseURL,
-        launchOptions: { args: ['--disable-dev-shm-usage'] },
-      },
+      // Run setup in FIREFOX, not chromium. The bearer this project persists is
+      // read off the OIDC `/oauth2/token` response and is browser-agnostic, but
+      // headless chromium crashes intermittently post-login in CI ("Target
+      // page, context or browser has been closed") - sometimes before the token
+      // is even captured - which made the token every api spec depends on flaky.
+      // firefox drives the identical SPA login reliably (it passes
+      // form-validation on the same runner and never hits the crash), so setup
+      // becomes deterministic. The crash itself is a runner-resource issue
+      // (container /dev/shm / RAM) tracked in DEV-396; move setup back to
+      // Desktop Chrome once that lands.
+      use: { ...devices['Desktop Firefox'], baseURL: env.baseURL },
     },
     // 2. Browser-driven coverage across all three engines (PMS-423). Each
     //    project runs the SPA-driven specs - auth/session (`auth.spec.ts`) and
