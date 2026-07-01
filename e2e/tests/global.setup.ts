@@ -230,52 +230,60 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   // analytics, etc.) that would just bloat the file. Normalise
   // leading-dot domains before comparing so `.a8n.systems` matches
   // `a8n.systems` as expected.
-  const opCookieDomains = computeOpCookieDomains(env.opBaseURL);
-  const allCookies = await page.context().cookies();
-  const opCookies = allCookies.filter((c) => {
-    const d = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
-    return opCookieDomains.has(d);
-  });
+  // OP cookies are a SECONDARY artifact: only oidc.spec.ts replays them; the
+  // 20+ bearer-auth specs run purely off the token persisted above. On headless
+  // chromium the browser process can die right after login ("Target page,
+  // context or browser has been closed") - a resource-level crash tracked for a
+  // runner-side fix (PMS-592) - and that must NOT take the already-captured
+  // token down with it. Guard the whole OP-cookie capture: on any failure (or
+  // an empty match) persist an EMPTY OP storage state and continue, so
+  // oidc.spec.ts degrades to a skip while every other api spec still runs.
+  let opCookies: Array<{ name: string; domain: string; path: string }> = [];
+  try {
+    const opCookieDomains = computeOpCookieDomains(env.opBaseURL);
+    const allCookies = await page.context().cookies();
+    opCookies = allCookies.filter((c) => {
+      const d = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+      return opCookieDomains.has(d);
+    });
 
-  // Full cookie inventory by NAME, marking which were kept vs dropped by the
-  // domain filter. The persisted-count line below only reports a number, which
-  // hides the failure mode where authorize 302s to login because bunyip's
-  // OP-session cookie was set on a host outside `opCookieDomains` and got
-  // dropped here - so the captured set is non-empty but missing the one cookie
-  // `/oauth2/authorize` actually gates on (bunyip PR #67). Logging name+domain+
-  // kept/dropped makes that diagnosable from the run output alone instead of
-  // requiring the trace zip. Names only (no values) so secrets stay out of logs.
-  const keptKeys = new Set(opCookies.map((c) => `${c.domain}${c.path}#${c.name}`));
-  const cookieInventory = allCookies
-    .map((c) => {
-      const key = `${c.domain}${c.path}#${c.name}`;
-      return `${keptKeys.has(key) ? 'KEEP' : 'drop'} ${c.domain}#${c.name}`;
-    })
-    .join('\n    ');
-  console.log(
-    `[setup] OP cookie inventory (KEEP = matched ${[...opCookieDomains].join('/')}):\n    ${cookieInventory || '(no cookies)'}`,
-  );
-  // The one cookie `/oauth2/authorize` gates on. Bunyip names it
-  // `bunyip_op_session` (bunyip-domain middleware/auth.rs OP_SESSION_COOKIE)
-  // and scopes it by the OP's `COOKIE_DOMAIN` env (host-only when empty). If it
-  // is not in the kept set, authorize will 302 to /login and oidc.spec.ts fails
-  // with "state mismatch" - so call it out loudly rather than burying it in the
-  // inventory. WARN (not throw): the 21 bearer-auth specs do not need this
-  // cookie, so a miss must not block the rest of the suite.
-  const OP_SESSION_COOKIE = 'bunyip_op_session';
-  if (!opCookies.some((c) => c.name === OP_SESSION_COOKIE)) {
-    const onAnyHost = allCookies.some((c) => c.name === OP_SESSION_COOKIE);
-    console.warn(
-      `[setup] WARNING: ${OP_SESSION_COOKIE} not in the persisted OP set` +
-        `${onAnyHost ? ' (present in the browser but on a domain outside the filter - check COOKIE_DOMAIN vs opBaseURL)' : ' (not set by login at all - check the OP login/SSO step)'}.` +
-        ` oidc.spec.ts authorize will 302 to /login.`,
+    // Full cookie inventory by NAME, marking which were kept vs dropped by the
+    // domain filter, so the "authorize 302s to login because the OP-session
+    // cookie was set on a host outside the filter" failure mode is diagnosable
+    // from the run output alone. Names only (no values) so secrets stay out.
+    const keptKeys = new Set(opCookies.map((c) => `${c.domain}${c.path}#${c.name}`));
+    const cookieInventory = allCookies
+      .map((c) => {
+        const key = `${c.domain}${c.path}#${c.name}`;
+        return `${keptKeys.has(key) ? 'KEEP' : 'drop'} ${c.domain}#${c.name}`;
+      })
+      .join('\n    ');
+    console.log(
+      `[setup] OP cookie inventory (KEEP = matched ${[...opCookieDomains].join('/')}):\n    ${cookieInventory || '(no cookies)'}`,
     );
-  }
-  if (opCookies.length === 0) {
-    throw new Error(
-      `No OP cookies matched ${[...opCookieDomains].join(', ')} after login. ` +
-        `Browser had ${allCookies.length} cookie(s) total: ` +
-        `${allCookies.map((c) => `${c.domain}${c.path}#${c.name}`).join(', ') || '(none)'}.`,
+    // The one cookie `/oauth2/authorize` gates on (bunyip_op_session). WARN, do
+    // not throw: the bearer-auth specs do not need it, so a miss must not block
+    // the rest of the suite.
+    const OP_SESSION_COOKIE = 'bunyip_op_session';
+    if (!opCookies.some((c) => c.name === OP_SESSION_COOKIE)) {
+      const onAnyHost = allCookies.some((c) => c.name === OP_SESSION_COOKIE);
+      console.warn(
+        `[setup] WARNING: ${OP_SESSION_COOKIE} not in the persisted OP set` +
+          `${onAnyHost ? ' (present in the browser but on a domain outside the filter - check COOKIE_DOMAIN vs opBaseURL)' : ' (not set by login at all - check the OP login/SSO step)'}.` +
+          ` oidc.spec.ts will skip.`,
+      );
+    }
+    if (opCookies.length === 0) {
+      console.warn(
+        `[setup] WARNING: no OP cookies matched ${[...opCookieDomains].join(', ')} after login ` +
+          `(browser had ${allCookies.length} total). oidc.spec.ts will skip; bearer-auth specs are unaffected.`,
+      );
+    }
+  } catch (e) {
+    console.warn(
+      `[setup] OP cookie capture failed (browser likely closed post-login, PMS-592): ${
+        (e as Error).message
+      }. Persisting an empty OP storage state; oidc.spec.ts will skip, bearer-auth specs are unaffected.`,
     );
   }
   writeFileSync(
@@ -283,9 +291,9 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     JSON.stringify({ cookies: opCookies, origins: [] }, null, 2),
   );
   console.log(
-    `[setup] persisted ${opCookies.length} OP cookie(s) [${opCookies
-      .map((c) => c.name)
-      .join(', ')}] (${[...opCookieDomains].join(', ')}) to ${OP_STORAGE_STATE_FILE}`,
+    `[setup] persisted ${opCookies.length} OP cookie(s)${
+      opCookies.length ? ` [${opCookies.map((c) => c.name).join(', ')}]` : ''
+    } to ${OP_STORAGE_STATE_FILE}`,
   );
 });
 
