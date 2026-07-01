@@ -73,7 +73,7 @@ oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
 compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
 .forgejo/workflows/     CI (Forgejo)
-dev-docs/               codebase-state.md is the authoritative module/route catalog
+docs/                   Contributor/user docs; docs/dev-docs/ = internal notes (codebase-state.md = module/route catalog)
 ```
 
 ### Auth: two independent mechanisms (PMS-295)
@@ -103,7 +103,7 @@ google-oauth-flow        Reusable Google OAuth popup/code-exchange client (used 
 
 ### Multi-tenancy
 
-No middleware-level tenant scoping. Every service method takes `tenant_id: Uuid` explicitly. Forgetting to thread `user.tenant_id` becomes a cross-tenant data leak. See `dev-docs/codebase-state.md` cross-cutting issue #8.
+No middleware-level tenant scoping. Every service method takes `tenant_id: Uuid` explicitly. Forgetting to thread `user.tenant_id` becomes a cross-tenant data leak. See `docs/dev-docs/codebase-state.md` cross-cutting issue #8.
 
 ### Migrations
 
@@ -113,7 +113,7 @@ Per-feature files under `migrations/` (split from the original `001_initial_sche
 
 ### Module status
 
-Most route groups are placeholders that return HTTP 501. Only `auth`, `contacts`, `tenants`, `tickets` have real handlers. The schema is far ahead of the handler layer. Before adding a new module, read `dev-docs/codebase-state.md` for the per-module status, open TODOs (`F1..F14`), and known shallow-DTO traps in tickets.
+Most route groups are placeholders that return HTTP 501. Only `auth`, `contacts`, `tenants`, `tickets` have real handlers. The schema is far ahead of the handler layer. Before adding a new module, read `docs/dev-docs/codebase-state.md` for the per-module status, open TODOs (`F1..F14`), and known shallow-DTO traps in tickets.
 
 ## Conventions specific to this repo
 

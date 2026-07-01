@@ -243,6 +243,6 @@ just dev-clean        # stop + drop app volumes + remove .env
 
 ## 9. What is real vs. stub
 
-Only `auth`, `contacts`, `tenants`, `tickets` modules have real handlers. The other 14 modules return HTTP 501. The database schema is far ahead of the handler layer. Before adding a feature module, read [`codebase-state.md`](codebase-state.md) for per-module status and known defects (`F1..F14`).
+Only `auth`, `contacts`, `tenants`, `tickets` modules have real handlers. The other 14 modules return HTTP 501. The database schema is far ahead of the handler layer. Before adding a feature module, read [`codebase-state.md`](dev-docs/codebase-state.md) for per-module status and known defects (`F1..F14`).
 
 SSO / OIDC IdP (the `crates/mokosh-auth*` subsystem) requires `MOKOSH_AUTH_*` env vars. They are intentionally absent from `.env.dev`; on a bare `.env.dev` the server logs `SSO subsystem not mounted` and runs with legacy email/password auth only. As of PMS-511 `just dev` is the Traefik-routed stack (per-developer `https://${USER}-mokosh-api.a8n.run`) with the SSO/OIDC env vars wired in `compose.dev.yml`; the former separate `just dev-sso` overlay is gone.

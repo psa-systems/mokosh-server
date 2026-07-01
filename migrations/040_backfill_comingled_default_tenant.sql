@@ -2,7 +2,7 @@
 -- default-tenant business rows.
 --
 -- Resolved decision (product owner, recorded in
--- dev-docs/rls-per-user-isolation.md "Legacy co-mingled data ownership"):
+-- docs/rls-per-user-isolation.md "Legacy co-mingled data ownership"):
 -- Mokosh is not in production. The database is wiped before go-live, so there
 -- is NO legacy co-mingled business data to re-home or quarantine. The data
 -- backfill is therefore intentionally a no-op: there is nothing to move. This
@@ -27,13 +27,13 @@
 --
 -- A standalone, human-runnable form of the same query (for attaching its output
 -- to a PR / ad-hoc audit) lives in
--- dev-docs/audits/pms-263-verify-no-comingled-business-rows.sql.
+-- docs/dev-docs/pms-263-verify-no-comingled-business-rows.sql.
 
 DO $$
 DECLARE
     default_tenant CONSTANT uuid := '00000000-0000-0000-0000-000000000001';
     -- Business tables (user-created records) per the PMS-255 inventory in
-    -- dev-docs/rls-per-user-isolation.md. Lookup/config, auth and per-tenant
+    -- docs/rls-per-user-isolation.md. Lookup/config, auth and per-tenant
     -- sequence tables are intentionally excluded: lookup rows are seeded into
     -- the default tenant on purpose and are not owned by any one user.
     business_tables CONSTANT text[] := ARRAY[

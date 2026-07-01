@@ -423,8 +423,8 @@ async fn name_claims_stamp_profile_completed_at(pool: PgPool) {
         sub,
         Some("named@example.com".to_string()),
         true,
-        Some("a contributor".to_string()),
-        Some("a contributor".to_string()),
+        Some("Alex".to_string()),
+        Some("Doe".to_string()),
         &claims(sub, None),
     )
     .await

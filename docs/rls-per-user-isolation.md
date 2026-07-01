@@ -210,7 +210,7 @@ strict per-user isolation for everything editable.
   (`migrations/040_backfill_comingled_default_tenant.sql`) is intentionally a no-op; it instead
   asserts the end-state invariant fail-loud (no business row sits in the default tenant
   `00000000-0000-0000-0000-000000000001`; lookup/auth/seq rows are excluded). The standalone
-  verification query is `dev-docs/audits/pms-263-verify-no-comingled-business-rows.sql`. This also
+  verification query is `docs/dev-docs/pms-263-verify-no-comingled-business-rows.sql`. This also
   sidesteps the unsafe one-shot path: personal tenants are provisioned lazily on login
   (PMS-243/245), so a bulk SQL backfill would have no tenant to resolve most owners to.
 - **Portal identity (PMS-255.6).** Portal runs on a `contacts`-row identity (`CurrentContact`,

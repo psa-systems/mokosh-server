@@ -10,7 +10,7 @@
 -- zero key, the running service now holds the real key.
 --
 -- Resolved decision (mirrors migration 040's product-owner ruling, recorded in
--- dev-docs/rls-per-user-isolation.md): Mokosh is NOT in production and the
+-- docs/rls-per-user-isolation.md): Mokosh is NOT in production and the
 -- database is wiped before go-live, so no real zero-key secrets exist to
 -- re-encrypt. The data re-encryption step is therefore intentionally skipped:
 -- there is nothing to migrate. AES-256-GCM ciphertext is opaque to SQL (a
