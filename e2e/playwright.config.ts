@@ -46,7 +46,17 @@ export default defineConfig({
       name: 'setup',
       testMatch: /global\.setup\.ts$/,
       dependencies: ['preflight'],
-      use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
+      // --disable-dev-shm-usage: CI runs headless chromium in a container
+      // whose /dev/shm defaults to 64 MB. The WASM SPA + post-login data load
+      // exhausts it and the tab crashes with "Target page, context or browser
+      // has been closed" (chromium only; firefox/webkit are unaffected). This
+      // flag routes chromium's shared memory to /tmp instead - the standard
+      // fix for that crash in CI (PMS-592).
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: env.baseURL,
+        launchOptions: { args: ['--disable-dev-shm-usage'] },
+      },
     },
     // 2. Browser-driven coverage across all three engines (PMS-423). Each
     //    project runs the SPA-driven specs - auth/session (`auth.spec.ts`) and
@@ -64,7 +74,17 @@ export default defineConfig({
       name: 'chromium',
       testMatch: /(auth|form-validation)\.spec\.ts$/,
       dependencies: ['preflight'],
-      use: { ...devices['Desktop Chrome'], baseURL: env.baseURL },
+      // --disable-dev-shm-usage: CI runs headless chromium in a container
+      // whose /dev/shm defaults to 64 MB. The WASM SPA + post-login data load
+      // exhausts it and the tab crashes with "Target page, context or browser
+      // has been closed" (chromium only; firefox/webkit are unaffected). This
+      // flag routes chromium's shared memory to /tmp instead - the standard
+      // fix for that crash in CI (PMS-592).
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: env.baseURL,
+        launchOptions: { args: ['--disable-dev-shm-usage'] },
+      },
     },
     {
       name: 'firefox',
