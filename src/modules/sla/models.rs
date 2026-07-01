@@ -3,7 +3,7 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SlaPolicyResponse {
@@ -93,6 +93,7 @@ pub struct UpsertBusinessHoursRequest {
     /// Per-day windows, e.g.
     /// `{"mon": [{"start": "09:00", "end": "17:00"}], ...}`.
     #[serde(default)]
+    #[validate(custom(function = validate_business_schedule))]
     pub schedule: serde_json::Value,
     #[serde(default)]
     pub is_default: bool,
@@ -100,6 +101,113 @@ pub struct UpsertBusinessHoursRequest {
 
 fn default_utc() -> String {
     "UTC".into()
+}
+
+/// Build a field-level `ValidationError` carrying a human message for a
+/// malformed JSON payload (PMS-604). The validator crate keys the error onto
+/// the field the `#[validate(custom(...))]` attribute sits on (`schedule` /
+/// `holidays`), so the frontend binds the message inline.
+fn json_shape_error(code: &'static str, message: String) -> ValidationError {
+    let mut error = ValidationError::new(code);
+    error.message = Some(message.into());
+    error
+}
+
+/// Write-time validation of the `schedule` JSONB payload (PMS-604).
+///
+/// The SLA clock reader ([`super::clock::BusinessSchedule::parse`]) is
+/// deliberately tolerant: it silently skips unknown weekday keys and malformed
+/// windows so one bad row never wedges evaluation. That tolerance means a
+/// typo'd payload is accepted at write time and then quietly ignored, which
+/// distorts SLA due-time math (a day the admin believes is closed, or a window
+/// that never takes effect). This is the strict counterpart run on
+/// create/update: it accepts exactly the shapes the reader understands (reusing
+/// the reader's own key/time parsers so the two cannot drift) and rejects
+/// anything else with a 422 instead of storing it.
+///
+/// Accepted:
+/// - JSON `null` or an empty object: no working windows (engine runs 24/7).
+/// - An object keyed by weekday (`"0"`..`"6"`, 0=Sunday, or `"mon"`..`"sun"`),
+///   each value either `null` (closed), a single `{"start","end"}` window, or
+///   an array of such windows; `start`/`end` are `HH:MM`(`:SS`) and `end` must
+///   be strictly after `start`.
+fn validate_business_schedule(schedule: &serde_json::Value) -> Result<(), ValidationError> {
+    // Absent / explicitly empty: no schedule, engine falls back to 24/7.
+    if schedule.is_null() {
+        return Ok(());
+    }
+    let Some(map) = schedule.as_object() else {
+        return Err(json_shape_error(
+            "invalid_schedule",
+            "schedule must be a JSON object keyed by weekday, \
+             e.g. {\"mon\": [{\"start\": \"09:00\", \"end\": \"17:00\"}]}"
+                .to_string(),
+        ));
+    };
+    for (key, value) in map {
+        if super::clock::parse_weekday_key(key).is_none() {
+            return Err(json_shape_error(
+                "invalid_schedule",
+                format!(
+                    "unknown weekday key {key:?}; use \"0\"-\"6\" (0=Sunday) or \"mon\"-\"sun\""
+                ),
+            ));
+        }
+        validate_schedule_day(key, value)?;
+    }
+    Ok(())
+}
+
+/// Validate one weekday's value: `null` (closed), a single window object, or an
+/// array of window objects.
+fn validate_schedule_day(day: &str, value: &serde_json::Value) -> Result<(), ValidationError> {
+    match value {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::Object(_) => validate_schedule_window(day, value),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                validate_schedule_window(day, item)?;
+            }
+            Ok(())
+        }
+        _ => Err(json_shape_error(
+            "invalid_schedule",
+            format!("schedule for {day:?} must be null, a {{start, end}} window, or an array of windows"),
+        )),
+    }
+}
+
+/// Validate a single `{"start": "HH:MM", "end": "HH:MM"}` window object.
+fn validate_schedule_window(day: &str, window: &serde_json::Value) -> Result<(), ValidationError> {
+    let obj = window.as_object().ok_or_else(|| {
+        json_shape_error(
+            "invalid_schedule",
+            format!("schedule window for {day:?} must be a {{start, end}} object"),
+        )
+    })?;
+    let (Some(start), Some(end)) = (
+        obj.get("start").and_then(|v| v.as_str()),
+        obj.get("end").and_then(|v| v.as_str()),
+    ) else {
+        return Err(json_shape_error(
+            "invalid_schedule",
+            format!("schedule window for {day:?} needs string \"start\" and \"end\" times"),
+        ));
+    };
+    let (Some(start_t), Some(end_t)) = (super::clock::parse_hhmm(start), super::clock::parse_hhmm(end))
+    else {
+        return Err(json_shape_error(
+            "invalid_schedule",
+            format!("schedule window for {day:?} has an unparseable time; use HH:MM (e.g. 09:00)"),
+        ));
+    };
+    if end_t <= start_t {
+        return Err(json_shape_error(
+            "invalid_schedule",
+            format!("schedule window for {day:?} must have end after start"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
