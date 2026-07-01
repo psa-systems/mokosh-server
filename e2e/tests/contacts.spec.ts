@@ -50,7 +50,7 @@ test.describe('tenants smoke', () => {
 });
 
 // Cross-tenant leak canary (AC), guarding against cross-cutting issue #8 in
-// dev-docs/codebase-state.md.
+// docs/dev-docs/codebase-state.md.
 test.describe('cross-tenant isolation', () => {
   test('foreign tenant id is not readable', async ({ request }) => {
     // A well-formed but foreign/non-existent tenant id must never return 200.

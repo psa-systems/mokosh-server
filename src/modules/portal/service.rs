@@ -67,7 +67,7 @@ impl PortalAuthService {
         // SAFETY (PMS-285): the portal runs on a separate `contacts`-row identity
         // plane (`CurrentContact`), not the `users`/`AuthState` plane, and
         // per-user RLS isolation is deliberately NOT applied to portal contacts
-        // yet (see `dev-docs/rls-per-user-isolation.md`, "Portal identity"). This
+        // yet (see `docs/rls-per-user-isolation.md`, "Portal identity"). This
         // login is pre-auth - it resolves the contact by `(tenant_slug, email)`
         // before any session exists - so there is no GUC to set and it runs on
         // the migrator pool. `contacts` is RLS-covered, so the app pool would

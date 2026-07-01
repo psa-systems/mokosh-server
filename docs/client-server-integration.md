@@ -5,7 +5,7 @@ planning a feature module or wondering "is anyone actually consuming
 this endpoint yet?"
 
 A symmetric view of the same content lives at
-[`mokosh-clients/dev-docs/client-server-integration.md`](../../mokosh-clients/dev-docs/client-server-integration.md).
+[`mokosh-clients/docs/client-server-integration.md`](../../mokosh-clients/docs/client-server-integration.md).
 
 ## At a glance
 

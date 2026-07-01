@@ -4,7 +4,7 @@
 //! (the REST API) and `mokosh-apps` (the WASM frontend). Both
 //! crates depend on this one; previously the model trees were
 //! byte-identical copies maintained by hand. See cross-cutting issue
-//! `#12` in `dev-docs/codebase-state.md` and PMS-129.
+//! `#12` in `docs/dev-docs/codebase-state.md` and PMS-129.
 //!
 //! Module shape mirrors the consuming feature modules:
 //!

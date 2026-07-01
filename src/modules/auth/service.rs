@@ -2677,15 +2677,15 @@ mod tests {
 
     #[test]
     fn synthetic_name_normal_first_last() {
-        let (first, last) = synthetic_name_from_email("a contributor.foo@a8n.run");
-        assert_eq!(first, "a contributor");
+        let (first, last) = synthetic_name_from_email("alex.foo@a8n.run");
+        assert_eq!(first, "Alex");
         assert_eq!(last, "Foo");
     }
 
     #[test]
     fn synthetic_name_first_only() {
-        let (first, last) = synthetic_name_from_email("a contributor@a8n.run");
-        assert_eq!(first, "a contributor");
+        let (first, last) = synthetic_name_from_email("alex@a8n.run");
+        assert_eq!(first, "Alex");
         assert_eq!(last, "");
     }
 

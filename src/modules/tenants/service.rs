@@ -632,7 +632,7 @@ impl TenantService {
     /// user-editable lookup / configuration rows, scoped to that tenant.
     ///
     /// PMS-259: under the personal-tenant-per-user isolation model
-    /// (`dev-docs/rls-per-user-isolation.md`) lookup tables are editable, so
+    /// (`docs/rls-per-user-isolation.md`) lookup tables are editable, so
     /// every user owns their own copies; a fresh tenant must not start with
     /// empty status / priority / type / work-type lists. The rows are copied
     /// from the migration-`023` seed held by the default tenant
