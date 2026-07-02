@@ -54,6 +54,60 @@ async fn login_then_me_happy_path(pool: PgPool) {
 }
 
 // ============================================================================
+// MAPPS-348: tombstoned user gets 410 Gone (ACCOUNT_DELETED), not 401
+// ============================================================================
+
+/// MAPPS-348: after the Bunyip account_deleted webhook has soft-deleted the
+/// user row, an authenticated request bearing the pre-tombstone JWT must
+/// come back as 410 Gone with `code: ACCOUNT_DELETED`, not the generic 401.
+/// Distinguishes "your account has been deleted" from "your session expired
+/// (please refresh)" so the SPA can render its terminal modal instead of
+/// falling into a token-refresh loop.
+#[sqlx::test]
+async fn tombstoned_user_gets_410_account_deleted_on_me(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Sanity: /me works while the user is active.
+    let me = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me pre-tombstone");
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+
+    // Simulate the Bunyip account_deleted webhook: soft-delete the row.
+    // This is the same terminal state PMS-591 leaves the row in.
+    sqlx::query("UPDATE users SET deleted_at = NOW() WHERE id = $1")
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("tombstone the seeded user");
+
+    let me_after = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me post-tombstone");
+    assert_eq!(
+        me_after.status(),
+        reqwest::StatusCode::GONE,
+        "/me must return 410 Gone once the user row is tombstoned"
+    );
+    let body: serde_json::Value = me_after.json().await.expect("/me body is JSON");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("ACCOUNT_DELETED"),
+        "410 response must carry the ACCOUNT_DELETED code so the SPA can catch it"
+    );
+}
+
+// ============================================================================
 // PMS-410: theme preferences round-trip on PUT/GET /me
 // ============================================================================
 

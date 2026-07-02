@@ -1696,6 +1696,25 @@ impl AuthService {
         .await?)
     }
 
+    /// MAPPS-348: probe whether a user row exists in the tombstoned state.
+    /// The auth middleware runs this on the error path (when the normal
+    /// `deleted_at IS NULL` lookup returned nothing) to distinguish
+    /// "the user's Bunyip account was deleted" from "no matching row at
+    /// all" (a stale JWT for a sub that never mirrored, a tenant mismatch,
+    /// etc). Returns true only when the row physically exists AND its
+    /// `deleted_at` is set - both a truly-missing row and an active row
+    /// return false. Runs unscoped by tenant so it works both for the
+    /// bunyip-RS path (which knows only the sub) and the legacy HS256
+    /// path.
+    pub async fn is_user_tombstoned(&self, user_id: Uuid) -> AppResult<bool> {
+        let found: Option<(bool,)> =
+            sqlx::query_as("SELECT (deleted_at IS NOT NULL) FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+        Ok(found.map(|(is_deleted,)| is_deleted).unwrap_or(false))
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_by_id(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<User> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
