@@ -1682,12 +1682,18 @@ impl AuthService {
         // context exists (pinned by `routes_do_not_reach_global_login_helpers`),
         // so it has no GUC to set and runs on the privileged migrator pool;
         // `users` is RLS-covered and would otherwise fail closed to `None`.
-        Ok(
-            sqlx::query_as::<_, (Uuid, String)>("SELECT tenant_id, role FROM users WHERE id = $1")
-                .bind(user_id)
-                .fetch_optional(self.db.migrator_pool())
-                .await?,
+        // PMS-591: skip tombstoned users so a stale Bunyip JWT that arrives
+        // after the account_deleted webhook has landed cannot resurrect a
+        // deleted account through the JIT placement path. A live user has
+        // `deleted_at IS NULL`; a tombstoned row here reads as "no placement",
+        // which the caller treats as "drop the bunyip path" and short-circuits
+        // to legacy auth (which then fails closed at get_user_by_id).
+        Ok(sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT tenant_id, role FROM users WHERE id = $1 AND deleted_at IS NULL",
         )
+        .bind(user_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?)
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -1703,7 +1709,12 @@ impl AuthService {
                    created_at, updated_at, profile_completed_at,
                    (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
             FROM users
-            WHERE id = $1 AND tenant_id = $2
+            -- PMS-591: a tombstoned user (deleted via the Bunyip
+            -- account_deleted webhook) reads as NotFound so every
+            -- extractor that resolves the current user through this
+            -- path fails closed with 401. The tombstoned row itself
+            -- stays for FK-owned history (time_entries, audit_log, ...).
+            WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
             "#,
         )
         .bind(user_id)

@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderValue, Method, StatusCode},
     middleware,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use std::sync::Arc;
@@ -18,7 +18,9 @@ use crate::db::Database;
 use crate::modules::approvals::{approval_routes, ApprovalsService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_routes, AuditService};
-use crate::modules::auth::{auth_routes, AuthMiddleware, AuthService};
+use crate::modules::auth::{
+    auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
+};
 use crate::modules::billing::{billing_routes, BillingService};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
@@ -67,6 +69,10 @@ pub fn create_api_router(
     // 32-byte AES-256-GCM key. Used for at-rest encryption of any
     // per-tenant secret material (today: payment-gateway configs).
     encryption_key: [u8; 32],
+    // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
+    // Verified as `hex(hmac_sha256(body, secret))` against the
+    // `X-Webhook-Signature` header on `/api/v1/bunyip/webhooks/account-deleted`.
+    bunyip_webhook_secret: Vec<u8>,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -408,6 +414,29 @@ pub fn create_api_router(
         // re-issue an OPTIONS before every credentialed request (PMS-389).
         .max_age(std::time::Duration::from_secs(600));
 
+    // PMS-591: Bunyip account-deleted webhook. Nested under `/api/v1/bunyip`
+    // OUTSIDE the JWT auth chain: this endpoint authenticates itself via a
+    // per-app HMAC-SHA256 signature (`X-Webhook-Signature`), and every
+    // request from Bunyip's dispatcher lacks a mokosh session cookie by
+    // design. The receiver soft-deletes the mirrored user row keyed by
+    // `users.id = <bunyip sub>` (mokosh's users.id IS the bunyip sub per
+    // the PMS-295 cutover, so no `bunyip_sub` column is needed).
+    let bunyip_webhook_state = Arc::new(BunyipWebhookState {
+        pool: db.pool().clone(),
+        webhook_secret: bunyip_webhook_secret,
+    });
+    let bunyip_webhooks = Router::new()
+        .route(
+            "/webhooks/account-deleted",
+            post(crate::modules::auth::bunyip_webhook::account_deleted),
+        )
+        .with_state(bunyip_webhook_state)
+        // PMS-298: shared JSON error envelope so a bad request here matches
+        // the rest of the API surface.
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
+
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
     // page that links the user back to the Mokosh frontend. This keeps
@@ -415,6 +444,7 @@ pub fn create_api_router(
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/portal", portal_api)
+        .nest("/api/v1/bunyip", bunyip_webhooks)
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))
