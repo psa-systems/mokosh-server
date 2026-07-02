@@ -57,15 +57,16 @@ test.describe('form validation (PMS-518 / AC7)', () => {
   // (src/modules/auth/routes.rs); `setup` already spends one, so both forms are
   // exercised in a single test rather than a login-per-test beforeEach.
   //
-  // MAPPS-347: cross-repo regression on mokosh-clients b028b7d - clicking
-  // "Create Ticket" on an empty new-ticket form no longer surfaces the
-  // "Title is required." (and sibling Description / Company) inline errors
-  // per PMS-518 AC7, though the backend contract (validate + FormGuard +
-  // handle_submit) is unchanged. Reproduces 6/6 across chromium / firefox /
-  // webkit against the deployed SPA and blocks every mokosh-server PR CI
-  // until the SPA regression is fixed. Un-fixme in the same PR that lands
-  // the mokosh-clients fix.
-  test.fixme('required fields report every error at once and block the submit', async ({
+  // MAPPS-347 (fixed on mokosh-apps 39872ab, merged into main): the SPA-side
+  // regression that swallowed "Title is required." (and sibling Description /
+  // Company) inline errors on empty new-ticket submit is closed. The Input
+  // component's always-installed `onmounted` + `onkeydown` handlers from
+  // dfb12cb were reverted; GlobalSearch keeps autofocus / Escape via
+  // parent-div keydown + a use_effect focus. Un-fixmed here now that the
+  // SPA fix has been merged and staging redeploys will pick it up on the
+  // next build. If this red-lights again after this un-fixme, refile a
+  // fresh ticket rather than restoring the quarantine.
+  test('required fields report every error at once and block the submit', async ({
     page,
   }) => {
     const diag = attachPageDiagnostics(page);
