@@ -73,6 +73,15 @@ pub async fn auth_middleware(
     // Extract Bearer token from Authorization header. The bunyip-as-OP
     // Resource-Server path is tried first; failing that we fall back to the
     // legacy HS256 cookie path. The fallback keeps existing sessions working.
+    //
+    // MAPPS-348: track the JWT-verified `sub` from whichever path decodes
+    // it. If NEITHER path establishes an auth state (both lookups failed),
+    // we probe `is_user_tombstoned(sub)` below - a positive result upgrades
+    // the plain "no user" default to `AuthState::deleted()`, which the
+    // `RequireAuth` extractor turns into a 410 Gone (`ACCOUNT_DELETED`)
+    // instead of the generic 401. Distinguishes "your bunyip account was
+    // deleted" from "your session expired / please refresh" at the SPA.
+    let mut candidate_sub: Option<uuid::Uuid> = None;
     let auth_state = match bearer(&request) {
         Some(token) => {
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
@@ -80,6 +89,7 @@ pub async fn auth_middleware(
             let from_bunyip = match auth_middleware.bunyip.as_ref() {
                 Some(v) => match v.verify_at_jwt(token).await {
                     Ok(claims) => {
+                        candidate_sub = uuid::Uuid::parse_str(&claims.sub).ok();
                         ensure_user_from_bunyip(
                             &auth_middleware.auth_service,
                             auth_middleware.tenants.as_ref(),
@@ -112,6 +122,9 @@ pub async fn auth_middleware(
                 // take effect on the very next request.
                 match auth_middleware.auth_service.decode_token(token) {
                     Ok(claims) if claims.typ == "access" => {
+                        if candidate_sub.is_none() {
+                            candidate_sub = Some(claims.sub);
+                        }
                         match auth_middleware
                             .auth_service
                             .ensure_user_and_tenant_active(claims.tid, claims.sub)
@@ -137,6 +150,26 @@ pub async fn auth_middleware(
         None => AuthState::default(),
     };
 
+    // MAPPS-348: neither path established an authenticated user, but if we
+    // decoded a JWT and its `sub` points at a tombstoned users row, upgrade
+    // the state to `deleted` so the extractor returns 410 rather than 401.
+    // Probe only on the error branch and only when a sub was successfully
+    // decoded - a missing or unparseable token skips the extra query. The
+    // probe is unscoped (bypasses the tenant GUC) so it works for both auth
+    // paths and for tenant-mismatched tokens.
+    let auth_state = if !auth_state.is_authenticated {
+        if let Some(sub) = candidate_sub {
+            match auth_middleware.auth_service.is_user_tombstoned(sub).await {
+                Ok(true) => AuthState::deleted(),
+                _ => auth_state,
+            }
+        } else {
+            auth_state
+        }
+    } else {
+        auth_state
+    };
+
     // Insert auth state into request extensions
     request.extensions_mut().insert(auth_state);
 
@@ -149,6 +182,19 @@ fn bearer(req: &Request) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
+}
+
+/// MAPPS-348: shared "resolve the current user or map to the right auth
+/// error" used by every extractor below. Ordering matters: an
+/// `AuthState::deleted()` (JWT verified, row tombstoned) has to short-
+/// circuit BEFORE the generic 401 path, so the SPA sees 410 Gone
+/// (`ACCOUNT_DELETED`) and can render the terminal modal instead of
+/// falling into its 401-refresh-and-retry loop.
+fn user_or_auth_error(auth_state: &AuthState) -> Result<CurrentUser, AppError> {
+    if auth_state.deleted {
+        return Err(AppError::AccountDeleted);
+    }
+    auth_state.user.clone().ok_or(AppError::Unauthorized)
 }
 
 /// Extractor for requiring authentication
@@ -171,10 +217,7 @@ where
             .cloned()
             .unwrap_or_default();
 
-        match auth_state.user {
-            Some(user) => Ok(RequireAuth(user)),
-            None => Err(AppError::Unauthorized),
-        }
+        Ok(RequireAuth(user_or_auth_error(&auth_state)?))
     }
 }
 
@@ -222,13 +265,11 @@ where
             .cloned()
             .unwrap_or_default();
 
-        match auth_state.user {
-            Some(user) => Ok(TenantScope {
-                tenant_id: super::tenant::TenantScoped::tenant(&user),
-                user,
-            }),
-            None => Err(AppError::Unauthorized),
-        }
+        let user = user_or_auth_error(&auth_state)?;
+        Ok(TenantScope {
+            tenant_id: super::tenant::TenantScoped::tenant(&user),
+            user,
+        })
     }
 }
 
@@ -258,16 +299,12 @@ where
             .cloned()
             .unwrap_or_default();
 
-        match auth_state.user {
-            Some(user) => {
-                let user_role = user.role.as_str();
-                if R::allowed_roles().contains(&user_role) {
-                    Ok(RequireRole(user, std::marker::PhantomData))
-                } else {
-                    Err(AppError::Forbidden("Insufficient permissions".to_string()))
-                }
-            }
-            None => Err(AppError::Unauthorized),
+        let user = user_or_auth_error(&auth_state)?;
+        let user_role = user.role.as_str();
+        if R::allowed_roles().contains(&user_role) {
+            Ok(RequireRole(user, std::marker::PhantomData))
+        } else {
+            Err(AppError::Forbidden("Insufficient permissions".to_string()))
         }
     }
 }
@@ -386,16 +423,14 @@ where
     ) -> Result<Self, Self::Rejection> {
         // First require authentication; share the same AuthState path
         // as RequireAuth so misconfigured handlers fail-closed on auth
-        // before ever touching the gate.
+        // before ever touching the gate. MAPPS-348: `user_or_auth_error`
+        // maps a tombstoned row to 410 Gone before falling to 401.
         let auth_state = parts
             .extensions
             .get::<AuthState>()
             .cloned()
             .unwrap_or_default();
-        let user = match auth_state.user {
-            Some(u) => u,
-            None => return Err(AppError::Unauthorized),
-        };
+        let user = user_or_auth_error(&auth_state)?;
 
         // Read the SettingsService from request extensions. Wired in
         // via `.layer(Extension(settings_service))` on the API v1
@@ -781,9 +816,63 @@ fn is_stuck_in_default(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default, UserRole,
+        default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default,
+        user_or_auth_error, AuthState, CurrentUser, UserRole,
     };
+    use crate::utils::error::AppError;
     use uuid::Uuid;
+
+    fn stub_user() -> CurrentUser {
+        CurrentUser {
+            id: Uuid::from_u128(1),
+            tenant_id: Uuid::from_u128(2),
+            email: "test@example.com".into(),
+            first_name: "T".into(),
+            last_name: "U".into(),
+            role: UserRole::Admin,
+            timezone: "UTC".into(),
+            avatar_url: None,
+            profile_completed: true,
+            date_format_string: None,
+            theme_base_mode: None,
+            theme_accent_id: None,
+            own_company_id: None,
+        }
+    }
+
+    #[test]
+    fn require_auth_returns_account_deleted_when_tombstoned() {
+        // MAPPS-348: `AuthState::deleted()` (JWT decoded, row tombstoned) must
+        // short-circuit to `AccountDeleted` (410 Gone) instead of falling
+        // through to the generic `Unauthorized` (401). Pins the ordering the
+        // SPA relies on to distinguish "account gone" from "session expired".
+        let deleted = AuthState::deleted();
+        match user_or_auth_error(&deleted) {
+            Err(AppError::AccountDeleted) => {}
+            other => panic!("expected AccountDeleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_auth_returns_unauthorized_when_no_user_and_not_deleted() {
+        // Default AuthState (no bearer, malformed token, verified-but-missing
+        // sub) keeps the pre-348 behaviour: plain 401.
+        let empty = AuthState::default();
+        match user_or_auth_error(&empty) {
+            Err(AppError::Unauthorized) => {}
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_auth_returns_user_when_authenticated() {
+        // Authenticated path is unchanged: the extractor hands back the user
+        // and no error path fires.
+        let user = stub_user();
+        let authed = AuthState::authenticated(user.clone(), Uuid::from_u128(2));
+        let got = user_or_auth_error(&authed).expect("authenticated");
+        assert_eq!(got.id, user.id);
+    }
 
     #[test]
     fn backfill_only_non_admin_default_tenant_users_without_invite() {

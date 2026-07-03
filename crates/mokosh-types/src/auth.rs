@@ -165,6 +165,14 @@ pub struct AuthState {
     pub user: Option<CurrentUser>,
     /// The current tenant ID
     pub tenant_id: Option<Uuid>,
+    /// MAPPS-348: JWT verified successfully but the user's row was
+    /// found to be soft-deleted (Bunyip account_deleted webhook
+    /// tombstoned them). Extractors surface this as a 410 Gone
+    /// (`ACCOUNT_DELETED`) instead of the generic 401. `#[serde(default)]`
+    /// keeps the wire shape backward-compatible for any consumer that
+    /// still deserializes a pre-348 payload.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 impl AuthState {
@@ -174,6 +182,21 @@ impl AuthState {
             is_authenticated: true,
             user: Some(user),
             tenant_id: Some(tenant_id),
+            deleted: false,
+        }
+    }
+
+    /// MAPPS-348: JWT verified but the target user's row is tombstoned.
+    /// The middleware sets this on the request extensions so the
+    /// `RequireAuth` extractor can return 410 Gone (`ACCOUNT_DELETED`)
+    /// instead of a plain 401, letting the SPA distinguish "your account
+    /// has been deleted" from "your session expired / please refresh".
+    pub fn deleted() -> Self {
+        Self {
+            is_authenticated: false,
+            user: None,
+            tenant_id: None,
+            deleted: true,
         }
     }
 
