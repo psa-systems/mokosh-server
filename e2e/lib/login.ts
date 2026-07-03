@@ -92,7 +92,21 @@ async function setInputValue(loc: Locator, value: string): Promise<void> {
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
     }, value);
-    if ((await loc.inputValue()) === value) return;
+    // BUNYIP-331: bunyip-web ships a six-digit TOTP auto-submit that fires on
+    // the bubbling `input` event above, so the `#code` field on `/login/2fa`
+    // detaches as `form.requestSubmit()` navigates the page. This readback
+    // then hits Playwright's default 180s action timeout waiting for an
+    // element that will never re-attach on `/dashboard`. Bound the readback
+    // to 500ms and treat a detach as "write took, form has already
+    // submitted"; the 5-attempt retry loop remains honest for the email +
+    // password fields (no auto-submit, no detach).
+    let current: string;
+    try {
+      current = await loc.inputValue({ timeout: 500 });
+    } catch {
+      return;
+    }
+    if (current === value) return;
     await loc.page().waitForTimeout(200);
   }
   throw new Error(
@@ -224,11 +238,25 @@ async function fillTotpStep(page: Page): Promise<void> {
     )
     .first();
   await codeInput.waitFor({ state: 'visible', timeout: 10_000 });
+  // BUNYIP-331: bunyip-web auto-submits the six-digit TOTP form the moment
+  // the input event fires (data-otp-autosubmit snippet). setInputValue's
+  // bubbling `input` event triggers that path, so the page usually navigates
+  // off /login/2fa before we can click the submit button below. Wait for the
+  // URL to leave the 2fa step; only click as a fallback if the auto-submit
+  // did not fire, so we never double-POST (a second submit trips the per-IP
+  // 2fa_verify rate limit and burns the current TOTP step). Mirrors the
+  // matching helper in bunyip's own e2e (login.ts:238).
   await setInputValue(codeInput, code);
-  await form
-    .getByRole('button', { name: /verify|continue|submit|sign ?in|log ?in/i })
-    .first()
-    .click();
+  const autoSubmitted = await page
+    .waitForURL((url) => !/\/login\/(2fa|mfa)(\/|$|\?)/.test(url.pathname), { timeout: 15_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!autoSubmitted) {
+    await form
+      .getByRole('button', { name: /verify|continue|submit|sign ?in|log ?in/i })
+      .first()
+      .click();
+  }
 }
 
 // An authenticated session can read the tenant-scoped tickets list (200); an
