@@ -8,6 +8,9 @@
 //!   instance (core logic in [`crate::infisical::run_dev_bootstrap`]).
 //! - `qa-seed` / `qa-teardown`    - load / remove the QA walkthrough dataset
 //!   (PMS-331), fail-closed against any tenant not explicitly marked QA.
+//! - `showcase-seed` / `showcase-refresh` / `showcase-teardown` - create,
+//!   reset, or remove the richer showcase demo dataset (PMS-620), fail-closed
+//!   against any tenant not explicitly marked `is_showcase`.
 //!
 //! The former `clients register` subcommand (which registered an OAuth client
 //! in `mokosh_auth.oauth_clients`) was removed with mokosh-auth in PMS-295;
@@ -37,7 +40,15 @@ const DEFAULT_ADMIN_LAST_NAME: &str = "Admin";
 /// by [`run`] rather than the long-running HTTP server. The caller starts the
 /// server when this returns `false`.
 pub fn is_subcommand(name: &str) -> bool {
-    matches!(name, "bootstrap-infisical" | "qa-seed" | "qa-teardown")
+    matches!(
+        name,
+        "bootstrap-infisical"
+            | "qa-seed"
+            | "qa-teardown"
+            | "showcase-seed"
+            | "showcase-refresh"
+            | "showcase-teardown"
+    )
 }
 
 /// Dispatch the operator subcommand named by `args[1]` (so `args` is the full
@@ -48,6 +59,9 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         Some("bootstrap-infisical") => run_bootstrap_infisical().await,
         Some("qa-seed") => run_qa("qa-seed", args).await,
         Some("qa-teardown") => run_qa("qa-teardown", args).await,
+        Some("showcase-seed") => run_showcase("showcase-seed", args).await,
+        Some("showcase-refresh") => run_showcase("showcase-refresh", args).await,
+        Some("showcase-teardown") => run_showcase("showcase-teardown", args).await,
         other => anyhow::bail!("not an operator subcommand: {other:?}"),
     }
 }
@@ -136,18 +150,59 @@ async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// --- showcase-seed / showcase-refresh / showcase-teardown (PMS-620) ------
+
+/// Drive the on-demand showcase demo dataset. `subcommand` is one of
+/// `"showcase-seed"`, `"showcase-refresh"`, `"showcase-teardown"`. The target
+/// tenant is taken from `--tenant <uuid>` (or the `MOKOSH_SHOWCASE_TENANT_ID`
+/// env var) and is cross-checked against the `is_showcase` marker by the seed
+/// itself, which refuses (zero writes) for any tenant not explicitly marked
+/// showcase, production included.
+async fn run_showcase(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
+    use crate::db::Database;
+
+    let tenant_id = parse_tenant_arg_env(args, "MOKOSH_SHOWCASE_TENANT_ID", "showcase")?;
+
+    // The showcase seed is a trusted admin tool. Connect the privileged
+    // `DATABASE_URL` as both pools so per-tenant RLS does not bite while the
+    // seed writes through the tenant-scoped service layer.
+    let database_url = require_env("DATABASE_URL")?;
+    let db = Database::new(&database_url, &database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to database: {e}"))?;
+
+    let report = match subcommand {
+        "showcase-seed" => crate::modules::seed::showcase_seed(&db, tenant_id).await,
+        "showcase-refresh" => crate::modules::seed::showcase_refresh(&db, tenant_id).await,
+        "showcase-teardown" => crate::modules::seed::showcase_teardown(&db, tenant_id).await,
+        other => unreachable!("unexpected showcase subcommand {other}"),
+    }
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("{subcommand} complete for tenant {tenant_id}.");
+    println!("  {report}");
+    Ok(())
+}
+
 /// Resolve the QA tenant id from `--tenant <uuid>`, falling back to the
 /// `MOKOSH_QA_TENANT_ID` env var. Errors if neither is present or the value is
 /// not a UUID.
 fn parse_tenant_arg(args: &[String]) -> anyhow::Result<uuid::Uuid> {
+    parse_tenant_arg_env(args, "MOKOSH_QA_TENANT_ID", "QA")
+}
+
+/// Resolve a tenant id from `--tenant <uuid>`, falling back to the named env
+/// var. `label` names the dataset for the error message. Errors if neither is
+/// present or the value is not a UUID.
+fn parse_tenant_arg_env(args: &[String], env_key: &str, label: &str) -> anyhow::Result<uuid::Uuid> {
     let raw = args
         .iter()
         .position(|a| a == "--tenant")
         .and_then(|i| args.get(i + 1).cloned())
-        .or_else(|| std::env::var("MOKOSH_QA_TENANT_ID").ok())
+        .or_else(|| std::env::var(env_key).ok())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "the QA tenant id is required: pass --tenant <uuid> or set MOKOSH_QA_TENANT_ID"
+                "the {label} tenant id is required: pass --tenant <uuid> or set {env_key}"
             )
         })?;
     uuid::Uuid::parse_str(raw.trim())
