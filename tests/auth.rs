@@ -1178,3 +1178,66 @@ fn routes_do_not_reach_global_login_helpers() {
         }
     }
 }
+
+// ============================================================================
+// PMS-625: role ceiling holds on the UPDATE path, not just create
+// ============================================================================
+
+/// PMS-625: the admin `PUT /users/{id}` path must enforce the same PMS-503
+/// role ceiling as `POST /users`. Without it a tenant `admin` (rank 2) could
+/// elevate any user - including themselves via `PUT /users/{self}`, which is
+/// NOT the role-sanitizing `/me` handler - to `super_admin` (rank 3), a
+/// platform-level cross-tenant account. Pins that an above-ceiling role is
+/// rejected with 403 while an at-or-below-ceiling change still succeeds.
+#[sqlx::test]
+async fn update_user_enforces_role_ceiling(pool: PgPool) {
+    // Caller is a tenant admin (rank 2), NOT a super_admin.
+    let (_admin_id, admin_email, admin_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "ceiling-admin@example.com",
+        "admin",
+    )
+    .await;
+    // Target the admin will try to elevate.
+    let (target_id, _t_email, _t_pw) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "ceiling-target@example.com",
+        "technician",
+    )
+    .await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &admin_email, &admin_password).await;
+
+    // Elevating the target to super_admin must be forbidden.
+    let denied = app
+        .client
+        .put(app.url(&format!("/api/v1/auth/users/{target_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role": "super_admin" }))
+        .send()
+        .await
+        .expect("send PUT elevate-to-super_admin");
+    assert_eq!(
+        denied.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "an admin must not be able to grant super_admin via the update path"
+    );
+
+    // A within-ceiling change (technician -> manager) still succeeds.
+    let allowed = app
+        .client
+        .put(app.url(&format!("/api/v1/auth/users/{target_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role": "manager" }))
+        .send()
+        .await
+        .expect("send PUT within-ceiling role change");
+    assert_eq!(
+        allowed.status(),
+        reqwest::StatusCode::OK,
+        "an at-or-below-ceiling role change must still be allowed"
+    );
+}
