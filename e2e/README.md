@@ -216,10 +216,66 @@ Tickets are hard-deletable via `DELETE /api/v1/tickets/{id}`
 its notes/status-history. They carry run-tagged titles and are swept before
 their parent companies.
 
+## Production-safe subset (PMS-608)
+
+Production E2E runs must **not** touch Stripe or any other external service.
+Real Stripe signups create real customers/subscriptions even on a free trial
+(this is how bunyip accumulated ~400 junk accounts, BUNYIP-273), and any
+outbound mail/SMS or live-gateway call is genuine traffic against a third party
+from the sensitive prod system. PMS-271 split the E2E secrets into staging vs
+production with prod opt-in; PMS-608 adds the behavioural gate on top of that
+wiring: on production, do not run anything that requires an external service.
+
+**Definition.** The production-safe subset is *every test that does not require
+Stripe or another external service*. That is the default: a spec is prod-safe
+unless it is explicitly tagged `@external`.
+
+**Tag convention.** Any test that requires an external service - creating a real
+Stripe customer/subscription, calling a live payment gateway, sending real
+mail/SMS, or otherwise producing outbound third-party traffic - MUST be tagged
+`@external` (Playwright test tag: `test('...', { tag: '@external' }, ...)` or
+`test.describe('...', { tag: '@external' }, ...)`). The tag is the single source
+of truth for "not prod-safe".
+
+**The gate.** The production dispatch in
+[`.forgejo/workflows/e2e.yml`](../.forgejo/workflows/e2e.yml) runs
+`playwright test --grep-invert @external`, so the `@external` set never executes
+against production. Staging, `push`, and `pull_request` runs pass no filter and
+run the full suite (`@external` tests included). The gate is demonstrable:
+
+```
+cd e2e
+bun x playwright test --list                       # includes @external tests
+bun x playwright test --grep-invert @external --list  # @external tests dropped
+```
+
+**Mechanical enforcement.** `tests/external-guard.spec.ts` is a canary tagged
+`@external`. On staging it runs and asserts `E2E_ENVIRONMENT !== 'production'`.
+If the `--grep-invert @external` filter is ever removed from the production
+dispatch, the canary runs against prod, sees `E2E_ENVIRONMENT=production`, and
+fails the run - so the exclusion cannot silently regress.
+
+**Current audit.** As of PMS-608, no product spec requires an external service:
+`billing.spec.ts` uses `check` payments and read-only invoices (no gateway
+call), `notifications.spec.ts` creates an email *template* and an `in_app`
+channel but sends nothing, and the payment-gateway config path is not exercised
+by any spec. The only `@external`-tagged test today is the guard canary. The
+whole product suite is therefore prod-safe; refine this list (and add the
+`@external` tag) as new external-touching specs land.
+
+**Escalation.** Running an `@external` flow against production is not routine
+CI: it requires **David's explicit sign-off**, after which it is run manually by
+dispatching the suite without the `--grep-invert @external` flag (or by
+temporarily narrowing the grep). Do not add an automatic path that runs
+`@external` tests on prod.
+
 ## Email
 
 Out of scope this phase. No signup-token or mailbox-dependent flow is tested;
-auth uses the pre-seeded account.
+auth uses the pre-seeded account. If a future mail-dependent spec is added, it
+sends real mail and is therefore an external-service flow: tag it `@external`
+(see [Production-safe subset](#production-safe-subset-pms-608)) so it is excluded
+from production runs.
 
 ## Run locally
 
@@ -245,7 +301,7 @@ login rate limit is 5/min, so parallel runs would collide):
 | --- | --- | --- | --- | --- |
 | `push` to `main` | staging | Post-merge validation: assert the deployed commit is actually serving on staging | `scripts/wait-for-deploy.mjs` polls `GET /api/v1/version` until staging reports the pushed commit's git hash (poll 15s, 10-min timeout). Walks back to the last build-relevant commit when the merged commit is doc/CI-only | Originally PMS-140 |
 | `pull_request` targeting `main` (incl. `release/*` PRs) | staging | Merge gate: every PR must pass the suite against staging before merge | `scripts/health-check.mjs` GETs `/api/v1/health` (one-shot, 30s timeout). A PR's SHA never deploys to staging so a version-SHA gate would always time out; this checks staging is up and the suite has something to talk to | PMS-141. Add `e2e` to required status checks on main branch protection to make the gate enforceable |
-| `workflow_dispatch` | `environment` input (`staging` default / `production`) | Manual ad-hoc runs | `staging`: deploy-sync gate (`wait-for-deploy.mjs`), like `push`. `production`: reachability check (`health-check.mjs`) - the dispatched SHA is unlikely to be what prod serves, so the SHA-polling gate would time out | Production runs ONLY here (PMS-271). The write-heavy suite is never run against prod automatically; a human dispatches and selects it |
+| `workflow_dispatch` | `environment` input (`staging` default / `production`) | Manual ad-hoc runs | `staging`: deploy-sync gate (`wait-for-deploy.mjs`), like `push`. `production`: reachability check (`health-check.mjs`) - the dispatched SHA is unlikely to be what prod serves, so the SHA-polling gate would time out | Production runs ONLY here (PMS-271). The write-heavy suite is never run against prod automatically; a human dispatches and selects it. The production run also excludes `@external` tests via `--grep-invert @external` (PMS-608) - see [Production-safe subset](#production-safe-subset-pms-608) |
 
 **Environment secrets (PMS-271).** CI holds staging and production config side
 by side as Forgejo Actions secrets. The job `env:` block selects per var and

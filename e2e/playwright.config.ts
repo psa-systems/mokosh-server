@@ -109,5 +109,16 @@ export default defineConfig({
       dependencies: ['setup'],
       use: { baseURL: env.apiBaseURL },
     },
+    // 4. External-service exclusion guard (PMS-608). Carries the `@external`
+    //    tag, so the production run's `--grep-invert @external` (see
+    //    .forgejo/workflows/e2e.yml) drops it on prod and keeps it on
+    //    staging/PR/push. It reads only E2E_ENVIRONMENT (no auth/tenant), so it
+    //    does not depend on `setup`; it depends on `preflight` only so a
+    //    misconfigured CI fails clean. See tests/external-guard.spec.ts.
+    {
+      name: 'guard',
+      testMatch: /external-guard\.spec\.ts$/,
+      dependencies: ['preflight'],
+    },
   ],
 });
