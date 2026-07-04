@@ -506,6 +506,20 @@ async fn update_user(
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
 
+    // Role ceiling (PMS-503 / PMS-625): a caller may only assign a role at or
+    // below their own privilege. `create_user` already gates this, but the
+    // update path did not - so a tenant `admin` could elevate any user (or
+    // themselves via `PUT /users/{self}`, which is NOT the role-sanitizing
+    // `/me` handler) to `super_admin`, a platform-level cross-tenant account.
+    // Mirror the create-side check so the ceiling holds on both surfaces.
+    if let Some(role) = request.role {
+        if !user.role.can_grant(role) {
+            return Err(AppError::Forbidden(
+                "Cannot assign a role above your own".to_string(),
+            ));
+        }
+    }
+
     request.validate()?;
 
     let updated = state

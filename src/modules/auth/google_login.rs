@@ -114,10 +114,20 @@ pub fn read_state_cookie(cookie_header: &str) -> Option<String> {
 /// `postMessage` so the browser only delivers the payload to the
 /// configured SPA origin - never `*`.
 pub fn callback_html(payload: &JsonValue, client_origin: &str) -> Html<String> {
-    // `serde_json::to_string` HTML-escapes `<`, `>`, and `&`, so this
-    // is safe to embed inline in a <script> tag.
-    let payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
-    let origin_json = serde_json::to_string(client_origin).unwrap_or_else(|_| "\"\"".to_string());
+    // PMS-625: `serde_json::to_string` does NOT HTML-escape `<`, `>`, or `&`
+    // (it only escapes the JSON-mandatory `"`, `\`, and control chars), so a
+    // payload string containing `</script>` would break out of the inline
+    // <script> element below. The OAuth error branch reflects the fully
+    // attacker-controlled `error_description` query param into `payload.error`,
+    // making this a reflected XSS on the API origin; a Google `given_name`
+    // reaches the success payload the same way. `escape_json_for_script`
+    // neutralizes the breakout while keeping the JSON byte-for-byte equivalent.
+    let payload_json = escape_json_for_script(
+        &serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()),
+    );
+    let origin_json = escape_json_for_script(
+        &serde_json::to_string(client_origin).unwrap_or_else(|_| "\"\"".to_string()),
+    );
 
     let body = format!(
         r#"<!DOCTYPE html>
@@ -138,4 +148,55 @@ pub fn callback_html(payload: &JsonValue, client_origin: &str) -> Html<String> {
 "#
     );
     Html(body)
+}
+
+/// Escape a serialized-JSON string so it is safe to embed inside an inline
+/// HTML `<script>` block. These characters can only ever appear inside JSON
+/// string literals in `serde_json`'s output, so replacing them with their
+/// `\uXXXX` escapes yields byte-for-byte equivalent JSON while closing the
+/// `</script>` / `<!--` breakout vectors (`<`, `>`, `&`) and the two Unicode
+/// line separators (U+2028, U+2029) that are valid JSON but break a JS string
+/// literal. PMS-625.
+fn escape_json_for_script(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_html_neutralizes_script_breakout() {
+        // The OAuth error branch reflects the attacker-controlled
+        // `error_description` into `payload.error`. A `</script>` in that
+        // string must NOT close the inline script element (PMS-625).
+        let payload = serde_json::json!({
+            "ok": false,
+            "error": "</script><script>alert(document.domain)</script>",
+        });
+        let html = callback_html(&payload, "https://app.example.com").0;
+        assert!(
+            !html.contains("</script><script>"),
+            "attacker `</script><script>` must not survive into the markup: {html}"
+        );
+        assert!(
+            html.contains("\\u003c/script\\u003e\\u003cscript\\u003e"),
+            "the breakout payload must appear only in escaped form: {html}"
+        );
+    }
+
+    #[test]
+    fn escape_json_for_script_is_reversible_json() {
+        // Escaping produces equivalent JSON: parsing the escaped string yields
+        // the original value, so no legitimate payload is corrupted.
+        let original = serde_json::json!({ "name": "a<b>c&d", "u": "x\u{2028}y" });
+        let escaped = escape_json_for_script(&serde_json::to_string(&original).unwrap());
+        let round_trip: JsonValue = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(round_trip, original);
+        assert!(!escaped.contains('<') && !escaped.contains('>') && !escaped.contains('&'));
+    }
 }
