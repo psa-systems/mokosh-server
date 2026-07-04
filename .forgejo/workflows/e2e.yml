@@ -101,6 +101,11 @@ jobs:
       E2E_OP_BASE_URL: ${{ inputs.environment == 'production' && secrets.OIDC_ISSUER_PRODUCTION || secrets.OIDC_ISSUER_STAGING }}
       E2E_TOTP_SECRET: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_TOTP_SECRET || secrets.E2E_STAGING_TOTP_SECRET }}
       E2E_FOREIGN_COMPANY_ID: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_FOREIGN_COMPANY_ID || secrets.E2E_STAGING_FOREIGN_COMPANY_ID }}
+      # PMS-608: name the target environment for the suite so the external-service
+      # guard (tests/external-guard.spec.ts) can assert it never runs against
+      # production. push / pull_request always resolve to staging (empty
+      # `inputs` context); a manual dispatch selects.
+      E2E_ENVIRONMENT: ${{ inputs.environment == 'production' && 'production' || 'staging' }}
 
     steps:
       - name: Clone the repository
@@ -144,8 +149,15 @@ jobs:
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
         run: node24 scripts/health-check.mjs
 
+      # PMS-608: production must not run anything that requires Stripe or another
+      # external service (real Stripe customers/subscriptions, outbound mail,
+      # etc.). Such tests are tagged `@external`; exclude that set from the
+      # production run with `--grep-invert`. push / pull_request / staging
+      # dispatch run the full suite (empty arg). Any need to exercise an
+      # `@external` flow on prod requires David's sign-off and a manual run
+      # without this flag - see e2e/README.md "Production-safe subset".
       - name: Run E2E suite
-        run: bun x playwright test
+        run: bun x playwright test ${{ inputs.environment == 'production' && '--grep-invert @external' || '' }}
 
       - name: Upload Playwright report and traces
         if: failure()
