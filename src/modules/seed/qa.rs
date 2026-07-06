@@ -38,7 +38,7 @@
 //!   plus payments (one paid in full, one partial).
 //! - 1 asset type and 6 assets across the companies (CMDB / company-360 rollup).
 //! - 1 knowledge-base category with 3 published articles.
-//! - 1 SLA policy (so the SLA-management view is populated).
+//! - 1 SLA policy with a response/resolution target on the top priority.
 //! - 5 calendar / dispatch appointments over the coming week (PSA-55).
 //!
 //! # Idempotency and teardown
@@ -73,7 +73,7 @@ use crate::modules::projects::{
     CreateProjectRequest, CreateTaskRequest, ProjectsService, UpsertProjectPhaseRequest,
     UpsertTaskStatusRequest,
 };
-use crate::modules::sla::{SlaService, UpsertSlaPolicyRequest};
+use crate::modules::sla::{SlaService, UpsertSlaPolicyRequest, UpsertSlaTargetRequest};
 use crate::modules::tickets::{CreateTicketRequest, TicketService, TicketSource};
 use crate::modules::time_tracking::{
     CreateTimeEntryRequest, TimeTrackingService, UpsertWorkTypeRequest,
@@ -422,11 +422,19 @@ impl QaSeeder {
             report.kb_articles += 1;
         }
 
-        // --- One SLA policy so the SLA-management view is populated ---
-        self.sla
+        // --- One SLA policy (+ a target) so the SLA view shows real deadlines ---
+        let sla_policy = self
+            .sla
             .create_policy(tenant, &qa_sla_policy(), &ctx)
             .await?;
         report.sla_policies += 1;
+        // Attach a target on the top priority so the policy is not an empty row:
+        // first-response 1h <= resolution 8h (the cross-field validator).
+        if let Some(&priority_id) = priorities.first() {
+            self.sla
+                .upsert_target(tenant, sla_policy.id, &qa_sla_target(priority_id))
+                .await?;
+        }
 
         // --- Calendar / dispatch appointments (scheduled onsite visits) ---
         for spec in qa_appointment_specs(user_id, &company_ids, &ticket_ids) {
@@ -608,6 +616,10 @@ async fn teardown(db: &Database, tid: Uuid) -> AppResult<QaReport> {
     del!("DELETE FROM asset_types WHERE tenant_id = $1 AND name LIKE $2");
     report.kb_articles = del!("DELETE FROM kb_articles WHERE tenant_id = $1 AND title LIKE $2");
     del!("DELETE FROM kb_categories WHERE tenant_id = $1 AND name LIKE $2");
+    del!(
+        "DELETE FROM sla_targets WHERE sla_policy_id IN \
+         (SELECT id FROM sla_policies WHERE tenant_id = $1 AND name LIKE $2)"
+    );
     report.sla_policies = del!("DELETE FROM sla_policies WHERE tenant_id = $1 AND name LIKE $2");
 
     // Leaves first, then their parents, then companies (contacts/sites cascade
@@ -1219,6 +1231,17 @@ fn qa_sla_policy() -> UpsertSlaPolicyRequest {
         description: Some("QA seed SLA policy".to_string()),
         business_hours_id: None,
         is_default: false,
+    }
+}
+
+/// One SLA target for the seeded policy: 1h first response, 8h resolution
+/// (first_response <= resolution, per the cross-field validator).
+fn qa_sla_target(priority_id: Uuid) -> UpsertSlaTargetRequest {
+    UpsertSlaTargetRequest {
+        priority_id,
+        first_response_hours: Some(Decimal::new(1, 0)),
+        resolution_hours: Some(Decimal::new(8, 0)),
+        operational_hours: "business_hours".to_string(),
     }
 }
 
