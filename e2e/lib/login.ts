@@ -225,10 +225,22 @@ async function fillTotpStep(page: Page): Promise<void> {
     .first();
   await codeInput.waitFor({ state: 'visible', timeout: 10_000 });
   await setInputValue(codeInput, code);
-  await form
+  // The bunyip hub auto-submits the 2FA form the instant the code reaches six
+  // digits (BUNYIP-331 OTP autosubmit). `setInputValue` dispatches an `input`
+  // event, which fires that autosubmit, so the form is usually already
+  // navigating to the OIDC callback by the time we get here and the submit
+  // button is detached. Click only as a fallback (for the case where autosubmit
+  // did not fire) and race it against the navigation off the 2FA step, so the
+  // happy autosubmit path never hangs waiting on a vanished button.
+  const submit = form
     .getByRole('button', { name: /verify|continue|submit|sign ?in|log ?in/i })
-    .first()
-    .click();
+    .first();
+  await Promise.race([
+    submit.click().catch(() => {}),
+    page.waitForURL((url) => !url.pathname.endsWith('/login/2fa'), {
+      timeout: 15_000,
+    }),
+  ]);
 }
 
 // An authenticated session can read the tenant-scoped tickets list (200); an
