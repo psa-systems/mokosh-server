@@ -36,6 +36,10 @@
 //!   to tickets and projects.
 //! - One contract of every type, and two invoices with multiple line items
 //!   plus payments (one paid in full, one partial).
+//! - 1 asset type and 6 assets across the companies (CMDB / company-360 rollup).
+//! - 1 knowledge-base category with 3 published articles.
+//! - 1 SLA policy with a response/resolution target on the top priority.
+//! - 5 calendar / dispatch appointments over the coming week (PSA-55).
 //!
 //! # Idempotency and teardown
 //!
@@ -51,21 +55,25 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::assets::{AssetsService, CreateAssetRequest, UpsertAssetTypeRequest};
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::TenantId;
 use crate::modules::billing::{
     BillingService, CreateInvoiceLineRequest, CreateInvoiceRequest, CreatePaymentRequest,
     InvoiceLineType, PaymentMethod,
 };
+use crate::modules::calendar::{CalendarService, CreateAppointmentRequest};
 use crate::modules::contacts::{
     Address, CompanyStatus, CompanyType, ContactService, ContactType, CreateCompanyRequest,
     CreateContactRequest, PreferredContactMethod,
 };
 use crate::modules::contracts::{ContractsService, CreateContractRequest};
+use crate::modules::knowledge_base::{CreateKbArticleRequest, KbService, UpsertKbCategoryRequest};
 use crate::modules::projects::{
     CreateProjectRequest, CreateTaskRequest, ProjectsService, UpsertProjectPhaseRequest,
     UpsertTaskStatusRequest,
 };
+use crate::modules::sla::{SlaService, UpsertSlaPolicyRequest, UpsertSlaTargetRequest};
 use crate::modules::tickets::{CreateTicketRequest, TicketService, TicketSource};
 use crate::modules::time_tracking::{
     CreateTimeEntryRequest, TimeTrackingService, UpsertWorkTypeRequest,
@@ -95,6 +103,10 @@ pub struct QaReport {
     pub contracts: usize,
     pub invoices: usize,
     pub payments: usize,
+    pub assets: usize,
+    pub kb_articles: usize,
+    pub sla_policies: usize,
+    pub appointments: usize,
 }
 
 impl fmt::Display for QaReport {
@@ -108,7 +120,8 @@ impl fmt::Display for QaReport {
         write!(
             f,
             "companies={} contacts={} tickets={} projects={} phases={} tasks={} \
-             time_entries={} contracts={} invoices={} payments={}",
+             time_entries={} contracts={} invoices={} payments={} assets={} \
+             kb_articles={} sla_policies={} appointments={}",
             self.companies,
             self.contacts,
             self.tickets,
@@ -119,6 +132,10 @@ impl fmt::Display for QaReport {
             self.contracts,
             self.invoices,
             self.payments,
+            self.assets,
+            self.kb_articles,
+            self.sla_policies,
+            self.appointments,
         )
     }
 }
@@ -204,6 +221,10 @@ struct QaSeeder {
     time: TimeTrackingService,
     contracts: ContractsService,
     billing: BillingService,
+    assets: AssetsService,
+    kb: KbService,
+    sla: SlaService,
+    calendar: CalendarService,
 }
 
 impl QaSeeder {
@@ -215,6 +236,14 @@ impl QaSeeder {
             time: TimeTrackingService::new(db.clone()),
             contracts: ContractsService::new(db.clone()),
             billing: BillingService::new(db.clone()),
+            // The QA seed only creates asset types and plain assets, never the
+            // encrypted asset secrets (credentials / configuration items) that
+            // are the sole users of the encryption key, so a zero key is never
+            // exercised on this path (PMS-188 removed the zero-key `new`).
+            assets: AssetsService::with_encryption_key(db.clone(), [0u8; 32]),
+            kb: KbService::new(db.clone()),
+            sla: SlaService::new(db.clone()),
+            calendar: CalendarService::new(db.clone()),
             db,
         }
     }
@@ -369,6 +398,50 @@ impl QaSeeder {
                 self.billing.create_payment(tenant, &pay, &ctx).await?;
                 report.payments += 1;
             }
+        }
+
+        // --- Assets (one asset type + a handful spread across companies) ---
+        let asset_type = self
+            .assets
+            .create_asset_type(tenant, &qa_asset_type(), &ctx)
+            .await?;
+        for spec in qa_asset_specs(asset_type.id, &company_ids) {
+            self.assets
+                .create_asset(tenant, user_id, &spec, &ctx)
+                .await?;
+            report.assets += 1;
+        }
+
+        // --- Knowledge base (a category + a few published articles) ---
+        let kb_category = self
+            .kb
+            .create_category(tenant, &qa_kb_category(), &ctx)
+            .await?;
+        for spec in qa_kb_article_specs(kb_category.id) {
+            self.kb.create_article(tenant, user_id, &spec, &ctx).await?;
+            report.kb_articles += 1;
+        }
+
+        // --- One SLA policy (+ a target) so the SLA view shows real deadlines ---
+        let sla_policy = self
+            .sla
+            .create_policy(tenant, &qa_sla_policy(), &ctx)
+            .await?;
+        report.sla_policies += 1;
+        // Attach a target on the top priority so the policy is not an empty row:
+        // first-response 1h <= resolution 8h (the cross-field validator).
+        if let Some(&priority_id) = priorities.first() {
+            self.sla
+                .upsert_target(tenant, sla_policy.id, &qa_sla_target(priority_id))
+                .await?;
+        }
+
+        // --- Calendar / dispatch appointments (scheduled onsite visits) ---
+        for spec in qa_appointment_specs(user_id, &company_ids, &ticket_ids) {
+            self.calendar
+                .create_appointment(tenant, &spec, &ctx)
+                .await?;
+            report.appointments += 1;
         }
 
         Ok(report)
@@ -534,6 +607,20 @@ async fn teardown(db: &Database, tid: Uuid) -> AppResult<QaReport> {
                 .rows_affected() as usize
         }};
     }
+
+    // Demo-gap entities (PSA-55) first, before the companies / tickets /
+    // projects they reference are removed below. asset_types and kb_categories
+    // are the QA lookup rows the seed created.
+    report.appointments = del!("DELETE FROM appointments WHERE tenant_id = $1 AND title LIKE $2");
+    report.assets = del!("DELETE FROM assets WHERE tenant_id = $1 AND name LIKE $2");
+    del!("DELETE FROM asset_types WHERE tenant_id = $1 AND name LIKE $2");
+    report.kb_articles = del!("DELETE FROM kb_articles WHERE tenant_id = $1 AND title LIKE $2");
+    del!("DELETE FROM kb_categories WHERE tenant_id = $1 AND name LIKE $2");
+    del!(
+        "DELETE FROM sla_targets WHERE sla_policy_id IN \
+         (SELECT id FROM sla_policies WHERE tenant_id = $1 AND name LIKE $2)"
+    );
+    report.sla_policies = del!("DELETE FROM sla_policies WHERE tenant_id = $1 AND name LIKE $2");
 
     // Leaves first, then their parents, then companies (contacts/sites cascade
     // on company delete; see scripts/wipe_demo_seed.sql).
@@ -1059,6 +1146,136 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
             Some(Decimal::new(5, 1)), // 0.5 -> partial payment
         ),
     ]
+}
+
+// --- Demo-gap builders (PSA-55): assets, knowledge base, SLA, calendar ------
+
+fn qa_asset_type() -> UpsertAssetTypeRequest {
+    UpsertAssetTypeRequest {
+        name: format!("{QA_PREFIX}Workstation"),
+        icon: Some("laptop".to_string()),
+        parent_type_id: None,
+        is_active: true,
+        itil_category: Some("hardware".to_string()),
+    }
+}
+
+/// Six assets spread across the seeded companies, so the assets list and the
+/// company-360 asset rollup both have rows.
+fn qa_asset_specs(asset_type_id: Uuid, company_ids: &[Uuid]) -> Vec<CreateAssetRequest> {
+    (0..6)
+        .map(|i| CreateAssetRequest {
+            asset_tag: Some(format!("{QA_PREFIX}AST-{:03}", i + 1)),
+            name: format!("{QA_PREFIX}Laptop {:02}", i + 1),
+            asset_type_id,
+            company_id: company_ids[i % company_ids.len()],
+            site_id: None,
+            contact_id: None,
+            status: "active".to_string(),
+            manufacturer: Some("Dell".to_string()),
+            model: Some("Latitude 7440".to_string()),
+            serial_number: Some(format!("{QA_PREFIX}SN-{:05}", i + 1)),
+            purchase_date: Some(today() - Duration::days(400)),
+            purchase_price: Some(Decimal::new(1499, 0)),
+            warranty_expiry: Some(today() + Duration::days(330)),
+            end_of_life: None,
+            assigned_user_id: None,
+            ip_address: Some(format!("10.0.0.{}", 10 + i)),
+            hostname: Some(format!("qa-ws-{:02}", i + 1)),
+            mac_address: None,
+            installed_date: Some(today() - Duration::days(390)),
+            department: Some("Operations".to_string()),
+            in_transit_ticket_id: None,
+            itil_lifecycle_stage: Some("in_service".to_string()),
+            license_vendor: None,
+            license_seat_count: None,
+            license_expiry: None,
+        })
+        .collect()
+}
+
+fn qa_kb_category() -> UpsertKbCategoryRequest {
+    UpsertKbCategoryRequest {
+        name: format!("{QA_PREFIX}Runbooks"),
+        description: Some("QA seed knowledge-base category".to_string()),
+        parent_id: None,
+        slug: "qa-runbooks".to_string(),
+        visibility: "internal".to_string(),
+        sort_order: 0,
+    }
+}
+
+/// A few published articles so the KB list and search have content.
+fn qa_kb_article_specs(category_id: Uuid) -> Vec<CreateKbArticleRequest> {
+    let mk = |n: usize, title: &str, slug: &str| CreateKbArticleRequest {
+        title: format!("{QA_PREFIX}{title}"),
+        slug: format!("qa-{slug}"),
+        content: format!("# {title}\n\nQA seed article {n}. Step-by-step runbook content."),
+        summary: Some(format!("QA seed article {n}")),
+        category_id: Some(category_id),
+        visibility: "internal".to_string(),
+        status: "published".to_string(),
+        tags: vec![QA_TAG.to_string()],
+        company_ids: None,
+    };
+    vec![
+        mk(1, "Onboarding a new workstation", "onboard-workstation"),
+        mk(2, "Resetting a user password", "reset-password"),
+        mk(3, "Escalating a P1 incident", "escalate-p1"),
+    ]
+}
+
+fn qa_sla_policy() -> UpsertSlaPolicyRequest {
+    UpsertSlaPolicyRequest {
+        name: format!("{QA_PREFIX}Standard SLA"),
+        description: Some("QA seed SLA policy".to_string()),
+        business_hours_id: None,
+        is_default: false,
+    }
+}
+
+/// One SLA target for the seeded policy: 1h first response, 8h resolution
+/// (first_response <= resolution, per the cross-field validator).
+fn qa_sla_target(priority_id: Uuid) -> UpsertSlaTargetRequest {
+    UpsertSlaTargetRequest {
+        priority_id,
+        first_response_hours: Some(Decimal::new(1, 0)),
+        resolution_hours: Some(Decimal::new(8, 0)),
+        operational_hours: "business_hours".to_string(),
+    }
+}
+
+/// A handful of scheduled onsite visits over the coming week, so the calendar
+/// and the dispatch board are not empty.
+fn qa_appointment_specs(
+    assigned_to: Uuid,
+    company_ids: &[Uuid],
+    ticket_ids: &[Uuid],
+) -> Vec<CreateAppointmentRequest> {
+    let base = Utc::now();
+    (0..5)
+        .map(|i| {
+            let start = base + Duration::days(i as i64 + 1) + Duration::hours(9);
+            CreateAppointmentRequest {
+                title: format!("{QA_PREFIX}Onsite visit {:02}", i + 1),
+                description: Some("QA seed scheduled visit".to_string()),
+                appointment_type: "other".to_string(),
+                ticket_id: ticket_ids.get(i).copied(),
+                project_id: None,
+                task_id: None,
+                company_id: Some(company_ids[i % company_ids.len()]),
+                contact_id: None,
+                site_id: None,
+                assigned_to_id: assigned_to,
+                start_time: start,
+                end_time: start + Duration::hours(2),
+                all_day: false,
+                timezone: "UTC".to_string(),
+                location: Some("Client site".to_string()),
+                recurrence_rule: None,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
