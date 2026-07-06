@@ -54,6 +54,60 @@ async fn login_then_me_happy_path(pool: PgPool) {
 }
 
 // ============================================================================
+// MAPPS-348: tombstoned user gets 410 Gone (ACCOUNT_DELETED), not 401
+// ============================================================================
+
+/// MAPPS-348: after the Bunyip account_deleted webhook has soft-deleted the
+/// user row, an authenticated request bearing the pre-tombstone JWT must
+/// come back as 410 Gone with `code: ACCOUNT_DELETED`, not the generic 401.
+/// Distinguishes "your account has been deleted" from "your session expired
+/// (please refresh)" so the SPA can render its terminal modal instead of
+/// falling into a token-refresh loop.
+#[sqlx::test]
+async fn tombstoned_user_gets_410_account_deleted_on_me(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Sanity: /me works while the user is active.
+    let me = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me pre-tombstone");
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+
+    // Simulate the Bunyip account_deleted webhook: soft-delete the row.
+    // This is the same terminal state PMS-591 leaves the row in.
+    sqlx::query("UPDATE users SET deleted_at = NOW() WHERE id = $1")
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("tombstone the seeded user");
+
+    let me_after = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me post-tombstone");
+    assert_eq!(
+        me_after.status(),
+        reqwest::StatusCode::GONE,
+        "/me must return 410 Gone once the user row is tombstoned"
+    );
+    let body: serde_json::Value = me_after.json().await.expect("/me body is JSON");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("ACCOUNT_DELETED"),
+        "410 response must carry the ACCOUNT_DELETED code so the SPA can catch it"
+    );
+}
+
+// ============================================================================
 // PMS-410: theme preferences round-trip on PUT/GET /me
 // ============================================================================
 
@@ -1123,4 +1177,67 @@ fn routes_do_not_reach_global_login_helpers() {
             );
         }
     }
+}
+
+// ============================================================================
+// PMS-625: role ceiling holds on the UPDATE path, not just create
+// ============================================================================
+
+/// PMS-625: the admin `PUT /users/{id}` path must enforce the same PMS-503
+/// role ceiling as `POST /users`. Without it a tenant `admin` (rank 2) could
+/// elevate any user - including themselves via `PUT /users/{self}`, which is
+/// NOT the role-sanitizing `/me` handler - to `super_admin` (rank 3), a
+/// platform-level cross-tenant account. Pins that an above-ceiling role is
+/// rejected with 403 while an at-or-below-ceiling change still succeeds.
+#[sqlx::test]
+async fn update_user_enforces_role_ceiling(pool: PgPool) {
+    // Caller is a tenant admin (rank 2), NOT a super_admin.
+    let (_admin_id, admin_email, admin_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "ceiling-admin@example.com",
+        "admin",
+    )
+    .await;
+    // Target the admin will try to elevate.
+    let (target_id, _t_email, _t_pw) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "ceiling-target@example.com",
+        "technician",
+    )
+    .await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &admin_email, &admin_password).await;
+
+    // Elevating the target to super_admin must be forbidden.
+    let denied = app
+        .client
+        .put(app.url(&format!("/api/v1/auth/users/{target_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role": "super_admin" }))
+        .send()
+        .await
+        .expect("send PUT elevate-to-super_admin");
+    assert_eq!(
+        denied.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "an admin must not be able to grant super_admin via the update path"
+    );
+
+    // A within-ceiling change (technician -> manager) still succeeds.
+    let allowed = app
+        .client
+        .put(app.url(&format!("/api/v1/auth/users/{target_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role": "manager" }))
+        .send()
+        .await
+        .expect("send PUT within-ceiling role change");
+    assert_eq!(
+        allowed.status(),
+        reqwest::StatusCode::OK,
+        "an at-or-below-ceiling role change must still be allowed"
+    );
 }

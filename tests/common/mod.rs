@@ -210,6 +210,11 @@ async fn boot_with_db(pool: PgPool, db: Database, app_pool: Option<PgPool>) -> T
         None,  // bunyip RS verifier disabled in tests
         mailer,
         encryption_key,
+        // PMS-591: no Bunyip webhook path exercised in these tests, but the
+        // constructor now requires a shared secret. Any non-empty value works
+        // for the constructor; specs that hit the webhook build their own
+        // signature against the same secret.
+        b"test-bunyip-webhook-secret".to_vec(),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

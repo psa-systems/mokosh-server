@@ -43,6 +43,15 @@ pub enum AppError {
     #[error("Gone: {0}")]
     Gone(String),
 
+    /// The authenticated principal's user row is soft-deleted (Bunyip
+    /// account_deleted webhook has tombstoned them). 410 Gone with the
+    /// distinct code `ACCOUNT_DELETED` so the SPA can catch it in its
+    /// shared fetch layer and render a terminal "your account has been
+    /// deleted" modal instead of degrading to the generic offline banner
+    /// on repeated 401s. See MAPPS-348.
+    #[error("Account has been deleted.")]
+    AccountDeleted,
+
     /// Rate limit exceeded
     #[error("Rate limit exceeded. Please try again later.")]
     RateLimited,
@@ -174,6 +183,7 @@ impl AppError {
             Self::Conflict(_) => 409,
             Self::BadRequest(_) => 400,
             Self::Gone(_) => 410,
+            Self::AccountDeleted => 410,
             Self::RateLimited => 429,
             Self::Database(_) => 500,
             Self::ExternalService { .. } => 502,
@@ -198,6 +208,7 @@ impl AppError {
             Self::Conflict(_) => "CONFLICT",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Gone(_) => "GONE",
+            Self::AccountDeleted => "ACCOUNT_DELETED",
             Self::RateLimited => "RATE_LIMITED",
             Self::Database(_) => "DATABASE_ERROR",
             Self::ExternalService { .. } => "EXTERNAL_SERVICE_ERROR",

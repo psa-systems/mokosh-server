@@ -36,6 +36,15 @@ pub struct AppConfig {
     /// Lowercased exact-email allowlist; only these emails may auto-provision
     /// a super_admin on first Google sign-in (everyone else is rejected).
     pub oauth_super_admin_emails: Vec<String>,
+    /// PMS-591: shared secret Bunyip signs its `account_deleted` webhook
+    /// payload with. Bunyip signs every outbound webhook with ONE service-wide
+    /// HMAC-SHA256 secret (see `bunyip crates/bunyip-domain/src/services/webhook.rs`
+    /// `WebhookService::new(signing_secret)`), NOT a per-app value on any
+    /// `applications` row - the model has no `webhook_secret` column. Both
+    /// sides must hold the same value: bunyip reads it from
+    /// `BUNYIP_WEBHOOK_SIGNING_SECRET` (BUNYIP-332), mokosh reads it from
+    /// `BUNYIP_WEBHOOK_SECRET`.
+    pub bunyip_webhook_secret: String,
 }
 
 /// Dev-only fallback for `JWT_SECRET`. Accepted only in dev/test
@@ -45,6 +54,10 @@ const DEV_JWT_SECRET: &str = "development-secret-change-in-production";
 /// Dev-only fallback for `ENCRYPTION_KEY`. Same production guard as
 /// [`DEV_JWT_SECRET`] (PMS-499).
 const DEV_ENCRYPTION_KEY: &str = "32-byte-key-for-dev-only-change!";
+/// Dev-only fallback for `BUNYIP_WEBHOOK_SECRET` (PMS-591). Accepted only
+/// in dev/test; production/staging must set a real value matching bunyip's
+/// service-wide `WebhookService` signing secret (BUNYIP-332), or boot fails.
+const DEV_BUNYIP_WEBHOOK_SECRET: &str = "development-bunyip-webhook-secret-change";
 
 /// True for the environments that may use the hardcoded dev fallbacks.
 /// Anything else (staging, production, or an unrecognized value) fails
@@ -141,6 +154,17 @@ impl AppConfig {
         let jwt_secret = resolve_secret("JWT_SECRET", &environment, DEV_JWT_SECRET)?;
         check_jwt_secret_len(&jwt_secret, &environment)?;
         let encryption_key = resolve_secret("ENCRYPTION_KEY", &environment, DEV_ENCRYPTION_KEY)?;
+        // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
+        // Same fail-loud posture as the other secrets: dev/test may fall back to
+        // a hardcoded value, staging/production refuse to boot without a real
+        // secret. Matches bunyip-api's `BUNYIP_WEBHOOK_SIGNING_SECRET`
+        // (BUNYIP-332); bunyip signs every outbound webhook with a single
+        // service-wide secret, not a per-Application value.
+        let bunyip_webhook_secret = resolve_secret(
+            "BUNYIP_WEBHOOK_SECRET",
+            &environment,
+            DEV_BUNYIP_WEBHOOK_SECRET,
+        )?;
 
         // PMS-498: outside dev/test the at-rest AES-256-GCM key must be the
         // unambiguous 64-hex form. resolve_secret already refuses an unset var
@@ -197,6 +221,7 @@ impl AppConfig {
                         .unwrap_or_else(|_| "http://localhost:4301".to_string())]
                 }),
             oauth_super_admin_emails,
+            bunyip_webhook_secret,
         })
     }
 
@@ -473,6 +498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bunyip_verifier,
         mailer,
         encryption_key,
+        config.bunyip_webhook_secret.into_bytes(),
     );
     let router = psa_router;
 

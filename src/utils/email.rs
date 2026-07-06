@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lettre::message::{Mailbox, MultiPart};
+use lettre::message::{Mailbox, MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use secrecy::{ExposeSecret, SecretString};
+use uuid::Uuid;
 
 use crate::utils::error::{AppError, AppResult};
 
@@ -138,6 +139,35 @@ impl SmtpMailer {
             from,
         })
     }
+
+    /// Start a `Message` for `to`, pre-populating the headers every outbound
+    /// message must carry: `From`, `To`, and a unique `Message-ID`. `Date` is
+    /// added automatically by lettre's `build`. Routing all sends through this
+    /// helper guarantees no path can ship a message without a `Message-ID`.
+    fn base_builder(&self, to: Mailbox) -> MessageBuilder {
+        base_builder(&self.from, to)
+    }
+}
+
+/// Generate a fresh, globally-unique `Message-ID` header value of the form
+/// `<uuid@from-domain>`. lettre only emits a `Message-ID` when one is set
+/// explicitly (its `hostname` feature is disabled here, so the `None` path
+/// would fall back to `@localhost`); anchoring the id to the sending domain
+/// keeps it RFC 5322 valid and deliverable. Google Workspace bounces messages
+/// that carry no `Message-ID` at all (PMS-624).
+fn new_message_id(from: &Mailbox) -> String {
+    format!("<{}@{}>", Uuid::new_v4(), from.email.domain())
+}
+
+/// Build the shared header skeleton (`From`, `To`, `Message-ID`) for an
+/// outbound message. Kept as a free function so it is unit-testable without
+/// constructing an `SmtpMailer` (whose pooled transport needs a Tokio
+/// runtime).
+fn base_builder(from: &Mailbox, to: Mailbox) -> MessageBuilder {
+    Message::builder()
+        .from(from.clone())
+        .to(to)
+        .message_id(Some(new_message_id(from)))
 }
 
 #[async_trait]
@@ -162,9 +192,8 @@ impl Mailer for SmtpMailer {
 </body></html>"#,
         );
 
-        let msg = Message::builder()
-            .from(self.from.clone())
-            .to(to_mailbox)
+        let msg = self
+            .base_builder(to_mailbox)
             .subject("Reset your Mokosh password")
             .multipart(MultiPart::alternative_plain_html(text, html))?;
 
@@ -197,9 +226,8 @@ impl Mailer for SmtpMailer {
 </body></html>"#,
         );
 
-        let msg = Message::builder()
-            .from(self.from.clone())
-            .to(to_mailbox)
+        let msg = self
+            .base_builder(to_mailbox)
             .subject("Welcome to Mokosh")
             .multipart(MultiPart::alternative_plain_html(text, html))?;
 
@@ -211,9 +239,8 @@ impl Mailer for SmtpMailer {
         let to_mailbox: Mailbox = to
             .parse()
             .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
-        let msg = Message::builder()
-            .from(self.from.clone())
-            .to(to_mailbox)
+        let msg = self
+            .base_builder(to_mailbox)
             .subject(subject.to_string())
             .body(body.to_string())?;
         self.transport.send(msg).await?;
@@ -289,5 +316,55 @@ impl MailerConfig {
             from,
         )?;
         Ok(Arc::new(mailer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_from() -> Mailbox {
+        "Mokosh <noreply@mokosh.example>".parse().unwrap()
+    }
+
+    #[test]
+    fn new_message_id_is_unique_and_anchored_to_from_domain() {
+        let from = test_from();
+        let a = new_message_id(&from);
+        let b = new_message_id(&from);
+
+        assert_ne!(a, b, "each Message-ID must be unique");
+        assert!(
+            a.starts_with('<') && a.ends_with('>'),
+            "must be angle-bracketed: {a}"
+        );
+        assert!(
+            a.ends_with("@mokosh.example>"),
+            "domain must match the From address: {a}"
+        );
+    }
+
+    /// PMS-624: every outbound message must carry a `Message-ID` (Google
+    /// Workspace bounces messages that lack one). Every send path funnels
+    /// through `base_builder`, so asserting its output guards them all.
+    #[test]
+    fn base_builder_sets_message_id_and_date_headers() {
+        let to: Mailbox = "user@recipient.example".parse().unwrap();
+
+        let msg = base_builder(&test_from(), to)
+            .subject("Header check")
+            .body("body".to_string())
+            .unwrap();
+
+        let raw = String::from_utf8(msg.formatted()).unwrap();
+        assert!(
+            raw.contains("Message-ID: <"),
+            "missing Message-ID header:\n{raw}"
+        );
+        assert!(
+            raw.contains("@mokosh.example>"),
+            "Message-ID not anchored to the From domain:\n{raw}"
+        );
+        assert!(raw.contains("Date: "), "missing Date header:\n{raw}");
     }
 }

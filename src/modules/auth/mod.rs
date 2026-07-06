@@ -4,6 +4,10 @@
 
 #[cfg(feature = "server")]
 pub mod bootstrap;
+// PMS-591: receiver for Bunyip's `account_deleted` webhook. Wired outside
+// the JWT auth chain in `create_api_router`.
+#[cfg(feature = "server")]
+pub mod bunyip_webhook;
 #[cfg(feature = "server")]
 pub mod google_login;
 #[cfg(feature = "server")]

@@ -10,6 +10,8 @@ mod middleware;
 pub mod qa;
 #[cfg(feature = "server")]
 mod service;
+#[cfg(feature = "server")]
+pub mod showcase;
 
 #[cfg(feature = "server")]
 pub use middleware::{seed_middleware, SeedMiddlewareState};
@@ -17,3 +19,7 @@ pub use middleware::{seed_middleware, SeedMiddlewareState};
 pub use qa::{confirm_qa_tenant, qa_seed, qa_teardown, QaReport};
 #[cfg(feature = "server")]
 pub use service::SeedService;
+#[cfg(feature = "server")]
+pub use showcase::{
+    confirm_showcase_tenant, showcase_refresh, showcase_seed, showcase_teardown, ShowcaseReport,
+};
