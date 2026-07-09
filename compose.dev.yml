@@ -325,6 +325,13 @@ services:
       # cannot find the file, and fails the workspace compile.
       - ./build.rs:/app/build.rs
       - ./migrations:/app/migrations
+      # PMS-640: mount the integration tests so `just pre-commit`'s
+      # `cargo {check,clippy} --all-targets` inside this container compiles the
+      # tests/*.rs binaries. Without this the container never sees tests/, so a
+      # harness-breaking signature change (e.g. create_api_router) passed the
+      # local hook and only failed in CI. `tests/` is compile-only here (the
+      # Postgres-backed run stays in `just test-integration`).
+      - ./tests:/app/tests
       - server-target:/app/target
     depends_on:
       postgres:

@@ -21,8 +21,11 @@ install-hooks:
     print $"Wrote ($hook) -> just pre-commit"
 
 # Mirrors check.yml one-to-one so a green hook means a green Check run. The
-# Postgres-backed suite is NOT run here; use `just test-integration` (mirrors
-# integration.yml) for that. PMS-267.
+# `--all-targets` clippy/check steps compile the tests/*.rs integration binaries
+# too (PMS-640 mounts ./tests into the `server` service), so a harness-breaking
+# signature change fails here rather than only in CI. The Postgres-backed suite
+# is still NOT run here (compile-only); use `just test-integration` (mirrors
+# integration.yml) to actually run it. PMS-267.
 # Run the fast, database-free checks inside the dev compose `server` container.
 [group: 'hooks']
 pre-commit: ensure-env
