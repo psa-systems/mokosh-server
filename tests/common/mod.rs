@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use mokosh_server::api::create_api_router;
-use mokosh_server::utils::email::{LogMailer, Mailer};
+use mokosh_server::utils::email::{LogMailer, SharedMailer};
 use mokosh_server::Database;
 use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
@@ -196,7 +196,9 @@ async fn boot_with_db(pool: PgPool, db: Database, app_pool: Option<PgPool>) -> T
         .expect("build stub google_oauth client"),
     );
 
-    let mailer: Arc<dyn Mailer> = Arc::new(LogMailer);
+    // create_api_router now takes the swappable handle (PMS-638); wrap the
+    // test LogMailer so the signature matches. Tests never swap it.
+    let mailer = Arc::new(SharedMailer::new(Arc::new(LogMailer)));
     let encryption_key = [0u8; 32];
 
     let router = create_api_router(

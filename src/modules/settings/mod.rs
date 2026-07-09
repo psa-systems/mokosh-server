@@ -1,5 +1,6 @@
 //! Settings module: tenant settings + per-module config.
 
+pub mod email;
 pub mod models;
 pub mod routes;
 pub mod service;

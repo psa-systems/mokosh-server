@@ -11,17 +11,36 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::SettingsService;
+use crate::db::Database;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
+use crate::utils::email::SharedMailer;
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct SettingsRouterState {
     pub service: Arc<SettingsService>,
+    // PMS-638: the typed email-settings endpoint needs raw DB access (the
+    // config lives on the system tenant, encrypted), the AES-256-GCM key to
+    // en/decrypt the SMTP password, and the live mailer handle to hot-swap
+    // after a change.
+    pub db: Database,
+    pub enc_key: [u8; 32],
+    pub shared_mailer: Arc<SharedMailer>,
 }
 
-pub fn settings_routes(service: Arc<SettingsService>) -> Router {
-    let state = SettingsRouterState { service };
+pub fn settings_routes(
+    service: Arc<SettingsService>,
+    db: Database,
+    enc_key: [u8; 32],
+    shared_mailer: Arc<SharedMailer>,
+) -> Router {
+    let state = SettingsRouterState {
+        service,
+        db,
+        enc_key,
+        shared_mailer,
+    };
     Router::new()
         // PMS-115 tenant settings list (paginated across categories).
         // The PMS-113 PR added `/settings/{category}` for category
@@ -40,6 +59,10 @@ pub fn settings_routes(service: Arc<SettingsService>) -> Router {
             "/settings/modules/{module}",
             get(get_module_config).put(upsert_module_config),
         )
+        // PMS-638: typed email settings (system-tenant config, encrypted SMTP
+        // password, live mailer swap on write). A literal route registered
+        // before `/settings/{category}` so it wins over the generic matcher.
+        .route("/settings/email", get(get_email).put(put_email))
         // PMS-113 AC1: category- and per-key tenant_settings endpoints.
         // Placed AFTER /settings/modules so the literal "modules"
         // segment matches the module routes first and only a non-
@@ -52,6 +75,27 @@ pub fn settings_routes(service: Arc<SettingsService>) -> Router {
                 .delete(delete_setting_by_key),
         )
         .with_state(state)
+}
+
+/// PMS-638: read the deployment-wide email settings (admin only). The SMTP
+/// password is never returned, only whether one is set.
+async fn get_email(
+    State(s): State<SettingsRouterState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<super::email::EmailSettingsView>> {
+    Ok(Json(super::email::get_email_settings(&s.db).await?))
+}
+
+/// PMS-638: write the deployment-wide email settings (admin only), then rebuild
+/// and hot-swap the live mailer so the change takes effect without a restart.
+async fn put_email(
+    State(s): State<SettingsRouterState>,
+    _admin: RequireAdmin,
+    Json(input): Json<super::email::EmailSettingsInput>,
+) -> AppResult<Json<super::email::EmailSettingsView>> {
+    let view = super::email::put_email_settings(&s.db, &s.enc_key, input).await?;
+    super::email::rebuild_and_swap(&s.db, &s.enc_key, &s.shared_mailer).await?;
+    Ok(Json(view))
 }
 
 async fn list_settings(

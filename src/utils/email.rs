@@ -87,7 +87,7 @@ pub enum SmtpTls {
 }
 
 impl SmtpTls {
-    fn parse(raw: &str) -> AppResult<Self> {
+    pub fn parse(raw: &str) -> AppResult<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "implicit" | "tls" | "smtps" => Ok(Self::Implicit),
             "starttls" | "" => Ok(Self::Starttls),
@@ -95,6 +95,16 @@ impl SmtpTls {
             other => Err(AppError::Configuration(format!(
                 "SMTP_TLS={other:?} invalid; expected implicit | starttls | none"
             ))),
+        }
+    }
+
+    /// Canonical lowercase name that round-trips through [`SmtpTls::parse`].
+    /// Used when persisting the TLS mode into DB-backed email settings.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Implicit => "implicit",
+            Self::Starttls => "starttls",
+            Self::None => "none",
         }
     }
 }
@@ -319,6 +329,55 @@ impl MailerConfig {
     }
 }
 
+/// Live-swappable [`Mailer`] handle. Wraps the active mailer behind a
+/// [`std::sync::RwLock`] so a settings change can rebuild and swap it in place
+/// (PMS-638). Every consumer keeps holding an `Arc<dyn Mailer>` (this type,
+/// upcast) and picks up the new configuration on its next send; `main` builds
+/// one at startup and distributes clones, while the admin email-settings
+/// handler holds the concrete `Arc<SharedMailer>` and calls [`SharedMailer::swap`].
+/// The lock is only ever held long enough to clone the inner `Arc` out, never
+/// across an `.await`.
+pub struct SharedMailer {
+    inner: std::sync::RwLock<Arc<dyn Mailer>>,
+}
+
+impl SharedMailer {
+    pub fn new(inner: Arc<dyn Mailer>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(inner),
+        }
+    }
+
+    /// Replace the active mailer. Takes effect on every consumer's next send.
+    pub fn swap(&self, inner: Arc<dyn Mailer>) {
+        *self.inner.write().expect("SharedMailer lock poisoned") = inner;
+    }
+
+    fn current(&self) -> Arc<dyn Mailer> {
+        self.inner
+            .read()
+            .expect("SharedMailer lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Mailer for SharedMailer {
+    async fn send_password_reset(&self, to: &str, reset_link: &str) -> AppResult<()> {
+        self.current().send_password_reset(to, reset_link).await
+    }
+
+    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()> {
+        self.current()
+            .send_welcome(to, display_name, setup_link)
+            .await
+    }
+
+    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
+        self.current().send_text(to, subject, body).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +425,53 @@ mod tests {
             "Message-ID not anchored to the From domain:\n{raw}"
         );
         assert!(raw.contains("Date: "), "missing Date header:\n{raw}");
+    }
+
+    #[test]
+    fn smtp_tls_round_trips_through_parse() {
+        for mode in [SmtpTls::Implicit, SmtpTls::Starttls, SmtpTls::None] {
+            let reparsed = SmtpTls::parse(mode.as_str()).unwrap();
+            assert_eq!(reparsed.as_str(), mode.as_str());
+        }
+    }
+
+    /// PMS-638: swapping the inner mailer must redirect subsequent sends to the
+    /// new instance for every consumer holding the shared handle.
+    #[tokio::test]
+    async fn shared_mailer_swaps_the_active_mailer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl Mailer for Counting {
+            async fn send_password_reset(&self, _to: &str, _link: &str) -> AppResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn send_welcome(&self, _t: &str, _n: &str, _l: &str) -> AppResult<()> {
+                Ok(())
+            }
+            async fn send_text(&self, _t: &str, _s: &str, _b: &str) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let shared = SharedMailer::new(Arc::new(Counting(first.clone())));
+
+        shared.send_password_reset("x@y.z", "link").await.unwrap();
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+
+        shared.swap(Arc::new(Counting(second.clone())));
+        shared.send_password_reset("x@y.z", "link").await.unwrap();
+        assert_eq!(first.load(Ordering::SeqCst), 1, "old mailer no longer used");
+        assert_eq!(
+            second.load(Ordering::SeqCst),
+            1,
+            "new mailer receives the send"
+        );
     }
 }
