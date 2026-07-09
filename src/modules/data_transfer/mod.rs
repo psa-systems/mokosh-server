@@ -373,6 +373,43 @@ async fn import_tenant_data(
     .await?;
     let order = topo_order(&load_tables, &edges);
 
+    // Break `tenants` -> load-table references before the wipe. `tenants` is
+    // not a tenant-scoped table (so it is neither exported nor wiped), but it
+    // keeps a RESTRICT reference into a table we are about to delete
+    // (tenants.own_company_id -> companies). NULL those columns on this tenant's
+    // row first and remember the old ids so they can be restored to the remapped
+    // values after the load.
+    let load_set: std::collections::HashSet<&str> =
+        load_tables.iter().map(String::as_str).collect();
+    let tenant_fk_cols: Vec<(String, String)> = sqlx::query_as(
+        "SELECT att.attname::text, ref.relname::text
+         FROM pg_constraint c
+         JOIN pg_class t ON t.oid = c.conrelid AND t.relname = 'tenants'
+         JOIN pg_class ref ON ref.oid = c.confrelid
+         JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = ANY(c.conkey)
+         WHERE c.contype = 'f' AND t.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut tenant_fk_restore: Vec<(String, Uuid)> = Vec::new();
+    for (col, ref_table) in &tenant_fk_cols {
+        if !load_set.contains(ref_table.as_str()) || !is_safe_identifier(col) {
+            continue;
+        }
+        let old: Option<Uuid> =
+            sqlx::query_scalar(&format!("SELECT {col} FROM tenants WHERE id = $1"))
+                .bind(tenant)
+                .fetch_one(&mut *tx)
+                .await?;
+        if let Some(old) = old {
+            tenant_fk_restore.push((col.clone(), old));
+        }
+        sqlx::query(&format!("UPDATE tenants SET {col} = NULL WHERE id = $1"))
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await?;
+    }
+
     // Wipe children-before-parents.
     for table in order.iter().rev() {
         let sql = format!("DELETE FROM {table} WHERE tenant_id = $1");
@@ -404,6 +441,17 @@ async fn import_tenant_data(
                 .await?;
         }
         summary.insert(table.clone(), Value::from(count as u64));
+    }
+
+    // Restore the tenants -> load-table references to the remapped ids.
+    for (col, old) in &tenant_fk_restore {
+        if let Some(new) = id_map.get(old) {
+            sqlx::query(&format!("UPDATE tenants SET {col} = $1 WHERE id = $2"))
+                .bind(new)
+                .bind(tenant)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
 
     audit_write(
