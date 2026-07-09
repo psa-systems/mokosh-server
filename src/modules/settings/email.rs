@@ -112,34 +112,48 @@ async fn load_stored(db: &Database) -> AppResult<Option<StoredEmailConfig>> {
     }
 }
 
-/// Resolve the effective mailer config: env baseline ([`MailerConfig::from_env`])
-/// overridden by any field present in the DB system row. Called at boot and
-/// whenever the settings change. No DB row => identical to `from_env()`.
-pub async fn resolve_mailer_config(db: &Database, enc_key: &[u8; 32]) -> AppResult<MailerConfig> {
+/// Build the effective [`MailerConfig`] from the env baseline overridden by a
+/// stored config object. Mirrors `from_env`'s invariant that a username with no
+/// password is a hard error (an unauthenticated SMTP send is a misconfiguration,
+/// not a silent fallback) - the override path must not weaken it.
+fn config_from_stored(stored: &StoredEmailConfig, enc_key: &[u8; 32]) -> AppResult<MailerConfig> {
     let mut cfg = MailerConfig::from_env()?;
-    let Some(stored) = load_stored(db).await? else {
-        return Ok(cfg);
-    };
-
-    if let Some(host) = stored.host.filter(|s| !s.is_empty()) {
-        cfg.host = Some(host);
+    if let Some(host) = stored.host.as_deref().filter(|s| !s.is_empty()) {
+        cfg.host = Some(host.to_string());
     }
     if let Some(port) = stored.port {
         cfg.port = port;
     }
-    if let Some(username) = stored.username.filter(|s| !s.is_empty()) {
-        cfg.username = Some(username);
+    if let Some(username) = stored.username.as_deref().filter(|s| !s.is_empty()) {
+        cfg.username = Some(username.to_string());
     }
-    if let Some(from) = stored.from.filter(|s| !s.is_empty()) {
-        cfg.from = from;
+    if let Some(from) = stored.from.as_deref().filter(|s| !s.is_empty()) {
+        cfg.from = from.to_string();
     }
-    if let Some(tls) = stored.tls {
-        cfg.tls = SmtpTls::parse(&tls)?;
+    if let Some(tls) = stored.tls.as_deref().filter(|s| !s.is_empty()) {
+        cfg.tls = SmtpTls::parse(tls)?;
     }
-    if let Some(enc) = stored.password_encrypted.filter(|s| !s.is_empty()) {
-        cfg.password = Some(SecretString::from(crypto::decrypt(&enc, enc_key)?));
+    if let Some(enc) = stored
+        .password_encrypted
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        cfg.password = Some(SecretString::from(crypto::decrypt(enc, enc_key)?));
+    }
+    if cfg.username.is_some() && cfg.password.is_none() {
+        return Err(AppError::Configuration(
+            "email settings set a username but no password; SMTP auth needs both".to_string(),
+        ));
     }
     Ok(cfg)
+}
+
+/// Resolve the effective mailer config: env baseline ([`MailerConfig::from_env`])
+/// overridden by any field present in the DB system row. Called at boot and
+/// whenever the settings change. No DB row => identical to `from_env()`.
+pub async fn resolve_mailer_config(db: &Database, enc_key: &[u8; 32]) -> AppResult<MailerConfig> {
+    let stored = load_stored(db).await?.unwrap_or_default();
+    config_from_stored(&stored, enc_key)
 }
 
 /// Rebuild the mailer from current settings and swap it into the shared handle,
@@ -202,6 +216,13 @@ pub async fn put_email_settings(
             Some(crypto::encrypt(&password, enc_key)?)
         };
     }
+
+    // Prove the FULL effective config builds a mailer BEFORE persisting it.
+    // Otherwise a bad value (an unparseable host, or a username with no
+    // password) would be saved and then panic the next boot, where
+    // `resolve_mailer_config(..).build()` is `.expect`-ed in main. Building is
+    // cheap (no network) and rejects the write with the underlying error.
+    config_from_stored(&stored, enc_key)?.build()?;
 
     let value = serde_json::to_value(&stored)
         .map_err(|e| AppError::Internal(format!("failed to serialise email config: {e}")))?;
