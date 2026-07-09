@@ -223,12 +223,22 @@ setup('capture bearer from the SPA login', async ({ page }) => {
     const meRes = await apiCtx.put(routes.authMe, {
       data: { first_name: 'E2E', last_name: 'Tester' },
     });
-    if (!meRes.ok()) {
-      throw new Error(
-        `PMS-641: onboarding PUT ${routes.authMe} failed: ${meRes.status()} ${await meRes.text()}`,
+    // PMS-645: best-effort, NOT fatal. A failed setup project makes Playwright
+    // SKIP every dependent spec (including the ~23 API specs that need no
+    // onboarding), and reports the browser specs as "did not run" instead of
+    // letting them fail with the /onboarding/profile bounce that is the real
+    // signal. So on a non-OK response, warn loudly and continue: API coverage
+    // survives and a genuine onboarding failure still surfaces as the browser
+    // bounce.
+    if (meRes.ok()) {
+      console.log('[setup] ensured E2E account profile is complete (PMS-641)');
+    } else {
+      console.error(
+        `[setup] WARNING: onboarding PUT ${routes.authMe} returned ${meRes.status()}: ` +
+          `${await meRes.text()}. The E2E account may still be bounced to ` +
+          `/onboarding/profile; the browser specs will surface it (PMS-645).`,
       );
     }
-    console.log('[setup] ensured E2E account profile is complete (PMS-641)');
   } finally {
     await apiCtx.dispose();
   }
