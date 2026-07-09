@@ -65,7 +65,10 @@ pub fn create_api_router(
     super_admin_emails: Vec<String>,
     cookie_secure: bool,
     bunyip_verifier: Option<crate::modules::auth::oidc_rs::Verifier>,
-    mailer: Arc<dyn crate::utils::email::Mailer>,
+    // PMS-638: the live, swappable mailer handle. Upcast to `Arc<dyn Mailer>`
+    // for the services below; the concrete handle is threaded into
+    // `settings_routes` so the admin email-settings endpoint can hot-swap it.
+    shared_mailer: Arc<crate::utils::email::SharedMailer>,
     // 32-byte AES-256-GCM key. Used for at-rest encryption of any
     // per-tenant secret material (today: payment-gateway configs).
     encryption_key: [u8; 32],
@@ -82,6 +85,8 @@ pub fn create_api_router(
             })
         })
         .collect();
+    let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
+
     // Create services. NotificationsService is constructed first so a
     // shared clone can be threaded into AuthService and TicketService,
     // letting them dispatch transactional messages (password reset,
@@ -316,7 +321,12 @@ pub fn create_api_router(
         // pending queue, decide, cancel).
         .merge(approval_routes(approvals_service))
         // Settings: tenant settings + module configs. PMS-114.
-        .merge(settings_routes(settings_service.clone()))
+        .merge(settings_routes(
+            settings_service.clone(),
+            db.clone(),
+            encryption_key,
+            shared_mailer.clone(),
+        ))
         // Audit log read. PMS-118.
         .merge(audit_routes(audit_service))
         // PMS-275: the coarse per-request audit middleware (PMS-119) was

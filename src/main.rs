@@ -333,16 +333,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cookie is not exposed over a downgraded connection.
     let cookie_secure = !config.is_dev_or_test();
 
-    // Build the host-crate mailer (SmtpMailer when SMTP_HOST is set,
-    // LogMailer otherwise). Hard-fail on misconfiguration so an
-    // operator does not learn at 3am that SMTP_USERNAME without
-    // SMTP_PASSWORD silently degraded to LogMailer.
-    let mailer = mokosh_server::utils::email::MailerConfig::from_env()
-        .and_then(|c| c.build())
-        .expect("Failed to build Mailer from SMTP_* env (see .env.example)");
-
     let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
         .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
+
+    // Build the host-crate mailer. PMS-638: the config resolves from the
+    // DB-backed system email setting when present, otherwise the SMTP_* env
+    // vars (the unchanged fallback). Wrapped in a `SharedMailer` so the admin
+    // email-settings endpoint can rebuild and swap it live. Hard-fail on
+    // misconfiguration so an operator does not learn at 3am that a bad config
+    // silently degraded to LogMailer.
+    let initial_mailer =
+        mokosh_server::modules::settings::email::resolve_mailer_config(&db, &encryption_key)
+            .await
+            .and_then(|c| c.build())
+            .expect("Failed to build Mailer from DB settings / SMTP_* env (see .env.example)");
+    let shared_mailer = std::sync::Arc::new(mokosh_server::utils::email::SharedMailer::new(
+        initial_mailer,
+    ));
+    let mailer: std::sync::Arc<dyn mokosh_server::utils::email::Mailer> = shared_mailer.clone();
 
     // Bunyip-as-OP Resource-Server verifier. Initialised when OIDC_ISSUER +
     // OIDC_AUDIENCE are set; otherwise the middleware falls back to the legacy
@@ -496,7 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.oauth_super_admin_emails,
         cookie_secure,
         bunyip_verifier,
-        mailer,
+        shared_mailer,
         encryption_key,
         config.bunyip_webhook_secret.into_bytes(),
     );
