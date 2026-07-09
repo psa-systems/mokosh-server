@@ -1,8 +1,14 @@
-import { expect, test as setup, type Response as PwResponse } from '@playwright/test';
+import {
+  expect,
+  request as requestFactory,
+  test as setup,
+  type Response as PwResponse,
+} from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { dirname } from 'node:path';
+import { routes } from '../lib/api';
 import { FOREIGN_COMPANY_FILE, OP_STORAGE_STATE_FILE, TOKEN_FILE } from '../lib/auth-state';
 import { env } from '../lib/env';
 import { loginViaSpa } from '../lib/login';
@@ -198,6 +204,34 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   console.log(`[setup] captured bearer from ${tokenSourceUrl}`);
   mkdirSync(dirname(TOKEN_FILE), { recursive: true });
   writeFileSync(TOKEN_FILE, token!);
+
+  // PMS-641: onboard the E2E fixture account. Bunyip's userinfo for the E2E
+  // user carries no given_name/family_name, so JIT provisioning
+  // (auth::service upsert_user_from_oidc) leaves profile_completed_at NULL and
+  // the mokosh-apps AuthGuard bounces every login to /onboarding/profile before
+  // a deep link (e.g. /tickets/new) can render - which broke form-validation on
+  // firefox/webkit. Stamp the profile once via PUT /me; the server COALESCEs
+  // profile_completed_at, so this is idempotent (only the first run sets it) and
+  // makes profile_completed=true for every subsequent spec. Uses the API host +
+  // the just-captured bearer directly, because the shared authed `request`
+  // fixture reads token.txt, which is only written on the line above.
+  const apiCtx = await requestFactory.newContext({
+    baseURL: env.apiBaseURL,
+    extraHTTPHeaders: { Authorization: `Bearer ${token!}` },
+  });
+  try {
+    const meRes = await apiCtx.put(routes.authMe, {
+      data: { first_name: 'E2E', last_name: 'Tester' },
+    });
+    if (!meRes.ok()) {
+      throw new Error(
+        `PMS-641: onboarding PUT ${routes.authMe} failed: ${meRes.status()} ${await meRes.text()}`,
+      );
+    }
+    console.log('[setup] ensured E2E account profile is complete (PMS-641)');
+  } finally {
+    await apiCtx.dispose();
+  }
 
   // Persist the cross-tenant company canary fixture so contacts.spec.ts runs
   // unconditionally instead of skipping. When the operator pinned a real
