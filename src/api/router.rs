@@ -329,6 +329,10 @@ pub fn create_api_router(
         ))
         // Audit log read. PMS-118.
         .merge(audit_routes(audit_service))
+        // PMS-647: admin-only tenant data export (first slice of PMS-646).
+        .merge(crate::modules::data_transfer::data_transfer_routes(
+            db.clone(),
+        ))
         // PMS-275: the coarse per-request audit middleware (PMS-119) was
         // removed. It ran post-response with only the HTTP method + URL, so it
         // could never populate `entity_id` or the old/new value payload, and
