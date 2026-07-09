@@ -9,8 +9,17 @@
 //! migrations add them; a new secrets-only table must be added to the exclude
 //! set. The sibling import issue consumes this envelope.
 
-use axum::{extract::State, response::Response, routing::get, Router};
+use std::collections::HashMap;
+
+use axum::{
+    extract::{DefaultBodyLimit, State},
+    response::Response,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -65,6 +74,10 @@ pub struct DataTransferState {
 pub fn data_transfer_routes(db: Database) -> Router {
     Router::new()
         .route("/data/export", get(export_tenant_data))
+        .route(
+            "/data/import",
+            post(import_tenant_data).layer(DefaultBodyLimit::max(IMPORT_MAX_BYTES)),
+        )
         .with_state(DataTransferState { db })
 }
 
@@ -166,6 +179,137 @@ async fn export_tenant_data(
         .map_err(|e| AppError::Internal(format!("failed to build export response: {e}")))
 }
 
+/// 25 MB cap on the uploaded import envelope. Sync import for now; a larger
+/// tenant is a background-job follow-up (PMS-646). Enforced as an axum body
+/// limit, so an over-size upload gets a 413 before the handler runs.
+const IMPORT_MAX_BYTES: usize = 25 * 1024 * 1024;
+
+/// `POST /api/v1/data/import` request: the export envelope plus a destructive-
+/// action confirmation that must equal the target tenant's name.
+#[derive(Deserialize)]
+struct ImportRequest {
+    confirm: String,
+    export: ImportEnvelope,
+}
+
+/// The subset of the export envelope import needs: the schema version and the
+/// per-table row arrays. Other envelope fields (excluded_tables, notes, ...)
+/// are informational and ignored on import.
+#[derive(Deserialize)]
+struct ImportEnvelope {
+    schema_version: i32,
+    entities: Map<String, Value>,
+}
+
+/// Assign a fresh id for every row across all entity tables, keyed by its old
+/// id, so primary keys and FK references can be remapped consistently. Rows
+/// without a parseable string `id` are skipped (nothing can reference them by
+/// id). Pure - unit-tested without a database.
+fn build_id_map(entities: &Map<String, Value>) -> HashMap<Uuid, Uuid> {
+    let mut map = HashMap::new();
+    for rows in entities.values() {
+        let Some(arr) = rows.as_array() else { continue };
+        for row in arr {
+            if let Some(old) = row
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                map.entry(old).or_insert_with(Uuid::new_v4);
+            }
+        }
+    }
+    map
+}
+
+/// Rewrite one row for load into `target_tenant`: force `tenant_id`, and replace
+/// any UUID-valued field whose value is a known old id with its new id (remaps
+/// the primary key AND any FK reference into the imported set in one pass).
+/// Values not in the map are left unchanged here; dangling-FK / user-reference
+/// resolution needs catalog metadata and is applied during the load
+/// (PMS-648 commit 2). Pure - unit-tested without a database.
+fn remap_row(mut row: Value, id_map: &HashMap<Uuid, Uuid>, target_tenant: Uuid) -> Value {
+    if let Value::Object(obj) = &mut row {
+        for (key, val) in obj.iter_mut() {
+            if key == "tenant_id" {
+                *val = Value::String(target_tenant.to_string());
+                continue;
+            }
+            if let Some(new) = val
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .and_then(|u| id_map.get(&u))
+            {
+                *val = Value::String(new.to_string());
+            }
+        }
+    }
+    row
+}
+
+/// `POST /api/v1/data/import` - admin-only. COMMIT 1: validates the envelope,
+/// checks the tenant-name confirmation, and computes the id remap over every
+/// row (so a malformed file fails now), then returns a dry-run summary. The
+/// destructive wipe-and-replace load lands in commit 2 (PMS-648); this endpoint
+/// performs NO mutation yet.
+async fn import_tenant_data(
+    State(s): State<DataTransferState>,
+    RequireAuth(u): RequireAuth,
+    _admin: RequireAdmin,
+    Json(req): Json<ImportRequest>,
+) -> AppResult<Json<Value>> {
+    if req.export.schema_version != SCHEMA_VERSION {
+        return Err(AppError::BadRequest(format!(
+            "unsupported schema_version {} (expected {SCHEMA_VERSION})",
+            req.export.schema_version
+        )));
+    }
+
+    // Reject any table the current export set would not produce, so a stale or
+    // hand-edited file fails loudly instead of silently dropping/mis-loading.
+    for table in req.export.entities.keys() {
+        if !is_safe_identifier(table) || EXCLUDE_TABLES.contains(&table.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "envelope contains an unexpected table: {table}"
+            )));
+        }
+    }
+
+    let tenant = u.tenant();
+    let mut tx = s.db.begin_with_tenant(tenant).await?;
+    let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if req.confirm.trim() != tenant_name.trim() {
+        return Err(AppError::BadRequest(
+            "confirmation does not match the tenant name".to_string(),
+        ));
+    }
+
+    let id_map = build_id_map(&req.export.entities);
+    let mut would_import = Map::new();
+    for (table, rows) in &req.export.entities {
+        let arr = rows.as_array().ok_or_else(|| {
+            AppError::BadRequest(format!("entities.{table} must be an array of rows"))
+        })?;
+        // Exercise the remap so a malformed row is caught during validation.
+        for row in arr {
+            let _ = remap_row(row.clone(), &id_map, tenant.get());
+        }
+        would_import.insert(table.clone(), Value::from(arr.len() as u64));
+    }
+
+    Ok(Json(json!({
+        "status": "validated",
+        "note": "envelope validated and id-remap computed; the wipe-and-replace load is not yet implemented (PMS-648 commit 2). No data was changed.",
+        "confirmed_tenant": tenant_name,
+        "id_remap_count": id_map.len(),
+        "would_import": would_import,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +373,48 @@ mod tests {
         assert!(!is_safe_identifier("companies; drop table x"));
         assert!(!is_safe_identifier("Companies"));
         assert!(!is_safe_identifier(""));
+    }
+
+    #[test]
+    fn build_id_map_assigns_one_fresh_id_per_row_with_an_id() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let entities = json!({
+            "companies": [{ "id": a, "name": "Acme" }],
+            "contacts": [{ "id": b, "company_id": a }],
+            "no_id_rows": [{ "foo": "bar" }],
+        });
+        let map = build_id_map(entities.as_object().unwrap());
+        assert_eq!(map.len(), 2, "one entry per row that carries an id");
+        assert_ne!(map[&a], a, "id must be remapped to a fresh value");
+        assert_ne!(map[&a], map[&b]);
+    }
+
+    #[test]
+    fn remap_row_rewrites_pk_fk_and_tenant_but_not_unrelated_uuids() {
+        let old_company = Uuid::new_v4();
+        let old_contact = Uuid::new_v4();
+        let target_tenant = Uuid::new_v4();
+        let unrelated = Uuid::new_v4(); // a uuid NOT in the map
+        let new_company = Uuid::new_v4();
+        let new_contact = Uuid::new_v4();
+        let mut map = HashMap::new();
+        map.insert(old_company, new_company);
+        map.insert(old_contact, new_contact);
+
+        let row = json!({
+            "id": old_contact,          // pk -> remapped
+            "company_id": old_company,  // FK into the imported set -> remapped
+            "tenant_id": Uuid::new_v4(), // -> forced to target
+            "external_ref": unrelated,  // not in map -> unchanged
+            "name": "Jane",             // non-uuid -> unchanged
+        });
+        let out = remap_row(row, &map, target_tenant);
+        let o = out.as_object().unwrap();
+        assert_eq!(o["id"], json!(new_contact.to_string()));
+        assert_eq!(o["company_id"], json!(new_company.to_string()));
+        assert_eq!(o["tenant_id"], json!(target_tenant.to_string()));
+        assert_eq!(o["external_ref"], json!(unrelated.to_string()));
+        assert_eq!(o["name"], json!("Jane"));
     }
 }
