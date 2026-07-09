@@ -359,7 +359,7 @@ create-release bump: ensure-env
     # host cargo, so run the one cargo step in the dev `server` container.
     # `--workspace` limits the change to the workspace members' own versions - no
     # transitive dependency churn.
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo update --workspace
+    ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo update --workspace
     git add Cargo.toml Cargo.lock
     git commit --signoff --message $"Release ($tag)"
 
