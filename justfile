@@ -312,7 +312,7 @@ dev-clean-all: dev-clean
 # Create a release: bump major (vx.0.0), minor (v0.x.0), or hotfix (v0.0.x), push the branch, and open the PR via fj.
 # After the PR merges, the create-release workflow creates the tag and release automatically.
 [group: 'release']
-create-release bump:
+create-release bump: ensure-env
     #!/usr/bin/env nu
     let bump = "{{ bump }}"
 
@@ -353,7 +353,14 @@ create-release bump:
     let toml_tmp = (mktemp --tmpdir --suffix .toml)
     open Cargo.toml --raw | str replace --regex '(?m)^version = "[^"]*"' $'version = "($bare)"' | save --append $toml_tmp
     ^mv $toml_tmp Cargo.toml
-    git add Cargo.toml
+    # PMS-642: sync Cargo.lock to the bumped version so the lock never drifts
+    # from Cargo.toml (a --locked build otherwise fails, and every build
+    # re-dirties the lock, masking real lock changes in diffs). Dev boxes have no
+    # host cargo, so run the one cargo step in the dev `server` container.
+    # `--workspace` limits the change to the workspace members' own versions - no
+    # transitive dependency churn.
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo update --workspace
+    git add Cargo.toml Cargo.lock
     git commit --signoff --message $"Release ($tag)"
 
     # Push release branch
