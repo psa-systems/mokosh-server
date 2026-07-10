@@ -5,8 +5,9 @@
 //! tenant via `GET /api/v1/data/export`, imports the envelope back
 //! (wipe-and-replace) via `POST /api/v1/data/import`, and asserts the data is
 //! restored with REMAPPED ids - the contact's FK follows the company's new id,
-//! proving cross-table FK remap + topological load order over the full tenant
-//! dataset - and that no secret column leaked into the export. Runs against
+//! proving cross-table FK remap (over deferrable constraints, migration 088)
+//! over the full tenant dataset - and that no secret column leaked into the
+//! export. Runs against
 //! Postgres in CI (`integration.yml`); the local `--lib` pre-commit only
 //! compiles it. Uses unique names so it is robust to the tenant's pre-seeded
 //! sample rows (no exact-count assertions).
@@ -29,20 +30,12 @@ const SECRET_SUBSTRINGS: &[&str] = &[
     "private_key",
 ];
 
-// PMS-648: quarantined until the import handles the schema's FK cycles. Generic
-// wipe-and-replace over cyclic, non-deferrable, NOT-NULL foreign keys (e.g.
-// companies.primary_contact_id <-> contacts.company_id) cannot be ordered by a
-// topological sort; the real fix is a migration making the FKs DEFERRABLE plus
-// `SET CONSTRAINTS ALL DEFERRED` in the import transaction (which also removes
-// the topo-sort + tenants-FK-break workarounds). Run explicitly with
-// `--ignored` while iterating. See PMS-648.
-#[ignore = "PMS-648: import needs deferrable FK constraints to survive cyclic schema; WIP"]
 #[sqlx::test]
 async fn export_import_round_trip_remaps_ids_and_leaks_no_secrets(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
 
     // Uniquely-named company + a contact that FK-references it, so the round-trip
-    // exercises cross-table FK remapping + topological load order and the rows
+    // exercises cross-table FK remapping (over deferred constraints) and the rows
     // are findable amid the tenant's pre-seeded sample data.
     let marker = Uuid::new_v4().simple().to_string();
     let company_name = format!("rt-company-{marker}");
