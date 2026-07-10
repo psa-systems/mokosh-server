@@ -140,6 +140,14 @@ async fn export_tenant_data(
         included.push(table);
     }
 
+    // The tenant name is echoed into the envelope so a downstream orchestrator
+    // (e.g. Bunyip account restore) can supply it as the import `confirm` guard
+    // without a second round-trip. Read under the same tenant transaction.
+    let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_one(&mut *tx)
+        .await?;
+
     audit_write(
         &mut *tx,
         tenant,
@@ -156,6 +164,7 @@ async fn export_tenant_data(
     let envelope = json!({
         "schema_version": SCHEMA_VERSION,
         "tenant_id": tenant.get(),
+        "tenant_name": tenant_name,
         "included_tables": included,
         "excluded_tables": EXCLUDE_TABLES,
         "redacted_column_patterns": SECRET_COLUMN_SUBSTRINGS,
