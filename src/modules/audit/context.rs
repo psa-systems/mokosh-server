@@ -61,10 +61,18 @@ where
             .get::<AuthState>()
             .cloned()
             .unwrap_or_default();
-        let ip = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ci| ci.0.ip().to_string());
+        // PMS-587: mokosh runs behind Traefik, so the socket peer is the proxy.
+        // Resolve the real client IP from the forwarded header, trusting it only
+        // when the peer is a configured proxy so a spoofed header cannot poison
+        // the recorded address.
+        let ip = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|ci| {
+            crate::utils::client_ip::extract_client_ip(
+                ci.0.ip(),
+                &parts.headers,
+                crate::utils::client_ip::trusted_proxies(),
+            )
+            .to_string()
+        });
         let user_agent = parts
             .headers
             .get(axum::http::header::USER_AGENT)
