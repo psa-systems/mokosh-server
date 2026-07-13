@@ -156,7 +156,19 @@ jobs:
       # dispatch run the full suite (empty arg). Any need to exercise an
       # `@external` flow on prod requires David's sign-off and a manual run
       # without this flag - see e2e/README.md "Production-safe subset".
+      # PMS-656: skip (do not fail) when staging is not E2E-seeded. After a data
+      # wipe the shared bunyip E2E account can be gone, making every login fail
+      # and the suite hard-fail opaquely. This probes bunyip's GET /e2e-bootstrapped
+      # and, ONLY on an explicit {bootstrapped:false}, sets skip=true so the suite
+      # is skipped with a notice (the job stays green) instead of a misleading
+      # login failure. Any other outcome (endpoint absent on prod, error) runs it.
+      - name: Check staging is E2E-seeded
+        id: seeded
+        if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
+        run: node24 scripts/check-e2e-bootstrapped.mjs
+
       - name: Run E2E suite
+        if: steps.seeded.outputs.skip != 'true'
         run: bun x playwright test ${{ inputs.environment == 'production' && '--grep-invert @external' || '' }}
 
       - name: Upload Playwright report and traces
