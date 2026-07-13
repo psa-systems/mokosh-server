@@ -85,6 +85,14 @@ async fn export_import_round_trip_remaps_ids_and_leaks_no_secrets(pool: PgPool) 
     );
     let envelope: Value = export_res.json().await.expect("export json");
 
+    // The envelope carries the tenant name so an orchestrator can echo it back
+    // as the import `confirm` guard without a second round-trip.
+    assert_eq!(
+        envelope["tenant_name"],
+        json!(tenant_name),
+        "export envelope must include the tenant name"
+    );
+
     let entities = envelope["entities"].as_object().expect("entities object");
     // The seeded company + contact are present in the export.
     let has_company = entities["companies"]
