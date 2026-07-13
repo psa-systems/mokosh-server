@@ -103,56 +103,33 @@ is manual-dispatch only (see [CI](#ci)).
 
 Done once by a human before the suite can pass against a deployment:
 
-1. **E2E tenant** - create a dedicated tenant for E2E. Record its UUID as
-   `E2E_TENANT_ID`. All test records live here and are swept after each run.
-2. **E2E account** - create a user in that tenant with the **`admin`** role
-   (or `super_admin`). Admin is REQUIRED, not optional: the suite enables
-   tenant-gated modules via the admin-only `PUT /api/v1/settings/modules/{module}`
-   route, and many writes are gated by `RequireAdmin` / `RequireManager` /
-   `RequireFinance` (admin satisfies all three). A non-admin account passes only
-   the tickets / contacts / OIDC specs and 403s on everything else. Record
-   `E2E_EMAIL` / `E2E_PASSWORD`. Enable 2FA on the account and save the base32
-   secret (the string under the QR code at enrollment) as `E2E_TOTP_SECRET` -
-   the setup test
-   computes the second factor at runtime.
+1. **E2E account** - a bunyip user (the OP owns identity). On staging it is
+   provisioned by bunyip's `bunyip-e2e-bootstrap` as `e2e-user@a8n.run` with a
+   preset password (docker repo: `just e2e-bootstrap`). Record `E2E_EMAIL` /
+   `E2E_PASSWORD`. If 2FA is enabled on the account, save its base32 secret as
+   `E2E_TOTP_SECRET` (the setup test computes the second factor at runtime); if
+   2FA is off, the login is password-only and the secret is unused.
+2. **E2E tenant** - do NOT pre-create one. On the account's first mokosh SSO
+   login, `place_bunyip_user` (`src/modules/auth/middleware.rs`) JIT-creates the
+   mokosh `users` row in an auto-provisioned **personal tenant** and sets its role
+   to **`admin`** automatically: MAPPS-330 floors every Mokosh user to admin of
+   its own instance (`effective_role_from_bunyip`), so there is NO manual
+   elevation step. Admin is required by the suite (it enables tenant-gated modules
+   via the admin-only `PUT /api/v1/settings/modules/{module}` route, and many
+   writes are gated by `RequireAdmin` / `RequireManager` / `RequireFinance`); the
+   JIT default satisfies it. After that first login, read the tenant UUID and
+   record it as `E2E_TENANT_ID`:
 
-   **Where the role lives, and how to set it.** The E2E account signs in
-   through the bunyip SSO, so it reaches mokosh on the bunyip Resource-Server
-   path (`ensure_user_from_bunyip`, `src/modules/auth/middleware.rs`). That path
-   resolves the request's role from the mokosh `users` table row
-   (`get_user_by_id(...).role`), NOT from the access token - the bunyip token
-   only carries `sub` + email. On first login the row is auto-created by
-   `upsert_user_from_oidc(...)` with the schema default `role = 'technician'`
-   (`migrations/003_auth.sql`), which is non-admin. So "make the account admin"
-   means flipping that row's `role` to `admin`. Valid values:
-   `super_admin, admin, manager, technician, dispatcher, sales, finance`.
+   ```sql
+   SELECT id, role, tenant_id FROM users WHERE email = '<E2E_EMAIL>';
+   -- role is already 'admin'; tenant_id is the personal tenant to record
+   ```
 
-   The role is re-read from the row on every request, so the change takes effect
-   on the next call (no re-login needed). Two ways to set it:
-
-   - **Direct DB on the staging mokosh Postgres** (simplest, avoids the
-     chicken-and-egg below):
-
-     ```sql
-     -- confirm the row first
-     SELECT id, email, role, tenant_id FROM users WHERE email = '<E2E_EMAIL>';
-     -- elevate
-     UPDATE users SET role = 'admin' WHERE email = '<E2E_EMAIL>';
-     ```
-
-   - **Admin API**, if an admin/super_admin already exists: as that admin,
-     `PUT /api/v1/users/{e2e_user_id}` with body `{"role":"admin"}`
-     (`update_user`; rejects non-admin callers). `e2e_user_id` is the bunyip
-     `sub` UUID, which is the mokosh `users.id`; list it via
-     `GET /api/v1/users` as the admin.
-
-   **Bootstrapping the first admin.** If no admin exists yet, an account whose
-   email is in the `OAUTH_SUPER_ADMIN_EMAILS` env and that signs in via the
-   **Google** path is auto-provisioned as `super_admin`
-   (`provision_user_from_google`). That account can then elevate others via the
-   Admin API above. This allowlist only applies to the Google login path, not
-   the bunyip SSO path the E2E account uses, so it cannot elevate the E2E
-   account directly - use the DB update for that.
+   The role lives in the mokosh `users` row (resolved per request from
+   `get_user_by_id(...).role`, NOT from the bunyip token, which carries only
+   `sub` + email) and is re-read on every call. A wiped or re-seeded account
+   gets a NEW `sub` and therefore a NEW personal-tenant UUID, so `E2E_TENANT_ID`
+   must be re-captured after any re-seed.
 3. **OIDC client** - reuse the staging SPA public client (PKCE) or register a
    dedicated E2E client. Record `E2E_OIDC_CLIENT_ID` and a registered
    `E2E_OIDC_REDIRECT_URI`. If `/oauth2/authorize` redirects the E2E session to

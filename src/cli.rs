@@ -1,8 +1,9 @@
 //! Operator subcommands folded into the `mokosh-server` binary (PMS-494).
 //!
 //! Three operator features used to live only in the standalone
-//! `mokosh-bootstrap` binary (`src/bin/mokosh-bootstrap.rs`, removed in
-//! PMS-493). They are now reachable as `mokosh-server <subcommand>`:
+//! `mokosh-bootstrap` binary (`src/bin/mokosh-bootstrap.rs`). PMS-494 folded them
+//! into the main binary, so they are now reachable as `mokosh-server <subcommand>`
+//! (the standalone binary still exists and now carries only `bootstrap-infisical`):
 //!
 //! - `bootstrap-infisical`        - first-run setup of a fresh Infisical
 //!   instance (core logic in [`crate::infisical::run_dev_bootstrap`]).
