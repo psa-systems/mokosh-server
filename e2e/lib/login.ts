@@ -19,16 +19,50 @@ import { routes } from './api';
 // uses `/^\/login(\/|$)/` so multi-step flows count as IN /login and the
 // helper only returns once the hub has actually let us through.
 export async function loginViaSpa(page: Page): Promise<void> {
-  await page.goto('/login');
+  // The E2E account shares one email, and the bunyip hub rate-limits login at 5
+  // requests / 60s PER EMAIL (bunyip RateLimitConfig::LOGIN, checked BEFORE
+  // credential verification). The former helper retried the fill+submit up to 4x
+  // on ONE page load with no backoff, firing four login POSTs in seconds and
+  // blowing that window; the hub then re-rendered /login with a rate-limit banner
+  // for every further POST, which the loop misread as a form-re-render race and
+  // retried harder - a self-reinforcing failure that swallowed the hub's actual
+  // reason (PMS-654; the hub was verified frozen and healthy, not a regression).
+  // Instead: submit ONCE per attempt, read the hub's rendered error banner, and
+  // only retry after waiting out the interval the hub names on a rate-limit
+  // rejection. Fail fast, surfacing the banner text, on any other rejection so
+  // bad credentials or a stalled POST (PMS-148) are self-diagnosing in the log.
+  // Each attempt does a fresh `goto('/login')`, so the re-render race is still
+  // covered by a clean reload rather than a same-page re-POST burst.
+  const maxAttempts = 4;
+  for (let attempt = 1; ; attempt += 1) {
+    await page.goto('/login');
+    const outcome = await submitCredentialsOnce(page);
+    if (outcome === 'advanced') break;
 
-  await submitCredentials(page);
+    // Retry on a rate-limit rejection (after the named backoff) or on an unclear
+    // submit (no banner and no navigation: a stalled POST or a fill lost to a
+    // re-render), but never on a definite credential rejection.
+    const backoffMs = rateLimitBackoffMs(outcome);
+    const retryable = backoffMs !== null || outcome === null;
+    if (retryable && attempt < maxAttempts) {
+      if (backoffMs !== null) {
+        await page.waitForTimeout(backoffMs);
+      }
+      continue;
+    }
+    throw new Error(
+      'SPA login was rejected at the bunyip hub credentials step ' +
+        `(attempt ${attempt}/${maxAttempts}, path ${new URL(page.url()).pathname})` +
+        (outcome
+          ? `: "${outcome}"`
+          : ' - no error banner and no navigation; the submit may not have POSTed ' +
+            '(PMS-148) or the form was re-rendered out from under the fill.') +
+        ' See PMS-654.',
+    );
+  }
 
-  // Wait for the hub to land on the next page. /login/2fa is the expected
-  // step for an MFA-enabled account; anything else (success or error) flows
-  // through to the URL-out-of-/login poll below.
-  await page
-    .waitForURL(/\/login\/(2fa|mfa)(\/|$|\?)/, { timeout: 15_000 })
-    .catch(() => {});
+  // Credentials accepted. Enter the TOTP code if the hub advanced to the 2FA step
+  // for this MFA-enabled account.
   if (/^\/login\/(2fa|mfa)/.test(new URL(page.url()).pathname)) {
     await fillTotpStep(page);
   }
@@ -114,109 +148,122 @@ async function setInputValue(loc: Locator, value: string): Promise<void> {
   );
 }
 
-// Fill the bunyip hub's credential form and submit it, recovering from the
-// race where the server-rendered form re-renders (htmx / a redirect) between
-// `fill` and `click`. On chromium that race cleared the inputs, so the click
-// POSTed an EMPTY form; the hub rejected it and 302'd back to a fresh
-// `/login`, the SPA login never reached `/login/2fa`, and the helper polled a
-// never-submitted form until the 30s timeout (PMS-592, run 2871: `setup`
-// logged in fine on Desktop Chrome 2s earlier, then form-validation - same
-// helper, same engine - sat on a bare `/login`). firefox/webkit won the race
-// and passed. The guard: confirm the typed values survived right before
-// submitting, then confirm the credential step was actually consumed (the
-// password field leaves the DOM as the hub advances to 2FA / onward). If
-// either check fails, the form was re-rendered out from under us, so re-fill
-// the freshly-rendered form and submit again.
-//
-// PMS-595 (run 2874): the PMS-592 "verify the values stuck right before the
-// click" guard was still insufficient on chromium - the swap landed in the
-// window between the click and the POST being serialised, so the body still
-// went out empty and re-filling into a form that was mid-re-render lost the
-// next attempt the same way. Two changes close it: (1) let the form settle
-// before each fill (drain in-flight network from the hub's hydration / htmx
-// swap on a short budget, then give a synchronous client re-render a frame to
-// land) so we type into the form the hub will actually submit, not one a frame
-// from being replaced; and (2) treat the credential step as consumed on EITHER
-// the password field detaching OR the URL advancing into the 2FA step, since on
-// chromium the post-submit DOM teardown and the navigation do not always land
-// in the same order.
-async function submitCredentials(page: Page): Promise<void> {
-  const maxAttempts = 4;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const form = page.locator('form').first();
-    const email = form
-      .locator(
-        'input[data-testid="email"], input[type="email"], input[name="email"], input[autocomplete="username"]',
-      )
-      .first();
-    const password = form
-      .locator(
-        'input[data-testid="password"], input[type="password"], input[name="password"], input[autocomplete="current-password"]',
-      )
-      .first();
+// Fill the bunyip hub credential form and submit it ONCE, then classify what
+// happened: 'advanced' when the hub accepted the credentials and moved to the
+// 2FA step (or otherwise left the bare /login credentials page), the hub's
+// rendered error-banner text on a rejection (a rate-limit message or "The email
+// or password you entered is incorrect."), or null when neither a banner nor a
+// navigation appeared within the budget (a stalled POST / PMS-148, or a fill
+// lost to a re-render). The caller (loginViaSpa) decides whether to back off and
+// retry. Assumes the page is freshly on /login. Submitting once - rather than
+// re-POSTing up to 4x on the same page - is what keeps the login under the hub's
+// 5/min per-email rate limit (PMS-654).
+async function submitCredentialsOnce(page: Page): Promise<'advanced' | string | null> {
+  const form = page.locator('form[action="/login"]').first();
+  const email = form
+    .locator(
+      'input#email, input[data-testid="email"], input[type="email"], input[name="email"], input[autocomplete="username"]',
+    )
+    .first();
+  const password = form
+    .locator(
+      'input#password, input[data-testid="password"], input[type="password"], input[name="password"], input[autocomplete="current-password"]',
+    )
+    .first();
 
-    await email.waitFor({ state: 'visible', timeout: 15_000 });
+  await email.waitFor({ state: 'visible', timeout: 15_000 });
 
-    // Let the form settle before filling. The hub form is server-rendered and
-    // chromium re-renders it (hydration / htmx swap) shortly after it first
-    // paints and again after a rejected submit; filling a form a frame from
-    // being replaced loses the input. Drain in-flight network on a short budget
-    // (the swap's fetch), then give a synchronous client re-render a frame.
-    await page.waitForLoadState('networkidle', { timeout: 3_000 }).catch(() => {});
-    await page.waitForTimeout(300);
+  // Let the server-rendered form settle before filling (drain the hub's
+  // hydration / any htmx swap on a short budget, then give a synchronous
+  // re-render a frame) so we type into the form the hub will actually submit.
+  await page.waitForLoadState('networkidle', { timeout: 3_000 }).catch(() => {});
+  await page.waitForTimeout(300);
 
-    await setInputValue(email, env.email);
-    await setInputValue(password, env.password);
+  await setInputValue(email, env.email);
+  await setInputValue(password, env.password);
 
-    // A re-render between the fills and the click would silently clear the
-    // inputs; submitting then POSTs an empty form. Verify the values stuck
-    // before clicking, and if they did not, re-fill on the next iteration.
-    const stuck = await Promise.all([
-      expect(email).toHaveValue(env.email, { timeout: 2_000 }),
-      expect(password).toHaveValue(env.password, { timeout: 2_000 }),
-    ]).then(
-      () => true,
-      () => false,
-    );
-    if (!stuck) {
-      continue;
-    }
-
-    await form
-      .getByRole('button', { name: /sign ?in|log ?in|continue|submit/i })
-      .first()
-      .click();
-
-    // A successful submit takes the hub off the credentials step: the password
-    // field detaches (navigation to /login/2fa or onward) and the URL moves into
-    // the 2FA step. Accept EITHER signal - on chromium the post-submit DOM
-    // teardown and the navigation do not always land in the same order, and a
-    // transient empty re-render can briefly leave a visible password field while
-    // the navigation is already under way. `state: 'hidden'` resolves on both
-    // detach and invisibility, so it covers the navigate-away and the
-    // empty-re-render cases. If neither fires the submit was swallowed or the hub
-    // bounced back to a fresh credentials form, so retry the fill+submit; each
-    // boolean settles to `true` only on success and `false` only at its own
-    // timeout, so the race never resolves `false` early.
-    const advanced = await Promise.race([
-      password.waitFor({ state: 'hidden', timeout: 8_000 }).then(
-        () => true,
-        () => false,
-      ),
-      page.waitForURL(/\/login\/(2fa|mfa)(\/|$|\?)/, { timeout: 8_000 }).then(
-        () => true,
-        () => false,
-      ),
-    ]);
-    if (advanced) {
-      return;
-    }
-  }
-  throw new Error(
-    'SPA login could not get past the bunyip hub credentials step: the form ' +
-      'kept re-rendering with empty fields after submit (PMS-592). Check the ' +
-      'hub login markup / selectors in e2e/lib/login.ts.',
+  // A re-render between the fills and the click would silently clear the inputs
+  // and POST an empty form. If the values did not survive to just before the
+  // click, report an unclear submit (null) so the caller reloads and retries
+  // rather than POSTing blanks (which the hub would reject as bad credentials).
+  const stuck = await Promise.all([
+    expect(email).toHaveValue(env.email, { timeout: 2_000 }),
+    expect(password).toHaveValue(env.password, { timeout: 2_000 }),
+  ]).then(
+    () => true,
+    () => false,
   );
+  if (!stuck) {
+    return null;
+  }
+
+  await form
+    .getByRole('button', { name: /sign ?in|log ?in|continue|submit/i })
+    .first()
+    .click();
+
+  // Race the hub's next state: a redirect to the 2FA step (credentials accepted)
+  // against the error banner becoming visible (rejected). Racing surfaces a
+  // rejection in ~1s instead of waiting out the full 2FA timeout, keeping each
+  // attempt cheap enough for the backoff loop to retry within the test budget.
+  const reach2fa = page
+    .waitForURL(/\/login\/(2fa|mfa)(\/|$|\?)/, { timeout: 15_000 })
+    .then(() => 'advanced' as const)
+    .catch(() => 'timeout' as const);
+  const earlyError = page
+    .locator('.text-destructive')
+    .first()
+    .waitFor({ state: 'visible', timeout: 15_000 })
+    .then(() => 'error' as const)
+    .catch(() => 'timeout' as const);
+  await Promise.race([reach2fa, earlyError]);
+
+  const path = (): string => new URL(page.url()).pathname;
+  if (/^\/login\/(2fa|mfa)/.test(path())) {
+    return 'advanced';
+  }
+  // Not on 2FA: a rendered banner is the rejection reason; otherwise, if the
+  // flow already left the bare /login credentials page, treat it as advanced.
+  const banner = await readLoginError(page);
+  if (banner) {
+    return banner;
+  }
+  if (!/^\/login\/?$/.test(path())) {
+    return 'advanced';
+  }
+  return null;
+}
+
+// Read the hub's login error banner (`.text-destructive`, bunyip-web
+// views/ui.rs error_box) into a single-line string, or null when none is
+// rendered. The box holds an icon (svg, no text) plus the message, so innerText
+// is the message.
+async function readLoginError(page: Page): Promise<string | null> {
+  try {
+    const box = page.locator('.text-destructive').first();
+    if ((await box.count()) === 0) {
+      return null;
+    }
+    const text = (await box.innerText()).trim().replace(/\s+/g, ' ');
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+// Classify a login error banner as a rate-limit rejection and return the backoff
+// to wait before resubmitting (ms), or null when the reason is NOT the rate
+// limit (so the caller fails fast on a real credential error). The hub renders
+// "Too many requests. Please wait N seconds and try again."; parse N, add a 1s
+// cushion for the window boundary, and cap at the 60s login window. Defaults to
+// 5s when no count is rendered.
+function rateLimitBackoffMs(reason: string | null): number | null {
+  if (!reason || !/too many|rate.?limit/i.test(reason)) {
+    return null;
+  }
+  const match = reason.match(/(\d+)\s*second/i);
+  const seconds = match ? Number(match[1]) : 5;
+  return Math.min(seconds, 60) * 1_000 + 1_000;
 }
 
 // Compute the current TOTP code from E2E_TOTP_SECRET (RFC 6238, 30s window,
