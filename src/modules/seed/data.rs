@@ -1,11 +1,19 @@
 //! Demo-data payloads seeded into a brand-new account (PMS-157).
 //!
-//! The builders return the same `Create*Request` DTOs the public API
-//! accepts, so seeding goes through the real service methods (validation,
-//! FK checks, audit rows) instead of hand-rolled INSERTs. Only `contacts`
-//! and `tickets` have real create paths today, so the demo set is one
-//! client company, two contacts, and three tickets that link to them.
+//! The demo CONTENT (company / contact / ticket names, titles, descriptions)
+//! lives in the committed `demo_seed.json` bundle, embedded at compile time
+//! (PMS-651, the service-layer seed-bundle slice). This module maps that bundle
+//! into the same `Create*Request` DTOs the public API accepts, so seeding still
+//! goes through the real service methods (validation, FK checks, per-tenant
+//! config defaults, audit rows) instead of hand-rolled INSERTs. Data-driven so
+//! the demo set can change without touching Rust; the load is create-only and
+//! non-destructive, distinct from the wipe-and-replace `data_transfer` import.
+//! Only `contacts` and `tickets` have real create paths today, so the demo set
+//! is one client company, two contacts, and three tickets that link to them.
 
+use std::sync::OnceLock;
+
+use serde::Deserialize;
 use uuid::Uuid;
 
 use mokosh_types::contacts::{
@@ -14,17 +22,63 @@ use mokosh_types::contacts::{
 };
 use mokosh_types::tickets::CreateTicketRequest;
 
+/// The committed demo-seed bundle. It carries only the human-meaningful content;
+/// structural defaults (tags, phone, portal flags, `..Default`) stay in the
+/// builders below so the bundle stays readable and small.
+const DEMO_SEED_JSON: &str = include_str!("demo_seed.json");
+
+#[derive(Deserialize)]
+struct DemoSeed {
+    company: DemoCompany,
+    contacts: Vec<DemoContact>,
+    tickets: Vec<DemoTicket>,
+}
+
+#[derive(Deserialize)]
+struct DemoCompany {
+    name: String,
+    industry: String,
+    website: String,
+    phone: String,
+    notes: String,
+}
+
+#[derive(Deserialize)]
+struct DemoContact {
+    first_name: String,
+    last_name: String,
+    email: String,
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct DemoTicket {
+    title: String,
+    description: String,
+}
+
+/// Parse the embedded bundle once. A malformed bundle is a committed bug, caught
+/// by `demo_seed_bundle_parses_to_the_expected_shape` below and by the
+/// integration seed tests; the panic surfaces it loudly at first use.
+fn demo_seed() -> &'static DemoSeed {
+    static SEED: OnceLock<DemoSeed> = OnceLock::new();
+    SEED.get_or_init(|| {
+        serde_json::from_str(DEMO_SEED_JSON).expect("embedded demo_seed.json is valid")
+    })
+}
+
 /// The sample client company. Names are obviously-fake so an operator can
 /// tell demo rows from real data at a glance.
 pub fn demo_company() -> CreateCompanyRequest {
+    let c = &demo_seed().company;
     CreateCompanyRequest {
-        name: "Acme Corporation (Demo)".to_string(),
+        name: c.name.clone(),
         parent_company_id: None,
         company_type: CompanyType::default(),
         status: CompanyStatus::default(),
-        industry: Some("Information Technology".to_string()),
-        website: Some("https://example.com".to_string()),
-        phone: Some("+1-555-0100".to_string()),
+        industry: Some(c.industry.clone()),
+        website: Some(c.website.clone()),
+        phone: Some(c.phone.clone()),
         fax: None,
         address: None,
         billing_address: None,
@@ -36,54 +90,33 @@ pub fn demo_company() -> CreateCompanyRequest {
         tax_exempt: false,
         custom_fields: serde_json::Value::Null,
         tags: vec!["demo".to_string()],
-        notes: Some(
-            "Sample company created automatically to show how Mokosh works. \
-             Safe to edit or delete."
-                .to_string(),
-        ),
+        notes: Some(c.notes.clone()),
         portal_enabled: true,
     }
 }
 
-/// Primary contact at the demo company.
+/// Primary contact at the demo company (the first bundle contact).
 pub fn demo_contact_primary(company_id: Uuid) -> CreateContactRequest {
-    demo_contact(
-        company_id,
-        "Alice",
-        "Anderson",
-        "alice.anderson@example.com",
-        "IT Director",
-    )
+    demo_contact(company_id, 0)
 }
 
-/// Secondary contact at the demo company.
+/// Secondary contact at the demo company (the second bundle contact).
 pub fn demo_contact_secondary(company_id: Uuid) -> CreateContactRequest {
-    demo_contact(
-        company_id,
-        "Bob",
-        "Baker",
-        "bob.baker@example.com",
-        "Operations Manager",
-    )
+    demo_contact(company_id, 1)
 }
 
-fn demo_contact(
-    company_id: Uuid,
-    first_name: &str,
-    last_name: &str,
-    email: &str,
-    title: &str,
-) -> CreateContactRequest {
+fn demo_contact(company_id: Uuid, index: usize) -> CreateContactRequest {
+    let c = &demo_seed().contacts[index];
     CreateContactRequest {
         company_id: Some(company_id),
         company_name: None,
-        first_name: first_name.to_string(),
-        last_name: last_name.to_string(),
-        email: Some(email.to_string()),
+        first_name: c.first_name.clone(),
+        last_name: c.last_name.clone(),
+        email: Some(c.email.clone()),
         phone: Some("+1-555-0100".to_string()),
         mobile: None,
         fax: None,
-        title: Some(title.to_string()),
+        title: Some(c.title.clone()),
         department: None,
         contact_type: ContactType::default(),
         preferred_contact_method: PreferredContactMethod::default(),
@@ -95,33 +128,18 @@ fn demo_contact(
     }
 }
 
-/// Three sample tickets spanning a few everyday MSP scenarios. Priority,
-/// status, and queue are left unset so `create_ticket` fills in the
-/// tenant's configured defaults. `contact_id` links the first contact so
-/// the demo shows the company -> contact -> ticket relationship.
+/// The sample tickets from the bundle. Priority, status, and queue are left
+/// unset so `create_ticket` fills in the tenant's configured defaults (the
+/// per-tenant NOT-NULL config FKs a static bundle cannot carry). `contact_id`
+/// links the given contact so the demo shows the company -> contact -> ticket
+/// relationship.
 pub fn demo_tickets(company_id: Uuid, contact_id: Uuid) -> Vec<CreateTicketRequest> {
-    let specs = [
-        (
-            "Welcome to Mokosh - here's a sample ticket",
-            "This is an example ticket. Open it to see how Mokosh tracks work, \
-             then close or delete it when you're done exploring.",
-        ),
-        (
-            "Laptop won't connect to Wi-Fi",
-            "Demo ticket: a contact reports their laptop cannot join the office \
-             wireless network after the latest update.",
-        ),
-        (
-            "Request: onboard a new employee",
-            "Demo ticket: provision accounts, email, and hardware for a new hire \
-             starting next week.",
-        ),
-    ];
-    specs
-        .into_iter()
-        .map(|(title, description)| CreateTicketRequest {
-            title: title.to_string(),
-            description: Some(description.to_string()),
+    demo_seed()
+        .tickets
+        .iter()
+        .map(|t| CreateTicketRequest {
+            title: t.title.clone(),
+            description: Some(t.description.clone()),
             company_id,
             contact_id: Some(contact_id),
             is_billable: true,
@@ -129,4 +147,39 @@ pub fn demo_tickets(company_id: Uuid, contact_id: Uuid) -> Vec<CreateTicketReque
             ..Default::default()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demo_seed_bundle_parses_to_the_expected_shape() {
+        // The embedded bundle must parse and carry exactly the demo baseline the
+        // seed service + integration tests expect (one company, two contacts,
+        // three tickets), so a malformed edit is caught in CI, not at seed time.
+        let seed = demo_seed();
+        assert_eq!(seed.company.name, "Acme Corporation (Demo)");
+        assert_eq!(seed.contacts.len(), 2, "two demo contacts");
+        assert_eq!(seed.tickets.len(), 3, "three demo tickets");
+
+        // The builders wire the FKs and produce the DTOs the service layer
+        // consumes; smoke-check the mapping and the company/contact/ticket links.
+        let company = demo_company();
+        assert_eq!(company.name, "Acme Corporation (Demo)");
+        assert_eq!(company.tags, vec!["demo".to_string()]);
+
+        let cid = Uuid::new_v4();
+        let primary = demo_contact_primary(cid);
+        assert_eq!(primary.company_id, Some(cid));
+        assert_eq!(primary.first_name, "Alice");
+        assert_eq!(demo_contact_secondary(cid).first_name, "Bob");
+
+        let contact_id = Uuid::new_v4();
+        let tickets = demo_tickets(cid, contact_id);
+        assert_eq!(tickets.len(), 3);
+        assert!(tickets
+            .iter()
+            .all(|t| t.company_id == cid && t.contact_id == Some(contact_id)));
+    }
 }
