@@ -6,6 +6,11 @@
 //! so the assertions are deterministic. The migrations seed the default
 //! tenant's ticket status/priority/queue defaults, which `create_ticket`
 //! requires.
+//!
+//! PMS-629: the demo baseline is the clean, un-prefixed demo data (`data.rs`,
+//! tagged `demo`). The `zQA`/`QA-` prefix belongs ONLY to the QA E2E fixtures
+//! (`qa.rs`, gated to `is_qa` tenants) and must never appear in demo data;
+//! `demo_seed_is_the_clean_baseline_with_no_qa_prefix` guards that separation.
 
 mod common;
 
@@ -159,5 +164,49 @@ async fn skips_seeding_a_tenant_that_already_has_companies(pool: PgPool) {
         demo_seeded_flag(&pool, tenant).await.as_deref(),
         Some("true"),
         "flag still set so the emptiness check runs only once"
+    );
+}
+
+/// PMS-629: a fresh tenant's first-visit seed must be the clean demo baseline,
+/// never the `zQA`/`QA-` E2E fixtures. Those live only in the QA seeder
+/// (`qa.rs`), gated to `is_qa` tenants; demo data (`data.rs`) is un-prefixed and
+/// tagged `demo`. This locks in that separation so a future change cannot leak
+/// QA fixtures into the demo baseline.
+#[sqlx::test]
+async fn demo_seed_is_the_clean_baseline_with_no_qa_prefix(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = common::DEFAULT_TENANT_ID;
+
+    seed_service(&pool)
+        .ensure_demo_seeded(tenant, admin_id)
+        .await;
+
+    // The one demo company is the expected, obviously-demo baseline row.
+    let company_name: String = sqlx::query_scalar(
+        "SELECT name FROM companies WHERE tenant_id = $1 AND company_type <> 'internal'",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("read demo company name");
+    assert_eq!(
+        company_name, "Acme Corporation (Demo)",
+        "demo seed must produce the clean demo baseline company"
+    );
+
+    // No seeded record (company / contact / ticket) carries a `QA-` or `zQA`
+    // marker - those are reserved for the qa.rs E2E fixtures.
+    let qa_prefixed: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM companies WHERE tenant_id = $1 AND (name LIKE 'QA-%' OR name ILIKE '%zqa%'))
+              + (SELECT COUNT(*) FROM contacts  WHERE tenant_id = $1 AND (first_name LIKE 'QA-%' OR last_name LIKE 'QA-%' OR first_name ILIKE '%zqa%' OR last_name ILIKE '%zqa%'))
+              + (SELECT COUNT(*) FROM tickets   WHERE tenant_id = $1 AND (title LIKE 'QA-%' OR title ILIKE '%zqa%'))",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("count QA/zQA-prefixed rows");
+    assert_eq!(
+        qa_prefixed, 0,
+        "demo seed must contain no QA-/zQA-prefixed records"
     );
 }
