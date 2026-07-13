@@ -1,5 +1,6 @@
 //! Utility modules for Mokosh Server
 
+pub mod client_ip;
 pub mod crypto;
 pub mod datetime;
 pub mod email;

@@ -127,7 +127,16 @@ async fn login(
         return Ok(resp);
     }
 
-    let ip_address = Some(addr.ip().to_string());
+    // PMS-587: record the real client IP (from the forwarded header behind
+    // Traefik), not the proxy peer address.
+    let ip_address = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            &headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
     let user_agent = headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
@@ -177,7 +186,15 @@ async fn logout(
             user.tenant_id,
             Some(user.id),
             crate::modules::audit::AuditAction::Logout,
-            Some(addr.ip().to_string()),
+            // PMS-587: real client IP behind Traefik, not the proxy peer.
+            Some(
+                crate::utils::client_ip::extract_client_ip(
+                    addr.ip(),
+                    &headers,
+                    crate::utils::client_ip::trusted_proxies(),
+                )
+                .to_string(),
+            ),
             ua,
         )
         .await;
@@ -641,7 +658,15 @@ async fn run_google_callback(
         .await
         .map_err(|e| format!("Google token exchange failed: {e}"))?;
 
-    let ip = Some(addr.ip().to_string());
+    // PMS-587: real client IP from the forwarded header behind Traefik.
+    let ip = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
     let user_agent = headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())

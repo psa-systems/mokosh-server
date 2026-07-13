@@ -143,6 +143,10 @@ sha1 = "0.10"
 sha2 = "0.10"
 constant_time_eq = "0.3"
 
+# CIDR parsing for the trusted-proxy allowlist that gates X-Forwarded-For
+# client-IP extraction (PMS-587).
+ipnetwork = { workspace = true }
+
 # Rate limiting
 governor = "0.8"
 
