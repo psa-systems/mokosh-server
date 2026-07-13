@@ -1,0 +1,37 @@
+{
+  "company": {
+    "name": "Acme Corporation (Demo)",
+    "industry": "Information Technology",
+    "website": "https://example.com",
+    "phone": "+1-555-0100",
+    "notes": "Sample company created automatically to show how Mokosh works. Safe to edit or delete."
+  },
+  "contacts": [
+    {
+      "first_name": "Alice",
+      "last_name": "Anderson",
+      "email": "alice.anderson@example.com",
+      "title": "IT Director"
+    },
+    {
+      "first_name": "Bob",
+      "last_name": "Baker",
+      "email": "bob.baker@example.com",
+      "title": "Operations Manager"
+    }
+  ],
+  "tickets": [
+    {
+      "title": "Welcome to Mokosh - here's a sample ticket",
+      "description": "This is an example ticket. Open it to see how Mokosh tracks work, then close or delete it when you're done exploring."
+    },
+    {
+      "title": "Laptop won't connect to Wi-Fi",
+      "description": "Demo ticket: a contact reports their laptop cannot join the office wireless network after the latest update."
+    },
+    {
+      "title": "Request: onboard a new employee",
+      "description": "Demo ticket: provision accounts, email, and hardware for a new hire starting next week."
+    }
+  ]
+}
