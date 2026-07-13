@@ -256,62 +256,12 @@ fn remap_row(mut row: Value, id_map: &HashMap<Uuid, Uuid>, target_tenant: Uuid) 
     row
 }
 
-/// Order `tables` so every FK parent comes before its child, given (child,
-/// parent) `edges` (self-refs and edges touching a non-load table are ignored
-/// by the caller/here). Kahn's algorithm; any table left over by a true FK
-/// cycle is appended in input order (the load would then fail and roll back
-/// with a clear FK error rather than corrupt data). Pure - unit-tested.
-fn topo_order(tables: &[String], edges: &[(String, String)]) -> Vec<String> {
-    use std::collections::{HashSet, VecDeque};
-
-    let set: HashSet<&str> = tables.iter().map(String::as_str).collect();
-    let mut indeg: HashMap<&str, usize> = tables.iter().map(|t| (t.as_str(), 0)).collect();
-    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (child, parent) in edges {
-        let (c, p) = (child.as_str(), parent.as_str());
-        if c == p || !set.contains(c) || !set.contains(p) {
-            continue;
-        }
-        children.entry(p).or_default().push(c);
-        *indeg.get_mut(c).expect("child in load set") += 1;
-    }
-
-    let mut queue: VecDeque<&str> = tables
-        .iter()
-        .map(String::as_str)
-        .filter(|t| indeg[t] == 0)
-        .collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    while let Some(t) = queue.pop_front() {
-        if !seen.insert(t) {
-            continue;
-        }
-        out.push(t.to_string());
-        if let Some(cs) = children.get(t) {
-            for &c in cs {
-                let d = indeg.get_mut(c).expect("edge child in load set");
-                *d -= 1;
-                if *d == 0 {
-                    queue.push_back(c);
-                }
-            }
-        }
-    }
-    for t in tables {
-        if !seen.contains(t.as_str()) {
-            out.push(t.clone());
-        }
-    }
-    out
-}
-
 /// `POST /api/v1/data/import` - admin-only, wipe-and-replace. Validates the
-/// envelope + tenant-name confirmation, then in ONE transaction wipes the
-/// tenant's in-scope tables and reloads the file with remapped ids, ordered so
-/// FK parents load before children. A failure anywhere rolls the whole thing
-/// back - the tenant is either fully replaced or untouched. Emits the `import`
-/// audit action.
+/// envelope + tenant-name confirmation, then in ONE transaction (FK checks
+/// deferred to commit, migration 088) wipes the tenant's data and reloads the
+/// file with remapped ids in ANY order. A failure anywhere rolls the whole
+/// thing back - the tenant is either fully replaced or untouched. Emits the
+/// `import` audit action.
 async fn import_tenant_data(
     State(s): State<DataTransferState>,
     RequireAuth(u): RequireAuth,
@@ -337,6 +287,13 @@ async fn import_tenant_data(
     let id_map = build_id_map(&req.export.entities);
     let mut tx = s.db.begin_with_tenant(tenant).await?;
 
+    // Defer every (deferrable, migration 088) FK check to COMMIT so the wipe +
+    // load run in ANY order - the schema has FK cycles, self-referential FKs, and
+    // excluded tables that reference load tables, none orderable per statement.
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *tx)
+        .await?;
+
     // Destructive-action guard: the confirmation must equal the tenant name.
     let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
         .bind(tenant)
@@ -348,48 +305,28 @@ async fn import_tenant_data(
         ));
     }
 
-    // A file table not among the current tenant tables is schema drift - reject
-    // before wiping anything.
-    let live_tables: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+    // Every tenant-scoped table. A file table not among them is schema drift.
+    let tenant_tables: Vec<String> = sqlx::query_scalar::<_, String>(
         "SELECT table_name::text FROM information_schema.columns
          WHERE table_schema = 'public' AND column_name = 'tenant_id'",
     )
     .fetch_all(&mut *tx)
-    .await?
-    .into_iter()
-    .collect();
-    let load_tables: Vec<String> = req.export.entities.keys().cloned().collect();
-    for table in &load_tables {
-        if !live_tables.contains(table) {
+    .await?;
+    let tenant_table_set: std::collections::HashSet<&str> =
+        tenant_tables.iter().map(String::as_str).collect();
+    for table in req.export.entities.keys() {
+        if !tenant_table_set.contains(table.as_str()) {
             return Err(AppError::BadRequest(format!(
                 "envelope table {table} is not a current tenant table (schema drift)"
             )));
         }
     }
 
-    // Cross-table FK edges (child, parent), self-refs excluded (handled by the
-    // single-statement-per-table load).
-    let edges: Vec<(String, String)> = sqlx::query_as(
-        "SELECT child.relname::text, parent.relname::text
-         FROM pg_constraint c
-         JOIN pg_class child ON child.oid = c.conrelid
-         JOIN pg_class parent ON parent.oid = c.confrelid
-         WHERE c.contype = 'f'
-           AND child.relnamespace = 'public'::regnamespace
-           AND child.relname <> parent.relname",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    let order = topo_order(&load_tables, &edges);
-
-    // Break `tenants` -> load-table references before the wipe. `tenants` is
-    // not a tenant-scoped table (so it is neither exported nor wiped), but it
-    // keeps a RESTRICT reference into a table we are about to delete
-    // (tenants.own_company_id -> companies). NULL those columns on this tenant's
-    // row first and remember the old ids so they can be restored to the remapped
-    // values after the load.
-    let load_set: std::collections::HashSet<&str> =
-        load_tables.iter().map(String::as_str).collect();
+    // Read tenants -> load-table references (e.g. tenants.own_company_id ->
+    // companies) so they can be remapped to the new ids after the load. `tenants`
+    // is not tenant-scoped, so it is neither wiped nor reloaded; its reference to
+    // a wiped+reloaded row would otherwise dangle. No NULL needed: the deferred
+    // check tolerates the stale value until it is remapped below.
     let tenant_fk_cols: Vec<(String, String)> = sqlx::query_as(
         "SELECT att.attname::text, ref.relname::text
          FROM pg_constraint c
@@ -402,7 +339,8 @@ async fn import_tenant_data(
     .await?;
     let mut tenant_fk_restore: Vec<(String, Uuid)> = Vec::new();
     for (col, ref_table) in &tenant_fk_cols {
-        if !load_set.contains(ref_table.as_str()) || !is_safe_identifier(col) {
+        // Only remap references into a table the import actually reloads.
+        if !is_safe_identifier(col) || !req.export.entities.contains_key(ref_table) {
             continue;
         }
         let old: Option<Uuid> =
@@ -413,26 +351,30 @@ async fn import_tenant_data(
         if let Some(old) = old {
             tenant_fk_restore.push((col.clone(), old));
         }
-        sqlx::query(&format!("UPDATE tenants SET {col} = NULL WHERE id = $1"))
+    }
+
+    // Wipe every tenant-scoped table EXCEPT the identity tables (users,
+    // user_sessions - Bunyip/OIDC-owned, referenced BY business rows rather than
+    // referencing them). This clears the load tables AND the excluded
+    // secret/audit/token tables that FK-reference load rows (credential_vault,
+    // rmm_connections, portal_setup_tokens, ...), so nothing non-reloaded dangles
+    // at commit. Order is irrelevant - constraints are deferred.
+    for table in &tenant_tables {
+        if table == "users" || table == "user_sessions" || !is_safe_identifier(table) {
+            continue;
+        }
+        sqlx::query(&format!("DELETE FROM {table} WHERE tenant_id = $1"))
             .bind(tenant)
             .execute(&mut *tx)
             .await?;
     }
 
-    // Wipe children-before-parents.
-    for table in order.iter().rev() {
-        let sql = format!("DELETE FROM {table} WHERE tenant_id = $1");
-        sqlx::query(&sql).bind(tenant).execute(&mut *tx).await?;
-    }
-
-    // Load parents-before-children. One statement per table; jsonb_populate_
-    // recordset coerces each remapped row to the table's rowtype (columns absent
-    // because they were redacted become NULL/default). Non-deferrable FK checks
-    // run at statement end, so cross-table refs are satisfied by the order and
-    // intra-table self-refs by the single statement.
+    // Load every table from the envelope (any order). jsonb_populate_recordset
+    // coerces each remapped row to the table's rowtype; redacted-away columns
+    // become NULL/default. Every FK check fires at commit.
     let mut summary = Map::new();
-    for table in &order {
-        let Some(rows) = req.export.entities.get(table).and_then(Value::as_array) else {
+    for (table, rows) in &req.export.entities {
+        let Some(rows) = rows.as_array() else {
             continue;
         };
         let remapped: Vec<Value> = rows
@@ -441,18 +383,17 @@ async fn import_tenant_data(
             .collect();
         let count = remapped.len();
         if count > 0 {
-            let sql = format!(
+            sqlx::query(&format!(
                 "INSERT INTO {table} SELECT * FROM jsonb_populate_recordset(NULL::{table}, $1)"
-            );
-            sqlx::query(&sql)
-                .bind(Value::Array(remapped))
-                .execute(&mut *tx)
-                .await?;
+            ))
+            .bind(Value::Array(remapped))
+            .execute(&mut *tx)
+            .await?;
         }
         summary.insert(table.clone(), Value::from(count as u64));
     }
 
-    // Restore the tenants -> load-table references to the remapped ids.
+    // Remap tenants -> load-table references to the new ids.
     for (col, old) in &tenant_fk_restore {
         if let Some(new) = id_map.get(old) {
             sqlx::query(&format!("UPDATE tenants SET {col} = $1 WHERE id = $2"))
@@ -589,28 +530,5 @@ mod tests {
         assert_eq!(o["tenant_id"], json!(target_tenant.to_string()));
         assert_eq!(o["external_ref"], json!(unrelated.to_string()));
         assert_eq!(o["name"], json!("Jane"));
-    }
-
-    #[test]
-    fn topo_order_places_parents_before_children() {
-        let tables = vec![
-            "contacts".to_string(),
-            "companies".to_string(),
-            "tickets".to_string(),
-            "standalone".to_string(),
-        ];
-        // contacts + tickets both FK companies; standalone has no edges.
-        let edges = vec![
-            ("contacts".to_string(), "companies".to_string()),
-            ("tickets".to_string(), "companies".to_string()),
-            // an edge touching a non-load table must be ignored
-            ("tickets".to_string(), "users".to_string()),
-        ];
-        let order = topo_order(&tables, &edges);
-        assert_eq!(order.len(), 4, "every load table is present exactly once");
-        let pos = |t: &str| order.iter().position(|x| x == t).unwrap();
-        assert!(pos("companies") < pos("contacts"));
-        assert!(pos("companies") < pos("tickets"));
-        assert!(order.contains(&"standalone".to_string()));
     }
 }
