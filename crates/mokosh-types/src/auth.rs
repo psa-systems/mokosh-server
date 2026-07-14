@@ -308,6 +308,14 @@ pub struct User {
     pub status: UserStatus,
     pub email_verified_at: Option<DateTime<Utc>>,
     pub last_login_at: Option<DateTime<Utc>>,
+    /// PMS-657: ISO 3166-1 alpha-2 country of the user's last geolocatable
+    /// login, or `None` until the first one. Compared against the current
+    /// login's country to detect a significant location change.
+    #[serde(default)]
+    pub last_login_country: Option<String>,
+    /// PMS-657: per-user opt-out for the new-login-location alert (default true).
+    #[serde(default = "crate::default_true")]
+    pub login_location_alerts: bool,
     pub mfa_enabled: bool,
     #[serde(skip_serializing)]
     pub mfa_secret: Option<String>,

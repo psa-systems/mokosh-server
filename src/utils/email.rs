@@ -34,6 +34,31 @@ pub trait Mailer: Send + Sync {
     /// notifications, ad-hoc alerts). Prefer a typed helper when adding
     /// a recurring template; reserve this for one-off bodies.
     async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()>;
+
+    /// PMS-657: alert the user that a sign-in came from a country they have not
+    /// signed in from before. The default composes a plain-text body and routes
+    /// it through [`Mailer::send_text`], so every mailer inherits it without a
+    /// per-impl override.
+    async fn send_new_login_location(
+        &self,
+        to: &str,
+        country: &str,
+        ip: &str,
+        when: &str,
+        user_agent: &str,
+    ) -> AppResult<()> {
+        let body = format!(
+            "We noticed a sign-in to your account from a country we have not seen you sign in from before.\n\n\
+             Country: {country}\n\
+             IP address: {ip}\n\
+             When: {when}\n\
+             Device: {user_agent}\n\n\
+             If this was you, no action is needed.\n\n\
+             If you do not recognize this sign-in, secure your account now: change your password and review your active sessions."
+        );
+        self.send_text(to, "New sign-in to your account", &body)
+            .await
+    }
 }
 
 /// Dev mailer. Writes the link to `tracing` so smoke tests work without

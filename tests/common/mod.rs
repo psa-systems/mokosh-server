@@ -217,6 +217,7 @@ async fn boot_with_db(pool: PgPool, db: Database, app_pool: Option<PgPool>) -> T
         // for the constructor; specs that hit the webhook build their own
         // signature against the same secret.
         b"test-bunyip-webhook-secret".to_vec(),
+        None, // PMS-657: no geoip DB in tests; login-location alerts disabled
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

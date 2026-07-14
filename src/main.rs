@@ -45,6 +45,10 @@ pub struct AppConfig {
     /// `BUNYIP_WEBHOOK_SIGNING_SECRET` (BUNYIP-332), mokosh reads it from
     /// `BUNYIP_WEBHOOK_SECRET`.
     pub bunyip_webhook_secret: String,
+    /// PMS-657: path to the IP2Location LITE `.BIN` DB used to resolve a login's
+    /// client IP to a country for login-location alerts. `None` when unset: the
+    /// alert feature is disabled (the server still boots normally).
+    pub ip2location_db_path: Option<String>,
 }
 
 /// Dev-only fallback for `JWT_SECRET`. Accepted only in dev/test
@@ -222,6 +226,11 @@ impl AppConfig {
                 }),
             oauth_super_admin_emails,
             bunyip_webhook_secret,
+            // PMS-657: optional IP2Location DB path for login-location alerts.
+            ip2location_db_path: std::env::var("IP2LOCATION_DB_PATH")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 
@@ -495,6 +504,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let _scheduler_handles = scheduler.start();
 
+    // PMS-657: build the IP -> country resolver for login-location alerts.
+    // Optional: an unset path or a failed .BIN load leaves it None and the
+    // alerts stay disabled (login is never affected).
+    let geoip = match config.ip2location_db_path.as_deref() {
+        Some(path) => match mokosh_server::utils::geoip::GeoIpService::new(path) {
+            Ok(svc) => {
+                tracing::info!(path = %path, "GeoIP (IP2Location) service initialized");
+                Some(std::sync::Arc::new(svc))
+            }
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "Failed to load IP2Location DB; login-location alerts disabled");
+                None
+            }
+        },
+        None => {
+            tracing::info!("IP2LOCATION_DB_PATH unset; login-location alerts disabled");
+            None
+        }
+    };
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -507,6 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_mailer,
         encryption_key,
         config.bunyip_webhook_secret.into_bytes(),
+        geoip,
     );
     let router = psa_router;
 

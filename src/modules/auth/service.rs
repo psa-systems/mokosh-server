@@ -33,6 +33,8 @@ use crate::utils::crypto::{generate_token, hash_password, verify_password};
 use crate::utils::email::{LogMailer, Mailer};
 #[cfg(feature = "server")]
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::geoip::GeoIpService;
+use std::net::IpAddr;
 
 #[cfg(feature = "server")]
 use super::models::*;
@@ -65,6 +67,10 @@ pub struct AuthService {
     /// and welcome links sent in transactional email. Equal to
     /// `AppConfig::client_origin`.
     frontend_base_url: String,
+    /// PMS-657: IP -> country resolver for login-location alerts. `None` when
+    /// `IP2LOCATION_DB_PATH` is unset or the DB failed to load, which disables
+    /// the alert (login is never blocked). Wired via [`Self::with_geoip`].
+    geoip: Option<Arc<GeoIpService>>,
 }
 
 #[cfg(feature = "server")]
@@ -112,6 +118,7 @@ impl AuthService {
             mailer,
             notifications: None,
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
+            geoip: None,
         }
     }
 
@@ -140,6 +147,126 @@ impl AuthService {
             mailer,
             notifications: Some(notifications),
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
+            geoip: None,
+        }
+    }
+
+    /// PMS-657: attach the IP -> country resolver used for login-location
+    /// alerts. Called once at server startup (see `create_api_router`); absent
+    /// in test fixtures, which leaves the feature disabled.
+    #[must_use]
+    pub fn with_geoip(mut self, geoip: Option<Arc<GeoIpService>>) -> Self {
+        self.geoip = geoip;
+        self
+    }
+
+    /// PMS-657: on a genuine login, resolve the client IP to a country and, when
+    /// it differs from the country recorded at the user's previous login (and
+    /// the user has not opted out), email a "new sign-in" alert, then persist the
+    /// new country. The first geolocatable login records the country silently.
+    /// Entirely best-effort: every failure is logged and swallowed so it can
+    /// never block a login, and the whole check no-ops when no IP2Location DB is
+    /// configured.
+    async fn check_login_location(&self, user: &User, ip: Option<&str>, user_agent: Option<&str>) {
+        let Some(geoip) = self.geoip.as_ref() else {
+            return;
+        };
+        let Some(parsed) = ip.and_then(|s| s.parse::<IpAddr>().ok()) else {
+            return;
+        };
+        // Private / loopback / link-local / unspecified addresses never map to a
+        // public country and only show up behind a proxy or in dev; skip them so
+        // they cannot spuriously "change country".
+        if Self::is_non_public_ip(&parsed) {
+            return;
+        }
+        let Some(country) = geoip.country_code(parsed) else {
+            return;
+        };
+
+        match login_location_decision(user.last_login_country.as_deref(), &country) {
+            // Same country as last time: nothing to do.
+            LoginLocationDecision::Unchanged => {}
+            // First login we can attribute to a country: record it, no alert.
+            LoginLocationDecision::Record => {
+                if let Err(e) = self
+                    .set_last_login_country(user.tenant_id, user.id, &country)
+                    .await
+                {
+                    tracing::warn!(user_id = %user.id, error = %e, "Failed to record initial login country");
+                }
+            }
+            // Country changed: alert (unless opted out), then persist the new one.
+            LoginLocationDecision::Alert => {
+                let previous = user.last_login_country.as_deref().unwrap_or("?");
+                if user.login_location_alerts {
+                    let when = Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+                    let ua = user_agent.unwrap_or("unknown");
+                    if let Err(e) = self
+                        .mailer
+                        .send_new_login_location(
+                            &user.email,
+                            &country,
+                            &parsed.to_string(),
+                            &when,
+                            ua,
+                        )
+                        .await
+                    {
+                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send new-login-location email");
+                    }
+                }
+                tracing::info!(user_id = %user.id, from = %previous, to = %country, "Login country changed");
+                if let Err(e) = self
+                    .set_last_login_country(user.tenant_id, user.id, &country)
+                    .await
+                {
+                    tracing::warn!(user_id = %user.id, error = %e, "Failed to update login country");
+                }
+            }
+        }
+    }
+
+    /// PMS-657: persist the ISO country of the user's most recent geolocatable
+    /// login. Tenant-scoped like `update_last_login` so it carries the RLS GUC.
+    async fn set_last_login_country(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        country: &str,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE users SET last_login_country = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(country)
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// True for addresses that can never map to a public country: loopback,
+    /// RFC1918 / unique-local, link-local, unspecified, broadcast. PMS-657 skips
+    /// these so a request arriving without a real client IP does not register as
+    /// a country change.
+    fn is_non_public_ip(ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local()
+            }
         }
     }
 
@@ -315,6 +442,11 @@ impl AuthService {
 
         // Update last login
         self.update_last_login(user.tenant_id, user.id).await?;
+        // PMS-657: alert on a country-level login-location change (best-effort;
+        // never blocks the login). Borrow the audit IP/UA before the audit block
+        // below consumes them.
+        self.check_login_location(&user, audit_ip.as_deref(), audit_ua.as_deref())
+            .await;
 
         // Record the successful login (PMS-117 AC3). Out-of-band on its own
         // tenant-scoped tx; a log-write failure must not fail the login
@@ -508,11 +640,17 @@ impl AuthService {
         }
 
         // 4. Issue session + tokens identically to the password flow.
+        // PMS-657: keep the client IP + UA for the login-location check below,
+        // since create_session consumes the owned values.
+        let loc_ip = ip_address.clone();
+        let loc_ua = user_agent.clone();
         let session_id = self
             .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
             .await?;
         let (access_token, refresh_token, expires_at) = self.generate_tokens(&user, session_id)?;
         self.update_last_login(user.tenant_id, user.id).await?;
+        self.check_login_location(&user, loc_ip.as_deref(), loc_ua.as_deref())
+            .await;
 
         Ok(LoginResponse {
             access_token,
@@ -596,7 +734,8 @@ impl AuthService {
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
                    date_format_string, theme_base_mode, theme_accent_id, role,
-                   status, email_verified_at, last_login_at, mfa_enabled,
+                   status, email_verified_at, last_login_at, last_login_country,
+                   login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
                    (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
@@ -1615,7 +1754,8 @@ impl AuthService {
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
                    date_format_string, theme_base_mode, theme_accent_id, role,
-                   status, email_verified_at, last_login_at, mfa_enabled,
+                   status, email_verified_at, last_login_at, last_login_country,
+                   login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
                    (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
@@ -1723,7 +1863,8 @@ impl AuthService {
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
                    date_format_string, theme_base_mode, theme_accent_id, role,
-                   status, email_verified_at, last_login_at, mfa_enabled,
+                   status, email_verified_at, last_login_at, last_login_country,
+                   login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
                    (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
@@ -1918,7 +2059,8 @@ impl AuthService {
             SELECT id, tenant_id, email, password_hash, first_name, last_name,
                    phone, mobile, title, avatar_url, timezone, locale,
                    date_format_string, theme_base_mode, theme_accent_id, role,
-                   status, email_verified_at, last_login_at, mfa_enabled,
+                   status, email_verified_at, last_login_at, last_login_country,
+                   login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
                    (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
@@ -2316,6 +2458,8 @@ struct UserRow {
     status: String,
     email_verified_at: Option<chrono::DateTime<Utc>>,
     last_login_at: Option<chrono::DateTime<Utc>>,
+    last_login_country: Option<String>,
+    login_location_alerts: bool,
     mfa_enabled: bool,
     mfa_secret: Option<String>,
     notification_preferences: serde_json::Value,
@@ -2352,6 +2496,8 @@ impl From<UserRow> for User {
             status: UserStatus::from_str(&row.status).unwrap_or_default(),
             email_verified_at: row.email_verified_at,
             last_login_at: row.last_login_at,
+            last_login_country: row.last_login_country,
+            login_location_alerts: row.login_location_alerts,
             mfa_enabled: row.mfa_enabled,
             mfa_secret: row.mfa_secret,
             notification_preferences: row.notification_preferences,
@@ -2590,6 +2736,30 @@ fn synthetic_name_from_email(email: &str) -> (String, String) {
     }
 }
 
+/// PMS-657: the action to take for a resolved login country, given the country
+/// recorded at the user's previous login. Kept pure (no DB, no mailer) so the
+/// branch logic is unit-testable in isolation.
+#[cfg(feature = "server")]
+#[derive(Debug, PartialEq, Eq)]
+enum LoginLocationDecision {
+    /// No prior country on record: store this one silently, no alert.
+    Record,
+    /// Same country as last time: do nothing.
+    Unchanged,
+    /// Country differs from last time: alert the user, then store the new one.
+    Alert,
+}
+
+/// Decide what to do for the `current` login country given the `previous` one.
+#[cfg(feature = "server")]
+fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLocationDecision {
+    match previous {
+        None => LoginLocationDecision::Record,
+        Some(prev) if prev == current => LoginLocationDecision::Unchanged,
+        Some(_) => LoginLocationDecision::Alert,
+    }
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
@@ -2724,5 +2894,55 @@ mod tests {
         let (first, last) = synthetic_name_from_email("first_last@a8n.run");
         assert_eq!(first, "First");
         assert_eq!(last, "Last");
+    }
+
+    // PMS-657: None -> Record / same -> Unchanged / differ -> Alert decides
+    // whether a login sends the new-location email.
+    #[test]
+    fn login_location_decision_branches() {
+        assert_eq!(
+            login_location_decision(None, "US"),
+            LoginLocationDecision::Record
+        );
+        assert_eq!(
+            login_location_decision(Some("US"), "US"),
+            LoginLocationDecision::Unchanged
+        );
+        assert_eq!(
+            login_location_decision(Some("US"), "GB"),
+            LoginLocationDecision::Alert
+        );
+    }
+
+    // PMS-657: only genuinely public client IPs may drive a country-change
+    // alert; loopback / RFC1918 / link-local / unspecified must be ignored.
+    #[test]
+    fn non_public_ip_detection() {
+        let non_public = [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.10.10",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+        ];
+        for ip in non_public {
+            assert!(
+                AuthService::is_non_public_ip(&ip.parse().unwrap()),
+                "{ip} should be treated as non-public"
+            );
+        }
+
+        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"];
+        for ip in public {
+            assert!(
+                !AuthService::is_non_public_ip(&ip.parse().unwrap()),
+                "{ip} should be treated as public"
+            );
+        }
     }
 }

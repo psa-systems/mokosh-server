@@ -76,6 +76,9 @@ pub fn create_api_router(
     // Verified as `hex(hmac_sha256(body, secret))` against the
     // `X-Webhook-Signature` header on `/api/v1/bunyip/webhooks/account-deleted`.
     bunyip_webhook_secret: Vec<u8>,
+    // PMS-657: IP -> country resolver for login-location alerts, built from
+    // IP2LOCATION_DB_PATH in main.rs. `None` disables the feature.
+    geoip: Option<Arc<crate::utils::geoip::GeoIpService>>,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -102,7 +105,8 @@ pub fn create_api_router(
         mailer.clone(),
         client_origin.clone(),
         notifications_service.clone(),
-    );
+    )
+    .with_geoip(geoip);
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
     // PMS-136: ContactService emails a `/portal/set-password` setup link when
