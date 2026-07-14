@@ -200,21 +200,41 @@ impl AuthService {
             LoginLocationDecision::Alert => {
                 let previous = user.last_login_country.as_deref().unwrap_or("?");
                 if user.login_location_alerts {
+                    // Send the alert on a detached task so a slow or failing SMTP
+                    // round-trip never adds latency to (or fails) the login. The
+                    // direct mailer is used rather than the notifications
+                    // dispatcher on purpose: the auth.* templates are seeded for
+                    // the default tenant only (migrations 021 / 030), so a queued
+                    // dispatch would silently drop the alert for every other
+                    // tenant, whereas the direct send covers all tenants. Retry
+                    // is intentionally not added here (best-effort security
+                    // signal); see PMS-657.
+                    let mailer = self.mailer.clone();
+                    let email = user.email.clone();
+                    let country = country.clone();
+                    let ip = parsed.to_string();
                     let when = Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
-                    let ua = user_agent.unwrap_or("unknown");
-                    if let Err(e) = self
-                        .mailer
-                        .send_new_login_location(
-                            &user.email,
-                            &country,
-                            &parsed.to_string(),
-                            &when,
-                            ua,
-                        )
-                        .await
-                    {
-                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send new-login-location email");
-                    }
+                    let ua = user_agent.unwrap_or("unknown").to_string();
+                    // No known deep-linkable SPA sessions route (only
+                    // /reset-password/<token>, which needs a token), so point at
+                    // the app root; the body tells them what to do there.
+                    let security_link = self.frontend_base_url.clone();
+                    let user_id = user.id;
+                    tokio::spawn(async move {
+                        if let Err(e) = mailer
+                            .send_new_login_location(
+                                &email,
+                                &country,
+                                &ip,
+                                &when,
+                                &ua,
+                                &security_link,
+                            )
+                            .await
+                        {
+                            tracing::warn!(user_id = %user_id, error = %e, "Failed to send new-login-location email");
+                        }
+                    });
                 }
                 tracing::info!(user_id = %user.id, from = %previous, to = %country, "Login country changed");
                 if let Err(e) = self
@@ -1288,9 +1308,13 @@ impl AuthService {
         }
         if request.theme_accent_id.is_some() {
             updates.push(format!("theme_accent_id = ${}", param_idx));
-            // `theme_accent_id` is the last field today, so this increment
-            // is currently unread (`#[allow(unused_assignments)]` on the
-            // fn); keep it so the pattern stays copy-paste safe (PMS-197).
+            param_idx += 1;
+        }
+        if request.login_location_alerts.is_some() {
+            updates.push(format!("login_location_alerts = ${}", param_idx));
+            // Last field today, so this increment is currently unread
+            // (`#[allow(unused_assignments)]` on the fn); keep it so the
+            // pattern stays copy-paste safe (PMS-197).
             param_idx += 1;
         }
 
@@ -1358,6 +1382,9 @@ impl AuthService {
         }
         if let Some(ref theme_accent_id) = request.theme_accent_id {
             query_builder = query_builder.bind(theme_accent_id);
+        }
+        if let Some(login_location_alerts) = request.login_location_alerts {
+            query_builder = query_builder.bind(login_location_alerts);
         }
 
         // Mutation + audit row in one transaction: snapshot the row

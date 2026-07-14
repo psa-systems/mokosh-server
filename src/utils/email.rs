@@ -46,6 +46,7 @@ pub trait Mailer: Send + Sync {
         ip: &str,
         when: &str,
         user_agent: &str,
+        security_link: &str,
     ) -> AppResult<()> {
         let body = format!(
             "We noticed a sign-in to your account from a country we have not seen you sign in from before.\n\n\
@@ -54,7 +55,8 @@ pub trait Mailer: Send + Sync {
              When: {when}\n\
              Device: {user_agent}\n\n\
              If this was you, no action is needed.\n\n\
-             If you do not recognize this sign-in, secure your account now: change your password and review your active sessions."
+             If you do not recognize this sign-in, secure your account now: review your active sessions and change your password.\n\n\
+             {security_link}"
         );
         self.send_text(to, "New sign-in to your account", &body)
             .await

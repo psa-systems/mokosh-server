@@ -583,6 +583,9 @@ pub struct UpdateUserRequest {
     /// the users.theme_accent_id check constraint.
     #[validate(length(max = 32, message = "Accent id must be 32 characters or fewer"))]
     pub theme_accent_id: Option<String>,
+    /// PMS-657: per-user opt-out for the new-login-location email alert.
+    /// Absent leaves it unchanged; `true`/`false` sets it.
+    pub login_location_alerts: Option<bool>,
 }
 
 /// User list filter parameters. Parsed from the query string on
