@@ -147,6 +147,10 @@ constant_time_eq = "0.3"
 # client-IP extraction (PMS-587).
 ipnetwork = { workspace = true }
 
+# IP -> country lookup for login-location alerts (PMS-657); reads the same
+# IP2Location LITE .BIN the ecosystem already deploys (see dmarc-reporter).
+ip2location = "0.6"
+
 # Rate limiting
 governor = "0.8"
 

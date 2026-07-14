@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod datetime;
 pub mod email;
 pub mod error;
+pub mod geoip;
 pub mod pagination;
 #[cfg(feature = "server")]
 pub mod security_headers;
