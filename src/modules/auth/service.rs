@@ -71,6 +71,22 @@ pub struct AuthService {
     /// `IP2LOCATION_DB_PATH` is unset or the DB failed to load, which disables
     /// the alert (login is never blocked). Wired via [`Self::with_geoip`].
     geoip: Option<Arc<GeoIpService>>,
+    /// PMS-658: master switch for the suspicious-login notify-and-approve gate.
+    /// Default false: the gate can withhold a login, so it is opt-in per
+    /// deployment for a safe rollout (PMS-289 lesson). When false, login behaves
+    /// exactly as before (PMS-657 alert only). Wired via
+    /// [`Self::with_login_approval`].
+    login_approval_enabled: bool,
+}
+
+/// PMS-658: outcome of screening a login for suspicious signals. `country` and
+/// `device_hash` are the resolved values to record once the login clears (either
+/// because it was not suspicious, or after the emailed approval code is entered).
+#[cfg(feature = "server")]
+struct LoginAssessment {
+    country: Option<String>,
+    device_hash: Option<String>,
+    suspicious: bool,
 }
 
 #[cfg(feature = "server")]
@@ -119,6 +135,7 @@ impl AuthService {
             notifications: None,
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
             geoip: None,
+            login_approval_enabled: false,
         }
     }
 
@@ -148,6 +165,7 @@ impl AuthService {
             notifications: Some(notifications),
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
             geoip: None,
+            login_approval_enabled: false,
         }
     }
 
@@ -157,6 +175,16 @@ impl AuthService {
     #[must_use]
     pub fn with_geoip(mut self, geoip: Option<Arc<GeoIpService>>) -> Self {
         self.geoip = geoip;
+        self
+    }
+
+    /// PMS-658: enable the suspicious-login notify-and-approve gate. Off by
+    /// default; set from `LOGIN_APPROVAL_ENABLED` at server startup. Requires
+    /// geoip for the country signal and/or a client-supplied `device_id` for the
+    /// device signal; with neither available the gate never fires.
+    #[must_use]
+    pub fn with_login_approval(mut self, enabled: bool) -> Self {
+        self.login_approval_enabled = enabled;
         self
     }
 
@@ -266,6 +294,281 @@ impl AuthService {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    // ===================== PMS-658: suspicious-login gate =====================
+    //
+    // After password + MFA succeed, a login is screened for a new country (the
+    // PMS-657 signal) or a new device (a client-supplied `device_id`, hashed into
+    // `user_login_devices`). When `login_approval_enabled` and the login looks
+    // suspicious, the session/tokens are withheld: a single-use 6-digit code is
+    // emailed and a `login_approvals` row is created; the client re-POSTs the
+    // login with `approval_code` to complete it. A disabled or geoip-less
+    // deployment keeps the PMS-657 alert-only behaviour untouched.
+
+    /// Wrong-code attempts tolerated against a single approval challenge before
+    /// it is destroyed and a fresh code must be requested.
+    const LOGIN_APPROVAL_MAX_ATTEMPTS: i32 = 5;
+
+    /// Resolve a client IP string to a public ISO country, or `None` when geoip
+    /// is unconfigured or the IP is missing / unparseable / non-public.
+    fn resolve_login_country(&self, ip: Option<&str>) -> Option<String> {
+        let geoip = self.geoip.as_ref()?;
+        let parsed = ip.and_then(|s| s.parse::<IpAddr>().ok())?;
+        if Self::is_non_public_ip(&parsed) {
+            return None;
+        }
+        geoip.country_code(parsed)
+    }
+
+    /// PMS-658: screen a login. Suspicious when the country changed (PMS-657
+    /// `Alert`) OR the device is new. A device is "new" only once the user has at
+    /// least one known device, so the first device(s) are baseline (mirroring how
+    /// the first login country is recorded, not alerted). An absent/blank
+    /// `device_id` contributes no device signal (country only). Returns the
+    /// resolved country + device hash to record once the login clears.
+    async fn assess_login(
+        &self,
+        user: &User,
+        ip: Option<&str>,
+        device_id: Option<&str>,
+    ) -> AppResult<LoginAssessment> {
+        let country = self.resolve_login_country(ip);
+        let country_new = country.as_deref().is_some_and(|c| {
+            matches!(
+                login_location_decision(user.last_login_country.as_deref(), c),
+                LoginLocationDecision::Alert
+            )
+        });
+
+        let device_hash = device_id
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(sha256_hex);
+        let device_new = match device_hash.as_deref() {
+            Some(h) => {
+                self.has_known_device(user.tenant_id, user.id).await?
+                    && !self.is_known_device(user.tenant_id, user.id, h).await?
+            }
+            None => false,
+        };
+
+        Ok(LoginAssessment {
+            country,
+            device_hash,
+            suspicious: country_new || device_new,
+        })
+    }
+
+    /// PMS-658: does the user have any recorded login device yet?
+    async fn has_known_device(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_login_devices WHERE tenant_id = $1 AND user_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(exists)
+    }
+
+    /// PMS-658: is this device hash already known for the user?
+    async fn is_known_device(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        device_hash: &str,
+    ) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_login_devices WHERE tenant_id = $1 AND user_id = $2 AND device_hash = $3)",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(device_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(exists)
+    }
+
+    /// PMS-658: record (or refresh) a device as known for the user.
+    async fn record_known_device(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        device_hash: &str,
+        user_agent: Option<&str>,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO user_login_devices (tenant_id, user_id, device_hash, user_agent)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (tenant_id, user_id, device_hash)
+            DO UPDATE SET last_seen_at = NOW(), user_agent = EXCLUDED.user_agent
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(device_hash)
+        .bind(user_agent)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// PMS-658: record the country + device of a cleared login (not suspicious,
+    /// or suspicious-then-approved) so the next login from here is recognised.
+    /// Best-effort: a write failure is logged, never fatal to the login.
+    async fn record_login_success(&self, user: &User, assessment: &LoginAssessment) {
+        if let Some(country) = assessment.country.as_deref() {
+            if user.last_login_country.as_deref() != Some(country) {
+                if let Err(e) = self
+                    .set_last_login_country(user.tenant_id, user.id, country)
+                    .await
+                {
+                    tracing::warn!(user_id = %user.id, error = %e, "PMS-658: failed to record login country");
+                }
+            }
+        }
+        if let Some(device_hash) = assessment.device_hash.as_deref() {
+            if let Err(e) = self
+                .record_known_device(user.tenant_id, user.id, device_hash, None)
+                .await
+            {
+                tracing::warn!(user_id = %user.id, error = %e, "PMS-658: failed to record login device");
+            }
+        }
+    }
+
+    /// PMS-658: mint a login-approval challenge - store the hashed 6-digit code,
+    /// email the plaintext, and (by returning `Ok`) signal `approval_required`.
+    /// Supersedes any prior unconsumed challenge so only the freshest code works.
+    /// The email send is detached so it never adds latency to or fails the login.
+    async fn issue_login_approval(
+        &self,
+        user: &User,
+        assessment: &LoginAssessment,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> AppResult<()> {
+        let code = crate::utils::crypto::generate_numeric_code(6);
+        let code_hash = sha256_hex(&code);
+        let expires_at = Utc::now() + Duration::minutes(15);
+
+        let mut tx = self.db.begin_with_tenant(user.tenant_id).await?;
+        sqlx::query(
+            "DELETE FROM login_approvals WHERE tenant_id = $1 AND user_id = $2 AND consumed_at IS NULL",
+        )
+        .bind(user.tenant_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO login_approvals
+                (tenant_id, user_id, code_hash, country, device_hash, ip_address, user_agent, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(user.tenant_id)
+        .bind(user.id)
+        .bind(&code_hash)
+        .bind(assessment.country.as_deref())
+        .bind(assessment.device_hash.as_deref())
+        .bind(ip)
+        .bind(user_agent)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let mailer = self.mailer.clone();
+        let email = user.email.clone();
+        let country = assessment.country.clone();
+        let ip_s = ip.map(str::to_string);
+        let ua = user_agent.unwrap_or("unknown").to_string();
+        let when = Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+        let user_id = user.id;
+        tokio::spawn(async move {
+            if let Err(e) = mailer
+                .send_login_approval_code(
+                    &email,
+                    &code,
+                    country.as_deref(),
+                    ip_s.as_deref(),
+                    &when,
+                    &ua,
+                )
+                .await
+            {
+                tracing::warn!(user_id = %user_id, error = %e, "PMS-658: failed to send login-approval email");
+            }
+        });
+        Ok(())
+    }
+
+    /// PMS-658: verify an `approval_code` re-POSTed to complete a challenged
+    /// login. On the freshest unconsumed, unexpired challenge: a matching code
+    /// marks it consumed and returns `Ok`; a mismatch increments `attempts` and,
+    /// past [`Self::LOGIN_APPROVAL_MAX_ATTEMPTS`], destroys the challenge (forcing
+    /// a fresh code). Absent / expired / over-limit challenges are `Unauthorized`.
+    async fn verify_login_approval(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        code: &str,
+    ) -> AppResult<()> {
+        let code_hash = sha256_hex(code.trim());
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(Uuid, String, i32)> = sqlx::query_as(
+            r#"
+            SELECT id, code_hash, attempts
+              FROM login_approvals
+             WHERE tenant_id = $1 AND user_id = $2
+               AND consumed_at IS NULL AND expires_at > NOW()
+             ORDER BY created_at DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((id, stored_hash, attempts)) = row else {
+            tx.commit().await?;
+            return Err(AppError::Unauthorized);
+        };
+
+        if stored_hash == code_hash {
+            sqlx::query("UPDATE login_approvals SET consumed_at = NOW() WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        } else {
+            let next = attempts + 1;
+            if next >= Self::LOGIN_APPROVAL_MAX_ATTEMPTS {
+                sqlx::query("DELETE FROM login_approvals WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                sqlx::query("UPDATE login_approvals SET attempts = $1 WHERE id = $2")
+                    .bind(next)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Err(AppError::Unauthorized)
+        }
     }
 
     /// True for addresses that can never map to a public country: loopback,
@@ -442,9 +745,49 @@ impl AuthService {
                     // is satisfied: no pre-2FA data leak.
                     user: None,
                     mfa_required: true,
+                    approval_required: false,
                 });
             }
         }
+
+        // PMS-658: suspicious-login gate. Only when enabled; otherwise fall
+        // through to the PMS-657 post-hoc alert below (unchanged). Runs after
+        // password + MFA, so a flagged sign-in is a genuine authenticated one.
+        let assessment = if self.login_approval_enabled {
+            let a = self
+                .assess_login(&user, audit_ip.as_deref(), request.device_id.as_deref())
+                .await?;
+            if a.suspicious {
+                match request.approval_code.as_deref() {
+                    Some(code) if !code.trim().is_empty() => {
+                        // Completing a challenge: the emailed code must match.
+                        self.verify_login_approval(user.tenant_id, user.id, code)
+                            .await?;
+                    }
+                    _ => {
+                        // First suspicious hit: email a code, withhold tokens.
+                        self.issue_login_approval(
+                            &user,
+                            &a,
+                            audit_ip.as_deref(),
+                            audit_ua.as_deref(),
+                        )
+                        .await?;
+                        return Ok(LoginResponse {
+                            access_token: String::new(),
+                            refresh_token: String::new(),
+                            expires_at: Utc::now(),
+                            user: None,
+                            mfa_required: false,
+                            approval_required: true,
+                        });
+                    }
+                }
+            }
+            Some(a)
+        } else {
+            None
+        };
 
         // Create session
         let session_id = self
@@ -462,11 +805,17 @@ impl AuthService {
 
         // Update last login
         self.update_last_login(user.tenant_id, user.id).await?;
-        // PMS-657: alert on a country-level login-location change (best-effort;
-        // never blocks the login). Borrow the audit IP/UA before the audit block
-        // below consumes them.
-        self.check_login_location(&user, audit_ip.as_deref(), audit_ua.as_deref())
-            .await;
+        // PMS-658/657: when the gate ran, record the cleared login's country +
+        // device so it is recognised next time; otherwise fall back to the
+        // PMS-657 post-hoc country alert (unchanged). Borrow the audit IP/UA
+        // before the audit block below consumes them.
+        match &assessment {
+            Some(a) => self.record_login_success(&user, a).await,
+            None => {
+                self.check_login_location(&user, audit_ip.as_deref(), audit_ua.as_deref())
+                    .await
+            }
+        }
 
         // Record the successful login (PMS-117 AC3). Out-of-band on its own
         // tenant-scoped tx; a log-write failure must not fail the login
@@ -490,6 +839,7 @@ impl AuthService {
             expires_at,
             user: Some(user.to_current_user()),
             mfa_required: false,
+            approval_required: false,
         })
     }
 
@@ -656,6 +1006,7 @@ impl AuthService {
                 // mirroring the password `login()` mfa_required branch.
                 user: None,
                 mfa_required: true,
+                approval_required: false,
             });
         }
 
@@ -678,6 +1029,7 @@ impl AuthService {
             expires_at,
             user: Some(user.to_current_user()),
             mfa_required: false,
+            approval_required: false,
         })
     }
 
