@@ -61,6 +61,34 @@ pub trait Mailer: Send + Sync {
         self.send_text(to, "New sign-in to your account", &body)
             .await
     }
+
+    /// PMS-658: email a single-use code to approve a suspicious sign-in that has
+    /// been held pending approval. The default composes a plain-text body and
+    /// routes it through [`Mailer::send_text`], so every mailer inherits it.
+    /// `country`/`ip` are optional (geoip may be off or the IP non-public).
+    async fn send_login_approval_code(
+        &self,
+        to: &str,
+        code: &str,
+        country: Option<&str>,
+        ip: Option<&str>,
+        when: &str,
+        user_agent: &str,
+    ) -> AppResult<()> {
+        let country = country.unwrap_or("unknown");
+        let ip = ip.unwrap_or("unknown");
+        let body = format!(
+            "We are holding a sign-in to your account until you confirm it was you.\n\n\
+             Country: {country}\n\
+             IP address: {ip}\n\
+             When: {when}\n\
+             Device: {user_agent}\n\n\
+             Enter this code to approve the sign-in:\n\n\
+             {code}\n\n\
+             The code expires in 15 minutes. If you did not just try to sign in, do not share this code, and change your password."
+        );
+        self.send_text(to, "Approve your sign-in", &body).await
+    }
 }
 
 /// Dev mailer. Writes the link to `tracing` so smoke tests work without

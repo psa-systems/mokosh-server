@@ -79,6 +79,9 @@ pub fn create_api_router(
     // PMS-657: IP -> country resolver for login-location alerts, built from
     // IP2LOCATION_DB_PATH in main.rs. `None` disables the feature.
     geoip: Option<Arc<crate::utils::geoip::GeoIpService>>,
+    // PMS-658: master switch for the suspicious-login notify-and-approve gate,
+    // from LOGIN_APPROVAL_ENABLED in main.rs. Off by default (can block logins).
+    login_approval_enabled: bool,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -106,7 +109,8 @@ pub fn create_api_router(
         client_origin.clone(),
         notifications_service.clone(),
     )
-    .with_geoip(geoip);
+    .with_geoip(geoip)
+    .with_login_approval(login_approval_enabled);
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
     // PMS-136: ContactService emails a `/portal/set-password` setup link when

@@ -49,6 +49,9 @@ pub struct AppConfig {
     /// client IP to a country for login-location alerts. `None` when unset: the
     /// alert feature is disabled (the server still boots normally).
     pub ip2location_db_path: Option<String>,
+    /// PMS-658: opt-in switch for the suspicious-login notify-and-approve gate
+    /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
+    pub login_approval_enabled: bool,
 }
 
 /// Dev-only fallback for `JWT_SECRET`. Accepted only in dev/test
@@ -231,6 +234,12 @@ impl AppConfig {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            // PMS-658: opt-in switch for the suspicious-login notify-and-approve
+            // gate. Default false because it can withhold a login; enable per
+            // deployment for a staged rollout.
+            login_approval_enabled: std::env::var("LOGIN_APPROVAL_ENABLED")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
         })
     }
 
@@ -537,6 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         encryption_key,
         config.bunyip_webhook_secret.into_bytes(),
         geoip,
+        config.login_approval_enabled,
     );
     let router = psa_router;
 

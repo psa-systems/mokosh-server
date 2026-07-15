@@ -375,6 +375,17 @@ pub struct LoginRequest {
     /// matched hash is removed from
     /// `users.mfa_recovery_codes_hashes`.
     pub recovery_code: Option<String>,
+    /// PMS-658: single-use 6-digit code from the "approve this sign-in"
+    /// email, supplied on the re-POST after a suspicious-login challenge
+    /// (`LoginResponse::approval_required`). Mirrors `mfa_code`.
+    pub approval_code: Option<String>,
+    /// PMS-658: stable per-browser device identifier generated and
+    /// persisted by the SPA. Hashed server-side into the known-device
+    /// set; a login from an unseen device is a suspicious-login signal.
+    /// Absent (older clients) means the device signal is inactive for
+    /// this request, so gating falls back to country only.
+    #[serde(default)]
+    pub device_id: Option<String>,
     /// Optional tenant hint sourced by the SPA from the request
     /// hostname (e.g. `acme.mokosh.example` -> tenant slug lookup
     /// -> tenant_id). Required to disambiguate multi-tenant
@@ -398,6 +409,12 @@ pub struct LoginResponse {
     pub user: Option<CurrentUser>,
     /// Whether MFA is required to complete login
     pub mfa_required: bool,
+    /// PMS-658: whether an "approve this sign-in" email challenge must be
+    /// cleared to finish login. Like `mfa_required`, the tokens are empty
+    /// and `user` is None while this is true; the client re-POSTs the same
+    /// login with `approval_code` to complete it.
+    #[serde(default)]
+    pub approval_required: bool,
 }
 
 /// Refresh token request
