@@ -20,6 +20,7 @@ pub mod mileage_tracking;
 pub mod notifications;
 pub mod portal;
 pub mod projects;
+pub mod quotes;
 pub mod reports;
 pub mod rmm;
 pub mod saved_reports;
