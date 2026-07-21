@@ -101,6 +101,10 @@ async fn role_route_coverage_matrix(pool: PgPool) {
     assert_matrix(&app, &tokens, "/api/v1/contracts", FINANCE_ROLES).await;
     assert_matrix(&app, &tokens, "/api/v1/rate-cards", FINANCE_ROLES).await;
 
+    // Quotes (PMS-672): a priced commercial document, so it joins the
+    // financial surfaces rather than getting a policy of its own.
+    assert_matrix(&app, &tokens, "/api/v1/quotes", FINANCE_ROLES).await;
+
     // Financial reports: the direct route and the CSV export side-door both
     // enforce the Invoices gate. Covers both the Revenue & A/R report
     // (/reports/billing) and Client Profitability (/reports/clients), which

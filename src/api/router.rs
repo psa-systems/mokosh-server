@@ -33,6 +33,7 @@ use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingS
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
+use crate::modules::quotes::{quotes_routes, QuotesService};
 use crate::modules::reports::{reports_routes, ReportsService};
 use crate::modules::rmm::{rmm_routes, RmmService};
 use crate::modules::saved_reports::{saved_reports_routes, SavedReportsService};
@@ -140,6 +141,7 @@ pub fn create_api_router(
     let calendar_service =
         CalendarService::with_dispatcher(db.clone(), notifications_service.clone());
     let contracts_service = ContractsService::new(db.clone());
+    let quotes_service = QuotesService::new(db.clone());
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
     let kb_service = KbService::new(db.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
@@ -293,6 +295,10 @@ pub fn create_api_router(
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
         .merge(billing_routes(billing_service))
+        // Quotes: the sales document that precedes a Project, plus its
+        // line items. Shares the billing module gate + finance role with
+        // invoices. PMS-672.
+        .merge(quotes_routes(quotes_service))
         // Assets / CMDB: types, assets, relationships, config items,
         // credential vault, audit log. PMS-72.
         .merge(assets_routes(assets_service))
