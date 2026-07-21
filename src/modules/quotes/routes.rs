@@ -43,6 +43,10 @@ pub fn quotes_routes(service: QuotesService) -> Router {
             "/quotes/{quote_id}",
             get(get_quote).put(update_quote).delete(cancel_quote),
         )
+        // PMS-673: issue the approved quote to the client. Internal
+        // sign-off stays on the existing `/quotes/{id}/approvals`
+        // surface, which this module does not touch.
+        .route("/quotes/{quote_id}/send", post(send_quote))
         .route("/quotes/{quote_id}/lines", post(add_line))
         .route(
             "/quotes/{quote_id}/lines/{line_id}",
@@ -166,6 +170,22 @@ async fn delete_line(
     let quote = state
         .service
         .delete_line(user.tenant(), quote_id, line_id)
+        .await?;
+    Ok(Json(quote))
+}
+
+/// Send an approved quote to the client (PMS-673). 409 unless the quote
+/// is internally `approved`; see [`QuotesService::send_quote`].
+async fn send_quote(
+    State(state): State<QuotesRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(quote_id): Path<Uuid>,
+) -> AppResult<Json<QuoteResponse>> {
+    let quote = state
+        .service
+        .send_quote(user.tenant(), quote_id, &ctx)
         .await?;
     Ok(Json(quote))
 }
