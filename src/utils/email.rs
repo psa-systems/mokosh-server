@@ -35,6 +35,45 @@ pub trait Mailer: Send + Sync {
     /// a recurring template; reserve this for one-off bodies.
     async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()>;
 
+    /// PMS-673: tell a client contact that a quote is ready for their
+    /// sign-off, linking them to the portal where they accept or decline.
+    /// The default composes a plain-text body and routes it through
+    /// [`Mailer::send_text`], so every mailer inherits it without a
+    /// per-impl override.
+    ///
+    /// `valid_until` is optional because a quote need not carry an expiry;
+    /// when absent the body simply omits the deadline line rather than
+    /// printing a placeholder date the customer might act on.
+    async fn send_quote_ready(
+        &self,
+        to: &str,
+        quote_number: &str,
+        title: &str,
+        total: &str,
+        valid_until: Option<&str>,
+        portal_link: &str,
+    ) -> AppResult<()> {
+        let deadline = match valid_until {
+            Some(d) => format!("This quote is valid until {d}.\n\n"),
+            None => String::new(),
+        };
+        let body = format!(
+            "A quote is ready for your review and approval.\n\n\
+             Quote: {quote_number}\n\
+             For: {title}\n\
+             Total: {total}\n\n\
+             {deadline}\
+             Review the full scope and accept or decline it here:\n\n\
+             {portal_link}"
+        );
+        self.send_text(
+            to,
+            &format!("Quote {quote_number} for your approval"),
+            &body,
+        )
+        .await
+    }
+
     /// PMS-657: alert the user that a sign-in came from a country they have not
     /// signed in from before. The default composes a plain-text body and routes
     /// it through [`Mailer::send_text`], so every mailer inherits it without a
