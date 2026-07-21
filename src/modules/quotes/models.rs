@@ -286,6 +286,48 @@ pub struct PortalQuoteDecisionRequest {
     pub notes: Option<String>,
 }
 
+/// Body of `POST /quotes/{id}/convert` (PMS-674).
+///
+/// Carries only the fields a quote cannot supply. Name, scope, client,
+/// and budget are mapped from the quote itself, so they are deliberately
+/// absent here: letting the caller restate them would allow the project
+/// to disagree with the quote the client signed.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+#[validate(schema(function = validate_project_dates))]
+pub struct ConvertQuoteRequest {
+    pub project_manager_id: Option<Uuid>,
+    pub start_date: Option<NaiveDate>,
+    pub target_end_date: Option<NaiveDate>,
+    /// Defaults to `fixed_price` when omitted: an accepted quote IS a
+    /// fixed price the client agreed to, so inheriting the `projects`
+    /// column default of `time_and_materials` would quietly contradict
+    /// what was signed.
+    #[validate(custom(function = validate_billing_method))]
+    pub billing_method: Option<String>,
+    pub budget_hours: Option<Decimal>,
+}
+
+fn validate_billing_method(value: &str) -> Result<(), validator::ValidationError> {
+    // Mirrors the CHECK on `projects.billing_method`; rejected here so a
+    // bad value is a 422 with a field name rather than a 500 from the
+    // database.
+    match value {
+        "fixed_price" | "time_and_materials" | "not_billable" => Ok(()),
+        _ => Err(validator::ValidationError::new("invalid_billing_method")),
+    }
+}
+
+fn validate_project_dates(req: &ConvertQuoteRequest) -> Result<(), validator::ValidationError> {
+    if let (Some(start), Some(end)) = (req.start_date, req.target_end_date) {
+        if end < start {
+            return Err(validator::ValidationError::new(
+                "target_end_date_before_start_date",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The client's sign-off, as handed from the portal route to the service
 /// (PMS-673).
 ///
