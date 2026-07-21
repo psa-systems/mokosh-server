@@ -47,6 +47,8 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         // sign-off stays on the existing `/quotes/{id}/approvals`
         // surface, which this module does not touch.
         .route("/quotes/{quote_id}/send", post(send_quote))
+        // PMS-674: the accepted quote becomes the Project the MSP works.
+        .route("/quotes/{quote_id}/convert", post(convert_quote))
         .route("/quotes/{quote_id}/lines", post(add_line))
         .route(
             "/quotes/{quote_id}/lines/{line_id}",
@@ -186,6 +188,29 @@ async fn send_quote(
     let quote = state
         .service
         .send_quote(user.tenant(), quote_id, &ctx)
+        .await?;
+    Ok(Json(quote))
+}
+
+/// Convert an accepted quote into a Project (PMS-674).
+///
+/// 409 unless the client has accepted. Converting an already-converted
+/// quote is not an error: it returns the same `converted_project_id`, so
+/// a double-clicked Convert button cannot produce two projects. The body
+/// is optional because every field on it is.
+async fn convert_quote(
+    State(state): State<QuotesRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(quote_id): Path<Uuid>,
+    body: Option<Json<ConvertQuoteRequest>>,
+) -> AppResult<Json<QuoteResponse>> {
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    request.validate()?;
+    let quote = state
+        .service
+        .convert_quote(user.tenant(), quote_id, &request, &ctx)
         .await?;
     Ok(Json(quote))
 }
