@@ -227,14 +227,19 @@ async fn seed_change_request(pool: &PgPool, admin_id: Uuid) -> Uuid {
 }
 
 async fn seed_quote(pool: &PgPool, admin_id: Uuid) -> Uuid {
+    // PMS-671 made `company_id` mandatory: a quote is always for a client,
+    // because the portal scopes every client-visible read by the signed-in
+    // contact's company.
+    let company_id = seed_company(pool).await;
     let id = Uuid::new_v4();
     sqlx::query(
         r#"INSERT INTO quotes
-           (id, tenant_id, title, summary, requested_by_id, total_cents, currency, status)
-           VALUES ($1, $2, 'Q1 hosting', 'Tier-2 monthly', $3, 30000, 'USD', 'submitted')"#,
+           (id, tenant_id, company_id, title, summary, requested_by_id, total, currency, status)
+           VALUES ($1, $2, $3, 'Q1 hosting', 'Tier-2 monthly', $4, 300.00, 'USD', 'submitted')"#,
     )
     .bind(id)
     .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
     .bind(admin_id)
     .execute(pool)
     .await
