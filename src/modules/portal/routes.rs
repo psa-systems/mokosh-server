@@ -19,7 +19,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
-use super::rate_limit::PortalLoginLimiter;
+use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalLoginRequest,
@@ -27,6 +27,9 @@ use super::{
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
+use crate::modules::quotes::{
+    ClientDecision, PortalQuoteDecisionRequest, QuoteResponse, QuotesService,
+};
 use crate::modules::tickets::{TicketNoteResponse, TicketResponse, TicketService};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -37,12 +40,17 @@ pub struct PortalRouterState {
     pub tickets: Arc<TicketService>,
     pub kb: Arc<KbService>,
     pub billing: Arc<BillingService>,
+    pub quotes: Arc<QuotesService>,
     /// Layered (per-IP + per-(tenant_slug, email)) login rate limiter
     /// (PMS-501). Lives for the lifetime of the router so quota state
     /// survives across requests. The check runs inline at the top of the
     /// `login` handler so the limiter can see both source IP and the
     /// `(tenant_slug, email)` from the deserialized request body.
     pub login_limiter: Arc<PortalLoginLimiter>,
+    /// PMS-673: throttles the quote accept / decline routes. Separate from
+    /// `login_limiter` so a burst of decisions cannot lock a contact out of
+    /// logging back in.
+    pub decision_limiter: Arc<PortalDecisionLimiter>,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
@@ -53,13 +61,16 @@ pub fn portal_routes(
     tickets: TicketService,
     kb: KbService,
     billing: BillingService,
+    quotes: QuotesService,
 ) -> Router {
     let state = PortalRouterState {
         service: Arc::new(service.clone()),
         tickets: Arc::new(tickets),
         kb: Arc::new(kb),
         billing: Arc::new(billing),
+        quotes: Arc::new(quotes),
         login_limiter: PortalLoginLimiter::new(),
+        decision_limiter: PortalDecisionLimiter::new(),
     };
     let mw = PortalAuthMiddleware::new(service);
 
@@ -87,6 +98,14 @@ pub fn portal_routes(
         )
         .route("/invoices", get(list_invoices))
         .route("/invoices/{invoice_id}", get(get_invoice))
+        // PMS-673: client-facing quote sign-off. Reads are scoped to the
+        // contact's own company and to statuses that were actually issued;
+        // accept / decline are the client's decision and are the only way
+        // a quote reaches `accepted` / `declined`.
+        .route("/quotes", get(list_quotes))
+        .route("/quotes/{quote_id}", get(get_quote))
+        .route("/quotes/{quote_id}/accept", post(accept_quote))
+        .route("/quotes/{quote_id}/decline", post(decline_quote))
         .route("/kb", get(list_kb))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
@@ -364,4 +383,118 @@ async fn create_ticket_note(
         created_by_contact_id: note.created_by_contact_id,
         created_at: note.created_at,
     }))
+}
+
+// ============================================================================
+// PMS-673: client-facing quote sign-off.
+// ============================================================================
+
+async fn list_quotes(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<QuoteResponse>>> {
+    // The company scope is forced from the authenticated `CurrentContact`,
+    // never a query param, so a contact only ever sees its own company's
+    // quotes. The service further restricts to issued statuses.
+    // SAFETY (PMS-285): `contact.tenant()` wraps a verified portal-JWT
+    // claim, the caller's own authenticated tenant; portal runs on contact
+    // sessions rather than `CurrentUser`, so it cannot use `TenantScoped`
+    // and `from_trusted` is the sanctioned bridge (see the invoice + KB
+    // notes above).
+    let (items, total) = state
+        .quotes
+        .list_quotes_for_company(contact.tenant(), contact.company_id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
+}
+
+async fn get_quote(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(quote_id): Path<Uuid>,
+) -> AppResult<Json<QuoteResponse>> {
+    // A quote belonging to another company, or one not yet issued, comes
+    // back 404 rather than 403 so the portal never confirms that it
+    // exists. Same posture as `get_invoice`.
+    let quote = state
+        .quotes
+        .get_quote_for_company(contact.tenant(), contact.company_id, quote_id)
+        .await?;
+    Ok(Json(quote))
+}
+
+async fn accept_quote(
+    state: State<PortalRouterState>,
+    addr: ConnectInfo<SocketAddr>,
+    auth: RequirePortalAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    path: Path<Uuid>,
+    body: Option<Json<PortalQuoteDecisionRequest>>,
+) -> Result<Response, AppError> {
+    decide(state, addr, auth, ctx, path, body, true).await
+}
+
+async fn decline_quote(
+    state: State<PortalRouterState>,
+    addr: ConnectInfo<SocketAddr>,
+    auth: RequirePortalAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    path: Path<Uuid>,
+    body: Option<Json<PortalQuoteDecisionRequest>>,
+) -> Result<Response, AppError> {
+    decide(state, addr, auth, ctx, path, body, false).await
+}
+
+/// Shared body of accept / decline. The two routes differ only in the
+/// outcome they record, so the rate-limit check, validation, and audit
+/// context handling live in one place.
+///
+/// The JSON body is optional: accepting with nothing to say is the common
+/// case, and requiring `{}` would be a needless 415 for that caller.
+async fn decide(
+    State(state): State<PortalRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(quote_id): Path<Uuid>,
+    body: Option<Json<PortalQuoteDecisionRequest>>,
+    accept: bool,
+) -> Result<Response, AppError> {
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    request.validate()?;
+
+    if let Err(retry_after) = state.decision_limiter.check(addr.ip(), contact.id) {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate_limited",
+                "message": "Too many quote decisions, please try again shortly",
+                "retry_after_seconds": retry_after,
+            })),
+        )
+            .into_response();
+        let h = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+            h.insert(header::RETRY_AFTER, v);
+        }
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(resp);
+    }
+
+    let decision = ClientDecision {
+        company_id: contact.company_id,
+        contact_id: contact.id,
+        accept,
+        notes: request.notes,
+    };
+    let quote = state
+        .quotes
+        .decide_quote(contact.tenant(), quote_id, &decision, &ctx)
+        .await?;
+    Ok(Json(quote).into_response())
 }

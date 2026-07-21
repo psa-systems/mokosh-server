@@ -121,7 +121,7 @@ pub fn create_api_router(
     let contact_service =
         ContactService::with_mailer(db.clone(), mailer.clone(), client_origin.clone());
     let ticket_service =
-        TicketService::with_dispatcher(db.clone(), mailer, notifications_service.clone());
+        TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
     // PMS-157: first-visit demo seeding. Holds its own clones of the
     // contacts + tickets services so it can drive the real create paths;
     // wired below as a middleware that runs after auth populates AuthState.
@@ -141,7 +141,15 @@ pub fn create_api_router(
     let calendar_service =
         CalendarService::with_dispatcher(db.clone(), notifications_service.clone());
     let contracts_service = ContractsService::new(db.clone());
-    let quotes_service = QuotesService::new(db.clone());
+    // PMS-673: quotes mail the client their sign-off link and notify the
+    // owner when the client decides, so the service carries the mailer,
+    // the dispatcher, and the portal origin those links are built from.
+    let quotes_service = QuotesService::with_delivery(
+        db.clone(),
+        mailer.clone(),
+        notifications_service.clone(),
+        client_origin.clone(),
+    );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
     let kb_service = KbService::new(db.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
@@ -308,7 +316,7 @@ pub fn create_api_router(
         .merge(invitations_routes(invitations_service))
         // Notifications: channels + templates + prefs + inbox + rules
         // + dispatcher. PMS-86.
-        .merge(notifications_routes(notifications_service))
+        .merge(notifications_routes(notifications_service.clone()))
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
         // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
@@ -397,6 +405,12 @@ pub fn create_api_router(
     let portal_ticket_service = TicketService::new(db.clone());
     let portal_kb_service = KbService::new(db.clone());
     let portal_billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
+    let portal_quotes_service = QuotesService::with_delivery(
+        db.clone(),
+        shared_mailer.clone(),
+        notifications_service.clone(),
+        client_origin.clone(),
+    );
     let portal_api = Router::new()
         .route("/health", get(health_check))
         .merge(portal_routes(
@@ -404,6 +418,7 @@ pub fn create_api_router(
             portal_ticket_service,
             portal_kb_service,
             portal_billing_service,
+            portal_quotes_service,
         ))
         // PMS-483: portal-side ticket-note attachments. Same routes as
         // the agent surface, but behind `RequirePortalAuth` and
