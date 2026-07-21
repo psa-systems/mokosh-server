@@ -73,6 +73,60 @@ impl PortalLoginLimiter {
     }
 }
 
+/// Per-(IP, contact) limiter for the PMS-673 quote decision routes.
+///
+/// Accepting or declining a quote is a commercial commitment and is not
+/// reversible from the client side, so the routes are throttled to blunt
+/// both a runaway client retrying a submit and an attacker who has a
+/// session and is spraying quote ids. It is a separate limiter from
+/// [`PortalLoginLimiter`] rather than a reused one because the buckets
+/// mean different things: login throttles credential guessing against an
+/// unauthenticated caller, this throttles actions by an already
+/// authenticated contact, and sharing quota would let a burst of
+/// decisions lock the contact out of logging back in.
+///
+/// Same in-memory, per-replica caveat as the login limiter: it does not
+/// survive a restart and does not coordinate across replicas. The durable
+/// guarantee is the state machine, which only accepts a decision from
+/// `sent` and 409s every repeat.
+pub struct PortalDecisionLimiter {
+    by_ip: IpLimiter,
+    by_contact: AccountLimiter,
+    clock: DefaultClock,
+}
+
+impl PortalDecisionLimiter {
+    pub fn new() -> Arc<Self> {
+        // Deliberately roomier than login: a legitimate contact clicking
+        // through several quotes in one sitting must not be throttled,
+        // while a script hammering the route still is.
+        let ip_quota = Quota::per_minute(NonZeroU32::new(30).expect("30 is non-zero"));
+        let contact_quota = Quota::per_minute(NonZeroU32::new(10).expect("10 is non-zero"));
+        Arc::new(Self {
+            by_ip: RateLimiter::keyed(ip_quota),
+            by_contact: RateLimiter::keyed(contact_quota),
+            clock: DefaultClock::default(),
+        })
+    }
+
+    /// Returns `Err(retry_after_seconds)` if either bucket is empty, with
+    /// the larger of the two refill waits.
+    pub fn check(&self, ip: IpAddr, contact_id: uuid::Uuid) -> Result<(), u64> {
+        let mut wait: Option<u64> = None;
+        if let Err(neg) = self.by_ip.check_key(&ip) {
+            wait = Some(seconds_until(&neg, &self.clock));
+        }
+        if let Err(neg) = self.by_contact.check_key(&contact_id.to_string()) {
+            let secs = seconds_until(&neg, &self.clock);
+            wait = Some(wait.map(|w| w.max(secs)).unwrap_or(secs));
+        }
+        match wait {
+            Some(w) => Err(w),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Normalised `(tenant_slug, email)` bucket key. Both halves are trimmed
 /// and lowercased so casing/whitespace cannot dodge the quota; a NUL byte
 /// separates them so `("ab", "c")` and `("a", "bc")` never collide.
