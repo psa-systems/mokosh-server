@@ -87,6 +87,14 @@ test:
 test-integration: ensure-env
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --tests -- --test-threads=4
 
+# Verify the demo-critical path only: demo-data seeding (seed_demo) and the
+# tenant import/export round-trip (data_transfer). A fast, targeted subset of
+# `test-integration` for re-checking before building the demo (PMS-677). Same
+# Postgres-backed setup as `test-integration`.
+[group: 'test']
+verify-demo: ensure-env
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --test seed_demo --test data_transfer -- --test-threads=4
+
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
 [group: 'test']
