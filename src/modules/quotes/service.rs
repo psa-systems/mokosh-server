@@ -986,6 +986,173 @@ impl QuotesService {
         }
     }
 
+    // ========================================================================
+    // PMS-674: convert an accepted quote into a Project.
+    // ========================================================================
+
+    /// Turn an accepted quote into a Project, in one transaction.
+    ///
+    /// This is the "upon approval, it becomes a project" step: the quote
+    /// supplies the client, the name, the scope, and the budget, and the
+    /// request supplies only what a quote cannot know (who runs it, when,
+    /// and how it bills).
+    ///
+    /// **Idempotent.** The quote row is taken with `SELECT ... FOR UPDATE`
+    /// before anything is read off it, so a second concurrent request
+    /// blocks until the first commits and then observes `converted` and
+    /// returns the existing link instead of building a second project.
+    /// The row lock, not the `UNIQUE (converted_project_id)` constraint,
+    /// is what makes this safe: that constraint stops two quotes pointing
+    /// at one project, which is a different failure. It remains as a
+    /// backstop.
+    ///
+    /// **Atomic.** The project insert and the quote's transition to
+    /// `converted` share one transaction, so a failure on either leaves
+    /// the quote exactly as it was rather than marked converted with no
+    /// project behind it.
+    ///
+    /// Returns the updated quote rather than the project: every other
+    /// route in this module returns a `QuoteResponse`, and the response
+    /// carries `converted_project_id`, so a caller that wants the project
+    /// has the id to fetch it.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn convert_quote(
+        &self,
+        tenant_id: TenantId,
+        quote_id: Uuid,
+        request: &ConvertQuoteRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<QuoteResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Serialise concurrent conversions of the same quote. Everything
+        // below reads from this locked row.
+        let row = sqlx::query_as::<_, QuoteForConversion>(
+            r#"
+            SELECT status, converted_project_id, company_id, title, description, total
+            FROM quotes
+            WHERE tenant_id = $1 AND id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
+        let status = QuoteStatus::from_str(&row.status).unwrap_or(QuoteStatus::Draft);
+
+        // Already converted: return the existing link rather than 409ing.
+        // A double-clicked Convert button is not an error, and the caller
+        // gets the same `converted_project_id` either way.
+        if status == QuoteStatus::Converted && row.converted_project_id.is_some() {
+            drop(tx);
+            return self.get_quote(tenant_id, quote_id).await;
+        }
+
+        if status != QuoteStatus::Accepted {
+            return Err(AppError::Conflict(format!(
+                "Quote in status '{}' cannot be converted; the client must accept it first",
+                status.as_str()
+            )));
+        }
+
+        let project_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO projects (
+                id, tenant_id, name, description, company_id,
+                project_type, project_type_id, status, project_manager_id,
+                start_date, target_end_date, budget_hours, budget_amount,
+                billing_method, is_billable
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                'client',
+                -- Same lookup resolution `create_project` does (PMS-322);
+                -- NULL when the tenant has no matching type row.
+                (SELECT id FROM project_types WHERE tenant_id = $2 AND name = 'client'),
+                'planning', $6, $7, $8, $9, $10, $11, TRUE
+            )
+            "#,
+        )
+        .bind(project_id)
+        .bind(tenant_id)
+        .bind(&row.title)
+        .bind(&row.description)
+        .bind(row.company_id)
+        .bind(request.project_manager_id)
+        .bind(request.start_date)
+        .bind(request.target_end_date)
+        .bind(request.budget_hours)
+        .bind(row.total)
+        .bind(request.billing_method.as_deref().unwrap_or("fixed_price"))
+        .execute(&mut *tx)
+        .await?;
+
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(quote_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE quotes
+            SET status = 'converted', converted_project_id = $3
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(quote_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        // Two audit rows: the project came into existence, and the quote
+        // changed state. Reading either entity's history alone should show
+        // what happened to it.
+        let project_after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM projects t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "projects",
+            Some(project_id),
+            None,
+            project_after,
+        )
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "quotes",
+            Some(quote_id),
+            before,
+            after,
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.get_quote(tenant_id, quote_id).await
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_line(
         &self,
@@ -1104,6 +1271,19 @@ const QUOTE_COLUMNS: &str = r#"id, tenant_id, quote_number, company_id, billing_
        subtotal, tax_amount, total, currency, requested_by_id,
        sent_at, decided_at, decided_by_contact_id, decision_notes,
        converted_project_id, created_at, updated_at"#;
+
+/// The fields `convert_quote` reads off the `FOR UPDATE`-locked quote
+/// row. A named struct rather than a tuple so the field meanings survive
+/// the trip to the INSERT below.
+#[derive(sqlx::FromRow)]
+struct QuoteForConversion {
+    status: String,
+    converted_project_id: Option<Uuid>,
+    company_id: Uuid,
+    title: String,
+    description: Option<String>,
+    total: Decimal,
+}
 
 #[derive(sqlx::FromRow)]
 struct QuoteLineRow {
