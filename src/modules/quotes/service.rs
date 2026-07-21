@@ -6,13 +6,17 @@
 //! `docs/dev-docs/codebase-state.md` cross-cutting issue #8), so the
 //! discipline is deliberate rather than incidental.
 
-use chrono::Utc;
+use std::sync::Arc;
+
+use chrono::{NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
+use crate::modules::notifications::NotificationsService;
+use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -23,11 +27,46 @@ use super::models::*;
 #[derive(Clone)]
 pub struct QuotesService {
     db: Database,
+    /// Mailer used to send the client their sign-off link (PMS-673).
+    /// `None` for the plain `new()` constructor so non-production callers
+    /// and unit tests stay compilable; sending then skips the mail and
+    /// still performs the state transition, matching how `TicketService`
+    /// treats its optional dispatcher.
+    mailer: Option<Arc<dyn Mailer>>,
+    /// Rule-driven fanout used to tell the quote's owner that the client
+    /// decided. Optional for the same reason as `mailer`.
+    notifications: Option<NotificationsService>,
+    /// Base origin of the client portal, used to build the sign-off link
+    /// in the outbound mail.
+    portal_origin: String,
 }
 
 impl QuotesService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            mailer: None,
+            notifications: None,
+            portal_origin: String::new(),
+        }
+    }
+
+    /// Full constructor used by `create_api_router`: adds the mailer that
+    /// carries the sign-off link to the client, the notifications
+    /// dispatcher that tells staff about the client's decision, and the
+    /// portal origin those links are built from.
+    pub fn with_delivery(
+        db: Database,
+        mailer: Arc<dyn Mailer>,
+        notifications: NotificationsService,
+        portal_origin: String,
+    ) -> Self {
+        Self {
+            db,
+            mailer: Some(mailer),
+            notifications: Some(notifications),
+            portal_origin,
+        }
     }
 
     /// Allocate the next gapless, per-tenant quote number inside the
@@ -613,6 +652,340 @@ impl QuotesService {
         Ok(())
     }
 
+    // ========================================================================
+    // PMS-673: issue to the client, and the client's sign-off.
+    // ========================================================================
+
+    /// Send an approved quote to the client.
+    ///
+    /// Allowed only from `approved`: internal sign-off is the gate, and it
+    /// runs on the existing polymorphic approvals surface
+    /// (`/quotes/{id}/approvals`), which this method deliberately does not
+    /// touch. Moves the quote to `sent`, stamps `sent_at`, and emails the
+    /// billing contact a link to the portal view where they accept or
+    /// decline.
+    ///
+    /// The mail is sent AFTER the transaction commits. A mail failure must
+    /// not roll back a transition the customer may already have been told
+    /// about out of band, and the reverse (committing a `sent` quote whose
+    /// mail silently vanished) is recoverable by resending, so the
+    /// transition is the durable half.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn send_quote(
+        &self,
+        tenant_id: TenantId,
+        quote_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<QuoteResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let current = Self::status_of(&mut tx, tenant_id, quote_id).await?;
+        if current != QuoteStatus::Approved {
+            return Err(AppError::Conflict(format!(
+                "Quote in status '{}' cannot be sent; it must be internally approved first",
+                current.as_str()
+            )));
+        }
+
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(quote_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        sqlx::query(
+            "UPDATE quotes SET status = 'sent', sent_at = NOW() WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(quote_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "quotes",
+            Some(quote_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+
+        let quote = self.get_quote(tenant_id, quote_id).await?;
+        self.mail_quote_to_client(tenant_id, &quote).await;
+        Ok(quote)
+    }
+
+    /// Best-effort delivery of the sign-off link.
+    ///
+    /// Swallows its errors on purpose: the quote is already `sent` and a
+    /// bounced mail must not surface as a 500 that makes the caller retry
+    /// a transition that already happened. Failures are logged so a
+    /// missing mail is diagnosable.
+    async fn mail_quote_to_client(&self, tenant_id: TenantId, quote: &QuoteResponse) {
+        let Some(mailer) = self.mailer.as_ref() else {
+            return;
+        };
+        let Some(contact_id) = quote.billing_contact_id else {
+            tracing::info!(
+                quote_id = %quote.id,
+                "quote sent with no billing contact; no client mail dispatched"
+            );
+            return;
+        };
+
+        let email: Option<String> = match self.db.begin_with_tenant(tenant_id).await {
+            Ok(mut tx) => {
+                sqlx::query_scalar("SELECT email FROM contacts WHERE tenant_id = $1 AND id = $2")
+                    .bind(tenant_id)
+                    .bind(contact_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not open tx to resolve quote billing contact");
+                None
+            }
+        };
+        let Some(email) = email.filter(|e| !e.is_empty()) else {
+            tracing::info!(
+                quote_id = %quote.id,
+                "quote billing contact has no email; no client mail dispatched"
+            );
+            return;
+        };
+
+        let link = format!(
+            "{}/portal/quotes/{}",
+            self.portal_origin.trim_end_matches('/'),
+            quote.id
+        );
+        let number = quote.quote_number.as_deref().unwrap_or("(unnumbered)");
+        let valid_until = quote.valid_until.map(|d| d.to_string());
+        if let Err(e) = mailer
+            .send_quote_ready(
+                &email,
+                number,
+                &quote.title,
+                &quote.total.to_string(),
+                valid_until.as_deref(),
+                &link,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, quote_id = %quote.id, "quote sign-off mail failed to send");
+        }
+    }
+
+    /// List the quotes a portal contact's company may see.
+    ///
+    /// Scoped by BOTH the contact's tenant and their company, and further
+    /// restricted to the statuses that have actually been issued. A
+    /// `draft`, `submitted`, `approved`, or `rejected` quote is internal
+    /// working state and must never reach a customer; `cancelled` is
+    /// withdrawn and equally not theirs to see.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_quotes_for_company(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<QuoteResponse>, u64)> {
+        let offset = pagination.offset() as i64;
+        let limit = pagination.limit() as i64;
+        let order_by = pagination.order_by("created_at", &["created_at", "valid_until", "total"]);
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, QuoteRow>(&format!(
+            r#"
+            SELECT {QUOTE_COLUMNS}
+            FROM quotes
+            WHERE tenant_id = $1 AND company_id = $4 AND status = ANY($5)
+            ORDER BY {order_by}
+            LIMIT $2 OFFSET $3
+            "#
+        ))
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .bind(company_id)
+        .bind(CLIENT_VISIBLE_STATUSES)
+        .fetch_all(&mut *tx)
+        .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM quotes WHERE tenant_id = $1 AND company_id = $2 AND status = ANY($3)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(CLIENT_VISIBLE_STATUSES)
+        .fetch_one(&mut *tx)
+        .await?;
+        drop(tx);
+
+        let mut resp: Vec<QuoteResponse> = rows.into_iter().map(Into::into).collect();
+        self.enrich_quotes(tenant_id, &mut resp).await?;
+        Ok((resp, total as u64))
+    }
+
+    /// Fetch one quote for a portal contact.
+    ///
+    /// Returns 404 rather than 403 when the quote belongs to another
+    /// company or has not been issued, so the portal never confirms the
+    /// existence of a quote the caller may not see. Mirrors the portal
+    /// invoice route's posture.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_quote_for_company(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        quote_id: Uuid,
+    ) -> AppResult<QuoteResponse> {
+        let quote = self.get_quote(tenant_id, quote_id).await?;
+        if quote.company_id != company_id || !quote.status.is_client_visible() {
+            return Err(AppError::NotFound("Quote".to_string()));
+        }
+        Ok(quote)
+    }
+
+    /// Record the client's accept / decline decision.
+    ///
+    /// Valid only from `sent`: an already-decided quote 409s, so a
+    /// double-click or a stale browser tab cannot flip a decision, and an
+    /// expired quote cannot be accepted at all.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn decide_quote(
+        &self,
+        tenant_id: TenantId,
+        quote_id: Uuid,
+        decision: &ClientDecision,
+        ctx: &AuditCtx,
+    ) -> AppResult<QuoteResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Company scope first, and as a 404: a contact must not be able to
+        // learn that another company's quote exists by watching the error
+        // change from 404 to 409.
+        let row: Option<(Uuid, String, Option<NaiveDate>)> = sqlx::query_as(
+            "SELECT company_id, status, valid_until FROM quotes WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (row_company, raw_status, valid_until) =
+            row.ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
+        let stored = QuoteStatus::from_str(&raw_status).unwrap_or(QuoteStatus::Draft);
+        if row_company != decision.company_id || !stored.is_client_visible() {
+            return Err(AppError::NotFound("Quote".to_string()));
+        }
+
+        // Read-time expiry: a quote past `valid_until` is treated as
+        // expired without a sweeper having to have run.
+        let effective = effective_status(stored, valid_until, Utc::now().date_naive());
+        if effective != QuoteStatus::Sent {
+            return Err(AppError::Conflict(format!(
+                "Quote in status '{}' can no longer be decided",
+                effective.as_str()
+            )));
+        }
+
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(quote_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let next = if decision.accept {
+            QuoteStatus::Accepted
+        } else {
+            QuoteStatus::Declined
+        };
+        sqlx::query(
+            r#"
+            UPDATE quotes
+            SET status = $3, decided_at = NOW(),
+                decided_by_contact_id = $4, decision_notes = $5
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .bind(next.as_str())
+        .bind(decision.contact_id)
+        .bind(decision.notes.as_deref())
+        .execute(&mut *tx)
+        .await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(quote_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "quotes",
+            Some(quote_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+
+        let quote = self.get_quote(tenant_id, quote_id).await?;
+        self.notify_owner_of_decision(tenant_id, &quote, next).await;
+        Ok(quote)
+    }
+
+    /// Best-effort "your client decided" fanout to the quote's owner.
+    /// Errors are logged, never surfaced: the decision is committed and
+    /// must not be undone by a notification failure.
+    async fn notify_owner_of_decision(
+        &self,
+        tenant_id: TenantId,
+        quote: &QuoteResponse,
+        outcome: QuoteStatus,
+    ) {
+        let Some(notifications) = self.notifications.as_ref() else {
+            return;
+        };
+        let event_type = match outcome {
+            QuoteStatus::Accepted => "quote.accepted",
+            _ => "quote.declined",
+        };
+        let context = serde_json::json!({
+            "quote_id": quote.id,
+            "quote_number": quote.quote_number,
+            "title": quote.title,
+            "total": quote.total.to_string(),
+            "company_id": quote.company_id,
+            "company_name": quote.company_name,
+            "decision_notes": quote.decision_notes,
+            "recipient_user_id": quote.requested_by_id,
+        });
+        if let Err(e) = notifications
+            .dispatch(tenant_id, event_type, &context)
+            .await
+        {
+            tracing::warn!(error = %e, quote_id = %quote.id, "quote decision notification failed");
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_line(
         &self,
@@ -699,6 +1072,32 @@ impl QuotesService {
     }
 }
 
+/// Statuses a portal contact may see, as the bind for `status = ANY($n)`.
+/// Kept in step with [`QuoteStatus::is_client_visible`]; the unit tests
+/// assert the two agree so a new status cannot be added to one and
+/// forgotten in the other.
+const CLIENT_VISIBLE_STATUSES: &[&str] = &["sent", "accepted", "declined", "expired", "converted"];
+
+/// Derive the status a reader should see, applying expiry at read time.
+///
+/// A `sent` quote whose `valid_until` has passed reads as `expired`
+/// without any sweeper having run. Doing it here rather than in a
+/// scheduled job means there is no window in which an expired quote is
+/// still acceptable, and no background machinery to operate; the cost is
+/// that the stored status stays `sent` until something writes the row.
+/// Only `sent` is reinterpreted: a quote already accepted or converted
+/// does not expire retroactively just because its validity date passed.
+fn effective_status(
+    stored: QuoteStatus,
+    valid_until: Option<NaiveDate>,
+    today: NaiveDate,
+) -> QuoteStatus {
+    match (stored, valid_until) {
+        (QuoteStatus::Sent, Some(until)) if until < today => QuoteStatus::Expired,
+        _ => stored,
+    }
+}
+
 /// Shared column list so the list and detail reads cannot drift apart.
 const QUOTE_COLUMNS: &str = r#"id, tenant_id, quote_number, company_id, billing_contact_id,
        title, summary, description, status, valid_until,
@@ -769,7 +1168,14 @@ impl From<QuoteRow> for QuoteResponse {
             title: r.title,
             summary: r.summary,
             description: r.description,
-            status: QuoteStatus::from_str(&r.status).unwrap_or(QuoteStatus::Draft),
+            // Read-time expiry (PMS-673): a `sent` quote past its
+            // `valid_until` reports as `expired` even though the stored
+            // column still says `sent`. See `effective_status`.
+            status: effective_status(
+                QuoteStatus::from_str(&r.status).unwrap_or(QuoteStatus::Draft),
+                r.valid_until,
+                Utc::now().date_naive(),
+            ),
             valid_until: r.valid_until,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
@@ -791,6 +1197,21 @@ impl From<QuoteRow> for QuoteResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every status, so the set-membership tests below cannot silently
+    /// miss a variant added later.
+    const ALL_STATUSES: [QuoteStatus; 10] = [
+        QuoteStatus::Draft,
+        QuoteStatus::Submitted,
+        QuoteStatus::Approved,
+        QuoteStatus::Rejected,
+        QuoteStatus::Sent,
+        QuoteStatus::Accepted,
+        QuoteStatus::Declined,
+        QuoteStatus::Expired,
+        QuoteStatus::Converted,
+        QuoteStatus::Cancelled,
+    ];
 
     #[test]
     fn frozen_covers_issued_and_terminal_states() {
@@ -853,6 +1274,75 @@ mod tests {
             QuoteStatus::Cancelled,
         ] {
             assert!(s.is_staff_settable(), "{} should be settable", s.as_str());
+        }
+    }
+
+    #[test]
+    fn client_visible_set_matches_the_sql_bind_list() {
+        // `CLIENT_VISIBLE_STATUSES` is what the portal list query binds,
+        // and `is_client_visible` is what the detail + decide paths check.
+        // If the two ever disagree, a quote would be listable but not
+        // openable (or worse). Pin them to each other.
+        for s in ALL_STATUSES {
+            assert_eq!(
+                s.is_client_visible(),
+                CLIENT_VISIBLE_STATUSES.contains(&s.as_str()),
+                "{} disagrees between the predicate and the SQL bind list",
+                s.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn internal_states_are_never_client_visible() {
+        // The customer must not learn that a quote was drafted, submitted,
+        // internally rejected, or withdrawn.
+        for s in [
+            QuoteStatus::Draft,
+            QuoteStatus::Submitted,
+            QuoteStatus::Approved,
+            QuoteStatus::Rejected,
+            QuoteStatus::Cancelled,
+        ] {
+            assert!(!s.is_client_visible(), "{} must stay internal", s.as_str());
+        }
+    }
+
+    #[test]
+    fn expiry_is_applied_at_read_time_to_sent_quotes_only() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let tomorrow = NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
+
+        // A sent quote past its date reads as expired.
+        assert_eq!(
+            effective_status(QuoteStatus::Sent, Some(yesterday), today),
+            QuoteStatus::Expired
+        );
+        // On the last valid day it is still live: `valid_until` is
+        // inclusive, so a customer accepting on the deadline succeeds.
+        assert_eq!(
+            effective_status(QuoteStatus::Sent, Some(today), today),
+            QuoteStatus::Sent
+        );
+        assert_eq!(
+            effective_status(QuoteStatus::Sent, Some(tomorrow), today),
+            QuoteStatus::Sent
+        );
+        // No expiry date means it never expires.
+        assert_eq!(
+            effective_status(QuoteStatus::Sent, None, today),
+            QuoteStatus::Sent
+        );
+        // A decided quote does not expire retroactively just because the
+        // validity date has since passed.
+        for s in [
+            QuoteStatus::Accepted,
+            QuoteStatus::Declined,
+            QuoteStatus::Converted,
+            QuoteStatus::Draft,
+        ] {
+            assert_eq!(effective_status(s, Some(yesterday), today), s);
         }
     }
 

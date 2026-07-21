@@ -112,6 +112,21 @@ impl QuoteStatus {
         matches!(self, Self::Draft | Self::Rejected)
     }
 
+    /// Statuses a client contact may see through the portal (PMS-673).
+    ///
+    /// Everything before `sent` is internal working state: a `draft` or
+    /// `submitted` quote is not finished, and `approved` only means staff
+    /// cleared it to go out. `rejected` and `cancelled` were killed
+    /// internally, so showing them would leak a negotiation the customer
+    /// was never part of. What remains is the quote as issued and whatever
+    /// became of it.
+    pub fn is_client_visible(&self) -> bool {
+        matches!(
+            self,
+            Self::Sent | Self::Accepted | Self::Declined | Self::Expired | Self::Converted
+        )
+    }
+
     /// Statuses a staff user may set directly through `PUT /quotes/{id}`.
     ///
     /// Excludes every status that belongs to another actor or route:
@@ -257,6 +272,37 @@ pub struct CreateQuoteRequest {
     #[serde(default)]
     #[validate(nested)]
     pub lines: Vec<QuoteLineRequest>,
+}
+
+/// Body of `POST /portal/quotes/{id}/accept|decline` (PMS-673).
+///
+/// Notes are optional: a client accepting rarely has anything to add,
+/// while a decline usually does. There is deliberately no status field;
+/// the route decides the outcome, so the client cannot post its way into
+/// an arbitrary state.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct PortalQuoteDecisionRequest {
+    #[validate(length(max = 2000))]
+    pub notes: Option<String>,
+}
+
+/// The client's sign-off, as handed from the portal route to the service
+/// (PMS-673).
+///
+/// Bundled rather than passed as loose parameters so the identity fields
+/// travel together: `company_id` is the scope check and `contact_id` is
+/// the actor recorded on the row, and separating them at a call site is
+/// how you end up recording the wrong one.
+#[derive(Debug, Clone)]
+pub struct ClientDecision {
+    /// The deciding contact's company. The service refuses a quote that
+    /// belongs to a different company.
+    pub company_id: Uuid,
+    /// Written to `quotes.decided_by_contact_id`.
+    pub contact_id: Uuid,
+    /// `true` accepts, `false` declines.
+    pub accept: bool,
+    pub notes: Option<String>,
 }
 
 /// Header update. Every field is optional; omitted fields keep their
