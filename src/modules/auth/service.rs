@@ -852,50 +852,34 @@ impl AuthService {
     /// `status == Active`, and asserts the owning tenant is active.
     /// Mirrors the checks `login()` runs at login time so a deactivated
     /// user or tenant cannot keep authenticating until token expiry.
+    /// Validate a legacy access token against the live user + tenant on every
+    /// request: the user must exist and be Active, the token must not predate
+    /// the user's last password change (PMS-681), and the tenant must be active.
+    /// Returns the user it loaded so the caller (the auth middleware) does not
+    /// re-query it.
     pub async fn ensure_user_and_tenant_active(
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
         token_iat: i64,
-    ) -> AppResult<()> {
+    ) -> AppResult<User> {
         let user = self.get_user_by_id(tenant_id, user_id).await?;
         if user.status != UserStatus::Active {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
-        // PMS-681: reject an access token minted before the user's last
-        // password change (reset or self-service change), so a stolen token
-        // dies the moment the password changes instead of living out its TTL.
-        self.ensure_token_after_password_change(tenant_id, user_id, token_iat)
-            .await?;
-        self.ensure_tenant_active(user.tenant_id).await
-    }
-
-    /// PMS-681: reject when the access token's `iat` predates
-    /// `users.password_changed_at`. A NULL stamp (the password has not changed
-    /// since the column was added) imposes no cutoff. One PK-scoped scalar read
-    /// under the tenant GUC, since `users` is RLS-covered.
-    async fn ensure_token_after_password_change(
-        &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
-        token_iat: i64,
-    ) -> AppResult<()> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let changed_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-            "SELECT password_changed_at FROM users WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(user_id)
-        .bind(tenant_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if let Some(changed_at) = changed_at {
+        // PMS-681: reject an access token minted before the user's last password
+        // change (reset or self-service), so a stolen token dies the moment the
+        // password changes instead of living out its TTL. Read straight off the
+        // row loaded above - no extra query. NULL = no cutoff.
+        if let Some(changed_at) = user.password_changed_at {
             if token_iat < changed_at.timestamp() {
                 return Err(AppError::Forbidden(
-                    "Your session ended because the account password was changed. Please sign in again.".to_string(),
+                    "Access token predates a password change".to_string(),
                 ));
             }
         }
-        Ok(())
+        self.ensure_tenant_active(user.tenant_id).await?;
+        Ok(user)
     }
 
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
@@ -1409,10 +1393,17 @@ impl AuthService {
         .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
 
-        // Invalidate all sessions
-        self.logout_all(tenant_id, user_id).await?;
+        // PMS-681: revoke all refresh sessions in the SAME transaction as the
+        // password change, so a revoke failure rolls the whole reset back
+        // (fail-closed) instead of leaving a usable refresh token behind. The
+        // password_changed_at stamp above kills the already-issued access tokens.
+        sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND tenant_id = $2")
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1464,14 +1455,19 @@ impl AuthService {
         .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
 
         // PMS-681: a self-service password change logs the user out everywhere.
-        // `logout_all` revokes the refresh sessions; the `password_changed_at`
-        // stamp above makes the middleware reject every already-issued access
-        // token on its next request, including this device's - so the user
-        // signs in again after changing their password.
-        self.logout_all(tenant_id, user_id).await?;
+        // Revoke all refresh sessions in the SAME transaction as the password
+        // update (so a revoke failure rolls the change back); the
+        // `password_changed_at` stamp above makes the middleware reject every
+        // already-issued access token on its next request, including this
+        // device's, so the user signs in again after changing their password.
+        sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND tenant_id = $2")
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -2290,7 +2286,7 @@ impl AuthService {
                    status, email_verified_at, last_login_at, last_login_country,
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
-                   created_at, updated_at, profile_completed_at,
+                   created_at, updated_at, password_changed_at, profile_completed_at,
                    (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
             FROM users
             -- PMS-591: a tombstoned user (deleted via the Bunyip
@@ -2890,6 +2886,11 @@ struct UserRow {
     settings: serde_json::Value,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+    // PMS-681: only `get_user_by_id` (the per-request auth load) selects this;
+    // the other UserRow queries omit it, so `#[sqlx(default)]` maps it to None
+    // there - those paths never read it.
+    #[sqlx(default)]
+    password_changed_at: Option<chrono::DateTime<Utc>>,
     profile_completed_at: Option<chrono::DateTime<Utc>>,
     // PMS-413: the owning tenant's own-company id, pulled in by a correlated
     // subquery against `tenants` in each user-load query (tenant-scoped, not a
@@ -2928,6 +2929,7 @@ impl From<UserRow> for User {
             settings: row.settings,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            password_changed_at: row.password_changed_at,
             profile_completed_at: row.profile_completed_at,
             own_company_id: row.own_company_id,
         }

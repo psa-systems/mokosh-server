@@ -130,16 +130,11 @@ pub async fn auth_middleware(
                             .ensure_user_and_tenant_active(claims.tid, claims.sub, claims.iat)
                             .await
                         {
-                            Ok(()) => match auth_middleware
-                                .auth_service
-                                .get_user_by_id(claims.tid, claims.sub)
-                                .await
-                            {
-                                Ok(user) => {
-                                    AuthState::authenticated(user.to_current_user(), claims.tid)
-                                }
-                                Err(_) => AuthState::default(),
-                            },
+                            // PMS-681: ensure_user_and_tenant_active returns the
+                            // user it already loaded, so there is no second query.
+                            Ok(user) => {
+                                AuthState::authenticated(user.to_current_user(), claims.tid)
+                            }
                             Err(_) => AuthState::default(),
                         }
                     }

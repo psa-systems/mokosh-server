@@ -323,6 +323,13 @@ pub struct User {
     pub settings: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// PMS-681: wall-clock time of the last password change (reset or
+    /// self-service). The auth middleware rejects any access token whose `iat`
+    /// predates it, so a stolen token dies the moment the password changes.
+    /// NULL = never changed since the column existed (no cutoff). Never
+    /// serialized to clients (internal auth state).
+    #[serde(skip_serializing)]
+    pub password_changed_at: Option<DateTime<Utc>>,
     /// Timestamp at which the user confirmed first + last name via the
     /// onboarding screen. NULL = needs onboarding; set on first
     /// successful `PUT /api/v1/auth/me` whose body includes non-empty
