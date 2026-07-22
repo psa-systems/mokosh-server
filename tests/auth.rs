@@ -726,7 +726,7 @@ async fn login_wrong_password_returns_401(pool: PgPool) {
 /// with the wrong password 5+ times trips the limiter and returns 429
 /// with a populated `Retry-After` header.
 ///
-/// Each `#[sqlx::test]` boots a fresh `LoginLimiter` instance because
+/// Each `#[sqlx::test]` boots a fresh `AuthRateLimiter` instance because
 /// `boot(pool)` builds a new `AuthRouterState` per test, so this test
 /// starts with empty buckets and does not need a serial guard.
 #[sqlx::test]
@@ -1527,4 +1527,60 @@ async fn forgot_password_unknown_email_issues_no_token(pool: PgPool) {
         token_count, 0,
         "no reset token may be issued for an unknown email"
     );
+}
+
+/// PMS-680: `/auth/forgot-password` is rate-limited per (IP, email) like login.
+/// The 4th request for one email within a minute trips the 3/min per-email cap
+/// with 429 + `Retry-After`, so a known address cannot be reset-email bombed.
+/// The email need not belong to a real user: the limiter runs before the
+/// (silent-success) lookup, so an unknown address is throttled the same.
+#[sqlx::test]
+async fn forgot_password_rate_limit_triggers_429(pool: PgPool) {
+    let app = common::boot(pool).await;
+    let body = serde_json::json!({ "email": "reset-flood-pms680@example.com" });
+
+    // First 3 requests are within the per-email quota (silent success).
+    for i in 0..3 {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/auth/forgot-password"))
+            .json(&body)
+            .send()
+            .await
+            .expect("send forgot-password within quota");
+        assert!(
+            resp.status().is_success(),
+            "request {i} should be 2xx within quota; got {}",
+            resp.status()
+        );
+    }
+
+    // 4th request trips the per-email cap.
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/forgot-password"))
+        .json(&body)
+        .send()
+        .await
+        .expect("send over-quota forgot-password");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the 4th reset request for one email must trip the rate limit"
+    );
+
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .expect("Retry-After header present on 429")
+        .to_str()
+        .expect("Retry-After is ASCII");
+    let secs: u64 = retry_after
+        .parse()
+        .expect("Retry-After parses as a positive integer");
+    assert!(secs >= 1, "Retry-After must be at least 1 second");
+
+    let json: serde_json::Value = resp.json().await.expect("rate-limit body is JSON");
+    assert_eq!(json["error"].as_str(), Some("rate_limited"));
+    assert!(json["retry_after_seconds"].as_u64().unwrap_or(0) >= 1);
 }

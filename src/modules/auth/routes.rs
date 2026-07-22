@@ -43,7 +43,13 @@ pub struct AuthRouterState {
     /// across requests. The check happens inline at the top of the
     /// `login` handler so the limiter can see both source IP and the
     /// email from the deserialized request body.
-    pub login_limiter: Arc<rate_limit::LoginLimiter>,
+    pub login_limiter: Arc<rate_limit::AuthRateLimiter>,
+    /// Layered (per-IP + per-email) limiter for `/forgot-password` (PMS-680).
+    /// A separate instance from `login_limiter` with its own (lower) quotas and
+    /// buckets, so reset requests and logins never consume each other's quota.
+    /// Checked inline in the `forgot_password` handler for the same reason as
+    /// login (the email lives in the request body).
+    pub forgot_password_limiter: Arc<rate_limit::AuthRateLimiter>,
 }
 
 /// Create the auth router
@@ -60,7 +66,12 @@ pub fn auth_routes(
         client_origin,
         jwt_secret,
         cookie_secure,
-        login_limiter: rate_limit::LoginLimiter::new(),
+        // Login: 20/min per IP (NAT'd offices), 5/min per email (account cap).
+        login_limiter: rate_limit::AuthRateLimiter::new(20, 5),
+        // Forgot-password: rarer than login, so tighter. 10/min per IP,
+        // 3/min per email - enough for a fumbling user, caps reset-email
+        // bombing of a known address (PMS-680).
+        forgot_password_limiter: rate_limit::AuthRateLimiter::new(10, 3),
     };
 
     Router::new()
@@ -97,6 +108,28 @@ pub fn auth_routes(
         .with_state(state)
 }
 
+/// Build the 429 response shared by the rate-limited auth endpoints (login and
+/// forgot-password): a `rate_limited` JSON body plus a `Retry-After` header and
+/// a `no-store` cache directive. `retry_after` is the limiter's suggested wait
+/// in seconds.
+fn rate_limited_response(retry_after: u64, message: &str) -> Response {
+    let mut resp = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "rate_limited",
+            "message": message,
+            "retry_after_seconds": retry_after,
+        })),
+    )
+        .into_response();
+    let h = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+        h.insert(header::RETRY_AFTER, v);
+    }
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
 /// Login endpoint. Rate-limited per `(source IP, lowercased email)`
 /// at 20/min per IP + 5/min per email; over-quota returns 429 with
 /// a `Retry-After` header. The check has to run inline because tower
@@ -110,21 +143,10 @@ async fn login(
     request.validate()?;
 
     if let Err(retry_after) = state.login_limiter.check(addr.ip(), &request.email) {
-        let mut resp = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "rate_limited",
-                "message": "Too many login attempts, please try again later",
-                "retry_after_seconds": retry_after,
-            })),
-        )
-            .into_response();
-        let h = resp.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-            h.insert(header::RETRY_AFTER, v);
-        }
-        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return Ok(resp);
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many login attempts, please try again later",
+        ));
     }
 
     // PMS-587: record the real client IP (from the forwarded header behind
@@ -220,14 +242,30 @@ async fn refresh_token(
 /// Forgot password endpoint
 async fn forgot_password(
     State(state): State<AuthRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<ForgotPasswordRequest>,
-) -> AppResult<()> {
+) -> Result<Response, AppError> {
     request.validate()?;
+
+    // PMS-680: throttle per (IP, email) so a known address cannot be
+    // reset-email bombed. Runs inline (like login) because the email is in the
+    // request body. Over quota returns 429 + Retry-After; under quota the
+    // silent-success semantics below are unchanged.
+    if let Err(retry_after) = state
+        .forgot_password_limiter
+        .check(addr.ip(), &request.email)
+    {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many password reset requests, please try again later",
+        ));
+    }
+
     state
         .auth_service
         .request_password_reset(request.tenant_id, &request.email)
         .await?;
-    Ok(())
+    Ok(StatusCode::OK.into_response())
 }
 
 /// Reset password endpoint
