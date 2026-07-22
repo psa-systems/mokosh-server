@@ -127,7 +127,7 @@ pub async fn auth_middleware(
                         }
                         match auth_middleware
                             .auth_service
-                            .ensure_user_and_tenant_active(claims.tid, claims.sub)
+                            .ensure_user_and_tenant_active(claims.tid, claims.sub, claims.iat)
                             .await
                         {
                             Ok(()) => match auth_middleware

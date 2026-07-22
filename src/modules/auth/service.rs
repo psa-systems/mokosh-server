@@ -856,12 +856,46 @@ impl AuthService {
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
+        token_iat: i64,
     ) -> AppResult<()> {
         let user = self.get_user_by_id(tenant_id, user_id).await?;
         if user.status != UserStatus::Active {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
+        // PMS-681: reject an access token minted before the user's last
+        // password change (reset or self-service change), so a stolen token
+        // dies the moment the password changes instead of living out its TTL.
+        self.ensure_token_after_password_change(tenant_id, user_id, token_iat)
+            .await?;
         self.ensure_tenant_active(user.tenant_id).await
+    }
+
+    /// PMS-681: reject when the access token's `iat` predates
+    /// `users.password_changed_at`. A NULL stamp (the password has not changed
+    /// since the column was added) imposes no cutoff. One PK-scoped scalar read
+    /// under the tenant GUC, since `users` is RLS-covered.
+    async fn ensure_token_after_password_change(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        token_iat: i64,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let changed_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT password_changed_at FROM users WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if let Some(changed_at) = changed_at {
+            if token_iat < changed_at.timestamp() {
+                return Err(AppError::Forbidden(
+                    "Your session ended because the account password was changed. Please sign in again.".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
@@ -1351,10 +1385,13 @@ impl AuthService {
         // Hash new password
         let new_hash = hash_password(&request.new_password)?;
 
-        // Update password
+        // Update password. PMS-681: stamp `password_changed_at` so the auth
+        // middleware rejects every access token issued before now (the `logout_all`
+        // below only revokes refresh sessions).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW() \
+            "UPDATE users SET password_hash = $1, updated_at = NOW(), \
+             password_changed_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&new_hash)
@@ -1418,7 +1455,8 @@ impl AuthService {
         let new_hash = hash_password(&request.new_password)?;
 
         sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW() \
+            "UPDATE users SET password_hash = $1, updated_at = NOW(), \
+             password_changed_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&new_hash)
@@ -1427,6 +1465,13 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+
+        // PMS-681: a self-service password change logs the user out everywhere.
+        // `logout_all` revokes the refresh sessions; the `password_changed_at`
+        // stamp above makes the middleware reject every already-issued access
+        // token on its next request, including this device's - so the user
+        // signs in again after changing their password.
+        self.logout_all(tenant_id, user_id).await?;
 
         Ok(())
     }
