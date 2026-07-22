@@ -12,7 +12,7 @@
 
 mod common;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -1239,5 +1239,292 @@ async fn update_user_enforces_role_ceiling(pool: PgPool) {
         allowed.status(),
         reqwest::StatusCode::OK,
         "an at-or-below-ceiling role change must still be allowed"
+    );
+}
+
+// ============================================================================
+// PMS-659: password-reset flow verification (redeem, expiry, single-use,
+// session revocation, no-enumeration). The emailed token is `{user_id}.{secret}`
+// where only the Argon2 hash of `secret` is stored, so the secret cannot be read
+// back from the row - these tests mint a row with a known secret to exercise the
+// redeem half of the flow that the request-side tests cannot reach.
+// ============================================================================
+
+/// Insert a redeemable `password_reset_tokens` row for `user_id` with a known
+/// secret and the given expiry, and return the emailed `{user_id}.{secret}`
+/// token. Writes the Argon2 hash exactly as `request_password_reset` does.
+async fn craft_reset_token(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    expires_at: chrono::DateTime<Utc>,
+) -> String {
+    // A dotless secret so `{user_id}.{secret}` splits cleanly on the first dot.
+    let secret = "pms659secretvaluewithoutanydots0";
+    let token_hash =
+        mokosh_server::utils::crypto::hash_password(secret).expect("hash the reset secret");
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(&token_hash)
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .expect("insert crafted reset token");
+    format!("{user_id}.{secret}")
+}
+
+/// AC1/AC2: a valid reset changes the password, marks the token used, and
+/// revokes the user's sessions (`logout_all`). Confirms end to end that the old
+/// password stops working and the new one logs in.
+#[sqlx::test]
+async fn reset_password_changes_password_and_revokes_sessions(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    // Log in to create a live session row, then confirm it exists.
+    let _token = common::login(&app, &email, &password).await;
+    let sessions_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_sessions WHERE user_id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions before reset");
+    assert!(
+        sessions_before >= 1,
+        "logging in must create at least one session row"
+    );
+
+    let token = craft_reset_token(
+        &app.pool,
+        common::DEFAULT_TENANT_ID,
+        admin_id,
+        Utc::now() + Duration::hours(1),
+    )
+    .await;
+    let new_password = "brand-new-password-123";
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": token,
+            "new_password": new_password,
+            "confirm_password": new_password,
+        }))
+        .send()
+        .await
+        .expect("send reset-password");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a valid reset token must succeed"
+    );
+
+    // Sessions revoked.
+    let sessions_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_sessions WHERE user_id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions after reset");
+    assert_eq!(
+        sessions_after, 0,
+        "a password reset must revoke all of the user's sessions"
+    );
+
+    // Token marked single-use.
+    let used_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT used_at FROM password_reset_tokens WHERE user_id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read token used_at");
+    assert!(
+        used_at.is_some(),
+        "the redeemed token must be stamped used_at"
+    );
+
+    // Old password rejected, new password accepted.
+    let old_login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .expect("send old-password login");
+    assert_eq!(
+        old_login.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the old password must no longer authenticate"
+    );
+    let new_session_token = common::login(&app, &email, new_password).await;
+    assert!(
+        !new_session_token.is_empty(),
+        "the new password must authenticate"
+    );
+}
+
+/// AC2: an expired token is rejected (the `expires_at > NOW()` guard).
+#[sqlx::test]
+async fn reset_password_rejects_expired_token(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let token = craft_reset_token(
+        &app.pool,
+        common::DEFAULT_TENANT_ID,
+        admin_id,
+        Utc::now() - Duration::hours(1),
+    )
+    .await;
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": token,
+            "new_password": "brand-new-password-123",
+            "confirm_password": "brand-new-password-123",
+        }))
+        .send()
+        .await
+        .expect("send reset with expired token");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an expired reset token must be rejected"
+    );
+}
+
+/// AC2: a token is single-use (`used_at IS NULL` guard). The second redeem of
+/// the same token fails.
+#[sqlx::test]
+async fn reset_password_token_is_single_use(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let token = craft_reset_token(
+        &app.pool,
+        common::DEFAULT_TENANT_ID,
+        admin_id,
+        Utc::now() + Duration::hours(1),
+    )
+    .await;
+    let body = serde_json::json!({
+        "token": token,
+        "new_password": "brand-new-password-123",
+        "confirm_password": "brand-new-password-123",
+    });
+
+    let first = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&body)
+        .send()
+        .await
+        .expect("first redeem");
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::OK,
+        "the first redeem of a valid token succeeds"
+    );
+
+    let second = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&body)
+        .send()
+        .await
+        .expect("second redeem");
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an already-used token must not be redeemable again"
+    );
+}
+
+/// AC1: a malformed token, and a well-formed token whose secret does not match
+/// the stored hash, are both rejected (no password change).
+#[sqlx::test]
+async fn reset_password_rejects_malformed_and_wrong_secret(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    // A valid row exists, but the requests below present bad tokens.
+    let _token = craft_reset_token(
+        &app.pool,
+        common::DEFAULT_TENANT_ID,
+        admin_id,
+        Utc::now() + Duration::hours(1),
+    )
+    .await;
+
+    let malformed = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": "not-a-valid-token",
+            "new_password": "brand-new-password-123",
+            "confirm_password": "brand-new-password-123",
+        }))
+        .send()
+        .await
+        .expect("send malformed token");
+    assert_eq!(
+        malformed.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a token without the user-bound shape must be rejected"
+    );
+
+    let wrong_secret = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": format!("{admin_id}.wrongsecretvaluethatwontmatch"),
+            "new_password": "brand-new-password-123",
+            "confirm_password": "brand-new-password-123",
+        }))
+        .send()
+        .await
+        .expect("send wrong-secret token");
+    assert_eq!(
+        wrong_secret.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a token whose secret does not match the stored hash must be rejected"
+    );
+}
+
+/// AC1: requesting a reset for an address that does not exist returns 2xx and
+/// issues no token, so the endpoint never reveals whether an email is
+/// registered (no user enumeration).
+#[sqlx::test]
+async fn forgot_password_unknown_email_issues_no_token(pool: PgPool) {
+    // Seed an admin so the default tenant/config exists, then request a reset for
+    // a different, unknown address.
+    let (_admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/forgot-password"))
+        .json(&serde_json::json!({ "email": "nobody-unknown-pms659@example.com" }))
+        .send()
+        .await
+        .expect("send forgot-password for unknown email");
+    assert!(
+        resp.status().is_success(),
+        "forgot-password must 2xx even for an unknown email; got {}",
+        resp.status()
+    );
+
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM password_reset_tokens")
+        .fetch_one(&app.pool)
+        .await
+        .expect("count reset tokens");
+    assert_eq!(
+        token_count, 0,
+        "no reset token may be issued for an unknown email"
     );
 }
