@@ -1335,6 +1335,20 @@ async fn reset_password_changes_password_and_revokes_sessions(pool: PgPool) {
         "a password reset must revoke all of the user's sessions"
     );
 
+    // PMS-681: the reset stamps password_changed_at, which is what invalidates
+    // every access token issued before it (the session delete above only
+    // revokes refresh).
+    let password_changed_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT password_changed_at FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read password_changed_at after reset");
+    assert!(
+        password_changed_at.is_some(),
+        "reset must stamp password_changed_at so pre-reset access tokens are rejected"
+    );
+
     // Token marked single-use.
     let used_at: Option<chrono::DateTime<Utc>> =
         sqlx::query_scalar("SELECT used_at FROM password_reset_tokens WHERE user_id = $1")
@@ -1583,4 +1597,130 @@ async fn forgot_password_rate_limit_triggers_429(pool: PgPool) {
     let json: serde_json::Value = resp.json().await.expect("rate-limit body is JSON");
     assert_eq!(json["error"].as_str(), Some("rate_limited"));
     assert!(json["retry_after_seconds"].as_u64().unwrap_or(0) >= 1);
+}
+
+// ============================================================================
+// PMS-681: an access token issued before the last password change is rejected
+// immediately (closes the up-to-1h stateless-JWT window after a reset/change).
+// ============================================================================
+
+/// PMS-681: an access token whose `iat` predates `users.password_changed_at` is
+/// rejected (401) on its next request. Stamps password_changed_at 30s in the
+/// future so the check is deterministic regardless of test timing.
+#[sqlx::test]
+async fn access_token_rejected_after_password_change(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Sanity: the token authenticates before any password change.
+    let before = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me before");
+    assert_eq!(
+        before.status(),
+        reqwest::StatusCode::OK,
+        "the token works before the password change"
+    );
+
+    // Stamp a password change strictly after the token was issued.
+    sqlx::query(
+        "UPDATE users SET password_changed_at = NOW() + INTERVAL '30 seconds' WHERE id = $1",
+    )
+    .bind(admin_id)
+    .execute(&app.pool)
+    .await
+    .expect("stamp a future password_changed_at");
+
+    // The same token is now rejected (the middleware maps the check failure to
+    // an unauthenticated state, so the extractor returns 401).
+    let after = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me after");
+    assert_eq!(
+        after.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a token issued before password_changed_at must be rejected"
+    );
+}
+
+/// PMS-681: a self-service password change (PUT /me/password) revokes all
+/// sessions and stamps password_changed_at, logging the user out everywhere.
+#[sqlx::test]
+async fn change_password_logs_out_everywhere(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let sessions_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_sessions WHERE user_id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions before change");
+    assert!(sessions_before >= 1, "login creates a session");
+
+    let new_password = "changed-password-123";
+    let resp = app
+        .client
+        .put(app.url("/api/v1/auth/me/password"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "current_password": password,
+            "new_password": new_password,
+            "confirm_password": new_password,
+        }))
+        .send()
+        .await
+        .expect("send change-password");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a valid password change succeeds"
+    );
+
+    let sessions_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_sessions WHERE user_id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions after change");
+    assert_eq!(
+        sessions_after, 0,
+        "a self-service password change must revoke all sessions (log out everywhere)"
+    );
+
+    let pca: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT password_changed_at FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read password_changed_at after change");
+    assert!(
+        pca.is_some(),
+        "a password change must stamp password_changed_at"
+    );
+
+    // The old password no longer authenticates; the new one does.
+    let old = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .expect("send old-password login");
+    assert_eq!(
+        old.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the old password no longer works after the change"
+    );
+    let _new_token = common::login(&app, &email, new_password).await;
 }
