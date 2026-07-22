@@ -10,6 +10,7 @@
 //! set. The sibling import issue consumes this envelope.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -24,6 +25,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
+use crate::modules::seed::{LoadDemoOutcome, SeedService};
 use crate::utils::error::{AppError, AppResult};
 
 const SCHEMA_VERSION: i32 = 1;
@@ -69,16 +71,44 @@ const SECRET_COLUMN_SUBSTRINGS: &[&str] = &[
 #[derive(Clone)]
 pub struct DataTransferState {
     pub db: Database,
+    /// Shared with the first-visit seed middleware (same `Arc`), so an explicit
+    /// "Load demo data" click and the auto-seed agree on the per-process
+    /// `seen` set and never double-seed a tenant (PMS-679).
+    pub seed: Arc<SeedService>,
 }
 
-pub fn data_transfer_routes(db: Database) -> Router {
+pub fn data_transfer_routes(db: Database, seed: Arc<SeedService>) -> Router {
     Router::new()
         .route("/data/export", get(export_tenant_data))
         .route(
             "/data/import",
             post(import_tenant_data).layer(DefaultBodyLimit::max(IMPORT_MAX_BYTES)),
         )
-        .with_state(DataTransferState { db })
+        .route("/data/seed-demo", post(seed_demo_data))
+        .with_state(DataTransferState { db, seed })
+}
+
+/// `POST /api/v1/data/seed-demo` - admin-only. Loads the built-in demo dataset
+/// into the caller's tenant, additively and only when it has no business data
+/// yet (never destructive, PMS-679). Mirrors the first-visit auto-seed on
+/// explicit request so an admin can populate a fresh/evaluation tenant from the
+/// Settings -> Data page. Always `200`: `seeded=false` is a legitimate "already
+/// has data" outcome, not an error.
+async fn seed_demo_data(
+    State(s): State<DataTransferState>,
+    RequireAuth(u): RequireAuth,
+    _admin: RequireAdmin,
+) -> AppResult<Json<Value>> {
+    match s.seed.load_demo_data(u.tenant_id, u.id).await? {
+        LoadDemoOutcome::Seeded => Ok(Json(json!({
+            "seeded": true,
+            "message": "Demo data loaded: a sample company, two contacts, and three tickets.",
+        }))),
+        LoadDemoOutcome::AlreadyHasData => Ok(Json(json!({
+            "seeded": false,
+            "message": "This tenant already has data; demo data is only loaded into an empty tenant.",
+        }))),
+    }
 }
 
 fn is_secret_column(name: &str) -> bool {

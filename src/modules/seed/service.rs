@@ -71,6 +71,17 @@ fn shared_landing_tenant() -> Option<Uuid> {
         .and_then(|s| Uuid::parse_str(s.trim()).ok())
 }
 
+/// Outcome of an explicit, admin-triggered demo-data load
+/// ([`SeedService::load_demo_data`], PMS-679). Distinct from the best-effort
+/// auto-seed, which returns nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadDemoOutcome {
+    /// Demo rows were inserted (the tenant was empty).
+    Seeded,
+    /// The tenant already had business data; nothing was inserted.
+    AlreadyHasData,
+}
+
 /// Seeds first-visit demo data for new accounts. Cheap to clone (holds
 /// `Arc`/`Clone` services and a shared seen-set).
 #[derive(Clone)]
@@ -154,6 +165,42 @@ impl SeedService {
                 tracing::warn!(error = %e, %tenant_id, "demo seeding failed; will retry on next request");
             }
         }
+    }
+
+    /// Load demo data on explicit admin request (the Settings -> Data "Load
+    /// demo data" button, PMS-679). Additive and non-destructive: it seeds
+    /// only when the tenant has no business data, and never wipes. Unlike
+    /// [`Self::ensure_demo_seeded`] - the best-effort first-visit auto-seed
+    /// that swallows its result - this surfaces the outcome so the UI can
+    /// report "loaded" vs. "already has data".
+    ///
+    /// Refuses the shared multi-user landing tenant (PMS-239) exactly as the
+    /// auto-seed does. On a successful load it also claims the `demo_seeded`
+    /// flag and marks the in-process `seen` set, so the first-visit auto-seed
+    /// stays a no-op for this tenant afterwards. It does NOT consult the
+    /// `MOKOSH_DEMO_SEED` kill-switch: that governs the automatic first-visit
+    /// path, whereas this is an explicit operator action.
+    pub async fn load_demo_data(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<LoadDemoOutcome> {
+        // PMS-239: the shared landing zone is never a single-owner account, so
+        // it must never receive per-account demo rows.
+        if self.shared_tenant == Some(tenant_id) {
+            return Ok(LoadDemoOutcome::AlreadyHasData);
+        }
+        // Additive: only an empty tenant is seeded; an established one is left
+        // untouched (no wipe).
+        if self.tenant_has_companies(tenant_id).await? {
+            return Ok(LoadDemoOutcome::AlreadyHasData);
+        }
+        self.seed_rows(tenant_id, user_id).await?;
+        // Keep the auto-seed bookkeeping consistent so the middleware never
+        // re-seeds this tenant: claim the flag (best-effort) and mark it seen.
+        let _ = self.try_claim(tenant_id).await;
+        self.mark_seen(tenant_id);
+        Ok(LoadDemoOutcome::Seeded)
     }
 
     /// Returns `Ok(true)` when demo rows were inserted, `Ok(false)` when the

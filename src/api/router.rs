@@ -352,8 +352,11 @@ pub fn create_api_router(
         // Audit log read. PMS-118.
         .merge(audit_routes(audit_service))
         // PMS-647: admin-only tenant data export (first slice of PMS-646).
+        // PMS-679: also the "Load demo data" endpoint, sharing the same
+        // `seed_service` Arc as the first-visit seed middleware below.
         .merge(crate::modules::data_transfer::data_transfer_routes(
             db.clone(),
+            seed_service.clone(),
         ))
         // PMS-275: the coarse per-request audit middleware (PMS-119) was
         // removed. It ran post-response with only the HTTP method + URL, so it

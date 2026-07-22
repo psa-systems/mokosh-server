@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use mokosh_server::modules::contacts::ContactService;
-use mokosh_server::modules::seed::SeedService;
+use mokosh_server::modules::seed::{LoadDemoOutcome, SeedService};
 use mokosh_server::modules::tickets::TicketService;
 use mokosh_server::Database;
 
@@ -165,6 +165,92 @@ async fn skips_seeding_a_tenant_that_already_has_companies(pool: PgPool) {
         Some("true"),
         "flag still set so the emptiness check runs only once"
     );
+}
+
+// PMS-679: the explicit, admin-triggered "Load demo data" path
+// (`load_demo_data`). Same underlying seed as the auto-seed, but it surfaces
+// its outcome and only ever loads into an empty tenant.
+
+#[sqlx::test]
+async fn load_demo_data_seeds_an_empty_tenant(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = common::DEFAULT_TENANT_ID;
+
+    let outcome = seed_service(&pool)
+        .load_demo_data(tenant, admin_id)
+        .await
+        .expect("load demo data");
+
+    assert_eq!(outcome, LoadDemoOutcome::Seeded, "empty tenant is seeded");
+    assert_eq!(company_count(&pool, tenant).await, 1, "one demo company");
+    assert_eq!(contact_count(&pool, tenant).await, 2, "two demo contacts");
+    assert_eq!(ticket_count(&pool, tenant).await, 3, "three demo tickets");
+    assert_eq!(
+        demo_seeded_flag(&pool, tenant).await.as_deref(),
+        Some("true"),
+        "flag is set so the first-visit auto-seed stays a no-op afterwards"
+    );
+}
+
+#[sqlx::test]
+async fn load_demo_data_refuses_a_tenant_that_already_has_data(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = common::DEFAULT_TENANT_ID;
+
+    // A tenant with real data already: the button must refuse, not wipe or
+    // append demo rows.
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Existing Co')")
+        .bind(Uuid::new_v4())
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .expect("seed pre-existing company");
+
+    let outcome = seed_service(&pool)
+        .load_demo_data(tenant, admin_id)
+        .await
+        .expect("load demo data");
+
+    assert_eq!(
+        outcome,
+        LoadDemoOutcome::AlreadyHasData,
+        "a non-empty tenant is refused"
+    );
+    assert_eq!(
+        company_count(&pool, tenant).await,
+        1,
+        "existing company untouched, no demo company added"
+    );
+    assert_eq!(contact_count(&pool, tenant).await, 0, "no demo contacts");
+    assert_eq!(ticket_count(&pool, tenant).await, 0, "no demo tickets");
+    assert_eq!(
+        demo_seeded_flag(&pool, tenant).await,
+        None,
+        "refusing an established tenant writes nothing, including the flag"
+    );
+}
+
+#[sqlx::test]
+async fn load_demo_data_refuses_the_shared_landing_tenant(pool: PgPool) {
+    // PMS-239: the shared multi-user landing tenant must never receive
+    // per-account demo rows, even on an explicit request.
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = common::DEFAULT_TENANT_ID;
+
+    let outcome = seed_service(&pool)
+        .with_shared_tenant(Some(tenant))
+        .load_demo_data(tenant, admin_id)
+        .await
+        .expect("load demo data");
+
+    assert_eq!(
+        outcome,
+        LoadDemoOutcome::AlreadyHasData,
+        "the shared landing tenant is refused"
+    );
+    assert_eq!(company_count(&pool, tenant).await, 0, "no demo company");
+    assert_eq!(contact_count(&pool, tenant).await, 0, "no demo contacts");
+    assert_eq!(ticket_count(&pool, tenant).await, 0, "no demo tickets");
 }
 
 /// PMS-629: a fresh tenant's first-visit seed must be the clean demo baseline,
