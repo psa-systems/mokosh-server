@@ -260,7 +260,7 @@ them. Tracked as **F5**.
 **Schema touched:** `tenants`, `tenant_settings`, `module_config`,
 plus reads across `users`, `tickets`, etc. for usage.
 
-#### `seed` (PMS-157, no routes)
+#### `seed` (PMS-157; one route via `data_transfer`, PMS-679)
 
 Files: [`service.rs`](../src/modules/seed/service.rs),
 [`middleware.rs`](../src/modules/seed/middleware.rs),
@@ -278,6 +278,17 @@ tenants that already have companies (so established tenants are never
 polluted on the first visit after a deploy). Disable with
 `MOKOSH_DEMO_SEED=false` (e.g. E2E/staging on the shared default
 tenant).
+
+PMS-679 adds `SeedService::load_demo_data` -> `LoadDemoOutcome`, the
+explicit-request counterpart to the auto-seed: it reuses the same
+emptiness gate and `seed_rows`, but returns its outcome instead of
+swallowing it, and only ever loads into an empty tenant (additive,
+never wipes; the shared landing tenant is refused too). It is exposed
+by the `data_transfer` module as admin-only `POST /api/v1/data/seed-demo`
+(sharing the middleware's `SeedService` `Arc`), which the mokosh-apps
+Settings -> Data "Load demo data" button calls. `MOKOSH_DEMO_SEED`
+does not gate this path - it is an explicit operator action, not the
+automatic first-visit seed.
 
 **Schema touched:** `tenants` (the `demo_seeded` settings flag), plus
 inserts into `companies`, `contacts`, `tickets`.
