@@ -1,7 +1,7 @@
 //! Per-(IP, (tenant_slug, email)) rate limiting for the portal
 //! `/auth/login` endpoint (PMS-501).
 //!
-//! Mirrors `crate::modules::auth::rate_limit::LoginLimiter`, but the
+//! Mirrors `crate::modules::auth::rate_limit::AuthRateLimiter`, but the
 //! account bucket is keyed by `(tenant_slug, email)` rather than by email
 //! alone: portal `contacts.email` is only unique within a tenant, so two
 //! tenants can legitimately host the same customer email and must not

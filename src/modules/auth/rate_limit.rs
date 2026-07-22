@@ -1,12 +1,15 @@
-//! Per-(IP, email-lowercased) rate limiting for `/auth/login`.
+//! Per-(IP, email-lowercased) rate limiting for the unauthenticated auth
+//! endpoints (`/auth/login`, `/auth/forgot-password`).
 //!
-//! Audit F2 (P0) closeout / PMS-4 AC2. Two keyed buckets are consulted
-//! on every login attempt: one keyed by source IP (20/min, covers
-//! NAT'd offices where several users legitimately log in inside the
-//! same minute), one keyed by lowercased email (5/min, the
-//! account-level cap the audit asked for). Either being over-quota
-//! returns 429 with a `Retry-After` header carrying the longer of the
-//! two refill times.
+//! Audit F2 (P0) closeout / PMS-4 AC2 (login) and PMS-680 (forgot-password).
+//! Two keyed buckets are consulted on every attempt: one keyed by source IP
+//! (covers NAT'd offices where several users legitimately act inside the same
+//! minute), one keyed by lowercased email (the account-level cap). Either being
+//! over-quota returns 429 with a `Retry-After` header carrying the longer of
+//! the two refill times. Quotas are per-endpoint (login is more frequent than a
+//! password-reset request), so each endpoint constructs its own limiter with
+//! its own numbers and its own buckets - one endpoint's traffic never consumes
+//! another's quota.
 //!
 //! In-memory state only; will not survive a server restart and does
 //! not coordinate across replicas. Acceptable for the single-process
@@ -24,18 +27,26 @@ use governor::{Quota, RateLimiter};
 pub type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 pub type EmailLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 
-/// Bundled limiters. Stash the resulting `Arc` in `AuthRouterState` and
-/// call `check` at the top of the login handler.
-pub struct LoginLimiter {
+/// Bundled per-(IP, email) limiters for an unauthenticated auth endpoint.
+/// Stash the resulting `Arc` in `AuthRouterState` and call `check` at the top
+/// of the handler. Construct one per endpoint with [`AuthRateLimiter::new`] so
+/// login and forgot-password keep independent quotas and buckets.
+pub struct AuthRateLimiter {
     by_ip: IpLimiter,
     by_email: EmailLimiter,
     clock: DefaultClock,
 }
 
-impl LoginLimiter {
-    pub fn new() -> Arc<Self> {
-        let ip_quota = Quota::per_minute(NonZeroU32::new(20).expect("20 is non-zero"));
-        let email_quota = Quota::per_minute(NonZeroU32::new(5).expect("5 is non-zero"));
+impl AuthRateLimiter {
+    /// Build a limiter that allows `ip_per_min` attempts per source IP and
+    /// `email_per_min` attempts per lowercased email each minute. Both must be
+    /// non-zero (callers pass compile-time literals).
+    pub fn new(ip_per_min: u32, email_per_min: u32) -> Arc<Self> {
+        let ip_quota =
+            Quota::per_minute(NonZeroU32::new(ip_per_min).expect("ip quota must be non-zero"));
+        let email_quota = Quota::per_minute(
+            NonZeroU32::new(email_per_min).expect("email quota must be non-zero"),
+        );
         Arc::new(Self {
             by_ip: RateLimiter::keyed(ip_quota),
             by_email: RateLimiter::keyed(email_quota),
