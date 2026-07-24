@@ -545,7 +545,7 @@ impl AuthService {
             return Err(AppError::Unauthorized);
         };
 
-        if stored_hash == code_hash {
+        if constant_time_eq::constant_time_eq(stored_hash.as_bytes(), code_hash.as_bytes()) {
             sqlx::query("UPDATE login_approvals SET consumed_at = NOW() WHERE id = $1")
                 .bind(id)
                 .execute(&mut *tx)

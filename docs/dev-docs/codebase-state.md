@@ -20,17 +20,29 @@ alongside source changes.
 > modules (many are now `merge`d in `api/router.rs`) is still
 > outstanding.
 
+> **Update 2026-07-24 (module-status correction, PMS-684).** The
+> "only `auth`/`contacts`/`tenants`/`tickets` have real handlers, most
+> route groups return HTTP 501" framing is obsolete. `api/router.rs`
+> now nests/merges ~30 implemented modules (billing, projects,
+> calendar, contracts, quotes, assets, rmm, sla, saved_reports,
+> workflows, time_tracking, dashboards, email_intake, approvals,
+> settings, audit, data_transfer, and more) and the `stub_routes()`
+> 501 mechanism is gone. The sole remaining HTTP 501 is the PDF format
+> of the report-export route (`reports/routes.rs`); CSV is
+> implemented. The "At a glance" and "Placeholder modules" tables
+> below are kept for history but no longer reflect the handler layer.
+
 ## At a glance
 
 | Metric | Value |
 | --- | --- |
 | Total Rust LOC under [`src/`](../src/) (excluding modules) | ~3,000 |
 | LOC under [`src/modules/`](../src/modules/) | ~6,950 |
-| Modules implemented | **4 / 18** (`auth`, `contacts`, `tenants`, `tickets`) |
-| Module placeholders | **14** |
-| Route groups under `/api/v1` | **25 nested + `/health`** |
-| Route groups returning real data | **4** |
-| Route groups returning HTTP 501 | **22** (includes all `/api/v1/portal/*`) |
+| Modules implemented | **most** (~30 nested/merged in [`api/router.rs`](../src/api/router.rs); see the 2026-07-24 correction) |
+| Module placeholders | **0** (the `stub_routes()` mechanism is gone) |
+| Route groups under `/api/v1` | **~30 + `/health`** |
+| Route groups returning real data | **most** |
+| Route groups returning HTTP 501 | **1 format** (PDF report export in [`reports/routes.rs`](../src/modules/reports/routes.rs); CSV works) |
 | Schema tables in [`migrations/001_initial_schema.sql`](../migrations/001_initial_schema.sql) | **71** |
 | Tests | **0** |
 | TODOs in source | **11** |
@@ -294,6 +306,13 @@ automatic first-visit seed.
 inserts into `companies`, `contacts`, `tickets`.
 
 ### Placeholder modules (14)
+
+> **Superseded (2026-07-24, PMS-684).** This list is historical. The
+> modules below (assets, audit, billing, calendar, contracts,
+> knowledge_base, notifications, portal, projects, reports, rmm,
+> settings, sla, time_tracking) now have real handlers merged in
+> `api/router.rs`, and the `stub_routes()` 501 mechanism no longer
+> exists. Retained to document the original schema-to-handler mapping.
 
 Each is a single-line `mod.rs` (`//! <name> module placeholder`) and
 the router maps each to `stub_routes()` which returns

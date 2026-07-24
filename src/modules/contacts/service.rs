@@ -321,7 +321,7 @@ impl ContactService {
         filter: &CompanyFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Company>, u64)> {
-        let offset = pagination.offset() as i32;
+        let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i32;
 
         // Parallel WHERE clauses so the data and count queries each get
@@ -1026,7 +1026,7 @@ impl ContactService {
         filter: &ContactFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Contact>, u64)> {
-        let offset = pagination.offset() as i32;
+        let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i32;
 
         // Parallel WHERE clauses so the data and count queries each get
@@ -1189,7 +1189,7 @@ impl ContactService {
         tenant_id: TenantId,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<CompanyIndustryResponse>, u64)> {
-        let offset = pagination.offset() as i32;
+        let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i32;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 =
