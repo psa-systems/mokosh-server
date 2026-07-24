@@ -80,7 +80,7 @@ GOOGLE_OAUTH_CLIENT_ID=dev-placeholder-client-id
 GOOGLE_OAUTH_CLIENT_SECRET=dev-placeholder-client-secret
 GOOGLE_OAUTH_REDIRECT_URI=http://localhost:4301/api/v1/auth/google/callback
 CLIENT_ORIGIN=http://localhost:4301
-OAUTH_SUPER_ADMIN_DOMAINS=niceguyit.biz
+OAUTH_SUPER_ADMIN_EMAILS=
 
 ADMIN_EMAIL=admin@example.com
 ADMIN_PASSWORD=devpassword12

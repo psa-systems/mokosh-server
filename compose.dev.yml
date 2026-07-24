@@ -273,10 +273,11 @@ services:
       # Must equal the browser-visible client origin byte-for-byte.
       CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:4301}
 
-      # Comma-separated, lowercased email-domain allowlist. First-time
-      # Google sign-ins from these domains are auto-promoted to
-      # role 'super_admin'. Existing users are never re-roled.
-      OAUTH_SUPER_ADMIN_DOMAINS: ${OAUTH_SUPER_ADMIN_DOMAINS:-niceguyit.biz}
+      # Comma-separated, lowercased exact-email allowlist. A first-time
+      # Google sign-in whose email exactly matches an entry is
+      # auto-provisioned as role 'super_admin'; others are rejected.
+      # Existing users are never re-roled. Empty by default (fail-closed).
+      OAUTH_SUPER_ADMIN_EMAILS: ${OAUTH_SUPER_ADMIN_EMAILS:-}
 
       # First-run admin bootstrap (DEV ONLY). Ignored once any user exists.
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
