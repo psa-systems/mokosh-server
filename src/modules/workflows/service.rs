@@ -1,13 +1,14 @@
 //! PMS-448: workflow-rule CRUD service.
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::models::{
     CreateWorkflowRuleRequest, UpdateWorkflowRuleRequest, WorkflowRuleResponse,
     WorkflowRuleRunResponse, RECOGNISED_TRIGGERS,
 };
+use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, FromRow)]
@@ -79,14 +80,21 @@ const RULE_SELECT: &str = "
     r.created_at, r.updated_at
 ";
 
+/// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
+/// the `app.current_tenant` GUC transaction-locally, so `workflow_rules` and
+/// `workflow_rule_runs` are safe under the fail-closed `tenant_isolation` RLS
+/// policy (migration 095). The only other path to these tables is the
+/// WorkflowExecutor, which reads `workflow_rules` and writes `workflow_rule_runs`
+/// inside the ticket service's own `begin_with_tenant` transaction, so it is
+/// GUC-safe too.
 #[derive(Clone)]
 pub struct WorkflowsService {
-    pool: PgPool,
+    db: Database,
 }
 
 impl WorkflowsService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
     pub async fn list(&self, tenant_id: Uuid) -> AppResult<Vec<WorkflowRuleResponse>> {
@@ -97,9 +105,10 @@ impl WorkflowsService {
              WHERE r.tenant_id = $1 \
              ORDER BY r.priority ASC, r.created_at ASC",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, RuleRow>(&sql)
             .bind(tenant_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -111,10 +120,11 @@ impl WorkflowsService {
              LEFT JOIN users u ON u.id = r.created_by_id \
              WHERE r.tenant_id = $1 AND r.id = $2",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, RuleRow>(&sql)
             .bind(tenant_id)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("WorkflowRule".into()))?;
         Ok(row.into())
@@ -137,6 +147,7 @@ impl WorkflowsService {
                 RECOGNISED_TRIGGERS.join(", "),
             )));
         }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO workflow_rules \
                  (tenant_id, trigger_event, name, description, conditions, actions, \
@@ -153,8 +164,9 @@ impl WorkflowsService {
         .bind(req.priority)
         .bind(req.is_active)
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get(tenant_id, id).await
     }
 
@@ -164,11 +176,12 @@ impl WorkflowsService {
         id: Uuid,
         req: UpdateWorkflowRuleRequest,
     ) -> AppResult<WorkflowRuleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let existing: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM workflow_rules WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         if existing.is_none() {
             return Err(AppError::NotFound("WorkflowRule".into()));
@@ -192,18 +205,21 @@ impl WorkflowsService {
         .bind(req.actions)
         .bind(req.priority)
         .bind(req.is_active)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get(tenant_id, id).await
     }
 
     pub async fn delete(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query("DELETE FROM workflow_rules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("WorkflowRule".into()));
         }
@@ -219,6 +235,7 @@ impl WorkflowsService {
         entity_type: &str,
         entity_id: Uuid,
     ) -> AppResult<Vec<WorkflowRuleRunResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run.id, run.rule_id, r.name AS rule_name, \
                     run.entity_type, run.entity_id, run.applied_actions, run.error, run.ran_at \
@@ -230,7 +247,7 @@ impl WorkflowsService {
         .bind(tenant_id)
         .bind(entity_type)
         .bind(entity_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }

@@ -8,12 +8,13 @@
 //! `(target, entity_id)` variants.
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::models::{
     ApprovalResponse, ApprovalTarget, CreateApprovalRequest, DecideApprovalRequest,
 };
+use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, FromRow)]
@@ -78,23 +79,26 @@ const SELECT_JOINS: &str = "
     LEFT JOIN users db ON db.id = a.decided_by_id
 ";
 
+/// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
+/// the `app.current_tenant` GUC transaction-locally, so `ticket_approvals` and
+/// `change_requests` are safe under the fail-closed `tenant_isolation` RLS
+/// policy (migration 095).
 #[derive(Clone)]
 pub struct ApprovalsService {
-    pool: PgPool,
+    db: Database,
 }
 
 impl ApprovalsService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
-    /// PMS-470: expose the underlying pool so the route layer can run
-    /// its own parent-existence checks against tables this service
-    /// doesn't own (`time_entries`, future `change_requests` /
-    /// `quotes`). The pool reference is read-only at the type level
-    /// because PgPool is `Clone` and the caller can only run queries.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// PMS-470/PMS-683: expose the `Database` so the route layer can run its
+    /// own tenant-scoped parent-existence checks (against `time_entries`,
+    /// `change_requests`, `quotes`) through `begin_with_tenant`, keeping them
+    /// GUC-safe now that those tables are RLS-enabled.
+    pub fn db(&self) -> &Database {
+        &self.db
     }
 
     /// PMS-470: list approvals for any `(target, entity_id)` parent.
@@ -111,11 +115,12 @@ impl ApprovalsService {
              WHERE a.tenant_id = $1 AND a.target = $2 AND a.entity_id = $3 \
              ORDER BY a.requested_at DESC",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, ApprovalRow>(&q)
             .bind(tenant_id)
             .bind(target.as_str())
             .bind(entity_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -137,11 +142,12 @@ impl ApprovalsService {
              ) \
              ORDER BY a.requested_at ASC",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, ApprovalRow>(&q)
             .bind(tenant_id)
             .bind(user_id)
             .bind(roles_held)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -172,6 +178,7 @@ impl ApprovalsService {
             ApprovalTarget::Ticket => Some(entity_id),
             _ => None,
         };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let insert = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO ticket_approvals \
                  (tenant_id, target, entity_id, ticket_id, requested_by_id, \
@@ -187,8 +194,9 @@ impl ApprovalsService {
         .bind(req.approver_user_id)
         .bind(&req.approver_role)
         .bind(&req.notes)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get(tenant_id, insert).await
     }
 
@@ -198,10 +206,11 @@ impl ApprovalsService {
              FROM ticket_approvals a {SELECT_JOINS} \
              WHERE a.tenant_id = $1 AND a.id = $2",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ApprovalRow>(&q)
             .bind(tenant_id)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("Approval not found".into()))?;
         Ok(row.into())
@@ -229,7 +238,7 @@ impl ApprovalsService {
                 ));
             }
         };
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let scope: Option<(String, Option<Uuid>, Option<String>)> = sqlx::query_as(
             "SELECT status, approver_user_id, approver_role \
              FROM ticket_approvals \
@@ -271,13 +280,14 @@ impl ApprovalsService {
     /// Rescind a pending approval. Only the original requester may
     /// cancel; other paths surface 403.
     pub async fn cancel(&self, tenant_id: Uuid, id: Uuid, caller_id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(String, Uuid)> = sqlx::query_as(
             "SELECT status, requested_by_id FROM ticket_approvals \
              WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let (status, requester) = row.ok_or(AppError::NotFound("Approval not found".into()))?;
         if status != "pending" {
@@ -294,8 +304,9 @@ impl ApprovalsService {
         )
         .bind(tenant_id)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -326,12 +337,14 @@ impl ApprovalsService {
         requested_by_id: Uuid,
         req: CreateApprovalRequest,
     ) -> AppResult<ApprovalResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let ticket_owned: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM tickets WHERE id = $1 AND tenant_id = $2")
                 .bind(ticket_id)
                 .bind(tenant_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
+        drop(tx);
         if ticket_owned.is_none() {
             return Err(AppError::NotFound("Ticket not found".into()));
         }

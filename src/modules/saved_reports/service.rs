@@ -1,10 +1,11 @@
 //! PMS-457: saved-reports service.
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::models::{CreateSavedReportRequest, SavedReportResponse, UpdateSavedReportRequest};
+use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, FromRow)]
@@ -65,14 +66,21 @@ const SELECT_FIELDS: &str = "
     r.is_shared, r.created_at, r.updated_at
 ";
 
+/// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
+/// the `app.current_tenant` GUC transaction-locally, so `saved_reports` and
+/// `scheduled_reports` are safe under the fail-closed `tenant_isolation` RLS
+/// policy (migration 095). `execute` also runs its compiled entity query inside
+/// the same GUC transaction, so report execution over RLS-enabled entity tables
+/// (e.g. tickets) is scoped correctly. The cross-tenant sweep in
+/// ScheduledReportsWorker uses the BYPASSRLS migrator pool.
 #[derive(Clone)]
 pub struct SavedReportsService {
-    pool: PgPool,
+    db: Database,
 }
 
 impl SavedReportsService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
     /// List reports visible to `user_id` under `scope`. Filters by
@@ -111,7 +119,8 @@ impl SavedReportsService {
         if let Some(et) = entity_type {
             q = q.bind(et);
         }
-        let rows = q.fetch_all(&self.pool).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -128,11 +137,12 @@ impl SavedReportsService {
              WHERE r.tenant_id = $1 AND r.id = $2 \
                AND (r.created_by_id = $3 OR r.is_shared = true)",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ReportRow>(&sql)
             .bind(tenant_id)
             .bind(id)
             .bind(user_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("SavedReport".into()))?;
         Ok(row.into())
@@ -144,6 +154,7 @@ impl SavedReportsService {
         user_id: Uuid,
         req: CreateSavedReportRequest,
     ) -> AppResult<SavedReportResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let inserted: Uuid = sqlx::query_scalar(
             "INSERT INTO saved_reports \
                  (tenant_id, created_by_id, name, description, entity_type, \
@@ -161,8 +172,9 @@ impl SavedReportsService {
         .bind(&req.group_by)
         .bind(&req.sort)
         .bind(req.is_shared)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get(tenant_id, user_id, inserted).await
     }
 
@@ -176,6 +188,7 @@ impl SavedReportsService {
         id: Uuid,
         req: UpdateSavedReportRequest,
     ) -> AppResult<SavedReportResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let owner: Option<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM saved_reports \
              WHERE tenant_id = $1 AND id = $2 AND created_by_id = $3",
@@ -183,7 +196,7 @@ impl SavedReportsService {
         .bind(tenant_id)
         .bind(id)
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if owner.is_none() {
             return Err(AppError::NotFound("SavedReport".into()));
@@ -210,12 +223,14 @@ impl SavedReportsService {
         .bind(req.group_by)
         .bind(req.sort)
         .bind(req.is_shared)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get(tenant_id, user_id, id).await
     }
 
     pub async fn delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
             "DELETE FROM saved_reports \
              WHERE tenant_id = $1 AND id = $2 AND created_by_id = $3",
@@ -223,9 +238,10 @@ impl SavedReportsService {
         .bind(tenant_id)
         .bind(id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("SavedReport".into()));
         }
@@ -260,6 +276,11 @@ impl SavedReportsService {
             offset,
         )?;
 
+        // PMS-683: the compiled query reads the entity tables (tickets, etc.),
+        // which are under fail-closed RLS, so run both statements inside the
+        // tenant-GUC transaction. A raw-pool read would return zero rows.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
         // The count query has the same WHERE binds as the paged
         // SELECT minus the LIMIT/OFFSET pair. Run it first so the
         // SPA's pagination footer renders even on an empty page.
@@ -267,7 +288,7 @@ impl SavedReportsService {
         for bv in &compiled.count_binds {
             count_q = bind_one_scalar(count_q, bv);
         }
-        let total: i64 = count_q.fetch_one(&self.pool).await?;
+        let total: i64 = count_q.fetch_one(&mut *tx).await?;
 
         // Materialise the rows as JSON via Postgres `row_to_json` so
         // the per-column type handling lives in the database, not
@@ -280,7 +301,7 @@ impl SavedReportsService {
         for bv in &compiled.binds {
             row_q = bind_one_scalar(row_q, bv);
         }
-        let rows = row_q.fetch_all(&self.pool).await?;
+        let rows = row_q.fetch_all(&mut *tx).await?;
 
         Ok(ExecuteReportResponse {
             rows,
@@ -410,6 +431,7 @@ impl SavedReportsService {
         // SPA's other report endpoints.
         let _ = self.get(tenant_id, user_id, saved_report_id).await?;
         let next_run = compute_next_run(&req.cron_expr, Utc::now())?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO scheduled_reports \
                  (tenant_id, saved_report_id, user_id, cron_expr, \
@@ -424,8 +446,9 @@ impl SavedReportsService {
         .bind(&req.recipient_email)
         .bind(req.is_active)
         .bind(next_run)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.schedule_get(tenant_id, id).await
     }
 
@@ -439,10 +462,11 @@ impl SavedReportsService {
              WHERE tenant_id = $1 AND saved_report_id = $2 \
              ORDER BY created_at DESC",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, ScheduleRow>(&sql)
             .bind(tenant_id)
             .bind(saved_report_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -456,10 +480,11 @@ impl SavedReportsService {
             "SELECT {SCHEDULE_SELECT} FROM scheduled_reports \
              WHERE tenant_id = $1 AND id = $2",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ScheduleRow>(&sql)
             .bind(tenant_id)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("ScheduledReport".into()))?;
         Ok(row.into())
@@ -482,6 +507,7 @@ impl SavedReportsService {
             Some(expr) => Some(compute_next_run(expr, Utc::now())?),
             None => None,
         };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
             "UPDATE scheduled_reports SET \
                  cron_expr       = COALESCE($4, cron_expr), \
@@ -498,9 +524,10 @@ impl SavedReportsService {
         .bind(new_next)
         .bind(req.recipient_email)
         .bind(req.is_active)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("ScheduledReport".into()));
         }
@@ -508,6 +535,7 @@ impl SavedReportsService {
     }
 
     pub async fn schedule_delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
             "DELETE FROM scheduled_reports \
              WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
@@ -515,9 +543,10 @@ impl SavedReportsService {
         .bind(tenant_id)
         .bind(id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("ScheduledReport".into()));
         }

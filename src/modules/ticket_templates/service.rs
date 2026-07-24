@@ -1,12 +1,13 @@
 //! PMS-448 AC4: ticket-template CRUD service.
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::models::{
     CreateTicketTemplateRequest, TicketTemplateResponse, UpdateTicketTemplateRequest,
 };
+use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, FromRow)]
@@ -53,14 +54,17 @@ const TEMPLATE_SELECT: &str = "
     t.created_at, t.updated_at
 ";
 
+/// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
+/// the `app.current_tenant` GUC transaction-locally, so `ticket_templates` is
+/// safe under the fail-closed `tenant_isolation` RLS policy (migration 095).
 #[derive(Clone)]
 pub struct TicketTemplatesService {
-    pool: PgPool,
+    db: Database,
 }
 
 impl TicketTemplatesService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
     /// List templates for the tenant. When `active_only` is true the
@@ -78,10 +82,11 @@ impl TicketTemplatesService {
              WHERE t.tenant_id = $1 AND ($2 = false OR t.is_active = true) \
              ORDER BY t.name ASC",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, TemplateRow>(&sql)
             .bind(tenant_id)
             .bind(active_only)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -93,10 +98,11 @@ impl TicketTemplatesService {
              LEFT JOIN users u ON u.id = t.created_by_id \
              WHERE t.tenant_id = $1 AND t.id = $2",
         );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TemplateRow>(&sql)
             .bind(tenant_id)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("TicketTemplate".into()))?;
         Ok(row.into())
@@ -108,6 +114,7 @@ impl TicketTemplatesService {
         user_id: Uuid,
         req: CreateTicketTemplateRequest,
     ) -> AppResult<TicketTemplateResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO ticket_templates \
                  (tenant_id, name, description, subject, body, category_id, \
@@ -125,8 +132,9 @@ impl TicketTemplatesService {
         .bind(req.type_id)
         .bind(req.is_active)
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get(tenant_id, id).await
     }
 
@@ -151,6 +159,7 @@ impl TicketTemplatesService {
         let type_id = req.type_id.unwrap_or(current.type_id);
         let is_active = req.is_active.unwrap_or(current.is_active);
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE ticket_templates SET \
                  name = $3, description = $4, subject = $5, body = $6, \
@@ -168,18 +177,21 @@ impl TicketTemplatesService {
         .bind(priority_id)
         .bind(type_id)
         .bind(is_active)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.get(tenant_id, id).await
     }
 
     pub async fn delete(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query("DELETE FROM ticket_templates WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("TicketTemplate".into()));
         }

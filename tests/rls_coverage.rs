@@ -25,19 +25,14 @@ use sqlx::PgPool;
 
 /// Tenant-scoped tables intentionally NOT yet under RLS, pending their services'
 /// migration to `begin_with_tenant`. Keep sorted.
-const ALLOWED_WITHOUT_RLS: &[&str] = &[
-    "change_requests",
-    "email_intake_log",
-    "saved_dashboards",
-    "saved_reports",
-    "scheduled_dashboards",
-    "scheduled_reports",
-    "tenant_intake_tokens",
-    "ticket_approvals",
-    "ticket_templates",
-    "workflow_rule_runs",
-    "workflow_rules",
-];
+///
+/// PMS-683 (tail): now EMPTY. The 11 tables previously deferred here had their
+/// services migrated onto `begin_with_tenant` and gained the fail-closed
+/// `tenant_isolation` policy in migration 095, so the invariant is fully
+/// restored: every tenant-scoped `public` table has RLS enabled, forced, and a
+/// `tenant_isolation` policy. A newly added tenant table that skips RLS will now
+/// fail this test outright rather than being silently allowlisted.
+const ALLOWED_WITHOUT_RLS: &[&str] = &[];
 
 #[sqlx::test]
 async fn every_tenant_table_has_rls_or_is_allowlisted(pool: PgPool) {

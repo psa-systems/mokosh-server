@@ -158,15 +158,15 @@ pub fn create_api_router(
         Arc::new(InvitationsService::new(db.clone()).with_app_url(client_origin.clone()));
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
-    let saved_reports_service = SavedReportsService::new(db.pool().clone());
+    let saved_reports_service = SavedReportsService::new(db.clone());
     // PMS-448: ticket.created workflow rule executor + CRUD.
-    let workflows_service = WorkflowsService::new(db.pool().clone());
+    let workflows_service = WorkflowsService::new(db.clone());
     // PMS-448 AC4: admin-authored ticket templates (new-ticket pre-fills).
-    let ticket_templates_service = TicketTemplatesService::new(db.pool().clone());
+    let ticket_templates_service = TicketTemplatesService::new(db.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.pool().clone());
     // PMS-453: per-user saved dashboards.
-    let dashboards_service = DashboardsService::new(db.pool().clone());
+    let dashboards_service = DashboardsService::new(db.clone());
     // PMS-450: email-to-ticket intake. Holds a TicketService clone so
     // the intake handler can reuse the full ticket-create flow
     // (audit + SLA assignment + ticket-number generation) without
@@ -176,12 +176,12 @@ pub fn create_api_router(
     // `AttachmentService` (same env-driven dir + size cap as the agent /
     // portal upload routes).
     let email_intake_service = EmailIntakeService::new(
-        db.pool().clone(),
+        db.clone(),
         ticket_service.clone(),
         AttachmentService::new(db.pool().clone(), AttachmentConfig::from_env()),
     );
     // PMS-451: per-ticket approval requests.
-    let approvals_service = ApprovalsService::new(db.pool().clone());
+    let approvals_service = ApprovalsService::new(db.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
     // SLA service shares the notifications dispatcher so the

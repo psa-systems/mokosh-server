@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -13,6 +12,7 @@ use super::models::{
     CreateIntakeTokenRequest, CreatedIntakeTokenResponse, EmailIntakeLogResponse,
     EmailIntakeRequest, EmailIntakeResponse, IntakeTokenResponse,
 };
+use crate::db::Database;
 use crate::modules::auth::TenantId;
 use crate::modules::tickets::{AttachmentService, TicketService};
 use crate::utils::error::{AppError, AppResult};
@@ -23,17 +23,24 @@ pub struct ResolvedTenantToken {
     pub token_id: Uuid,
 }
 
+/// PMS-683: `email_intake_log` and `tenant_intake_tokens` reads/writes run
+/// through `Database::begin_with_tenant` (GUC-safe under the fail-closed
+/// `tenant_isolation` RLS policy, migration 095). The one exception is the
+/// cross-tenant `resolve_token` hash lookup, which by design has no tenant
+/// context and runs on the BYPASSRLS migrator pool. Cross-table helper reads
+/// (contacts / tickets / users / ticket_notes) use `self.db.pool()`, exactly
+/// as before; those tables' RLS posture is unchanged by this migration.
 #[derive(Clone)]
 pub struct EmailIntakeService {
-    pool: PgPool,
+    db: Database,
     tickets: TicketService,
     attachments: AttachmentService,
 }
 
 impl EmailIntakeService {
-    pub fn new(pool: PgPool, tickets: TicketService, attachments: AttachmentService) -> Self {
+    pub fn new(db: Database, tickets: TicketService, attachments: AttachmentService) -> Self {
         Self {
-            pool,
+            db,
             tickets,
             attachments,
         }
@@ -47,6 +54,13 @@ impl EmailIntakeService {
     /// can see at a glance which tokens are live.
     pub async fn resolve_token(&self, bearer: &str) -> AppResult<ResolvedTenantToken> {
         let hash = sha256_hex(bearer.as_bytes());
+        // SAFETY (PMS-683): resolve-by-hash is cross-tenant BY DESIGN - the
+        // presented bearer is the only identity, so there is no tenant context
+        // to set as the RLS GUC. This lookup, and the paired `last_used_at`
+        // bump, run on the BYPASSRLS migrator pool. `tenant_intake_tokens` has
+        // RLS enabled (migration 095); every OTHER access to it is tenant-scoped
+        // via `begin_with_tenant`. `token_hash` is a unique SHA-256, so the
+        // lookup still resolves exactly one tenant.
         let row: Option<(Uuid, Uuid)> = sqlx::query_as(
             "SELECT id, tenant_id FROM tenant_intake_tokens \
              WHERE token_hash = $1 \
@@ -54,12 +68,12 @@ impl EmailIntakeService {
                AND revoked_at IS NULL",
         )
         .bind(&hash)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.db.migrator_pool())
         .await?;
         let (token_id, tenant_uuid) = row.ok_or(AppError::Unauthorized)?;
         sqlx::query("UPDATE tenant_intake_tokens SET last_used_at = NOW() WHERE id = $1")
             .bind(token_id)
-            .execute(&self.pool)
+            .execute(self.db.migrator_pool())
             .await?;
         // `from_trusted` is the documented seam for cases that have no
         // request context to source the tenant from. Email-intake's
@@ -108,7 +122,7 @@ impl EmailIntakeService {
         // `ticket_id` (success) or `error` (failure).
         let log_id = self.record_intake_log(tenant_id, &req).await?;
         let result = self.intake_inner(tenant_id, &req).await;
-        self.finalise_intake_log(log_id, &result).await?;
+        self.finalise_intake_log(tenant_id, log_id, &result).await?;
         result
     }
 
@@ -201,7 +215,7 @@ impl EmailIntakeService {
              ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.db.pool())
         .await?;
         let creator = creator.ok_or(AppError::Configuration(
             "Cannot create email-intake ticket: tenant has no admin/manager user to attribute it to"
@@ -291,13 +305,13 @@ impl EmailIntakeService {
         )
         .bind(tenant_id)
         .bind(&from)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.db.pool())
         .await?;
         if let Some(pair) = existing {
             return Ok(Some(pair));
         }
         let default_company = crate::modules::settings::read_email_intake_default_company(
-            &self.pool,
+            self.db.pool(),
             tenant_id.get(),
         )
         .await?;
@@ -317,7 +331,7 @@ impl EmailIntakeService {
         .bind(first)
         .bind(last)
         .bind(&from)
-        .execute(&self.pool)
+        .execute(self.db.pool())
         .await?;
         Ok(Some((contact_id, company_id)))
     }
@@ -343,7 +357,7 @@ impl EmailIntakeService {
              ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.db.pool())
         .await?;
         let Some(creator) = creator else {
             return Err(AppError::Configuration(
@@ -366,7 +380,7 @@ impl EmailIntakeService {
         .bind(content)
         .bind(creator)
         .bind(contact_id)
-        .fetch_one(&self.pool)
+        .fetch_one(self.db.pool())
         .await?;
         Ok(note_id)
     }
@@ -436,6 +450,7 @@ impl EmailIntakeService {
         tenant_id: TenantId,
         req: &EmailIntakeRequest,
     ) -> AppResult<Uuid> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let log_id: Uuid = sqlx::query_scalar(
             "INSERT INTO email_intake_log \
                  (tenant_id, message_id, raw_headers, raw_body_text, raw_body_html) \
@@ -446,8 +461,9 @@ impl EmailIntakeService {
         .bind(&req.raw_headers)
         .bind(req.body_text.as_deref())
         .bind(req.body_html.as_deref())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(log_id)
     }
 
@@ -457,6 +473,7 @@ impl EmailIntakeService {
     /// logged but does NOT mask the original intake outcome.
     async fn finalise_intake_log(
         &self,
+        tenant_id: TenantId,
         log_id: Uuid,
         result: &AppResult<EmailIntakeResponse>,
     ) -> AppResult<()> {
@@ -464,12 +481,21 @@ impl EmailIntakeService {
             Ok(resp) => (Some(resp.ticket_id), None),
             Err(e) => (None, Some(e.to_string())),
         };
-        let r = sqlx::query("UPDATE email_intake_log SET ticket_id = $1, error = $2 WHERE id = $3")
-            .bind(ticket_id)
-            .bind(error)
-            .bind(log_id)
-            .execute(&self.pool)
-            .await;
+        // Best-effort settle inside a tenant-GUC transaction so the UPDATE is
+        // RLS-scoped (the row was written under the same tenant). A failure
+        // here is logged but does NOT mask the original intake outcome.
+        let r: AppResult<()> = async {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query("UPDATE email_intake_log SET ticket_id = $1, error = $2 WHERE id = $3")
+                .bind(ticket_id)
+                .bind(error)
+                .bind(log_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
         if let Err(e) = r {
             tracing::warn!(?e, %log_id, "failed to finalise email_intake_log row");
         }
@@ -484,6 +510,7 @@ impl EmailIntakeService {
         tenant_id: TenantId,
         id: Uuid,
     ) -> AppResult<EmailIntakeLogResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<IntakeLogRow> = sqlx::query_as(
             "SELECT id, tenant_id, message_id, ticket_id, raw_headers, \
                     raw_body_text, raw_body_html, received_at, error \
@@ -492,7 +519,7 @@ impl EmailIntakeService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
             .ok_or(AppError::NotFound("EmailIntakeLog".into()))
@@ -509,7 +536,7 @@ impl EmailIntakeService {
         )
         .bind(tenant_id)
         .bind(message_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.db.pool())
         .await?;
         Ok(row)
     }
@@ -526,7 +553,7 @@ impl EmailIntakeService {
         )
         .bind(tenant_id)
         .bind(references)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.db.pool())
         .await?;
         Ok(row)
     }
@@ -538,6 +565,7 @@ impl EmailIntakeService {
     /// (the operator wants to confirm they revoked the right one);
     /// the auth-resolving `resolve_token` path keeps filtering them.
     pub async fn list_tokens(&self, tenant_id: TenantId) -> AppResult<Vec<IntakeTokenResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, IntakeTokenRow>(
             "SELECT id, kind, label, last_used_at, created_at, revoked_at \
              FROM tenant_intake_tokens \
@@ -545,7 +573,7 @@ impl EmailIntakeService {
              ORDER BY revoked_at NULLS FIRST, created_at DESC",
         )
         .bind(tenant_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -574,6 +602,7 @@ impl EmailIntakeService {
         let plaintext = URL_SAFE_NO_PAD.encode(bytes);
         let hash = sha256_hex(plaintext.as_bytes());
 
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: IntakeTokenRow = sqlx::query_as(
             "INSERT INTO tenant_intake_tokens (tenant_id, kind, token_hash, label) \
              VALUES ($1, $2, $3, $4) \
@@ -583,8 +612,9 @@ impl EmailIntakeService {
         .bind(&req.kind)
         .bind(&hash)
         .bind(&req.label)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         let metadata: IntakeTokenResponse = row.into();
         Ok(CreatedIntakeTokenResponse {
             token_metadata: metadata,
@@ -597,6 +627,7 @@ impl EmailIntakeService {
     /// move the timestamp), and a missing id surfaces as 404 so the
     /// SPA can confirm the row really existed.
     pub async fn revoke_token(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
             "UPDATE tenant_intake_tokens \
                  SET revoked_at = COALESCE(revoked_at, NOW()) \
@@ -604,9 +635,10 @@ impl EmailIntakeService {
         )
         .bind(tenant_id)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("IntakeToken".into()));
         }

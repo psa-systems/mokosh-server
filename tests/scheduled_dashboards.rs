@@ -44,7 +44,7 @@ async fn create_dashboard(app: &common::TestApp, token: &str) -> Uuid {
 
 fn build_worker(pool: PgPool) -> ScheduledDashboardsWorker {
     let db = Database::from_pool(pool);
-    let dashboards = Arc::new(DashboardsService::new(db.pool().clone()));
+    let dashboards = Arc::new(DashboardsService::new(db.clone()));
     ScheduledDashboardsWorker::new(db, dashboards)
 }
 
