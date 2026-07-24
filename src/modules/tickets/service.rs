@@ -401,7 +401,7 @@ impl TicketService {
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Ticket>, u64)> {
-        let offset = pagination.offset() as i32;
+        let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i32;
 
         // Shared filter builder so the data/count placeholder numbering
@@ -2321,7 +2321,7 @@ impl TicketService {
         self.validate_fk_opt(tenant_id, "teams", filter.team_id)
             .await?;
 
-        let offset = pagination.offset() as i32;
+        let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i32;
 
         // Shared filter builder so the data/count placeholder numbering
