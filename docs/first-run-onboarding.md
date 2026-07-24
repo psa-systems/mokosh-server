@@ -2,9 +2,13 @@
 
 How the very first administrator gets into a brand-new mokosh-server instance and configures it, including the case where email/SMTP is not yet set up.
 
-## The chicken-and-egg this avoids
+## Scope: this is the mokosh (downstream) side only
 
-On a fresh instance email/SMTP is not configured, so no verification message can be sent. If admin access were gated on a verified email address, the first admin could never get in to configure email in the first place. mokosh-server does not have that gate: the production bootstrap-admin login does not depend on email verification, so first-run is unblocked by construction.
+The admin-onboarding chicken-and-egg that actually blocked first-run lives in **bunyip** (the OP), not mokosh: bunyip's web onboarding gate could trap an unverified admin when SMTP was enabled-but-undeliverable, so the only admin could never reach `/admin/email` to fix the relay. That is fixed in **BUNYIP-401** (bunyip PR #393). This document only covers mokosh-server's downstream posture; it is not the fix for the bunyip blocker. For the end-to-end first-run flow and the actual fix, see BUNYIP-401 and PSA-1.
+
+## Why mokosh does not add a second gate
+
+On a fresh instance email/SMTP is not configured, so no verification message can be sent. If admin access were gated on a verified email address, the first admin could never get in. mokosh-server does not add such a gate: the production bootstrap-admin login does not depend on mokosh-side email verification, so mokosh never contributes to the chicken-and-egg. (The verification decision that mattered was bunyip's, upstream.)
 
 ## Production: bootstrap admin via bunyip-as-OP
 
