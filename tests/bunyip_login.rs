@@ -15,7 +15,7 @@ use uuid::Uuid;
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::middleware::place_bunyip_user;
 use mokosh_server::modules::auth::oidc_rs::AtClaims;
-use mokosh_server::modules::auth::{AuthService, TenantId};
+use mokosh_server::modules::auth::{AuthService, TenantId, UserRole};
 use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
 use mokosh_server::modules::tenants::TenantService;
 use mokosh_server::modules::tickets::{CreateTicketRequest, TicketService};
@@ -403,6 +403,92 @@ async fn placement_seeds_off_psa_target_tenant_so_tickets_create(pool: PgPool) {
         !ticket.ticket_number.is_empty(),
         "ticket received a sequenced number"
     );
+}
+
+/// PMS-676: the first/bootstrap admin must be able to log in and operate with
+/// FULL admin rights on a fresh instance even when email is unconfigured and
+/// the address can therefore never be verified. Production authenticates the
+/// bootstrap admin through bunyip-as-OP: the platform-admin claim
+/// (`bunyip_role = "admin"`) maps to mokosh `super_admin` in `place_bunyip_user`,
+/// and that path does NOT gate login on `email_verified`. Here `email_verified
+/// = false` stands in for the "SMTP unconfigured, email can never be verified"
+/// state: the admin still authenticates and still lands as `super_admin`.
+#[sqlx::test]
+async fn bootstrap_admin_unverified_email_still_gets_super_admin(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    let state = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("bootstrap-admin@example.com".to_string()),
+        // email_verified = false: no SMTP, so the address is never verified.
+        false,
+        None,
+        None,
+        // Platform-admin claim -> the bootstrap admin.
+        &claims(sub, Some("admin")),
+    )
+    .await;
+
+    let state = state.expect("bootstrap admin authenticates even with an unverified email");
+    let user = state
+        .require_user()
+        .expect("authenticated state carries the current user");
+    assert_eq!(
+        user.role,
+        UserRole::SuperAdmin,
+        "the platform-admin claim grants super_admin regardless of email verification"
+    );
+    assert!(
+        state.has_role(UserRole::SuperAdmin),
+        "bootstrap admin has super_admin access on a fresh, email-unconfigured instance"
+    );
+
+    let (_tenant, role) = user_tenant_role(&pool, sub).await;
+    assert_eq!(
+        role, "super_admin",
+        "the persisted row is super_admin, so admin access survives the next request"
+    );
+}
+
+/// PMS-676 companion: once email IS configured (address verified), the same
+/// bootstrap-admin login still yields `super_admin` - i.e. turning email on does
+/// not regress or downgrade the bootstrap admin. `email_verified = true` stands
+/// in for the "SMTP configured, email verified" state.
+#[sqlx::test]
+async fn bootstrap_admin_verified_email_still_gets_super_admin(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    let state = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("bootstrap-admin@example.com".to_string()),
+        // email_verified = true: SMTP configured, address verified.
+        true,
+        None,
+        None,
+        &claims(sub, Some("admin")),
+    )
+    .await;
+
+    let state = state.expect("bootstrap admin authenticates with a verified email");
+    let user = state
+        .require_user()
+        .expect("authenticated state carries the current user");
+    assert_eq!(
+        user.role,
+        UserRole::SuperAdmin,
+        "enabling email must not downgrade the bootstrap admin"
+    );
+
+    let (_tenant, role) = user_tenant_role(&pool, sub).await;
+    assert_eq!(role, "super_admin");
 }
 
 /// MAPPS-329: Bunyip-onboarded users (BUNYIP-206 guarantees first + last name
