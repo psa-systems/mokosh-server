@@ -57,6 +57,14 @@ jobs:
         # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
+      - name: Ensure C toolchain + native deps
+        # RUNS_ON_OPENSUSE_BASE_LATEST was trimmed of the C toolchain + OpenSSL
+        # headers: `gcc` provides `cc` (rustc's linker; without it `linker cc
+        # not found`) and `libopenssl-devel` provides openssl.pc for
+        # `openssl-sys` (via lettre's native-tls SMTP transport). Runner user
+        # is unprivileged, so zypper needs sudo. Same regression as check.yml.
+        run: sudo zypper --non-interactive install --no-recommends gcc libopenssl-devel
+
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`
         # binaries) plus the lib unit tests, so new suites are picked up
