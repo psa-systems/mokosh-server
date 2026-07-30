@@ -56,6 +56,18 @@ jobs:
         run: |
           nu scripts/check-migration-immutability.nu
 
+      - name: Ensure C toolchain + native deps
+        # The RUNS_ON_OPENSUSE_BASE_LATEST runner image was trimmed of the C
+        # toolchain + OpenSSL headers the build relies on. `gcc` provides `cc`,
+        # which rustc drives linking through (without it: `linker cc not
+        # found`). `libopenssl-devel` provides the OpenSSL headers + openssl.pc
+        # that `openssl-sys` probes with pkg-config - pulled in via lettre's
+        # `tokio1-native-tls` SMTP transport (without it: `Package 'openssl'
+        # not found`). The runner user is unprivileged, so zypper needs sudo
+        # (passwordless on the runner). Same runner-image regression fixed in
+        # mokosh-apps #446 and bunyip #396.
+        run: sudo zypper --non-interactive install --no-recommends gcc libopenssl-devel
+
       - name: Check formatting
         run: cargo fmt --all --check
 
