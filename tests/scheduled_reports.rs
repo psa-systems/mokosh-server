@@ -88,7 +88,7 @@ fn build_worker(pool: PgPool) -> ScheduledReportsWorker {
     // both as app + migrator so the tick can read scheduled_reports
     // and INSERT notifications without RLS friction.
     let db = Database::from_pool(pool);
-    let reports = Arc::new(SavedReportsService::new(db.pool().clone()));
+    let reports = Arc::new(SavedReportsService::new(db.clone()));
     ScheduledReportsWorker::new(db, reports)
 }
 

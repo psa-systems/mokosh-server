@@ -492,7 +492,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::saved_reports::ScheduledReportsWorker::new(
             db.clone(),
             std::sync::Arc::new(
-                mokosh_server::modules::saved_reports::SavedReportsService::new(db.pool().clone()),
+                mokosh_server::modules::saved_reports::SavedReportsService::new(db.clone()),
             ),
         );
     scheduler.register(scheduled_reports_worker, std::time::Duration::from_secs(60));
@@ -504,7 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::dashboards::ScheduledDashboardsWorker::new(
             db.clone(),
             std::sync::Arc::new(mokosh_server::modules::dashboards::DashboardsService::new(
-                db.pool().clone(),
+                db.clone(),
             )),
         );
     scheduler.register(

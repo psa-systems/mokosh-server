@@ -234,12 +234,17 @@ async fn assert_parent_exists(
     tenant_id: Uuid,
     entity_id: Uuid,
 ) -> AppResult<()> {
+    // PMS-683: run the parent-existence check inside a tenant-GUC transaction
+    // so it stays correct now that the checked tables (`time_entries`,
+    // `change_requests`, `quotes`) are under fail-closed RLS. A raw-pool read
+    // would match no rows once RLS is enabled.
+    let mut tx = s.service.db().begin_with_tenant(tenant_id).await?;
     let exists: Option<(Uuid,)> = sqlx::query_as(&format!(
         "SELECT id FROM {table} WHERE tenant_id = $1 AND id = $2"
     ))
     .bind(tenant_id)
     .bind(entity_id)
-    .fetch_optional(s.service.pool())
+    .fetch_optional(&mut *tx)
     .await?;
     if exists.is_none() {
         return Err(AppError::NotFound(format!(

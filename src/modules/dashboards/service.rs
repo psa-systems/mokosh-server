@@ -1,13 +1,14 @@
 //! PMS-453: saved dashboards service.
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::models::{
     CreateSavedDashboardRequest, CreateScheduledDashboardRequest, SavedDashboardResponse,
     ScheduledDashboardResponse, UpdateSavedDashboardRequest, UpdateScheduledDashboardRequest,
 };
+use crate::db::Database;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, FromRow)]
@@ -33,14 +34,19 @@ impl From<DashboardRow> for SavedDashboardResponse {
     }
 }
 
+/// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
+/// the `app.current_tenant` GUC transaction-locally, so `saved_dashboards` and
+/// `scheduled_dashboards` are safe under the fail-closed `tenant_isolation` RLS
+/// policy (migration 095). The cross-tenant sweep in ScheduledDashboardsWorker
+/// uses the BYPASSRLS migrator pool.
 #[derive(Clone)]
 pub struct DashboardsService {
-    pool: PgPool,
+    db: Database,
 }
 
 impl DashboardsService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
     /// List the caller's own saved dashboards. Default-first so the
@@ -51,6 +57,7 @@ impl DashboardsService {
         tenant_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<Vec<SavedDashboardResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, DashboardRow>(
             "SELECT id, name, layout, is_default, created_at, updated_at \
              FROM saved_dashboards \
@@ -59,7 +66,7 @@ impl DashboardsService {
         )
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -70,6 +77,7 @@ impl DashboardsService {
         user_id: Uuid,
         id: Uuid,
     ) -> AppResult<SavedDashboardResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, DashboardRow>(
             "SELECT id, name, layout, is_default, created_at, updated_at \
              FROM saved_dashboards \
@@ -78,7 +86,7 @@ impl DashboardsService {
         .bind(tenant_id)
         .bind(user_id)
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound("Dashboard not found".into()))?;
         Ok(row.into())
@@ -90,7 +98,7 @@ impl DashboardsService {
         user_id: Uuid,
         req: CreateSavedDashboardRequest,
     ) -> AppResult<SavedDashboardResponse> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // If the caller asked for is_default, clear any existing
         // default for the same (tenant, user) so the partial-unique
         // index does not conflict.
@@ -127,7 +135,7 @@ impl DashboardsService {
         id: Uuid,
         req: UpdateSavedDashboardRequest,
     ) -> AppResult<SavedDashboardResponse> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Confirm the row exists in the caller's scope before touching
         // anything; surface a 404 instead of a silent no-op.
         let exists: Option<(Uuid,)> = sqlx::query_as(
@@ -178,6 +186,7 @@ impl DashboardsService {
     }
 
     pub async fn delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
             "DELETE FROM saved_dashboards \
              WHERE tenant_id = $1 AND user_id = $2 AND id = $3",
@@ -185,9 +194,10 @@ impl DashboardsService {
         .bind(tenant_id)
         .bind(user_id)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("Dashboard not found".into()));
         }
@@ -203,6 +213,7 @@ impl DashboardsService {
         tenant_id: Uuid,
         user_id: Uuid,
     ) -> AppResult<Option<SavedDashboardResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, DashboardRow>(
             "SELECT id, name, layout, is_default, created_at, updated_at \
              FROM saved_dashboards \
@@ -211,7 +222,7 @@ impl DashboardsService {
         )
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         Ok(row.map(Into::into))
     }
@@ -230,6 +241,7 @@ impl DashboardsService {
     ) -> AppResult<ScheduledDashboardResponse> {
         let _ = self.get(tenant_id, user_id, dashboard_id).await?;
         let next_run = compute_next_run(&req.cron_expr, Utc::now())?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO scheduled_dashboards \
                  (tenant_id, dashboard_id, user_id, cron_expr, \
@@ -244,8 +256,9 @@ impl DashboardsService {
         .bind(&req.recipient_email)
         .bind(req.is_active)
         .bind(next_run)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.schedule_get(tenant_id, id).await
     }
 
@@ -254,6 +267,7 @@ impl DashboardsService {
         tenant_id: Uuid,
         dashboard_id: Uuid,
     ) -> AppResult<Vec<ScheduledDashboardResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, ScheduleRow>(
             "SELECT id, dashboard_id, user_id, cron_expr, channel, \
                     recipient_email, is_active, last_run_at, next_run_at, \
@@ -264,7 +278,7 @@ impl DashboardsService {
         )
         .bind(tenant_id)
         .bind(dashboard_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -274,6 +288,7 @@ impl DashboardsService {
         tenant_id: Uuid,
         id: Uuid,
     ) -> AppResult<ScheduledDashboardResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ScheduleRow>(
             "SELECT id, dashboard_id, user_id, cron_expr, channel, \
                     recipient_email, is_active, last_run_at, next_run_at, \
@@ -283,7 +298,7 @@ impl DashboardsService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound("ScheduledDashboard".into()))?;
         Ok(row.into())
@@ -300,6 +315,7 @@ impl DashboardsService {
             Some(expr) => Some(compute_next_run(expr, Utc::now())?),
             None => None,
         };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
             "UPDATE scheduled_dashboards SET \
                  cron_expr       = COALESCE($4, cron_expr), \
@@ -316,9 +332,10 @@ impl DashboardsService {
         .bind(new_next)
         .bind(req.recipient_email)
         .bind(req.is_active)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("ScheduledDashboard".into()));
         }
@@ -326,6 +343,7 @@ impl DashboardsService {
     }
 
     pub async fn schedule_delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
             "DELETE FROM scheduled_dashboards \
              WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
@@ -333,9 +351,10 @@ impl DashboardsService {
         .bind(tenant_id)
         .bind(id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if rows == 0 {
             return Err(AppError::NotFound("ScheduledDashboard".into()));
         }
