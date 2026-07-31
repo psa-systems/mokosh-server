@@ -553,10 +553,11 @@ async fn health_check() -> &'static str {
 /// Readiness probe (PMS-130). Pings every external dependency the
 /// running server actually talks to:
 ///
-/// - **Database** (always): `SELECT 1` against the pool. The legacy
-///   `health_check()` returns `"OK"` unconditionally; this is the
-///   first probe that distinguishes a process that booted from one
-///   that can actually serve a request.
+/// - **Database** (always): `SELECT 1` against the pool, bounded by
+///   [`READY_DB_PING_TIMEOUT`]. The legacy `health_check()` returns
+///   `"OK"` unconditionally; this is the first probe that
+///   distinguishes a process that booted from one that can actually
+///   serve a request.
 /// - **Infisical** (best-effort): if the operator set
 ///   `INFISICAL_BASE_URL` at process start, a 1-second HTTP probe
 ///   against `<base>/api/status`. Mokosh-server loads Infisical
@@ -585,7 +586,7 @@ async fn ready_check(
     [(axum::http::HeaderName, &'static str); 2],
     String,
 ) {
-    let db_result = db.health_check().await;
+    let db_result = bounded_db_ping(db.health_check()).await;
     let infisical_result = probe_infisical().await;
 
     let db_value = match &db_result {
@@ -621,6 +622,30 @@ async fn ready_check(
         ],
         body.to_string(),
     )
+}
+
+/// Upper bound on the readiness DB ping (PMS-685). 3s leaves room for
+/// a cold connection pool or a loaded Postgres, which can take ~1s to
+/// answer `SELECT 1`; calling a reachable database unready makes the
+/// orchestrator drain or restart a healthy instance. The ping was
+/// previously unbounded, so a wedged connection could hold the probe
+/// open indefinitely.
+const READY_DB_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run the readiness DB ping under [`READY_DB_PING_TIMEOUT`]. Takes the
+/// ping future (rather than the pool) so the timeout path is unit
+/// testable without a wedged database.
+async fn bounded_db_ping(
+    ping: impl std::future::Future<Output = crate::utils::error::AppResult<()>>,
+) -> Result<(), String> {
+    match tokio::time::timeout(READY_DB_PING_TIMEOUT, ping).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "db ping exceeded {}s",
+            READY_DB_PING_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Captured-at-boot Infisical probe state. The handler used to read
@@ -708,4 +733,43 @@ async fn probe_infisical() -> Result<bool, String> {
 /// to confirm exactly which revision a running server was built from.
 async fn version_info() -> Json<VersionInfo> {
     Json(VersionInfo::current())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::error::AppError;
+
+    /// A ping that answers just under the bound still reports ready
+    /// (PMS-685: a slow-but-healthy DB must not read as unready).
+    #[tokio::test(start_paused = true)]
+    async fn slow_but_answering_db_ping_is_ok() {
+        let ping = async {
+            tokio::time::sleep(READY_DB_PING_TIMEOUT - std::time::Duration::from_millis(1)).await;
+            Ok(())
+        };
+        assert_eq!(bounded_db_ping(ping).await, Ok(()));
+    }
+
+    /// A wedged ping is still bounded, so a truly unreachable DB fails
+    /// the probe instead of hanging it open.
+    #[tokio::test(start_paused = true)]
+    async fn hung_db_ping_times_out() {
+        let ping = async {
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        assert_eq!(
+            bounded_db_ping(ping).await,
+            Err("db ping exceeded 3s".to_string())
+        );
+    }
+
+    /// A ping that fails fast surfaces the sqlx error, not the timeout.
+    #[tokio::test]
+    async fn failing_db_ping_surfaces_the_error() {
+        let ping = async { Err(AppError::Database("connection closed".into())) };
+        let err = bounded_db_ping(ping).await.expect_err("ping should fail");
+        assert!(err.contains("connection closed"), "unexpected error: {err}");
+    }
 }

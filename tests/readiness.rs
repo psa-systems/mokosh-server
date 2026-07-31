@@ -5,14 +5,31 @@
 //! provisions a fresh per-test database via `#[sqlx::test]` and does
 //! not configure Infisical, so the expected payload is:
 //!   `{"status":"ready","checks":{"db":"ok","infisical":"skipped"}}`
+//!
+//! Every /ready case calls `unconfigure_infisical()` first so that
+//! premise holds no matter what the surrounding shell exports.
 
 mod common;
 
 use common::boot;
 use sqlx::PgPool;
 
+/// Pin the harness premise: Infisical is unconfigured. `just
+/// test-integration` runs inside the dev compose `server` container,
+/// which always exports `INFISICAL_BASE_URL` (compose.dev.yml) while
+/// the `infisical` service itself is an opt-in profile, so the probe
+/// hit an absent host and 503'd after its 1s timeout (PMS-685). The
+/// handler caches the env read in a `OnceLock` on the first /ready
+/// request, so clearing it before the first boot is enough; `Once`
+/// keeps the mutation to a single call for the whole binary.
+fn unconfigure_infisical() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::remove_var("INFISICAL_BASE_URL"));
+}
+
 #[sqlx::test]
 async fn ready_returns_ok_when_db_reachable_and_infisical_unconfigured(pool: PgPool) {
+    unconfigure_infisical();
     let app = boot(pool).await;
 
     let resp = app
@@ -51,6 +68,7 @@ async fn health_remains_plain_text_ok(pool: PgPool) {
 
 #[sqlx::test]
 async fn ready_sets_cache_control_no_store(pool: PgPool) {
+    unconfigure_infisical();
     let app = boot(pool).await;
 
     let resp = app
@@ -73,6 +91,7 @@ async fn ready_sets_cache_control_no_store(pool: PgPool) {
 
 #[sqlx::test]
 async fn ready_returns_503_when_db_pool_closed(pool: PgPool) {
+    unconfigure_infisical();
     // Close the pool before booting the app so the SELECT 1 inside
     // /ready fails. boot() stores a clone on TestApp so the listener
     // task keeps the closed pool; the handler gets a real failure
