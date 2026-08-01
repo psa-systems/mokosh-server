@@ -737,3 +737,31 @@ async fn portal_login_success_resets_failed_counter(pool: PgPool) {
         "successful login clears any lockout"
     );
 }
+
+/// PMS-693: `register_failed_login` derives the lock window in SQL from the
+/// post-increment counter, so that expression is a second copy of the schedule
+/// `lockout_until` defines in Rust. Pin the two together across the whole
+/// documented table (`1..=12` spans below-threshold, the doubling ramp and the
+/// 3600s cap) so neither can drift.
+#[sqlx::test]
+async fn portal_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
+    let sql = format!(
+        "SELECT {}",
+        mokosh_server::modules::portal::lock_seconds_sql("$1::int")
+    );
+    let now = chrono::Utc::now();
+    for n in 1..=12 {
+        let sql_secs: Option<f64> = sqlx::query_scalar(&sql)
+            .bind(n)
+            .fetch_one(&pool)
+            .await
+            .expect("evaluate the SQL lockout schedule");
+        let rust_secs = mokosh_server::modules::portal::lockout_until(n, now)
+            .map(|until| (until - now).num_seconds());
+        assert_eq!(
+            sql_secs.map(|s| s as i64),
+            rust_secs,
+            "SQL and Rust portal lockout schedules disagree at failed_count = {n}"
+        );
+    }
+}

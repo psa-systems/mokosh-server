@@ -38,4 +38,8 @@ pub use models::*;
 pub use routes::auth_routes;
 #[cfg(feature = "server")]
 pub use service::AuthService;
+// PMS-693: exported for the parity test that pins the SQL lockout schedule
+// against the Rust one.
+#[cfg(feature = "server")]
+pub use service::{mfa_lock_seconds_sql, mfa_lockout_until};
 pub use tenant::{TenantId, TenantScoped};

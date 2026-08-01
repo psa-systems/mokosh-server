@@ -17,3 +17,6 @@ pub use middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortal
 pub use models::*;
 pub use routes::portal_routes;
 pub use service::PortalAuthService;
+// PMS-693: exported for the parity test that pins the SQL lockout schedule
+// against the Rust one.
+pub use service::{lock_seconds_sql, lockout_until};
