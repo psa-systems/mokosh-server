@@ -11,6 +11,8 @@
 //!   * `notification_channels.config_encrypted` is actual ciphertext,
 //!     not the plaintext config that was POSTed (zero-key regression
 //!     guard).
+//!   * Every migration-seeded template stores real newlines and only
+//!     flat placeholders (PMS-702 regression guard).
 
 mod common;
 
@@ -270,4 +272,61 @@ async fn channel_config_is_encrypted_at_rest(pool: PgPool) {
         !stored.contains(secret_marker),
         "config_encrypted should be ciphertext, but contained the plaintext marker: {stored}",
     );
+}
+
+/// Every placeholder key in `text`, i.e. the contents of each `{{...}}`.
+fn placeholder_keys(text: &str) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        rest = &rest[open + 2..];
+        let Some(close) = rest.find("}}") else {
+            break;
+        };
+        keys.push(rest[..close].trim());
+        rest = &rest[close + 2..];
+    }
+    keys
+}
+
+/// PMS-702: migration 023 seeded its templates with plain single-quoted
+/// literals (so `\n` was stored as backslash + n and the mail arrived as
+/// one long line) and dotted placeholders that `render_template`'s flat
+/// `context.get` can never resolve. Migration 096 rewrites those rows;
+/// this asserts no seeded template ever regresses to either shape.
+#[sqlx::test]
+async fn seeded_templates_have_real_newlines_and_flat_placeholders(pool: PgPool) {
+    // (name, subject, body_text, body_html)
+    type TemplateRow = (String, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<TemplateRow> =
+        sqlx::query_as("SELECT name, subject, body_text, body_html FROM notification_templates")
+            .fetch_all(&pool)
+            .await
+            .expect("fetch seeded templates");
+
+    assert!(!rows.is_empty(), "migrations should seed some templates");
+
+    for (name, subject, body_text, body_html) in rows {
+        for (column, value) in [
+            ("subject", subject),
+            ("body_text", body_text),
+            ("body_html", body_html),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            assert!(
+                !value.contains("\\n"),
+                "template {name}.{column} stores a literal backslash-n: use an E'...' literal so \
+                 the newline is real: {value}",
+            );
+            for key in placeholder_keys(&value) {
+                assert!(
+                    !key.contains('.'),
+                    "template {name}.{column} has dotted placeholder {{{{{key}}}}}: \
+                     render_template resolves flat context keys only",
+                );
+            }
+        }
+    }
 }
