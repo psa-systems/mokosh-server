@@ -46,7 +46,7 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-runner-labels
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
@@ -59,6 +59,13 @@ check-migrations:
 [group: 'check']
 check-mail-copy:
     nu scripts/check-no-duplicate-mail-copy.nu
+
+# Keep CI jobs on the right runner label (PMS-719). Fails if a compiling job
+# requests the base label, if a workflow installs a C toolchain at run time,
+# or if a runs-on carries no comment justifying its label.
+[group: 'check']
+check-runner-labels:
+    nu scripts/check-runner-labels.nu
 
 # Check compilation
 [group: 'check']

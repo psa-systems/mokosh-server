@@ -65,6 +65,9 @@ concurrency:
 jobs:
   e2e:
     name: Playwright against staging
+    # Dev label, deliberate (PMS-423): the dev image pre-bakes bun, nodejs24 and
+    # the Playwright browser binaries plus their system libraries. Nothing here
+    # compiles, but base carries none of that toolchain.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
     defaults:
