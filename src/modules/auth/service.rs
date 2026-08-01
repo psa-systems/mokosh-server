@@ -861,13 +861,15 @@ impl AuthService {
         token_iat: i64,
     ) -> AppResult<User> {
         let user = self.get_user_by_id(tenant_id, user_id).await?;
-        if user.status != UserStatus::Active {
-            return Err(AppError::Forbidden("Account is not active".to_string()));
-        }
+        self.ensure_principal_usable(&user).await?;
         // PMS-681: reject an access token minted before the user's last password
         // change (reset or self-service), so a stolen token dies the moment the
         // password changes instead of living out its TTL. Read straight off the
         // row loaded above - no extra query. NULL = no cutoff.
+        //
+        // PMS-698: deliberately NOT part of `ensure_principal_usable`. Bunyip
+        // owns the credential on the RS path, so a mokosh-side password change
+        // is not a revocation signal for a bunyip token.
         if let Some(changed_at) = user.password_changed_at {
             if token_iat < changed_at.timestamp() {
                 return Err(AppError::Forbidden(
@@ -875,8 +877,19 @@ impl AuthService {
                 ));
             }
         }
-        self.ensure_tenant_active(user.tenant_id).await?;
         Ok(user)
+    }
+
+    /// PMS-698: the shared "is this principal still usable" gate. Both auth
+    /// paths run it - the legacy HS256 branch via
+    /// [`Self::ensure_user_and_tenant_active`] and the bunyip RS branch via
+    /// `middleware::place_bunyip_user` - so a deactivated user or a suspended
+    /// tenant loses access on the very next request on either path.
+    pub async fn ensure_principal_usable(&self, user: &User) -> AppResult<()> {
+        if user.status != UserStatus::Active {
+            return Err(AppError::Forbidden("Account is not active".to_string()));
+        }
+        self.ensure_tenant_active(user.tenant_id).await
     }
 
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {

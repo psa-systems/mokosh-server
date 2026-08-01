@@ -565,3 +565,93 @@ async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
         "no name claims -> profile_completed_at stays NULL, SPA still gates"
     );
 }
+
+/// PMS-698 AC1: a user whose `users.status` is not `active` is not placed, so
+/// the bunyip branch of `auth_middleware` never authenticates them.
+#[sqlx::test]
+async fn inactive_user_is_not_placed(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let (auth, tenants, invitations) = services(&pool);
+
+    let placed = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        admin_id,
+        Some("test-admin@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(admin_id, Some("admin")),
+    )
+    .await;
+    assert!(placed.is_some(), "active user places normally");
+
+    sqlx::query("UPDATE users SET status = 'inactive' WHERE id = $1")
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate user");
+
+    let placed = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        admin_id,
+        Some("test-admin@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(admin_id, Some("admin")),
+    )
+    .await;
+    assert!(
+        placed.is_none(),
+        "inactive user is rejected on the bunyip path"
+    );
+}
+
+/// PMS-698 AC2: a placement whose resolved tenant is not `active` is rejected,
+/// so a tenant suspension stops data access on the bunyip path too.
+#[sqlx::test]
+async fn suspended_tenant_is_not_placed(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let (auth, tenants, invitations) = services(&pool);
+
+    let placed = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        admin_id,
+        Some("test-admin@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(admin_id, Some("admin")),
+    )
+    .await;
+    assert!(placed.is_some(), "active tenant places normally");
+
+    sqlx::query("UPDATE tenants SET status = 'suspended' WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(&pool)
+        .await
+        .expect("suspend tenant");
+
+    let placed = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        admin_id,
+        Some("test-admin@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(admin_id, Some("admin")),
+    )
+    .await;
+    assert!(
+        placed.is_none(),
+        "suspended tenant is rejected on the bunyip path"
+    );
+}
