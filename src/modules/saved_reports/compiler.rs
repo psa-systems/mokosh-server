@@ -38,8 +38,13 @@ pub struct CompiledQuery {
     /// vector. Mixed (`Uuid`, `String`, `Vec<Uuid>`, `Vec<String>`,
     /// `i64`) per the column whitelist.
     pub binds: Vec<BindValue>,
-    /// Output row shape: ordered alias list. The executor zips this
-    /// with the JSON-encoded row and returns the map.
+    /// Output row shape: ordered SQL output names. Derived from the
+    /// `ticket_column` whitelist keys (never from caller input, see
+    /// PMS-690), so these are the keys `row_to_json` produces.
+    pub columns: Vec<String>,
+    /// Display headers, positionally matching `columns`. The executor
+    /// re-keys each row from `columns` to these before returning, so
+    /// the SPA still gets operator-chosen labels.
     pub aliases: Vec<String>,
     /// COUNT(*) query that matches the same WHERE clause (but no
     /// LIMIT/OFFSET) so the executor can return `total` alongside
@@ -301,16 +306,22 @@ fn compile_tickets(
     // shape that confuses the SPA.
     let column_specs = parse_columns(columns)?;
     let mut select_fragments: Vec<String> = Vec::with_capacity(column_specs.len());
+    let mut output_columns: Vec<String> = Vec::with_capacity(column_specs.len());
     let mut aliases: Vec<String> = Vec::with_capacity(column_specs.len());
-    for (field, alias) in &column_specs {
+    for (field, header) in &column_specs {
         let Some(col) = ticket_column(field) else {
             return Err(AppError::BadRequest(format!(
                 "Unsupported column '{field}' for entity 'tickets'. \
                  See the saved-report column whitelist."
             )));
         };
-        select_fragments.push(format!("{} AS \"{}\"", col.sql, alias));
-        aliases.push(alias.clone());
+        // PMS-690: the SQL alias comes from the whitelisted field key,
+        // never from the caller's header, so no `columns` payload can
+        // reach the SQL text. The header travels in `aliases` only.
+        let key = unique_output_key(&output_columns, field);
+        select_fragments.push(format!("{} AS \"{}\"", col.sql, key));
+        output_columns.push(key);
+        aliases.push(header.clone());
     }
     let select_clause = select_fragments.join(", ");
 
@@ -358,17 +369,41 @@ fn compile_tickets(
     Ok(CompiledQuery {
         sql,
         binds,
+        columns: output_columns,
         aliases,
         count_sql,
         count_binds,
     })
 }
 
-/// Parse the saved-report `columns` JSON into `(field, alias)` pairs.
+/// Pick a unique SQL output name for a whitelisted field key. The same
+/// field selected twice would otherwise collapse to one `row_to_json`
+/// key, so repeats get a `_2`, `_3`, ... suffix. Input is always a
+/// whitelist key, so the result never carries caller-supplied text.
+fn unique_output_key(taken: &[String], field: &str) -> String {
+    let mut key = field.to_string();
+    let mut n = 2;
+    while taken.contains(&key) {
+        key = format!("{field}_{n}");
+        n += 1;
+    }
+    key
+}
+
+/// Longest display header the compiler accepts. A header is a column
+/// label, not free text; anything longer is a malformed payload.
+const MAX_HEADER_LEN: usize = 100;
+
+/// Parse the saved-report `columns` JSON into `(field, header)` pairs.
 /// Accepts `[{"field": "ticket_number"}, {"field": "title", "header": "Subject"}]`
 /// or a plain string array `["ticket_number", "title"]`. When the
 /// array is empty, fall back to a sensible default subset rather
 /// than emit `SELECT ` with no columns.
+///
+/// The header is display-only (PMS-690) and never reaches the SQL
+/// text, but an over-long header or one carrying a `"` is still
+/// rejected here so a hostile payload fails loudly rather than
+/// silently rendering under a different name.
 fn parse_columns(columns: &Value) -> AppResult<Vec<(String, String)>> {
     let Some(arr) = columns.as_array() else {
         // A non-array `columns` blob is a SPA bug; better to 422
@@ -410,6 +445,16 @@ fn parse_columns(columns: &Value) -> AppResult<Vec<(String, String)>> {
                 )));
             }
         };
+        if header.contains('"') {
+            return Err(AppError::BadRequest(format!(
+                "columns[{idx}].header must not contain a double quote"
+            )));
+        }
+        if header.chars().count() > MAX_HEADER_LEN {
+            return Err(AppError::BadRequest(format!(
+                "columns[{idx}].header must be at most {MAX_HEADER_LEN} characters"
+            )));
+        }
         out.push((field, header));
     }
     Ok(out)
@@ -717,6 +762,87 @@ mod tests {
         )
         .expect("ok");
         assert!(q.sql.contains("ORDER BY t.updated_at DESC"));
+    }
+
+    // PMS-690: the header never reaches the SQL text.
+    #[test]
+    fn header_with_double_quote_rejected() {
+        let err = compile(
+            tenant(),
+            "tickets",
+            &json!({}),
+            &json!([{"field": "ticket_number", "header": "a\" , 1 AS \"b"}]),
+            &json!([]),
+            50,
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("double quote"), "got {err}");
+    }
+
+    #[test]
+    fn over_long_header_rejected() {
+        let err = compile(
+            tenant(),
+            "tickets",
+            &json!({}),
+            &json!([{"field": "ticket_number", "header": "x".repeat(MAX_HEADER_LEN + 1)}]),
+            &json!([]),
+            50,
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most"), "got {err}");
+    }
+
+    #[test]
+    fn header_never_reaches_sql() {
+        // Same payload shape as the injection report, minus the quote
+        // that `parse_columns` now rejects outright: even an accepted
+        // header contributes nothing to the SQL text.
+        let q = compile(
+            tenant(),
+            "tickets",
+            &json!({}),
+            &json!([
+                {"field": "ticket_number", "header": "a , 1 AS b"},
+                {"field": "title", "header": "Subject"},
+            ]),
+            &json!([]),
+            50,
+            0,
+        )
+        .expect("ok");
+        assert!(!q.sql.contains("1 AS b"), "sql: {}", q.sql);
+        assert!(!q.sql.contains("Subject"), "sql: {}", q.sql);
+        // One `AS` per whitelisted column, and every alias is a
+        // whitelist key.
+        assert_eq!(q.sql.matches(" AS ").count(), 2, "sql: {}", q.sql);
+        assert!(q.sql.contains("t.ticket_number AS \"ticket_number\""));
+        assert!(q.sql.contains("t.title AS \"title\""));
+        assert_eq!(q.sql.matches('"').count(), 4, "sql: {}", q.sql);
+        assert_eq!(q.columns, vec!["ticket_number", "title"]);
+        // The display headers survive for the SPA.
+        assert_eq!(q.aliases, vec!["a , 1 AS b", "Subject"]);
+    }
+
+    #[test]
+    fn repeated_field_gets_distinct_output_keys() {
+        let q = compile(
+            tenant(),
+            "tickets",
+            &json!({}),
+            &json!([
+                {"field": "title", "header": "Subject"},
+                {"field": "title", "header": "Subject copy"},
+            ]),
+            &json!([]),
+            50,
+            0,
+        )
+        .expect("ok");
+        assert_eq!(q.columns, vec!["title", "title_2"]);
+        assert!(q.sql.contains("t.title AS \"title_2\""), "sql: {}", q.sql);
     }
 
     #[test]

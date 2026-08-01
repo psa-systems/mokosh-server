@@ -303,6 +303,14 @@ impl SavedReportsService {
         }
         let rows = row_q.fetch_all(&mut *tx).await?;
 
+        // PMS-690: the SELECT aliases are whitelist-derived column keys,
+        // so re-key each row to the operator's display headers here. The
+        // wire shape (rows keyed by header) is unchanged.
+        let rows: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| relabel_row(r, &compiled.columns, &compiled.aliases))
+            .collect();
+
         Ok(ExecuteReportResponse {
             rows,
             total,
@@ -321,6 +329,27 @@ impl SavedReportsService {
 /// asking them to page; anything larger should go through the
 /// scheduled-delivery path (PMS-478) which streams to S3 / email.
 const MAX_REPORT_ROWS_PER_PAGE: u32 = 10_000;
+
+/// Re-key one `row_to_json` object from the compiler's SQL output
+/// names to the display headers, keeping the declared column order.
+/// A column the row does not carry lands as null.
+fn relabel_row(
+    row: serde_json::Value,
+    columns: &[String],
+    aliases: &[String],
+) -> serde_json::Value {
+    let Some(obj) = row.as_object() else {
+        return row;
+    };
+    let mut out = serde_json::Map::with_capacity(columns.len());
+    for (key, alias) in columns.iter().zip(aliases) {
+        out.insert(
+            alias.clone(),
+            obj.get(key).cloned().unwrap_or(serde_json::Value::Null),
+        );
+    }
+    serde_json::Value::Object(out)
+}
 
 /// Bind a `BindValue` onto a `query_scalar` builder. Returned
 /// builder is type-identical to its input so the binds can be
