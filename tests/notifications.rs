@@ -15,16 +15,53 @@
 //!     flat placeholders (PMS-702 regression guard).
 //!   * A rule with no template writes no `notifications` row, and the
 //!     rules endpoint rejects a template-less rule (PMS-701).
+//!   * An authored `body_html` reaches the mailer as the HTML alternative,
+//!     and a NULL one still sends single-part plain text (PMS-700).
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use mokosh_server::modules::notifications::DispatcherWorker;
-use mokosh_server::utils::email::LogMailer;
+use mokosh_server::utils::email::{LogMailer, Mailer};
+use mokosh_server::utils::error::AppResult;
 use mokosh_server::Database;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// One captured send, so a test can assert the message shape the dispatcher
+/// asked for.
+#[derive(Clone)]
+struct SentMail {
+    to: String,
+    text: String,
+    html: Option<String>,
+}
+
+/// Records every send the worker performs.
+#[derive(Default)]
+struct CapturingMailer {
+    sent: Mutex<Vec<SentMail>>,
+}
+
+#[async_trait]
+impl Mailer for CapturingMailer {
+    async fn send_multipart(
+        &self,
+        to: &str,
+        _subject: &str,
+        text: &str,
+        html: Option<&str>,
+    ) -> AppResult<()> {
+        self.sent.lock().unwrap().push(SentMail {
+            to: to.to_string(),
+            text: text.to_string(),
+            html: html.map(str::to_string),
+        });
+        Ok(())
+    }
+}
 
 #[sqlx::test]
 async fn dispatch_respects_preferences_and_worker_marks_sent(pool: PgPool) {
@@ -430,4 +467,151 @@ async fn seeded_templates_have_real_newlines_and_flat_placeholders(pool: PgPool)
             }
         }
     }
+}
+
+/// PMS-700: `dispatch` selected `body_html` but never read it, and `deliver`
+/// only ever called the plain-text send, so every authored HTML body was
+/// dropped. The rendered HTML must now ride the `notifications` row and reach
+/// the mailer as the HTML alternative; a template with a NULL `body_html`
+/// must still produce a single-part plain-text send.
+#[sqlx::test]
+async fn dispatch_carries_rendered_body_html_to_the_mailer(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+
+    // Two events: one template carries HTML, the other leaves it NULL.
+    let html_event = "test.body_html_present";
+    let text_event = "test.body_html_absent";
+    for (event_type, name, body_html) in [
+        (
+            html_event,
+            "HTML Template",
+            Some("<html><body><p>Hi {{display_name}}: <a href=\"{{link}}\">open</a></p></body></html>"),
+        ),
+        (text_event, "Text Template", None),
+    ] {
+        let template_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO notification_templates
+                (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+            VALUES ($1, $2, $3, $4, 'email', $5, $6, $7, TRUE)
+            "#,
+        )
+        .bind(template_id)
+        .bind(tenant_id)
+        .bind(name)
+        .bind(event_type)
+        .bind("Hello {{display_name}}")
+        .bind("Plain body for {{display_name}} at {{link}}")
+        .bind(body_html)
+        .execute(&pool)
+        .await
+        .expect("seed template");
+
+        sqlx::query(
+            r#"
+            INSERT INTO notification_rules
+                (id, tenant_id, name, event_type, channels, recipients, template_id, is_active)
+            VALUES ($1, $2, $3, $4, ARRAY['email']::VARCHAR(20)[],
+                    '{"user_ids": [], "emails": []}'::jsonb, $5, TRUE)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant_id)
+        .bind(format!("{name} Rule"))
+        .bind(event_type)
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("seed rule");
+    }
+
+    for (event_type, recipient) in [
+        (html_event, "html@example.test"),
+        (text_event, "text@example.test"),
+    ] {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/notifications/dispatch"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "event_type": event_type,
+                "context": {
+                    "recipient_email": recipient,
+                    "display_name": "Test Admin",
+                    "link": "https://example.test/welcome",
+                },
+            }))
+            .send()
+            .await
+            .expect("send dispatch");
+        assert!(
+            resp.status().is_success(),
+            "dispatch of {event_type} should 2xx, got {}",
+            resp.status(),
+        );
+    }
+
+    // The rendered HTML is persisted on the queue row (not re-resolved from
+    // the template at delivery time), with placeholders already substituted.
+    let queued_html: Option<String> = sqlx::query_scalar(
+        "SELECT body_html FROM notifications WHERE tenant_id = $1 AND recipient = 'html@example.test'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch queued html row");
+    let queued_html = queued_html.expect("dispatch must persist the rendered body_html");
+    assert!(
+        queued_html.contains("Hi Test Admin")
+            && queued_html.contains("https://example.test/welcome"),
+        "body_html placeholders should resolve from context, got: {queued_html}",
+    );
+
+    let queued_text_html: Option<String> = sqlx::query_scalar(
+        "SELECT body_html FROM notifications WHERE tenant_id = $1 AND recipient = 'text@example.test'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch queued text row");
+    assert!(
+        queued_text_html.is_none(),
+        "a template with no body_html must leave the row's body_html NULL",
+    );
+
+    // Drain both rows and inspect what the worker handed the mailer.
+    let mailer = Arc::new(CapturingMailer::default());
+    let worker = DispatcherWorker::new(Database::from_pool(pool.clone()), mailer.clone());
+    let stats = worker.run_tick(10).await.expect("worker tick");
+    assert_eq!(stats.sent, 2, "both email rows should send: {stats:?}");
+
+    let sent = mailer.sent.lock().unwrap().clone();
+    let html_send = sent
+        .iter()
+        .find(|m| m.to == "html@example.test")
+        .expect("html recipient was mailed");
+    assert_eq!(
+        html_send.html.as_deref(),
+        Some(queued_html.as_str()),
+        "the rendered HTML must be handed to the mailer as the HTML alternative",
+    );
+    assert!(
+        html_send.text.contains("Plain body for Test Admin"),
+        "the plain-text part must still be the fallback, got: {}",
+        html_send.text,
+    );
+
+    let text_send = sent
+        .iter()
+        .find(|m| m.to == "text@example.test")
+        .expect("text recipient was mailed");
+    assert!(
+        text_send.html.is_none(),
+        "a NULL body_html must stay a single-part plain-text send, got: {:?}",
+        text_send.html,
+    );
 }

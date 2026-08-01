@@ -833,9 +833,23 @@ impl NotificationsService {
                     None => (None, Vec::new()),
                 };
                 let (body, body_unresolved) = render_template(&template.body_text, context);
+                // PMS-700: render the authored HTML alternative alongside the
+                // text and persist it on the row, so the worker sends one
+                // multipart message instead of re-resolving the template
+                // (which could have been edited after the row was queued).
+                let (body_html, html_unresolved) = match template.body_html.as_deref() {
+                    Some(raw) => {
+                        let (rendered, unresolved) = render_template(raw, context);
+                        (Some(rendered), unresolved)
+                    }
+                    None => (None, Vec::new()),
+                };
                 // A placeholder the context cannot supply would otherwise
                 // ship as literal braces to the recipient (PMS-702).
-                if !subject_unresolved.is_empty() || !body_unresolved.is_empty() {
+                if !subject_unresolved.is_empty()
+                    || !body_unresolved.is_empty()
+                    || !html_unresolved.is_empty()
+                {
                     tracing::warn!(
                         %tenant_id,
                         event_type,
@@ -843,6 +857,7 @@ impl NotificationsService {
                         template_id = %template.id,
                         subject_keys = ?subject_unresolved,
                         body_keys = ?body_unresolved,
+                        html_keys = ?html_unresolved,
                         "notification template has unresolved placeholders",
                     );
                 }
@@ -856,8 +871,8 @@ impl NotificationsService {
                     let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                     sqlx::query(
                         r#"INSERT INTO notifications
-                           (tenant_id, user_id, channel_type, template_id, subject, body, status)
-                           VALUES ($1, $2, $3, $4, $5, $6, 'pending')"#,
+                           (tenant_id, user_id, channel_type, template_id, subject, body, body_html, status)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
                     )
                     .bind(tenant_id)
                     .bind(user_id)
@@ -865,6 +880,7 @@ impl NotificationsService {
                     .bind(template.id)
                     .bind(&subject)
                     .bind(&body)
+                    .bind(&body_html)
                     .execute(&mut *tx)
                     .await?;
                     tx.commit().await?;
@@ -879,8 +895,8 @@ impl NotificationsService {
                         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                         sqlx::query(
                             r#"INSERT INTO notifications
-                               (tenant_id, channel_type, template_id, recipient, subject, body, status)
-                               VALUES ($1, $2, $3, $4, $5, $6, 'pending')"#,
+                               (tenant_id, channel_type, template_id, recipient, subject, body, body_html, status)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
                         )
                         .bind(tenant_id)
                         .bind(channel)
@@ -888,6 +904,7 @@ impl NotificationsService {
                         .bind(addr)
                         .bind(&subject)
                         .bind(&body)
+                        .bind(&body_html)
                         .execute(&mut *tx)
                         .await?;
                         tx.commit().await?;

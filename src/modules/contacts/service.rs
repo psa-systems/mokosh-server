@@ -1,15 +1,13 @@
 //! Contact service implementation
 
-use std::sync::Arc;
-
 use crate::modules::auth::TenantId;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{generate_token, hash_password};
-use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -23,31 +21,39 @@ const PORTAL_SETUP_TOKEN_TTL_HOURS: i64 = 72;
 #[derive(Clone)]
 pub struct ContactService {
     db: Database,
-    /// Outbound mailer used to deliver portal setup-link emails. Defaults
-    /// to `LogMailer` (dev/tests log the link) unless the router wires the
-    /// shared `Mailer`.
-    mailer: Arc<dyn Mailer>,
     /// Base URL of the customer-facing SPA. The setup link is
     /// `{app_url}/portal/set-password?token=...`.
     app_url: String,
+    /// PMS-700: the setup mail is queued through the same `auth.welcome`
+    /// dispatch the staff welcome mail uses, so both render one template and
+    /// both get the worker's retries. `None` in fixtures built without a
+    /// dispatcher, which then queue nothing.
+    notifications: Option<NotificationsService>,
 }
 
 impl ContactService {
     pub fn new(db: Database) -> Self {
         Self {
             db,
-            mailer: Arc::new(LogMailer),
             app_url: String::new(),
+            notifications: None,
         }
     }
 
-    /// Construct with the shared mailer and SPA base URL so granting
-    /// portal access can email the contact a setup link (PMS-136).
-    pub fn with_mailer(db: Database, mailer: Arc<dyn Mailer>, app_url: String) -> Self {
+    /// Construct with the SPA base URL (the setup-link prefix) and the
+    /// notifications dispatcher, so granting portal access queues the
+    /// contact a setup link through the `auth.welcome` template
+    /// (PMS-136, PMS-700). The server uses this constructor in
+    /// `create_api_router`.
+    pub fn with_dispatcher(
+        db: Database,
+        app_url: String,
+        notifications: NotificationsService,
+    ) -> Self {
         Self {
             db,
-            mailer,
             app_url,
+            notifications: Some(notifications),
         }
     }
 
@@ -847,6 +853,10 @@ impl ContactService {
     /// the flag flip / token row; the token is persisted and the link can
     /// be resent later. A contact with no email address is skipped (the
     /// agent owns following up out of band). PMS-136.
+    ///
+    /// PMS-700: queued through the `auth.welcome` dispatch rather than sent
+    /// inline, so the contact gets the same rendered template (and the same
+    /// worker retries) as the staff welcome mail.
     async fn send_setup_email(&self, contact: &Contact, token: &str) {
         let Some(ref email) = contact.email else {
             tracing::warn!(
@@ -860,16 +870,34 @@ impl ContactService {
             self.app_url.trim_end_matches('/'),
             token,
         );
-        match self
-            .mailer
-            .send_welcome(email, &contact.first_name, &setup_link)
+        let Some(notify) = self.notifications.as_ref() else {
+            tracing::warn!(
+                contact_id = %contact.id,
+                "no notifications dispatcher wired; portal setup token persisted but no message queued",
+            );
+            return;
+        };
+        let context = serde_json::json!({
+            "recipient_email": email,
+            "display_name": contact.first_name,
+            "setup_link": setup_link,
+        });
+        // SAFETY (PMS-261): `contact.tenant_id` is read off the contact row
+        // this method was handed, not from caller input; `dispatch` re-derives
+        // the RLS GUC per query via `begin_with_tenant`.
+        match notify
+            .dispatch(
+                TenantId::from_trusted(contact.tenant_id),
+                "auth.welcome",
+                &context,
+            )
             .await
         {
-            Ok(()) => tracing::info!(contact_id = %contact.id, "portal setup-link email sent"),
+            Ok(_) => tracing::info!(contact_id = %contact.id, "portal setup-link email queued"),
             Err(e) => tracing::warn!(
                 contact_id = %contact.id,
                 error = ?e,
-                "portal setup email send failed; token persisted but link unreachable",
+                "portal setup email dispatch failed; token persisted but link unreachable",
             ),
         }
     }
