@@ -992,8 +992,8 @@ fn render_alert_fields(
         .map(str::to_string)
         .unwrap_or_else(|| alert.message.clone().unwrap_or_default());
     (
-        render_template(&raw_title, context),
-        render_template(&raw_desc, context),
+        render_template(&raw_title, context).0,
+        render_template(&raw_desc, context).0,
     )
 }
 

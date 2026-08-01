@@ -809,8 +809,21 @@ impl NotificationsService {
                     .as_ref()
                     .map(|t| t.body_text.clone())
                     .unwrap_or_else(|| format!("Event {event_type} fired with context {context}"));
-                let subject = render_template(&raw_subject, context);
-                let body = render_template(&raw_body, context);
+                let (subject, subject_unresolved) = render_template(&raw_subject, context);
+                let (body, body_unresolved) = render_template(&raw_body, context);
+                // A placeholder the context cannot supply would otherwise
+                // ship as literal braces to the recipient (PMS-702).
+                if !subject_unresolved.is_empty() || !body_unresolved.is_empty() {
+                    tracing::warn!(
+                        %tenant_id,
+                        event_type,
+                        channel,
+                        template_id = ?template.as_ref().map(|t| t.id),
+                        subject_keys = ?subject_unresolved,
+                        body_keys = ?body_unresolved,
+                        "notification template has unresolved placeholders",
+                    );
+                }
 
                 // Fan out to each user_id, honoring user preferences for
                 // this (event_type, channel) pair.
@@ -917,8 +930,13 @@ fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) ->
 /// untouched so an operator can see what was expected at delivery time.
 /// String values render verbatim; other JSON values render as their
 /// `Display` representation.
-pub fn render_template(input: &str, context: &serde_json::Value) -> String {
+///
+/// Returns the rendered text plus the de-duplicated list of keys that
+/// did not resolve (PMS-702), so the caller can log a template typo
+/// instead of shipping literal braces to a customer.
+pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec<String>) {
     let mut out = String::with_capacity(input.len());
+    let mut unresolved: Vec<String> = Vec::new();
     let mut rest = input;
     while let Some(open) = rest.find("{{") {
         out.push_str(&rest[..open]);
@@ -926,13 +944,16 @@ pub fn render_template(input: &str, context: &serde_json::Value) -> String {
         let Some(close) = rest.find("}}") else {
             out.push_str("{{");
             out.push_str(rest);
-            return out;
+            return (out, unresolved);
         };
         let key = rest[..close].trim();
         match context.get(key) {
             Some(serde_json::Value::String(s)) => out.push_str(s),
             Some(v) => out.push_str(&v.to_string()),
             None => {
+                if !unresolved.iter().any(|k| k == key) {
+                    unresolved.push(key.to_string());
+                }
                 out.push_str("{{");
                 out.push_str(&rest[..close]);
                 out.push_str("}}");
@@ -941,7 +962,7 @@ pub fn render_template(input: &str, context: &serde_json::Value) -> String {
         rest = &rest[close + 2..];
     }
     out.push_str(rest);
-    out
+    (out, unresolved)
 }
 
 #[cfg(test)]
@@ -951,29 +972,42 @@ mod tests {
 
     #[test]
     fn render_substitutes_string_keys() {
-        let out = render_template(
+        let (out, unresolved) = render_template(
             "Hi {{name}}, see {{link}}",
             &json!({"name": "Pat", "link": "https://x"}),
         );
         assert_eq!(out, "Hi Pat, see https://x");
+        assert!(unresolved.is_empty());
     }
 
     #[test]
     fn render_leaves_missing_keys_intact() {
-        let out = render_template("Hello {{absent}}", &json!({}));
+        let (out, unresolved) = render_template("Hello {{absent}}", &json!({}));
         assert_eq!(out, "Hello {{absent}}");
+        assert_eq!(unresolved, vec!["absent".to_string()]);
+    }
+
+    #[test]
+    fn render_reports_each_unresolved_key_once() {
+        let (_, unresolved) = render_template(
+            "{{ticket.number}} {{ticket.number}} {{ticket_title}}",
+            &json!({"ticket_title": "Boom"}),
+        );
+        assert_eq!(unresolved, vec!["ticket.number".to_string()]);
     }
 
     #[test]
     fn render_handles_non_string_values() {
-        let out = render_template("count={{n}}", &json!({"n": 42}));
+        let (out, unresolved) = render_template("count={{n}}", &json!({"n": 42}));
         assert_eq!(out, "count=42");
+        assert!(unresolved.is_empty());
     }
 
     #[test]
     fn render_passes_through_when_no_placeholders() {
-        let out = render_template("plain text", &json!({}));
+        let (out, unresolved) = render_template("plain text", &json!({}));
         assert_eq!(out, "plain text");
+        assert!(unresolved.is_empty());
     }
 }
 
