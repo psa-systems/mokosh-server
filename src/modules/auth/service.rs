@@ -701,9 +701,18 @@ impl AuthService {
                 .fetch_one(&mut *tx)
                 .await?;
                 tx.commit().await?;
+                // PMS-694: a wrong recovery code is a failed second factor
+                // like any other, so it feeds the same per-account counter.
+                // Leaving it out gave an attacker unlimited guesses (and, since
+                // nothing else arms the lockout, neutralised it for TOTP too).
                 if !removed {
+                    self.register_failed_mfa(user.tenant_id, user.id).await?;
                     return Err(AppError::Unauthorized);
                 }
+                // Symmetrically, a good recovery code clears the counter and
+                // lockout. Not `record_mfa_success`: a recovery code is not a
+                // TOTP step, so the anti-replay watermark must not advance.
+                self.clear_mfa_lockout(user.tenant_id, user.id).await?;
             } else if let Some(code) = request.mfa_code.as_deref() {
                 let secret_b32 = user
                     .mfa_secret
@@ -2574,6 +2583,25 @@ impl AuthService {
         .await?;
         tx.commit().await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// PMS-694: clear the failed-attempt counter and lockout after a second
+    /// factor that is not a TOTP step (an accepted recovery code), leaving
+    /// `mfa_last_used_step` untouched so the anti-replay watermark cannot be
+    /// dragged forward by a non-TOTP credential.
+    async fn clear_mfa_lockout(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE users \
+             SET mfa_failed_attempts = 0, mfa_locked_until = NULL, updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// PMS-138 backward-compat fallback: when the caller does not

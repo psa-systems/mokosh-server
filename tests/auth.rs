@@ -11,6 +11,8 @@
 //! - Negative pin: wrong password returns 401.
 //! - PMS-693: concurrent failed second-factor codes each increment the
 //!   persistent attempt counter, and one TOTP step is spendable exactly once.
+//! - PMS-694: a failed recovery code advances the same lockout counter a
+//!   failed TOTP code does, and an accepted one clears it.
 
 mod common;
 
@@ -851,6 +853,178 @@ async fn mfa_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
             "SQL and Rust lockout schedules disagree at failed_count = {n}"
         );
     }
+}
+
+// ============================================================================
+// PMS-694: a failed recovery code counts against the same MFA lockout
+// ============================================================================
+
+fn recovery_login_request(email: &str, password: &str, recovery_code: &str) -> LoginRequest {
+    serde_json::from_value(serde_json::json!({
+        "email": email,
+        "password": password,
+        "recovery_code": recovery_code,
+    }))
+    .expect("build recovery LoginRequest")
+}
+
+/// PMS-694: guessing recovery codes must arm the PMS-502 lockout exactly like
+/// guessing TOTP codes. Pre-fix the `!removed` branch returned `Unauthorized`
+/// without touching `mfa_failed_attempts`, so an attacker holding the password
+/// got unlimited second-factor guesses just by sending `recovery_code` instead
+/// of `mfa_code` (and, since nothing else armed it, the lockout never applied
+/// to the TOTP path either).
+///
+/// Calls `AuthService::login` directly for the same reason the PMS-693 pins do:
+/// the router's 5/min per-email limiter would answer 429 on its own and mask
+/// which gate refused the attempt.
+#[sqlx::test]
+async fn failed_recovery_codes_lock_account(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    seed_mfa_enabled(&pool, uid).await;
+    // A populated code set the guesses can miss against.
+    sqlx::query("UPDATE users SET mfa_recovery_codes_hashes = $1 WHERE id = $2")
+        .bind(vec!["a".repeat(64), "b".repeat(64)])
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .expect("seed recovery code hashes");
+    let auth = auth_service(&pool);
+
+    // Three wrong recovery codes cross the threshold and arm the lockout.
+    for i in 0..3 {
+        let err = auth
+            .login(
+                &recovery_login_request(&email, &password, &format!("wrong-code-{i}")),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a wrong recovery code must never log in");
+        assert!(
+            matches!(err, AppError::Unauthorized),
+            "wrong recovery code attempt {i} is a 401, got {err:?}"
+        );
+    }
+
+    let (failed, locked_until): (i32, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT mfa_failed_attempts, mfa_locked_until FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&pool)
+            .await
+            .expect("read mfa lockout state");
+    assert_eq!(failed, 3, "every wrong recovery code is counted");
+    assert!(
+        locked_until.is_some_and(|until| until > Utc::now()),
+        "lockout window armed and in the future"
+    );
+
+    // The 4th attempt is refused by the armed lockout, not merely rejected as
+    // a bad code.
+    let err = auth
+        .login(
+            &recovery_login_request(&email, &password, "wrong-code-3"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("4th attempt must fail");
+    assert!(
+        matches!(err, AppError::RateLimited),
+        "the lockout is armed, so the next attempt is rate-limited, got {err:?}"
+    );
+}
+
+/// PMS-694: the mirror image. A valid recovery code succeeds while failures
+/// have accumulated below the threshold and clears the counter + lockout, so a
+/// user who locked themselves out of TOTP is not still penalised afterwards.
+/// It must NOT move `mfa_last_used_step`: a recovery code is not a TOTP step,
+/// and dragging the anti-replay watermark forward would invalidate live codes.
+#[sqlx::test]
+async fn recovery_code_success_clears_mfa_counters(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Enroll + enable inline (rather than via `enroll_and_enable_mfa`) because
+    // the plaintext recovery codes are returned exactly once, by `enable`.
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send mfa setup")
+        .json()
+        .await
+        .expect("mfa setup JSON");
+    let secret_b32 = setup["secret"].as_str().expect("secret in mfa setup");
+    let secret = mokosh_server::utils::totp::base32_decode(secret_b32).expect("decode mfa secret");
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let enable_json: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code_now }))
+        .send()
+        .await
+        .expect("send mfa enable")
+        .json()
+        .await
+        .expect("enable JSON");
+    let recovery = enable_json["recovery_codes"][0]
+        .as_str()
+        .expect("a recovery code")
+        .to_string();
+
+    // Two failures already banked (still under the 3-failure threshold, so no
+    // lockout is armed) plus a watermark the recovery code must not disturb.
+    const WATERMARK: i64 = 12_345;
+    sqlx::query("UPDATE users SET mfa_failed_attempts = 2, mfa_last_used_step = $1 WHERE id = $2")
+        .bind(WATERMARK)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .expect("seed a partial failure count");
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "recovery_code": recovery,
+        }))
+        .send()
+        .await
+        .expect("send recovery login");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a valid recovery code still logs in with failures banked"
+    );
+    let body: serde_json::Value = resp.json().await.expect("recovery login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "access_token populated after the recovery code is accepted"
+    );
+
+    let (failed, locked_until, step): (i32, Option<chrono::DateTime<Utc>>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT mfa_failed_attempts, mfa_locked_until, mfa_last_used_step \
+             FROM users WHERE id = $1",
+        )
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .expect("read mfa state after the recovery login");
+    assert_eq!(failed, 0, "the failure counter is cleared");
+    assert!(locked_until.is_none(), "the lockout window is cleared");
+    assert_eq!(
+        step,
+        Some(WATERMARK),
+        "a recovery code must not advance the TOTP anti-replay watermark"
+    );
 }
 
 // ============================================================================
