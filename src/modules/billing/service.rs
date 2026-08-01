@@ -124,6 +124,69 @@ impl BillingService {
         ))
     }
 
+    /// Lock an invoice row for a payment read-modify-write and return its
+    /// `(total, amount_paid)` (PMS-695).
+    ///
+    /// `FOR UPDATE` is what makes concurrent payment creates/deletes
+    /// serialise: without it two transactions both read the pre-payment
+    /// `amount_paid` under READ COMMITTED and the later write discards the
+    /// earlier one. Every path that mutates an invoice's payment state takes
+    /// this lock first, in the same order, so they queue rather than deadlock.
+    async fn lock_invoice_totals(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<Option<(Decimal, Decimal)>> {
+        Ok(sqlx::query_as(
+            "SELECT total, amount_paid FROM invoices \
+             WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?)
+    }
+
+    /// Recompute an invoice's `amount_paid` / `balance_due` / `status` /
+    /// `paid_at` from its `payments` rows (PMS-695).
+    ///
+    /// The single place invoice payment state is derived, mirroring
+    /// `QuotesService::recompute_totals`. Deriving from `SUM(payments.amount)`
+    /// rather than from Rust-side arithmetic makes
+    /// `invoices.amount_paid = SUM(payments.amount)` true by construction.
+    /// Callers must already hold the row lock from [`Self::lock_invoice_totals`].
+    async fn recompute_invoice_payment_state(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<()> {
+        // A zeroed-out invoice returns to 'sent', identical to the
+        // pre-PMS-695 `delete_payment` ladder this replaces.
+        sqlx::query(
+            r#"
+            UPDATE invoices i SET
+                amount_paid = p.paid,
+                balance_due = i.total - p.paid,
+                status      = CASE WHEN i.total - p.paid <= 0 THEN 'paid'
+                                   WHEN p.paid > 0 THEN 'partially_paid'
+                                   ELSE 'sent' END,
+                paid_at     = CASE WHEN i.total - p.paid <= 0
+                                   THEN COALESCE(i.paid_at, NOW()) END,
+                updated_at  = NOW()
+            FROM (
+                SELECT COALESCE(SUM(amount), 0) AS paid
+                FROM payments WHERE invoice_id = $1 AND tenant_id = $2
+            ) p
+            WHERE i.id = $1 AND i.tenant_id = $2
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
     /// Validate that `payment_term_id` references a `payment_terms` row in the
     /// caller's tenant (PMS-333). RLS scopes the lookup, so a foreign-tenant id
     /// (whose FK would otherwise pass, since FK checks bypass RLS) is rejected
@@ -1632,6 +1695,28 @@ impl BillingService {
     ) -> AppResult<PaymentResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // PMS-695: take the invoice row lock before anything else, so the
+        // whole read-modify-write is serialised and an overpayment rejection
+        // does not have to unwind an already-inserted payment row.
+        if let Some(invoice_id) = request.invoice_id {
+            let Some((total, prior_paid)) =
+                Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
+            else {
+                return Err(AppError::NotFound("Invoice".to_string()));
+            };
+            // Reject overpayment so `balance_due` never goes negative
+            // (PMS-194). The remaining balance is `total - prior_paid`; a
+            // payment larger than that is a data-integrity error, not a
+            // valid partial/full payment.
+            let remaining = total - prior_paid;
+            if request.amount > remaining {
+                return Err(AppError::BadRequest(format!(
+                    "payment amount {} exceeds invoice balance due {}",
+                    request.amount, remaining
+                )));
+            }
+        }
+
         let payment_id = Uuid::new_v4();
         let created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
             r#"
@@ -1657,60 +1742,7 @@ impl BillingService {
         .await?;
 
         if let Some(invoice_id) = request.invoice_id {
-            // Pull the current totals + tenant guard.
-            let current: Option<(Decimal, Decimal)> = sqlx::query_as(
-                "SELECT total, amount_paid FROM invoices WHERE id = $1 AND tenant_id = $2",
-            )
-            .bind(invoice_id)
-            .bind(tenant_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((total, prior_paid)) = current else {
-                return Err(AppError::NotFound("Invoice".to_string()));
-            };
-            // Reject overpayment so `balance_due` never goes negative
-            // (PMS-194). The remaining balance is `total - prior_paid`; a
-            // payment larger than that is a data-integrity error, not a
-            // valid partial/full payment.
-            let remaining = total - prior_paid;
-            if request.amount > remaining {
-                return Err(AppError::BadRequest(format!(
-                    "payment amount {} exceeds invoice balance due {}",
-                    request.amount, remaining
-                )));
-            }
-            let new_paid = prior_paid + request.amount;
-            let new_balance = total - new_paid;
-            let new_status = if new_balance <= Decimal::ZERO {
-                "paid"
-            } else if new_paid > Decimal::ZERO {
-                "partially_paid"
-            } else {
-                "sent"
-            };
-            let paid_at = if new_status == "paid" {
-                Some(Utc::now())
-            } else {
-                None
-            };
-            sqlx::query(
-                r#"
-                UPDATE invoices SET
-                    amount_paid = $2,
-                    balance_due = $3,
-                    status      = $4,
-                    paid_at     = COALESCE($5, paid_at),
-                    updated_at  = NOW()
-                WHERE id = $1
-                "#,
-            )
-            .bind(invoice_id)
-            .bind(new_paid)
-            .bind(new_balance)
-            .bind(new_status)
-            .bind(paid_at)
-            .execute(&mut *tx)
-            .await?;
+            Self::recompute_invoice_payment_state(&mut tx, tenant_id, invoice_id).await?;
         }
 
         // Audit row in the same transaction. CREATE: old = None, after
@@ -1776,16 +1808,22 @@ impl BillingService {
     ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        let row: Option<(Option<Uuid>, Decimal)> = sqlx::query_as(
-            "SELECT invoice_id, amount FROM payments WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(payment_id)
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((invoice_id, amount)) = row else {
+        let row: Option<(Option<Uuid>,)> =
+            sqlx::query_as("SELECT invoice_id FROM payments WHERE id = $1 AND tenant_id = $2")
+                .bind(payment_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((invoice_id,)) = row else {
             return Err(AppError::NotFound("Payment".to_string()));
         };
+
+        // PMS-695: lock the invoice before removing the payment row, in the
+        // same order `create_payment` takes it, so a delete racing a create
+        // queues instead of losing one of the two updates.
+        if let Some(invoice_id) = invoice_id {
+            Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?;
+        }
 
         // Snapshot before the delete, minus the secret `gateway_response`
         // blob, for the audit `old_values`. PMS-117.
@@ -1804,39 +1842,7 @@ impl BillingService {
             .await?;
 
         if let Some(invoice_id) = invoice_id {
-            let current: Option<(Decimal, Decimal)> =
-                sqlx::query_as("SELECT total, amount_paid FROM invoices WHERE id = $1")
-                    .bind(invoice_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if let Some((total, prior_paid)) = current {
-                let new_paid = (prior_paid - amount).max(Decimal::ZERO);
-                let new_balance = total - new_paid;
-                let new_status = if new_paid == Decimal::ZERO {
-                    "sent"
-                } else if new_balance <= Decimal::ZERO {
-                    "paid"
-                } else {
-                    "partially_paid"
-                };
-                sqlx::query(
-                    r#"
-                    UPDATE invoices SET
-                        amount_paid = $2,
-                        balance_due = $3,
-                        status      = $4,
-                        paid_at     = CASE WHEN $4 = 'paid' THEN paid_at ELSE NULL END,
-                        updated_at  = NOW()
-                    WHERE id = $1
-                    "#,
-                )
-                .bind(invoice_id)
-                .bind(new_paid)
-                .bind(new_balance)
-                .bind(new_status)
-                .execute(&mut *tx)
-                .await?;
-            }
+            Self::recompute_invoice_payment_state(&mut tx, tenant_id, invoice_id).await?;
         }
 
         // Audit row in the same transaction. DELETE: old = before,
@@ -1879,6 +1885,30 @@ impl BillingService {
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // PMS-695: this path also rewrites `balance_due` and `status` from a
+        // read of `amount_paid`, so it takes the same invoice row lock as the
+        // payment paths and re-reads both under it. The pre-transaction
+        // `get_invoice` above is only a fast-path guard; a payment committed
+        // between it and here would otherwise be written back out.
+        let locked: Option<(Decimal, String)> = sqlx::query_as(
+            "SELECT amount_paid, status FROM invoices \
+             WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((amount_paid, locked_status)) = locked else {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        };
+        let locked_status = InvoiceStatus::from_str(&locked_status).unwrap_or(InvoiceStatus::Draft);
+        if locked_status.is_frozen() {
+            return Err(AppError::Conflict(format!(
+                "Invoice in status '{}' cannot be edited",
+                locked_status.as_str()
+            )));
+        }
 
         // Snapshot before any mutation (line replace + header update). PMS-117.
         let before: Option<serde_json::Value> = sqlx::query_scalar(
@@ -1930,10 +1960,10 @@ impl BillingService {
         let tax = request.tax_amount.unwrap_or(current.tax_amount);
         let discount = request.discount_amount.unwrap_or(current.discount_amount);
         let total = subtotal + tax - discount;
-        let balance_due = total - current.amount_paid;
+        let balance_due = total - amount_paid;
 
         // `sent_at` is stamped when the status first moves to `sent`.
-        let status = request.status.unwrap_or(current.status);
+        let status = request.status.unwrap_or(locked_status);
         let sent_at = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none() {
             Some(Utc::now())
         } else {

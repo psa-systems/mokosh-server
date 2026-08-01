@@ -843,3 +843,243 @@ async fn payment_gateway_secret_is_write_only(pool: PgPool) {
         "creating a new gateway without a config is a 400"
     );
 }
+
+// ============================================================================
+// PMS-695: concurrent payments against one invoice must not lose an update.
+// `create_payment` locks the invoice row before inserting, and both the
+// create and delete paths derive `amount_paid` from `SUM(payments.amount)`.
+// ============================================================================
+
+/// Seed a `sent` invoice with the given total and no payments; returns its id.
+async fn seed_sent_invoice(pool: &PgPool, company_id: Uuid, total: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO invoices (
+            id, tenant_id, invoice_number, company_id, status,
+            invoice_date, due_date, subtotal, total, amount_paid, balance_due
+        )
+        VALUES ($1, $2, $3, $4, 'sent',
+                CURRENT_DATE, CURRENT_DATE + 30, $5, $5, 0, $5)
+        "#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(format!("PMS695-{}", &id.simple().to_string()[..8]))
+    .bind(company_id)
+    .bind(common::dec(total))
+    .execute(pool)
+    .await
+    .expect("seed test invoice");
+    id
+}
+
+/// POST a payment of `amount` against `invoice_id`.
+async fn post_payment(
+    app: &common::TestApp,
+    token: &str,
+    invoice_id: Uuid,
+    company_id: Uuid,
+    amount: &str,
+) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "payment_date": chrono::Utc::now().date_naive().to_string(),
+            "amount": amount,
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("send record-payment request")
+}
+
+/// Read the invoice's stored payment state straight from the DB.
+async fn invoice_state(pool: &PgPool, invoice_id: Uuid) -> (String, String, String) {
+    let row = sqlx::query(
+        "SELECT amount_paid::text, balance_due::text, status FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(pool)
+    .await
+    .expect("read invoice state");
+    (row.get(0), row.get(1), row.get(2))
+}
+
+/// Fire two payments at one invoice with the read-modify-write window held
+/// open, and return both responses.
+///
+/// Simply firing two requests is not enough to reproduce the lost update: a
+/// handler finishes in well under the time the second request needs to reach
+/// the server, so the two never overlap. Instead a third transaction takes the
+/// invoice row lock first, both requests are sent and park against it, and the
+/// lock is only released once both are in flight. Pre-PMS-695 both requests get
+/// their unlocked `SELECT total, amount_paid` in before either `UPDATE
+/// invoices` can proceed, which is exactly the failing interleaving. Post-fix
+/// they queue on the `FOR UPDATE` lock instead and serialise.
+async fn race_two_payments(
+    pool: &PgPool,
+    app: &common::TestApp,
+    token: &str,
+    invoice_id: Uuid,
+    company_id: Uuid,
+    amount_a: &str,
+    amount_b: &str,
+) -> (reqwest::Response, reqwest::Response) {
+    let mut blocker = pool.begin().await.expect("open blocking transaction");
+    sqlx::query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE")
+        .bind(invoice_id)
+        .execute(&mut *blocker)
+        .await
+        .expect("take the invoice row lock");
+
+    let (a, b, ()) = tokio::join!(
+        post_payment(app, token, invoice_id, company_id, amount_a),
+        post_payment(app, token, invoice_id, company_id, amount_b),
+        async {
+            // Long enough for both handlers to reach the invoice row and park.
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            blocker
+                .rollback()
+                .await
+                .expect("release the invoice row lock");
+        },
+    );
+    (a, b)
+}
+
+/// Sum of the invoice's payment rows, as the ledger sees it.
+async fn payments_sum(pool: &PgPool, invoice_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT COALESCE(SUM(amount), 0)::text FROM payments WHERE invoice_id = $1")
+        .bind(invoice_id)
+        .fetch_one(pool)
+        .await
+        .expect("sum payments")
+}
+
+/// Two concurrent partial payments that together settle the invoice: both
+/// must land and the invoice must end fully paid. Before PMS-695 the two
+/// requests both read `amount_paid = 0` and the later write discarded the
+/// earlier one, leaving `amount_paid = 600.00` against `1000.00` of payments.
+#[sqlx::test]
+async fn concurrent_partial_payments_both_land(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let invoice_id = seed_sent_invoice(&pool, company_id, "1000.00").await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let (a, b) = race_two_payments(
+        &pool, &app, &token, invoice_id, company_id, "400.00", "600.00",
+    )
+    .await;
+    assert!(a.status().is_success(), "400.00 payment: {}", a.status());
+    assert!(b.status().is_success(), "600.00 payment: {}", b.status());
+
+    let (paid, balance, status) = invoice_state(&pool, invoice_id).await;
+    assert_eq!(paid, "1000.00", "amount_paid is the sum of both payments");
+    assert_eq!(balance, "0.00", "balance_due is settled");
+    assert_eq!(status, "paid", "a fully settled invoice is 'paid'");
+    assert_eq!(
+        payments_sum(&pool, invoice_id).await,
+        paid,
+        "amount_paid always equals SUM(payments.amount)"
+    );
+}
+
+/// Two concurrent payments that each fit the balance alone but overshoot it
+/// together: exactly one wins, the loser is rejected with a 400, and the
+/// invoice is never overpaid.
+#[sqlx::test]
+async fn concurrent_overpayment_is_rejected(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let invoice_id = seed_sent_invoice(&pool, company_id, "1000.00").await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let (a, b) = race_two_payments(
+        &pool, &app, &token, invoice_id, company_id, "700.00", "700.00",
+    )
+    .await;
+    let statuses = [a.status(), b.status()];
+    assert_eq!(
+        statuses.iter().filter(|s| s.is_success()).count(),
+        1,
+        "exactly one of the two 700.00 payments succeeds, got {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == reqwest::StatusCode::BAD_REQUEST)
+            .count(),
+        1,
+        "the loser is rejected as an overpayment, got {statuses:?}"
+    );
+
+    let (paid, balance, status) = invoice_state(&pool, invoice_id).await;
+    assert_eq!(paid, "700.00", "only the winning payment is applied");
+    assert_eq!(balance, "300.00", "balance_due never goes negative");
+    assert_eq!(status, "partially_paid");
+    assert_eq!(
+        payments_sum(&pool, invoice_id).await,
+        paid,
+        "the rejected payment left no row behind"
+    );
+}
+
+/// Deleting one of two payments recomputes the invoice from the surviving
+/// rows rather than subtracting the deleted amount from a stale snapshot.
+#[sqlx::test]
+async fn deleting_a_payment_recomputes_from_remaining(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let invoice_id = seed_sent_invoice(&pool, company_id, "1000.00").await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let first: serde_json::Value = post_payment(&app, &token, invoice_id, company_id, "500.00")
+        .await
+        .json()
+        .await
+        .expect("first payment JSON");
+    let first_id = first["id"].as_str().expect("payment id").to_string();
+    let second = post_payment(&app, &token, invoice_id, company_id, "500.00").await;
+    assert!(second.status().is_success(), "second payment should 2xx");
+
+    let (paid, _, status) = invoice_state(&pool, invoice_id).await;
+    assert_eq!(paid, "1000.00");
+    assert_eq!(status, "paid");
+
+    let del = app
+        .client
+        .delete(app.url(&format!("/api/v1/payments/{first_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete payment");
+    assert!(
+        del.status().is_success(),
+        "delete payment should 2xx, got {}",
+        del.status()
+    );
+
+    let (paid, balance, status) = invoice_state(&pool, invoice_id).await;
+    assert_eq!(
+        paid, "500.00",
+        "amount_paid falls back to the surviving row"
+    );
+    assert_eq!(balance, "500.00");
+    assert_eq!(status, "partially_paid");
+    assert_eq!(
+        payments_sum(&pool, invoice_id).await,
+        paid,
+        "amount_paid always equals SUM(payments.amount)"
+    );
+}
