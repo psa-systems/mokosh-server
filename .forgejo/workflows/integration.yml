@@ -17,7 +17,10 @@ on:
 jobs:
   integration:
     name: integration tests
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    # Dev label: `cargo test --tests` compiles natively on the runner, and only
+    # the dev image ships the C toolchain + OpenSSL headers that needs. Base
+    # fails at `linker cc not found` (PMS-706, same cause as check.yml).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
     # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
     # fresh database per invocation against the URL in DATABASE_URL, so
@@ -56,14 +59,6 @@ jobs:
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
-
-      - name: Ensure C toolchain + native deps
-        # RUNS_ON_OPENSUSE_BASE_LATEST was trimmed of the C toolchain + OpenSSL
-        # headers: `gcc` provides `cc` (rustc's linker; without it `linker cc
-        # not found`) and `libopenssl-devel` provides openssl.pc for
-        # `openssl-sys` (via lettre's native-tls SMTP transport). Runner user
-        # is unprivileged, so zypper needs sudo. Same regression as check.yml.
-        run: sudo zypper --non-interactive install --no-recommends gcc libopenssl-devel
 
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`

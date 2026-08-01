@@ -122,6 +122,7 @@ Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 imple
 ## Conventions specific to this repo
 
 - Branches: `fix/...`, `feat/...`, `chore/...`. Forgejo PRs via `fj pr create` (host `dev.a8n.run`). `gh` is not installed.
+- CI runner labels (PMS-719, GOV-43): a job that compiles on the runner requests `RUNS_ON_OPENSUSE_DEV_LATEST` (only that image ships `cc` / `gcc` / `ld` plus glibc and OpenSSL headers); everything else stays on `RUNS_ON_OPENSUSE_BASE_LATEST`. Base plus a compile fails at `linker cc not found` on a cold cache (PMS-705, PMS-706); the fix is the label, never a run-time `zypper install gcc`. `scripts/check-runner-labels.nu` (in `just check` and `check.yml`) enforces this and requires every `runs-on:` to carry a comment justifying its label.
 - Releases: `just create-release <major|minor|hotfix>` bumps `Cargo.toml`, pushes a `release/v<X.Y.Z>` branch, opens the PR. CI tags + publishes on merge.
 - Email backend selection: `MailerConfig::from_env().build()` returns `SmtpMailer` if `SMTP_HOST` is set, `LogMailer` otherwise. `SMTP_USERNAME` without `SMTP_PASSWORD` is a hard error at startup (fail-loud, not silent degrade).
 - `ENCRYPTION_KEY` must parse as 32 bytes (raw or 64 hex chars) via `utils::crypto::parse_encryption_key`. Used for AES-256-GCM at-rest encryption of per-tenant secrets (e.g. payment-gateway configs).

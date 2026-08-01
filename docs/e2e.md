@@ -108,7 +108,7 @@ On every staging trigger the suite first probes bunyip's `GET /e2e-bootstrapped`
 
 To make `e2e` enforce, add it to the required status checks on the `main` branch protection (PMS-141 sets a 10-consecutive-green stability bar before flipping that switch).
 
-The runner uses Node + Chromium off the OpenSUSE base image (`node24` binary, `corepack npm` / `corepack npx`; see Troubleshooting). On failure it uploads `playwright-report/` + `test-results/` as artifacts.
+The job runs on the dev runner label (`RUNS_ON_OPENSUSE_DEV_LATEST`), whose image pre-bakes bun, `node24` and the Playwright browsers; the base image carries none of that (PMS-719). On failure it uploads `playwright-report/` + `test-results/` as artifacts.
 
 ## Coverage status and quarantined specs
 

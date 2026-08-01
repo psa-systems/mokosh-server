@@ -35,6 +35,7 @@ on:
 jobs:
   gate:
     name: Gate (release-branch merges only)
+    # Base label: one bash branch-name test, no compile.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
     permissions:
       contents: read
@@ -60,6 +61,7 @@ jobs:
     name: Create release from merged PR
     needs: gate
     if: needs.gate.outputs.do_release == 'true'
+    # Base label: nu + git + the Forgejo release API, no compile.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
     permissions:
       contents: write
