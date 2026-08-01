@@ -242,9 +242,14 @@ services:
       SMTP_FROM: ${SMTP_FROM:-Mokosh Dev <noreply@mokosh.localdev>}
       SMTP_TLS: ${SMTP_TLS:-none}
 
-      # Inside the compose network, reach Infisical by service-DNS, not the
-      # published localhost port.
-      INFISICAL_BASE_URL: http://infisical:8080
+      # Infisical is an opt-in profile, so this stays EMPTY on a plain
+      # `just dev` and the readiness probe reports "skipped" instead of
+      # 503ing against an absent host (PMS-707). `just dev-infisical`
+      # writes the service-DNS URL into .env under the MOKOSH_SERVER_
+      # name; the plain INFISICAL_BASE_URL in .env is the host-side
+      # localhost URL that `just infisical-bootstrap` consumes, so the
+      # two contexts need two names.
+      INFISICAL_BASE_URL: ${MOKOSH_SERVER_INFISICAL_BASE_URL:-}
       INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}

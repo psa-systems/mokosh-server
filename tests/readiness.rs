@@ -16,15 +16,19 @@ use sqlx::PgPool;
 
 /// Pin the harness premise: Infisical is unconfigured. `just
 /// test-integration` runs inside the dev compose `server` container,
-/// which always exports `INFISICAL_BASE_URL` (compose.dev.yml) while
-/// the `infisical` service itself is an opt-in profile, so the probe
-/// hit an absent host and 503'd after its 1s timeout (PMS-685). The
-/// handler caches the env read in a `OnceLock` on the first /ready
-/// request, so clearing it before the first boot is enough; `Once`
-/// keeps the mutation to a single call for the whole binary.
+/// which exports `INFISICAL_BASE_URL` (compose.dev.yml) while the
+/// `infisical` service itself is an opt-in profile, so the probe hit
+/// an absent host and 503'd after its 1s timeout (PMS-685). PMS-707
+/// made that export EMPTY by default, so set the empty value here
+/// rather than removing the key: that is the exact shape compose now
+/// hands the container, and asserting "skipped" on it guards the
+/// blank-is-unconfigured rule end to end. The handler caches the env
+/// read in a `OnceLock` on the first /ready request, so setting it
+/// before the first boot is enough; `Once` keeps the mutation to a
+/// single call for the whole binary.
 fn unconfigure_infisical() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::remove_var("INFISICAL_BASE_URL"));
+    ONCE.call_once(|| std::env::set_var("INFISICAL_BASE_URL", ""));
 }
 
 #[sqlx::test]
