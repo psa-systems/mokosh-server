@@ -81,7 +81,7 @@ impl DispatcherWorker {
         let rows = sqlx::query(
             r#"
             SELECT id, tenant_id, user_id, channel_type, recipient,
-                   subject, body, attempt_count
+                   subject, body, body_html, attempt_count
             FROM notifications
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
@@ -104,6 +104,7 @@ impl DispatcherWorker {
             let recipient: Option<String> = row.try_get("recipient")?;
             let subject: Option<String> = row.try_get("subject")?;
             let body: String = row.try_get("body")?;
+            let body_html: Option<String> = row.try_get("body_html")?;
             let attempt: i32 = row.try_get("attempt_count")?;
 
             let new_attempt = attempt + 1;
@@ -115,6 +116,7 @@ impl DispatcherWorker {
                     recipient.as_deref(),
                     subject.as_deref().unwrap_or(""),
                     &body,
+                    body_html.as_deref(),
                 )
                 .await;
 
@@ -207,6 +209,11 @@ impl DispatcherWorker {
     ///     need an address.
     ///   * else if the row carries an explicit `recipient`, use that.
     ///   * else fail permanently (nothing to send to).
+    ///
+    /// `body_html` is the HTML alternative rendered at dispatch time
+    /// (PMS-700); `Some` makes the email a `multipart/alternative`, `None`
+    /// keeps it single-part plain text.
+    #[allow(clippy::too_many_arguments)]
     async fn deliver(
         &self,
         tenant_id: Uuid,
@@ -215,6 +222,7 @@ impl DispatcherWorker {
         recipient: Option<&str>,
         subject: &str,
         body: &str,
+        body_html: Option<&str>,
     ) -> Result<(), DeliveryError> {
         match channel {
             "in_app" => {
@@ -244,7 +252,7 @@ impl DispatcherWorker {
                     }
                 };
                 self.mailer
-                    .send_text(&to, subject, body)
+                    .send_multipart(&to, subject, body, body_html)
                     .await
                     .map_err(|e| DeliveryError::Transient(format!("smtp: {e}")))
             }

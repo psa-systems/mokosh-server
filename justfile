@@ -46,13 +46,19 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
 [group: 'check']
 check-migrations:
     nu scripts/check-migration-prefixes.nu
+
+# Keep transactional email body copy in notification_templates, not in Rust
+# (PMS-700). Fails if a `Mailer` helper re-adds a seeded template's wording.
+[group: 'check']
+check-mail-copy:
+    nu scripts/check-no-duplicate-mail-copy.nu
 
 # Check compilation
 [group: 'check']

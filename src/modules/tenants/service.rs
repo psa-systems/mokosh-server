@@ -975,8 +975,13 @@ impl TenantService {
         // workers need so a freshly created tenant fires SLA at-risk/breach
         // alerts (PMS-106) and appointment reminders (PMS-58) out of the
         // box, matching the default tenant's migration 027 / 028 seed.
-        // Other transactional templates (auth.*, ticket.*) stay on the
-        // migration seed / per-tenant CRUD.
+        // PMS-700 adds the auth.* transactional templates: the dispatcher is
+        // now their only delivery path (the duplicate hard-coded bodies in
+        // `Mailer` are gone), so a tenant without these rows would get no
+        // password-reset or welcome mail at all. Migration 097 backfills the
+        // same two event types into tenants created before this. Other
+        // transactional templates (ticket.*) stay on the migration seed /
+        // per-tenant CRUD.
         sqlx::query(
             r#"
             INSERT INTO notification_templates
@@ -984,7 +989,8 @@ impl TenantService {
             SELECT $1, name, event_type, channel_type, subject, body_text, body_html, is_active
             FROM notification_templates
             WHERE tenant_id = $2
-              AND event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached')
+              AND event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached',
+                                 'auth.password_reset', 'auth.welcome')
             "#,
         )
         .bind(new_tenant_id)
@@ -1009,7 +1015,8 @@ impl TenantService {
              AND nt.event_type = ot.event_type
              AND nt.channel_type = ot.channel_type
             WHERE r.tenant_id = $2
-              AND r.event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached')
+              AND r.event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached',
+                                   'auth.password_reset', 'auth.welcome')
             "#,
         )
         .bind(new_tenant_id)

@@ -21,19 +21,23 @@ use crate::utils::error::{AppError, AppResult};
 /// Anything that can send mokosh's transactional emails.
 #[async_trait]
 pub trait Mailer: Send + Sync {
-    /// Password reset link mail. `reset_link` is the full URL the user
-    /// clicks (token already interpolated).
-    async fn send_password_reset(&self, to: &str, reset_link: &str) -> AppResult<()>;
+    /// PMS-700: the single send primitive. `html` is the optional HTML
+    /// alternative; `Some` produces a `multipart/alternative` message with
+    /// `text` as the fallback part, `None` a single-part plain-text message.
+    /// Body copy for transactional mail lives in `notification_templates`,
+    /// so this trait carries no per-message templates.
+    async fn send_multipart(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        html: Option<&str>,
+    ) -> AppResult<()>;
 
-    /// Welcome / account-created mail for users provisioned by an
-    /// admin. `setup_link` lands them on a "pick your password" page.
-    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()>;
-
-    /// Generic plain-text mail. Escape hatch for notification flows
-    /// that don't fit a typed helper above (e.g. ticket-note
-    /// notifications, ad-hoc alerts). Prefer a typed helper when adding
-    /// a recurring template; reserve this for one-off bodies.
-    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()>;
+    /// Plain-text convenience wrapper over [`Mailer::send_multipart`].
+    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
+        self.send_multipart(to, subject, body, None).await
+    }
 
     /// PMS-673: tell a client contact that a quote is ready for their
     /// sign-off, linking them to the portal where they accept or decline.
@@ -136,34 +140,20 @@ pub struct LogMailer;
 
 #[async_trait]
 impl Mailer for LogMailer {
-    async fn send_password_reset(&self, to: &str, reset_link: &str) -> AppResult<()> {
-        tracing::info!(
-            target: "mokosh_server.mailer",
-            to = %to,
-            link = %reset_link,
-            "[DEV] would send password reset email",
-        );
-        Ok(())
-    }
-
-    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()> {
-        tracing::info!(
-            target: "mokosh_server.mailer",
-            to = %to,
-            name = %display_name,
-            link = %setup_link,
-            "[DEV] would send welcome email",
-        );
-        Ok(())
-    }
-
-    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
+    async fn send_multipart(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        html: Option<&str>,
+    ) -> AppResult<()> {
         tracing::info!(
             target: "mokosh_server.mailer",
             to = %to,
             subject = %subject,
-            body_len = body.len(),
-            "[DEV] would send text email",
+            body_len = text.len(),
+            html_len = html.map(str::len),
+            "[DEV] would send email",
         );
         Ok(())
     }
@@ -243,14 +233,6 @@ impl SmtpMailer {
             from,
         })
     }
-
-    /// Start a `Message` for `to`, pre-populating the headers every outbound
-    /// message must carry: `From`, `To`, and a unique `Message-ID`. `Date` is
-    /// added automatically by lettre's `build`. Routing all sends through this
-    /// helper guarantees no path can ship a message without a `Message-ID`.
-    fn base_builder(&self, to: Mailbox) -> MessageBuilder {
-        base_builder(&self.from, to)
-    }
 }
 
 /// Generate a fresh, globally-unique `Message-ID` header value of the form
@@ -274,79 +256,41 @@ fn base_builder(from: &Mailbox, to: Mailbox) -> MessageBuilder {
         .message_id(Some(new_message_id(from)))
 }
 
+/// Assemble the outbound message. `html` decides the shape: `Some` yields a
+/// `multipart/alternative` carrying the plain text first and the HTML second,
+/// `None` a single-part plain-text body. Free function so a unit test can
+/// inspect the formatted bytes without an SMTP transport (PMS-700).
+fn build_message(
+    from: &Mailbox,
+    to: Mailbox,
+    subject: &str,
+    text: &str,
+    html: Option<&str>,
+) -> AppResult<Message> {
+    let builder = base_builder(from, to).subject(subject.to_string());
+    let msg = match html {
+        Some(html) => builder.multipart(MultiPart::alternative_plain_html(
+            text.to_string(),
+            html.to_string(),
+        ))?,
+        None => builder.body(text.to_string())?,
+    };
+    Ok(msg)
+}
+
 #[async_trait]
 impl Mailer for SmtpMailer {
-    async fn send_password_reset(&self, to: &str, reset_link: &str) -> AppResult<()> {
+    async fn send_multipart(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        html: Option<&str>,
+    ) -> AppResult<()> {
         let to_mailbox: Mailbox = to
             .parse()
             .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
-
-        let text = format!(
-            "We received a request to reset your Mokosh password.\n\n\
-             Use the link below within 24 hours to set a new password.\n\n\
-             {reset_link}\n\n\
-             If you did not request this, ignore this message.\n",
-        );
-        let html = format!(
-            r#"<!doctype html><html><body>
-<p>We received a request to reset your Mokosh password.</p>
-<p>Use the link below within 24 hours to set a new password.</p>
-<p><a href="{reset_link}">{reset_link}</a></p>
-<p>If you did not request this, ignore this message.</p>
-</body></html>"#,
-        );
-
-        let msg = self
-            .base_builder(to_mailbox)
-            .subject("Reset your Mokosh password")
-            .multipart(MultiPart::alternative_plain_html(text, html))?;
-
-        self.transport.send(msg).await?;
-        Ok(())
-    }
-
-    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()> {
-        let to_mailbox: Mailbox = to
-            .parse()
-            .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
-
-        let salutation = if display_name.trim().is_empty() {
-            "Hello,".to_string()
-        } else {
-            format!("Hello {},", display_name.trim())
-        };
-
-        let text = format!(
-            "{salutation}\n\n\
-             An account has been created for you in Mokosh. Use the link\n\
-             below to set your password and finish signing in.\n\n\
-             {setup_link}\n",
-        );
-        let html = format!(
-            r#"<!doctype html><html><body>
-<p>{salutation}</p>
-<p>An account has been created for you in Mokosh. Use the link below to set your password and finish signing in.</p>
-<p><a href="{setup_link}">{setup_link}</a></p>
-</body></html>"#,
-        );
-
-        let msg = self
-            .base_builder(to_mailbox)
-            .subject("Welcome to Mokosh")
-            .multipart(MultiPart::alternative_plain_html(text, html))?;
-
-        self.transport.send(msg).await?;
-        Ok(())
-    }
-
-    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
-        let to_mailbox: Mailbox = to
-            .parse()
-            .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
-        let msg = self
-            .base_builder(to_mailbox)
-            .subject(subject.to_string())
-            .body(body.to_string())?;
+        let msg = build_message(&self.from, to_mailbox, subject, text, html)?;
         self.transport.send(msg).await?;
         Ok(())
     }
@@ -457,18 +401,14 @@ impl SharedMailer {
 
 #[async_trait]
 impl Mailer for SharedMailer {
-    async fn send_password_reset(&self, to: &str, reset_link: &str) -> AppResult<()> {
-        self.current().send_password_reset(to, reset_link).await
-    }
-
-    async fn send_welcome(&self, to: &str, display_name: &str, setup_link: &str) -> AppResult<()> {
-        self.current()
-            .send_welcome(to, display_name, setup_link)
-            .await
-    }
-
-    async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
-        self.current().send_text(to, subject, body).await
+    async fn send_multipart(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        html: Option<&str>,
+    ) -> AppResult<()> {
+        self.current().send_multipart(to, subject, text, html).await
     }
 }
 
@@ -529,6 +469,64 @@ mod tests {
         }
     }
 
+    /// PMS-700: an authored `body_html` must reach the wire as the second part
+    /// of a `multipart/alternative` message, with the plain text kept as the
+    /// fallback part.
+    #[test]
+    fn build_message_emits_the_html_part_as_a_multipart_alternative() {
+        let to: Mailbox = "user@recipient.example".parse().unwrap();
+
+        let msg = build_message(
+            &test_from(),
+            to,
+            "Rendered subject",
+            "plain fallback body",
+            Some("<html><body><p>rendered html body</p></body></html>"),
+        )
+        .unwrap();
+
+        let raw = String::from_utf8(msg.formatted()).unwrap();
+        assert!(
+            raw.contains("multipart/alternative"),
+            "message is not multipart/alternative:\n{raw}"
+        );
+        assert!(
+            raw.contains("text/html"),
+            "message carries no HTML part:\n{raw}"
+        );
+        assert!(
+            raw.contains("rendered html body"),
+            "HTML part content missing:\n{raw}"
+        );
+        assert!(
+            raw.contains("plain fallback body"),
+            "plain-text fallback part missing:\n{raw}"
+        );
+    }
+
+    /// PMS-700: a template with no `body_html` must still produce the previous
+    /// single-part plain-text message, not an empty HTML alternative.
+    #[test]
+    fn build_message_without_html_stays_single_part_plain_text() {
+        let to: Mailbox = "user@recipient.example".parse().unwrap();
+
+        let msg = build_message(&test_from(), to, "Subject", "plain only body", None).unwrap();
+
+        let raw = String::from_utf8(msg.formatted()).unwrap();
+        assert!(
+            !raw.contains("multipart/"),
+            "message should not be multipart:\n{raw}"
+        );
+        assert!(
+            !raw.contains("text/html"),
+            "message should carry no HTML part:\n{raw}"
+        );
+        assert!(
+            raw.contains("plain only body"),
+            "plain-text body missing:\n{raw}"
+        );
+    }
+
     /// PMS-638: swapping the inner mailer must redirect subsequent sends to the
     /// new instance for every consumer holding the shared handle.
     #[tokio::test]
@@ -539,14 +537,14 @@ mod tests {
 
         #[async_trait]
         impl Mailer for Counting {
-            async fn send_password_reset(&self, _to: &str, _link: &str) -> AppResult<()> {
+            async fn send_multipart(
+                &self,
+                _to: &str,
+                _subject: &str,
+                _text: &str,
+                _html: Option<&str>,
+            ) -> AppResult<()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-            async fn send_welcome(&self, _t: &str, _n: &str, _l: &str) -> AppResult<()> {
-                Ok(())
-            }
-            async fn send_text(&self, _t: &str, _s: &str, _b: &str) -> AppResult<()> {
                 Ok(())
             }
         }
@@ -555,12 +553,12 @@ mod tests {
         let second = Arc::new(AtomicUsize::new(0));
         let shared = SharedMailer::new(Arc::new(Counting(first.clone())));
 
-        shared.send_password_reset("x@y.z", "link").await.unwrap();
+        shared.send_text("x@y.z", "subject", "body").await.unwrap();
         assert_eq!(first.load(Ordering::SeqCst), 1);
         assert_eq!(second.load(Ordering::SeqCst), 0);
 
         shared.swap(Arc::new(Counting(second.clone())));
-        shared.send_password_reset("x@y.z", "link").await.unwrap();
+        shared.send_text("x@y.z", "subject", "body").await.unwrap();
         assert_eq!(first.load(Ordering::SeqCst), 1, "old mailer no longer used");
         assert_eq!(
             second.load(Ordering::SeqCst),

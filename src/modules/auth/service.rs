@@ -231,12 +231,10 @@ impl AuthService {
                     // Send the alert on a detached task so a slow or failing SMTP
                     // round-trip never adds latency to (or fails) the login. The
                     // direct mailer is used rather than the notifications
-                    // dispatcher on purpose: the auth.* templates are seeded for
-                    // the default tenant only (migrations 021 / 030), so a queued
-                    // dispatch would silently drop the alert for every other
-                    // tenant, whereas the direct send covers all tenants. Retry
-                    // is intentionally not added here (best-effort security
-                    // signal); see PMS-657.
+                    // dispatcher because no template is seeded for this event at
+                    // all, so a queued dispatch would find no rule and drop the
+                    // alert (PMS-701). Retry is intentionally not added here
+                    // (best-effort security signal); see PMS-657.
                     let mailer = self.mailer.clone();
                     let email = user.email.clone();
                     let country = country.clone();
@@ -1289,20 +1287,14 @@ impl AuthService {
                     tracing::info!(user_id = %user.id, "password reset queued via notifications dispatcher");
                 }
             }
+            // PMS-700: the body copy lives in the `auth.password_reset`
+            // template, so there is no direct-send fallback to duplicate it.
+            // Only fixtures built without a dispatcher land here.
             None => {
-                if let Err(e) = self
-                    .mailer
-                    .send_password_reset(&user.email, &reset_link)
-                    .await
-                {
-                    tracing::warn!(
-                        user_id = %user.id,
-                        error = ?e,
-                        "password reset email send failed; token is persisted but unreachable",
-                    );
-                } else {
-                    tracing::info!(user_id = %user.id, "password reset email sent (legacy mailer path)");
-                }
+                tracing::warn!(
+                    user_id = %user.id,
+                    "no notifications dispatcher wired; password reset token persisted but no message queued",
+                );
             }
         }
 
@@ -1616,20 +1608,14 @@ impl AuthService {
                         tracing::info!(user_id = %user_id, "welcome email queued via notifications dispatcher");
                     }
                 }
+                // PMS-700: the body copy lives in the `auth.welcome` template,
+                // so there is no direct-send fallback to duplicate it. Only
+                // fixtures built without a dispatcher land here.
                 None => {
-                    if let Err(e) = self
-                        .mailer
-                        .send_welcome(&request.email, &display_name, &setup_link)
-                        .await
-                    {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            error = ?e,
-                            "welcome email send failed; setup token persisted but unreachable",
-                        );
-                    } else {
-                        tracing::info!(user_id = %user_id, "welcome email sent (legacy mailer path)");
-                    }
+                    tracing::warn!(
+                        user_id = %user_id,
+                        "no notifications dispatcher wired; setup token persisted but no welcome message queued",
+                    );
                 }
             }
         }

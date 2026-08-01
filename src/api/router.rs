@@ -115,11 +115,15 @@ pub fn create_api_router(
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
     // PMS-136: ContactService emails a `/portal/set-password` setup link when
-    // an agent grants portal access, so it holds the shared mailer + the SPA
-    // origin (the link base). `mailer` is cloned here because TicketService
-    // also takes it below.
-    let contact_service =
-        ContactService::with_mailer(db.clone(), mailer.clone(), client_origin.clone());
+    // an agent grants portal access, so it holds the SPA origin (the link
+    // base). PMS-700: that mail is queued through the same `auth.welcome`
+    // dispatch the staff welcome mail uses, so it takes the dispatcher rather
+    // than the mailer.
+    let contact_service = ContactService::with_dispatcher(
+        db.clone(),
+        client_origin.clone(),
+        notifications_service.clone(),
+    );
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
     // PMS-157: first-visit demo seeding. Holds its own clones of the

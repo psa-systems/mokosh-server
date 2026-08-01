@@ -152,8 +152,14 @@ foreign keys are re-linked to the new tenant's freshly copied rows by name.
 | `sla_policies` | yes | `business_hours_id` by name |
 | `sla_targets` | yes | `sla_policy_id`, `priority_id` by name |
 | `module_config` | yes | - |
-| `notification_templates` (worker subset) | yes | - |
-| `notification_rules` (worker subset) | yes | `template_id` by (event, channel) |
+| `notification_templates` (worker + auth subset) | yes | - |
+| `notification_rules` (worker + auth subset) | yes | `template_id` by (event, channel) |
+
+The notification subset is the three worker events (`appointment.reminder`, `sla.at_risk`,
+`sla.breached`) plus the two transactional auth events (`auth.password_reset`, `auth.welcome`).
+The auth pair was added by PMS-700: the dispatcher is their only delivery path now that the
+duplicate hard-coded bodies are gone from `Mailer`, so a tenant without those rows would get no
+password-reset or welcome mail. Migration `097` backfills the same pair into older tenants.
 
 The seed is **idempotent**: `copy_default_config` skips entirely when the tenant already holds
 `ticket_statuses` rows, and runs in a single transaction so a tenant is either fully seeded or

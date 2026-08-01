@@ -27,13 +27,13 @@ struct CapturingMailer {
 
 #[async_trait]
 impl Mailer for CapturingMailer {
-    async fn send_password_reset(&self, _to: &str, _link: &str) -> AppResult<()> {
-        Ok(())
-    }
-    async fn send_welcome(&self, _to: &str, _name: &str, _link: &str) -> AppResult<()> {
-        Ok(())
-    }
-    async fn send_text(&self, _to: &str, _subject: &str, _body: &str) -> AppResult<()> {
+    async fn send_multipart(
+        &self,
+        _to: &str,
+        _subject: &str,
+        _text: &str,
+        _html: Option<&str>,
+    ) -> AppResult<()> {
         Ok(())
     }
     async fn send_login_approval_code(

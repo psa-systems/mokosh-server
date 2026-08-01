@@ -56,6 +56,15 @@ jobs:
         run: |
           nu scripts/check-migration-immutability.nu
 
+      - name: No duplicate mail copy
+        # PMS-700: transactional email bodies live in notification_templates
+        # and are rendered by the dispatcher. A second hard-coded copy in
+        # `Mailer` made the document a recipient got depend on whether the
+        # dispatcher was wired; fail loud if that copy comes back.
+        shell: nu {0}
+        run: |
+          nu scripts/check-no-duplicate-mail-copy.nu
+
       - name: Ensure C toolchain + native deps
         # The RUNS_ON_OPENSUSE_BASE_LATEST runner image was trimmed of the C
         # toolchain + OpenSSL headers the build relies on. `gcc` provides `cc`,
