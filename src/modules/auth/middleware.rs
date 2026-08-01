@@ -119,7 +119,10 @@ pub async fn auth_middleware(
                 // A deactivated user or a suspended tenant kept working
                 // until token TTL. `ensure_user_and_tenant_active` mirrors
                 // the checks `login()` runs at login time so revocations
-                // take effect on the very next request.
+                // take effect on the very next request. PMS-698: those
+                // status/tenant checks now live in the shared
+                // `ensure_principal_usable`, which the bunyip branch above
+                // runs too, so both paths reject the same principal.
                 match auth_middleware.auth_service.decode_token(token) {
                     Ok(claims) if claims.typ == "access" => {
                         if candidate_sub.is_none() {
@@ -491,8 +494,10 @@ gated_module!(TimeTrackingModule, "time_tracking", RequireTimeTracking);
 /// with a 1 in the low bits, matching `auth::bootstrap::default_tenant_id`)
 /// per docs §3.3: multi-tenant claim plumbing is out of scope for v1.
 ///
-/// Returns `None` only when the user can't be resolved AND can't be created.
-/// The caller treats `None` as "drop the bunyip path" and falls back to legacy.
+/// Returns `None` when the user can't be resolved AND can't be created, or
+/// when the resolved principal fails `AuthService::ensure_principal_usable`
+/// (inactive user / non-active tenant, PMS-698). The caller treats `None` as
+/// "drop the bunyip path" and falls back to legacy.
 async fn ensure_user_from_bunyip(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -701,6 +706,19 @@ pub async fn place_bunyip_user(
                 .ok()?
         }
     };
+
+    // PMS-698: same principal gate the legacy HS256 branch runs, so a
+    // deactivated user or a suspended tenant loses access on the very next
+    // request on this path too. `None` drops the bunyip path; the legacy
+    // fallback cannot decode a bunyip token, so the request ends unauthenticated
+    // and the extractors answer 401/403 instead of silently authenticating.
+    // Excludes the PMS-681 `iat`-vs-`password_changed_at` cutoff on purpose:
+    // bunyip owns the credential here, so a mokosh-side password change is not
+    // a revocation signal for a bunyip token.
+    if let Err(e) = auth_service.ensure_principal_usable(&user).await {
+        tracing::info!(error = %e, user = %user.id, tenant_id = %user.tenant_id, "rejecting bunyip principal");
+        return None;
+    }
 
     // Mark the invite accepted now the user is placed (best-effort).
     if let (Some(invs), Some(inv)) = (invitations, invite.as_ref()) {

@@ -2,8 +2,10 @@
 //!
 //! `boot(pool)` spins the real PSA router up on a per-test TCP socket and
 //! returns a `TestApp` with a reqwest client and (after `login`) a Bearer
-//! access token. The SSO subsystem is intentionally NOT mounted: tests
-//! cover the legacy HS256 path that 99% of PSA endpoints still go through.
+//! access token. The SSO subsystem is intentionally NOT mounted by `boot`:
+//! tests cover the legacy HS256 path that 99% of PSA endpoints still go
+//! through. `boot_with_bunyip` (PMS-698) mounts the bunyip Resource-Server
+//! verifier for the suites that need the bunyip branch instead.
 //! The legacy `AuthMiddleware` reads `Authorization: Bearer <token>`
 //! (`src/modules/auth/middleware.rs:123-126`), so tests authenticate by
 //! pulling `access_token` out of the login JSON response and attaching
@@ -103,7 +105,18 @@ pub fn dec(s: &str) -> Decimal {
 #[allow(dead_code)]
 pub async fn boot(pool: PgPool) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None).await
+    boot_with_db(pool, db, None, None).await
+}
+
+/// PMS-698: bring up the API with the bunyip Resource-Server verifier mounted,
+/// so a suite can exercise the bunyip auth branch end-to-end against a stub OP.
+#[allow(dead_code)]
+pub async fn boot_with_bunyip(
+    pool: PgPool,
+    verifier: mokosh_server::modules::auth::oidc_rs::Verifier,
+) -> TestApp {
+    let db = Database::from_pool(pool.clone());
+    boot_with_db(pool, db, None, Some(verifier)).await
 }
 
 /// PMS-285: bring up the API with the request-serving connection running as an
@@ -120,7 +133,7 @@ pub async fn boot(pool: PgPool) -> TestApp {
 pub async fn boot_rls(pool: PgPool) -> TestApp {
     let app_pool = build_app_role_pool(&pool).await;
     let db = Database::from_pools(app_pool.clone(), pool.clone());
-    boot_with_db(pool, db, Some(app_pool)).await
+    boot_with_db(pool, db, Some(app_pool), None).await
 }
 
 /// Create a per-test `NOSUPERUSER NOBYPASSRLS` role, grant it the same
@@ -172,7 +185,12 @@ pub async fn build_app_role_pool(superuser_pool: &PgPool) -> PgPool {
 }
 
 #[allow(dead_code)]
-async fn boot_with_db(pool: PgPool, db: Database, app_pool: Option<PgPool>) -> TestApp {
+async fn boot_with_db(
+    pool: PgPool,
+    db: Database,
+    app_pool: Option<PgPool>,
+    bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
+) -> TestApp {
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
     // sqlx error swallowed by `AppError::Database("Database operation
@@ -208,8 +226,8 @@ async fn boot_with_db(pool: PgPool, db: Database, app_pool: Option<PgPool>) -> T
         "http://localhost".into(),
         vec!["http://localhost".into()],
         Vec::new(),
-        false, // cookie_secure: irrelevant for bearer-token tests
-        None,  // bunyip RS verifier disabled in tests
+        false,  // cookie_secure: irrelevant for bearer-token tests
+        bunyip, // bunyip RS verifier: None unless the suite booted via `boot_with_bunyip`
         mailer,
         encryption_key,
         // PMS-591: no Bunyip webhook path exercised in these tests, but the
