@@ -222,6 +222,20 @@ dev *args: ensure-env
 [doc("Start Infisical and its Postgres sidecar (compose profile: infisical)")]
 [group: 'dev']
 dev-infisical *args: ensure-env
+    #!/usr/bin/env nu
+    # Point the server container at Infisical by service DNS. `just dev` leaves
+    # this empty so /ready reports infisical "skipped" instead of 503ing against
+    # the profile-gated service (PMS-707); restart `server` to pick it up.
+    let updated = (
+        open .env --raw
+        | lines
+        | where not ($it | str starts-with 'MOKOSH_SERVER_INFISICAL_BASE_URL=')
+        | append 'MOKOSH_SERVER_INFISICAL_BASE_URL=http://infisical:8080'
+        | str join "\n"
+    )
+    if ('.env.new' | path exists) { rm .env.new }
+    $"($updated)\n" | save .env.new
+    mv .env.new .env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
 
 # Stop the dev stack. Volumes preserved. `--remove-orphans` cleans up any

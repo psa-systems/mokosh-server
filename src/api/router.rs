@@ -564,8 +564,8 @@ async fn health_check() -> &'static str {
 ///   secrets at boot only, so a transient Infisical outage does
 ///   not break in-flight requests; the probe still surfaces the
 ///   outage because the next process restart would fail. Skipped
-///   when the env var was unset at boot (single-machine deployments
-///   without an Infisical sibling). The 1s timeout matches the
+///   when the env var was unset or blank at boot (single-machine
+///   deployments without an Infisical sibling). The 1s timeout matches the
 ///   Kubernetes `timeoutSeconds` default so the orchestrator gets
 ///   our error body instead of timing out the whole probe.
 ///
@@ -672,41 +672,54 @@ static INFISICAL_PROBE: std::sync::OnceLock<Option<InfisicalProbe>> = std::sync:
 
 fn infisical_probe() -> Option<&'static InfisicalProbe> {
     INFISICAL_PROBE
-        .get_or_init(|| {
-            let base = std::env::var("INFISICAL_BASE_URL").ok()?;
-            let trimmed = base.trim_end_matches('/').to_string();
-            // Best-effort credential scrub for error strings. If
-            // `INFISICAL_BASE_URL` does not parse as a URL, fall back
-            // to the literal trimmed string (no leak path exists for
-            // a value that does not parse anyway, but stay defensive).
-            let display = match url::Url::parse(&trimmed) {
-                Ok(mut u) => {
-                    let _ = u.set_username("");
-                    let _ = u.set_password(None);
-                    u.set_query(None);
-                    u.set_fragment(None);
-                    u.to_string().trim_end_matches('/').to_string()
-                }
-                Err(_) => trimmed.clone(),
-            };
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(1))
-                .build()
-                .ok()?;
-            Some(InfisicalProbe {
-                url: format!("{trimmed}/api/status"),
-                display,
-                client,
-            })
-        })
+        .get_or_init(|| build_infisical_probe(std::env::var("INFISICAL_BASE_URL").ok()))
         .as_ref()
+}
+
+/// Build the probe from the raw `INFISICAL_BASE_URL` value. Split out of
+/// [`infisical_probe`] so the blank-is-unconfigured rule is unit testable
+/// without mutating the process-global env behind the `OnceLock`.
+///
+/// A blank value counts as unconfigured (PMS-707): Docker Compose renders
+/// `KEY: ${VAR:-}` as the key present with an empty value, and probing
+/// `/api/status` on an empty base URL would 503 the dev stack forever.
+fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
+    let base = raw?;
+    let base = base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let trimmed = base.trim_end_matches('/').to_string();
+    // Best-effort credential scrub for error strings. If
+    // `INFISICAL_BASE_URL` does not parse as a URL, fall back
+    // to the literal trimmed string (no leak path exists for
+    // a value that does not parse anyway, but stay defensive).
+    let display = match url::Url::parse(&trimmed) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => trimmed.clone(),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .ok()?;
+    Some(InfisicalProbe {
+        url: format!("{trimmed}/api/status"),
+        display,
+        client,
+    })
 }
 
 /// Probe Infisical's `/api/status` endpoint when the operator opted
 /// in via `INFISICAL_BASE_URL`. Returns:
 ///
 /// - `Ok(true)` - probe ran and got a 2xx response
-/// - `Ok(false)` - probe skipped (env var unset)
+/// - `Ok(false)` - probe skipped (env var unset or blank)
 /// - `Err(_)` - env var set, but the probe failed (DNS, TCP, non-2xx
 ///   response, or 1s timeout). Error messages reference only the
 ///   sanitised display URL so credentials in the env var stay out
@@ -715,6 +728,13 @@ async fn probe_infisical() -> Result<bool, String> {
     let Some(probe) = infisical_probe() else {
         return Ok(false);
     };
+    run_infisical_probe(probe).await
+}
+
+/// Run one configured probe. Split out of [`probe_infisical`] so the
+/// "configured but unreachable stays an error" path is unit testable
+/// without the process-global `OnceLock`.
+async fn run_infisical_probe(probe: &InfisicalProbe) -> Result<bool, String> {
     let resp = probe
         .client
         .get(&probe.url)
@@ -771,5 +791,44 @@ mod tests {
         let ping = async { Err(AppError::Database("connection closed".into())) };
         let err = bounded_db_ping(ping).await.expect_err("ping should fail");
         assert!(err.contains("connection closed"), "unexpected error: {err}");
+    }
+
+    /// Unset, empty, and whitespace-only all mean "no Infisical" (PMS-707).
+    /// Compose renders an unset host var as an empty value, and probing an
+    /// empty base URL 503'd the dev stack on every /ready.
+    #[test]
+    fn blank_infisical_base_url_is_unconfigured() {
+        for raw in [None, Some(String::new()), Some("   \t ".to_string())] {
+            assert!(
+                build_infisical_probe(raw.clone()).is_none(),
+                "expected no probe for {raw:?}"
+            );
+        }
+    }
+
+    /// A real value still builds the probe, against `<base>/api/status`.
+    #[test]
+    fn set_infisical_base_url_builds_the_probe() {
+        let probe = build_infisical_probe(Some("http://infisical:8080/".to_string()))
+            .expect("probe should be configured");
+        assert_eq!(probe.url, "http://infisical:8080/api/status");
+        assert_eq!(probe.display, "http://infisical:8080");
+    }
+
+    /// Configured-but-unreachable stays an error (which /ready turns into
+    /// a 503), so PMS-707's blank-is-skipped rule does not weaken the
+    /// fail-loud behaviour for a real deployment.
+    #[tokio::test]
+    async fn configured_but_unreachable_infisical_is_an_error() {
+        // Port 1 is reserved and never listening, so this refuses fast.
+        let probe = build_infisical_probe(Some("http://127.0.0.1:1".to_string()))
+            .expect("probe should be configured");
+        let err = run_infisical_probe(&probe)
+            .await
+            .expect_err("unreachable probe should error");
+        assert!(
+            err.contains("http://127.0.0.1:1"),
+            "unexpected error: {err}"
+        );
     }
 }

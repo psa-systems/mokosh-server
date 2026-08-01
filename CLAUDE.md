@@ -49,6 +49,8 @@ OIDC client registration recipes (`register-client`, etc.) were removed with mok
 
 `just dev` rewrites `MOKOSH_HOST_BIND_IP` and `USER` in `.env` each run (the LAN IP, discovered from `sys net | where name =~ 'eth0|br0'`, still drives the published `postgres`/`mailpit` host ports for sqlx-cli and the mail UI; the `server` itself is ingress-only via Traefik). First run copies `.env.dev` to `.env`.
 
+`just dev-infisical` rewrites `MOKOSH_SERVER_INFISICAL_BASE_URL` in `.env` to `http://infisical:8080`, which compose passes to the `server` container as `INFISICAL_BASE_URL` (restart `server` to pick it up). It stays empty on a plain `just dev` so the readiness probe reports `checks.infisical == "skipped"` rather than 503ing against the profile-gated service (PMS-707). The plain `INFISICAL_BASE_URL` in `.env` is a different value for the same key: the host-side `http://localhost:28002` that `just infisical-bootstrap` uses.
+
 `just dev` requires the shared external `network-traefik-public` to already exist. (Before PMS-295 it also needed a local Ed25519 keypair for mokosh-auth's OP signing; that subsystem is gone, so no key material is provisioned now. The bunyip-as-OP Resource-Server path verifies tokens against bunyip's JWKS over the network.)
 
 ## Architecture
