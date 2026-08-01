@@ -49,7 +49,7 @@ branch; "Follow-up issue" = should be filed as its own tracked YouTrack issue
 | F2 | High | OAuth callback | `google_login::callback_html` embeds `serde_json::to_string(payload)` into an inline `<script>`; the code comment claimed serde_json HTML-escapes `<>&` (it does not). The OAuth error branch reflects the fully attacker-controlled `error_description` query param into `payload.error`, so `GET /auth/google/callback?error=x&error_description=</script><script>...` is a reflected XSS on the API origin. A Google `given_name` reaches the success payload the same way. | **Fixed here** |
 | F3 | Medium | Session revocation | The legacy HS256 access-token path in `auth_middleware` never checks `claims.sid` against `user_sessions` (only `refresh_token` does). After `logout()` / `logout_all()` (the latter is what `reset_password` calls to "invalidate all sessions"), an outstanding **access** token still authenticates until it expires (up to 1h). Bounded by the 1h access TTL, and only affects the legacy path. | **Follow-up issue** |
 | F4 | Medium | Password change | `change_password` updates the hash but does **not** revoke other sessions, unlike `reset_password` (which calls `logout_all`). A user changing their password because they suspect compromise leaves other sessions and refresh tokens live. Behavioral/UX decision (keep-current-session vs revoke-all). | **Follow-up issue** |
-| F5 | Low | 2FA lockout | In `login`, a failed **recovery code** returns `Unauthorized` without calling `register_failed_mfa`; only failed TOTP codes arm the PMS-502 second-factor lockout. Recovery-code guessing is still bounded by the 5/min-per-email login limiter and 80-bit entropy, so brute force is infeasible, but the lockout coverage is asymmetric. | **Follow-up issue** |
+| F5 | Low | 2FA lockout | As audited, `login` returned `Unauthorized` for a failed **recovery code** without calling `register_failed_mfa`, so only failed TOTP codes armed the PMS-502 second-factor lockout. Recovery-code guessing was still bounded by the 5/min-per-email login limiter and 80-bit entropy, so brute force was infeasible, but the lockout coverage was asymmetric. | Tracked (PMS-694) |
 | F6 | Low | Re-auth rate limiting | The password re-auth in `change_password` and `disable_mfa` is not rate-limited (the login limiter only guards `/login`). An attacker holding a stolen session could brute-force the current password to disable MFA / change the password without any per-account throttle. | **Follow-up issue** |
 | F7 | Info | Legacy JWT | `decode_token` deliberately does not yet pin `iss`/`aud` (mint side stamps them; strict flip deferred). Already tracked by **MAPPS-334**; no new issue - complete that ticket after the rolling refresh-TTL window rotates every live legacy token. | Tracked (MAPPS-334) |
 | F8 | Info | Webhook replay | The `account_deleted` webhook has no timestamp/nonce window; a captured valid delivery can be replayed. Harmless today because the tombstone is idempotent, but any future non-idempotent event added to the same endpoint pattern would be exposed. | **Follow-up issue** (only if the endpoint gains non-idempotent events) |
@@ -84,13 +84,13 @@ corrected. Unit tests:
 
 ## Follow-up issues to file
 
-Each of F3, F4, F5, F6, and (conditionally) F8 should become its own YouTrack
-issue linked to PMS-625 (`is required for` / `relates to`). Suggested titles:
+Each of F3, F4, F6, and (conditionally) F8 should become its own YouTrack
+issue linked to PMS-625 (`is required for` / `relates to`). F5 is tracked by
+PMS-694. Suggested titles:
 
 - F3: "Legacy HS256 access token not validated against user_sessions; logout /
   reset-password leaves access tokens live up to 1h"
 - F4: "change_password does not revoke other sessions (reset_password does)"
-- F5: "Failed MFA recovery codes bypass the PMS-502 second-factor lockout counter"
 - F6: "Rate-limit password re-auth on change_password and disable_mfa"
 - F8: "Add replay/timestamp window to the Bunyip webhook receiver before adding
   any non-idempotent event"
