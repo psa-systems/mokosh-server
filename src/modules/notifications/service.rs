@@ -550,6 +550,7 @@ impl NotificationsService {
         request: &UpsertNotificationRuleRequest,
         ctx: &AuditCtx,
     ) -> AppResult<NotificationRuleResponse> {
+        let template_id = require_template_id(request)?;
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -565,7 +566,7 @@ impl NotificationsService {
         .bind(&request.conditions)
         .bind(&request.channels)
         .bind(&request.recipients)
-        .bind(request.template_id)
+        .bind(template_id)
         .bind(request.is_active)
         .execute(&mut *tx)
         .await?;
@@ -611,6 +612,7 @@ impl NotificationsService {
         request: &UpsertNotificationRuleRequest,
         ctx: &AuditCtx,
     ) -> AppResult<NotificationRuleResponse> {
+        let template_id = require_template_id(request)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM notification_rules t WHERE tenant_id = $1 AND id = $2",
@@ -632,7 +634,7 @@ impl NotificationsService {
         .bind(&request.conditions)
         .bind(&request.channels)
         .bind(&request.recipients)
-        .bind(request.template_id)
+        .bind(template_id)
         .bind(request.is_active)
         .execute(&mut *tx)
         .await?
@@ -709,6 +711,10 @@ impl NotificationsService {
     /// `is_enabled = false` OR whose `channel_types` does not include
     /// the channel, that row is skipped. Absent preferences = send (the
     /// project default).
+    ///
+    /// A rule whose `template_id` is NULL, or whose template row is gone,
+    /// is skipped with a `warn!` and contributes nothing to the returned
+    /// fanout count (PMS-701).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch(
         &self,
@@ -762,6 +768,22 @@ impl NotificationsService {
                 None => None,
             };
 
+            // PMS-701: no template means nothing renderable. The old
+            // fallback body was the whole dispatch JSON (recipient
+            // addresses, user ids, ticket text) mailed to a real
+            // recipient. Skip the rule and log the misconfiguration.
+            let Some(template) = template else {
+                tracing::warn!(
+                    %tenant_id,
+                    event_type,
+                    rule_id = %rule.id,
+                    rule_name = %rule.name,
+                    template_id = ?rule.template_id,
+                    "notification rule has no usable template; skipping dispatch",
+                );
+                continue;
+            };
+
             // Merge rule.recipients with caller-supplied context recipients.
             let mut user_ids: Vec<Uuid> = rule
                 .recipients
@@ -801,16 +823,16 @@ impl NotificationsService {
                 .await?;
 
             for channel in &rule.channels {
-                let raw_subject = template
-                    .as_ref()
-                    .and_then(|t| t.subject.clone())
-                    .unwrap_or_else(|| format!("Mokosh event: {event_type}"));
-                let raw_body = template
-                    .as_ref()
-                    .map(|t| t.body_text.clone())
-                    .unwrap_or_else(|| format!("Event {event_type} fired with context {context}"));
-                let (subject, subject_unresolved) = render_template(&raw_subject, context);
-                let (body, body_unresolved) = render_template(&raw_body, context);
+                // A template with no subject (in_app rows need none) leaves
+                // the column NULL rather than inventing one.
+                let (subject, subject_unresolved) = match template.subject.as_deref() {
+                    Some(raw) => {
+                        let (rendered, unresolved) = render_template(raw, context);
+                        (Some(rendered), unresolved)
+                    }
+                    None => (None, Vec::new()),
+                };
+                let (body, body_unresolved) = render_template(&template.body_text, context);
                 // A placeholder the context cannot supply would otherwise
                 // ship as literal braces to the recipient (PMS-702).
                 if !subject_unresolved.is_empty() || !body_unresolved.is_empty() {
@@ -818,7 +840,7 @@ impl NotificationsService {
                         %tenant_id,
                         event_type,
                         channel,
-                        template_id = ?template.as_ref().map(|t| t.id),
+                        template_id = %template.id,
                         subject_keys = ?subject_unresolved,
                         body_keys = ?body_unresolved,
                         "notification template has unresolved placeholders",
@@ -840,7 +862,7 @@ impl NotificationsService {
                     .bind(tenant_id)
                     .bind(user_id)
                     .bind(channel)
-                    .bind(template.as_ref().map(|t| t.id))
+                    .bind(template.id)
                     .bind(&subject)
                     .bind(&body)
                     .execute(&mut *tx)
@@ -862,7 +884,7 @@ impl NotificationsService {
                         )
                         .bind(tenant_id)
                         .bind(channel)
-                        .bind(template.as_ref().map(|t| t.id))
+                        .bind(template.id)
                         .bind(addr)
                         .bind(&subject)
                         .bind(&body)
@@ -934,6 +956,16 @@ fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) ->
 /// Returns the rendered text plus the de-duplicated list of keys that
 /// did not resolve (PMS-702), so the caller can log a template typo
 /// instead of shipping literal braces to a customer.
+/// PMS-701: a rule without a template can never render a message, so
+/// reject it at write time instead of letting `dispatch` skip it later.
+/// The route-level `#[validate(required)]` catches the HTTP path; this
+/// covers every other caller of the service.
+fn require_template_id(request: &UpsertNotificationRuleRequest) -> AppResult<Uuid> {
+    request
+        .template_id
+        .ok_or_else(|| AppError::validation_field("template_id", "is required"))
+}
+
 pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec<String>) {
     let mut out = String::with_capacity(input.len());
     let mut unresolved: Vec<String> = Vec::new();
@@ -967,8 +999,10 @@ pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec
 
 #[cfg(test)]
 mod tests {
-    use super::render_template;
+    use super::{render_template, require_template_id, UpsertNotificationRuleRequest};
     use serde_json::json;
+    use uuid::Uuid;
+    use validator::Validate;
 
     #[test]
     fn render_substitutes_string_keys() {
@@ -1008,6 +1042,74 @@ mod tests {
         let (out, unresolved) = render_template("plain text", &json!({}));
         assert_eq!(out, "plain text");
         assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn rule_without_template_fails_validation() {
+        let req: UpsertNotificationRuleRequest = serde_json::from_value(json!({
+            "name": "No template",
+            "event_type": "test.event",
+            "channels": ["email"],
+            "recipients": {"emails": ["ops@example.test"]},
+        }))
+        .expect("deserialise rule request");
+
+        let errors = req.validate().expect_err("missing template_id must fail");
+        assert!(
+            errors.field_errors().contains_key("template_id"),
+            "expected a template_id field error, got {errors:?}",
+        );
+        let err = require_template_id(&req).expect_err("service guard must reject too");
+        assert_eq!(err.status_code(), 422, "must surface as a validation error");
+    }
+
+    #[test]
+    fn rule_with_template_passes_validation() {
+        let req: UpsertNotificationRuleRequest = serde_json::from_value(json!({
+            "name": "With template",
+            "event_type": "test.event",
+            "channels": ["email"],
+            "recipients": {"emails": ["ops@example.test"]},
+            "template_id": Uuid::new_v4(),
+        }))
+        .expect("deserialise rule request");
+        req.validate().expect("template_id present validates");
+        require_template_id(&req).expect("service guard accepts");
+    }
+
+    /// PMS-701: `dispatch` used to fall back to a synthetic subject and a
+    /// body holding the serialized dispatch context (recipient addresses,
+    /// user ids, ticket text). Fail if either literal reappears anywhere
+    /// under `src/`. The needles are split so this guard never matches
+    /// itself.
+    #[test]
+    fn no_context_dump_fallback_in_source() {
+        let needles = [
+            concat!("Mokosh ", "event:"),
+            concat!("fired with ", "context"),
+        ];
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut hits: Vec<String> = Vec::new();
+        let mut dirs = vec![root.join("src"), root.join("tests"), root.join("crates")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source file");
+                    for needle in needles {
+                        if text.contains(needle) {
+                            hits.push(format!("{}: {needle}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "notification fallback subject/body is back: {hits:?}",
+        );
     }
 }
 

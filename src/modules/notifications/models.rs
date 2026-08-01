@@ -109,6 +109,9 @@ pub struct UpsertNotificationRuleRequest {
     pub conditions: serde_json::Value,
     pub channels: Vec<String>,
     pub recipients: serde_json::Value,
+    /// Required (PMS-701): a rule with no template has nothing to render,
+    /// and `dispatch` skips it instead of mailing a fallback body.
+    #[validate(required)]
     pub template_id: Option<Uuid>,
     #[serde(default = "default_true")]
     pub is_active: bool,

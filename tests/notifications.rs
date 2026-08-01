@@ -13,6 +13,8 @@
 //!     guard).
 //!   * Every migration-seeded template stores real newlines and only
 //!     flat placeholders (PMS-702 regression guard).
+//!   * A rule with no template writes no `notifications` row, and the
+//!     rules endpoint rejects a template-less rule (PMS-701).
 
 mod common;
 
@@ -272,6 +274,105 @@ async fn channel_config_is_encrypted_at_rest(pool: PgPool) {
         !stored.contains(secret_marker),
         "config_encrypted should be ciphertext, but contained the plaintext marker: {stored}",
     );
+}
+
+/// PMS-701: a rule with no template used to dispatch a row with a
+/// synthetic subject and the serialized dispatch context as its body.
+/// Such a rule must now write nothing at all, and the API must refuse to
+/// create one.
+#[sqlx::test]
+async fn rule_without_template_dispatches_nothing_and_cannot_be_created(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let event_type = "test.template_less_rule";
+
+    // Legacy shape: a rule row with a NULL template_id (PMS-386-era rules
+    // predate templates, so this state exists in the wild).
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (id, tenant_id, name, event_type, channels, recipients, template_id, is_active)
+        VALUES ($1, $2, 'Template-less Rule', $3, ARRAY['email', 'in_app']::VARCHAR(20)[],
+                '{"user_ids": [], "emails": ["ops@example.test"]}'::jsonb, NULL, TRUE)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(event_type)
+    .execute(&pool)
+    .await
+    .expect("seed template-less rule");
+
+    let dispatch_resp = app
+        .client
+        .post(app.url("/api/v1/notifications/dispatch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "event_type": event_type,
+            "context": {
+                "recipient_user_id": admin_id.to_string(),
+                "recipient_email": "victim@example.test",
+                "reset_token": "super-secret-value",
+            },
+        }))
+        .send()
+        .await
+        .expect("send dispatch");
+    assert!(
+        dispatch_resp.status().is_success(),
+        "dispatch should 2xx, got {}",
+        dispatch_resp.status(),
+    );
+
+    let rows: Vec<(Option<String>, String)> = sqlx::query_as(
+        "SELECT subject, body FROM notifications WHERE tenant_id = $1 AND template_id IS NULL",
+    )
+    .bind(tenant_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query notifications");
+    assert!(
+        rows.is_empty(),
+        "a rule with no template must insert no notifications row, got {rows:?}",
+    );
+
+    // The write path is closed too: no template_id -> 422.
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/notification-rules"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "No Template Rule",
+            "event_type": event_type,
+            "channels": ["email"],
+            "recipients": {"emails": ["ops@example.test"]},
+            "is_active": true,
+        }))
+        .send()
+        .await
+        .expect("send create rule");
+    assert_eq!(
+        create_resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "creating a rule without template_id must be a validation error",
+    );
+    let body: serde_json::Value = create_resp.json().await.expect("error JSON");
+    assert!(
+        serde_json::to_string(&body)
+            .expect("serialise error body")
+            .contains("template_id"),
+        "validation error should name template_id, got {body}",
+    );
+
+    let created: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notification_rules WHERE tenant_id = $1 AND name = 'No Template Rule'")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rules");
+    assert_eq!(created, 0, "rejected rule must not be persisted");
 }
 
 /// Every placeholder key in `text`, i.e. the contents of each `{{...}}`.
