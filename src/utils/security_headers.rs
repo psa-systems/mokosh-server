@@ -11,11 +11,13 @@
 //! This middleware is the mokosh-server half of that decision: parity with
 //! bunyip-api's `SecurityHeaders`. It attaches HSTS, nosniff, frame-deny, a
 //! restrictive Referrer-Policy / Permissions-Policy, and a CSP tuned for this
-//! surface (a JSON API whose only browser-rendered page is the
-//! `not_a_frontend` fallback) to every response.
+//! surface (a JSON API whose browser-rendered pages are the `not_a_frontend`
+//! fallback and the Google OAuth popup) to every response.
 //!
-//! Headers are set with `insert` (not `append`) so a handler that already set
-//! one - none do today - would win; the middleware fills in the rest.
+//! A header the handler already set wins: the middleware only fills in the
+//! ones that are absent. The OAuth callback relies on that to swap in its own
+//! nonce CSP ([`csp_with_script_nonce`], PMS-691) instead of loosening the
+//! global policy for every response.
 
 use axum::http::{header::HeaderName, HeaderValue};
 
@@ -54,6 +56,17 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ),
 ];
 
+/// CSP for a response that must run one specific inline script, identified by
+/// `nonce`. Same denials as the global policy with `script-src 'nonce-...'`
+/// added; deliberately no `'unsafe-inline'`, so only the nonced script runs.
+/// The only caller is the Google OAuth popup page (PMS-691).
+pub fn csp_with_script_nonce(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; \
+         frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    )
+}
+
 /// Axum middleware that adds the [`SECURITY_HEADERS`] set to every response.
 /// Mounted as a global layer on the outermost router so it covers the API, the
 /// portal API, and the `not_a_frontend` fallback uniformly.
@@ -64,10 +77,12 @@ pub async fn security_headers(
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     for (name, value) in SECURITY_HEADERS {
-        headers.insert(
-            HeaderName::from_static(name),
-            HeaderValue::from_static(value),
-        );
+        // `or_insert`, not `insert`: the middleware runs after the handler, so
+        // `insert` would clobber a handler-set header (the OAuth callback's
+        // nonce CSP) with the global default.
+        headers
+            .entry(HeaderName::from_static(name))
+            .or_insert(HeaderValue::from_static(value));
     }
     response
 }
@@ -75,6 +90,7 @@ pub async fn security_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
 
@@ -114,5 +130,74 @@ mod tests {
             response.headers().get("x-content-type-options").unwrap(),
             "nosniff"
         );
+    }
+
+    /// PMS-691: the nonce relaxation belongs to the OAuth callback alone. Every
+    /// other response keeps `default-src 'none'` with no `script-src` at all,
+    /// so an injected inline script has nothing to run under.
+    #[tokio::test]
+    async fn global_csp_has_no_script_src_relaxation() {
+        let response = app()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("default-src 'none'"), "global CSP: {csp}");
+        assert!(!csp.contains("script-src"), "global CSP: {csp}");
+        assert!(!csp.contains("nonce-"), "global CSP: {csp}");
+    }
+
+    /// The middleware runs after the handler, so it must not overwrite a CSP the
+    /// handler set for itself (PMS-691).
+    #[tokio::test]
+    async fn handler_set_csp_survives_the_middleware() {
+        let handler_csp = csp_with_script_nonce("dGVzdC1ub25jZQ");
+        let expected = handler_csp.clone();
+        let app = Router::new()
+            .route(
+                "/popup",
+                get(move || {
+                    let value = handler_csp.clone();
+                    async move {
+                        let mut response = "<html></html>".into_response();
+                        response.headers_mut().insert(
+                            HeaderName::from_static("content-security-policy"),
+                            HeaderValue::from_str(&value).unwrap(),
+                        );
+                        response
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(security_headers));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/popup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            expected.as_str()
+        );
+        // The rest of the set is still filled in.
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+    }
+
+    #[test]
+    fn nonce_csp_denies_everything_but_the_nonced_script() {
+        let csp = csp_with_script_nonce("abc123");
+        assert!(csp.contains("script-src 'nonce-abc123'"), "{csp}");
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
     }
 }

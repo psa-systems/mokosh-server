@@ -643,7 +643,7 @@ async fn google_callback(
         ),
     };
 
-    let mut response = google_login::callback_html(&payload, &state.client_origin).into_response();
+    let mut response = google_login::callback_response(&payload, &state.client_origin);
     for cookie in set_cookies {
         if let Ok(v) = HeaderValue::from_str(&cookie) {
             response.headers_mut().append(SET_COOKIE, v);
