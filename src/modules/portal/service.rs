@@ -50,13 +50,12 @@ impl PortalAuthService {
             String,
             bool,
             Option<String>,
-            i32,
             Option<DateTime<Utc>>,
         )> = sqlx::query_as(
             r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email, c.first_name,
                        c.last_name, c.is_portal_user, c.portal_password_hash,
-                       c.portal_failed_login_count, c.portal_locked_until
+                       c.portal_locked_until
                 FROM contacts c
                 INNER JOIN tenants t ON c.tenant_id = t.id
                 WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
@@ -84,7 +83,6 @@ impl PortalAuthService {
             last_name,
             is_portal_user,
             hash,
-            failed_count,
             locked_until,
         )) = row
         else {
@@ -107,7 +105,7 @@ impl PortalAuthService {
         };
         if !verify_password(&request.password, &hash)? {
             // PMS-501: record the failure and (re)arm the lockout window.
-            self.register_failed_login(id, failed_count).await?;
+            self.register_failed_login(id).await?;
             return Err(AppError::Unauthorized);
         }
 
@@ -164,19 +162,28 @@ impl PortalAuthService {
     /// threshold (see [`lockout_until`]). Runs on the migrator pool for the
     /// same reason the login lookup does: the portal plane sets no RLS GUC
     /// and `contacts` is RLS-covered, so the app pool would write closed.
-    async fn register_failed_login(&self, contact_id: Uuid, prior_count: i32) -> AppResult<()> {
-        let new_count = prior_count.saturating_add(1);
-        let locked_until = lockout_until(new_count, Utc::now());
-        sqlx::query(
+    ///
+    /// PMS-693: the increment is relative (`portal_failed_login_count + 1`)
+    /// and the new lock window is derived from the post-increment value inside
+    /// the same statement, so a burst of concurrent wrong passwords counts
+    /// every one of them. Taking no `prior_count` makes the stale-read defect
+    /// unrepresentable.
+    async fn register_failed_login(&self, contact_id: Uuid) -> AppResult<()> {
+        // A NULL window (still under the threshold) leaves any existing
+        // lockout in place rather than clearing it.
+        let sql = format!(
             "UPDATE contacts \
-             SET portal_failed_login_count = $1, portal_locked_until = $2, updated_at = NOW() \
-             WHERE id = $3",
-        )
-        .bind(new_count)
-        .bind(locked_until)
-        .bind(contact_id)
-        .execute(self.db.migrator_pool())
-        .await?;
+             SET portal_failed_login_count = portal_failed_login_count + 1, \
+                 portal_locked_until = COALESCE( \
+                     NOW() + make_interval(secs => {secs}), portal_locked_until), \
+                 updated_at = NOW() \
+             WHERE id = $1",
+            secs = lock_seconds_sql("portal_failed_login_count + 1"),
+        );
+        sqlx::query(&sql)
+            .bind(contact_id)
+            .execute(self.db.migrator_pool())
+            .await?;
         Ok(())
     }
 
@@ -361,7 +368,11 @@ fn parse_contact_bound_token(token: &str) -> Option<(Uuid, &str)> {
 /// | 12+          | 3600s (cap) |
 ///
 /// Returns `None` while under the threshold (no lockout yet).
-fn lockout_until(failed_count: i32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+///
+/// PMS-693: `pub` so the DB-backed parity test can pin [`lock_seconds_sql`],
+/// the SQL twin that `register_failed_login` runs, against this Rust
+/// definition of the schedule.
+pub fn lockout_until(failed_count: i32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     /// Failures tolerated before any lockout arms.
     const LOCKOUT_THRESHOLD: i32 = 5;
     /// Lock window for the first threshold-crossing failure.
@@ -380,6 +391,23 @@ fn lockout_until(failed_count: i32, now: DateTime<Utc>) -> Option<DateTime<Utc>>
         .unwrap_or(LOCKOUT_MAX_SECONDS)
         .min(LOCKOUT_MAX_SECONDS);
     Some(now + Duration::seconds(secs))
+}
+
+/// PMS-693: SQL twin of [`lockout_until`], as an expression yielding the lock
+/// window in seconds (NULL under the threshold) for the post-increment failure
+/// count `count_expr`. `register_failed_login` needs the schedule evaluated
+/// inside its `UPDATE` so the window is derived from the counter value the
+/// database just produced, never from a stale read. Keeping it in one place
+/// lets `portal_lock_seconds_sql_matches_rust_schedule` (`tests/portal.rs`)
+/// pin it against the Rust helper.
+///
+/// `count_expr` is a caller-supplied SQL fragment (a column expression or a
+/// bind placeholder), never user input.
+pub fn lock_seconds_sql(count_expr: &str) -> String {
+    format!(
+        "CASE WHEN ({count_expr}) >= 5 \
+         THEN LEAST(3600, 30 * 2 ^ LEAST(20, ({count_expr}) - 5))::double precision END"
+    )
 }
 
 #[cfg(test)]

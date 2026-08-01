@@ -9,14 +9,21 @@
 //! - PMS-4 AC6: cross-tenant `GET /users/{id}` returns 404 (pins the
 //!   surgical `tenant_id` WHERE-clause fixes in service.rs).
 //! - Negative pin: wrong password returns 401.
+//! - PMS-693: concurrent failed second-factor codes each increment the
+//!   persistent attempt counter, and one TOTP step is spendable exactly once.
 
 mod common;
+
+use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use mokosh_server::modules::auth::AuthService;
+use mokosh_server::modules::auth::{
+    mfa_lock_seconds_sql, mfa_lockout_until, AuthService, LoginRequest,
+};
+use mokosh_server::utils::error::AppError;
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
 
@@ -692,6 +699,158 @@ async fn mfa_failed_codes_lock_account(pool: PgPool) {
         reqwest::StatusCode::TOO_MANY_REQUESTS,
         "a correct code is still rejected while the account is locked"
     );
+}
+
+// ============================================================================
+// PMS-693: the attempt counter increments atomically, not from a stale read
+// ============================================================================
+
+/// Enable TOTP MFA for `user_id` straight on the row and return the shared
+/// secret. The HTTP enrollment path is covered by `mfa_challenge_happy_path`;
+/// the concurrency pins below call `AuthService::login` directly (the router's
+/// 5/min per-email limiter would reject most of a 20-request burst before it
+/// ever reached the MFA branch), so they seed the same end state in SQL.
+async fn seed_mfa_enabled(pool: &PgPool, user_id: Uuid) -> Vec<u8> {
+    let secret = mokosh_server::utils::totp::generate_secret();
+    let secret_b32 = mokosh_server::utils::totp::base32_encode(&secret);
+    sqlx::query("UPDATE users SET mfa_enabled = TRUE, mfa_secret = $1 WHERE id = $2")
+        .bind(&secret_b32)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("enable MFA on the seeded user");
+    secret.to_vec()
+}
+
+fn login_request(email: &str, password: &str, mfa_code: &str) -> LoginRequest {
+    serde_json::from_value(serde_json::json!({
+        "email": email,
+        "password": password,
+        "mfa_code": mfa_code,
+    }))
+    .expect("build LoginRequest")
+}
+
+fn auth_service(pool: &PgPool) -> Arc<AuthService> {
+    Arc::new(AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    ))
+}
+
+/// PMS-693: a burst of concurrent wrong second-factor codes must count every
+/// one of them. Pre-fix each request read `mfa_failed_attempts` in its own
+/// transaction, so all of them computed `0 + 1` and the column ended at 1 no
+/// matter how many codes were guessed: the lockout never armed and the
+/// attacker got a whole burst of guesses per round trip.
+#[sqlx::test]
+async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let secret = seed_mfa_enabled(&pool, uid).await;
+    let auth = auth_service(&pool);
+
+    // 21 distinct six-digit codes the verifier rejects (20 for the burst plus
+    // one to probe the lockout afterwards).
+    let codes: Vec<String> = (0..64)
+        .map(|i| format!("{:06}", 100_000 + i))
+        .filter(|c| mokosh_server::utils::totp::verify(&secret, c, Utc::now(), 1).is_none())
+        .take(21)
+        .collect();
+    assert_eq!(codes.len(), 21, "need 21 codes that are all wrong");
+
+    let mut handles = Vec::new();
+    for code in &codes[..20] {
+        let auth = Arc::clone(&auth);
+        let req = login_request(&email, &password, code);
+        handles.push(tokio::spawn(async move {
+            auth.login(&req, None, None).await.is_ok()
+        }));
+    }
+    for h in handles {
+        assert!(
+            !h.await.expect("login task joins"),
+            "a wrong second-factor code must never log in"
+        );
+    }
+
+    let failed: i32 = sqlx::query_scalar("SELECT mfa_failed_attempts FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .expect("read mfa_failed_attempts");
+    assert!(
+        failed >= 20,
+        "every concurrent failure is counted, got {failed}"
+    );
+
+    // The 21st attempt is refused by the armed lockout, not merely rejected
+    // as a bad code.
+    let err = auth
+        .login(&login_request(&email, &password, &codes[20]), None, None)
+        .await
+        .expect_err("21st attempt must fail");
+    assert!(
+        matches!(err, AppError::RateLimited),
+        "the lockout is armed, so the next attempt is rate-limited, got {err:?}"
+    );
+}
+
+/// PMS-693 / PMS-502 anti-replay: two concurrent logins presenting the SAME
+/// valid TOTP code must not both succeed. Pre-fix both compared the code's
+/// step against a watermark read before either write, so both passed; the
+/// advance is now a compare-and-set inside the UPDATE.
+#[sqlx::test]
+async fn concurrent_same_totp_code_accepted_once(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let secret = seed_mfa_enabled(&pool, uid).await;
+    let auth = auth_service(&pool);
+
+    // Compute the code immediately before spawning so the 30-second step
+    // cannot roll past the verifier's +-1 window.
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let auth = Arc::clone(&auth);
+        let req = login_request(&email, &password, &code);
+        handles.push(tokio::spawn(async move {
+            auth.login(&req, None, None).await.is_ok()
+        }));
+    }
+    let mut wins = 0;
+    for h in handles {
+        if h.await.expect("login task joins") {
+            wins += 1;
+        }
+    }
+    assert_eq!(
+        wins, 1,
+        "exactly one of two concurrent logins with the same TOTP code succeeds"
+    );
+}
+
+/// PMS-693: `register_failed_mfa` derives the lock window in SQL from the
+/// post-increment counter, so that expression is a second copy of the schedule
+/// `mfa_lockout_until` defines in Rust. Pin the two together across the whole
+/// documented table (`1..=12` spans below-threshold, the doubling ramp and the
+/// 3600s cap) so neither can drift.
+#[sqlx::test]
+async fn mfa_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
+    let sql = format!("SELECT {}", mfa_lock_seconds_sql("$1::int"));
+    let now = Utc::now();
+    for n in 1..=12 {
+        let sql_secs: Option<f64> = sqlx::query_scalar(&sql)
+            .bind(n)
+            .fetch_one(&pool)
+            .await
+            .expect("evaluate the SQL lockout schedule");
+        let rust_secs = mfa_lockout_until(n, now).map(|until| (until - now).num_seconds());
+        assert_eq!(
+            sql_secs.map(|s| s as i64),
+            rust_secs,
+            "SQL and Rust lockout schedules disagree at failed_count = {n}"
+        );
+    }
 }
 
 // ============================================================================

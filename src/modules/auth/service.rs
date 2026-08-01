@@ -525,9 +525,9 @@ impl AuthService {
     ) -> AppResult<()> {
         let code_hash = sha256_hex(code.trim());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(Uuid, String, i32)> = sqlx::query_as(
+        let row: Option<(Uuid, String)> = sqlx::query_as(
             r#"
-            SELECT id, code_hash, attempts
+            SELECT id, code_hash
               FROM login_approvals
              WHERE tenant_id = $1 AND user_id = $2
                AND consumed_at IS NULL AND expires_at > NOW()
@@ -540,7 +540,7 @@ impl AuthService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some((id, stored_hash, attempts)) = row else {
+        let Some((id, stored_hash)) = row else {
             tx.commit().await?;
             return Err(AppError::Unauthorized);
         };
@@ -553,15 +553,20 @@ impl AuthService {
             tx.commit().await?;
             Ok(())
         } else {
-            let next = attempts + 1;
+            // PMS-693: increment relatively and decide from the value the
+            // UPDATE returns. Reading `attempts` and writing back `attempts +
+            // 1` let a burst of concurrent guesses all read the same value and
+            // collapse into a single tick, so the cap never bit. The UPDATE's
+            // row lock serialises the burst instead.
+            let next: i32 = sqlx::query_scalar(
+                "UPDATE login_approvals SET attempts = attempts + 1 \
+                 WHERE id = $1 RETURNING attempts",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
             if next >= Self::LOGIN_APPROVAL_MAX_ATTEMPTS {
                 sqlx::query("DELETE FROM login_approvals WHERE id = $1")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-            } else {
-                sqlx::query("UPDATE login_approvals SET attempts = $1 WHERE id = $2")
-                    .bind(next)
                     .bind(id)
                     .execute(&mut *tx)
                     .await?;
@@ -670,11 +675,8 @@ impl AuthService {
             // login limiter, this survives a process restart, coordinates
             // across replicas (it lives in Postgres), and is budgeted
             // independently of the password-attempt bucket.
-            let mfa_state = self.mfa_lockout_state(user.tenant_id, user.id).await?;
-            if mfa_state
-                .locked_until
-                .is_some_and(|until| until > Utc::now())
-            {
+            let locked_until = self.mfa_locked_until(user.tenant_id, user.id).await?;
+            if locked_until.is_some_and(|until| until > Utc::now()) {
                 return Err(AppError::RateLimited);
             }
 
@@ -714,27 +716,24 @@ impl AuthService {
                 // +-1 step (30s) tolerance handles modest clock skew. The
                 // verifier returns the matched step so we can enforce
                 // anti-replay (PMS-502).
-                match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
-                    // PMS-502 anti-replay: a captured code stays valid for its
-                    // whole +/-1 window, so only honour a step STRICTLY GREATER
-                    // than the last accepted one. The same code (or an earlier
-                    // still-live one) cannot be replayed.
-                    Some(step) if mfa_state.last_used_step.is_none_or(|last| step > last) => {
+                // PMS-502 anti-replay: a captured code stays valid for its
+                // whole +/-1 window, so only honour a step STRICTLY GREATER
+                // than the last accepted one. PMS-693: that comparison is the
+                // watermark UPDATE's own WHERE clause, so two concurrent
+                // logins presenting the same code cannot both win it.
+                let accepted = match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
+                    Some(step) => {
                         self.record_mfa_success(user.tenant_id, user.id, step)
-                            .await?;
+                            .await?
                     }
-                    // Wrong code, or a replay of an already-spent step: count it
-                    // against the per-account cap and (re)arm the lockout, then
-                    // fail closed.
-                    _ => {
-                        self.register_failed_mfa(
-                            user.tenant_id,
-                            user.id,
-                            mfa_state.failed_attempts,
-                        )
-                        .await?;
-                        return Err(AppError::Unauthorized);
-                    }
+                    None => false,
+                };
+                // Wrong code, or a replay of an already-spent step: count it
+                // against the per-account cap and (re)arm the lockout, then
+                // fail closed.
+                if !accepted {
+                    self.register_failed_mfa(user.tenant_id, user.id).await?;
+                    return Err(AppError::Unauthorized);
                 }
             } else {
                 return Ok(LoginResponse {
@@ -2497,54 +2496,52 @@ impl AuthService {
         Ok(row.into())
     }
 
-    /// PMS-502: read the per-account second-factor lockout + anti-replay
-    /// state for `user_id`. Tenant-scoped (`begin_with_tenant`) like every
-    /// other `users` access on the login path so RLS is satisfied.
-    async fn mfa_lockout_state(
+    /// PMS-502: read the per-account second-factor lockout window for
+    /// `user_id`. Tenant-scoped (`begin_with_tenant`) like every other `users`
+    /// access on the login path so RLS is satisfied.
+    async fn mfa_locked_until(
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
-    ) -> AppResult<MfaLockoutState> {
+    ) -> AppResult<Option<chrono::DateTime<Utc>>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: (i32, Option<chrono::DateTime<Utc>>, Option<i64>) = sqlx::query_as(
-            "SELECT mfa_failed_attempts, mfa_locked_until, mfa_last_used_step \
-             FROM users WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(user_id)
-        .bind(tenant_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let row: (Option<chrono::DateTime<Utc>>,) =
+            sqlx::query_as("SELECT mfa_locked_until FROM users WHERE id = $1 AND tenant_id = $2")
+                .bind(user_id)
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
         tx.commit().await?;
-        Ok(MfaLockoutState {
-            failed_attempts: row.0,
-            locked_until: row.1,
-            last_used_step: row.2,
-        })
+        Ok(row.0)
     }
 
     /// PMS-502: record one more failed (or replayed) second-factor code for
     /// `user_id` and (re)arm the exponential-backoff lockout once the
     /// failures cross the threshold (see [`mfa_lockout_until`]).
-    async fn register_failed_mfa(
-        &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
-        prior_count: i32,
-    ) -> AppResult<()> {
-        let new_count = prior_count.saturating_add(1);
-        let locked_until = mfa_lockout_until(new_count, Utc::now());
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+    ///
+    /// PMS-693: the increment is relative (`mfa_failed_attempts + 1`) and the
+    /// new lock window is derived from the post-increment value inside the
+    /// same statement, so a burst of concurrent wrong codes counts every one
+    /// of them. Taking no `prior_count` makes the stale-read defect
+    /// unrepresentable.
+    async fn register_failed_mfa(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
+        // A NULL window (still under the threshold) leaves any existing
+        // lockout in place rather than clearing it.
+        let sql = format!(
             "UPDATE users \
-             SET mfa_failed_attempts = $1, mfa_locked_until = $2, updated_at = NOW() \
-             WHERE id = $3 AND tenant_id = $4",
-        )
-        .bind(new_count)
-        .bind(locked_until)
-        .bind(user_id)
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await?;
+             SET mfa_failed_attempts = mfa_failed_attempts + 1, \
+                 mfa_locked_until = COALESCE( \
+                     NOW() + make_interval(secs => {secs}), mfa_locked_until), \
+                 updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+            secs = mfa_lock_seconds_sql("mfa_failed_attempts + 1"),
+        );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(&sql)
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2552,18 +2549,24 @@ impl AuthService {
     /// PMS-502: an accepted TOTP code advances the anti-replay watermark to
     /// its step and clears the failed-attempt counter + lockout so a later
     /// legitimate login is never penalised.
+    ///
+    /// PMS-693: the watermark comparison lives in the `WHERE` clause, so the
+    /// advance is a compare-and-set. Returns `false` when no row moved, which
+    /// means the step was already spent (a replay, possibly by a concurrent
+    /// request that won the race); the caller must then fail closed.
     async fn record_mfa_success(
         &self,
         tenant_id: Uuid,
         user_id: Uuid,
         used_step: i64,
-    ) -> AppResult<()> {
+    ) -> AppResult<bool> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE users \
              SET mfa_last_used_step = $1, mfa_failed_attempts = 0, \
                  mfa_locked_until = NULL, updated_at = NOW() \
-             WHERE id = $2 AND tenant_id = $3",
+             WHERE id = $2 AND tenant_id = $3 \
+               AND (mfa_last_used_step IS NULL OR mfa_last_used_step < $1)",
         )
         .bind(used_step)
         .bind(user_id)
@@ -2571,7 +2574,7 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// PMS-138 backward-compat fallback: when the caller does not
@@ -2985,19 +2988,6 @@ struct SessionRow {
     created_at: chrono::DateTime<Utc>,
 }
 
-/// PMS-502: per-account second-factor lockout + anti-replay state, read from
-/// the `users` row at the top of the MFA branch in `login`.
-#[cfg(feature = "server")]
-struct MfaLockoutState {
-    /// Consecutive failed/replayed second-factor codes since the last accept.
-    failed_attempts: i32,
-    /// When set and in the future, the MFA code is rejected before it is
-    /// even checked.
-    locked_until: Option<chrono::DateTime<Utc>>,
-    /// TOTP step of the last accepted code; a new code must beat it.
-    last_used_step: Option<i64>,
-}
-
 /// PMS-502: exponential-backoff lockout schedule for failed second-factor
 /// codes. Mirrors the portal-login schedule
 /// (`portal::service::lockout_until`) but is STRICTER: a TOTP code is
@@ -3014,8 +3004,12 @@ struct MfaLockoutState {
 /// | 10+          | 3600s (cap) |
 ///
 /// Returns `None` while under the threshold (no lockout yet).
+///
+/// PMS-693: `pub` so the DB-backed parity test can pin
+/// [`mfa_lock_seconds_sql`], the SQL twin that `register_failed_mfa` runs,
+/// against this Rust definition of the schedule.
 #[cfg(feature = "server")]
-fn mfa_lockout_until(
+pub fn mfa_lockout_until(
     failed_count: i32,
     now: chrono::DateTime<Utc>,
 ) -> Option<chrono::DateTime<Utc>> {
@@ -3039,6 +3033,24 @@ fn mfa_lockout_until(
         .unwrap_or(LOCKOUT_MAX_SECONDS)
         .min(LOCKOUT_MAX_SECONDS);
     Some(now + Duration::seconds(secs))
+}
+
+/// PMS-693: SQL twin of [`mfa_lockout_until`], as an expression yielding the
+/// lock window in seconds (NULL under the threshold) for the post-increment
+/// failure count `count_expr`. `register_failed_mfa` needs the schedule
+/// evaluated inside its `UPDATE` so the window is derived from the counter
+/// value the database just produced, never from a stale read. Keeping it in
+/// one place lets `mfa_lock_seconds_sql_matches_rust_schedule`
+/// (`tests/auth.rs`) pin it against the Rust helper.
+///
+/// `count_expr` is a caller-supplied SQL fragment (a column expression or a
+/// bind placeholder), never user input.
+#[cfg(feature = "server")]
+pub fn mfa_lock_seconds_sql(count_expr: &str) -> String {
+    format!(
+        "CASE WHEN ({count_expr}) >= 3 \
+         THEN LEAST(3600, 30 * 2 ^ LEAST(20, ({count_expr}) - 3))::double precision END"
+    )
 }
 
 /// Split a user-bound credential token of the form `{user_id}.{secret}` into
@@ -3265,6 +3277,42 @@ mod tests {
         assert_eq!(
             (mfa_lockout_until(i32::MAX, now).unwrap() - now).num_seconds(),
             3600
+        );
+    }
+
+    /// PMS-693: the persistent attempt counters must never go back to being
+    /// computed from a value read in an earlier transaction. Fail if any
+    /// counter write assigns a bind placeholder instead of incrementing the
+    /// column, or if either `register_failed_*` regrows a count parameter.
+    #[test]
+    fn attempt_counters_are_incremented_in_sql() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sources = [
+            root.join("src/modules/auth/service.rs"),
+            root.join("src/modules/portal/service.rs"),
+        ];
+        let banned = [
+            concat!("SET mfa_failed_attempts", " = $"),
+            concat!("SET portal_failed_login_count", " = $"),
+            concat!("SET attempts", " = $"),
+            concat!(
+                "register_failed_mfa(&self, tenant_id: Uuid, ",
+                "user_id: Uuid,"
+            ),
+            concat!("register_failed_login(&self, ", "contact_id: Uuid,"),
+        ];
+        let mut hits: Vec<String> = Vec::new();
+        for path in sources {
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            for needle in banned {
+                if text.contains(needle) {
+                    hits.push(format!("{}: {needle}", path.display()));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "a stale-read attempt counter is back: {hits:?}"
         );
     }
 
