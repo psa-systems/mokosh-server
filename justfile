@@ -46,7 +46,7 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-runner-labels
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-runner-labels check-oci-cache
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
@@ -66,6 +66,13 @@ check-mail-copy:
 [group: 'check']
 check-runner-labels:
     nu scripts/check-runner-labels.nu
+
+# Keep the OCI build on the type=gha runner cache (PMS-720, GOV-20). Fails if a
+# buildx workflow drops the docker-container driver or the runtime-env step, or
+# if the retired inline / registry :buildcache backends come back.
+[group: 'check']
+check-oci-cache:
+    nu scripts/check-oci-build-cache.nu
 
 # Check compilation
 [group: 'check']
