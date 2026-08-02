@@ -2,6 +2,22 @@ import { authenticator } from 'otplib';
 import { expect, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { env } from './env';
 import { routes } from './api';
+import { mainFrameResponseLog } from './page-diagnostics';
+
+// What one credentials submit did, as seen from the hub's response. 'no-form'
+// is the PMS-721 case: the hub never rendered the credential form at all (the
+// flow parked on `/oauth2/authorize`), which used to surface as a raw locator
+// timeout with no HTTP reason attached.
+type CredentialOutcome =
+  | { kind: 'advanced' }
+  | { kind: 'rejected'; banner: string }
+  | { kind: 'no-form'; detail: string; banner: string | null }
+  | { kind: 'unclear' };
+
+// Backoff before re-loading /login when the credential form never rendered and
+// the hub named no rate limit. Long enough to ride out a hub restart or a
+// transient 5xx, short enough that four attempts stay inside the test budget.
+const NO_FORM_BACKOFF_MS = 3_000;
 
 // Drive the staging SPA login form to establish a real session.
 //
@@ -33,32 +49,33 @@ export async function loginViaSpa(page: Page): Promise<void> {
   // bad credentials or a stalled POST (PMS-148) are self-diagnosing in the log.
   // Each attempt does a fresh `goto('/login')`, so the re-render race is still
   // covered by a clean reload rather than a same-page re-POST burst.
+
+  // Record main-frame responses from the very first navigation so a login that
+  // never reaches the credential form can name the status the hub returned
+  // (PMS-721). Idempotent: a spec that already attached page diagnostics shares
+  // the same log.
+  mainFrameResponseLog(page);
+
   const maxAttempts = 4;
   for (let attempt = 1; ; attempt += 1) {
     await page.goto('/login');
     const outcome = await submitCredentialsOnce(page);
-    if (outcome === 'advanced') break;
+    if (outcome.kind === 'advanced') break;
 
-    // Retry on a rate-limit rejection (after the named backoff) or on an unclear
+    // Retry on a rate-limit rejection (after the named backoff), on an unclear
     // submit (no banner and no navigation: a stalled POST or a fill lost to a
-    // re-render), but never on a definite credential rejection.
-    const backoffMs = rateLimitBackoffMs(outcome);
-    const retryable = backoffMs !== null || outcome === null;
+    // re-render), or when the hub never rendered the credential form at all
+    // (PMS-721) - but never on a definite credential rejection.
+    const backoffMs = rateLimitBackoffMs(outcomeBanner(outcome));
+    const retryable = backoffMs !== null || outcome.kind === 'unclear' || outcome.kind === 'no-form';
     if (retryable && attempt < maxAttempts) {
-      if (backoffMs !== null) {
-        await page.waitForTimeout(backoffMs);
+      const waitMs = backoffMs ?? (outcome.kind === 'no-form' ? NO_FORM_BACKOFF_MS : 0);
+      if (waitMs > 0) {
+        await page.waitForTimeout(waitMs);
       }
       continue;
     }
-    throw new Error(
-      'SPA login was rejected at the bunyip hub credentials step ' +
-        `(attempt ${attempt}/${maxAttempts}, path ${new URL(page.url()).pathname})` +
-        (outcome
-          ? `: "${outcome}"`
-          : ' - no error banner and no navigation; the submit may not have POSTed ' +
-            '(PMS-148) or the form was re-rendered out from under the fill.') +
-        ' See PMS-654.',
-    );
+    throw new Error(loginFailureMessage(page, outcome, attempt, maxAttempts));
   }
 
   // Credentials accepted. Enter the TOTP code if the hub advanced to the 2FA step
@@ -150,15 +167,16 @@ async function setInputValue(loc: Locator, value: string): Promise<void> {
 
 // Fill the bunyip hub credential form and submit it ONCE, then classify what
 // happened: 'advanced' when the hub accepted the credentials and moved to the
-// 2FA step (or otherwise left the bare /login credentials page), the hub's
-// rendered error-banner text on a rejection (a rate-limit message or "The email
-// or password you entered is incorrect."), or null when neither a banner nor a
-// navigation appeared within the budget (a stalled POST / PMS-148, or a fill
-// lost to a re-render). The caller (loginViaSpa) decides whether to back off and
-// retry. Assumes the page is freshly on /login. Submitting once - rather than
+// 2FA step (or otherwise left the bare /login credentials page), 'rejected' with
+// the hub's rendered error-banner text (a rate-limit message or "The email or
+// password you entered is incorrect."), 'no-form' when the credential form never
+// rendered at all (PMS-721), or 'unclear' when neither a banner nor a navigation
+// appeared within the budget (a stalled POST / PMS-148, or a fill lost to a
+// re-render). The caller (loginViaSpa) decides whether to back off and retry. Assumes the page is freshly on /login. Submitting once - rather than
 // re-POSTing up to 4x on the same page - is what keeps the login under the hub's
 // 5/min per-email rate limit (PMS-654).
-async function submitCredentialsOnce(page: Page): Promise<'advanced' | string | null> {
+async function submitCredentialsOnce(page: Page): Promise<CredentialOutcome> {
+  const responses = mainFrameResponseLog(page);
   const form = page.locator('form[action="/login"]').first();
   const email = form
     .locator(
@@ -171,7 +189,28 @@ async function submitCredentialsOnce(page: Page): Promise<'advanced' | string | 
     )
     .first();
 
-  await email.waitFor({ state: 'visible', timeout: 15_000 });
+  // PMS-721: the credential form failing to render is a CLASSIFIED outcome, not
+  // a raw locator timeout. A bare `waitFor` throw bypassed loginViaSpa's
+  // backoff/retry loop entirely and reported nothing but the selector, so a
+  // webkit run that parked on `/oauth2/authorize` gave the CI log no HTTP
+  // reason. Carry the location, the last main-frame response (status, URL and
+  // for non-2xx a truncated body) and any rendered banner instead, and let the
+  // caller decide whether to back off and retry.
+  const rendered = await email.waitFor({ state: 'visible', timeout: 15_000 }).then(
+    () => true,
+    () => false,
+  );
+  if (!rendered) {
+    const banner = await readLoginError(page);
+    return {
+      kind: 'no-form',
+      banner,
+      detail:
+        `the credential form ('form[action="/login"]' email input) never became visible within 15s ` +
+        `(at ${describeLocation(page)}, last main-frame response ${responses.describeLast()}, ` +
+        `${banner ? `banner "${banner}"` : 'no error banner'})`,
+    };
+  }
 
   // Let the server-rendered form settle before filling (drain the hub's
   // hydration / any htmx swap on a short budget, then give a synchronous
@@ -184,8 +223,8 @@ async function submitCredentialsOnce(page: Page): Promise<'advanced' | string | 
 
   // A re-render between the fills and the click would silently clear the inputs
   // and POST an empty form. If the values did not survive to just before the
-  // click, report an unclear submit (null) so the caller reloads and retries
-  // rather than POSTing blanks (which the hub would reject as bad credentials).
+  // click, report an unclear submit so the caller reloads and retries rather
+  // than POSTing blanks (which the hub would reject as bad credentials).
   const stuck = await Promise.all([
     expect(email).toHaveValue(env.email, { timeout: 2_000 }),
     expect(password).toHaveValue(env.password, { timeout: 2_000 }),
@@ -194,7 +233,7 @@ async function submitCredentialsOnce(page: Page): Promise<'advanced' | string | 
     () => false,
   );
   if (!stuck) {
-    return null;
+    return { kind: 'unclear' };
   }
 
   await form
@@ -220,18 +259,60 @@ async function submitCredentialsOnce(page: Page): Promise<'advanced' | string | 
 
   const path = (): string => new URL(page.url()).pathname;
   if (/^\/login\/(2fa|mfa)/.test(path())) {
-    return 'advanced';
+    return { kind: 'advanced' };
   }
   // Not on 2FA: a rendered banner is the rejection reason; otherwise, if the
   // flow already left the bare /login credentials page, treat it as advanced.
   const banner = await readLoginError(page);
   if (banner) {
-    return banner;
+    return { kind: 'rejected', banner };
   }
   if (!/^\/login\/?$/.test(path())) {
-    return 'advanced';
+    return { kind: 'advanced' };
   }
+  return { kind: 'unclear' };
+}
+
+// The hub's own reason for an outcome, when it rendered one. Drives the
+// rate-limit backoff for both a rejected submit and a form that never rendered
+// (the hub renders its rate-limit banner on the bare /login page too).
+function outcomeBanner(outcome: CredentialOutcome): string | null {
+  if (outcome.kind === 'rejected') return outcome.banner;
+  if (outcome.kind === 'no-form') return outcome.banner;
   return null;
+}
+
+// Host + path of the page's current URL. Query strings are dropped: the
+// authorize URL's state/nonce/PKCE values add noise, and the full URL trail is
+// already in the page-diagnostics dump.
+function describeLocation(page: Page): string {
+  const url = new URL(page.url());
+  return `${url.host}${url.pathname}`;
+}
+
+// Render the terminal login failure, naming what the hub actually did so the CI
+// log is self-diagnosing without the (undownloadable) Playwright trace.
+function loginFailureMessage(
+  page: Page,
+  outcome: CredentialOutcome,
+  attempt: number,
+  maxAttempts: number,
+): string {
+  const where = `(attempt ${attempt}/${maxAttempts}, at ${describeLocation(page)})`;
+  if (outcome.kind === 'no-form') {
+    return (
+      `SPA login never reached the bunyip hub credential form ${where}: ` +
+      `${outcome.detail}. See PMS-721.`
+    );
+  }
+  return (
+    `SPA login was rejected at the bunyip hub credentials step ${where}` +
+    (outcome.kind === 'rejected'
+      ? `: "${outcome.banner}"`
+      : ' - no error banner and no navigation; the submit may not have POSTed ' +
+        '(PMS-148) or the form was re-rendered out from under the fill.') +
+    ' See PMS-654.'
+  );
 }
 
 // Read the hub's login error banner (`.text-destructive`, bunyip-web
