@@ -49,6 +49,7 @@ export async function loginViaSpa(page: Page): Promise<void> {
   // bad credentials or a stalled POST (PMS-148) are self-diagnosing in the log.
   // Each attempt does a fresh `goto('/login')`, so the re-render race is still
   // covered by a clean reload rather than a same-page re-POST burst.
+
   // Record main-frame responses from the very first navigation so a login that
   // never reaches the credential form can name the status the hub returned
   // (PMS-721). Idempotent: a spec that already attached page diagnostics shares
