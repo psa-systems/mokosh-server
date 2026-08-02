@@ -57,6 +57,15 @@ fn invite(email: &str, role: &str) -> CreateInvitationRequest {
     }
 }
 
+/// PMS-512: the cached `(first_name, last_name)` bunyip owns.
+async fn names(pool: &PgPool, sub: Uuid) -> (String, String) {
+    sqlx::query_as("SELECT first_name, last_name FROM users WHERE id = $1")
+        .bind(sub)
+        .fetch_one(pool)
+        .await
+        .expect("user row")
+}
+
 async fn user_tenant_role(pool: &PgPool, sub: Uuid) -> (Uuid, String) {
     sqlx::query_as("SELECT tenant_id, role FROM users WHERE id = $1")
         .bind(sub)
@@ -563,6 +572,160 @@ async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
     assert!(
         completed_at.is_none(),
         "no name claims -> profile_completed_at stays NULL, SPA still gates"
+    );
+}
+
+/// PMS-512: bunyip owns the profile names, so the local columns are a
+/// read-only cache refreshed on EVERY login, not just the JIT one. A rename in
+/// bunyip lands in `users.first_name` / `last_name` on the next placement.
+#[sqlx::test]
+async fn name_claims_refresh_on_every_login(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    let place = |first: Option<&str>, last: Option<&str>| {
+        let (auth, tenants, invitations) = (auth.clone(), tenants.clone(), invitations.clone());
+        let (first, last) = (first.map(str::to_string), last.map(str::to_string));
+        async move {
+            place_bunyip_user(
+                &auth,
+                Some(&tenants),
+                Some(&invitations),
+                sub,
+                Some("renamed@example.com".to_string()),
+                true,
+                first,
+                last,
+                &claims(sub, None),
+            )
+            .await
+            .expect("placed")
+        }
+    };
+
+    place(Some("Alex"), Some("Doe")).await;
+    assert_eq!(names(&pool, sub).await, ("Alex".into(), "Doe".into()));
+
+    // Second login with the bunyip-side rename: both columns follow.
+    place(Some("Alexandra"), Some("Roe")).await;
+    assert_eq!(
+        names(&pool, sub).await,
+        ("Alexandra".into(), "Roe".into()),
+        "a later login must overwrite the cached names from the claims"
+    );
+}
+
+/// PMS-512: the same overwrite-not-seed contract on `upsert_user_from_oidc`
+/// itself, so the `ON CONFLICT DO UPDATE` branch is pinned independently of
+/// which caller reaches it. A re-run with fresh hints overwrites; a re-run
+/// with no hints keeps the stored values (the synthetic `EXCLUDED` fallback
+/// must never clobber a real name).
+#[sqlx::test]
+async fn upsert_on_conflict_overwrites_names_only_from_non_empty_hints(pool: PgPool) {
+    let (auth, _tenants, _invitations) = services(&pool);
+    let tenant = common::DEFAULT_TENANT_ID;
+    let sub = Uuid::new_v4();
+
+    auth.upsert_user_from_oidc(
+        sub,
+        tenant,
+        "upsert@example.com",
+        UserRole::Admin,
+        Some("Alex"),
+        Some("Doe"),
+        true,
+    )
+    .await
+    .expect("insert");
+    assert_eq!(names(&pool, sub).await, ("Alex".into(), "Doe".into()));
+
+    auth.upsert_user_from_oidc(
+        sub,
+        tenant,
+        "upsert@example.com",
+        UserRole::Admin,
+        Some("Alexandra"),
+        Some("Roe"),
+        true,
+    )
+    .await
+    .expect("conflict update");
+    assert_eq!(
+        names(&pool, sub).await,
+        ("Alexandra".into(), "Roe".into()),
+        "the ON CONFLICT branch overwrites from the hints"
+    );
+
+    auth.upsert_user_from_oidc(
+        sub,
+        tenant,
+        "upsert@example.com",
+        UserRole::Admin,
+        None,
+        Some("   "),
+        true,
+    )
+    .await
+    .expect("conflict update without hints");
+    assert_eq!(
+        names(&pool, sub).await,
+        ("Alexandra".into(), "Roe".into()),
+        "absent / empty hints must not write the synthetic placeholder"
+    );
+}
+
+/// PMS-512: `users.first_name` / `last_name` are `NOT NULL`, so a login whose
+/// claims are absent (scope not granted) or empty (whitespace-only) must leave
+/// the cached values intact rather than blanking the columns.
+#[sqlx::test]
+async fn absent_or_empty_name_claims_leave_cached_names_intact(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    let place = |first: Option<&str>, last: Option<&str>| {
+        let (auth, tenants, invitations) = (auth.clone(), tenants.clone(), invitations.clone());
+        let (first, last) = (first.map(str::to_string), last.map(str::to_string));
+        async move {
+            place_bunyip_user(
+                &auth,
+                Some(&tenants),
+                Some(&invitations),
+                sub,
+                Some("keeper@example.com".to_string()),
+                true,
+                first,
+                last,
+                &claims(sub, None),
+            )
+            .await
+            .expect("placed")
+        }
+    };
+
+    place(Some("Alex"), Some("Doe")).await;
+
+    // Claims absent entirely.
+    place(None, None).await;
+    assert_eq!(
+        names(&pool, sub).await,
+        ("Alex".into(), "Doe".into()),
+        "absent claims must not blank the NOT NULL columns"
+    );
+
+    // Claims present but empty / whitespace-only.
+    place(Some("  "), Some("")).await;
+    assert_eq!(
+        names(&pool, sub).await,
+        ("Alex".into(), "Doe".into()),
+        "empty claims must not blank the NOT NULL columns"
+    );
+
+    // One side present, the other empty: only the present side moves.
+    place(Some("Sam"), None).await;
+    assert_eq!(
+        names(&pool, sub).await,
+        ("Sam".into(), "Doe".into()),
+        "an absent family_name must leave last_name alone"
     );
 }
 
