@@ -126,14 +126,6 @@ pub fn create_api_router(
     );
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
-    // PMS-157: first-visit demo seeding. Holds its own clones of the
-    // contacts + tickets services so it can drive the real create paths;
-    // wired below as a middleware that runs after auth populates AuthState.
-    let seed_service = Arc::new(crate::modules::seed::SeedService::new(
-        db.clone(),
-        contact_service.clone(),
-        ticket_service.clone(),
-    ));
     let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
@@ -193,6 +185,18 @@ pub fn create_api_router(
     // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
     // do not use the dispatcher; only the worker does.
     let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
+    // PMS-157 / PMS-710: first-visit demo seeding. Holds its own clones of the
+    // contacts, tickets, projects, and SLA services so it can drive the real
+    // create paths for the connected demo dataset; wired below as a middleware
+    // that runs after auth populates AuthState. Constructed here (after the
+    // projects + SLA services exist) rather than at the top of the builder.
+    let seed_service = Arc::new(crate::modules::seed::SeedService::new(
+        db.clone(),
+        contact_service.clone(),
+        ticket_service.clone(),
+        projects_service.clone(),
+        sla_service.clone(),
+    ));
     // PMS-113 AC2: Arc'd so both `settings_routes` and `tenant_routes`
     // share the same instance. The tenants-side module-config handlers
     // delegate to this; one canonical writer for `module_config`.
