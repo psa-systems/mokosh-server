@@ -707,6 +707,32 @@ pub async fn place_bunyip_user(
         }
     };
 
+    // PMS-512: bunyip owns the profile names, so the local columns are a
+    // read-only cache refreshed from every login's userinfo claims (the JIT
+    // branch above already seeded them, so only the existing-row branch can
+    // drift). This helper runs per request, not per login, so only write when
+    // a non-empty hint actually differs; an absent or empty hint leaves the
+    // NOT NULL column untouched.
+    let first_hint = given_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let last_hint = family_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let names_drifted = first_hint.is_some_and(|f| f != user.first_name)
+        || last_hint.is_some_and(|l| l != user.last_name);
+    if names_drifted {
+        match auth_service
+            .refresh_names_from_oidc(user.tenant_id, user.id, first_hint, last_hint)
+            .await
+        {
+            Ok(refreshed) => user = refreshed,
+            Err(e) => tracing::warn!(error = %e, sub = %sub, "profile name refresh failed"),
+        }
+    }
+
     // PMS-698: same principal gate the legacy HS256 branch runs, so a
     // deactivated user or a suspended tenant loses access on the very next
     // request on this path too. `None` drops the bunyip path; the legacy

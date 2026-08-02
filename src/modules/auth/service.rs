@@ -1664,18 +1664,9 @@ impl AuthService {
             updates.push(format!("email = ${}", param_idx));
             param_idx += 1;
         }
-        if request.first_name.is_some() {
-            updates.push(format!("first_name = ${}", param_idx));
-            param_idx += 1;
-        }
-        if request.last_name.is_some() {
-            updates.push(format!("last_name = ${}", param_idx));
-            param_idx += 1;
-        }
-        if request.phone.is_some() {
-            updates.push(format!("phone = ${}", param_idx));
-            param_idx += 1;
-        }
+        // PMS-512: no `first_name` / `last_name` / `phone` branches. The names
+        // are a read-only cache of bunyip's claims and `phone` has no source
+        // yet, so none of the three is settable through this API.
         if request.mobile.is_some() {
             updates.push(format!("mobile = ${}", param_idx));
             param_idx += 1;
@@ -1724,20 +1715,10 @@ impl AuthService {
 
         updates.push("updated_at = NOW()".to_string());
 
-        // Mark profile-completed when this PUT supplies non-empty first AND
-        // last name. COALESCE preserves any prior completion timestamp so a
-        // returning user editing their name on Settings (after onboarding)
-        // doesn't reset the activation clock. This is the SPA's onboarding
-        // signal: `profile_completed = true` on `/api/v1/auth/me` lets the
-        // SPA stop redirecting them to `/onboarding/profile`.
-        let completes_profile = matches!(
-            (request.first_name.as_deref(), request.last_name.as_deref()),
-            (Some(f), Some(l)) if !f.trim().is_empty() && !l.trim().is_empty()
-        );
-        if completes_profile {
-            updates
-                .push("profile_completed_at = COALESCE(profile_completed_at, NOW())".to_string());
-        }
+        // PMS-512: this handler no longer accepts names, so it can no longer
+        // be the thing that completes a profile. `profile_completed_at` is
+        // stamped by `upsert_user_from_oidc` on the login whose bunyip claims
+        // carry both names.
 
         // $1 = user_id, $2 = tenant_id (PMS-4 AC6).
         let query = format!(
@@ -1749,15 +1730,6 @@ impl AuthService {
 
         if let Some(ref email) = request.email {
             query_builder = query_builder.bind(email);
-        }
-        if let Some(ref first_name) = request.first_name {
-            query_builder = query_builder.bind(first_name);
-        }
-        if let Some(ref last_name) = request.last_name {
-            query_builder = query_builder.bind(last_name);
-        }
-        if let Some(ref phone) = request.phone {
-            query_builder = query_builder.bind(phone);
         }
         if let Some(ref mobile) = request.mobile {
             query_builder = query_builder.bind(mobile);
@@ -2326,13 +2298,14 @@ impl AuthService {
     /// - `Some(non-empty)`: seed the column with the claim value on insert.
     /// - `None` or empty: fall back to `synthetic_name_from_email`.
     ///
-    /// Subsequent JIT runs (the `ON CONFLICT DO UPDATE` branch) refresh only
-    /// `email` and `updated_at`. They do NOT overwrite `first_name` /
-    /// `last_name` so a tenant admin (or the user themselves on a future
-    /// /profile screen) can edit those fields without their next login
-    /// silently reverting them. Bunyip's stance is that mokosh names are
-    /// tenant-local once seeded; the bunyip column is the seed source, not
-    /// an authoritative mirror.
+    /// PMS-512: bunyip is the identity source of truth, so `first_name` /
+    /// `last_name` are a read-only local cache. The `ON CONFLICT DO UPDATE`
+    /// branch OVERWRITES both from the hints on every run, not just on
+    /// insert; the local columns are no longer editable through the mokosh
+    /// API. Both columns are `NOT NULL`, so an absent or empty hint binds
+    /// NULL and `COALESCE` leaves the existing value intact rather than
+    /// writing an empty string. See [`Self::refresh_names_from_oidc`] for the
+    /// already-provisioned-user half of the same refresh.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_user_from_oidc(
@@ -2375,8 +2348,8 @@ impl AuthService {
         // page kicks in as the fallback.
         let names_complete = first_hint.is_some() && last_hint.is_some();
         let (default_first, default_last) = synthetic_name_from_email(email);
-        let seed_first = first_hint.unwrap_or(default_first);
-        let seed_last = last_hint.unwrap_or(default_last);
+        let seed_first = first_hint.clone().unwrap_or(default_first);
+        let seed_last = last_hint.clone().unwrap_or(default_last);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // `COALESCE` on UPDATE keeps a pre-existing `profile_completed_at`
         // intact (legacy user who already completed mokosh-side onboarding
@@ -2408,6 +2381,12 @@ impl AuthService {
             VALUES ($1, $2, $3, $4, 'active', $8, 'UTC', $5, $6, $7)
             ON CONFLICT (id) DO UPDATE SET
                 email = EXCLUDED.email,
+                -- PMS-512: bunyip owns the names; refresh them on every run.
+                -- $9 / $10 are the raw hints (NULL when absent or empty), so
+                -- COALESCE keeps the existing NOT NULL value rather than
+                -- overwriting it with the synthetic EXCLUDED placeholder.
+                first_name = COALESCE($9, users.first_name),
+                last_name = COALESCE($10, users.last_name),
                 email_verified_at = COALESCE(
                     users.email_verified_at,
                     EXCLUDED.email_verified_at
@@ -2428,10 +2407,51 @@ impl AuthService {
         .bind(&seed_last)
         .bind(profile_completed_at)
         .bind(email_verified_at)
+        .bind(&first_hint)
+        .bind(&last_hint)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         self.get_user_by_id(tenant_id, sub).await
+    }
+
+    /// PMS-512: refresh the read-only `first_name` / `last_name` cache from
+    /// bunyip's `given_name` / `family_name` claims for a user who already
+    /// has a local row (so [`Self::upsert_user_from_oidc`] never runs again).
+    ///
+    /// Both columns are `NOT NULL`: a hint that is `None` (or empty after
+    /// trimming) binds NULL and `COALESCE` leaves the stored value alone, so
+    /// a user whose bunyip profile has no name keeps their seeded synthetic
+    /// one. Callers skip this entirely when neither hint differs from the
+    /// cached value; the bunyip path runs per request, not per login.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn refresh_names_from_oidc(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        given_name_hint: Option<&str>,
+        family_name_hint: Option<&str>,
+    ) -> AppResult<User> {
+        let first_hint = given_name_hint.map(str::trim).filter(|s| !s.is_empty());
+        let last_hint = family_name_hint.map(str::trim).filter(|s| !s.is_empty());
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET first_name = COALESCE($3, first_name),
+                last_name = COALESCE($4, last_name),
+                updated_at = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(first_hint)
+        .bind(last_hint)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_user_by_id(tenant_id, user_id).await
     }
 
     /// Lazy backfill (PMS-243): re-home a user row from `from_tenant` to

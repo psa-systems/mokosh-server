@@ -574,14 +574,17 @@ pub struct CreateUserRequest {
     pub send_welcome_email: bool,
 }
 
-/// Update user request
+/// Update user request.
+///
+/// PMS-512: `first_name`, `last_name`, and `phone` are deliberately absent.
+/// Bunyip is the identity source of truth for the names (mokosh keeps them as
+/// a read-only cache refreshed on every login, see
+/// `AuthService::upsert_user_from_oidc`), and `phone` is an inert cache with
+/// no local edit path. Sending any of the three is ignored, not applied.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateUserRequest {
     #[validate(email(message = "Invalid email address"))]
     pub email: Option<String>,
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    pub phone: Option<String>,
     pub mobile: Option<String>,
     pub title: Option<String>,
     pub role: Option<UserRole>,

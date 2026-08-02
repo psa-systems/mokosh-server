@@ -229,6 +229,93 @@ async fn update_me_theme_prefs_round_trip(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-512: profile identity fields are Bunyip-owned and no longer editable
+// ============================================================================
+
+/// PMS-512: `first_name`, `last_name`, and `phone` are gone from
+/// `UpdateUserRequest`, so `PUT /api/v1/auth/me` cannot mutate them: the body
+/// keys are ignored and the `users` row keeps the values Bunyip seeded. This
+/// is the mechanical guard on the removal - re-adding any of the three fields
+/// to the request type makes this test fail. `GET /me` still returns all
+/// three for display.
+#[sqlx::test]
+async fn put_me_cannot_mutate_bunyip_owned_profile_fields(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    // `phone` has no seeder, so set it directly: it must survive the PUT too.
+    sqlx::query("UPDATE users SET phone = '+15550100' WHERE id = $1")
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("seed phone");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // A PUT carrying all three fields plus one still-editable field. The
+    // editable field proves the request was accepted and applied, so an
+    // unchanged name is immutability rather than a rejected request.
+    let put = app
+        .client
+        .put(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "first_name": "Hacked",
+            "last_name": "Name",
+            "phone": "+19995550000",
+            "theme_accent_id": "ocean",
+        }))
+        .send()
+        .await
+        .expect("send PUT /me with Bunyip-owned fields");
+    assert_eq!(
+        put.status(),
+        reqwest::StatusCode::OK,
+        "the unknown keys are ignored, not rejected"
+    );
+    let put_body: serde_json::Value = put.json().await.expect("PUT /me body is JSON");
+    assert_eq!(
+        put_body["theme_accent_id"].as_str(),
+        Some("ocean"),
+        "the editable field in the same body must have been applied"
+    );
+
+    let (first, last, phone): (String, String, Option<String>) =
+        sqlx::query_as("SELECT first_name, last_name, phone FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read user row");
+    assert_eq!(
+        first, "Test",
+        "first_name is Bunyip-owned, not user-editable"
+    );
+    assert_eq!(
+        last, "Admin",
+        "last_name is Bunyip-owned, not user-editable"
+    );
+    assert_eq!(
+        phone.as_deref(),
+        Some("+15550100"),
+        "phone is no longer user-editable"
+    );
+
+    // GET /me still surfaces all three for display.
+    let me: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me request")
+        .json()
+        .await
+        .expect("/me body is JSON");
+    assert_eq!(me["first_name"].as_str(), Some("Test"));
+    assert_eq!(me["last_name"].as_str(), Some("Admin"));
+    assert_eq!(me["phone"].as_str(), Some("+15550100"));
+}
+
+// ============================================================================
 // PMS-4 AC1: list_users pagination + filter
 // ============================================================================
 
