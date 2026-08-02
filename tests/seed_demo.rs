@@ -1,9 +1,11 @@
-//! Integration test for PMS-157: first-visit demo-data seeding.
+//! Integration test for PMS-157 / PMS-710: first-visit demo-data seeding.
 //!
-//! `SeedService::ensure_demo_seeded` seeds one demo company, two contacts,
-//! and three tickets into a fresh tenant, exactly once. These tests drive
-//! the service directly (rather than through the detached middleware spawn)
-//! so the assertions are deterministic. The migrations seed the default
+//! `SeedService::ensure_demo_seeded` seeds the connected demo dataset (two
+//! companies, four contacts, one SLA, two projects, five tickets) into a fresh
+//! tenant, exactly once. These tests drive the service directly (rather than
+//! through the detached middleware spawn) so the assertions are deterministic,
+//! and pin the PMS-710 environment gate with `with_seed_enabled(true)` so they
+//! do not depend on the process `ENVIRONMENT`. The migrations seed the default
 //! tenant's ticket status/priority/queue defaults, which `create_ticket`
 //! requires.
 //!
@@ -18,17 +20,32 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use mokosh_server::modules::contacts::ContactService;
+use mokosh_server::modules::projects::ProjectsService;
 use mokosh_server::modules::seed::{LoadDemoOutcome, SeedService};
+use mokosh_server::modules::sla::SlaService;
 use mokosh_server::modules::tickets::TicketService;
 use mokosh_server::Database;
 
+/// The demo dataset the PMS-710 profile creates.
+const DEMO_COMPANIES: i64 = 2;
+const DEMO_CONTACTS: i64 = 4;
+const DEMO_TICKETS: i64 = 5;
+const DEMO_PROJECTS: i64 = 2;
+const DEMO_SLA_POLICIES: i64 = 1;
+
+/// A seed service with the automatic gate turned ON, for the first-visit tests.
+/// The gate itself (production-on / staging-off) is covered by unit tests plus
+/// `auto_seed_is_a_no_op_when_the_gate_is_off` below.
 fn seed_service(pool: &PgPool) -> SeedService {
     let db = Database::from_pool(pool.clone());
     SeedService::new(
         db.clone(),
         ContactService::new(db.clone()),
-        TicketService::new(db),
+        TicketService::new(db.clone()),
+        ProjectsService::new(db.clone()),
+        SlaService::new(db),
     )
+    .with_seed_enabled(true)
 }
 
 async fn company_count(pool: &PgPool, tenant: Uuid) -> i64 {
@@ -57,6 +74,44 @@ async fn ticket_count(pool: &PgPool, tenant: Uuid) -> i64 {
         .expect("count tickets")
 }
 
+async fn project_count(pool: &PgPool, tenant: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(pool)
+        .await
+        .expect("count projects")
+}
+
+/// Count only the demo SLA policy. A fresh tenant already ships a default SLA
+/// policy (migration / `copy_default_config`), so this filters to the seeded
+/// `(Demo)` one by name rather than counting every policy.
+async fn sla_policy_count(pool: &PgPool, tenant: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sla_policies WHERE tenant_id = $1 AND name LIKE '%(Demo)%'",
+    )
+    .bind(tenant)
+    .fetch_one(pool)
+    .await
+    .expect("count demo sla policies")
+}
+
+/// Whether a demo company is assigned the demo SLA policy - proves the durable
+/// company -> SLA relationship the demo is meant to show (ticket SLA due dates
+/// are managed separately by the SLA subsystem).
+async fn a_company_links_the_demo_sla(pool: &PgPool, tenant: Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM companies c
+             JOIN sla_policies s ON s.id = c.sla_id AND s.tenant_id = c.tenant_id
+             WHERE c.tenant_id = $1 AND s.name LIKE '%(Demo)%'
+         )",
+    )
+    .bind(tenant)
+    .fetch_one(pool)
+    .await
+    .expect("check company -> demo sla link")
+}
+
 async fn demo_seeded_flag(pool: &PgPool, tenant: Uuid) -> Option<String> {
     sqlx::query_scalar("SELECT settings->>'demo_seeded' FROM tenants WHERE id = $1")
         .bind(tenant)
@@ -78,9 +133,36 @@ async fn seeds_demo_data_once_for_a_fresh_tenant(pool: PgPool) {
         .ensure_demo_seeded(tenant, admin_id)
         .await;
 
-    assert_eq!(company_count(&pool, tenant).await, 1, "one demo company");
-    assert_eq!(contact_count(&pool, tenant).await, 2, "two demo contacts");
-    assert_eq!(ticket_count(&pool, tenant).await, 3, "three demo tickets");
+    assert_eq!(
+        company_count(&pool, tenant).await,
+        DEMO_COMPANIES,
+        "two demo companies"
+    );
+    assert_eq!(
+        contact_count(&pool, tenant).await,
+        DEMO_CONTACTS,
+        "four demo contacts"
+    );
+    assert_eq!(
+        ticket_count(&pool, tenant).await,
+        DEMO_TICKETS,
+        "five demo tickets"
+    );
+    assert_eq!(
+        project_count(&pool, tenant).await,
+        DEMO_PROJECTS,
+        "two demo projects"
+    );
+    assert_eq!(
+        sla_policy_count(&pool, tenant).await,
+        DEMO_SLA_POLICIES,
+        "one demo SLA policy"
+    );
+    // Relationships are visible: a company carries the demo SLA.
+    assert!(
+        a_company_links_the_demo_sla(&pool, tenant).await,
+        "a demo company is assigned the demo SLA"
+    );
     assert_eq!(
         demo_seeded_flag(&pool, tenant).await.as_deref(),
         Some("true"),
@@ -96,15 +178,66 @@ async fn seeds_demo_data_once_for_a_fresh_tenant(pool: PgPool) {
 
     assert_eq!(
         company_count(&pool, tenant).await,
-        1,
-        "no duplicate company"
+        DEMO_COMPANIES,
+        "no duplicate companies"
     );
     assert_eq!(
         contact_count(&pool, tenant).await,
-        2,
+        DEMO_CONTACTS,
         "no duplicate contacts"
     );
-    assert_eq!(ticket_count(&pool, tenant).await, 3, "no duplicate tickets");
+    assert_eq!(
+        ticket_count(&pool, tenant).await,
+        DEMO_TICKETS,
+        "no duplicate tickets"
+    );
+    assert_eq!(
+        project_count(&pool, tenant).await,
+        DEMO_PROJECTS,
+        "no duplicate projects"
+    );
+    assert_eq!(
+        sla_policy_count(&pool, tenant).await,
+        DEMO_SLA_POLICIES,
+        "no duplicate SLA policy"
+    );
+}
+
+/// PMS-710: the automatic first-visit seed must do nothing when the environment
+/// gate is off (staging / dev without the opt-in). Proves "staging seeds
+/// nothing" at the service level, complementing the `seed_enabled_for` unit
+/// tests.
+#[sqlx::test]
+async fn auto_seed_is_a_no_op_when_the_gate_is_off(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = common::DEFAULT_TENANT_ID;
+
+    let db = Database::from_pool(pool.clone());
+    SeedService::new(
+        db.clone(),
+        ContactService::new(db.clone()),
+        TicketService::new(db.clone()),
+        ProjectsService::new(db.clone()),
+        SlaService::new(db),
+    )
+    .with_seed_enabled(false)
+    .ensure_demo_seeded(tenant, admin_id)
+    .await;
+
+    assert_eq!(company_count(&pool, tenant).await, 0, "no demo companies");
+    assert_eq!(contact_count(&pool, tenant).await, 0, "no demo contacts");
+    assert_eq!(ticket_count(&pool, tenant).await, 0, "no demo tickets");
+    assert_eq!(project_count(&pool, tenant).await, 0, "no demo projects");
+    assert_eq!(
+        sla_policy_count(&pool, tenant).await,
+        0,
+        "no demo SLA policy"
+    );
+    assert_eq!(
+        demo_seeded_flag(&pool, tenant).await,
+        None,
+        "the gate-off skip writes nothing, including the flag"
+    );
 }
 
 #[sqlx::test]
@@ -182,9 +315,31 @@ async fn load_demo_data_seeds_an_empty_tenant(pool: PgPool) {
         .expect("load demo data");
 
     assert_eq!(outcome, LoadDemoOutcome::Seeded, "empty tenant is seeded");
-    assert_eq!(company_count(&pool, tenant).await, 1, "one demo company");
-    assert_eq!(contact_count(&pool, tenant).await, 2, "two demo contacts");
-    assert_eq!(ticket_count(&pool, tenant).await, 3, "three demo tickets");
+    assert_eq!(
+        company_count(&pool, tenant).await,
+        DEMO_COMPANIES,
+        "two demo companies"
+    );
+    assert_eq!(
+        contact_count(&pool, tenant).await,
+        DEMO_CONTACTS,
+        "four demo contacts"
+    );
+    assert_eq!(
+        ticket_count(&pool, tenant).await,
+        DEMO_TICKETS,
+        "five demo tickets"
+    );
+    assert_eq!(
+        project_count(&pool, tenant).await,
+        DEMO_PROJECTS,
+        "two demo projects"
+    );
+    assert_eq!(
+        sla_policy_count(&pool, tenant).await,
+        DEMO_SLA_POLICIES,
+        "one demo SLA policy"
+    );
     assert_eq!(
         demo_seeded_flag(&pool, tenant).await.as_deref(),
         Some("true"),
@@ -267,17 +422,21 @@ async fn demo_seed_is_the_clean_baseline_with_no_qa_prefix(pool: PgPool) {
         .ensure_demo_seeded(tenant, admin_id)
         .await;
 
-    // The one demo company is the expected, obviously-demo baseline row.
-    let company_name: String = sqlx::query_scalar(
-        "SELECT name FROM companies WHERE tenant_id = $1 AND company_type <> 'internal'",
+    // The demo companies are the expected, obviously-demo baseline rows.
+    let company_names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM companies WHERE tenant_id = $1 AND company_type <> 'internal' ORDER BY name",
     )
     .bind(tenant)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("read demo company name");
+    .expect("read demo company names");
     assert_eq!(
-        company_name, "Acme Corporation (Demo)",
-        "demo seed must produce the clean demo baseline company"
+        company_names,
+        vec![
+            "Contoso Ltd (Demo)".to_string(),
+            "Northwind Traders (Demo)".to_string(),
+        ],
+        "demo seed must produce the clean demo baseline companies"
     );
 
     // No seeded record (company / contact / ticket) carries a `QA-` or `zQA`
