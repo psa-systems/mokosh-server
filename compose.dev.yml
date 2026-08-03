@@ -48,7 +48,7 @@
 # avoid clashing with any host-side postgres on 5432).
 #
 # This file contains no hardcoded values. Every environment variable is
-# sourced from .env (which is created from .env.dev by `just dev`).
+# sourced from .env (which is generated from .env.example by `just dev`).
 # Required-but-empty values use the `${VAR:?...}` form so compose fails
 # loudly with a helpful message instead of starting a misconfigured stack.
 
@@ -63,9 +63,9 @@ services:
     # https://hub.docker.com/_/postgres
     image: postgres:18.2-alpine3.23
     environment:
-      POSTGRES_DB: ${INFISICAL_PG_DB:?INFISICAL_PG_DB missing - run `just dev` (which copies .env.dev to .env)}
-      POSTGRES_USER: ${INFISICAL_PG_USER:?INFISICAL_PG_USER missing - run `just dev` (which copies .env.dev to .env)}
-      POSTGRES_PASSWORD: ${INFISICAL_PG_PASSWORD:?INFISICAL_PG_PASSWORD missing - run `just dev` (which copies .env.dev to .env)}
+      POSTGRES_DB: ${INFISICAL_PG_DB:?INFISICAL_PG_DB missing - run `just dev` (which generates .env from .env.example)}
+      POSTGRES_USER: ${INFISICAL_PG_USER:?INFISICAL_PG_USER missing - run `just dev` (which generates .env from .env.example)}
+      POSTGRES_PASSWORD: ${INFISICAL_PG_PASSWORD:?INFISICAL_PG_PASSWORD missing - run `just dev` (which generates .env from .env.example)}
     networks:
       - private
     expose:
@@ -102,12 +102,12 @@ services:
     container_name: dev-mokosh-infisical-${USER:?USER missing - run via just dev}
     image: infisical/infisical:v0.161.0
     environment:
-      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
-      AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev` (which copies .env.dev to .env)}
-      DB_CONNECTION_URI: ${INFISICAL_DB_CONNECTION_URI:?INFISICAL_DB_CONNECTION_URI missing - run `just dev` (which copies .env.dev to .env)}
-      REDIS_URL: ${INFISICAL_REDIS_URL:?INFISICAL_REDIS_URL missing - run `just dev` (which copies .env.dev to .env)}
-      SITE_URL: ${INFISICAL_SITE_URL:?INFISICAL_SITE_URL missing - run `just dev` (which copies .env.dev to .env)}
-      TELEMETRY_ENABLED: ${INFISICAL_TELEMETRY_ENABLED:?INFISICAL_TELEMETRY_ENABLED missing - run `just dev` (which copies .env.dev to .env)}
+      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev` (which generates .env from .env.example)}
+      AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev` (which generates .env from .env.example)}
+      DB_CONNECTION_URI: ${INFISICAL_DB_CONNECTION_URI:?INFISICAL_DB_CONNECTION_URI missing - run `just dev` (which generates .env from .env.example)}
+      REDIS_URL: ${INFISICAL_REDIS_URL:?INFISICAL_REDIS_URL missing - run `just dev` (which generates .env from .env.example)}
+      SITE_URL: ${INFISICAL_SITE_URL:?INFISICAL_SITE_URL missing - run `just dev` (which generates .env from .env.example)}
+      TELEMETRY_ENABLED: ${INFISICAL_TELEMETRY_ENABLED:?INFISICAL_TELEMETRY_ENABLED missing - run `just dev` (which generates .env from .env.example)}
     networks:
       - private
     ports:
@@ -204,7 +204,7 @@ services:
       dockerfile: Dockerfile
     environment:
       HOST: 0.0.0.0
-      PORT: ${MOKOSH_PORT:?MOKOSH_PORT missing - run `just dev` (which copies .env.dev to .env)}
+      PORT: ${MOKOSH_PORT:?MOKOSH_PORT missing - run `just dev` (which generates .env from .env.example)}
       ENVIRONMENT: development
       BASE_URL: http://${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}
 
@@ -255,8 +255,8 @@ services:
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
       INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}
 
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - run `just dev` (which copies .env.dev to .env)}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - run `just dev` (which copies .env.dev to .env)}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - run `just dev` (which generates .env from .env.example)}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - run `just dev` (which generates .env from .env.example)}
 
       # bunyip-as-OP Resource-Server verifier (the sole OP after PMS-295,
       # which removed mokosh-auth / mechanism 2). OIDC_ISSUER must equal the
