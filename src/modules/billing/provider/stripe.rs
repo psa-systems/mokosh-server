@@ -20,20 +20,15 @@
 //! zero-decimal currency is first supported.
 
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
-use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
+use dunite_stripe_core::{
+    from_minor_units, parse_event_envelope, to_minor_units, verify_webhook_signature,
+    DEFAULT_TOLERANCE_SECS,
+};
 use serde_json::Value;
-use sha2::Sha256;
 use uuid::Uuid;
 
 use super::{CheckoutParams, CheckoutSession, PaymentEvent, PaymentProvider, RefundLine};
 use crate::utils::error::{AppError, AppResult};
-
-/// Reject a signature whose timestamp is more than this many seconds from now,
-/// in either direction. Bounds webhook replay independently of the DB-level
-/// idempotency keys (Stripe's own recommended default is five minutes).
-const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 
 /// Stripe REST API base. Overridable via `STRIPE_API_BASE` so an integration
 /// test can point the checkout call at a stub; defaults to the live host.
@@ -64,20 +59,6 @@ impl StripeProvider {
     }
 }
 
-/// Convert a major-unit amount (e.g. `12.50`) to Stripe minor units (`1250`).
-/// Two-decimal currencies only (see module doc).
-fn to_minor_units(amount: Decimal) -> AppResult<i64> {
-    (amount * Decimal::from(100))
-        .round()
-        .to_i64()
-        .ok_or_else(|| AppError::BadRequest(format!("amount {amount} is out of range")))
-}
-
-/// Convert Stripe minor units back to a major-unit `Decimal` (`1250` -> `12.50`).
-fn from_minor_units(minor: i64) -> Decimal {
-    Decimal::new(minor, 2)
-}
-
 #[async_trait]
 impl PaymentProvider for StripeProvider {
     fn id(&self) -> &'static str {
@@ -88,7 +69,9 @@ impl PaymentProvider for StripeProvider {
         &self,
         params: &CheckoutParams<'_>,
     ) -> AppResult<CheckoutSession> {
-        let unit_amount = to_minor_units(params.amount)?;
+        let unit_amount = to_minor_units(params.amount).map_err(|_| {
+            AppError::BadRequest(format!("amount {} is out of range", params.amount))
+        })?;
         let currency = params.currency.to_ascii_lowercase();
         let tenant = params.tenant_id.to_string();
         let invoice = params.invoice_id.to_string();
@@ -168,55 +151,17 @@ impl PaymentProvider for StripeProvider {
         signature: &str,
     ) -> AppResult<PaymentEvent> {
         let now = chrono::Utc::now().timestamp();
-        verify_stripe_signature(self.webhook_secret.as_bytes(), raw_body, signature, now)?;
+        // DEV-514: the constant-time signature verifier lives in the shared
+        // dunite-stripe-core crate (also consumed by a8n-tools and bunyip).
+        verify_webhook_signature(
+            self.webhook_secret.as_bytes(),
+            raw_body,
+            signature,
+            DEFAULT_TOLERANCE_SECS,
+            now,
+        )
+        .map_err(|_| AppError::Unauthorized)?;
         parse_stripe_event(raw_body)
-    }
-}
-
-/// Verify a `Stripe-Signature` header against the raw body.
-///
-/// Header shape: `t=<unix ts>,v1=<hex hmac_sha256>` (possibly several `v1=`
-/// entries during a secret rotation; any match passes). The signed payload is
-/// `"<t>.<raw body>"`. Rejects a timestamp outside [`SIGNATURE_TOLERANCE_SECS`]
-/// of `now` before checking the MAC, so a captured-and-replayed body is refused
-/// even if its signature is otherwise valid.
-fn verify_stripe_signature(secret: &[u8], body: &[u8], header: &str, now: i64) -> AppResult<()> {
-    let mut timestamp: Option<i64> = None;
-    let mut v1_sigs: Vec<&str> = Vec::new();
-    for part in header.split(',') {
-        let Some((k, v)) = part.split_once('=') else {
-            continue;
-        };
-        match k.trim() {
-            "t" => timestamp = v.trim().parse::<i64>().ok(),
-            "v1" => v1_sigs.push(v.trim()),
-            _ => {}
-        }
-    }
-
-    let timestamp = timestamp.ok_or(AppError::Unauthorized)?;
-    if (now - timestamp).abs() > SIGNATURE_TOLERANCE_SECS {
-        return Err(AppError::Unauthorized);
-    }
-    if v1_sigs.is_empty() {
-        return Err(AppError::Unauthorized);
-    }
-
-    // signed_payload = "<t>.<body>", MAC'd with the webhook secret.
-    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).map_err(|_| AppError::Unauthorized)?;
-    mac.update(timestamp.to_string().as_bytes());
-    mac.update(b".");
-    mac.update(body);
-    let computed = mac.finalize().into_bytes();
-    let computed_hex = hex_encode(&computed);
-
-    let matched = v1_sigs.iter().any(|candidate| {
-        constant_time_eq::constant_time_eq(computed_hex.as_bytes(), candidate.as_bytes())
-    });
-    if matched {
-        Ok(())
-    } else {
-        Err(AppError::Unauthorized)
     }
 }
 
@@ -227,10 +172,13 @@ fn verify_stripe_signature(secret: &[u8], body: &[u8], header: &str, now: i64) -
 /// session on the tenant's account) - becomes [`PaymentEvent::Ignored`] so the
 /// handler answers 200 rather than provoking retries.
 fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
-    let event: Value = serde_json::from_slice(raw_body)
+    // DEV-514: envelope parse (id + type + raw JSON) comes from the shared
+    // dunite-stripe-core crate; mokosh maps `data.object` to its own
+    // PaymentEvent below.
+    let event = parse_event_envelope(raw_body)
         .map_err(|_| AppError::BadRequest("malformed Stripe event body".to_string()))?;
-    let kind = event["type"].as_str().unwrap_or_default().to_string();
-    let object = &event["data"]["object"];
+    let kind = event.kind.clone();
+    let object = &event.raw["data"]["object"];
 
     match kind.as_str() {
         "checkout.session.completed" => {
@@ -264,7 +212,7 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
                     .as_str()
                     .unwrap_or("usd")
                     .to_ascii_uppercase(),
-                raw: event,
+                raw: event.raw,
             })
         }
         "charge.refunded" => {
@@ -302,95 +250,27 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
                 provider_reference,
                 currency,
                 refunds,
-                raw: event,
+                raw: event.raw,
             })
         }
         _ => Ok(PaymentEvent::Ignored { kind }),
     }
 }
 
-/// Lowercase hex. Local hand-roll (matches `auth::bunyip_webhook`) so the module
-/// does not pull in the `hex` crate for a few lines of encoding.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    // DEV-514: the Stripe-Signature verifier + money conversion now live in
+    // dunite-stripe-core and are unit-tested there; these tests cover mokosh's
+    // own event -> PaymentEvent mapping on top of the shared envelope parse.
     use super::*;
-
-    /// Build a valid `Stripe-Signature` header for `body` at time `t`.
-    fn sign(secret: &[u8], body: &[u8], t: i64) -> String {
-        let mut mac = <Hmac<Sha256>>::new_from_slice(secret).unwrap();
-        mac.update(t.to_string().as_bytes());
-        mac.update(b".");
-        mac.update(body);
-        format!("t={t},v1={}", hex_encode(&mac.finalize().into_bytes()))
-    }
-
-    #[test]
-    fn signature_accepts_a_fresh_valid_header() {
-        let secret = b"whsec_test";
-        let body = br#"{"type":"checkout.session.completed"}"#;
-        let now = 1_700_000_000;
-        let header = sign(secret, body, now);
-        assert!(verify_stripe_signature(secret, body, &header, now).is_ok());
-    }
-
-    #[test]
-    fn signature_rejects_wrong_secret() {
-        let body = br#"{"a":1}"#;
-        let now = 1_700_000_000;
-        let header = sign(b"whsec_wrong", body, now);
-        assert!(matches!(
-            verify_stripe_signature(b"whsec_right", body, &header, now),
-            Err(AppError::Unauthorized)
-        ));
-    }
-
-    #[test]
-    fn signature_rejects_tampered_body() {
-        let secret = b"whsec_test";
-        let now = 1_700_000_000;
-        let header = sign(secret, br#"{"amount_total":1000}"#, now);
-        assert!(matches!(
-            verify_stripe_signature(secret, br#"{"amount_total":9999}"#, &header, now),
-            Err(AppError::Unauthorized)
-        ));
-    }
-
-    #[test]
-    fn signature_rejects_a_stale_timestamp() {
-        let secret = b"whsec_test";
-        let body = br#"{}"#;
-        let signed_at = 1_700_000_000;
-        let header = sign(secret, body, signed_at);
-        // Valid MAC, but the request arrives 10 minutes later.
-        let now = signed_at + 600;
-        assert!(matches!(
-            verify_stripe_signature(secret, body, &header, now),
-            Err(AppError::Unauthorized)
-        ));
-    }
-
-    #[test]
-    fn signature_rejects_a_header_without_v1() {
-        let secret = b"whsec_test";
-        assert!(matches!(
-            verify_stripe_signature(secret, b"{}", "t=1700000000", 1_700_000_000),
-            Err(AppError::Unauthorized)
-        ));
-    }
+    use rust_decimal::Decimal;
 
     #[test]
     fn parse_maps_a_paid_checkout_to_payment_succeeded() {
         let tenant = Uuid::new_v4();
         let invoice = Uuid::new_v4();
         let body = serde_json::json!({
+            "id": "evt_test",
             "type": "checkout.session.completed",
             "data": {"object": {
                 "payment_status": "paid",
@@ -423,6 +303,7 @@ mod tests {
     #[test]
     fn parse_ignores_an_unpaid_checkout_session() {
         let body = serde_json::json!({
+            "id": "evt_test",
             "type": "checkout.session.completed",
             "data": {"object": {"payment_status": "unpaid", "payment_intent": "pi_1"}}
         })
@@ -437,6 +318,7 @@ mod tests {
     fn parse_ignores_a_checkout_session_without_our_metadata() {
         // A real paid session created outside mokosh on the tenant's account.
         let body = serde_json::json!({
+            "id": "evt_test",
             "type": "checkout.session.completed",
             "data": {"object": {
                 "payment_status": "paid",
@@ -456,6 +338,7 @@ mod tests {
     #[test]
     fn parse_maps_a_charge_refunded_to_refund_lines() {
         let body = serde_json::json!({
+            "id": "evt_test",
             "type": "charge.refunded",
             "data": {"object": {
                 "payment_intent": "pi_123",
@@ -487,18 +370,12 @@ mod tests {
 
     #[test]
     fn parse_ignores_an_unhandled_event_type() {
-        let body = br#"{"type":"payment_intent.payment_failed","data":{"object":{}}}"#;
+        let body = br#"{"id":"evt_x","type":"payment_intent.payment_failed","data":{"object":{}}}"#;
         match parse_stripe_event(body).unwrap() {
             PaymentEvent::Ignored { kind } => {
                 assert_eq!(kind, "payment_intent.payment_failed")
             }
             other => panic!("expected Ignored, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn minor_units_round_trip() {
-        assert_eq!(to_minor_units(Decimal::new(1250, 2)).unwrap(), 1250);
-        assert_eq!(from_minor_units(1250), Decimal::new(1250, 2));
     }
 }
