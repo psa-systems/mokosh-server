@@ -41,9 +41,9 @@ pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOu
     // Deliberately do NOT write INFISICAL_BASE_URL: the URL used here is
     // how the host CLI reaches Infisical (e.g. `http://localhost:28002`),
     // which is not the URL the Mokosh service inside the compose network
-    // uses (`http://infisical:8080`). The user keeps the correct in-network
-    // URL in `.env.dev`; we only fill in the secret-bearing fields the user
-    // could not pre-populate.
+    // uses (`http://infisical:8080`). The correct in-network URL is carried
+    // in the generated `.env` (from `.env.example`); we only fill in the
+    // secret-bearing fields the user could not pre-populate.
     //
     // Admin email and password are persisted as a dev convenience so the
     // operator can later log into Infisical's web UI without re-supplying

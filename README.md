@@ -30,7 +30,7 @@ Modules under `src/modules/` cover the typical PSA surface area: `tickets`, `con
 
 ## Quick start
 
-The dev stack lives in `compose.dev.yml` and is driven entirely through `just`. The first run copies `.env.dev` to `.env` (gitignored) and discovers the host's private LAN IP automatically.
+The dev stack lives in `compose.dev.yml` and is driven entirely through `just`. The first run generates `.env` (gitignored) from the committed `.env.example`, minting fresh random values for every self-owned secret, and discovers the host's private LAN IP automatically.
 
 ```nu
 # 1. Bring up the dev stack (mokosh-server + Infisical + Postgres + Valkey).
@@ -102,10 +102,10 @@ When both `ADMIN_EMAIL` and `ADMIN_PASSWORD` are set in `.env` AND the `users` t
 
 Once any user exists in the database, the env vars are ignored on subsequent startups. It is safe to leave `ADMIN_EMAIL` / `ADMIN_PASSWORD` in `.env` indefinitely.
 
-The dev `.env.dev` ships with `admin@example.com` / `devpassword12`. Override locally:
+The generated `.env` ships `ADMIN_EMAIL` / `ADMIN_PASSWORD` empty (they are blank in `.env.example`), so no admin is bootstrapped until you set them. To create a dev admin, set both and restart:
 
 ```nu
-# Override in .env (gitignored), then restart the stack.
+# Set in .env (gitignored), then restart the stack.
 "ADMIN_EMAIL=you@example.com\nADMIN_PASSWORD=at-least-12-characters\n" | save --append .env
 just dev-down
 just dev
@@ -178,8 +178,7 @@ migrations/      SQLx migrations (embedded at compile time).
 oci-build/       Production OCI image (multi-stage Alpine).
 Dockerfile       Dev OCI image (debug build, source-mounted).
 compose.dev.yml  Dev stack: mokosh-server + Infisical + Postgres + Valkey.
-.env.dev         Dev defaults (copied to .env on first `just dev`).
-.env.example     Sanitized example for non-dev environments.
+.env.example     Committed template; `just dev` generates `.env` from it with fresh per-clone secrets.
 justfile         Task runner.
 .forgejo/        CI workflows (Forgejo).
 .devcontainer/   VS Code devcontainer config.
