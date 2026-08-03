@@ -2249,7 +2249,13 @@ impl AuthService {
         let found: Option<(bool,)> =
             sqlx::query_as("SELECT (deleted_at IS NOT NULL) FROM users WHERE id = $1")
                 .bind(user_id)
-                .fetch_optional(self.db.pool())
+                // SAFETY (PMS-285 / PMS-692): deliberately tenant-unscoped - the
+                // middleware error path knows only the sub, not the tenant, so
+                // there is no `app.current_tenant` GUC to set. Runs on the
+                // migrator pool; `users` is RLS-covered, so on the app pool this
+                // would always read "not tombstoned" (case E) and the MAPPS-348
+                // 410 ACCOUNT_DELETED branch would be dead code.
+                .fetch_optional(self.db.migrator_pool())
                 .await?;
         Ok(found.map(|(is_deleted,)| is_deleted).unwrap_or(false))
     }
