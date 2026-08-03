@@ -21,7 +21,9 @@ use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::{
     auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
 };
-use crate::modules::billing::{billing_routes, BillingService};
+use crate::modules::billing::{
+    billing_routes, stripe_webhook_handler, BillingService, StripeWebhookState,
+};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
@@ -126,7 +128,15 @@ pub fn create_api_router(
     );
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
-    let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
+    // PMS-711: the agent-facing billing service also sends the outbound invoice
+    // "Pay Now" email on the send transition, so it takes the mailer + the SPA
+    // origin the pay link is built from.
+    let billing_service = BillingService::with_delivery(
+        db.clone(),
+        encryption_key,
+        mailer.clone(),
+        client_origin.clone(),
+    );
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
@@ -430,6 +440,7 @@ pub fn create_api_router(
             portal_kb_service,
             portal_billing_service,
             portal_quotes_service,
+            client_origin.clone(),
         ))
         // PMS-483: portal-side ticket-note attachments. Same routes as
         // the agent surface, but behind `RequirePortalAuth` and
@@ -497,6 +508,25 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
+    // PMS-711: Stripe webhook receiver. Nested under `/api/v1/stripe` OUTSIDE
+    // the JWT auth chain: Stripe authenticates itself with the `Stripe-Signature`
+    // header (HMAC over the raw body, keyed by the tenant's per-account webhook
+    // secret). The tenant id in the path selects which tenant's secret to verify
+    // against; it is not itself a credential. Its own `BillingService` instance
+    // (the router's `billing_service` is moved into `billing_routes`).
+    let stripe_webhook_state = Arc::new(StripeWebhookState {
+        billing: Arc::new(BillingService::with_encryption_key(
+            db.clone(),
+            encryption_key,
+        )),
+    });
+    let stripe_webhooks = Router::new()
+        .route("/webhooks/{tenant_id}", post(stripe_webhook_handler))
+        .with_state(stripe_webhook_state)
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
+
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
     // page that links the user back to the Mokosh frontend. This keeps
@@ -505,6 +535,7 @@ pub fn create_api_router(
         .nest("/api/v1", api_v1)
         .nest("/api/v1/portal", portal_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
+        .nest("/api/v1/stripe", stripe_webhooks)
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))
