@@ -287,10 +287,11 @@ impl SeedService {
                RETURNING id"#,
         )
         .bind(tenant_id)
-        // The demo-seed claim flips a flag on the caller's own `tenants` row.
-        // `tenants` is the RLS-exempt isolation root (migration 038), so this is
-        // safe on the app pool; the per-tenant seed writes that follow set the
-        // tenant GUC via `begin_with_tenant`.
+        // SAFETY (PMS-285 / PMS-692): the demo-seed claim flips a flag on the
+        // caller's own `tenants` row. `tenants` is the RLS-exempt isolation root
+        // (migration 038), so this is safe on the app pool with no GUC; the
+        // per-tenant seed writes that follow set the tenant GUC via
+        // `begin_with_tenant`.
         .fetch_optional(self.db.pool())
         .await?;
         Ok(claimed.is_some())
