@@ -78,6 +78,35 @@ pub trait Mailer: Send + Sync {
         .await
     }
 
+    /// PMS-711: tell a client contact that an invoice is ready to pay, linking
+    /// them to the portal invoice page where the "Pay Now" button opens a
+    /// provider checkout session. The default composes a plain-text body and
+    /// routes it through [`Mailer::send_text`], so every mailer inherits it
+    /// without a per-impl override.
+    async fn send_invoice_pay_now(
+        &self,
+        to: &str,
+        invoice_number: &str,
+        amount_due: &str,
+        due_date: &str,
+        portal_link: &str,
+    ) -> AppResult<()> {
+        let body = format!(
+            "An invoice is ready for payment.\n\n\
+             Invoice: {invoice_number}\n\
+             Amount due: {amount_due}\n\
+             Due: {due_date}\n\n\
+             Review the invoice and pay online here:\n\n\
+             {portal_link}"
+        );
+        self.send_text(
+            to,
+            &format!("Invoice {invoice_number} is ready to pay"),
+            &body,
+        )
+        .await
+    }
+
     /// PMS-657: alert the user that a sign-in came from a country they have not
     /// signed in from before. The default composes a plain-text body and routes
     /// it through [`Mailer::send_text`], so every mailer inherits it without a

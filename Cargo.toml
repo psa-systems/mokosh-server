@@ -210,6 +210,11 @@ reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], de
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros", "rust_decimal"] }
 # Name the `Decimal` type in test fixtures that bind money columns.
 rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
+# PMS-711: sign a synthetic Stripe webhook (`t=<ts>,v1=<hmac>`) in
+# tests/pms711_stripe_pay_now.rs so the paid/refund paths run through the real
+# signature verification, not a bypass.
+hmac = "0.12"
+sha2 = "0.10"
 
 [build-dependencies]
 # Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().

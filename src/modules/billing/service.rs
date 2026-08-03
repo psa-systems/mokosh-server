@@ -7,12 +7,28 @@ use crate::modules::contracts::service::CycleStep;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+use super::provider::{CheckoutParams, CheckoutSession, PaymentProvider, StripeProvider};
+
+/// Shape of the decrypted `payment_gateway_configs.config_encrypted` blob for
+/// the Stripe provider (PMS-711). Both fields are write-only secrets: the
+/// tenant's restricted API key and the webhook signing secret. Never logged,
+/// never returned to a client.
+#[derive(serde::Deserialize)]
+struct StripeCredentials {
+    #[serde(default)]
+    secret_key: String,
+    #[serde(default)]
+    webhook_secret: String,
+}
 
 /// Billing operations: invoices, payments, gateway configs, tax rates.
 #[derive(Clone)]
@@ -24,6 +40,15 @@ pub struct BillingService {
     /// default `new()` constructor so non-production callers stay
     /// compilable.
     encryption_key: [u8; 32],
+    /// Shared HTTP client for outbound provider calls (Stripe). Cheap to clone;
+    /// reused across requests per reqwest's guidance (PMS-711).
+    http: reqwest::Client,
+    /// PMS-711: mailer used to send the outbound invoice "Pay Now" email on the
+    /// send transition. `None` on the portal-side instance, which never sends.
+    mailer: Option<Arc<dyn Mailer>>,
+    /// PMS-711: SPA/portal origin the "Pay Now" email links point at. `None`
+    /// disables the email (no base to build the link from).
+    portal_origin: Option<String>,
 }
 
 impl BillingService {
@@ -31,6 +56,9 @@ impl BillingService {
         Self {
             db,
             encryption_key: [0u8; 32],
+            http: reqwest::Client::new(),
+            mailer: None,
+            portal_origin: None,
         }
     }
 
@@ -148,20 +176,23 @@ impl BillingService {
     }
 
     /// Recompute an invoice's `amount_paid` / `balance_due` / `status` /
-    /// `paid_at` from its `payments` rows (PMS-695).
+    /// `paid_at` from its `payments` rows, net of `payment_refunds` (PMS-695,
+    /// refunds added in PMS-711).
     ///
     /// The single place invoice payment state is derived, mirroring
-    /// `QuotesService::recompute_totals`. Deriving from `SUM(payments.amount)`
-    /// rather than from Rust-side arithmetic makes
-    /// `invoices.amount_paid = SUM(payments.amount)` true by construction.
+    /// `QuotesService::recompute_totals`. Deriving from
+    /// `SUM(payments.amount) - SUM(payment_refunds.amount)` rather than from
+    /// Rust-side arithmetic makes the net-paid figure true by construction, so
+    /// a full refund walks the invoice back to `sent` (unpaid) and a partial
+    /// refund to `partially_paid` without any bespoke transition logic.
     /// Callers must already hold the row lock from [`Self::lock_invoice_totals`].
     async fn recompute_invoice_payment_state(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         invoice_id: Uuid,
     ) -> AppResult<()> {
-        // A zeroed-out invoice returns to 'sent', identical to the
-        // pre-PMS-695 `delete_payment` ladder this replaces.
+        // A zeroed-out (or fully refunded) invoice returns to 'sent', identical
+        // to the pre-PMS-695 `delete_payment` ladder this replaces.
         sqlx::query(
             r#"
             UPDATE invoices i SET
@@ -174,8 +205,12 @@ impl BillingService {
                                    THEN COALESCE(i.paid_at, NOW()) END,
                 updated_at  = NOW()
             FROM (
-                SELECT COALESCE(SUM(amount), 0) AS paid
-                FROM payments WHERE invoice_id = $1 AND tenant_id = $2
+                SELECT
+                    COALESCE((SELECT SUM(amount) FROM payments
+                              WHERE invoice_id = $1 AND tenant_id = $2), 0)
+                  - COALESCE((SELECT SUM(amount) FROM payment_refunds
+                              WHERE invoice_id = $1 AND tenant_id = $2), 0)
+                  AS paid
             ) p
             WHERE i.id = $1 AND i.tenant_id = $2
             "#,
@@ -274,7 +309,33 @@ impl BillingService {
     /// payment-gateway-config write path so secrets never hit the DB
     /// in cleartext.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        Self { db, encryption_key }
+        Self {
+            db,
+            encryption_key,
+            http: reqwest::Client::new(),
+            mailer: None,
+            portal_origin: None,
+        }
+    }
+
+    /// PMS-711: production constructor for the agent-facing instance, which also
+    /// sends the outbound invoice "Pay Now" email on the send transition. Takes
+    /// the shared mailer and the portal origin the pay link is built from. The
+    /// portal-side `BillingService` keeps using [`Self::with_encryption_key`]
+    /// (no mailer) since it never triggers a send.
+    pub fn with_delivery(
+        db: Database,
+        encryption_key: [u8; 32],
+        mailer: Arc<dyn Mailer>,
+        portal_origin: String,
+    ) -> Self {
+        Self {
+            db,
+            encryption_key,
+            http: reqwest::Client::new(),
+            mailer: Some(mailer),
+            portal_origin: Some(portal_origin),
+        }
     }
 
     /// PMS-35: paginated + filterable invoice list. `lines` is left
@@ -1614,6 +1675,330 @@ impl BillingService {
         Ok(())
     }
 
+    // ========================================================================
+    // PMS-711: Stripe "Pay Now" - checkout sessions + webhook reconciliation.
+    // ========================================================================
+
+    /// Decrypt the stored `payment_gateway_configs.config_encrypted` blob into
+    /// the Stripe credential pair. The plaintext never leaves this function's
+    /// callers as data returned to a client (PMS-342).
+    fn decrypt_stripe_config(&self, config_encrypted: &str) -> AppResult<StripeCredentials> {
+        let plaintext = crate::utils::crypto::decrypt(config_encrypted, &self.encryption_key)?;
+        serde_json::from_str::<StripeCredentials>(&plaintext).map_err(|_| {
+            AppError::Configuration("stored Stripe config is not valid JSON".to_string())
+        })
+    }
+
+    /// Load the tenant's ACTIVE Stripe credentials over the tenant-scoped
+    /// serving connection. Used by the authenticated checkout path, where the
+    /// caller's tenant is already established, so the read runs through
+    /// `begin_with_tenant` like every other serving read.
+    async fn active_stripe_credentials(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Option<StripeCredentials>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT config_encrypted FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND provider = 'stripe' AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match row {
+            Some(enc) => Ok(Some(self.decrypt_stripe_config(&enc)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether the tenant has an active Stripe gateway. Cheap existence check
+    /// used to decide whether the outbound invoice email carries a Pay Now
+    /// button (PMS-711).
+    pub async fn has_active_gateway(&self, tenant_id: TenantId) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let found: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND provider = 'stripe' AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(found.is_some())
+    }
+
+    /// Build a Stripe provider scoped to the tenant's ACTIVE gateway for the
+    /// inbound-webhook path. Returns `None` when the tenant has no active Stripe
+    /// config (so the handler answers 404 without confirming a tenant exists).
+    ///
+    /// SAFETY (PMS-285 / PMS-692): the Stripe webhook is pre-auth - the caller
+    /// is Stripe, not a mokosh session, and the request is only trusted AFTER
+    /// its signature verifies against the secret this read returns. There is no
+    /// authenticated tenant to set as the `app.current_tenant` GUC yet, so this
+    /// single credential lookup runs on the BYPASSRLS `migrator_pool`, keyed by
+    /// the `tenant_id` from the webhook URL path. `payment_gateway_configs` is
+    /// RLS-covered and would fail closed on the unprivileged app pool here.
+    pub async fn stripe_provider_for_webhook(
+        &self,
+        tenant_id: Uuid,
+    ) -> AppResult<Option<StripeProvider>> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT config_encrypted FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND provider = 'stripe' AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some(enc) = row else {
+            return Ok(None);
+        };
+        let creds = self.decrypt_stripe_config(&enc)?;
+        // The webhook path needs only the signing secret; the API key is unused
+        // for verify/parse but carried for symmetry.
+        Ok(Some(StripeProvider::new(
+            creds.secret_key,
+            creds.webhook_secret,
+            self.http.clone(),
+        )))
+    }
+
+    /// PMS-711: create a hosted checkout session for an invoice's outstanding
+    /// balance. Fails 400 when the tenant has no active Stripe gateway, when the
+    /// invoice has nothing left to pay, or when the invoice is void / written
+    /// off. The payer is redirected to the returned `url`; the payment is
+    /// reconciled later by the webhook, not by this call.
+    pub async fn create_invoice_checkout_session(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> AppResult<CheckoutSession> {
+        let invoice = self.get_invoice(tenant_id, invoice_id).await?;
+        if matches!(
+            invoice.status,
+            InvoiceStatus::Void | InvoiceStatus::WrittenOff
+        ) {
+            return Err(AppError::Conflict(format!(
+                "invoice {} cannot be paid in status '{}'",
+                invoice.invoice_number,
+                invoice.status.as_str()
+            )));
+        }
+        if invoice.balance_due <= Decimal::ZERO {
+            return Err(AppError::BadRequest(
+                "invoice has no outstanding balance to pay".to_string(),
+            ));
+        }
+        let Some(creds) = self.active_stripe_credentials(tenant_id).await? else {
+            return Err(AppError::BadRequest(
+                "no active payment provider is configured for this account".to_string(),
+            ));
+        };
+
+        // Prefer the invoice's billing contact email so the checkout page is
+        // pre-filled; absent that, leave it for the payer to enter.
+        let customer_email = match invoice.billing_contact_id {
+            Some(cid) => self
+                .billing_contact_email(tenant_id, cid)
+                .await?
+                .and_then(|(email, _)| email),
+            None => None,
+        };
+
+        let provider =
+            StripeProvider::new(creds.secret_key, creds.webhook_secret, self.http.clone());
+        let currency = invoice.currency.as_deref().unwrap_or("USD");
+        let params = CheckoutParams {
+            tenant_id: tenant_id.get(),
+            invoice_id,
+            invoice_number: &invoice.invoice_number,
+            amount: invoice.balance_due,
+            currency,
+            success_url,
+            cancel_url,
+            customer_email: customer_email.as_deref(),
+        };
+        provider.create_checkout_session(&params).await
+    }
+
+    /// PMS-711: record a gateway-confirmed payment from a verified webhook.
+    /// Idempotent on the provider reference (the unique partial index on
+    /// `payments(tenant_id, gateway_transaction_id)`): a redelivered event
+    /// inserts nothing and returns `Ok(false)`. On first sight it inserts the
+    /// `payments` row (method `credit_card`, `gateway_transaction_id` = the
+    /// provider reference, `gateway_response` = the raw event, `currency`
+    /// recorded) under the invoice row lock and recomputes the invoice's
+    /// payment state, returning `Ok(true)`.
+    pub async fn record_gateway_payment(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        provider_reference: &str,
+        amount: Decimal,
+        currency: &str,
+        raw: &serde_json::Value,
+    ) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Lock the invoice so this read-modify-write serialises with manual
+        // payments and concurrent webhook deliveries (PMS-695).
+        if Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id)
+            .await?
+            .is_none()
+        {
+            // Invoice deleted between checkout and webhook. Nothing to
+            // reconcile; report handled so the provider stops retrying.
+            return Ok(false);
+        }
+
+        let payment_id = Uuid::new_v4();
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO payments (
+                id, tenant_id, invoice_id, company_id, payment_date, amount,
+                currency, payment_method, gateway_transaction_id, gateway_response
+            )
+            SELECT $1, $2, $3, i.company_id, CURRENT_DATE, $4, $5, 'credit_card', $6, $7
+            FROM invoices i
+            WHERE i.id = $3 AND i.tenant_id = $2
+            ON CONFLICT (tenant_id, gateway_transaction_id)
+                WHERE gateway_transaction_id IS NOT NULL DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(payment_id)
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .bind(amount)
+        .bind(currency)
+        .bind(provider_reference)
+        .bind(raw)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(payment_id) = inserted else {
+            // Already recorded by a prior delivery. Idempotent no-op.
+            return Ok(false);
+        };
+
+        Self::recompute_invoice_payment_state(&mut tx, tenant_id, invoice_id).await?;
+
+        // Audit row in the same transaction; no user actor (the trigger is
+        // Stripe's dispatcher). Secret `gateway_response` blob is subtracted.
+        let ctx = AuditCtx::system(tenant_id.get());
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) - 'gateway_response' FROM payments t \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(payment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            &ctx,
+            AuditAction::Create,
+            "payments",
+            Some(payment_id),
+            None,
+            after,
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// PMS-711: record one or more refunds from a verified `charge.refunded`
+    /// webhook. Each refund is idempotent on its provider reference (the unique
+    /// `payment_refunds(tenant_id, provider_reference)`), so redelivery and
+    /// incremental partial refunds both converge. Finds the originating payment
+    /// by its `gateway_transaction_id` (the charge's payment_intent); a refund
+    /// for a charge mokosh never recorded is a logged no-op (the provider may
+    /// refund a payment taken outside mokosh). Recomputes the invoice's net
+    /// payment state after inserting.
+    pub async fn record_gateway_refunds(
+        &self,
+        tenant_id: TenantId,
+        provider_reference: &str,
+        currency: &str,
+        refunds: &[super::provider::RefundLine],
+        raw: &serde_json::Value,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Resolve the payment this charge refers to, and its invoice.
+        let payment: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, invoice_id FROM payments \
+             WHERE tenant_id = $1 AND gateway_transaction_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider_reference)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((payment_id, invoice_id)) = payment else {
+            tracing::warn!(
+                target: "mokosh_server.billing",
+                %provider_reference,
+                "charge.refunded for a payment_intent not recorded in mokosh; ignoring"
+            );
+            return Ok(());
+        };
+
+        // Take the invoice lock first (same order as every other payment-state
+        // mutation) so the recompute below is serialised.
+        if let Some(inv) = invoice_id {
+            Self::lock_invoice_totals(&mut tx, tenant_id, inv).await?;
+        }
+
+        for refund in refunds {
+            sqlx::query(
+                r#"
+                INSERT INTO payment_refunds (
+                    id, tenant_id, payment_id, invoice_id, amount, currency,
+                    provider, provider_reference, gateway_response
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, 'stripe', $7, $8)
+                ON CONFLICT (tenant_id, provider_reference) DO NOTHING
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(tenant_id)
+            .bind(payment_id)
+            .bind(invoice_id)
+            .bind(refund.amount)
+            .bind(currency)
+            .bind(&refund.provider_reference)
+            .bind(raw)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if let Some(inv) = invoice_id {
+            Self::recompute_invoice_payment_state(&mut tx, tenant_id, inv).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Resolve a billing contact to `(email, first_name)`, tenant-scoped. Used
+    /// to pre-fill the checkout page and address the Pay Now email (PMS-711).
+    async fn billing_contact_email(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Option<(Option<String>, Option<String>)>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT email, first_name FROM contacts WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(row.map(|(email, first)| (email, Some(first))))
+    }
+
     /// PMS-39: list payments. Optional filter on invoice_id and/or
     /// company_id.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -2036,7 +2421,74 @@ impl BillingService {
         .await?;
 
         tx.commit().await?;
+
+        // PMS-711: on the first send transition, email the billing contact a
+        // "Pay Now" link. Best-effort and post-commit: a mail failure must not
+        // undo the status change. No-op unless this instance carries a mailer
+        // (agent-facing only), the invoice actually just moved to `sent`, and
+        // the tenant has an active payment gateway.
+        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
+        if just_sent {
+            self.notify_invoice_pay_now(tenant_id, invoice_id).await;
+        }
+
         self.get_invoice(tenant_id, invoice_id).await
+    }
+
+    /// PMS-711: best-effort outbound invoice "Pay Now" email. Short-circuits
+    /// when this service instance has no mailer/origin, when the tenant has no
+    /// active gateway (a Pay Now button would be dead), or when the invoice has
+    /// no billing contact with an email. Every failure is logged, never
+    /// propagated: the caller has already committed the send.
+    async fn notify_invoice_pay_now(&self, tenant_id: TenantId, invoice_id: Uuid) {
+        let (Some(mailer), Some(origin)) = (self.mailer.as_ref(), self.portal_origin.as_ref())
+        else {
+            return;
+        };
+        // Only offer online payment when a gateway is actually connected.
+        match self.has_active_gateway(tenant_id).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: gateway check failed");
+                return;
+            }
+        }
+        let invoice = match self.get_invoice(tenant_id, invoice_id).await {
+            Ok(inv) => inv,
+            Err(e) => {
+                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: invoice reload failed");
+                return;
+            }
+        };
+        let Some(contact_id) = invoice.billing_contact_id else {
+            return;
+        };
+        let email = match self.billing_contact_email(tenant_id, contact_id).await {
+            Ok(Some((Some(email), _))) => email,
+            Ok(_) => return, // no contact, or contact has no email on file
+            Err(e) => {
+                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: contact lookup failed");
+                return;
+            }
+        };
+        let base = origin.trim_end_matches('/');
+        let link = format!("{base}/portal/invoices/{invoice_id}");
+        let currency = invoice.currency.as_deref().unwrap_or("USD");
+        let amount_due = format!("{} {}", invoice.balance_due, currency);
+        let due_date = invoice.due_date.to_string();
+        if let Err(e) = mailer
+            .send_invoice_pay_now(
+                &email,
+                &invoice.invoice_number,
+                &amount_due,
+                &due_date,
+                &link,
+            )
+            .await
+        {
+            tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: send failed");
+        }
     }
 
     /// PMS-36: read a single invoice with `lines` populated. 404 when
