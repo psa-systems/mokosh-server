@@ -2202,7 +2202,7 @@ impl TicketService {
              ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         let fallback_creator = fallback_creator.ok_or(AppError::Configuration(
             "Cannot accept portal note: tenant has no admin/manager user to attribute it to".into(),
@@ -2270,7 +2270,7 @@ impl TicketService {
         .bind(tenant_id)
         .bind(ticket_id)
         .bind(company_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         if row.is_none() {
             return Err(AppError::NotFound("Ticket".to_string()));

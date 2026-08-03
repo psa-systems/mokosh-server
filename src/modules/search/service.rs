@@ -1,9 +1,9 @@
 //! MAPPS-298: cross-entity search service.
 
 use serde::Serialize;
-use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::db::Database;
 use crate::utils::error::AppResult;
 
 /// One matched row in the search response. All five entity types share
@@ -54,12 +54,12 @@ const SECTION_LIMIT: i64 = 5;
 
 #[derive(Clone)]
 pub struct SearchService {
-    pool: PgPool,
+    db: Database,
 }
 
 impl SearchService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
     /// Run the cross-entity search inside one tenant scope. The query
@@ -70,6 +70,13 @@ impl SearchService {
     /// (per-table ILIKE on indexed name / title / number columns,
     /// LIMIT 5) so parallelising them would not amortise meaningfully
     /// and would multiply pool-connection pressure for no win.
+    ///
+    /// PMS-692: every scanned table (`tickets`/`contacts`/`companies`/
+    /// `assets`/`projects`) is RLS-covered, so all ten statements run inside a
+    /// single `begin_with_tenant` transaction. On the unprivileged
+    /// (`NOBYPASSRLS`) serving connection a bare-pool read would fail the
+    /// `tenant_isolation` policy closed and return an empty result set with a
+    /// 200 - silently wrong.
     pub async fn search(&self, tenant_id: Uuid, q: &str) -> AppResult<SearchResponse> {
         let trimmed = q.trim();
         if trimmed.is_empty() {
@@ -84,11 +91,13 @@ impl SearchService {
             .replace('_', "\\_");
         let pattern = format!("%{}%", escaped);
 
-        let tickets = self.search_tickets(tenant_id, &pattern).await?;
-        let contacts = self.search_contacts(tenant_id, &pattern).await?;
-        let companies = self.search_companies(tenant_id, &pattern).await?;
-        let assets = self.search_assets(tenant_id, &pattern).await?;
-        let projects = self.search_projects(tenant_id, &pattern).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let tickets = Self::search_tickets(&mut tx, tenant_id, &pattern).await?;
+        let contacts = Self::search_contacts(&mut tx, tenant_id, &pattern).await?;
+        let companies = Self::search_companies(&mut tx, tenant_id, &pattern).await?;
+        let assets = Self::search_assets(&mut tx, tenant_id, &pattern).await?;
+        let projects = Self::search_projects(&mut tx, tenant_id, &pattern).await?;
+        tx.commit().await?;
 
         let counts = SearchCounts {
             tickets: tickets.1,
@@ -109,7 +118,7 @@ impl SearchService {
     }
 
     async fn search_tickets(
-        &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
         pattern: &str,
     ) -> AppResult<(Vec<SearchHit>, i64)> {
@@ -126,7 +135,7 @@ impl SearchService {
         .bind(tenant_id)
         .bind(pattern)
         .bind(SECTION_LIMIT)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM tickets t WHERE t.tenant_id = $1 AND ( \
@@ -135,7 +144,7 @@ impl SearchService {
         )
         .bind(tenant_id)
         .bind(pattern)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await?;
         let hits = rows
             .into_iter()
@@ -149,7 +158,7 @@ impl SearchService {
     }
 
     async fn search_contacts(
-        &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
         pattern: &str,
     ) -> AppResult<(Vec<SearchHit>, i64)> {
@@ -166,7 +175,7 @@ impl SearchService {
         .bind(tenant_id)
         .bind(pattern)
         .bind(SECTION_LIMIT)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM contacts k WHERE k.tenant_id = $1 AND ( \
@@ -175,7 +184,7 @@ impl SearchService {
         )
         .bind(tenant_id)
         .bind(pattern)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await?;
         let hits = rows
             .into_iter()
@@ -189,7 +198,7 @@ impl SearchService {
     }
 
     async fn search_companies(
-        &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
         pattern: &str,
     ) -> AppResult<(Vec<SearchHit>, i64)> {
@@ -203,14 +212,14 @@ impl SearchService {
         .bind(tenant_id)
         .bind(pattern)
         .bind(SECTION_LIMIT)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM companies WHERE tenant_id = $1 AND name ILIKE $2",
         )
         .bind(tenant_id)
         .bind(pattern)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await?;
         let hits = rows
             .into_iter()
@@ -224,7 +233,7 @@ impl SearchService {
     }
 
     async fn search_assets(
-        &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
         pattern: &str,
     ) -> AppResult<(Vec<SearchHit>, i64)> {
@@ -241,7 +250,7 @@ impl SearchService {
         .bind(tenant_id)
         .bind(pattern)
         .bind(SECTION_LIMIT)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM assets a WHERE a.tenant_id = $1 AND ( \
@@ -250,7 +259,7 @@ impl SearchService {
         )
         .bind(tenant_id)
         .bind(pattern)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await?;
         let hits = rows
             .into_iter()
@@ -270,7 +279,7 @@ impl SearchService {
     }
 
     async fn search_projects(
-        &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
         pattern: &str,
     ) -> AppResult<(Vec<SearchHit>, i64)> {
@@ -285,14 +294,14 @@ impl SearchService {
         .bind(tenant_id)
         .bind(pattern)
         .bind(SECTION_LIMIT)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM projects p WHERE p.tenant_id = $1 AND p.name ILIKE $2",
         )
         .bind(tenant_id)
         .bind(pattern)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await?;
         let hits = rows
             .into_iter()

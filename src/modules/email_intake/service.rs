@@ -27,9 +27,14 @@ pub struct ResolvedTenantToken {
 /// through `Database::begin_with_tenant` (GUC-safe under the fail-closed
 /// `tenant_isolation` RLS policy, migration 095). The one exception is the
 /// cross-tenant `resolve_token` hash lookup, which by design has no tenant
-/// context and runs on the BYPASSRLS migrator pool. Cross-table helper reads
-/// (contacts / tickets / users / ticket_notes) use `self.db.pool()`, exactly
-/// as before; those tables' RLS posture is unchanged by this migration.
+/// context and runs on the BYPASSRLS migrator pool.
+///
+/// PMS-692: the cross-table helper reads/writes (contacts / tickets / users /
+/// ticket_notes / tenant_settings) are ALSO RLS-covered (migration 038), so they
+/// too run through `begin_with_tenant` - the earlier note that they used
+/// `self.db.pool()` "as before" was wrong: on the NOBYPASSRLS serving connection
+/// they fail-closed (no creator found -> intake errors; contact lookup empty ->
+/// duplicate contacts).
 #[derive(Clone)]
 pub struct EmailIntakeService {
     db: Database,
@@ -215,7 +220,7 @@ impl EmailIntakeService {
              ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         let creator = creator.ok_or(AppError::Configuration(
             "Cannot create email-intake ticket: tenant has no admin/manager user to attribute it to"
@@ -299,22 +304,24 @@ impl EmailIntakeService {
         req: &EmailIntakeRequest,
     ) -> AppResult<Option<(Uuid, Uuid)>> {
         let from = req.from_email.to_lowercase();
+        // PMS-692: `contacts` and `tenant_settings` are RLS-covered, so the
+        // lookup, the default-company setting read, and the auto-create INSERT
+        // all run under one tenant-GUC transaction.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let existing: Option<(Uuid, Uuid)> = sqlx::query_as(
             "SELECT id, company_id FROM contacts \
              WHERE tenant_id = $1 AND lower(email) = $2 LIMIT 1",
         )
         .bind(tenant_id)
         .bind(&from)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(pair) = existing {
             return Ok(Some(pair));
         }
-        let default_company = crate::modules::settings::read_email_intake_default_company(
-            self.db.pool(),
-            tenant_id.get(),
-        )
-        .await?;
+        let default_company =
+            crate::modules::settings::read_email_intake_default_company(&mut tx, tenant_id.get())
+                .await?;
         let Some(company_id) = default_company else {
             return Ok(None);
         };
@@ -331,8 +338,9 @@ impl EmailIntakeService {
         .bind(first)
         .bind(last)
         .bind(&from)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(Some((contact_id, company_id)))
     }
 
@@ -357,7 +365,7 @@ impl EmailIntakeService {
              ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         let Some(creator) = creator else {
             return Err(AppError::Configuration(
@@ -370,6 +378,9 @@ impl EmailIntakeService {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or("(reply body empty)");
+        // PMS-692: `ticket_notes` is RLS-covered; the INSERT's WITH CHECK needs
+        // the tenant GUC, so run it in a `begin_with_tenant` transaction.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let note_id: Uuid = sqlx::query_scalar(
             "INSERT INTO ticket_notes \
                  (tenant_id, ticket_id, note_type, content, created_by_id, created_by_contact_id) \
@@ -380,8 +391,9 @@ impl EmailIntakeService {
         .bind(content)
         .bind(creator)
         .bind(contact_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(note_id)
     }
 
@@ -536,7 +548,7 @@ impl EmailIntakeService {
         )
         .bind(tenant_id)
         .bind(message_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         Ok(row)
     }
@@ -553,7 +565,7 @@ impl EmailIntakeService {
         )
         .bind(tenant_id)
         .bind(references)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         Ok(row)
     }
