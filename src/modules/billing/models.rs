@@ -400,6 +400,13 @@ pub struct PaymentGatewayConfigResponse {
     pub configured: bool,
 }
 
+/// PMS-711: response to the portal "Pay Now" action. The SPA redirects the
+/// browser to `checkout_url` (the provider's hosted checkout page).
+#[derive(Debug, Clone, Serialize)]
+pub struct PayInvoiceResponse {
+    pub checkout_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertPaymentGatewayConfigRequest {
     pub provider: GatewayProvider,

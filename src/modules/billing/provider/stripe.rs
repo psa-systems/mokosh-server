@@ -1,0 +1,504 @@
+//! PMS-711: Stripe implementation of [`PaymentProvider`].
+//!
+//! Uses the tenant's own restricted secret key (stored write-only in
+//! `payment_gateway_configs`), so a Checkout Session is created ON the tenant's
+//! Stripe account and funds settle to them, not to the platform. This is the
+//! per-tenant-credentials model: the platform is not in the money flow.
+//!
+//! Two surfaces:
+//! - [`StripeProvider::create_checkout_session`] POSTs to
+//!   `POST /v1/checkout/sessions` with the tenant key as the Bearer, embedding
+//!   `{tenant_id, invoice_id}` in the session + payment-intent metadata so the
+//!   webhook can reconcile the payment back to the invoice.
+//! - [`StripeProvider::verify_and_parse_webhook`] verifies the `Stripe-Signature`
+//!   scheme (`t=<ts>,v1=<hmac>`) over the raw bytes and maps the event to a
+//!   [`PaymentEvent`].
+//!
+//! Zero-decimal currencies (JPY, ...) are out of scope: amounts are converted
+//! at 100 minor units per major unit. Every currency mokosh invoices in today
+//! is two-decimal, so this holds; a follow-up adds an exponent table when a
+//! zero-decimal currency is first supported.
+
+use async_trait::async_trait;
+use hmac::{Hmac, Mac};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
+use serde_json::Value;
+use sha2::Sha256;
+use uuid::Uuid;
+
+use super::{CheckoutParams, CheckoutSession, PaymentEvent, PaymentProvider, RefundLine};
+use crate::utils::error::{AppError, AppResult};
+
+/// Reject a signature whose timestamp is more than this many seconds from now,
+/// in either direction. Bounds webhook replay independently of the DB-level
+/// idempotency keys (Stripe's own recommended default is five minutes).
+const SIGNATURE_TOLERANCE_SECS: i64 = 300;
+
+/// Stripe REST API base. Overridable via `STRIPE_API_BASE` so an integration
+/// test can point the checkout call at a stub; defaults to the live host.
+fn api_base() -> String {
+    std::env::var("STRIPE_API_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://api.stripe.com".to_string())
+}
+
+/// A tenant's Stripe connection. Built per request from the decrypted config.
+pub struct StripeProvider {
+    /// The tenant's restricted secret key (`rk_live_...` / `sk_test_...`).
+    /// Bearer for API calls; empty is acceptable on the webhook-only path.
+    secret_key: String,
+    /// The tenant's webhook signing secret (`whsec_...`).
+    webhook_secret: String,
+    http: reqwest::Client,
+}
+
+impl StripeProvider {
+    pub fn new(secret_key: String, webhook_secret: String, http: reqwest::Client) -> Self {
+        Self {
+            secret_key,
+            webhook_secret,
+            http,
+        }
+    }
+}
+
+/// Convert a major-unit amount (e.g. `12.50`) to Stripe minor units (`1250`).
+/// Two-decimal currencies only (see module doc).
+fn to_minor_units(amount: Decimal) -> AppResult<i64> {
+    (amount * Decimal::from(100))
+        .round()
+        .to_i64()
+        .ok_or_else(|| AppError::BadRequest(format!("amount {amount} is out of range")))
+}
+
+/// Convert Stripe minor units back to a major-unit `Decimal` (`1250` -> `12.50`).
+fn from_minor_units(minor: i64) -> Decimal {
+    Decimal::new(minor, 2)
+}
+
+#[async_trait]
+impl PaymentProvider for StripeProvider {
+    fn id(&self) -> &'static str {
+        "stripe"
+    }
+
+    async fn create_checkout_session(
+        &self,
+        params: &CheckoutParams<'_>,
+    ) -> AppResult<CheckoutSession> {
+        let unit_amount = to_minor_units(params.amount)?;
+        let currency = params.currency.to_ascii_lowercase();
+        let tenant = params.tenant_id.to_string();
+        let invoice = params.invoice_id.to_string();
+        let unit_amount = unit_amount.to_string();
+        let line_item_name = format!("Invoice {}", params.invoice_number);
+
+        // Stripe takes application/x-www-form-urlencoded with bracketed nested
+        // keys. `client_reference_id` + metadata carry our reconciliation keys;
+        // `payment_intent_data[metadata]` copies them onto the PaymentIntent so
+        // both the checkout.session.completed and any later charge event can be
+        // traced back to the invoice.
+        let mut form: Vec<(String, String)> = vec![
+            ("mode".into(), "payment".into()),
+            ("success_url".into(), params.success_url.to_string()),
+            ("cancel_url".into(), params.cancel_url.to_string()),
+            ("client_reference_id".into(), invoice.clone()),
+            ("line_items[0][quantity]".into(), "1".into()),
+            ("line_items[0][price_data][currency]".into(), currency),
+            ("line_items[0][price_data][unit_amount]".into(), unit_amount),
+            (
+                "line_items[0][price_data][product_data][name]".into(),
+                line_item_name,
+            ),
+            ("metadata[tenant_id]".into(), tenant.clone()),
+            ("metadata[invoice_id]".into(), invoice.clone()),
+            ("payment_intent_data[metadata][tenant_id]".into(), tenant),
+            ("payment_intent_data[metadata][invoice_id]".into(), invoice),
+        ];
+        if let Some(email) = params.customer_email {
+            form.push(("customer_email".into(), email.to_string()));
+        }
+
+        let url = format!("{}/v1/checkout/sessions", api_base());
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.secret_key)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| AppError::external_service("stripe", format!("request failed: {e}")))?;
+
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::external_service("stripe", format!("response not JSON: {e}")))?;
+
+        if !status.is_success() {
+            // Surface Stripe's own error message but never the request (which
+            // carried the tenant key). A 401/403 here means the tenant's key is
+            // wrong or lacks the checkout permission.
+            let msg = body["error"]["message"].as_str().unwrap_or("unknown error");
+            return Err(AppError::external_service(
+                "stripe",
+                format!("checkout session failed ({status}): {msg}"),
+            ));
+        }
+
+        let session_id = body["id"].as_str().unwrap_or_default().to_string();
+        let checkout_url = body["url"].as_str().unwrap_or_default().to_string();
+        if session_id.is_empty() || checkout_url.is_empty() {
+            return Err(AppError::external_service(
+                "stripe",
+                "checkout session response missing id/url",
+            ));
+        }
+        Ok(CheckoutSession {
+            session_id,
+            url: checkout_url,
+        })
+    }
+
+    fn verify_and_parse_webhook(
+        &self,
+        raw_body: &[u8],
+        signature: &str,
+    ) -> AppResult<PaymentEvent> {
+        let now = chrono::Utc::now().timestamp();
+        verify_stripe_signature(self.webhook_secret.as_bytes(), raw_body, signature, now)?;
+        parse_stripe_event(raw_body)
+    }
+}
+
+/// Verify a `Stripe-Signature` header against the raw body.
+///
+/// Header shape: `t=<unix ts>,v1=<hex hmac_sha256>` (possibly several `v1=`
+/// entries during a secret rotation; any match passes). The signed payload is
+/// `"<t>.<raw body>"`. Rejects a timestamp outside [`SIGNATURE_TOLERANCE_SECS`]
+/// of `now` before checking the MAC, so a captured-and-replayed body is refused
+/// even if its signature is otherwise valid.
+fn verify_stripe_signature(secret: &[u8], body: &[u8], header: &str, now: i64) -> AppResult<()> {
+    let mut timestamp: Option<i64> = None;
+    let mut v1_sigs: Vec<&str> = Vec::new();
+    for part in header.split(',') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        match k.trim() {
+            "t" => timestamp = v.trim().parse::<i64>().ok(),
+            "v1" => v1_sigs.push(v.trim()),
+            _ => {}
+        }
+    }
+
+    let timestamp = timestamp.ok_or(AppError::Unauthorized)?;
+    if (now - timestamp).abs() > SIGNATURE_TOLERANCE_SECS {
+        return Err(AppError::Unauthorized);
+    }
+    if v1_sigs.is_empty() {
+        return Err(AppError::Unauthorized);
+    }
+
+    // signed_payload = "<t>.<body>", MAC'd with the webhook secret.
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).map_err(|_| AppError::Unauthorized)?;
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    let computed = mac.finalize().into_bytes();
+    let computed_hex = hex_encode(&computed);
+
+    let matched = v1_sigs.iter().any(|candidate| {
+        constant_time_eq::constant_time_eq(computed_hex.as_bytes(), candidate.as_bytes())
+    });
+    if matched {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized)
+    }
+}
+
+/// Map a verified Stripe event body to a normalised [`PaymentEvent`].
+///
+/// Anything we do not act on - including a `checkout.session.completed` whose
+/// `payment_status` is not `paid`, or one missing our metadata (an unrelated
+/// session on the tenant's account) - becomes [`PaymentEvent::Ignored`] so the
+/// handler answers 200 rather than provoking retries.
+fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
+    let event: Value = serde_json::from_slice(raw_body)
+        .map_err(|_| AppError::BadRequest("malformed Stripe event body".to_string()))?;
+    let kind = event["type"].as_str().unwrap_or_default().to_string();
+    let object = &event["data"]["object"];
+
+    match kind.as_str() {
+        "checkout.session.completed" => {
+            if object["payment_status"].as_str() != Some("paid") {
+                return Ok(PaymentEvent::Ignored { kind });
+            }
+            let provider_reference = match object["payment_intent"].as_str() {
+                Some(pi) if !pi.is_empty() => pi.to_string(),
+                _ => return Ok(PaymentEvent::Ignored { kind }),
+            };
+            let tenant_id = object["metadata"]["tenant_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let invoice_id = object["metadata"]["invoice_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let amount_total = object["amount_total"].as_i64();
+            let (Some(tenant_id), Some(invoice_id), Some(amount_total)) =
+                (tenant_id, invoice_id, amount_total)
+            else {
+                // Legit Stripe event, but not one of ours (no metadata) or
+                // missing the amount. Do not act, do not retry.
+                return Ok(PaymentEvent::Ignored { kind });
+            };
+            Ok(PaymentEvent::PaymentSucceeded {
+                provider_reference,
+                tenant_id,
+                invoice_id,
+                amount: from_minor_units(amount_total),
+                currency: object["currency"]
+                    .as_str()
+                    .unwrap_or("usd")
+                    .to_ascii_uppercase(),
+                raw: event,
+            })
+        }
+        "charge.refunded" => {
+            let provider_reference = match object["payment_intent"].as_str() {
+                Some(pi) if !pi.is_empty() => pi.to_string(),
+                _ => return Ok(PaymentEvent::Ignored { kind }),
+            };
+            let currency = object["currency"]
+                .as_str()
+                .unwrap_or("usd")
+                .to_ascii_uppercase();
+            // A charge carries the cumulative list of every refund against it,
+            // each with its own id. Recording all of them with ON CONFLICT DO
+            // NOTHING on the refund id makes redelivery + incremental refunds
+            // both idempotent: only refunds not yet seen actually insert.
+            let refunds: Vec<RefundLine> = object["refunds"]["data"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| {
+                            let id = r["id"].as_str()?.to_string();
+                            let amount = from_minor_units(r["amount"].as_i64()?);
+                            Some(RefundLine {
+                                provider_reference: id,
+                                amount,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if refunds.is_empty() {
+                return Ok(PaymentEvent::Ignored { kind });
+            }
+            Ok(PaymentEvent::Refunded {
+                provider_reference,
+                currency,
+                refunds,
+                raw: event,
+            })
+        }
+        _ => Ok(PaymentEvent::Ignored { kind }),
+    }
+}
+
+/// Lowercase hex. Local hand-roll (matches `auth::bunyip_webhook`) so the module
+/// does not pull in the `hex` crate for a few lines of encoding.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a valid `Stripe-Signature` header for `body` at time `t`.
+    fn sign(secret: &[u8], body: &[u8], t: i64) -> String {
+        let mut mac = <Hmac<Sha256>>::new_from_slice(secret).unwrap();
+        mac.update(t.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        format!("t={t},v1={}", hex_encode(&mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn signature_accepts_a_fresh_valid_header() {
+        let secret = b"whsec_test";
+        let body = br#"{"type":"checkout.session.completed"}"#;
+        let now = 1_700_000_000;
+        let header = sign(secret, body, now);
+        assert!(verify_stripe_signature(secret, body, &header, now).is_ok());
+    }
+
+    #[test]
+    fn signature_rejects_wrong_secret() {
+        let body = br#"{"a":1}"#;
+        let now = 1_700_000_000;
+        let header = sign(b"whsec_wrong", body, now);
+        assert!(matches!(
+            verify_stripe_signature(b"whsec_right", body, &header, now),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn signature_rejects_tampered_body() {
+        let secret = b"whsec_test";
+        let now = 1_700_000_000;
+        let header = sign(secret, br#"{"amount_total":1000}"#, now);
+        assert!(matches!(
+            verify_stripe_signature(secret, br#"{"amount_total":9999}"#, &header, now),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn signature_rejects_a_stale_timestamp() {
+        let secret = b"whsec_test";
+        let body = br#"{}"#;
+        let signed_at = 1_700_000_000;
+        let header = sign(secret, body, signed_at);
+        // Valid MAC, but the request arrives 10 minutes later.
+        let now = signed_at + 600;
+        assert!(matches!(
+            verify_stripe_signature(secret, body, &header, now),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn signature_rejects_a_header_without_v1() {
+        let secret = b"whsec_test";
+        assert!(matches!(
+            verify_stripe_signature(secret, b"{}", "t=1700000000", 1_700_000_000),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn parse_maps_a_paid_checkout_to_payment_succeeded() {
+        let tenant = Uuid::new_v4();
+        let invoice = Uuid::new_v4();
+        let body = serde_json::json!({
+            "type": "checkout.session.completed",
+            "data": {"object": {
+                "payment_status": "paid",
+                "payment_intent": "pi_123",
+                "amount_total": 12500,
+                "currency": "usd",
+                "metadata": {"tenant_id": tenant, "invoice_id": invoice}
+            }}
+        })
+        .to_string();
+        match parse_stripe_event(body.as_bytes()).unwrap() {
+            PaymentEvent::PaymentSucceeded {
+                provider_reference,
+                tenant_id,
+                invoice_id,
+                amount,
+                currency,
+                ..
+            } => {
+                assert_eq!(provider_reference, "pi_123");
+                assert_eq!(tenant_id, tenant);
+                assert_eq!(invoice_id, invoice);
+                assert_eq!(amount, Decimal::new(12500, 2));
+                assert_eq!(currency, "USD");
+            }
+            other => panic!("expected PaymentSucceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ignores_an_unpaid_checkout_session() {
+        let body = serde_json::json!({
+            "type": "checkout.session.completed",
+            "data": {"object": {"payment_status": "unpaid", "payment_intent": "pi_1"}}
+        })
+        .to_string();
+        assert!(matches!(
+            parse_stripe_event(body.as_bytes()).unwrap(),
+            PaymentEvent::Ignored { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_ignores_a_checkout_session_without_our_metadata() {
+        // A real paid session created outside mokosh on the tenant's account.
+        let body = serde_json::json!({
+            "type": "checkout.session.completed",
+            "data": {"object": {
+                "payment_status": "paid",
+                "payment_intent": "pi_9",
+                "amount_total": 500,
+                "currency": "usd",
+                "metadata": {}
+            }}
+        })
+        .to_string();
+        assert!(matches!(
+            parse_stripe_event(body.as_bytes()).unwrap(),
+            PaymentEvent::Ignored { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_maps_a_charge_refunded_to_refund_lines() {
+        let body = serde_json::json!({
+            "type": "charge.refunded",
+            "data": {"object": {
+                "payment_intent": "pi_123",
+                "currency": "usd",
+                "refunds": {"data": [
+                    {"id": "re_1", "amount": 500},
+                    {"id": "re_2", "amount": 250}
+                ]}
+            }}
+        })
+        .to_string();
+        match parse_stripe_event(body.as_bytes()).unwrap() {
+            PaymentEvent::Refunded {
+                provider_reference,
+                refunds,
+                currency,
+                ..
+            } => {
+                assert_eq!(provider_reference, "pi_123");
+                assert_eq!(currency, "USD");
+                assert_eq!(refunds.len(), 2);
+                assert_eq!(refunds[0].provider_reference, "re_1");
+                assert_eq!(refunds[0].amount, Decimal::new(500, 2));
+                assert_eq!(refunds[1].amount, Decimal::new(250, 2));
+            }
+            other => panic!("expected Refunded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ignores_an_unhandled_event_type() {
+        let body = br#"{"type":"payment_intent.payment_failed","data":{"object":{}}}"#;
+        match parse_stripe_event(body).unwrap() {
+            PaymentEvent::Ignored { kind } => {
+                assert_eq!(kind, "payment_intent.payment_failed")
+            }
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn minor_units_round_trip() {
+        assert_eq!(to_minor_units(Decimal::new(1250, 2)).unwrap(), 1250);
+        assert_eq!(from_minor_units(1250), Decimal::new(1250, 2));
+    }
+}
