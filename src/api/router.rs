@@ -160,7 +160,7 @@ pub fn create_api_router(
     // PMS-448 AC4: admin-authored ticket templates (new-ticket pre-fills).
     let ticket_templates_service = TicketTemplatesService::new(db.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
-    let search_service = SearchService::new(db.pool().clone());
+    let search_service = SearchService::new(db.clone());
     // PMS-453: per-user saved dashboards.
     let dashboards_service = DashboardsService::new(db.clone());
     // PMS-450: email-to-ticket intake. Holds a TicketService clone so
@@ -174,7 +174,7 @@ pub fn create_api_router(
     let email_intake_service = EmailIntakeService::new(
         db.clone(),
         ticket_service.clone(),
-        AttachmentService::new(db.pool().clone(), AttachmentConfig::from_env()),
+        AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
     );
     // PMS-451: per-ticket approval requests.
     let approvals_service = ApprovalsService::new(db.clone());
@@ -276,7 +276,7 @@ pub fn create_api_router(
         // Merged at the top level so its `/tickets/{id}/notes/...`
         // path nests cleanly under the existing ticket tree.
         .merge(agent_attachment_routes(AttachmentService::new(
-            db.pool().clone(),
+            db.clone(),
             AttachmentConfig::from_env(),
         )))
         // PMS-468: agent "all comments from this contact" feed. The
@@ -439,7 +439,7 @@ pub fn create_api_router(
         // - without that, every portal upload would 401 before the
         // handler.
         .merge(portal_attachment_routes(
-            AttachmentService::new(db.pool().clone(), AttachmentConfig::from_env()),
+            AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
             portal_attachment_auth_service,
         ))
         // PMS-298: same envelope normalization for the portal surface.
@@ -476,7 +476,13 @@ pub fn create_api_router(
     // `users.id = <bunyip sub>` (mokosh's users.id IS the bunyip sub per
     // the PMS-295 cutover, so no `bunyip_sub` column is needed).
     let bunyip_webhook_state = Arc::new(BunyipWebhookState {
-        pool: db.pool().clone(),
+        // SAFETY (PMS-285 / PMS-692): the account-deleted webhook is pre-auth
+        // (HMAC-signed, no session) and inherently cross-tenant - `soft_delete`
+        // resolves the tenant FROM the `users` row it reads by bunyip sub, so
+        // there is no `app.current_tenant` GUC to set beforehand. It runs on the
+        // BYPASSRLS migrator pool; `users` is RLS-covered and would fail closed
+        // on the unprivileged app pool.
+        pool: db.migrator_pool().clone(),
         webhook_secret: bunyip_webhook_secret,
     });
     let bunyip_webhooks = Router::new()

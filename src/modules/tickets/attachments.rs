@@ -34,9 +34,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::db::Database;
 use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 use crate::modules::portal::{
     portal_auth_middleware, PortalAuthMiddleware, PortalAuthService, RequirePortalAuth,
@@ -118,13 +118,13 @@ impl From<AttachmentRow> for AttachmentResponse {
 
 #[derive(Clone)]
 pub struct AttachmentService {
-    pool: PgPool,
+    db: Database,
     config: AttachmentConfig,
 }
 
 impl AttachmentService {
-    pub fn new(pool: PgPool, config: AttachmentConfig) -> Self {
-        Self { pool, config }
+    pub fn new(db: Database, config: AttachmentConfig) -> Self {
+        Self { db, config }
     }
 
     fn storage_path_for(&self, tenant_id: Uuid, attachment_id: Uuid) -> PathBuf {
@@ -152,7 +152,7 @@ impl AttachmentService {
         .bind(note_id)
         .bind(ticket_id)
         .bind(tenant_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         if exists.is_none() {
             return Err(AppError::NotFound(
@@ -178,7 +178,7 @@ impl AttachmentService {
         .bind(ticket_id)
         .bind(tenant_id)
         .bind(company_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         if exists.is_none() {
             return Err(AppError::NotFound("ticket not visible".into()));
@@ -202,7 +202,7 @@ impl AttachmentService {
         .bind(tenant_id)
         .bind(ticket_id)
         .bind(note_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -303,6 +303,11 @@ impl AttachmentService {
         let safe_name = sanitize_filename(&file_name);
         let safe_mime = sanitize_mime_type(&mime_type);
 
+        // PMS-692: `ticket_attachments` is RLS-covered; the INSERT's WITH CHECK
+        // compares `tenant_id` to the `app.current_tenant` GUC, so it must run in
+        // a `begin_with_tenant` transaction. On the NOBYPASSRLS serving
+        // connection an unset GUC rejects the write outright.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: AttachmentRow = sqlx::query_as(
             "INSERT INTO ticket_attachments \
                 (id, tenant_id, ticket_id, note_id, file_name, file_size, \
@@ -321,8 +326,9 @@ impl AttachmentService {
         .bind(&storage_path)
         .bind(uploaded_by_id)
         .bind(created_by_contact_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row.into())
     }
 
@@ -339,7 +345,7 @@ impl AttachmentService {
         )
         .bind(tenant_id)
         .bind(attachment_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?
         .ok_or_else(|| AppError::NotFound("attachment not found".into()))?;
         let bytes = tokio::fs::read(&row.storage_path)
@@ -349,6 +355,9 @@ impl AttachmentService {
     }
 
     async fn delete_one(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<()> {
+        // PMS-692: RLS-covered write - run under the tenant GUC so the DELETE's
+        // USING/WITH CHECK matches, then commit.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(String,)> = sqlx::query_as(
             "DELETE FROM ticket_attachments \
              WHERE tenant_id = $1 AND id = $2 \
@@ -356,8 +365,9 @@ impl AttachmentService {
         )
         .bind(tenant_id)
         .bind(attachment_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         let Some((path,)) = row else {
             return Err(AppError::NotFound("attachment not found".into()));
         };
