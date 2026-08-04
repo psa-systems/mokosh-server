@@ -196,8 +196,8 @@ mokosh-types = { path = "crates/mokosh-types" }
 # verification, event-envelope parsing, money conversion. Consumed identically
 # by a8n-tools and bunyip so the same defect is not solved three times. Pinned by
 # rev (not branch) so a dunite bump is an explicit reviewable diff, mirroring
-# bunyip's dunite pins. Re-pin to the merged commit once dunite PR #27 lands.
-dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "0734f2adb4a7a85a29ae32815527d93b8efc06cb" }
+# bunyip's dunite pins. Pinned to dunite main.
+dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc10e8358a6f21160544a415a9488c16827af699" }
 
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for

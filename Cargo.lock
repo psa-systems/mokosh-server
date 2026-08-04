@@ -805,7 +805,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "dunite-stripe-core"
 version = "0.1.0"
-source = "git+https://dev.a8n.run/psa-systems/dunite?rev=0734f2adb4a7a85a29ae32815527d93b8efc06cb#0734f2adb4a7a85a29ae32815527d93b8efc06cb"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=cc10e8358a6f21160544a415a9488c16827af699#cc10e8358a6f21160544a415a9488c16827af699"
 dependencies = [
  "hex",
  "hmac 0.12.1",
