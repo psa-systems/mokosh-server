@@ -53,7 +53,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-nativ
 
 [package]
 name = "mokosh-server"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["Mokosh Server Team"]
 description = "Professional Services Automation platform for MSPs - API server"
@@ -192,6 +192,13 @@ google-oauth-flow = { path = "crates/google-oauth-flow" }
 # mokosh-clients to keep the wire format in lock-step (PMS-129).
 mokosh-types = { path = "crates/mokosh-types" }
 
+# Shared Stripe primitives (DEV-495 / DEV-514): constant-time webhook signature
+# verification, event-envelope parsing, money conversion. Consumed identically
+# by a8n-tools and bunyip so the same defect is not solved three times. Pinned by
+# rev (not branch) so a dunite bump is an explicit reviewable diff, mirroring
+# bunyip's dunite pins. Pinned to dunite main.
+dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc10e8358a6f21160544a415a9488c16827af699" }
+
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
 # deterministic virtual-clock tests (used by tests/scheduler.rs).
@@ -210,6 +217,11 @@ reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], de
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros", "rust_decimal"] }
 # Name the `Decimal` type in test fixtures that bind money columns.
 rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
+# PMS-711: sign a synthetic Stripe webhook (`t=<ts>,v1=<hmac>`) in
+# tests/pms711_stripe_pay_now.rs so the paid/refund paths run through the real
+# signature verification, not a bypass.
+hmac = "0.12"
+sha2 = "0.10"
 
 [build-dependencies]
 # Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().

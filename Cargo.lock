@@ -803,6 +803,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dunite-stripe-core"
+version = "0.1.0"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=cc10e8358a6f21160544a415a9488c16827af699#cc10e8358a6f21160544a415a9488c16827af699"
+dependencies = [
+ "hex",
+ "hmac 0.12.1",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1852,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "mokosh-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1867,6 +1881,7 @@ dependencies = [
  "cookie",
  "cron",
  "dotenvy",
+ "dunite-stripe-core",
  "google-oauth-flow",
  "governor",
  "hmac 0.12.1",

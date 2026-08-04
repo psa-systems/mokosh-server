@@ -324,7 +324,7 @@ against an existing schema.
 | --- | --- | --- |
 | `assets` | `asset_types`, `assets`, `asset_relationships`, `configuration_items`, `credential_vault`, `asset_audit_log` | `/assets`, `/assets/new`, `/assets/:id` |
 | `audit` | `audit_log` | none direct |
-| `billing` | `invoices`, `invoice_sequences`, `invoice_lines`, `payments`, `payment_gateway_configs`, `tax_rates` | `/invoices`, `/invoices/new`, `/invoices/:id`, `/payments` |
+| `billing` | `invoices`, `invoice_sequences`, `invoice_lines`, `payments`, `payment_refunds`, `payment_gateway_configs`, `tax_rates` | `/invoices`, `/invoices/new`, `/invoices/:id`, `/payments`, `/payment-gateways`; PMS-711 Pay Now: `POST /portal/invoices/:id/pay`, `POST /stripe/webhooks/:tenant_id` (unauth, signature-verified) |
 | `calendar` | `appointments`, `user_availability`, `time_off`, `on_call_schedules` | `/calendar`, `/dispatch` |
 | `contracts` | `contracts`, `contract_items`, `contract_hour_balances`, `rate_cards`, `rate_card_items` | `/contracts`, `/contracts/new`, `/contracts/:id` |
 | `knowledge_base` | `kb_categories`, `kb_articles`, `kb_article_versions` | `/kb`, `/kb/articles`, `/portal/kb` |

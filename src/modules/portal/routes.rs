@@ -25,7 +25,7 @@ use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalLoginRequest,
     PortalSetupPasswordRequest,
 };
-use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse};
+use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::quotes::{
     ClientDecision, PortalQuoteDecisionRequest, QuoteResponse, QuotesService,
@@ -51,6 +51,9 @@ pub struct PortalRouterState {
     /// `login_limiter` so a burst of decisions cannot lock a contact out of
     /// logging back in.
     pub decision_limiter: Arc<PortalDecisionLimiter>,
+    /// PMS-711: SPA origin the invoice "Pay Now" success / cancel return URLs
+    /// are built from (the base of the portal invoice pages).
+    pub portal_origin: String,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
@@ -62,6 +65,7 @@ pub fn portal_routes(
     kb: KbService,
     billing: BillingService,
     quotes: QuotesService,
+    portal_origin: String,
 ) -> Router {
     let state = PortalRouterState {
         service: Arc::new(service.clone()),
@@ -71,6 +75,7 @@ pub fn portal_routes(
         quotes: Arc::new(quotes),
         login_limiter: PortalLoginLimiter::new(),
         decision_limiter: PortalDecisionLimiter::new(),
+        portal_origin,
     };
     let mw = PortalAuthMiddleware::new(service);
 
@@ -98,6 +103,10 @@ pub fn portal_routes(
         )
         .route("/invoices", get(list_invoices))
         .route("/invoices/{invoice_id}", get(get_invoice))
+        // PMS-711: client-facing "Pay Now". Mints a provider checkout session
+        // for the invoice balance and returns its URL for the SPA to redirect
+        // to. Company-scoped exactly like `get_invoice`.
+        .route("/invoices/{invoice_id}/pay", post(pay_invoice))
         // PMS-673: client-facing quote sign-off. Reads are scoped to the
         // contact's own company and to statuses that were actually issued;
         // accept / decline are the client's decision and are the only way
@@ -224,6 +233,40 @@ async fn get_invoice(
         ));
     }
     Ok(Json(invoice))
+}
+
+/// PMS-711: client-facing "Pay Now". Mints a provider checkout session for the
+/// invoice's outstanding balance and returns its URL. The company scope is
+/// enforced first (a cross-company invoice is a 404, same posture as
+/// `get_invoice`); the service then rejects a void / fully-paid invoice or a
+/// tenant with no active gateway.
+async fn pay_invoice(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<PayInvoiceResponse>> {
+    // SAFETY (PMS-285): `contact.tenant()` wraps a verified portal-JWT claim,
+    // the caller's own authenticated tenant. Portal runs on contact sessions,
+    // not `CurrentUser`, so it cannot use `TenantScoped`; `from_trusted` is the
+    // sanctioned bridge. The company scope is enforced in code below.
+    let invoice = state
+        .billing
+        .get_invoice(contact.tenant(), invoice_id)
+        .await?;
+    if invoice.company_id != contact.company_id {
+        return Err(AppError::NotFound("Invoice".to_string()));
+    }
+
+    let base = state.portal_origin.trim_end_matches('/');
+    let success_url = format!("{base}/portal/invoices/{invoice_id}?paid=1");
+    let cancel_url = format!("{base}/portal/invoices/{invoice_id}");
+    let session = state
+        .billing
+        .create_invoice_checkout_session(contact.tenant(), invoice_id, &success_url, &cancel_url)
+        .await?;
+    Ok(Json(PayInvoiceResponse {
+        checkout_url: session.url,
+    }))
 }
 
 async fn list_kb(

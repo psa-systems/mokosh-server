@@ -201,7 +201,9 @@ impl PortalAuthService {
         )
         .bind(tenant_id)
         .bind(contact_id)
-        .fetch_optional(self.db.pool())
+        // PMS-692: `contacts` is RLS-covered; scope the read with the tenant GUC
+        // so it does not fail closed on the NOBYPASSRLS serving connection.
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         Ok(row)
     }
@@ -259,7 +261,14 @@ impl PortalAuthService {
             "#,
             )
             .bind(contact_id)
-            .fetch_all(self.db.pool())
+            // SAFETY (PMS-285 / PMS-692): pre-auth, single-use setup-token
+            // redemption. The token is `{contact_id}.{secret}` and the tenant is
+            // resolved FROM the matched `portal_setup_tokens` row, so there is no
+            // `app.current_tenant` GUC to set before the lookup. Runs on the
+            // migrator pool; `portal_setup_tokens` is RLS-covered (migration 042)
+            // and would fail this lookup closed on the unprivileged app pool -
+            // exactly the PMS-692 "no customer can set a portal password" bug.
+            .fetch_all(self.db.migrator_pool())
             .await?;
 
         let mut matched: Option<(Uuid, Uuid)> = None; // (token_id, tenant_id)

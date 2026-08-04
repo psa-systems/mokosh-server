@@ -61,7 +61,7 @@ impl SlaService {
     /// drain), so it cannot set a single `app.current_tenant` GUC and runs on the
     /// migrator (BYPASSRLS) pool. Per-ticket alert ledger writes that follow are
     /// scoped to the ticket's own tenant via `begin_with_tenant`.
-    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+    pub(crate) fn migrator_pool(&self) -> &sqlx::PgPool {
         self.db.migrator_pool()
     }
 

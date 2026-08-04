@@ -1,18 +1,27 @@
-//! Demo-data payloads seeded into a brand-new account (PMS-157).
+//! Demo-data payloads seeded into a brand-new account (PMS-157, PMS-710).
 //!
-//! The demo CONTENT (company / contact / ticket names, titles, descriptions)
-//! lives in the committed `demo_seed.json` bundle, embedded at compile time
-//! (PMS-651, the service-layer seed-bundle slice). This module maps that bundle
-//! into the same `Create*Request` DTOs the public API accepts, so seeding still
-//! goes through the real service methods (validation, FK checks, per-tenant
-//! config defaults, audit rows) instead of hand-rolled INSERTs. Data-driven so
-//! the demo set can change without touching Rust; the load is create-only and
-//! non-destructive, distinct from the wipe-and-replace `data_transfer` import.
-//! Only `contacts` and `tickets` have real create paths today, so the demo set
-//! is one client company, two contacts, and three tickets that link to them.
+//! The demo CONTENT (company / contact / ticket / project / SLA names, titles,
+//! descriptions) lives in the committed `demo_seed.json` bundle, embedded at
+//! compile time. This module maps that bundle into the same `Create*Request`
+//! DTOs the public API accepts, so seeding still goes through the real service
+//! methods (validation, FK checks, per-tenant config defaults, audit rows)
+//! instead of hand-rolled INSERTs. Data-driven so the demo set can change
+//! without touching Rust; the load is create-only and non-destructive, distinct
+//! from the wipe-and-replace `data_transfer` import.
+//!
+//! PMS-710 widened the set from one company / two contacts / three tickets to a
+//! small but connected PSA example - two companies, four contacts, one service
+//! SLA (attached to a company), two projects (one with a phase and a task), and
+//! five tickets - so a new production account can see how the objects relate.
+//! Human content stays in the JSON; the structural fields
+//! (dates, budgets, billing method, tags, FK wiring) live in the builders here
+//! so the bundle stays readable. Cross-references are by index into the bundle
+//! arrays; the loader resolves them to real ids as it creates each row.
 
 use std::sync::OnceLock;
 
+use chrono::{Duration, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -22,15 +31,20 @@ use mokosh_types::contacts::{
 };
 use mokosh_types::tickets::CreateTicketRequest;
 
+use crate::modules::projects::{CreateProjectRequest, UpsertProjectPhaseRequest};
+use crate::modules::sla::UpsertSlaPolicyRequest;
+
 /// The committed demo-seed bundle. It carries only the human-meaningful content;
-/// structural defaults (tags, phone, portal flags, `..Default`) stay in the
-/// builders below so the bundle stays readable and small.
+/// structural defaults (tags, phone, dates, `..Default`) stay in the builders
+/// below so the bundle stays readable and small.
 const DEMO_SEED_JSON: &str = include_str!("demo_seed.json");
 
 #[derive(Deserialize)]
 struct DemoSeed {
-    company: DemoCompany,
+    companies: Vec<DemoCompany>,
     contacts: Vec<DemoContact>,
+    sla: DemoSla,
+    projects: Vec<DemoProject>,
     tickets: Vec<DemoTicket>,
 }
 
@@ -45,6 +59,7 @@ struct DemoCompany {
 
 #[derive(Deserialize)]
 struct DemoContact {
+    company_index: usize,
     first_name: String,
     last_name: String,
     email: String,
@@ -52,7 +67,32 @@ struct DemoContact {
 }
 
 #[derive(Deserialize)]
+struct DemoSla {
+    name: String,
+    description: String,
+    /// Which company (by bundle index) this SLA is applied to.
+    company_index: usize,
+}
+
+#[derive(Deserialize)]
+struct DemoProject {
+    company_index: usize,
+    name: String,
+    description: String,
+    /// One of the project status strings the projects service accepts
+    /// (`active`, `planning`, ...).
+    status: String,
+    /// Optional first phase; `None` seeds a project with no phases.
+    phase_name: Option<String>,
+    /// Optional single task under the phase; needs a phase and a tenant task
+    /// status to be created (best-effort in the loader).
+    task_title: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct DemoTicket {
+    company_index: usize,
+    contact_index: usize,
     title: String,
     description: String,
 }
@@ -67,84 +107,164 @@ fn demo_seed() -> &'static DemoSeed {
     })
 }
 
-/// The sample client company. Names are obviously-fake so an operator can
+/// The service SLA policy to create. Names are obviously-fake so an operator can
 /// tell demo rows from real data at a glance.
-pub fn demo_company() -> CreateCompanyRequest {
-    let c = &demo_seed().company;
-    CreateCompanyRequest {
-        name: c.name.clone(),
-        parent_company_id: None,
-        company_type: CompanyType::default(),
-        status: CompanyStatus::default(),
-        industry: Some(c.industry.clone()),
-        website: Some(c.website.clone()),
-        phone: Some(c.phone.clone()),
-        fax: None,
-        address: None,
-        billing_address: None,
-        tax_id: None,
-        account_number: None,
-        account_manager_id: None,
-        sla_id: None,
-        payment_terms: None,
-        tax_exempt: false,
-        custom_fields: serde_json::Value::Null,
-        tags: vec!["demo".to_string()],
-        notes: Some(c.notes.clone()),
-        portal_enabled: true,
+pub fn demo_sla() -> UpsertSlaPolicyRequest {
+    let s = &demo_seed().sla;
+    UpsertSlaPolicyRequest {
+        name: s.name.clone(),
+        description: Some(s.description.clone()),
+        business_hours_id: None,
+        is_default: false,
     }
 }
 
-/// Primary contact at the demo company (the first bundle contact).
-pub fn demo_contact_primary(company_id: Uuid) -> CreateContactRequest {
-    demo_contact(company_id, 0)
+/// The bundle index of the company the SLA attaches to.
+pub fn demo_sla_company_index() -> usize {
+    demo_seed().sla.company_index
 }
 
-/// Secondary contact at the demo company (the second bundle contact).
-pub fn demo_contact_secondary(company_id: Uuid) -> CreateContactRequest {
-    demo_contact(company_id, 1)
+/// The sample client companies. `sla_policy_id` is stamped onto the company the
+/// bundle's `sla.company_index` points at, so the demo shows an SLA attached to
+/// a client; the others carry no SLA.
+pub fn demo_companies(sla_policy_id: Uuid) -> Vec<CreateCompanyRequest> {
+    let sla_idx = demo_sla_company_index();
+    demo_seed()
+        .companies
+        .iter()
+        .enumerate()
+        .map(|(i, c)| CreateCompanyRequest {
+            name: c.name.clone(),
+            parent_company_id: None,
+            company_type: CompanyType::default(),
+            status: CompanyStatus::default(),
+            industry: Some(c.industry.clone()),
+            website: Some(c.website.clone()),
+            phone: Some(c.phone.clone()),
+            fax: None,
+            address: None,
+            billing_address: None,
+            tax_id: None,
+            account_number: None,
+            account_manager_id: None,
+            sla_id: (i == sla_idx).then_some(sla_policy_id),
+            payment_terms: None,
+            tax_exempt: false,
+            custom_fields: serde_json::Value::Null,
+            tags: vec!["demo".to_string()],
+            notes: Some(c.notes.clone()),
+            portal_enabled: true,
+        })
+        .collect()
 }
 
-fn demo_contact(company_id: Uuid, index: usize) -> CreateContactRequest {
-    let c = &demo_seed().contacts[index];
-    CreateContactRequest {
-        company_id: Some(company_id),
-        company_name: None,
-        first_name: c.first_name.clone(),
-        last_name: c.last_name.clone(),
-        email: Some(c.email.clone()),
-        phone: Some("+1-555-0100".to_string()),
-        mobile: None,
-        fax: None,
-        title: Some(c.title.clone()),
-        department: None,
-        contact_type: ContactType::default(),
-        preferred_contact_method: PreferredContactMethod::default(),
-        timezone: None,
-        custom_fields: serde_json::Value::Null,
-        tags: vec!["demo".to_string()],
-        notes: None,
-        create_portal_access: false,
-    }
+/// The demo contacts, each linked to its bundle company via `company_ids`
+/// (indexed by the contact's `company_index`).
+pub fn demo_contacts(company_ids: &[Uuid]) -> Vec<CreateContactRequest> {
+    demo_seed()
+        .contacts
+        .iter()
+        .map(|c| CreateContactRequest {
+            company_id: company_ids.get(c.company_index).copied(),
+            company_name: None,
+            first_name: c.first_name.clone(),
+            last_name: c.last_name.clone(),
+            email: Some(c.email.clone()),
+            phone: Some("+1-555-0100".to_string()),
+            mobile: None,
+            fax: None,
+            title: Some(c.title.clone()),
+            department: None,
+            contact_type: ContactType::default(),
+            preferred_contact_method: PreferredContactMethod::default(),
+            timezone: None,
+            custom_fields: serde_json::Value::Null,
+            tags: vec!["demo".to_string()],
+            notes: None,
+            create_portal_access: false,
+        })
+        .collect()
 }
 
-/// The sample tickets from the bundle. Priority, status, and queue are left
-/// unset so `create_ticket` fills in the tenant's configured defaults (the
-/// per-tenant NOT-NULL config FKs a static bundle cannot carry). `contact_id`
-/// links the given contact so the demo shows the company -> contact -> ticket
-/// relationship.
-pub fn demo_tickets(company_id: Uuid, contact_id: Uuid) -> Vec<CreateTicketRequest> {
+/// A demo project plus its optional phase and task title. The loader creates the
+/// project (required), then best-effort adds the phase and, if the tenant has a
+/// task status, one task under it.
+pub struct DemoProjectBuild {
+    pub request: CreateProjectRequest,
+    pub phase: Option<UpsertProjectPhaseRequest>,
+    pub task_title: Option<String>,
+}
+
+/// The demo projects, linked to their bundle company via `company_ids` and
+/// managed by the seeding user. Structural fields (dates, budget, billing) are
+/// set here to sensible, obviously-illustrative values.
+pub fn demo_projects(company_ids: &[Uuid], manager_id: Uuid) -> Vec<DemoProjectBuild> {
+    let today = Utc::now().date_naive();
+    demo_seed()
+        .projects
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let request = CreateProjectRequest {
+                name: p.name.clone(),
+                description: Some(p.description.clone()),
+                project_number: Some(format!("DEMO-PRJ-{:03}", i + 1)),
+                company_id: company_ids.get(p.company_index).copied(),
+                contract_id: None,
+                project_type: "client".to_string(),
+                status: p.status.clone(),
+                project_manager_id: Some(manager_id),
+                start_date: Some(today),
+                target_end_date: Some(today + Duration::days(30)),
+                actual_end_date: None,
+                budget_hours: Some(Decimal::new(4000, 2)),
+                budget_amount: Some(Decimal::new(1000000, 2)),
+                billing_method: "time_and_materials".to_string(),
+                hourly_rate: Some(Decimal::new(15000, 2)),
+                is_billable: true,
+                default_due_business_days: None,
+            };
+            let phase = p.phase_name.as_ref().map(|name| UpsertProjectPhaseRequest {
+                name: name.clone(),
+                description: Some("Example project phase.".to_string()),
+                sort_order: 0,
+                start_date: Some(today),
+                end_date: Some(today + Duration::days(14)),
+                status: "in_progress".to_string(),
+            });
+            DemoProjectBuild {
+                request,
+                phase,
+                task_title: p.task_title.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The sample tickets. Priority, status, and queue are left unset so
+/// `create_ticket` fills in the tenant's configured defaults (the per-tenant
+/// NOT-NULL config FKs a static bundle cannot carry). Each ticket links its
+/// bundle company and contact so the demo shows the company -> contact -> ticket
+/// relationship. `sla_id` is left unset: the SLA subsystem assigns due dates
+/// from the applicable policy, and the durable "this client is on an SLA"
+/// relationship is carried by the company's `sla_id`, not the ticket's.
+pub fn demo_tickets(company_ids: &[Uuid], contact_ids: &[Uuid]) -> Vec<CreateTicketRequest> {
     demo_seed()
         .tickets
         .iter()
-        .map(|t| CreateTicketRequest {
-            title: t.title.clone(),
-            description: Some(t.description.clone()),
-            company_id,
-            contact_id: Some(contact_id),
-            is_billable: true,
-            tags: vec!["demo".to_string()],
-            ..Default::default()
+        .filter_map(|t| {
+            // A ticket needs a company; skip any whose index does not resolve
+            // (only possible from a malformed bundle, which the tests catch).
+            let company_id = company_ids.get(t.company_index).copied()?;
+            Some(CreateTicketRequest {
+                title: t.title.clone(),
+                description: Some(t.description.clone()),
+                company_id,
+                contact_id: contact_ids.get(t.contact_index).copied(),
+                is_billable: true,
+                tags: vec!["demo".to_string()],
+                ..Default::default()
+            })
         })
         .collect()
 }
@@ -155,31 +275,60 @@ mod tests {
 
     #[test]
     fn demo_seed_bundle_parses_to_the_expected_shape() {
-        // The embedded bundle must parse and carry exactly the demo baseline the
-        // seed service + integration tests expect (one company, two contacts,
-        // three tickets), so a malformed edit is caught in CI, not at seed time.
+        // The embedded bundle must parse and carry exactly the PMS-710 baseline
+        // the seed service + integration tests expect, so a malformed edit is
+        // caught in CI, not at seed time.
         let seed = demo_seed();
-        assert_eq!(seed.company.name, "Acme Corporation (Demo)");
-        assert_eq!(seed.contacts.len(), 2, "two demo contacts");
-        assert_eq!(seed.tickets.len(), 3, "three demo tickets");
+        assert_eq!(seed.companies.len(), 2, "two demo companies");
+        assert_eq!(seed.contacts.len(), 4, "four demo contacts");
+        assert_eq!(seed.projects.len(), 2, "two demo projects");
+        assert_eq!(seed.tickets.len(), 5, "five demo tickets");
+        assert_eq!(seed.companies[0].name, "Northwind Traders (Demo)");
+
+        // Every cross-reference index is in range.
+        assert!(seed.contacts.iter().all(|c| c.company_index < 2));
+        assert!(seed.projects.iter().all(|p| p.company_index < 2));
+        assert!(seed.tickets.iter().all(|t| t.company_index < 2));
+        assert!(seed.tickets.iter().all(|t| t.contact_index < 4));
+        assert!(seed.sla.company_index < 2);
 
         // The builders wire the FKs and produce the DTOs the service layer
-        // consumes; smoke-check the mapping and the company/contact/ticket links.
-        let company = demo_company();
-        assert_eq!(company.name, "Acme Corporation (Demo)");
-        assert_eq!(company.tags, vec!["demo".to_string()]);
+        // consumes; smoke-check the mapping and the relationships.
+        let sla_id = Uuid::new_v4();
+        let companies = demo_companies(sla_id);
+        assert_eq!(companies.len(), 2);
+        assert_eq!(companies[demo_sla_company_index()].sla_id, Some(sla_id));
+        assert!(companies
+            .iter()
+            .enumerate()
+            .all(|(i, c)| (i == demo_sla_company_index()) == (c.sla_id == Some(sla_id))));
 
-        let cid = Uuid::new_v4();
-        let primary = demo_contact_primary(cid);
-        assert_eq!(primary.company_id, Some(cid));
-        assert_eq!(primary.first_name, "Alice");
-        assert_eq!(demo_contact_secondary(cid).first_name, "Bob");
+        let company_ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        let contacts = demo_contacts(&company_ids);
+        assert_eq!(contacts.len(), 4);
+        assert_eq!(contacts[0].first_name, "Alice");
+        assert!(contacts
+            .iter()
+            .zip(&seed.contacts)
+            .all(|(dto, src)| dto.company_id == Some(company_ids[src.company_index])));
 
-        let contact_id = Uuid::new_v4();
-        let tickets = demo_tickets(cid, contact_id);
-        assert_eq!(tickets.len(), 3);
+        let manager = Uuid::new_v4();
+        let projects = demo_projects(&company_ids, manager);
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].request.status, "active");
+        assert!(projects[0].phase.is_some(), "active project has a phase");
+        assert_eq!(
+            projects[0].task_title.as_deref(),
+            Some("Inventory current mailboxes and shared drives")
+        );
+        assert!(projects[1].phase.is_none(), "planning project has no phase");
+
+        let contact_ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let tickets = demo_tickets(&company_ids, &contact_ids);
+        assert_eq!(tickets.len(), 5);
+        assert!(tickets.iter().all(|t| company_ids.contains(&t.company_id)));
         assert!(tickets
             .iter()
-            .all(|t| t.company_id == cid && t.contact_id == Some(contact_id)));
+            .all(|t| t.contact_id.is_some_and(|c| contact_ids.contains(&c))));
     }
 }

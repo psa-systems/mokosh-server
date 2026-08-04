@@ -88,7 +88,12 @@ impl SlaSweepWorker {
         let Some(notifications) = self.service.notifications() else {
             return Ok(0);
         };
-        let pool = self.service.pool();
+        // SAFETY (PMS-285 / PMS-692): the SLA sweep is a cross-tenant background
+        // worker - it projects open tickets across EVERY tenant, so it cannot set
+        // a single `app.current_tenant` GUC and runs on the BYPASSRLS migrator
+        // pool. Per-ticket alert-ledger writes that follow are tenant-scoped via
+        // `begin_with_tenant`.
+        let pool = self.service.migrator_pool();
         let now = Utc::now();
 
         // Open tickets with at least one SLA due time set. "Open" =

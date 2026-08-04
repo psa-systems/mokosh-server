@@ -102,12 +102,6 @@ impl AuthService {
         )
     }
 
-    /// Connection pool accessor, used by auth handlers to write audit
-    /// events (login / logout) via the shared `audit_write` helper.
-    pub fn pool(&self) -> &sqlx::PgPool {
-        self.db.pool()
-    }
-
     /// Database accessor so auth handlers can open a tenant-scoped
     /// transaction (`begin_with_tenant`) for out-of-band audit writes
     /// that must still carry the RLS `app.current_tenant` GUC (PMS-256).
@@ -902,10 +896,10 @@ impl AuthService {
     }
 
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
-        // The `tenants` table is the isolation root and is deliberately
-        // excluded from RLS (see migration 038: `table_name != 'tenants'`), so
-        // this single-row status read is safe on the NOBYPASSRLS app pool with
-        // no GUC. `mokosh_app` holds SELECT on it.
+        // SAFETY (PMS-285 / PMS-692): the `tenants` table is the isolation root
+        // and is deliberately excluded from RLS (migration 038:
+        // `table_name != 'tenants'`), so this single-row status read is safe on
+        // the NOBYPASSRLS app pool with no GUC. `mokosh_app` holds SELECT on it.
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
             .bind(tenant_id)
             .fetch_optional(self.db.pool())
@@ -2249,7 +2243,13 @@ impl AuthService {
         let found: Option<(bool,)> =
             sqlx::query_as("SELECT (deleted_at IS NOT NULL) FROM users WHERE id = $1")
                 .bind(user_id)
-                .fetch_optional(self.db.pool())
+                // SAFETY (PMS-285 / PMS-692): deliberately tenant-unscoped - the
+                // middleware error path knows only the sub, not the tenant, so
+                // there is no `app.current_tenant` GUC to set. Runs on the
+                // migrator pool; `users` is RLS-covered, so on the app pool this
+                // would always read "not tombstoned" (case E) and the MAPPS-348
+                // 410 ACCOUNT_DELETED branch would be dead code.
+                .fetch_optional(self.db.migrator_pool())
                 .await?;
         Ok(found.map(|(is_deleted,)| is_deleted).unwrap_or(false))
     }
