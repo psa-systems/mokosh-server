@@ -199,6 +199,13 @@ mokosh-types = { path = "crates/mokosh-types" }
 # bunyip's dunite pins. Pinned to dunite main.
 dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc10e8358a6f21160544a415a9488c16827af699" }
 
+# BUNYIP-475: the shared ASN / VPN enrichment crate (BUNYIP-437), consumed here
+# as mokosh's second-product use of the same offline IP2Proxy signal so there is
+# no second implementation to drift. Leaf crate (owns its error, depends only on
+# ip2location), so it is pinned to the dunite rev that introduced it independently
+# of dunite-stripe-core above.
+dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c276ab187852578daad1c4b9c823579b194a" }
+
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
 # deterministic virtual-clock tests (used by tests/scheduler.rs).

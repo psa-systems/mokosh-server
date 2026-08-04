@@ -49,6 +49,11 @@ pub struct AppConfig {
     /// client IP to a country for login-location alerts. `None` when unset: the
     /// alert feature is disabled (the server still boots normally).
     pub ip2location_db_path: Option<String>,
+    /// BUNYIP-475: path to the IP2Proxy PX `.BIN` used for advisory ASN / VPN
+    /// enrichment of a client IP (the shared dunite-ipenrich signal). `None` when
+    /// unset: the admin enrichment lookup reports nothing and the server boots
+    /// normally.
+    pub ip2proxy_db_path: Option<String>,
     /// PMS-658: opt-in switch for the suspicious-login notify-and-approve gate
     /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
     pub login_approval_enabled: bool,
@@ -231,6 +236,11 @@ impl AppConfig {
             bunyip_webhook_secret,
             // PMS-657: optional IP2Location DB path for login-location alerts.
             ip2location_db_path: std::env::var("IP2LOCATION_DB_PATH")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            // BUNYIP-475: optional IP2Proxy PX DB path for ASN / VPN enrichment.
+            ip2proxy_db_path: std::env::var("IP2PROXY_DB_PATH")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
@@ -533,6 +543,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // BUNYIP-475: build the advisory ASN / VPN enrichment service (shared
+    // dunite-ipenrich crate). Optional and independent of geoip: an unset path or
+    // a failed .BIN load leaves it None and the admin enrichment lookup reports
+    // nothing (never fatal, mirroring geoip).
+    let ip_enrich: Option<std::sync::Arc<dunite_ipenrich::IpEnrichService>> = match config
+        .ip2proxy_db_path
+        .as_deref()
+    {
+        Some(path) => match dunite_ipenrich::IpEnrichService::new(path) {
+            Ok(svc) => {
+                tracing::info!(path = %path, "IP enrichment (IP2Proxy) service initialized");
+                Some(std::sync::Arc::new(svc))
+            }
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "Failed to load IP2Proxy DB; IP enrichment disabled");
+                None
+            }
+        },
+        None => {
+            tracing::info!("IP2PROXY_DB_PATH unset; IP enrichment disabled");
+            None
+        }
+    };
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -546,6 +580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         encryption_key,
         config.bunyip_webhook_secret.into_bytes(),
         geoip,
+        ip_enrich,
         config.login_approval_enabled,
     );
     let router = psa_router;
