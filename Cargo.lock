@@ -803,6 +803,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dunite-ipenrich"
+version = "0.1.0"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=ae62c276ab187852578daad1c4b9c823579b194a#ae62c276ab187852578daad1c4b9c823579b194a"
+dependencies = [
+ "ip2location",
+]
+
+[[package]]
 name = "dunite-stripe-core"
 version = "0.1.0"
 source = "git+https://dev.a8n.run/psa-systems/dunite?rev=cc10e8358a6f21160544a415a9488c16827af699#cc10e8358a6f21160544a415a9488c16827af699"
@@ -1881,6 +1889,7 @@ dependencies = [
  "cookie",
  "cron",
  "dotenvy",
+ "dunite-ipenrich",
  "dunite-stripe-core",
  "google-oauth-flow",
  "governor",

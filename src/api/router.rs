@@ -82,6 +82,10 @@ pub fn create_api_router(
     // PMS-657: IP -> country resolver for login-location alerts, built from
     // IP2LOCATION_DB_PATH in main.rs. `None` disables the feature.
     geoip: Option<Arc<crate::utils::geoip::GeoIpService>>,
+    // BUNYIP-475: advisory ASN / VPN enrichment service (shared dunite-ipenrich
+    // crate), built from IP2PROXY_DB_PATH in main.rs. `None` disables the
+    // admin enrichment lookup.
+    ip_enrich: Option<Arc<dunite_ipenrich::IpEnrichService>>,
     // PMS-658: master switch for the suspicious-login notify-and-approve gate,
     // from LOGIN_APPROVAL_ENABLED in main.rs. Off by default (can block logins).
     login_approval_enabled: bool,
@@ -369,6 +373,9 @@ pub fn create_api_router(
         ))
         // Audit log read. PMS-118.
         .merge(audit_routes(audit_service))
+        // BUNYIP-475: advisory ASN / VPN enrichment lookup (admin-gated),
+        // consuming the shared dunite-ipenrich crate.
+        .merge(crate::modules::ip_enrich::ip_enrich_routes(ip_enrich))
         // PMS-647: admin-only tenant data export (first slice of PMS-646).
         // PMS-679: also the "Load demo data" endpoint, sharing the same
         // `seed_service` Arc as the first-visit seed middleware below.

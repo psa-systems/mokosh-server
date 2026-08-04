@@ -15,6 +15,7 @@ pub mod dashboards;
 pub mod data_transfer;
 pub mod email_intake;
 pub mod invitations;
+pub mod ip_enrich;
 pub mod knowledge_base;
 pub mod mileage_tracking;
 pub mod notifications;
