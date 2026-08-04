@@ -56,9 +56,29 @@ exist in mokosh's local `users` table):
   a real browser and asserts on URL transitions (login leaves `/login`,
   logout returns to it). DOM-only, no API probe - the SPA's in-memory token
   cannot be exfiltrated for an external request context to use. Captures a
-  URL trail + request log via `lib/page-diagnostics.ts` and folds them into
-  the thrown error on failure. Currently `test.fixme` pending PMS-148 (see
-  "What it covers" above).
+  URL trail, a main-frame response log and a request log via
+  `lib/page-diagnostics.ts` and folds them into the thrown error on failure.
+  Currently `test.fixme` pending PMS-148 (see "What it covers" above).
+
+## Diagnosing a failed browser login
+
+fj cannot download the Playwright trace artifact, so a thrown error is the only
+channel a CI log has. Two helpers make a browser failure self-diagnosing:
+
+- `lib/page-diagnostics.ts` - `attachPageDiagnostics(page).snapshot(label)`
+  renders four blocks: `currentUrl`, `urlTrail` (main-frame navigations),
+  `mainFrameResponses` (every main-frame document response as `status url`,
+  with the first 500 chars of the body for non-2xx), and `requests`. The
+  response block is what separates "the hub 5xxed" from "the redirect was never
+  followed" from "the form selector drifted" (PMS-721: a webkit run parked on
+  `/oauth2/authorize` and the log showed only a locator timeout). Each
+  cross-origin hop is its own entry, e.g. `302 .../oauth2/authorize` followed by
+  `200 https://a8n.systems/login?...&checked=1`.
+- `lib/login.ts` - the credential step returns a classified outcome rather than
+  throwing a raw locator timeout. When the hub's credential form never renders,
+  the outcome carries the location, the last main-frame response and any error
+  banner, and `loginViaSpa` backs off and retries (rate-limit backoff when the
+  hub names one, otherwise 3s) before failing with that reason in the message.
 
 ## Required configuration
 

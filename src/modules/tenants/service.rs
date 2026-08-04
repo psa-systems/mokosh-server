@@ -194,7 +194,11 @@ impl TenantService {
             "SELECT EXISTS(SELECT 1 FROM ticket_sequences WHERE tenant_id = $1)",
         )
         .bind(tenant_id)
-        .fetch_one(self.db.pool())
+        // PMS-692: `ticket_sequences` is RLS-covered, so this probe must run
+        // under the tenant GUC too - on the app pool it was a permanent false
+        // negative (always "no sequences"), harmless only because the inserts
+        // below are idempotent.
+        .fetch_one(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         if !has_sequences {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -328,10 +332,11 @@ impl TenantService {
             "#,
         )
         .bind(tenant_id)
-        // The `tenants` table is the RLS-exempt isolation root (migration 038
-        // skips it), so this single-row read is safe on the app pool; the route
-        // handler enforces that a non-super-admin caller may only read its own
-        // tenant id (the `cross_user_tenant_endpoint_denied` regression pins it).
+        // SAFETY (PMS-285 / PMS-692): the `tenants` table is the RLS-exempt
+        // isolation root (migration 038 skips it), so this single-row read is
+        // safe on the app pool with no GUC; the route handler enforces that a
+        // non-super-admin caller may only read its own tenant id (the
+        // `cross_user_tenant_endpoint_denied` regression pins it).
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
@@ -574,7 +579,8 @@ impl TenantService {
     /// converging on one own-company.
     pub async fn ensure_own_company(&self, tenant_id: Uuid) -> AppResult<()> {
         // Cheap guard so the already-provisioned common case skips the write tx.
-        // `tenants` is RLS-exempt, so this reads safely on the app pool.
+        // SAFETY (PMS-285 / PMS-692): `tenants` is the RLS-exempt isolation root
+        // (migration 038), so this probe reads safely on the app pool with no GUC.
         let already_linked: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM tenants WHERE id = $1 AND own_company_id IS NOT NULL)",
         )

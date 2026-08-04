@@ -21,7 +21,9 @@ use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::{
     auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
 };
-use crate::modules::billing::{billing_routes, BillingService};
+use crate::modules::billing::{
+    billing_routes, stripe_webhook_handler, BillingService, StripeWebhookState,
+};
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
@@ -126,15 +128,15 @@ pub fn create_api_router(
     );
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
-    // PMS-157: first-visit demo seeding. Holds its own clones of the
-    // contacts + tickets services so it can drive the real create paths;
-    // wired below as a middleware that runs after auth populates AuthState.
-    let seed_service = Arc::new(crate::modules::seed::SeedService::new(
+    // PMS-711: the agent-facing billing service also sends the outbound invoice
+    // "Pay Now" email on the send transition, so it takes the mailer + the SPA
+    // origin the pay link is built from.
+    let billing_service = BillingService::with_delivery(
         db.clone(),
-        contact_service.clone(),
-        ticket_service.clone(),
-    ));
-    let billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
+        encryption_key,
+        mailer.clone(),
+        client_origin.clone(),
+    );
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
@@ -168,7 +170,7 @@ pub fn create_api_router(
     // PMS-448 AC4: admin-authored ticket templates (new-ticket pre-fills).
     let ticket_templates_service = TicketTemplatesService::new(db.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
-    let search_service = SearchService::new(db.pool().clone());
+    let search_service = SearchService::new(db.clone());
     // PMS-453: per-user saved dashboards.
     let dashboards_service = DashboardsService::new(db.clone());
     // PMS-450: email-to-ticket intake. Holds a TicketService clone so
@@ -182,7 +184,7 @@ pub fn create_api_router(
     let email_intake_service = EmailIntakeService::new(
         db.clone(),
         ticket_service.clone(),
-        AttachmentService::new(db.pool().clone(), AttachmentConfig::from_env()),
+        AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
     );
     // PMS-451: per-ticket approval requests.
     let approvals_service = ApprovalsService::new(db.clone());
@@ -193,6 +195,18 @@ pub fn create_api_router(
     // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
     // do not use the dispatcher; only the worker does.
     let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
+    // PMS-157 / PMS-710: first-visit demo seeding. Holds its own clones of the
+    // contacts, tickets, projects, and SLA services so it can drive the real
+    // create paths for the connected demo dataset; wired below as a middleware
+    // that runs after auth populates AuthState. Constructed here (after the
+    // projects + SLA services exist) rather than at the top of the builder.
+    let seed_service = Arc::new(crate::modules::seed::SeedService::new(
+        db.clone(),
+        contact_service.clone(),
+        ticket_service.clone(),
+        projects_service.clone(),
+        sla_service.clone(),
+    ));
     // PMS-113 AC2: Arc'd so both `settings_routes` and `tenant_routes`
     // share the same instance. The tenants-side module-config handlers
     // delegate to this; one canonical writer for `module_config`.
@@ -272,7 +286,7 @@ pub fn create_api_router(
         // Merged at the top level so its `/tickets/{id}/notes/...`
         // path nests cleanly under the existing ticket tree.
         .merge(agent_attachment_routes(AttachmentService::new(
-            db.pool().clone(),
+            db.clone(),
             AttachmentConfig::from_env(),
         )))
         // PMS-468: agent "all comments from this contact" feed. The
@@ -426,6 +440,7 @@ pub fn create_api_router(
             portal_kb_service,
             portal_billing_service,
             portal_quotes_service,
+            client_origin.clone(),
         ))
         // PMS-483: portal-side ticket-note attachments. Same routes as
         // the agent surface, but behind `RequirePortalAuth` and
@@ -435,7 +450,7 @@ pub fn create_api_router(
         // - without that, every portal upload would 401 before the
         // handler.
         .merge(portal_attachment_routes(
-            AttachmentService::new(db.pool().clone(), AttachmentConfig::from_env()),
+            AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
             portal_attachment_auth_service,
         ))
         // PMS-298: same envelope normalization for the portal surface.
@@ -472,7 +487,13 @@ pub fn create_api_router(
     // `users.id = <bunyip sub>` (mokosh's users.id IS the bunyip sub per
     // the PMS-295 cutover, so no `bunyip_sub` column is needed).
     let bunyip_webhook_state = Arc::new(BunyipWebhookState {
-        pool: db.pool().clone(),
+        // SAFETY (PMS-285 / PMS-692): the account-deleted webhook is pre-auth
+        // (HMAC-signed, no session) and inherently cross-tenant - `soft_delete`
+        // resolves the tenant FROM the `users` row it reads by bunyip sub, so
+        // there is no `app.current_tenant` GUC to set beforehand. It runs on the
+        // BYPASSRLS migrator pool; `users` is RLS-covered and would fail closed
+        // on the unprivileged app pool.
+        pool: db.migrator_pool().clone(),
         webhook_secret: bunyip_webhook_secret,
     });
     let bunyip_webhooks = Router::new()
@@ -487,6 +508,25 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
+    // PMS-711: Stripe webhook receiver. Nested under `/api/v1/stripe` OUTSIDE
+    // the JWT auth chain: Stripe authenticates itself with the `Stripe-Signature`
+    // header (HMAC over the raw body, keyed by the tenant's per-account webhook
+    // secret). The tenant id in the path selects which tenant's secret to verify
+    // against; it is not itself a credential. Its own `BillingService` instance
+    // (the router's `billing_service` is moved into `billing_routes`).
+    let stripe_webhook_state = Arc::new(StripeWebhookState {
+        billing: Arc::new(BillingService::with_encryption_key(
+            db.clone(),
+            encryption_key,
+        )),
+    });
+    let stripe_webhooks = Router::new()
+        .route("/webhooks/{tenant_id}", post(stripe_webhook_handler))
+        .with_state(stripe_webhook_state)
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
+
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
     // page that links the user back to the Mokosh frontend. This keeps
@@ -495,6 +535,7 @@ pub fn create_api_router(
         .nest("/api/v1", api_v1)
         .nest("/api/v1/portal", portal_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
+        .nest("/api/v1/stripe", stripe_webhooks)
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))

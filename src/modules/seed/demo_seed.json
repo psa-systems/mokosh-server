@@ -1,37 +1,103 @@
 {
-  "company": {
-    "name": "Acme Corporation (Demo)",
-    "industry": "Information Technology",
-    "website": "https://example.com",
-    "phone": "+1-555-0100",
-    "notes": "Sample company created automatically to show how Mokosh works. Safe to edit or delete."
-  },
+  "companies": [
+    {
+      "name": "Northwind Traders (Demo)",
+      "industry": "Retail",
+      "website": "https://example.com",
+      "phone": "+1-555-0100",
+      "notes": "Sample client created automatically to show how Mokosh works. Safe to edit or delete."
+    },
+    {
+      "name": "Contoso Ltd (Demo)",
+      "industry": "Professional Services",
+      "website": "https://example.net",
+      "phone": "+1-555-0180",
+      "notes": "Second sample client so you can see how work is organised across companies. Safe to edit or delete."
+    }
+  ],
   "contacts": [
     {
+      "company_index": 0,
       "first_name": "Alice",
       "last_name": "Anderson",
       "email": "alice.anderson@example.com",
       "title": "IT Director"
     },
     {
+      "company_index": 0,
       "first_name": "Bob",
       "last_name": "Baker",
       "email": "bob.baker@example.com",
       "title": "Operations Manager"
+    },
+    {
+      "company_index": 1,
+      "first_name": "Carol",
+      "last_name": "Chen",
+      "email": "carol.chen@example.net",
+      "title": "Office Manager"
+    },
+    {
+      "company_index": 1,
+      "first_name": "David",
+      "last_name": "Diaz",
+      "email": "david.diaz@example.net",
+      "title": "Owner"
+    }
+  ],
+  "sla": {
+    "name": "Standard Support (Demo)",
+    "description": "Example service level: business-hours first response and resolution targets for standard tickets. Applied to Northwind Traders so you can see how an SLA attaches to a client.",
+    "company_index": 0
+  },
+  "projects": [
+    {
+      "company_index": 0,
+      "name": "Microsoft 365 Migration (Demo)",
+      "description": "Example active engagement showing how a project groups work for a client.",
+      "status": "active",
+      "phase_name": "Discovery & Planning",
+      "task_title": "Inventory current mailboxes and shared drives"
+    },
+    {
+      "company_index": 1,
+      "name": "Network Refresh (Demo)",
+      "description": "Example planned engagement so you can see a project before work has started.",
+      "status": "planning",
+      "phase_name": null,
+      "task_title": null
     }
   ],
   "tickets": [
     {
+      "company_index": 0,
+      "contact_index": 0,
       "title": "Welcome to Mokosh - here's a sample ticket",
-      "description": "This is an example ticket. Open it to see how Mokosh tracks work, then close or delete it when you're done exploring."
+      "description": "This is an example ticket. Open it to see how Mokosh tracks work and links to a client and contact. Close or delete it when you're done exploring."
     },
     {
+      "company_index": 0,
+      "contact_index": 1,
       "title": "Laptop won't connect to Wi-Fi",
       "description": "Demo ticket: a contact reports their laptop cannot join the office wireless network after the latest update."
     },
     {
+      "company_index": 0,
+      "contact_index": 0,
+      "title": "Email delivery delayed for the sales team",
+      "description": "Demo ticket: outbound mail from the sales distribution list is arriving an hour late for a client on the Standard Support SLA."
+    },
+    {
+      "company_index": 1,
+      "contact_index": 2,
       "title": "Request: onboard a new employee",
       "description": "Demo ticket: provision accounts, email, and hardware for a new hire starting next week."
+    },
+    {
+      "company_index": 1,
+      "contact_index": 3,
+      "title": "Printer on the 2nd floor is offline",
+      "description": "Demo ticket: the shared printer stopped responding this morning; several staff cannot print."
     }
   ]
 }

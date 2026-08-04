@@ -13,7 +13,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use mokosh_server::modules::audit::AuditCtx;
-use mokosh_server::modules::auth::middleware::place_bunyip_user;
+use mokosh_server::modules::auth::middleware::{bunyip_userinfo_needed, place_bunyip_user};
 use mokosh_server::modules::auth::oidc_rs::AtClaims;
 use mokosh_server::modules::auth::{AuthService, TenantId, UserRole};
 use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
@@ -726,6 +726,142 @@ async fn absent_or_empty_name_claims_leave_cached_names_intact(pool: PgPool) {
         names(&pool, sub).await,
         ("Sam".into(), "Doe".into()),
         "an absent family_name must leave last_name alone"
+    );
+}
+
+// PMS-713: the Bunyip RS path fetched `/oauth2/userinfo` (a network hop) on
+// EVERY authenticated request, so a page that fires several API calls (the
+// dashboard) stalled for seconds waiting on Bunyip. `bunyip_userinfo_needed`
+// gates that hop: it is fetched only to provision / re-place a user, and skipped
+// for an already-placed user with no pending invite, who is resolved from local
+// state.
+
+#[sqlx::test]
+async fn userinfo_is_fetched_for_a_first_sight_user(pool: PgPool) {
+    // No local placement yet -> userinfo IS needed to JIT-provision the user.
+    let (auth, _tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    assert!(
+        bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        "a first-sight user needs userinfo to be provisioned"
+    );
+}
+
+#[sqlx::test]
+async fn userinfo_is_skipped_for_an_existing_placed_user(pool: PgPool) {
+    // The perf fix: an already-provisioned user in their own tenant with no
+    // pending invite is resolved locally, so the per-request userinfo hop is
+    // skipped.
+    let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("placed@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("first placement");
+
+    assert!(
+        !bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        "an existing placed user with no invite must not trigger a userinfo fetch"
+    );
+}
+
+#[sqlx::test]
+async fn userinfo_is_fetched_when_a_pending_invite_matches(pool: PgPool) {
+    // Invites still work: an existing user with a pending invite for their
+    // verified email goes through the full (userinfo) path so it is honored.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("invitee@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("first placement");
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4())
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("invitee@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
+
+    assert!(
+        bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        "a pending invite for the user's verified email must trigger the userinfo path"
+    );
+}
+
+#[sqlx::test]
+async fn existing_user_resolves_with_no_userinfo(pool: PgPool) {
+    // The fast path end to end: once provisioned, a user is resolved by
+    // place_bunyip_user with NO email/name (the values the middleware passes when
+    // it skips userinfo), staying in their tenant and keeping their cached name.
+    let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("fastpath@example.com".to_string()),
+        true,
+        Some("Fast".to_string()),
+        Some("Path".to_string()),
+        &claims(sub, None),
+    )
+    .await
+    .expect("first placement");
+    let (tenant, _) = user_tenant_role(&pool, sub).await;
+
+    let state = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        None,
+        false,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await;
+    assert!(
+        state.is_some(),
+        "an existing user resolves with no userinfo (the skipped-hop fast path)"
+    );
+    let (tenant2, _) = user_tenant_role(&pool, sub).await;
+    assert_eq!(
+        tenant, tenant2,
+        "the user stays in their tenant on the no-userinfo fast path"
+    );
+    assert_eq!(
+        names(&pool, sub).await,
+        ("Fast".into(), "Path".into()),
+        "cached names are untouched when no name hints are supplied"
     );
 }
 

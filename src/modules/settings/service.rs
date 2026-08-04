@@ -362,7 +362,10 @@ pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> App
 /// Reads off a `PgPool` so the email-intake flow does not have to
 /// thread its outer connection through.
 pub async fn read_email_intake_default_company(
-    pool: &sqlx::PgPool,
+    // PMS-692: takes the tenant-GUC transaction connection (like
+    // `read_ci_impact_max_depth`), not a bare pool - `tenant_settings` is
+    // RLS-covered, so a bare-pool read fail-closes on the NOBYPASSRLS connection.
+    conn: &mut sqlx::PgConnection,
     tenant_id: Uuid,
 ) -> AppResult<Option<Uuid>> {
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -370,7 +373,7 @@ pub async fn read_email_intake_default_company(
            WHERE tenant_id = $1 AND category = 'email_intake' AND key = 'default_company_id'"#,
     )
     .bind(tenant_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(value
         .and_then(|v| v.as_str().map(str::to_string))

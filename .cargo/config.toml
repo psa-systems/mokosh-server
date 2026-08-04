@@ -1,0 +1,7 @@
+# Use the system git CLI (not libgit2) to fetch git dependencies, so cargo
+# honours the configured credential helper / token when pulling the private
+# psa-systems crates (dunite-stripe-core, DEV-514) from
+# https://dev.a8n.run/psa-systems/dunite. Without this, libgit2 may fail to
+# authenticate against the private Forgejo repo. Mirrors bunyip's .cargo/config.
+[net]
+git-fetch-with-cli = true
