@@ -51,16 +51,11 @@ jobs:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
 
-      - name: Cache Rust build
-        uses: https://github.com/Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
-        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
-
       - name: Require disk headroom for the link step
+        # Runs BEFORE the cache restore on purpose: a runner too full to link
+        # is also too full to usefully restore a multi-GB cargo cache, so
+        # failing first saves that download and leaves less on disk for
+        # whatever runs next.
         # PMS-740. `cargo test --tests` links 22 debug test binaries, each
         # several hundred MB, several concurrently under CARGO_BUILD_JOBS.
         # When the runner filesystem fills mid-write, `rust-lld` writes its
@@ -84,6 +79,16 @@ jobs:
             echo "::error::Runner has only ${avail_gb}G free; this suite needs ~25G to link its test binaries. This is a runner-capacity problem, not a problem with the commit under test. See PMS-740."
             exit 1
           fi
+
+      - name: Cache Rust build
+        uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Cap build parallelism
+        # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
+        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
+
 
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`
