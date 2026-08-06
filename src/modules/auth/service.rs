@@ -2415,6 +2415,46 @@ impl AuthService {
         self.get_user_by_id(tenant_id, sub).await
     }
 
+    /// PMS-635: replace the JIT placeholder address with the real one once the
+    /// IdP reports the email verified. [`Self::upsert_user_from_oidc`] runs on
+    /// first sight only, so a user provisioned before verifying kept
+    /// `{sub}@unresolved.invalid` forever: every mokosh-side email to them was
+    /// addressed to a reserved, non-routable domain and bounced, and every
+    /// `email_verified_at IS NOT NULL` gate (invite consumption) stayed shut.
+    ///
+    /// The `WHERE` clause re-checks the placeholder domain so a concurrent
+    /// request can never overwrite a real address, which also makes the repair
+    /// idempotent (the second run matches no row and just re-reads).
+    /// `email_verified_at` is stamped in the same statement because the caller
+    /// only reaches here on a verified address.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn repair_placeholder_email(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        email: &str,
+    ) -> AppResult<User> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET email = $3,
+                email_verified_at = COALESCE(email_verified_at, NOW()),
+                updated_at = NOW()
+            WHERE id = $1 AND tenant_id = $2
+              AND split_part(email, '@', 2) = $4
+            "#,
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(email)
+        .bind(UNRESOLVED_EMAIL_DOMAIN)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_user_by_id(tenant_id, user_id).await
+    }
+
     /// PMS-512: refresh the read-only `first_name` / `last_name` cache from
     /// bunyip's `given_name` / `family_name` claims for a user who already
     /// has a local row (so [`Self::upsert_user_from_oidc`] never runs again).
@@ -3153,6 +3193,19 @@ fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
     allowlist.iter().any(|e| e == &email)
 }
 
+/// Domain of the JIT placeholder address (`{sub}@unresolved.invalid`) stored
+/// when bunyip has not yet verified the user's email. `.invalid` is reserved by
+/// RFC 2606 and never resolves, so mail addressed to it is guaranteed to bounce.
+pub const UNRESOLVED_EMAIL_DOMAIN: &str = "unresolved.invalid";
+
+/// Whether `email` is mokosh's own JIT placeholder rather than a real address
+/// (PMS-635). Used to decide when a mirrored user row still needs repairing.
+pub fn is_unresolved_placeholder_email(email: &str) -> bool {
+    email
+        .rsplit_once('@')
+        .is_some_and(|(_, domain)| domain.eq_ignore_ascii_case(UNRESOLVED_EMAIL_DOMAIN))
+}
+
 /// Build a placeholder `(first_name, last_name)` from an email for JIT
 /// inserts. The OIDC at+jwt has no name claims so the local row needs a
 /// default for the NOT NULL schema columns. Splits the local-part on
@@ -3177,15 +3230,12 @@ fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
 fn synthetic_name_from_email(email: &str) -> (String, String) {
     const FALLBACK: (&str, &str) = ("Mokosh", "User");
 
-    let (local, domain) = email
-        .split_once('@')
-        .map(|(l, d)| (l, d.to_ascii_lowercase()))
-        .unwrap_or((email, String::new()));
+    let local = email.split_once('@').map(|(l, _)| l).unwrap_or(email);
 
     // mokosh-server's own JIT placeholder: there is no real email here,
     // so anything we synthesise from the local-part would just look
     // like the user's bunyip sub. Land on the explicit placeholder.
-    if domain == "unresolved.invalid" {
+    if is_unresolved_placeholder_email(email) {
         return (FALLBACK.0.to_string(), FALLBACK.1.to_string());
     }
 
@@ -3372,6 +3422,26 @@ mod tests {
             !is_allowlisted_email(&[], "admin@niceguyit.biz"),
             "empty allowlist matches nothing"
         );
+    }
+
+    /// PMS-635: the predicate that decides whether a mirrored row still needs
+    /// its address repaired. It must match the JIT placeholder (in any case)
+    /// and nothing that could be a real, routable address.
+    #[test]
+    fn placeholder_email_predicate_matches_only_the_jit_placeholder() {
+        let sub = "7fa2b249-6132-4abc-90de-1234567890ab";
+        assert!(is_unresolved_placeholder_email(&format!(
+            "{sub}@{UNRESOLVED_EMAIL_DOMAIN}"
+        )));
+        assert!(is_unresolved_placeholder_email(&format!(
+            "{sub}@UNRESOLVED.INVALID"
+        )));
+        assert!(!is_unresolved_placeholder_email("david@niceguyit.biz"));
+        assert!(
+            !is_unresolved_placeholder_email("david@unresolved.invalid.example.com"),
+            "a real domain that merely contains the placeholder is not a placeholder"
+        );
+        assert!(!is_unresolved_placeholder_email("no-at-sign"));
     }
 
     // ── synthetic_name_from_email ──────────────────────────────────────────

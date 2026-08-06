@@ -36,7 +36,7 @@ This path is DEV ONLY (it is labelled as such in code and `.env.example`); it is
 `email_verified` is read in three places, none of which block bootstrap-admin login:
 
 - Invite consumption: a pending invite is honored only for a verified address (`place_bunyip_user`).
-- Email persistence: the real address is stored on the JIT insert only when verified; otherwise a `<sub>@unresolved.invalid` placeholder is used (MAPPS-335).
+- Email persistence: the real address is stored on the JIT insert only when verified; otherwise a `<sub>@unresolved.invalid` placeholder is used (MAPPS-335). The placeholder is repaired on the first request after bunyip reports the address verified (`repair_placeholder_email`, PMS-635): the JIT insert runs once, so until then the row kept an address in the reserved `.invalid` TLD that every outbound email bounced off, and the invite gate above could never open for it.
 - Google account-linking: linking Google to an existing unverified local account asks the user to sign in with a password first (`login_with_google`).
 
 There is no `RequireVerified` extractor and no `email_verified_at`-based 403 anywhere in the request path.

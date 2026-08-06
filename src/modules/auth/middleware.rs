@@ -8,6 +8,7 @@ use axum::{
 use std::sync::Arc;
 
 use super::oidc_rs::Verifier as BunyipVerifier;
+use super::service::{is_unresolved_placeholder_email, UNRESOLVED_EMAIL_DOMAIN};
 use super::{AuthService, AuthState, CurrentUser, UserRole};
 use crate::utils::error::AppError;
 
@@ -608,18 +609,28 @@ pub async fn bunyip_userinfo_needed(
     if is_stuck_in_default(Some(tenant), default_bunyip_tenant_id(), &role, false) {
         return true;
     }
+    let Ok(user) = auth_service.get_user_by_id(tenant, sub).await else {
+        return false;
+    };
+    // PMS-635: the row still carries the `{sub}@unresolved.invalid` JIT
+    // placeholder, so it holds no usable address (every mokosh email to it
+    // bounces) and no invite can ever match it. Only userinfo can tell us
+    // whether bunyip has since verified the address, so keep fetching it until
+    // the row is repaired. This costs the PMS-713 hop for as long as the user
+    // stays unverified, which is a bounded, self-clearing state.
+    if is_unresolved_placeholder_email(&user.email) {
+        return true;
+    }
     // A pending invite for the user's verified email re-homes them, so the full
     // path must run. Match on the user's LOCAL verified email (no userinfo): a
     // JIT row carries a verified email only when the IdP reported it verified,
     // which is exactly the condition the invite-consumption path already requires
     // (place_bunyip_user gates the invite match on `email_verified`).
     if let Some(invs) = invitations {
-        if let Ok(user) = auth_service.get_user_by_id(tenant, sub).await {
-            if user.email_verified_at.is_some()
-                && matches!(invs.newest_pending_for(&user.email).await, Ok(Some(_)))
-            {
-                return true;
-            }
+        if user.email_verified_at.is_some()
+            && matches!(invs.newest_pending_for(&user.email).await, Ok(Some(_)))
+        {
+            return true;
         }
     }
     false
@@ -745,7 +756,7 @@ pub async fn place_bunyip_user(
             // the auto-link/capture path against the real owner closed.
             let email_for_insert = match (email.clone(), email_verified) {
                 (Some(em), true) => em,
-                _ => format!("{sub}@unresolved.invalid"),
+                _ => format!("{sub}@{UNRESOLVED_EMAIL_DOMAIN}"),
             };
             // BUNYIP-141: hand the userinfo profile claims to the JIT path
             // so a bunyip-provisioned user lands with their real name on
@@ -766,6 +777,31 @@ pub async fn place_bunyip_user(
                 .ok()?
         }
     };
+
+    // PMS-635: heal a row still holding the `{sub}@unresolved.invalid`
+    // placeholder now that bunyip reports a verified address. The JIT insert
+    // runs once, so without this the placeholder was permanent: transactional
+    // mail (login-approval codes, notifications) was addressed to a reserved
+    // non-routable domain and bounced, and `email_verified_at` stayed NULL so
+    // invites never matched. Only ever overwrites the placeholder, never a real
+    // address; a failure is logged and the request continues (the next request
+    // retries).
+    if let (Some(em), true) = (email.as_deref(), email_verified) {
+        if is_unresolved_placeholder_email(&user.email) {
+            match auth_service
+                .repair_placeholder_email(user.tenant_id, user.id, em)
+                .await
+            {
+                Ok(repaired) => {
+                    tracing::info!(sub = %sub, "repaired placeholder email from verified userinfo");
+                    user = repaired;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, sub = %sub, "placeholder email repair failed")
+                }
+            }
+        }
+    }
 
     // PMS-512: bunyip owns the profile names, so the local columns are a
     // read-only cache refreshed from every login's userinfo claims (the JIT
