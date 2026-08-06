@@ -16,6 +16,8 @@
 
 mod models;
 #[cfg(feature = "server")]
+mod request_links;
+#[cfg(feature = "server")]
 mod routes;
 #[cfg(feature = "server")]
 mod service;

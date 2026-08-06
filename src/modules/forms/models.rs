@@ -233,3 +233,85 @@ where
 {
     Ok(Some(Option::deserialize(deserializer)?))
 }
+
+// ============================================================================
+// PMS-730: REQUEST LINKS
+// ============================================================================
+
+/// Issue a magic link for a client to fill in a form. Either `contact_id` or
+/// `recipient_email` must be present; a contact supplies the address and the
+/// greeting, an explicit address overrides it (or stands alone when the
+/// addressee is not a contact yet).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct IssueRequestLinkRequest {
+    pub form_definition_id: Uuid,
+    pub company_id: Uuid,
+    pub contact_id: Option<Uuid>,
+    #[validate(email)]
+    pub recipient_email: Option<String>,
+}
+
+/// The issued link as the agent surface sees it. Deliberately WITHOUT the
+/// token: only the recipient should ever hold it, and echoing it back would
+/// put a credential into every response log and browser history entry that
+/// touches this endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestLinkResponse {
+    pub id: Uuid,
+    pub form_definition_id: Uuid,
+    pub form_name: String,
+    pub company_id: Uuid,
+    pub company_name: String,
+    pub contact_id: Option<Uuid>,
+    pub recipient_email: String,
+    pub expires_at: DateTime<Utc>,
+    pub used_at: Option<DateTime<Utc>>,
+    pub submission_id: Option<Uuid>,
+}
+
+/// What a presented token resolves to. Internal: never serialised, because
+/// every field is a tenant-internal id.
+#[derive(Debug, Clone)]
+pub struct ResolvedRequestToken {
+    pub token_id: Uuid,
+    pub tenant_id: crate::modules::auth::TenantId,
+    pub form_definition_id: Uuid,
+    pub company_id: Uuid,
+    pub contact_id: Option<Uuid>,
+    /// The MSP user who issued the link. Becomes the created ticket's
+    /// `created_by_id`, since the submitter is a client with no `users` row
+    /// and that column is NOT NULL.
+    pub created_by_id: Uuid,
+}
+
+/// The client-facing view of a form: what is needed to render and validate the
+/// inputs, and nothing more. No ids, no author, no timestamps, and no KB
+/// article, which is an internal procedure for whoever works the ticket rather
+/// than something the client is entitled to read.
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicFormResponse {
+    pub name: String,
+    pub description: Option<String>,
+    pub rules: Vec<FormRule>,
+    pub fields: Vec<PublicFormField>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicFormField {
+    pub name: String,
+    pub label: String,
+    pub help_text: Option<String>,
+    pub field_type: FieldType,
+    pub is_required: bool,
+    pub min_length: Option<i32>,
+    pub max_length: Option<i32>,
+    pub options: Option<Vec<String>>,
+    pub date_not_in_past: bool,
+}
+
+/// What the client gets back after a successful submission: the ticket number
+/// to quote, and nothing else about the tenant's internals.
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicSubmissionReceipt {
+    pub ticket_number: String,
+}
