@@ -213,11 +213,12 @@ impl TicketService {
                 company_id, contact_id, site_id, assigned_to_id, team_id,
                 contract_id, sla_id, scheduled_start, scheduled_end,
                 estimated_hours, is_billable, asset_id, custom_fields, tags,
-                created_by_id, source_kb_article_id, email_message_id, email_thread_id
+                created_by_id, source_kb_article_id, procedure_kb_article_id,
+                email_message_id, email_thread_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27, $28, $29
+                $27, $28, $29, $30
             )
             "#,
         )
@@ -248,6 +249,7 @@ impl TicketService {
         .bind(&request.tags)
         .bind(user_id)
         .bind(request.source_kb_article_id)
+        .bind(request.procedure_kb_article_id)
         .bind(&request.email_message_id)
         .bind(&request.email_thread_id)
         .execute(&mut *tx)
@@ -346,7 +348,8 @@ impl TicketService {
                    sla_due_date, first_response_due, first_response_at,
                    resolution_due, resolved_at, closed_at,
                    scheduled_start, scheduled_end, estimated_hours, actual_hours,
-                   is_billable, billing_status, asset_id, custom_fields, tags,
+                   is_billable, billing_status, asset_id, procedure_kb_article_id,
+                   custom_fields, tags,
                    created_by_id, last_updated_by_id, created_at, updated_at
             FROM tickets
             WHERE tenant_id = $1 AND id = $2
@@ -378,7 +381,8 @@ impl TicketService {
                    sla_due_date, first_response_due, first_response_at,
                    resolution_due, resolved_at, closed_at,
                    scheduled_start, scheduled_end, estimated_hours, actual_hours,
-                   is_billable, billing_status, asset_id, custom_fields, tags,
+                   is_billable, billing_status, asset_id, procedure_kb_article_id,
+                   custom_fields, tags,
                    created_by_id, last_updated_by_id, created_at, updated_at
             FROM tickets
             WHERE tenant_id = $1 AND ticket_number = $2
@@ -435,7 +439,8 @@ impl TicketService {
                    t.sla_due_date, t.first_response_due, t.first_response_at,
                    t.resolution_due, t.resolved_at, t.closed_at,
                    t.scheduled_start, t.scheduled_end, t.estimated_hours, t.actual_hours,
-                   t.is_billable, t.billing_status, t.asset_id, t.custom_fields, t.tags,
+                   t.is_billable, t.billing_status, t.asset_id, t.procedure_kb_article_id,
+                   t.custom_fields, t.tags,
                    t.created_by_id, t.last_updated_by_id, t.created_at, t.updated_at
             FROM tickets t
             WHERE {data_where}
@@ -2558,7 +2563,7 @@ const TICKET_RESPONSE_SELECT: &str = r#"
 SELECT
     t.id, t.ticket_number, t.title, t.description,
     t.source, t.company_id, t.contact_id, t.assigned_to_id,
-    t.asset_id,
+    t.asset_id, t.procedure_kb_article_id,
     t.sla_due_date, t.is_billable, t.billing_status,
     t.estimated_hours, t.actual_hours, t.tags,
     t.closed_at, t.created_at, t.updated_at,
@@ -2579,6 +2584,9 @@ SELECT
     -- detail can render a link directly without a second fetch. NULL
     -- when the ticket has no associated asset.
     a.name AS asset_name,
+    -- PMS-730: same trick for the procedure article, so the ticket
+    -- detail can link straight to "how we perform this change".
+    pka.title AS procedure_kb_article_title,
     COALESCE(TRIM(cu.first_name || ' ' || cu.last_name), '') AS created_by_name
 FROM tickets t
 INNER JOIN ticket_statuses    ts ON t.status_id   = ts.id
@@ -2590,6 +2598,7 @@ INNER JOIN companies          co ON t.company_id  = co.id
 LEFT  JOIN contacts           ct ON t.contact_id  = ct.id
 LEFT  JOIN users              au ON t.assigned_to_id = au.id
 LEFT  JOIN assets             a  ON t.asset_id   = a.id
+LEFT  JOIN kb_articles        pka ON t.procedure_kb_article_id = pka.id
 LEFT  JOIN users              cu ON t.created_by_id  = cu.id
 "#;
 
@@ -2632,6 +2641,7 @@ struct TicketRow {
     is_billable: bool,
     billing_status: String,
     asset_id: Option<Uuid>,
+    procedure_kb_article_id: Option<Uuid>,
     custom_fields: serde_json::Value,
     tags: Vec<String>,
     created_by_id: Uuid,
@@ -2678,6 +2688,7 @@ impl From<TicketRow> for Ticket {
             is_billable: row.is_billable,
             billing_status: BillingStatus::from_str(&row.billing_status).unwrap_or_default(),
             asset_id: row.asset_id,
+            procedure_kb_article_id: row.procedure_kb_article_id,
             custom_fields: row.custom_fields,
             tags: row.tags,
             created_by_id: row.created_by_id,
@@ -2701,6 +2712,7 @@ struct TicketResponseRow {
     contact_id: Option<Uuid>,
     assigned_to_id: Option<Uuid>,
     asset_id: Option<Uuid>,
+    procedure_kb_article_id: Option<Uuid>,
     sla_due_date: Option<chrono::DateTime<Utc>>,
     is_billable: bool,
     billing_status: String,
@@ -2724,6 +2736,7 @@ struct TicketResponseRow {
     contact_name: Option<String>,
     assigned_to_name: Option<String>,
     asset_name: Option<String>,
+    procedure_kb_article_title: Option<String>,
     created_by_name: String,
 }
 
@@ -2771,6 +2784,8 @@ impl From<TicketResponseRow> for TicketResponse {
             tags: r.tags,
             asset_id: r.asset_id,
             asset_name: r.asset_name,
+            procedure_kb_article_id: r.procedure_kb_article_id,
+            procedure_kb_article_title: r.procedure_kb_article_title,
             created_by_name: r.created_by_name,
             created_at: r.created_at,
             updated_at: r.updated_at,

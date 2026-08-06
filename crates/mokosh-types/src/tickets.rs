@@ -341,6 +341,11 @@ pub struct Ticket {
     pub is_billable: bool,
     pub billing_status: BillingStatus,
     pub asset_id: Option<Uuid>,
+    /// PMS-730: KB article describing HOW to perform the work this
+    /// ticket asks for. Distinct from `CreateTicketRequest::source_kb_article_id`,
+    /// which records the article a ticket was opened FROM (see
+    /// migration 099 for why the two are not one column).
+    pub procedure_kb_article_id: Option<Uuid>,
     pub custom_fields: serde_json::Value,
     pub tags: Vec<String>,
     pub created_by_id: Uuid,
@@ -400,6 +405,19 @@ pub struct CreateTicketRequest {
     /// not cascade-delete tickets that referenced it.
     #[serde(default)]
     pub source_kb_article_id: Option<Uuid>,
+    /// PMS-730: KB article describing HOW to perform the requested
+    /// work, attached so whoever picks the ticket up has the procedure
+    /// in hand. Set by the MACD request flow from the submitted change
+    /// type; the agent / portal / intake create paths leave it `None`.
+    ///
+    /// Deliberately NOT `source_kb_article_id`: that column means the
+    /// ticket was opened FROM the article and feeds the PMS-485 "which
+    /// articles drive the most tickets" report, whose whole point is
+    /// finding docs that fail the user. Stamping it here would count a
+    /// working procedure as a documentation failure. Migration 099
+    /// carries the full rationale.
+    #[serde(default)]
+    pub procedure_kb_article_id: Option<Uuid>,
     /// PMS-450: opaque per-tenant Message-Id of the inbound email
     /// that originated this ticket. Set by the email-intake handler;
     /// the regular agent / portal create paths leave it `None`. The
@@ -484,6 +502,17 @@ pub struct TicketResponse {
     /// when the ticket has no associated asset, which is the default.
     pub asset_id: Option<Uuid>,
     pub asset_name: Option<String>,
+    /// PMS-730: the KB article describing HOW to perform the work this
+    /// ticket asks for, returned as id + title so the SPA can render the
+    /// procedure link without a second fetch (same shape as `asset_*`
+    /// above). NULL for every ticket not created from a request form,
+    /// which is the default.
+    ///
+    /// Not to be confused with the PMS-452 `source_kb_article_id`, which
+    /// records the article a ticket was opened FROM and is write-only on
+    /// the create request; see migration 099.
+    pub procedure_kb_article_id: Option<Uuid>,
+    pub procedure_kb_article_title: Option<String>,
     pub created_by_name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
