@@ -49,6 +49,8 @@ pub fn reports_routes(service: ReportsService) -> Router {
         .route("/reports/dashboard", get(dashboard))
         .route("/reports/tickets", get(tickets_report))
         .route("/reports/time", get(time_report))
+        // PMS-732: measured duration per client-request type.
+        .route("/reports/request-types", get(request_types_report))
         .route("/reports/billing", get(billing_report))
         .route("/reports/projects", get(projects_report))
         .route("/reports/clients", get(clients_report))
@@ -394,4 +396,18 @@ fn csv_for_clients(r: &ClientsReportResponse) -> String {
         s.push_str(&format!("{},{}\n", b.label, b.count));
     }
     s
+}
+
+/// PMS-732: how long each client-request type actually takes, measured from
+/// the time tracked against the tickets those requests produced.
+async fn request_types_report(
+    State(s): State<ReportsRouterState>,
+    RequireReports { user: u, .. }: RequireReports,
+    Query(q): Query<DateRange>,
+) -> AppResult<Json<crate::modules::reports::service::RequestTypeDurationsResponse>> {
+    Ok(Json(
+        s.service
+            .request_type_durations(u.tenant(), q.from, q.to)
+            .await?,
+    ))
 }
