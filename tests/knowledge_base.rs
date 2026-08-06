@@ -1360,3 +1360,135 @@ async fn top_ticket_driving_articles_orders_by_count_and_respects_window(pool: P
         "the single row is the top driver (article A)"
     );
 }
+
+/// PMS-730 groundwork: `tickets.procedure_kb_article_id` (migration 099)
+/// attaches the article describing HOW to perform the requested work, and
+/// is a different relation from the PMS-452 `source_kb_article_id` that
+/// records the article a ticket was opened FROM.
+///
+/// Three things are pinned here:
+///
+/// 1. The link round-trips through the API: it is accepted on create and
+///    returned on both create and get, alongside the resolved article
+///    title so the SPA can render the procedure link without a second
+///    fetch (the PMS-344 `asset_id` / `asset_name` shape).
+/// 2. It does NOT feed the PMS-485 "top ticket-driving articles" widget.
+///    That widget counts `source_kb_article_id` to find docs that are
+///    FAILING the user; counting attached procedures there would report a
+///    working runbook as a documentation failure, which is exactly why
+///    migration 099 adds a column instead of reusing 068's.
+/// 3. The FK is `ON DELETE SET NULL`, so retiring an article drops the
+///    linkage and leaves the ticket intact.
+#[sqlx::test]
+async fn procedure_kb_article_round_trips_and_stays_out_of_the_driving_widget(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let article = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Onboard a new starter",
+            "slug": "onboard-a-new-starter",
+            "content": "Create the account, assign the laptop, enrol the phone.",
+            "visibility": "internal",
+            "status": "published",
+        }),
+    )
+    .await;
+    let article_id = article["id"].as_str().expect("article id").to_string();
+
+    // CREATE with the procedure attached. `custom_fields` is sent as `{}`
+    // for the reason documented in tests/tickets.rs: the field defaults to
+    // JSON null, which sqlx encodes as SQL NULL against a NOT NULL column.
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "New starter: Dana Reyes",
+            "company_id": company_id,
+            "procedure_kb_article_id": article_id,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("send create ticket");
+    let create_status = create_resp.status();
+    let create_text = create_resp.text().await.expect("create ticket body");
+    assert!(
+        create_status.is_success(),
+        "create ticket should 2xx, got {create_status} body={create_text}"
+    );
+    let created: serde_json::Value =
+        serde_json::from_str(&create_text).expect("create ticket JSON");
+    let ticket_id = created["id"].as_str().expect("ticket id").to_string();
+    assert_eq!(
+        created["procedure_kb_article_id"].as_str(),
+        Some(article_id.as_str()),
+        "create response must echo the attached procedure article"
+    );
+    assert_eq!(
+        created["procedure_kb_article_title"].as_str(),
+        Some("Onboard a new starter"),
+        "create response must resolve the article title from the JOIN"
+    );
+
+    // GET returns the same pair.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get ticket");
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let fetched: serde_json::Value = get_resp.json().await.expect("get ticket JSON");
+    assert_eq!(
+        fetched["procedure_kb_article_id"].as_str(),
+        Some(article_id.as_str()),
+        "get response must carry the procedure article"
+    );
+    assert_eq!(
+        fetched["procedure_kb_article_title"].as_str(),
+        Some("Onboard a new starter"),
+        "get response must resolve the article title"
+    );
+
+    // The PMS-485 widget counts `source_kb_article_id` only. A ticket
+    // whose ONLY KB link is a procedure must not appear.
+    let widget_resp = app
+        .client
+        .get(app.url("/api/v1/kb/top-ticket-driving-articles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send top-ticket-driving");
+    assert_eq!(widget_resp.status(), reqwest::StatusCode::OK);
+    let widget: serde_json::Value = widget_resp.json().await.expect("widget JSON");
+    assert_eq!(
+        widget.as_array().map(|a| a.len()),
+        Some(0),
+        "an attached procedure is not a ticket-driving article, got {widget:?}"
+    );
+
+    // ON DELETE SET NULL: retiring the article drops the link, not the ticket.
+    sqlx::query("DELETE FROM kb_articles WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&article_id).expect("article uuid"))
+        .execute(&pool)
+        .await
+        .expect("delete the article");
+
+    let after: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT procedure_kb_article_id FROM tickets WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&ticket_id).expect("ticket uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("ticket still exists after the article is deleted");
+    assert!(
+        after.is_none(),
+        "deleting the article must NULL the linkage, got {after:?}"
+    );
+}
