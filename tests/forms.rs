@@ -474,3 +474,83 @@ async fn authoring_is_admin_gated_but_submitting_is_not(pool: PgPool) {
         "an authenticated agent must be able to submit, got {status}"
     );
 }
+
+/// Replacing a field set without touching the rules can strand a rule on a
+/// field that no longer exists. Left unchecked the rule would be silently
+/// inert, so the update path validates whichever rule set is in force against
+/// whichever field set is in force, even when only one of the two changed.
+#[sqlx::test]
+async fn replacing_the_field_set_cannot_strand_an_existing_rule(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let form = create_form(&app, &token, departure_form()).await;
+    let form_id = form["id"].as_str().expect("form id").to_string();
+
+    // Drop `forward_to` while leaving the `required_if` rule that targets it.
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({
+            "fields": [
+                {
+                    "name": "employee_name",
+                    "label": "Employee name",
+                    "field_type": "text",
+                    "is_required": true,
+                    "sort_order": 1
+                },
+                {
+                    "name": "mailbox_handling",
+                    "label": "Mailbox handling",
+                    "field_type": "select",
+                    "is_required": true,
+                    "options": ["forward", "convert to shared"],
+                    "sort_order": 2
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("send patch dropping a rule target");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "dropping a field a rule targets must be rejected, not silently accepted"
+    );
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    assert!(
+        field_codes(&body)
+            .iter()
+            .any(|(f, c)| f == "rules[0].field" && c == "unknown_field"),
+        "the stranded rule must be named, got {:?}",
+        field_codes(&body)
+    );
+
+    // Dropping the field AND the rule together is fine.
+    let ok = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({
+            "rules": [],
+            "fields": [
+                {
+                    "name": "employee_name",
+                    "label": "Employee name",
+                    "field_type": "text",
+                    "is_required": true,
+                    "sort_order": 1
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("send patch dropping both");
+    assert!(
+        ok.status().is_success(),
+        "dropping the field and its rule together is a legitimate edit"
+    );
+}

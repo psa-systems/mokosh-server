@@ -246,23 +246,30 @@ impl FormsService {
     ) -> AppResult<FormDefinitionResponse> {
         let existing = self.get(tenant_id, id).await?;
 
-        // Rules are validated against whichever field set will be in force
-        // after this update, not the one being replaced.
+        // Rules are checked against whichever field set will be in force AFTER
+        // this update, against whichever rule set will be in force after it.
+        // Both halves matter: replacing the field set without touching the
+        // rules can strand a rule on a field that no longer exists, which
+        // would leave it silently inert rather than rejected. So the check
+        // runs whenever EITHER half changes, using the post-update value of
+        // each.
         if let Some(fields) = &req.fields {
             check_field_set(fields)?;
         }
-        if let Some(rules) = &req.rules {
-            match &req.fields {
-                Some(fields) => check_rules(rules, fields)?,
-                None => check_rules_against_names(
-                    rules,
-                    &existing
-                        .fields
-                        .iter()
-                        .map(|f| (f.name.clone(), f.options.clone()))
-                        .collect::<Vec<_>>(),
-                )?,
-            }
+        if req.fields.is_some() || req.rules.is_some() {
+            let names: Vec<(String, Option<Vec<String>>)> = match &req.fields {
+                Some(fields) => fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.options.clone()))
+                    .collect(),
+                None => existing
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.options.clone()))
+                    .collect(),
+            };
+            let rules = req.rules.as_deref().unwrap_or(&existing.rules);
+            check_rules_against_names(rules, &names)?;
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
