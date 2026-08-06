@@ -100,20 +100,31 @@ test:
     cargo test
 
 # Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
-# this omits `--no-deps`, so the compose `postgres` dependency starts; the
-# `server` dev service already exports a usable DATABASE_URL. PMS-267.
+# this omits `--no-deps`, so the compose `postgres` dependency starts. PMS-267.
+#
+# DATABASE_URL is overridden to the superuser connection for the run, because
+# `#[sqlx::test]` creates a database per test. The `server` service's own
+# DATABASE_URL connects as `mokosh_migrator`, which PMS-489 provisions with
+# `LOGIN BYPASSRLS` and deliberately WITHOUT `CREATEDB`, so the suite fails at
+# setup with `42501 permission denied to create database` once those roles
+# exist. CI does not hit this because integration.yml points DATABASE_URL at
+# the postgres superuser; this keeps the recipe a true mirror of it. The
+# override is expanded inside the container so the credential stays in the
+# compose environment rather than reaching the host shell.
 # Run the Postgres-backed integration suite in the dev compose `server` container.
 [group: 'test']
 test-integration: ensure-env
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --tests -- --test-threads=4
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests -- --test-threads=4'
 
 # Verify the demo-critical path only: demo-data seeding (seed_demo) and the
 # tenant import/export round-trip (data_transfer). A fast, targeted subset of
 # `test-integration` for re-checking before building the demo (PMS-677). Same
-# Postgres-backed setup as `test-integration`.
+# Postgres-backed setup as `test-integration`, including its superuser
+# DATABASE_URL override (see the note there for why `mokosh_migrator` cannot
+# run a `#[sqlx::test]` suite).
 [group: 'test']
 verify-demo: ensure-env
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server cargo test --test seed_demo --test data_transfer -- --test-threads=4
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --test seed_demo --test data_transfer -- --test-threads=4'
 
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
