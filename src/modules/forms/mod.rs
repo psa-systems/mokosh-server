@@ -15,7 +15,15 @@
 //! absent because nothing in that list needs them. See migration 100.
 
 mod models;
+#[cfg(feature = "server")]
+mod routes;
+#[cfg(feature = "server")]
+mod service;
 mod validation;
 
 pub use models::*;
+#[cfg(feature = "server")]
+pub use routes::forms_routes;
+#[cfg(feature = "server")]
+pub use service::FormsService;
 pub use validation::validate_submission;
