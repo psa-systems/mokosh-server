@@ -60,6 +60,31 @@ jobs:
         # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
+      - name: Require disk headroom for the link step
+        # PMS-740. `cargo test --tests` links 22 debug test binaries, each
+        # several hundred MB, several concurrently under CARGO_BUILD_JOBS.
+        # When the runner filesystem fills mid-write, `rust-lld` writes its
+        # output through an mmap and takes SIGBUS, which surfaces as:
+        #
+        #   collect2: fatal error: ld terminated with signal 7 [Bus error]
+        #
+        # That reads as a toolchain crash and has twice been triaged as a
+        # code defect it never was (runs #3666 and #3719). Failing here
+        # instead names the real problem in one line, before 20 minutes of
+        # compilation is spent to reach a confusing crash.
+        #
+        # 25G is chosen as roughly twice the peak this suite's link stage has
+        # been observed to need. Raise it if the suite grows rather than
+        # lowering it after a near miss.
+        run: |
+          avail_gb=$(df -P -BG . | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+          echo "Free space on the workspace filesystem: ${avail_gb}G"
+          df -h .
+          if [ "${avail_gb}" -lt 25 ]; then
+            echo "::error::Runner has only ${avail_gb}G free; this suite needs ~25G to link its test binaries. This is a runner-capacity problem, not a problem with the commit under test. See PMS-740."
+            exit 1
+          fi
+
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`
         # binaries) plus the lib unit tests, so new suites are picked up
@@ -73,4 +98,25 @@ jobs:
         # tests/auth.rs (14 tests). 4 in-flight is well within the
         # postgres default max_connections (100); slight wall-clock cost,
         # full reliability.
-        run: cargo test --tests -- --test-threads=4
+        #
+        # The sampler records free space every 5s for the life of the build so
+        # a failure has evidence from DURING the link rather than from after
+        # it, when the space has already been released and the filesystem
+        # looks healthy. That gap is why the first two occurrences could not
+        # be pinned down (PMS-740).
+        run: |
+          ( while :; do df -P -BM . | awk 'NR==2 {gsub(/M/, "", $4); print $4}'; sleep 5; done ) > /tmp/disk-samples.txt 2>/dev/null &
+          sampler=$!
+          set +e
+          cargo test --tests -- --test-threads=4
+          status=$?
+          set -e
+          kill "${sampler}" 2>/dev/null || true
+          if [ -s /tmp/disk-samples.txt ]; then
+            low=$(sort -n /tmp/disk-samples.txt | head -1)
+            echo "Lowest free space seen during the build: ${low}M"
+            if [ "${status}" -ne 0 ] && [ "${low}" -lt 5000 ]; then
+              echo "::error::The build failed with under 5G free at its lowest point, which is the PMS-740 disk-exhaustion signature. Check the linker errors above for 'signal 7 [Bus error]' before treating this as a code failure."
+            fi
+          fi
+          exit "${status}"
