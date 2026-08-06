@@ -14,6 +14,7 @@ pub mod contracts;
 pub mod dashboards;
 pub mod data_transfer;
 pub mod email_intake;
+pub mod forms;
 pub mod invitations;
 pub mod ip_enrich;
 pub mod knowledge_base;
