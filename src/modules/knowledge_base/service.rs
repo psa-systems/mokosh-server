@@ -1038,3 +1038,104 @@ impl From<VersionRow> for KbArticleVersionResponse {
         }
     }
 }
+
+// ============================================================================
+// PMS-732: MEASURED DURATION FOR AN ARTICLE
+// ============================================================================
+
+/// What the tracked time says a request documented by this article actually
+/// takes.
+///
+/// Every measurement field is `Option` and they move together: a request type
+/// nobody has tracked time against reports `null`, not zero. Zero minutes
+/// would be a measurement, and putting a confident "0 min" on an article is
+/// worse than the hand-written guess this is meant to replace.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArticleMeasuredDuration {
+    pub from: chrono::NaiveDate,
+    pub to: chrono::NaiveDate,
+    /// Tickets with tracked time in the period, across every request type
+    /// pointing at this article. The sample the average is drawn from.
+    pub ticket_count: Option<i64>,
+    pub total_minutes: Option<i64>,
+    pub average_minutes: Option<f64>,
+}
+
+/// Default window for the article figure: a trailing 90 days.
+///
+/// Deliberately NOT the calendar month `/reports/request-types` defaults to,
+/// because the two answer different questions. The report is period
+/// accounting ("what did this month cost"), so a calendar boundary is the
+/// right unit. The article figure is an ESTIMATE for the person about to do
+/// the work, and an estimate needs a sample: on the 2nd of the month a
+/// calendar-month window would report "no data" for almost every article,
+/// which is accurate and useless. Both responses state the period they cover,
+/// so neither number is ambiguous.
+const ARTICLE_DURATION_WINDOW_DAYS: i64 = 90;
+
+impl KbService {
+    /// Measured duration for the request types documented by `article_id`.
+    ///
+    /// Walks time_entries -> tickets -> form_submissions -> form_definitions,
+    /// so only tickets that came from a client request submission count. An
+    /// ad-hoc ticket in the same category never entered a request form and is
+    /// excluded, which is what keeps this a measurement of the request type
+    /// rather than of the category.
+    pub async fn measured_duration(
+        &self,
+        tenant_id: TenantId,
+        article_id: Uuid,
+        from: Option<chrono::NaiveDate>,
+        to: Option<chrono::NaiveDate>,
+    ) -> AppResult<ArticleMeasuredDuration> {
+        let today = chrono::Utc::now().date_naive();
+        let (from, to) = (
+            from.unwrap_or_else(|| today - chrono::Duration::days(ARTICLE_DURATION_WINDOW_DAYS)),
+            to.unwrap_or(today),
+        );
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE tenant_id = $1 AND id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("Article".to_string()));
+        }
+
+        let (ticket_count, total_minutes): (i64, Option<i64>) = sqlx::query_as(
+            r#"SELECT COUNT(DISTINCT te.ticket_id),
+                      SUM(te.duration_minutes)::bigint
+               FROM form_definitions d
+               JOIN form_submissions s
+                 ON s.form_definition_id = d.id
+                AND s.tenant_id = d.tenant_id
+                AND s.ticket_id IS NOT NULL
+               JOIN time_entries te
+                 ON te.ticket_id = s.ticket_id
+                AND te.tenant_id = d.tenant_id
+                AND te.date BETWEEN $3 AND $4
+               WHERE d.tenant_id = $1 AND d.kb_article_id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let has_data = ticket_count > 0 && total_minutes.is_some();
+        Ok(ArticleMeasuredDuration {
+            from,
+            to,
+            ticket_count: has_data.then_some(ticket_count),
+            total_minutes: has_data.then(|| total_minutes.unwrap_or(0)),
+            average_minutes: has_data
+                .then(|| total_minutes.unwrap_or(0) as f64 / ticket_count as f64),
+        })
+    }
+}
