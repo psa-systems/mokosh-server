@@ -996,7 +996,12 @@ impl TenantService {
             FROM notification_templates
             WHERE tenant_id = $2
               AND event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached',
-                                 'auth.password_reset', 'auth.welcome')
+                                 'auth.password_reset', 'auth.welcome',
+                                 -- PMS-730: without this a tenant created from
+                                 -- here on would silently send no request-form
+                                 -- link email at all, since the dispatcher is
+                                 -- the only delivery path (migration 097).
+                                 'forms.request_link')
             "#,
         )
         .bind(new_tenant_id)

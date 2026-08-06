@@ -16,12 +16,18 @@
 
 mod models;
 #[cfg(feature = "server")]
+mod public_routes;
+#[cfg(feature = "server")]
+mod request_links;
+#[cfg(feature = "server")]
 mod routes;
 #[cfg(feature = "server")]
 mod service;
 mod validation;
 
 pub use models::*;
+#[cfg(feature = "server")]
+pub use public_routes::public_form_routes;
 #[cfg(feature = "server")]
 pub use routes::forms_routes;
 #[cfg(feature = "server")]

@@ -109,12 +109,41 @@ const FIELD_SELECT: &str = "
 
 #[derive(Clone)]
 pub struct FormsService {
-    db: Database,
+    // `pub(super)` so the PMS-730 request-link half in `super::request_links`
+    // can reach them: field privacy is module-scoped, and that is a sibling
+    // module rather than a descendant of this one.
+    pub(super) db: Database,
+    /// Queues the request-link email (PMS-730). `None` in the tests and in
+    /// any build with no dispatcher wired, where the token is still persisted
+    /// so the link can be resent.
+    pub(super) notifications: Option<crate::modules::notifications::NotificationsService>,
+    /// Turns a submission into a ticket (PMS-730). `None` on the
+    /// definition-only surface, where submissions are stored but not converted.
+    pub(super) tickets: Option<crate::modules::tickets::TicketService>,
 }
 
 impl FormsService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            notifications: None,
+            tickets: None,
+        }
+    }
+
+    /// Wire the PMS-730 request-link flow: emailing a client their link needs
+    /// the dispatcher, and converting their submission needs the ticket
+    /// service.
+    pub fn with_request_links(
+        db: Database,
+        notifications: crate::modules::notifications::NotificationsService,
+        tickets: crate::modules::tickets::TicketService,
+    ) -> Self {
+        Self {
+            db,
+            notifications: Some(notifications),
+            tickets: Some(tickets),
+        }
     }
 
     pub async fn list(
