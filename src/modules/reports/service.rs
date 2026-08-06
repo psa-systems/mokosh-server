@@ -1,7 +1,7 @@
 //! Reports service. Read-only aggregates against the production
 //! schemas; no business logic of its own beyond the SQL.
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use uuid::Uuid;
@@ -595,4 +595,142 @@ pub struct ClientsReportResponse {
     pub warranty_expiring_90d: i64,
     pub contracts_active: i64,
     pub contracts_renewing_90d: i64,
+}
+
+// ============================================================================
+// PMS-732: REQUEST-TYPE DURATIONS
+// ============================================================================
+
+/// Measured duration for one request type over a period.
+///
+/// `total_minutes`, `ticket_count` and `average_minutes` are `Option` on
+/// purpose. A request type with no recorded time in the period reports NULL,
+/// not zero: zero minutes is a measurement ("we did these and they took no
+/// time"), while no data is the absence of one, and the whole point of this
+/// report is to replace hand-written guesses with measurements. Collapsing the
+/// two would put a confident "0 min" estimate on an article nobody has ever
+/// tracked time against.
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestTypeDuration {
+    pub form_definition_id: Uuid,
+    pub form_name: String,
+    pub form_slug: String,
+    pub kb_article_id: Option<Uuid>,
+    pub kb_article_title: Option<String>,
+    /// Tickets from this request type with at least one time entry in the
+    /// period. This is the sample the average is drawn from, not the number of
+    /// requests received.
+    pub ticket_count: Option<i64>,
+    pub total_minutes: Option<i64>,
+    pub average_minutes: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestTypeDurationsResponse {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    pub request_types: Vec<RequestTypeDuration>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RequestTypeDurationRow {
+    form_definition_id: Uuid,
+    form_name: String,
+    form_slug: String,
+    kb_article_id: Option<Uuid>,
+    kb_article_title: Option<String>,
+    ticket_count: i64,
+    total_minutes: Option<i64>,
+}
+
+/// First day of the calendar month containing `today`.
+pub(crate) fn month_start(today: NaiveDate) -> NaiveDate {
+    today.with_day(1).unwrap_or(today)
+}
+
+impl ReportsService {
+    /// Time tracked against tickets that came from a client request
+    /// submission, grouped by the request type that produced them.
+    ///
+    /// The join walks time_entries -> tickets -> form_submissions ->
+    /// form_definitions, so ONLY tickets created from a submission are
+    /// counted. An ad-hoc ticket in the same category never entered a request
+    /// form, has no submission row, and is excluded, which is what keeps the
+    /// measurement about the request type rather than about the category.
+    ///
+    /// Every request type is returned, including ones with no tracked time, so
+    /// the caller can tell "no data" apart from "not a request type".
+    ///
+    /// Default period is the current calendar month, per PMS-732. Note this
+    /// differs from `/reports/time`, which defaults to a trailing 30 days;
+    /// worth reconciling if the inconsistency bites.
+    pub async fn request_type_durations(
+        &self,
+        tenant_id: TenantId,
+        from: Option<NaiveDate>,
+        to: Option<NaiveDate>,
+    ) -> AppResult<RequestTypeDurationsResponse> {
+        let today = chrono::Utc::now().date_naive();
+        let (from, to) = (
+            from.unwrap_or_else(|| month_start(today)),
+            to.unwrap_or(today),
+        );
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, RequestTypeDurationRow>(
+            r#"SELECT d.id                          AS form_definition_id,
+                      d.name                        AS form_name,
+                      d.slug                        AS form_slug,
+                      d.kb_article_id,
+                      a.title                       AS kb_article_title,
+                      COUNT(DISTINCT te.ticket_id)  AS ticket_count,
+                      SUM(te.duration_minutes)::bigint AS total_minutes
+               FROM form_definitions d
+               LEFT JOIN kb_articles a
+                      ON a.id = d.kb_article_id AND a.tenant_id = d.tenant_id
+               LEFT JOIN form_submissions s
+                      ON s.form_definition_id = d.id
+                     AND s.tenant_id = d.tenant_id
+                     AND s.ticket_id IS NOT NULL
+               LEFT JOIN time_entries te
+                      ON te.ticket_id = s.ticket_id
+                     AND te.tenant_id = d.tenant_id
+                     AND te.date BETWEEN $2 AND $3
+               WHERE d.tenant_id = $1
+               GROUP BY d.id, d.name, d.slug, d.kb_article_id, a.title
+               ORDER BY d.name ASC"#,
+        )
+        .bind(tenant_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let request_types = rows
+            .into_iter()
+            .map(|r| {
+                // COUNT over an all-NULL outer join is 0, and SUM is NULL.
+                // Both collapse to "no data" rather than a zero measurement.
+                let has_data = r.ticket_count > 0 && r.total_minutes.is_some();
+                RequestTypeDuration {
+                    form_definition_id: r.form_definition_id,
+                    form_name: r.form_name,
+                    form_slug: r.form_slug,
+                    kb_article_id: r.kb_article_id,
+                    kb_article_title: r.kb_article_title,
+                    ticket_count: has_data.then_some(r.ticket_count),
+                    total_minutes: has_data.then(|| r.total_minutes.unwrap_or(0)),
+                    average_minutes: has_data
+                        .then(|| r.total_minutes.unwrap_or(0) as f64 / r.ticket_count as f64),
+                }
+            })
+            .collect();
+
+        Ok(RequestTypeDurationsResponse {
+            from,
+            to,
+            request_types,
+        })
+    }
 }

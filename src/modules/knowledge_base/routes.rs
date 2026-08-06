@@ -60,6 +60,16 @@ pub fn kb_routes(service: KbService) -> Router {
             "/kb/top-ticket-driving-articles",
             get(list_top_ticket_driving_articles),
         )
+        // PMS-732: what the tracked time says this article's request type
+        // actually takes. A sub-resource rather than a field on the article
+        // response, so it is never a sometimes-populated key: computing it for
+        // every row of a list would join the whole time table, and a field
+        // that is real on GET-one and always null on GET-many is exactly the
+        // shallow-DTO trap docs/dev-docs/codebase-state.md warns about.
+        .route(
+            "/kb/articles/{id}/measured-duration",
+            get(article_measured_duration),
+        )
         // The portal-visible feed lives on the portal tree at
         // `GET /api/v1/portal/kb`, behind `PortalAuthMiddleware` /
         // `RequirePortalAuth` and scoped to the authenticated contact's
@@ -262,6 +272,25 @@ async fn list_top_ticket_driving_articles(
     Ok(Json(
         s.service
             .list_top_ticket_driving_articles(u.tenant(), since, limit)
+            .await?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MeasuredDurationQuery {
+    from: Option<chrono::NaiveDate>,
+    to: Option<chrono::NaiveDate>,
+}
+
+async fn article_measured_duration(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    Path(id): Path<Uuid>,
+    Query(q): Query<MeasuredDurationQuery>,
+) -> AppResult<Json<super::service::ArticleMeasuredDuration>> {
+    Ok(Json(
+        s.service
+            .measured_duration(u.tenant(), id, q.from, q.to)
             .await?,
     ))
 }
