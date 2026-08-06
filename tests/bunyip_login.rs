@@ -954,3 +954,220 @@ async fn suspended_tenant_is_not_placed(pool: PgPool) {
         "suspended tenant is rejected on the bunyip path"
     );
 }
+
+// PMS-635: a user JIT-mirrored before bunyip verified their email lands under
+// the `{sub}@unresolved.invalid` placeholder. `upsert_user_from_oidc` runs on
+// first sight ONLY, so that placeholder used to be permanent: every mokosh-side
+// email to the user was addressed to a reserved non-routable domain (guaranteed
+// bounce, rejected outright by Google Workspace) and `email_verified_at` stayed
+// NULL so no invite could ever match. The row now repairs itself on the first
+// request after bunyip reports the address verified.
+
+/// The row's stored `(email, email_verified_at IS NOT NULL)`.
+async fn email_state(pool: &PgPool, sub: Uuid) -> (String, bool) {
+    sqlx::query_as("SELECT email, email_verified_at IS NOT NULL FROM users WHERE id = $1")
+        .bind(sub)
+        .fetch_one(pool)
+        .await
+        .expect("user row")
+}
+
+#[sqlx::test]
+async fn unverified_first_sight_user_is_mirrored_under_the_placeholder(pool: PgPool) {
+    // The bad-data shape this issue is about, pinned so it stays intentional.
+    let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("david@example.com".to_string()),
+        false,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("placed");
+
+    let (email, verified) = email_state(&pool, sub).await;
+    assert_eq!(email, format!("{sub}@unresolved.invalid"));
+    assert!(
+        !verified,
+        "an unverified address must not stamp verified_at"
+    );
+}
+
+#[sqlx::test]
+async fn userinfo_is_fetched_while_the_row_holds_a_placeholder_email(pool: PgPool) {
+    // The PMS-713 hop is skipped for placed users, which is what made the
+    // placeholder permanent. A placeholder row must keep fetching userinfo:
+    // nothing else can tell mokosh the address was verified since.
+    let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("david@example.com".to_string()),
+        false,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("placed");
+
+    assert!(
+        bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        "a placeholder row must keep fetching userinfo until it is repaired"
+    );
+}
+
+#[sqlx::test]
+async fn placeholder_email_is_repaired_once_bunyip_verifies_it(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    // First sight, unverified -> placeholder.
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("david@example.com".to_string()),
+        false,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("first placement");
+    let (tenant, _) = user_tenant_role(&pool, sub).await;
+
+    // Next request after the user verifies in bunyip -> the row is repaired.
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("david@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("second placement");
+
+    let (email, verified) = email_state(&pool, sub).await;
+    assert_eq!(email, "david@example.com", "the real address is persisted");
+    assert!(verified, "email_verified_at is stamped on repair");
+    let (tenant2, _) = user_tenant_role(&pool, sub).await;
+    assert_eq!(tenant, tenant2, "the repair does not move the user");
+    assert!(
+        !bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        "a repaired row falls back to the no-userinfo fast path"
+    );
+}
+
+#[sqlx::test]
+async fn a_real_address_is_never_overwritten_by_the_repair(pool: PgPool) {
+    // The repair only ever replaces the placeholder. A verified user whose
+    // userinfo later reports a different address keeps the stored one (bunyip
+    // address changes are out of scope here) and an unverified userinfo response
+    // cannot clobber a verified row.
+    let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("real@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("first placement");
+
+    for (email, verified) in [("other@example.com", true), ("attacker@example.com", false)] {
+        place_bunyip_user(
+            &auth,
+            Some(&tenants),
+            Some(&invitations),
+            sub,
+            Some(email.to_string()),
+            verified,
+            None,
+            None,
+            &claims(sub, None),
+        )
+        .await
+        .expect("re-placement");
+        let (stored, stored_verified) = email_state(&pool, sub).await;
+        assert_eq!(stored, "real@example.com", "stored address is untouched");
+        assert!(stored_verified, "verified_at stays stamped");
+    }
+}
+
+#[sqlx::test]
+async fn a_repaired_user_can_then_consume_a_pending_invite(pool: PgPool) {
+    // The downstream consequence of the placeholder: `email_verified_at IS NULL`
+    // plus a placeholder address means the invite gate can never open. After the
+    // repair the invite for the real address is honored.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("invited@example.com".to_string()),
+        false,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("first placement");
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4())
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("invited@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
+
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("invited@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("second placement");
+
+    let (tenant, _role) = user_tenant_role(&pool, sub).await;
+    assert_eq!(tenant, org, "the repaired user joins the inviting tenant");
+    let (email, verified) = email_state(&pool, sub).await;
+    assert_eq!(email, "invited@example.com");
+    assert!(verified);
+}

@@ -285,6 +285,22 @@ fn base_builder(from: &Mailbox, to: Mailbox) -> MessageBuilder {
         .message_id(Some(new_message_id(from)))
 }
 
+/// Reject a recipient in the RFC 2606 reserved `.invalid` TLD, which is
+/// guaranteed never to resolve. Mokosh mints `{sub}@unresolved.invalid`
+/// placeholders for users whose IdP email is not verified yet (PMS-635); handing
+/// one to the relay always bounces, so fail locally with an actionable error
+/// instead of emitting a message that can only be rejected.
+fn reject_undeliverable_recipient(to: &Mailbox) -> AppResult<()> {
+    let domain = to.email.domain().to_ascii_lowercase();
+    if domain == "invalid" || domain.ends_with(".invalid") {
+        return Err(AppError::BadRequest(format!(
+            "refusing to send to the reserved non-routable address {}",
+            to.email
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble the outbound message. `html` decides the shape: `Some` yields a
 /// `multipart/alternative` carrying the plain text first and the HTML second,
 /// `None` a single-part plain-text body. Free function so a unit test can
@@ -319,6 +335,7 @@ impl Mailer for SmtpMailer {
         let to_mailbox: Mailbox = to
             .parse()
             .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
+        reject_undeliverable_recipient(&to_mailbox)?;
         let msg = build_message(&self.from, to_mailbox, subject, text, html)?;
         self.transport.send(msg).await?;
         Ok(())
@@ -488,6 +505,35 @@ mod tests {
             "Message-ID not anchored to the From domain:\n{raw}"
         );
         assert!(raw.contains("Date: "), "missing Date header:\n{raw}");
+    }
+
+    /// PMS-635: a user whose IdP email is unverified is mirrored under
+    /// `{sub}@unresolved.invalid`. That domain can only bounce, so the send is
+    /// refused locally rather than handed to the relay.
+    #[test]
+    fn reserved_invalid_recipients_are_refused() {
+        for addr in [
+            "7fa2b249-6132-4abc-90de-1234567890ab@unresolved.invalid",
+            "someone@UNRESOLVED.INVALID",
+            "someone@invalid",
+        ] {
+            let to: Mailbox = addr.parse().unwrap();
+            assert!(
+                reject_undeliverable_recipient(&to).is_err(),
+                "must refuse the reserved address {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn routable_recipients_are_accepted() {
+        for addr in ["user@recipient.example", "user@invalidation.example.com"] {
+            let to: Mailbox = addr.parse().unwrap();
+            assert!(
+                reject_undeliverable_recipient(&to).is_ok(),
+                "must accept the routable address {addr}"
+            );
+        }
     }
 
     #[test]
