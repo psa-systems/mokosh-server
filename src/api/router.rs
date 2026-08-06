@@ -29,7 +29,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
-use crate::modules::forms::{forms_routes, FormsService};
+use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
@@ -175,8 +175,14 @@ pub fn create_api_router(
     // PMS-448 AC4: admin-authored ticket templates (new-ticket pre-fills).
     let ticket_templates_service = TicketTemplatesService::new(db.clone());
     // PMS-731: form definitions + per-field validation, the substrate the
-    // PMS-730 MACD request flow consumes.
-    let forms_service = FormsService::new(db.clone());
+    // PMS-730 MACD request flow consumes. PMS-730 adds the request-link half,
+    // which needs the dispatcher (to email the client their link) and the
+    // ticket service (to turn their submission into a ticket).
+    let forms_service = FormsService::with_request_links(
+        db.clone(),
+        notifications_service.clone(),
+        TicketService::new(db.clone()),
+    );
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.clone());
     // PMS-453: per-user saved dashboards.
@@ -355,7 +361,7 @@ pub fn create_api_router(
         // PMS-448 AC4: ticket-template CRUD (new-ticket pre-fills).
         .merge(ticket_template_routes(ticket_templates_service))
         // PMS-731: form-definition CRUD + validated submissions.
-        .merge(forms_routes(forms_service))
+        .merge(forms_routes(forms_service, client_origin.clone()))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
@@ -544,8 +550,24 @@ pub fn create_api_router(
     // (including hitting `/` directly in a browser) with a small placeholder
     // page that links the user back to the Mokosh frontend. This keeps
     // api.msp.<tld> from leaking internal route info.
+    // PMS-730: the unauthenticated client-facing request-form surface. Its
+    // own nest, OUTSIDE `AuthMiddleware` and outside the portal tree, because
+    // the caller has no session at all: the magic-link token is the only
+    // identity, and it resolves its own tenant. Same envelope normalization as
+    // the other trees so a 400 here looks like a 400 anywhere else.
+    let public_api = Router::new()
+        .merge(public_form_routes(FormsService::with_request_links(
+            db.clone(),
+            notifications_service.clone(),
+            TicketService::new(db.clone()),
+        )))
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
+
     Router::new()
         .nest("/api/v1", api_v1)
+        .nest("/api/v1/public", public_api)
         .nest("/api/v1/portal", portal_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
         .nest("/api/v1/stripe", stripe_webhooks)

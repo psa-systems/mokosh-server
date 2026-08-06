@@ -12,8 +12,8 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::models::{
-    CreateFormDefinitionRequest, FormDefinitionResponse, FormSubmissionResponse, SubmitFormRequest,
-    UpdateFormDefinitionRequest,
+    CreateFormDefinitionRequest, FormDefinitionResponse, FormSubmissionResponse,
+    IssueRequestLinkRequest, RequestLinkResponse, SubmitFormRequest, UpdateFormDefinitionRequest,
 };
 use super::service::FormsService;
 use crate::modules::auth::{RequireAdminUser, RequireAuth, TenantScoped};
@@ -22,6 +22,9 @@ use crate::utils::error::AppResult;
 #[derive(Clone)]
 struct FormsRouterState {
     service: Arc<FormsService>,
+    /// SPA origin the emailed request link is built from (PMS-730), the same
+    /// base the portal setup link uses.
+    app_url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -32,9 +35,10 @@ struct ListQuery {
     active_only: bool,
 }
 
-pub fn forms_routes(service: FormsService) -> Router {
+pub fn forms_routes(service: FormsService, app_url: String) -> Router {
     let state = FormsRouterState {
         service: Arc::new(service),
+        app_url,
     };
     Router::new()
         .route("/forms", get(list).post(create))
@@ -42,6 +46,12 @@ pub fn forms_routes(service: FormsService) -> Router {
         .route(
             "/forms/{id}/submissions",
             get(list_submissions).post(submit),
+        )
+        // PMS-730: issue a client a magic link to a form, and see which links
+        // have gone out for a company.
+        .route(
+            "/form-request-links",
+            get(list_request_links).post(issue_request_link),
         )
         .with_state(state)
 }
@@ -120,4 +130,40 @@ async fn list_submissions(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<FormSubmissionResponse>>> {
     Ok(Json(s.service.list_submissions(u.tenant(), id).await?))
+}
+
+// PMS-730: sending a client a request link is ordinary agent work (the person
+// handling the account emails the form), so it is RequireAuth rather than
+// admin-gated. Authoring the definition it points at stays admin-only above.
+
+async fn issue_request_link(
+    State(s): State<FormsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Json(body): Json<IssueRequestLinkRequest>,
+) -> AppResult<Json<RequestLinkResponse>> {
+    body.validate()?;
+    Ok(Json(
+        s.service
+            .issue_request_link(u.tenant(), u.id, &body, &s.app_url)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestLinkQuery {
+    /// Narrow to one client. Absent lists every link the tenant has issued,
+    /// newest first.
+    company_id: Option<Uuid>,
+}
+
+async fn list_request_links(
+    State(s): State<FormsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Query(q): Query<RequestLinkQuery>,
+) -> AppResult<Json<Vec<RequestLinkResponse>>> {
+    Ok(Json(
+        s.service
+            .list_request_links(u.tenant(), q.company_id)
+            .await?,
+    ))
 }
