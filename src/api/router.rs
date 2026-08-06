@@ -29,6 +29,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
+use crate::modules::forms::{forms_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
@@ -173,6 +174,9 @@ pub fn create_api_router(
     let workflows_service = WorkflowsService::new(db.clone());
     // PMS-448 AC4: admin-authored ticket templates (new-ticket pre-fills).
     let ticket_templates_service = TicketTemplatesService::new(db.clone());
+    // PMS-731: form definitions + per-field validation, the substrate the
+    // PMS-730 MACD request flow consumes.
+    let forms_service = FormsService::new(db.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.clone());
     // PMS-453: per-user saved dashboards.
@@ -350,6 +354,8 @@ pub fn create_api_router(
         .merge(workflow_routes(workflows_service))
         // PMS-448 AC4: ticket-template CRUD (new-ticket pre-fills).
         .merge(ticket_template_routes(ticket_templates_service))
+        // PMS-731: form-definition CRUD + validated submissions.
+        .merge(forms_routes(forms_service))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
