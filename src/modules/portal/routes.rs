@@ -203,22 +203,50 @@ async fn resolve_login_slug(
     resolve_slug(host_tenant.as_ref(), body_slug).map_err(|_| AppError::Unauthorized)
 }
 
-/// PMS-729: read the Host header, run it through the configured slug
-/// extractor, and (if the label survives) resolve to an active tenant
-/// row. Returns `None` on every negative case (feature disabled, host
-/// miss, malformed label, unknown or inactive tenant) so the caller
-/// only distinguishes `Some` from `None`.
+/// PMS-729: read the request's effective host, run it through the
+/// configured slug extractor, and (if the label survives) resolve to an
+/// active tenant row. Returns `None` on every negative case (feature
+/// disabled, host miss, malformed label, unknown or inactive tenant) so
+/// the caller only distinguishes `Some` from `None`.
+///
+/// Header priority: `X-Forwarded-Host` (first value only) beats `Host`.
+/// Under a reverse proxy that rewrites the `Host` header for its backend
+/// (Dioxus 0.7.7's dev proxy, most CDN edges, some load balancers) the
+/// original browser-visible host lives on `X-Forwarded-Host`; without
+/// this fallback the extractor would see the proxy's own hostname and
+/// fail closed even for a legitimate `{slug}.client.<apex>` request.
+/// Reading the FIRST value on the header respects the RFC 7239 chain
+/// (leftmost is the original client-visible host).
 async fn lookup_host_tenant(
     state: &PortalRouterState,
     headers: &HeaderMap,
 ) -> Result<Option<ResolvedTenant>, AppError> {
-    let Some(host_hdr) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+    let Some(host_hdr) = effective_host(headers) else {
         return Ok(None);
     };
     let Some(slug) = state.host_config.extract_slug(host_hdr) else {
         return Ok(None);
     };
     state.service.resolve_host_tenant(&slug).await
+}
+
+/// PMS-729: pull the browser-visible host out of the request. Prefers
+/// `X-Forwarded-Host` (first value, comma-split) so the dev Dioxus
+/// proxy + production reverse proxies + CDN edges all thread through
+/// consistently. Falls back to the plain `Host` header when the
+/// forwarded one is absent, so a direct client hitting the server also
+/// works.
+fn effective_host(headers: &HeaderMap) -> Option<&str> {
+    if let Some(fwd) = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+    {
+        let first = fwd.split(',').next().unwrap_or(fwd).trim();
+        if !first.is_empty() {
+            return Some(first);
+        }
+    }
+    headers.get(header::HOST).and_then(|v| v.to_str().ok())
 }
 
 /// PMS-729: public branding hint for the SPA login page. Returns 200
