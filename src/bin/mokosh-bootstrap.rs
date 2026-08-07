@@ -73,6 +73,18 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // PMS-729: seed a small portal-login fixture set (three tenants +
+        // one portal contact per tenant, all sharing PORTAL_DEV_PASSWORD)
+        // so a developer can exercise the client-portal login flow at
+        // `http://{slug}.client.localhost:4301/portal/login`. Fail-closes
+        // outside dev/test/development ENVIRONMENT and is idempotent.
+        Some("dev-seed-portal") => match run_dev_seed_portal().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {:#}", e);
+                ExitCode::FAILURE
+            }
+        },
         // PMS-602: normalize existing free-text company industries to the
         // canonical set across all tenants. Re-runnable / no-op-safe.
         Some("normalize-company-industries") => match run_normalize_industries().await {
@@ -106,6 +118,7 @@ SUBCOMMANDS:
     bootstrap-infisical    First-run setup of a fresh Infisical instance.
     qa-seed                Seed the QA walkthrough dataset into a QA-marked tenant (PMS-331).
     qa-teardown            Remove the QA walkthrough dataset from a QA-marked tenant.
+    dev-seed-portal        Seed portal-login fixture tenants + contacts (PMS-729, dev only).
     normalize-company-industries
                            Normalize existing free-text company industries to the canonical
                            set across all tenants (PMS-602). Re-runnable; reports unmapped values.
@@ -221,6 +234,37 @@ async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
 
     println!("{subcommand} complete for tenant {tenant_id}.");
     println!("  {report}");
+    Ok(())
+}
+
+/// PMS-729: seed the client-portal login fixture set (three tenants +
+/// one portal contact each, sharing a fixed dev password). The seeder
+/// itself refuses to run outside `ENVIRONMENT=development|dev|test`, so
+/// no additional guard is needed here.
+async fn run_dev_seed_portal() -> anyhow::Result<()> {
+    use mokosh_server::db::Database;
+
+    let database_url = require_env("DATABASE_URL")?;
+    let db = Database::new(&database_url, &database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to database: {e}"))?;
+
+    // Run migrations before seeding so a fresh dev DB (no `tenants` table
+    // yet) still succeeds. Cheap on a warm DB (sqlx no-ops when the
+    // checksum ledger says every migration already ran) and covers the
+    // "just ran `just dev` once but never let the server complete boot"
+    // case that would otherwise 42P01 on the tenants insert.
+    db.run_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("run migrations before seeding: {e}"))?;
+
+    // The seeder writes tenants + companies + contacts directly and does
+    // not need per-tenant RLS to fire, so it uses the migrator pool.
+    // Bubble the anyhow chain verbatim so `error: {:#}` in main() renders
+    // every layer (sqlx error, then `seed tenant 'X'`, then the top).
+    let report = mokosh_server::modules::seed::portal_dev_seed(db.migrator_pool()).await?;
+
+    print!("{report}");
     Ok(())
 }
 
