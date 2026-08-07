@@ -300,6 +300,16 @@ services:
       # `.localhost` shape). See docs/mokosh-client-login/README.md §14.
       PORTAL_HOST_SUFFIX: ${PORTAL_HOST_SUFFIX:-}
 
+      # PMS-729: CORS allow-list, comma-separated. Empty passes through as
+      # `[CLIENT_ORIGIN]` on the server side (the pre-729 dev default). Set
+      # in .env to `http://localhost:4301,http://*.client.localhost:4301`
+      # when exercising the portal host-derived path in a real browser -
+      # the scheme-locked wildcard lets any `{slug}.client.localhost:4301`
+      # tab POST credentialed calls to the dev server. See
+      # `.env.example` for the exact value and `src/api/cors_origin.rs`
+      # for the predicate.
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:
       - private
