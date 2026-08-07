@@ -382,6 +382,70 @@ async fn host_hint_returns_404_when_feature_disabled(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
+// AC: X-Forwarded-Host takes precedence over Host so a reverse-proxy
+// chain (Dioxus dev proxy, Traefik, cloud LB) that rewrites Host to
+// the backend service name still lets the extractor see the browser's
+// original host. Sends the "wrong" Host and the "right" X-Forwarded-Host,
+// verifies the resolve fires against the forwarded value.
+#[sqlx::test]
+async fn x_forwarded_host_wins_over_host(pool: PgPool) {
+    seed_tenant(&pool, "acme", "Acme MSP", None).await;
+    let app = common::boot_with_portal_host(pool, portal_host_enabled()).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/portal/host"))
+        .header(reqwest::header::HOST, "server:8080")
+        .header("X-Forwarded-Host", "acme.client.a8n.systems")
+        .send()
+        .await
+        .expect("send /portal/host");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("host hint body");
+    assert_eq!(body["name"].as_str(), Some("Acme MSP"));
+}
+
+// AC: `X-Forwarded-Host` allows a comma-separated chain (RFC 7239); the
+// extractor reads the LEFTMOST value (the original browser host before
+// any of the forwarded hops rewrote it).
+#[sqlx::test]
+async fn x_forwarded_host_reads_leftmost_of_a_chain(pool: PgPool) {
+    seed_tenant(&pool, "acme", "Acme MSP", None).await;
+    let app = common::boot_with_portal_host(pool, portal_host_enabled()).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/portal/host"))
+        .header(reqwest::header::HOST, "server:8080")
+        .header(
+            "X-Forwarded-Host",
+            "acme.client.a8n.systems, edge-1.internal, lb.internal",
+        )
+        .send()
+        .await
+        .expect("send /portal/host");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+// AC: an empty X-Forwarded-Host falls through to Host (defensive; some
+// proxies send an empty header when they can't determine the original
+// host, and we want the extractor to still work in that case).
+#[sqlx::test]
+async fn empty_x_forwarded_host_falls_back_to_host(pool: PgPool) {
+    seed_tenant(&pool, "acme", "Acme MSP", None).await;
+    let app = common::boot_with_portal_host(pool, portal_host_enabled()).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/portal/host"))
+        .header(reqwest::header::HOST, "acme.client.a8n.systems")
+        .header("X-Forwarded-Host", "")
+        .send()
+        .await
+        .expect("send /portal/host");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
 // AC: a Host that ends with the suffix but carries a malformed label
 // (invalid characters, leading/trailing hyphen, empty label) is treated
 // exactly like an unknown host: 404 on `/portal/host`, 401 on
