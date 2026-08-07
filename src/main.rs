@@ -582,6 +582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         geoip,
         ip_enrich,
         config.login_approval_enabled,
+        mokosh_server::modules::portal::PortalHostConfig::from_env(),
     );
     let router = psa_router;
 

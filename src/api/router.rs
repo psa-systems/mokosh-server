@@ -1,7 +1,7 @@
 //! API router configuration
 
 use axum::{
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, Method, StatusCode},
     middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -13,6 +13,8 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
+
+use super::cors_origin::CorsOriginMatcher;
 
 use crate::db::Database;
 use crate::modules::approvals::{approval_routes, ApprovalsService};
@@ -90,15 +92,14 @@ pub fn create_api_router(
     // PMS-658: master switch for the suspicious-login notify-and-approve gate,
     // from LOGIN_APPROVAL_ENABLED in main.rs. Off by default (can block logins).
     login_approval_enabled: bool,
+    // PMS-729: host-to-tenant resolution config for the client portal. Built
+    // by the caller (main.rs from `PORTAL_HOST_SUFFIX`, integration tests
+    // from an explicit suffix so they do not have to mutate process env). An
+    // empty suffix keeps the feature off; the login handler then reads the
+    // slug from the body exactly like the pre-PMS-729 path.
+    portal_host_config: crate::modules::portal::PortalHostConfig,
 ) -> Router {
-    let cors_origin_values: Vec<HeaderValue> = cors_origins
-        .iter()
-        .map(|o| {
-            o.parse::<HeaderValue>().unwrap_or_else(|e| {
-                panic!("CORS_ORIGIN entry {o:?} is not a valid header value: {e}")
-            })
-        })
-        .collect();
+    let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
 
     // Create services. NotificationsService is constructed first so a
@@ -451,11 +452,6 @@ pub fn create_api_router(
         notifications_service.clone(),
         client_origin.clone(),
     );
-    // PMS-729: host-to-tenant resolution config, read once at router
-    // build time from the `PORTAL_HOST_SUFFIX` env. Empty suffix (dev
-    // default) disables the feature; the login handler then reads the
-    // slug from the body exactly like before.
-    let portal_host_config = crate::modules::portal::PortalHostConfig::from_env();
     let portal_api = Router::new()
         .route("/health", get(health_check))
         .merge(portal_routes(
@@ -488,8 +484,17 @@ pub fn create_api_router(
     // The list comes from the CORS_ORIGIN env var (comma-separated). The
     // bunyip apex is included so the SaaS shell can call mokosh endpoints
     // in the future without losing credentials.
+    //
+    // PMS-729: entries starting with `https://*.` or `http://*.` are
+    // scheme-locked wildcard suffixes: they match any Origin whose scheme
+    // matches and whose host ends with the suffix (dot preserved). Used for
+    // the client-portal wildcard host `{slug}.client.<apex>` so per-tenant
+    // portal origins do not each need their own explicit CORS_ORIGIN entry.
+    // See `CorsOriginMatcher::from_entries` for the parse rules.
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(cors_origin_values))
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            cors_matcher.matches(origin.as_bytes())
+        }))
         .allow_methods([
             Method::GET,
             Method::POST,

@@ -105,7 +105,19 @@ pub fn dec(s: &str) -> Decimal {
 #[allow(dead_code)]
 pub async fn boot(pool: PgPool) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None, None).await
+    boot_with_db(pool, db, None, None, portal_host_disabled()).await
+}
+
+/// PMS-729: bring up the API with a specific `PortalHostConfig` (built
+/// from an explicit suffix, not the process env), so a portal-host test
+/// can exercise the host-to-tenant resolution path without mutating env.
+#[allow(dead_code)]
+pub async fn boot_with_portal_host(
+    pool: PgPool,
+    portal_host_config: mokosh_server::modules::portal::PortalHostConfig,
+) -> TestApp {
+    let db = Database::from_pool(pool.clone());
+    boot_with_db(pool, db, None, None, portal_host_config).await
 }
 
 /// PMS-698: bring up the API with the bunyip Resource-Server verifier mounted,
@@ -116,7 +128,15 @@ pub async fn boot_with_bunyip(
     verifier: mokosh_server::modules::auth::oidc_rs::Verifier,
 ) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None, Some(verifier)).await
+    boot_with_db(pool, db, None, Some(verifier), portal_host_disabled()).await
+}
+
+/// The default `PortalHostConfig` for tests that do not care about the
+/// PMS-729 host-derived tenant path: feature off (empty suffix), so every
+/// request needs a `tenant_slug` in the body exactly like pre-PMS-729.
+#[allow(dead_code)]
+fn portal_host_disabled() -> mokosh_server::modules::portal::PortalHostConfig {
+    mokosh_server::modules::portal::PortalHostConfig::from_suffix("")
 }
 
 /// PMS-285: bring up the API with the request-serving connection running as an
@@ -133,7 +153,7 @@ pub async fn boot_with_bunyip(
 pub async fn boot_rls(pool: PgPool) -> TestApp {
     let app_pool = build_app_role_pool(&pool).await;
     let db = Database::from_pools(app_pool.clone(), pool.clone());
-    boot_with_db(pool, db, Some(app_pool), None).await
+    boot_with_db(pool, db, Some(app_pool), None, portal_host_disabled()).await
 }
 
 /// Create a per-test `NOSUPERUSER NOBYPASSRLS` role, grant it the same
@@ -190,6 +210,7 @@ async fn boot_with_db(
     db: Database,
     app_pool: Option<PgPool>,
     bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
+    portal_host_config: mokosh_server::modules::portal::PortalHostConfig,
 ) -> TestApp {
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
@@ -235,9 +256,10 @@ async fn boot_with_db(
         // for the constructor; specs that hit the webhook build their own
         // signature against the same secret.
         b"test-bunyip-webhook-secret".to_vec(),
-        None,  // PMS-657: no geoip DB in tests; login-location alerts disabled
+        None,               // PMS-657: no geoip DB in tests; login-location alerts disabled
         None,  // BUNYIP-475: no IP2Proxy DB in tests; enrichment lookup reports nothing
         false, // PMS-658: login-approval gate off in the default test router
+        portal_host_config, // PMS-729: caller supplies the portal host config
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

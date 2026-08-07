@@ -46,8 +46,10 @@ impl PortalHostConfig {
         Self { suffix }
     }
 
-    /// Build a config from an explicit suffix. Test-only helper.
-    #[cfg(test)]
+    /// Build a config from an explicit suffix. Used by integration tests
+    /// (which build the router without going through the process env) and
+    /// by callers that want to override the env for a specific instance.
+    /// The empty string keeps the feature disabled, exactly like unset env.
     pub fn from_suffix(suffix: impl Into<String>) -> Self {
         Self {
             suffix: suffix.into().to_ascii_lowercase(),
