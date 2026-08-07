@@ -288,6 +288,18 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
 
+      # PMS-729: portal host-to-tenant resolution suffix. Empty by
+      # default so `just dev` behaves exactly like it did pre-729 - the
+      # portal login handler reads `tenant_slug` out of the body. Set
+      # `PORTAL_HOST_SUFFIX=.client.localhost` in .env to exercise the
+      # host-derived path locally: browsers resolve any *.localhost host
+      # to 127.0.0.1 without /etc/hosts, so
+      # `http://acme.client.localhost:4301/api/v1/portal/host` reaches
+      # the mokosh-server directly (Traefik on staging listens on
+      # `${USER}-mokosh-api.a8n.run` and does not participate in the
+      # `.localhost` shape). See docs/mokosh-client-login/README.md §14.
+      PORTAL_HOST_SUFFIX: ${PORTAL_HOST_SUFFIX:-}
+
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:
       - private
