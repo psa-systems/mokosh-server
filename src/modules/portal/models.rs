@@ -49,16 +49,23 @@ impl CurrentContact {
     }
 }
 
-/// `POST /api/v1/portal/auth/login` request body. `tenant_slug` is
-/// required because `contacts.email` is only unique within a tenant.
-/// A portal hosted at e.g. `portal.acme.example.com` should supply the
-/// slug from the subdomain client-side; we don't strip it from the
-/// Host header here because the host-to-tenant mapping is deployment
-/// specific.
-#[derive(Debug, Clone, Deserialize, Validate)]
+/// `POST /api/v1/portal/auth/login` request body.
+///
+/// `tenant_slug` was mandatory before PMS-729; it is now optional so the
+/// login handler can resolve the tenant from the Host header when the
+/// portal is served under `{slug}.client.<apex>`. The resolution policy
+/// (host-only / body-only / both-must-match / neither-fails-closed) lives
+/// on [`super::host_tenant::resolve_slug`]. Legacy `?tenant=X` links that
+/// still fill this field continue to authenticate.
+#[derive(Debug, Clone, Deserialize, Validate, Default)]
 pub struct PortalLoginRequest {
-    #[validate(length(min = 1, max = 100, message = "tenant_slug is required"))]
-    pub tenant_slug: String,
+    /// Deprecated for new clients; kept for the legacy `?tenant=` path.
+    /// Missing OR present-and-matching-host both authenticate; a body
+    /// slug that disagrees with the host slug fails closed with the
+    /// wrong-password envelope (PMS-729 AC).
+    #[serde(default)]
+    #[validate(length(max = 100, message = "tenant_slug too long"))]
+    pub tenant_slug: Option<String>,
     #[validate(email(message = "Invalid email address"))]
     pub email: String,
     #[validate(length(min = 1, message = "Password is required"))]
@@ -112,6 +119,31 @@ pub struct PortalSetupPasswordRequest {
     pub token: String,
     #[validate(length(min = 8, message = "Password must be at least 8 characters"))]
     pub password: String,
+}
+
+/// PMS-729: an active tenant resolved from the request Host by
+/// [`super::host_tenant::PortalHostConfig::extract_slug`] +
+/// [`super::service::PortalAuthService::resolve_host_tenant`]. Carries
+/// just enough for the login policy check + the branding-hint response.
+#[derive(Debug, Clone)]
+pub struct ResolvedTenant {
+    pub tenant_id: Uuid,
+    pub slug: String,
+    pub display_name: String,
+    pub logo_url: Option<String>,
+}
+
+/// PMS-729: response body for `GET /api/v1/portal/host`. Returns the
+/// active tenant's display name + logo URL so the SPA login page can
+/// paint MSP-owned branding above the credential fields before a
+/// session exists. Fail-closed: an unknown or malformed host returns
+/// `404 Not Found` with an empty body so the endpoint cannot be used to
+/// enumerate live MSPs.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalHostHint {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo_url: Option<String>,
 }
 
 /// JWT claim shape for portal access tokens. Kept separate from the

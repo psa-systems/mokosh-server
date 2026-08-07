@@ -7,12 +7,14 @@
 //! [`portal_auth_middleware`] / [`RequirePortalAuth`] for the session
 //! plumbing.
 
+pub mod host_tenant;
 pub mod middleware;
 pub mod models;
 pub mod rate_limit;
 pub mod routes;
 pub mod service;
 
+pub use host_tenant::PortalHostConfig;
 pub use middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 pub use models::*;
 pub use routes::portal_routes;

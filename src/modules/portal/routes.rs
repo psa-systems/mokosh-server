@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -18,12 +18,13 @@ use axum::{
 use uuid::Uuid;
 use validator::Validate;
 
+use super::host_tenant::{resolve_slug, PortalHostConfig};
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
-    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalLoginRequest,
-    PortalSetupPasswordRequest,
+    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalHostHint,
+    PortalLoginRequest, PortalSetupPasswordRequest, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -54,6 +55,12 @@ pub struct PortalRouterState {
     /// PMS-711: SPA origin the invoice "Pay Now" success / cancel return URLs
     /// are built from (the base of the portal invoice pages).
     pub portal_origin: String,
+    /// PMS-729: host-to-tenant resolution config. Drives the `PortalHostConfig`
+    /// extract_slug call inside the login handler and the `/host` branding
+    /// endpoint. When the underlying suffix is empty (feature disabled),
+    /// every host lookup returns `None` and the handlers fall back to the
+    /// legacy body `tenant_slug` path.
+    pub host_config: PortalHostConfig,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
@@ -66,6 +73,7 @@ pub fn portal_routes(
     billing: BillingService,
     quotes: QuotesService,
     portal_origin: String,
+    host_config: PortalHostConfig,
 ) -> Router {
     let state = PortalRouterState {
         service: Arc::new(service.clone()),
@@ -76,6 +84,7 @@ pub fn portal_routes(
         login_limiter: PortalLoginLimiter::new(),
         decision_limiter: PortalDecisionLimiter::new(),
         portal_origin,
+        host_config,
     };
     let mw = PortalAuthMiddleware::new(service);
 
@@ -86,6 +95,12 @@ pub fn portal_routes(
         // (PMS-136). No auth: the customer is not yet a logged-in contact;
         // the single-use token IS the credential proving they own the link.
         .route("/auth/setup-password", post(setup_password))
+        // PMS-729: public branding hint. The SPA login page calls this on
+        // mount to decide (a) whether to hide the slug input and (b) which
+        // MSP name + logo to paint above the credential fields. Returns
+        // 404 with an empty body on any resolution miss so the endpoint
+        // cannot be used to enumerate live MSPs.
+        .route("/host", get(host_hint))
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
         .route("/auth/me", get(me))
@@ -129,17 +144,26 @@ pub fn portal_routes(
 /// tower middleware cannot read the JSON body without buffering it. A
 /// persistent failed-attempt lockout lives in `PortalAuthService::login`
 /// and surfaces here as `AppError::RateLimited` (429) as well.
+///
+/// PMS-729: resolves the tenant slug from the request Host FIRST, then
+/// gates against the body's optional `tenant_slug`. Missing or
+/// mismatching pairs collapse to `AppError::Unauthorized` so the
+/// response envelope is byte-identical to a wrong-password rejection and
+/// the endpoint cannot be used to enumerate MSPs.
 async fn login(
     State(state): State<PortalRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<PortalLoginRequest>,
 ) -> Result<Response, AppError> {
     request.validate()?;
 
-    if let Err(retry_after) =
-        state
-            .login_limiter
-            .check(addr.ip(), &request.tenant_slug, &request.email)
+    let resolved_slug =
+        resolve_login_slug(&state, &headers, request.tenant_slug.as_deref()).await?;
+
+    if let Err(retry_after) = state
+        .login_limiter
+        .check(addr.ip(), &resolved_slug, &request.email)
     {
         let mut resp = (
             StatusCode::TOO_MANY_REQUESTS,
@@ -158,8 +182,60 @@ async fn login(
         return Ok(resp);
     }
 
-    let resp = state.service.login(&request).await?;
+    let resp = state
+        .service
+        .login(&resolved_slug, &request.email, &request.password)
+        .await?;
     Ok(Json(resp).into_response())
+}
+
+/// PMS-729 helper: pull the resolved slug out of the (host, body) pair.
+/// Any failure mode collapses to `AppError::Unauthorized` so the caller
+/// treats it exactly like a wrong password. Split out so the login
+/// handler stays readable and the `/host` endpoint can reuse the
+/// host-lookup half.
+async fn resolve_login_slug(
+    state: &PortalRouterState,
+    headers: &HeaderMap,
+    body_slug: Option<&str>,
+) -> Result<String, AppError> {
+    let host_tenant = lookup_host_tenant(state, headers).await?;
+    resolve_slug(host_tenant.as_ref(), body_slug).map_err(|_| AppError::Unauthorized)
+}
+
+/// PMS-729: read the Host header, run it through the configured slug
+/// extractor, and (if the label survives) resolve to an active tenant
+/// row. Returns `None` on every negative case (feature disabled, host
+/// miss, malformed label, unknown or inactive tenant) so the caller
+/// only distinguishes `Some` from `None`.
+async fn lookup_host_tenant(
+    state: &PortalRouterState,
+    headers: &HeaderMap,
+) -> Result<Option<ResolvedTenant>, AppError> {
+    let Some(host_hdr) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return Ok(None);
+    };
+    let Some(slug) = state.host_config.extract_slug(host_hdr) else {
+        return Ok(None);
+    };
+    state.service.resolve_host_tenant(&slug).await
+}
+
+/// PMS-729: public branding hint for the SPA login page. Returns 200
+/// `{name, logo_url}` when the Host resolves to an active tenant; 404
+/// with an empty body on every other outcome so an unknown or malformed
+/// host is indistinguishable from a legitimately-not-portal host.
+async fn host_hint(
+    State(state): State<PortalRouterState>,
+    headers: HeaderMap,
+) -> Result<Json<PortalHostHint>, AppError> {
+    let tenant = lookup_host_tenant(&state, &headers)
+        .await?
+        .ok_or(AppError::NotFound("portal host".to_string()))?;
+    Ok(Json(PortalHostHint {
+        name: tenant.display_name,
+        logo_url: tenant.logo_url,
+    }))
 }
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {

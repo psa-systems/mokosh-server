@@ -451,6 +451,11 @@ pub fn create_api_router(
         notifications_service.clone(),
         client_origin.clone(),
     );
+    // PMS-729: host-to-tenant resolution config, read once at router
+    // build time from the `PORTAL_HOST_SUFFIX` env. Empty suffix (dev
+    // default) disables the feature; the login handler then reads the
+    // slug from the body exactly like before.
+    let portal_host_config = crate::modules::portal::PortalHostConfig::from_env();
     let portal_api = Router::new()
         .route("/health", get(health_check))
         .merge(portal_routes(
@@ -460,6 +465,7 @@ pub fn create_api_router(
             portal_billing_service,
             portal_quotes_service,
             client_origin.clone(),
+            portal_host_config,
         ))
         // PMS-483: portal-side ticket-note attachments. Same routes as
         // the agent surface, but behind `RequirePortalAuth` and

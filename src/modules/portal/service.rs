@@ -33,14 +33,24 @@ impl PortalAuthService {
         }
     }
 
-    /// Verify (tenant_slug, email, password) against the contacts table
-    /// and issue a portal JWT on success. Returns 401 on any credential
+    /// Verify (slug, email, password) against the contacts table and
+    /// issue a portal JWT on success. Returns 401 on any credential
     /// failure so the surface stays enumeration-resistant, and 429
     /// (`AppError::RateLimited`) when the account is in a lockout window
     /// from repeated failures (PMS-501).
+    ///
+    /// PMS-729: `slug` is now a separate argument. The route handler
+    /// resolves it up front (host-derived or body-supplied, gated by
+    /// [`super::host_tenant::resolve_slug`]) so this method never has to
+    /// know about the request shape.
     #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip_all)]
-    pub async fn login(&self, request: &PortalLoginRequest) -> AppResult<PortalLoginResponse> {
+    pub async fn login(
+        &self,
+        slug: &str,
+        email: &str,
+        password: &str,
+    ) -> AppResult<PortalLoginResponse> {
         let row: Option<(
             Uuid,
             Uuid,
@@ -61,8 +71,8 @@ impl PortalAuthService {
                 WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
                 "#,
         )
-        .bind(&request.tenant_slug)
-        .bind(&request.email)
+        .bind(slug)
+        .bind(email)
         // SAFETY (PMS-285): the portal runs on a separate `contacts`-row identity
         // plane (`CurrentContact`), not the `users`/`AuthState` plane, and
         // per-user RLS isolation is deliberately NOT applied to portal contacts
@@ -103,7 +113,7 @@ impl PortalAuthService {
         let Some(hash) = hash else {
             return Err(AppError::Unauthorized);
         };
-        if !verify_password(&request.password, &hash)? {
+        if !verify_password(password, &hash)? {
             // PMS-501: record the failure and (re)arm the lockout window.
             self.register_failed_login(id).await?;
             return Err(AppError::Unauthorized);
@@ -155,6 +165,46 @@ impl PortalAuthService {
                 last_name,
             },
         })
+    }
+
+    /// PMS-729: look up a tenant by slug for the host-to-tenant
+    /// resolution path. Returns `Some` when the slug matches an active
+    /// row; `None` on miss or inactive (fail-closed). The login handler
+    /// and the `/host` branding endpoint both call this after the
+    /// [`super::host_tenant::PortalHostConfig::extract_slug`] filter has
+    /// validated the label shape.
+    ///
+    /// Reads `tenants.branding` as JSONB and pulls a `logo_url` key out
+    /// of it when present. The full branding blob stays private; only
+    /// the two fields the login page renders are exposed.
+    ///
+    /// SAFETY (PMS-285): pre-auth cross-tenant read, same posture as the
+    /// login lookup above. Runs on the migrator pool; `tenants` is RLS-
+    /// covered so the app pool would fail this closed.
+    #[tracing::instrument(skip_all)]
+    pub async fn resolve_host_tenant(&self, slug: &str) -> AppResult<Option<ResolvedTenant>> {
+        let row: Option<(Uuid, String, String, serde_json::Value)> = sqlx::query_as(
+            r#"
+                SELECT id, slug, name, branding
+                FROM tenants
+                WHERE slug = $1 AND status = 'active'
+                "#,
+        )
+        .bind(slug)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        Ok(
+            row.map(|(tenant_id, slug, display_name, branding)| ResolvedTenant {
+                tenant_id,
+                slug,
+                display_name,
+                logo_url: branding
+                    .get("logo_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            }),
+        )
     }
 
     /// PMS-501: persist one more failed portal login for `contact_id` and
