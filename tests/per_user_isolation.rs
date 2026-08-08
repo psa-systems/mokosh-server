@@ -72,7 +72,7 @@ async fn provision_actor(pool: &PgPool, app: &common::TestApp, label: &str) -> A
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let user_id = Uuid::new_v4();
     let tenant_id = svc
-        .ensure_personal_tenant(user_id)
+        .ensure_personal_tenant(user_id, None, None)
         .await
         .expect("provision personal tenant");
     let email = format!("{label}@example.com");

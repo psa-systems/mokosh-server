@@ -31,6 +31,62 @@ fn seed_source_tenant_id() -> AppResult<Uuid> {
     }
 }
 
+/// Name a personal tenant gets when nothing about its owner is usable.
+///
+/// PMS-743: this used to be the name EVERY personal tenant got. It is
+/// customer-facing (it renders in the client request-form email subject and in
+/// invitation mail), so eight staging tenants meant eight MSPs whose clients
+/// received mail from "My workspace". Now it is the last resort.
+const DEFAULT_PERSONAL_TENANT_NAME: &str = "My workspace";
+
+/// `tenants.name` is `VARCHAR(255)` (migration 002), and `UpdateTenantRequest`
+/// validates the same bound, so a derived name is truncated to fit rather than
+/// failing the insert that provisions someone's first login.
+const MAX_TENANT_NAME_LEN: usize = 255;
+
+/// Display name for a freshly provisioned personal tenant (PMS-743).
+///
+/// Order of preference, and why:
+///
+/// 1. the IdP's `given_name`, which is a real name the owner chose;
+/// 2. the first name synthesised from a real email address, reusing
+///    [`synthetic_name_from_email`] so a UUID local-part or mokosh's own
+///    `@unresolved.invalid` placeholder is rejected by logic that is already
+///    tested, rather than by a second copy of it here;
+/// 3. [`DEFAULT_PERSONAL_TENANT_NAME`].
+///
+/// Falling back is deliberate rather than clever: a tenant named "Mokosh
+/// User's workspace" or "7fa2b249's workspace" reads worse to a client than
+/// the honest generic, and the owner can rename it in Settings either way.
+///
+/// The possessive is always `'s`, including after a trailing s ("Chris's
+/// workspace"), which is the common style and avoids branching on spelling.
+fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String {
+    let from_given = given_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let from_email = || {
+        let first = crate::modules::auth::synthetic_name_from_email(email?).0;
+        // The helper returns its own fallback when it could not derive
+        // anything; that is a signal, not a name.
+        (first != crate::modules::auth::SYNTHETIC_NAME_FALLBACK.0 && !first.is_empty())
+            .then_some(first)
+    };
+
+    match from_given.or_else(from_email) {
+        Some(owner) => {
+            let mut name = format!("{owner}'s workspace");
+            if name.chars().count() > MAX_TENANT_NAME_LEN {
+                name = name.chars().take(MAX_TENANT_NAME_LEN).collect();
+            }
+            name
+        }
+        None => DEFAULT_PERSONAL_TENANT_NAME.to_string(),
+    }
+}
+
 /// Tenant management service
 #[derive(Clone)]
 pub struct TenantService {
@@ -239,8 +295,18 @@ impl TenantService {
     /// same sequences + default config (`copy_default_config`) a normally
     /// created tenant does, so it works out of the box; the owning user is
     /// JIT-mirrored separately.
+    ///
+    /// PMS-743: `given_name` and `email` are the IdP's, passed straight through
+    /// from the placement path, and name the tenant. They are optional because
+    /// neither claim is guaranteed; see [`personal_tenant_name`] for what each
+    /// absence costs.
     #[tracing::instrument(skip_all, fields(owner_id = %owner_id))]
-    pub async fn ensure_personal_tenant(&self, owner_id: Uuid) -> AppResult<Uuid> {
+    pub async fn ensure_personal_tenant(
+        &self,
+        owner_id: Uuid,
+        given_name: Option<&str>,
+        email: Option<&str>,
+    ) -> AppResult<Uuid> {
         if let Some(id) = self.personal_tenant_for_owner(owner_id).await? {
             return Ok(id);
         }
@@ -260,7 +326,7 @@ impl TenantService {
                RETURNING id"#,
         )
         .bind(tenant_id)
-        .bind("My workspace")
+        .bind(personal_tenant_name(given_name, email))
         .bind(&slug)
         .bind(owner_id)
         // SAFETY (PMS-285): personal-tenant provisioning runs on the pre-session
@@ -1075,5 +1141,73 @@ impl From<TenantRow> for Tenant {
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_real_given_name_wins() {
+        assert_eq!(
+            personal_tenant_name(Some("Long"), Some("long@example.com")),
+            "Long's workspace"
+        );
+    }
+
+    #[test]
+    fn a_missing_given_name_falls_back_to_the_email() {
+        assert_eq!(
+            personal_tenant_name(None, Some("dana.reid@example.com")),
+            "Dana's workspace"
+        );
+    }
+
+    #[test]
+    fn a_blank_given_name_is_treated_as_absent() {
+        // The IdP can return an empty string rather than omitting the claim;
+        // "'s workspace" would be worse than the generic.
+        assert_eq!(
+            personal_tenant_name(Some("   "), Some("dana@example.com")),
+            "Dana's workspace"
+        );
+    }
+
+    #[test]
+    fn an_unusable_owner_keeps_the_generic_name() {
+        // mokosh's own JIT placeholder address, and a UUID local-part: naming a
+        // tenant "Mokosh User's workspace" or "7fa2b249's workspace" in front of
+        // a client is worse than saying nothing about the owner.
+        let sub = "7fa2b249-6132-4abc-90de-1f2e3d4c5b6a";
+        assert_eq!(
+            personal_tenant_name(None, Some(&format!("{sub}@unresolved.invalid"))),
+            DEFAULT_PERSONAL_TENANT_NAME
+        );
+        assert_eq!(
+            personal_tenant_name(None, Some(&format!("{sub}@example.com"))),
+            DEFAULT_PERSONAL_TENANT_NAME
+        );
+        assert_eq!(
+            personal_tenant_name(None, None),
+            DEFAULT_PERSONAL_TENANT_NAME
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_truncated_to_the_column_width() {
+        // Provisioning runs on someone's first login; a name too long for
+        // VARCHAR(255) must not be the thing that fails it.
+        let long = "a".repeat(400);
+        let name = personal_tenant_name(Some(&long), None);
+        assert_eq!(name.chars().count(), MAX_TENANT_NAME_LEN);
+    }
+
+    #[test]
+    fn a_trailing_s_still_takes_an_apostrophe_s() {
+        assert_eq!(
+            personal_tenant_name(Some("Chris"), None),
+            "Chris's workspace"
+        );
     }
 }

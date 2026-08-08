@@ -84,7 +84,7 @@ async fn invited_user_lands_in_inviting_tenant_as_admin(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations
@@ -293,7 +293,7 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations
@@ -796,7 +796,7 @@ async fn userinfo_is_fetched_when_a_pending_invite_matches(pool: PgPool) {
     .expect("first placement");
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations
@@ -1138,7 +1138,7 @@ async fn a_repaired_user_can_then_consume_a_pending_invite(pool: PgPool) {
     .expect("first placement");
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations

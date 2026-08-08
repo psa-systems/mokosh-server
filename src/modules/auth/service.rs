@@ -3226,9 +3226,15 @@ pub fn is_unresolved_placeholder_email(email: &str) -> bool {
 /// which then surfaced on the profile page as a UUID-fragment name.
 /// The fallback name is meant to be a clearly-placeholder string the
 /// user is expected to overwrite from the profile screen.
+/// The `(first, last)` this helper returns when it could not derive anything
+/// real. PMS-743 reads it so tenant naming can tell "derived from the user"
+/// from "gave up", rather than naming a tenant after the placeholder.
 #[cfg(feature = "server")]
-fn synthetic_name_from_email(email: &str) -> (String, String) {
-    const FALLBACK: (&str, &str) = ("Mokosh", "User");
+pub(crate) const SYNTHETIC_NAME_FALLBACK: (&str, &str) = ("Mokosh", "User");
+
+#[cfg(feature = "server")]
+pub(crate) fn synthetic_name_from_email(email: &str) -> (String, String) {
+    const FALLBACK: (&str, &str) = SYNTHETIC_NAME_FALLBACK;
 
     let local = email.split_once('@').map(|(l, _)| l).unwrap_or(email);
 
