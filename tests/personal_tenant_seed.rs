@@ -33,11 +33,11 @@ async fn personal_tenant_seeded_with_full_default_lookups(pool: PgPool) {
     let owner_a = Uuid::new_v4();
     let owner_b = Uuid::new_v4();
     let tenant_a = svc
-        .ensure_personal_tenant(owner_a)
+        .ensure_personal_tenant(owner_a, None, None)
         .await
         .expect("provision A");
     let tenant_b = svc
-        .ensure_personal_tenant(owner_b)
+        .ensure_personal_tenant(owner_b, None, None)
         .await
         .expect("provision B");
 
@@ -126,7 +126,7 @@ async fn personal_tenant_seeded_with_full_default_lookups(pool: PgPool) {
 
     // Idempotent: re-provisioning returns the same tenant and does not duplicate.
     let again = svc
-        .ensure_personal_tenant(owner_a)
+        .ensure_personal_tenant(owner_a, None, None)
         .await
         .expect("re-provision A");
     assert_eq!(again, tenant_a);
@@ -177,4 +177,43 @@ async fn system_shared_class_guards_global_rows(pool: PgPool) {
         .await
         .expect("count globals");
     assert_eq!(globals, 1, "the global system-shared row persisted");
+}
+
+/// PMS-743: a provisioned personal tenant is named after its owner.
+///
+/// The name is not internal. It renders in the client request-form email
+/// subject and in invitation mail, so before this every MSP's clients received
+/// mail from "My workspace" until somebody renamed the tenant by hand. Staging
+/// had eight tenants sharing that one name.
+#[sqlx::test]
+async fn a_personal_tenant_is_named_after_its_owner(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+
+    let named = svc
+        .ensure_personal_tenant(Uuid::new_v4(), Some("Long"), Some("long@example.com"))
+        .await
+        .expect("provision from a given name");
+    let from_email = svc
+        .ensure_personal_tenant(Uuid::new_v4(), None, Some("dana.reid@example.com"))
+        .await
+        .expect("provision from an email");
+    // Nothing usable about the owner: the generic is the honest answer, and is
+    // still what the owner renames in Settings (MAPPS-426).
+    let anonymous = svc
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("provision with no identity");
+
+    for (tenant, expected) in [
+        (named, "Long's workspace"),
+        (from_email, "Dana's workspace"),
+        (anonymous, "My workspace"),
+    ] {
+        let name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("read the provisioned tenant");
+        assert_eq!(name, expected);
+    }
 }
