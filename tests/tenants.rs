@@ -36,7 +36,7 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
 
     let tenants = TenantService::new(Database::from_pool(pool.clone()));
     let org_tenant = tenants
-        .ensure_personal_tenant(uuid::Uuid::new_v4())
+        .ensure_personal_tenant(uuid::Uuid::new_v4(), None, None)
         .await
         .expect("provision target tenant");
 
@@ -72,7 +72,7 @@ async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
     let owner_b = uuid::Uuid::new_v4();
 
     let first = svc
-        .ensure_personal_tenant(owner_a)
+        .ensure_personal_tenant(owner_a, None, None)
         .await
         .expect("provision tenant");
 
@@ -106,13 +106,13 @@ async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
 
     // Second call resolves the same tenant; a different owner gets a different one.
     let again = svc
-        .ensure_personal_tenant(owner_a)
+        .ensure_personal_tenant(owner_a, None, None)
         .await
         .expect("resolve tenant");
     assert_eq!(again, first, "idempotent for the same owner");
 
     let other = svc
-        .ensure_personal_tenant(owner_b)
+        .ensure_personal_tenant(owner_b, None, None)
         .await
         .expect("provision second owner");
     assert_ne!(other, first, "distinct owner gets a distinct tenant");

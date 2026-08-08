@@ -74,7 +74,7 @@ async fn provision_with_email(pool: &PgPool, app: &common::TestApp, login_email:
     // seeded separately below so it carries a password + `admin` role.
     let owner_id = Uuid::new_v4();
     let tenant_id = svc
-        .ensure_personal_tenant(owner_id)
+        .ensure_personal_tenant(owner_id, None, None)
         .await
         .expect("provision tenant");
 

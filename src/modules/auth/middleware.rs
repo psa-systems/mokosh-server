@@ -691,7 +691,10 @@ pub async fn place_bunyip_user(
         // Brand-new user (or one being backfilled off the default tenant), no
         // invite: provision their own personal tenant.
         match tenants {
-            Some(svc) => match svc.ensure_personal_tenant(sub).await {
+            Some(svc) => match svc
+                .ensure_personal_tenant(sub, given_name.as_deref(), email.as_deref())
+                .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, sub = %sub, "personal tenant provisioning failed");
