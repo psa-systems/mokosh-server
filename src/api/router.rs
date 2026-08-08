@@ -65,6 +65,10 @@ pub fn create_api_router(
     jwt_secret: String,
     google_oauth: Arc<google_oauth_flow::Client>,
     client_origin: String,
+    // MAPPS-425: base for emailed links to pages that exist only in the
+    // mokosh-apps SPA. Distinct from `client_origin`, which is the apex on
+    // every deployed environment because bunyip-web hosts login there.
+    spa_base_url: String,
     cors_origins: Vec<String>,
     super_admin_emails: Vec<String>,
     cookie_secure: bool,
@@ -114,6 +118,12 @@ pub fn create_api_router(
         jwt_secret.clone(),
         super_admin_emails,
         mailer.clone(),
+        // MAPPS-425: stays on `client_origin` deliberately. This is the base
+        // for `/reset-password/{token}`, and bunyip-web at the apex owns the
+        // canonical reset page; mokosh-apps' route only redirects there. Same
+        // for the invitation link, the OAuth postMessage origin and the
+        // not-a-frontend fallback below. Only links to pages that exist ONLY
+        // in mokosh-apps take `spa_base_url`.
         client_origin.clone(),
         notifications_service.clone(),
     )
@@ -128,7 +138,10 @@ pub fn create_api_router(
     // than the mailer.
     let contact_service = ContactService::with_dispatcher(
         db.clone(),
-        client_origin.clone(),
+        // MAPPS-425: `/portal/set-password` is a mokosh-apps route, so it takes
+        // the SPA origin. Built from `client_origin` it landed on the apex,
+        // which has no portal.
+        spa_base_url.clone(),
         notifications_service.clone(),
     );
     let ticket_service =
@@ -140,7 +153,9 @@ pub fn create_api_router(
         db.clone(),
         encryption_key,
         mailer.clone(),
-        client_origin.clone(),
+        // MAPPS-425: the Pay Now link is `/portal/invoices/{id}`, a mokosh-apps
+        // route, so it takes the SPA origin.
+        spa_base_url.clone(),
     );
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
@@ -159,7 +174,9 @@ pub fn create_api_router(
         db.clone(),
         mailer.clone(),
         notifications_service.clone(),
-        client_origin.clone(),
+        // MAPPS-425: the emailed quote link is `/portal/quotes/{id}`, a
+        // mokosh-apps route, so it takes the SPA origin.
+        spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
     let kb_service = KbService::new(db.clone());
@@ -361,7 +378,10 @@ pub fn create_api_router(
         // PMS-448 AC4: ticket-template CRUD (new-ticket pre-fills).
         .merge(ticket_template_routes(ticket_templates_service))
         // PMS-731: form-definition CRUD + validated submissions.
-        .merge(forms_routes(forms_service, client_origin.clone()))
+        // MAPPS-425: the emailed link must resolve against the SPA, not the
+        // apex. `/request-forms/:token` exists only in mokosh-apps, so the
+        // apex serves bunyip's 404 for it.
+        .merge(forms_routes(forms_service, spa_base_url.clone()))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
@@ -449,7 +469,7 @@ pub fn create_api_router(
         db.clone(),
         shared_mailer.clone(),
         notifications_service.clone(),
-        client_origin.clone(),
+        spa_base_url.clone(),
     );
     let portal_api = Router::new()
         .route("/health", get(health_check))
@@ -459,7 +479,10 @@ pub fn create_api_router(
             portal_kb_service,
             portal_billing_service,
             portal_quotes_service,
-            client_origin.clone(),
+            // MAPPS-425: the Stripe checkout success/cancel URLs are
+            // `/portal/invoices/{id}`, mokosh-apps routes, so the portal
+            // origin is the SPA origin and not the apex.
+            spa_base_url.clone(),
         ))
         // PMS-483: portal-side ticket-note attachments. Same routes as
         // the agent surface, but behind `RequirePortalAuth` and
