@@ -28,6 +28,23 @@ use crate::utils::error::{AppError, AppResult};
 /// that a link forwarded onward goes stale.
 const REQUEST_LINK_TTL_DAYS: i64 = 7;
 
+/// Everything the `forms.request_link` template renders.
+///
+/// A struct rather than a row of positional `&str`s: the fields are five
+/// strings in a row, so a transposed pair would email the tenant's name as the
+/// form's and nothing would fail. Named fields make that impossible to write
+/// by accident.
+struct RequestLinkEmail<'a> {
+    recipient_email: &'a str,
+    display_name: &'a str,
+    form_name: &'a str,
+    /// MAPPS-425: the MSP's name. The seeded subject asks for it, and without
+    /// it the client received a literal `{{tenant_name}}`.
+    tenant_name: &'a str,
+    form_link: &'a str,
+    expires_at: chrono::DateTime<Utc>,
+}
+
 impl FormsService {
     /// Mint a link for `company_id` against `form_definition_id` and queue the
     /// email. Returns the row (never the token, which only the recipient
@@ -63,6 +80,19 @@ impl FormsService {
                 .fetch_optional(&mut *tx)
                 .await?;
         let company_name = company_name.ok_or_else(|| AppError::NotFound("Company".to_string()))?;
+
+        // MAPPS-425: the seeded subject is
+        // `{{form_name}} request form from {{tenant_name}}`, and the context
+        // never carried `tenant_name`, so clients received a literal
+        // `{{tenant_name}}`. Supplied here rather than fixed by a new
+        // migration: `101_form_request_tokens.sql` is already applied
+        // everywhere and immutable, so filling the value repairs every tenant
+        // that already holds the seeded template. Read inside the tenant
+        // transaction, matching `InvitationsService`.
+        let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
         // Resolve the addressee. An explicit contact supplies the address and
         // the greeting; otherwise the caller must give an email outright.
@@ -127,11 +157,14 @@ impl FormsService {
         let form_link = format!("{}/request-forms/{}", app_url.trim_end_matches('/'), token);
         self.queue_request_link_email(
             tenant_id,
-            &recipient_email,
-            &display_name,
-            &definition.name,
-            &form_link,
-            expires_at,
+            RequestLinkEmail {
+                recipient_email: &recipient_email,
+                display_name: &display_name,
+                form_name: &definition.name,
+                tenant_name: &tenant_name,
+                form_link: &form_link,
+                expires_at,
+            },
         )
         .await;
 
@@ -149,15 +182,15 @@ impl FormsService {
         })
     }
 
-    async fn queue_request_link_email(
-        &self,
-        tenant_id: TenantId,
-        recipient_email: &str,
-        display_name: &str,
-        form_name: &str,
-        form_link: &str,
-        expires_at: chrono::DateTime<Utc>,
-    ) {
+    async fn queue_request_link_email(&self, tenant_id: TenantId, mail: RequestLinkEmail<'_>) {
+        let RequestLinkEmail {
+            recipient_email,
+            display_name,
+            form_name,
+            tenant_name,
+            form_link,
+            expires_at,
+        } = mail;
         let Some(notify) = self.notifications.as_ref() else {
             tracing::warn!(
                 "no notifications dispatcher wired; request-link token persisted but no message queued",
@@ -168,6 +201,9 @@ impl FormsService {
             "recipient_email": recipient_email,
             "display_name": display_name,
             "form_name": form_name,
+            // MAPPS-425: the seeded subject asks for this; without it the
+            // client sees the placeholder itself.
+            "tenant_name": tenant_name,
             "form_link": form_link,
             "expires_on": expires_at.format("%Y-%m-%d").to_string(),
         });
