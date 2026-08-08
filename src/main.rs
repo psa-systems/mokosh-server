@@ -26,7 +26,27 @@ pub struct AppConfig {
     pub encryption_key: String,
     /// Exact origin allowed to receive `postMessage` from the Google
     /// OAuth callback HTML (the SPA's browser-visible origin).
+    ///
+    /// On both deployed environments this is the APEX, not the mokosh-apps
+    /// SPA: bunyip-web hosts the login UI and opens the OAuth popup, so the
+    /// popup's parent-origin check requires the apex byte-for-byte
+    /// (staging `https://a8n.systems`, prod `https://psa.systems`). Do not
+    /// reuse it as a base for links to mokosh-apps pages - use
+    /// [`AppConfig::spa_base_url`].
     pub client_origin: String,
+    /// MAPPS-425: browser origin of the mokosh-apps SPA
+    /// (`https://msp.a8n.systems`, `https://msp.psa.systems`), the base for
+    /// emailed links to pages that exist ONLY in mokosh-apps.
+    ///
+    /// Separate from [`AppConfig::client_origin`] and from `BASE_URL`, both of
+    /// which point at the apex on purpose because bunyip-web owns login, the
+    /// OAuth popup and `/reset-password` there. The request-form link is the
+    /// first emailed link whose page bunyip does NOT have, and pointing it at
+    /// the apex sent every client to bunyip's 404.
+    ///
+    /// Defaults to `client_origin`, so a single-origin dev stack (where the
+    /// SPA and the shell are the same host) needs no new configuration.
+    pub spa_base_url: String,
     /// All origins permitted to make credentialed CORS requests against
     /// the API. Defaults to `[client_origin]` if `CORS_ORIGIN` is unset.
     /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
@@ -166,6 +186,16 @@ impl AppConfig {
         let jwt_secret = resolve_secret("JWT_SECRET", &environment, DEV_JWT_SECRET)?;
         check_jwt_secret_len(&jwt_secret, &environment)?;
         let encryption_key = resolve_secret("ENCRYPTION_KEY", &environment, DEV_ENCRYPTION_KEY)?;
+        let client_origin =
+            std::env::var("CLIENT_ORIGIN").unwrap_or_else(|_| "http://localhost:4301".to_string());
+        // MAPPS-425: falls back to `client_origin` so a single-origin dev
+        // stack is unaffected. Deployed environments MUST set it, because
+        // there `CLIENT_ORIGIN` is the apex and the SPA is a subdomain.
+        let spa_base_url = std::env::var("SPA_BASE_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| client_origin.clone());
         // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
         // Same fail-loud posture as the other secrets: dev/test may fall back to
         // a hardcoded value, staging/production refuse to boot without a real
@@ -217,8 +247,8 @@ impl AppConfig {
                 .parse()
                 .unwrap_or(true),
             encryption_key,
-            client_origin: std::env::var("CLIENT_ORIGIN")
-                .unwrap_or_else(|_| "http://localhost:4301".to_string()),
+            client_origin: client_origin.clone(),
+            spa_base_url,
             cors_origins: std::env::var("CORS_ORIGIN")
                 .ok()
                 .map(|raw| {
@@ -572,6 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.jwt_secret,
         google_oauth,
         config.client_origin,
+        config.spa_base_url,
         config.cors_origins,
         config.oauth_super_admin_emails,
         cookie_secure,
