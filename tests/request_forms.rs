@@ -162,6 +162,55 @@ fn field_codes(body: &serde_json::Value) -> Vec<(String, String)> {
     pairs
 }
 
+/// MAPPS-425: the client received a link to the apex and a subject reading
+/// `... request form from {{tenant_name}}`.
+///
+/// The link host is the whole defect: `/request-forms/:token` exists only in
+/// mokosh-apps, and on every deployed environment `CLIENT_ORIGIN` is the apex
+/// (bunyip-web hosts login and the OAuth popup there), so a link built from it
+/// landed on bunyip's 404. The test harness sets `spa_base_url` to a host that
+/// differs from `client_origin` precisely so this cannot pass by coincidence.
+#[sqlx::test]
+async fn the_emailed_link_points_at_the_spa_and_names_the_tenant(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _article_id) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+    let _ = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    let (subject, body): (String, String) = sqlx::query_as(
+        "SELECT subject, body FROM notifications WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("a request-link email was queued");
+
+    assert!(
+        body.contains("http://spa.localhost/request-forms/"),
+        "the link must be built from the SPA origin, not the login origin; got body={body}"
+    );
+    assert!(
+        !body.contains("http://localhost/request-forms/"),
+        "a link on the login origin is the MAPPS-425 404; got body={body}"
+    );
+
+    let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded tenant has a name");
+    assert!(
+        subject.contains(&tenant_name),
+        "the subject must name the MSP; got subject={subject}"
+    );
+    assert!(
+        !subject.contains("{{") && !body.contains("{{"),
+        "an unresolved placeholder must never reach a client; subject={subject} body={body}"
+    );
+}
+
 #[sqlx::test]
 async fn a_link_resolves_to_the_form_without_leaking_internals(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;

@@ -224,6 +224,9 @@ async fn boot_with_db(
         "test-jwt-secret-that-is-clearly-not-for-prod".into(),
         google_oauth,
         "http://localhost".into(),
+        // MAPPS-425 spa_base_url: deliberately different from client_origin so
+        // a test asserting an emailed link's host cannot pass by accident.
+        "http://spa.localhost".into(),
         vec!["http://localhost".into()],
         Vec::new(),
         false,  // cookie_secure: irrelevant for bearer-token tests
