@@ -833,6 +833,13 @@ fn auth_service(pool: &PgPool) -> Arc<AuthService> {
 /// transaction, so all of them computed `0 + 1` and the column ended at 1 no
 /// matter how many codes were guessed: the lockout never armed and the
 /// attacker got a whole burst of guesses per round trip.
+///
+/// PMS-753: the counter is compared against the number of attempts that
+/// actually reached the verifier, not against the burst size. Once the third
+/// failure arms the lockout, a later racer is turned away by the lockout gate
+/// before any code is checked, so it spends no guess and must not tick the
+/// counter. How many racers land on each side is pure scheduling, so pinning
+/// the burst size made the test flaky (CI run #3783 saw 17 of 20).
 #[sqlx::test]
 async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
@@ -853,14 +860,20 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
         let auth = Arc::clone(&auth);
         let req = login_request(&email, &password, code);
         handles.push(tokio::spawn(async move {
-            auth.login(&req, None, None).await.is_ok()
+            auth.login(&req, None, None).await.err()
         }));
     }
+    // Every racer ends one of two ways: it reached the verifier and its wrong
+    // code was counted (401), or the already-armed lockout refused it before
+    // any code was checked (429, no guess spent, no tick).
+    let mut evaluated = 0;
     for h in handles {
-        assert!(
-            !h.await.expect("login task joins"),
-            "a wrong second-factor code must never log in"
-        );
+        match h.await.expect("login task joins") {
+            None => panic!("a wrong second-factor code must never log in"),
+            Some(AppError::Unauthorized) => evaluated += 1,
+            Some(AppError::RateLimited) => {}
+            Some(other) => panic!("unexpected login failure: {other:?}"),
+        }
     }
 
     let failed: i32 = sqlx::query_scalar("SELECT mfa_failed_attempts FROM users WHERE id = $1")
@@ -868,9 +881,18 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("read mfa_failed_attempts");
+    // The pre-fix stale read collapsed the whole burst into a single tick, so
+    // this equality is what catches a regression: 20 evaluated failures that
+    // leave the column at 1 fail here.
+    assert_eq!(
+        failed, evaluated,
+        "every evaluated failure is counted exactly once"
+    );
+    // Nothing can be refused before the threshold, so the burst always gets at
+    // least that far and the lockout is armed for the probe below.
     assert!(
-        failed >= 20,
-        "every concurrent failure is counted, got {failed}"
+        failed >= 3,
+        "the burst must cross the lockout threshold, got {failed}"
     );
 
     // The 21st attempt is refused by the armed lockout, not merely rejected
