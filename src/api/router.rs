@@ -94,6 +94,10 @@ pub fn create_api_router(
     // PMS-658: master switch for the suspicious-login notify-and-approve gate,
     // from LOGIN_APPROVAL_ENABLED in main.rs. Off by default (can block logins).
     login_approval_enabled: bool,
+    // PMS-748: address a client can report an unwanted request-form email to,
+    // from ABUSE_CONTACT_EMAIL in main.rs. `None` drops the line from the mail
+    // rather than pointing it at the noreply from-address.
+    abuse_contact_email: Option<String>,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -199,7 +203,11 @@ pub fn create_api_router(
         db.clone(),
         notifications_service.clone(),
         TicketService::new(db.clone()),
-    );
+    )
+    // PMS-748: only the authenticated surface sends mail, but the public
+    // surface is built from the same constructor, so both are given it and
+    // neither can drift from the other.
+    .with_abuse_contact(abuse_contact_email.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.clone());
     // PMS-453: per-user saved dashboards.
@@ -579,11 +587,14 @@ pub fn create_api_router(
     // identity, and it resolves its own tenant. Same envelope normalization as
     // the other trees so a 400 here looks like a 400 anywhere else.
     let public_api = Router::new()
-        .merge(public_form_routes(FormsService::with_request_links(
-            db.clone(),
-            notifications_service.clone(),
-            TicketService::new(db.clone()),
-        )))
+        .merge(public_form_routes(
+            FormsService::with_request_links(
+                db.clone(),
+                notifications_service.clone(),
+                TicketService::new(db.clone()),
+            )
+            .with_abuse_contact(abuse_contact_email),
+        ))
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
