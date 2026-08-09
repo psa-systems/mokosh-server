@@ -89,6 +89,8 @@ pub fn auth_routes(
         // Protected routes
         .route("/me", get(get_current_user))
         .route("/me", put(update_current_user))
+        // PMS-752: let the onboarding screen finish. See the handler.
+        .route("/me/complete-onboarding", post(complete_onboarding))
         .route("/me/password", put(change_password))
         .route("/me/sessions", get(get_sessions))
         .route("/me/sessions/{session_id}", delete(delete_session))
@@ -311,6 +313,28 @@ async fn update_current_user(
         .update_user(user.tenant_id, user.id, &sanitized_request, &ctx)
         .await?;
 
+    Ok(Json(updated.into()))
+}
+
+/// PMS-752: mark the caller's profile as onboarded.
+///
+/// Since PMS-512 `profile_completed_at` was stamped in exactly one place:
+/// `upsert_user_from_oidc`, on a login whose bunyip claims carry both names.
+/// That left the SPA's fallback onboarding screen unable to complete itself.
+/// It collects what it can, posts here, and the guard stops firing.
+///
+/// Idempotent by `COALESCE`, so a double submit or a replayed request keeps the
+/// original timestamp rather than moving it. Nothing here trusts a body: the
+/// only thing being asserted is "this user has been through onboarding", and
+/// the caller is the user.
+async fn complete_onboarding(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<UserResponse>> {
+    let updated = state
+        .auth_service
+        .mark_profile_completed(user.tenant_id, user.id)
+        .await?;
     Ok(Json(updated.into()))
 }
 
