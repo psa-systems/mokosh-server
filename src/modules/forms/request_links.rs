@@ -462,6 +462,16 @@ fn summarise(
 /// Render the answers as the ticket description, in the form's own field
 /// order and using its labels, so whoever works the ticket reads what the
 /// client saw rather than raw payload keys.
+///
+/// PMS-747: emitted as a Markdown list, because the ticket description is
+/// RENDERED as Markdown by the SPA. Separating the answers with plain newlines
+/// put every one of them in a single paragraph, so a three-field submission
+/// arrived as `First name: David Last name: Randall Phone number: 919...` on
+/// one run-on line, and got worse the more the form asked for.
+///
+/// A textarea answer carries its own newlines. Those become hard breaks
+/// (two trailing spaces) and the continuation is indented into the list item,
+/// so the client's paragraphing survives instead of collapsing the same way.
 fn render_answers(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,
@@ -476,7 +486,8 @@ fn render_answers(
             serde_json::Value::Bool(b) => if *b { "Yes" } else { "No" }.to_string(),
             other => other.to_string(),
         };
-        out.push_str(&format!("{}: {}\n", field.label, rendered));
+        let rendered = rendered.replace('\n', "  \n  ");
+        out.push_str(&format!("- **{}:** {}\n", field.label, rendered));
     }
     out
 }
@@ -554,5 +565,102 @@ impl From<LinkRow> for RequestLinkResponse {
             used_at: r.used_at,
             submission_id: r.submission_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::forms::models::{FieldType, FormDefinitionResponse, FormFieldResponse};
+
+    fn field(name: &str, label: &str, field_type: FieldType) -> FormFieldResponse {
+        FormFieldResponse {
+            id: Uuid::nil(),
+            name: name.to_string(),
+            label: label.to_string(),
+            help_text: None,
+            field_type,
+            is_required: false,
+            min_length: None,
+            max_length: None,
+            options: None,
+            date_not_in_past: false,
+            sort_order: 0,
+        }
+    }
+
+    fn definition(fields: Vec<FormFieldResponse>) -> FormDefinitionResponse {
+        FormDefinitionResponse {
+            id: Uuid::nil(),
+            name: "New user".to_string(),
+            slug: "new-user".to_string(),
+            description: None,
+            kb_article_id: None,
+            kb_article_title: None,
+            rules: Vec::new(),
+            is_active: true,
+            created_by_id: Uuid::nil(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            fields,
+        }
+    }
+
+    /// PMS-747: the SPA renders a ticket description as Markdown, where a plain
+    /// newline is not a break. Joining answers with one meant a three-field
+    /// submission arrived as a single run-on line.
+    #[test]
+    fn each_answer_is_its_own_line_in_the_rendered_description() {
+        let def = definition(vec![
+            field("first_name", "First name", FieldType::Text),
+            field("last_name", "Last name", FieldType::Text),
+            field("needs_laptop", "Needs a laptop", FieldType::Boolean),
+        ]);
+        let answers = serde_json::json!({
+            "first_name": "David",
+            "last_name": "Randall",
+            "needs_laptop": true,
+        });
+
+        let rendered = render_answers(&def, answers.as_object().expect("object"));
+
+        assert_eq!(
+            rendered,
+            "- **First name:** David\n- **Last name:** Randall\n- **Needs a laptop:** Yes\n"
+        );
+    }
+
+    /// A textarea answer carries the client's own paragraphing, which must not
+    /// collapse for the same reason the answers themselves must not.
+    #[test]
+    fn a_multi_line_answer_keeps_its_breaks() {
+        let def = definition(vec![field("detail", "Detail", FieldType::Textarea)]);
+        let answers = serde_json::json!({ "detail": "Line one\nLine two" });
+
+        let rendered = render_answers(&def, answers.as_object().expect("object"));
+
+        assert_eq!(
+            rendered, "- **Detail:** Line one  \n  Line two\n",
+            "two trailing spaces are the Markdown hard break; the indent keeps the continuation in the list item"
+        );
+    }
+
+    /// The form's field order is the order the client answered in, and a field
+    /// left blank is dropped rather than rendered as an empty line.
+    #[test]
+    fn unanswered_fields_are_left_out_and_order_follows_the_form() {
+        let def = definition(vec![
+            field("first_name", "First name", FieldType::Text),
+            field("nickname", "Nickname", FieldType::Text),
+            field("last_name", "Last name", FieldType::Text),
+        ]);
+        let answers = serde_json::json!({ "last_name": "Randall", "first_name": "David" });
+
+        let rendered = render_answers(&def, answers.as_object().expect("object"));
+
+        assert_eq!(
+            rendered,
+            "- **First name:** David\n- **Last name:** Randall\n"
+        );
     }
 }
