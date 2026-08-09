@@ -379,16 +379,22 @@ async fn a_valid_submission_creates_a_ticket_carrying_the_data_and_the_article(p
 
     // The description renders the answers under the form's own labels, in the
     // form's order, so whoever works the ticket reads what the client saw.
+    // PMS-747: as a Markdown list. The SPA renders this field as Markdown,
+    // where the plain newlines this used to emit are not line breaks, so every
+    // answer collapsed into one run-on paragraph.
     let description = db_description.expect("description");
     assert!(
-        description.contains("First name: Dana"),
+        description.contains("- **First name:** Dana"),
         "got {description}"
     );
     assert!(
-        description.contains("Start date: 2099-06-01"),
+        description.contains("- **Start date:** 2099-06-01"),
         "got {description}"
     );
-    assert!(description.contains("Laptop: new"), "got {description}");
+    assert!(
+        description.contains("- **Laptop:** new"),
+        "got {description}"
+    );
 
     // The chain link -> submission -> ticket is traceable in both directions.
     let (used_at, submission_id): (Option<chrono::DateTime<chrono::Utc>>, Option<Uuid>) =
