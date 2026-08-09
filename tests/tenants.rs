@@ -559,3 +559,163 @@ async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) 
         "exactly one own-company, even after two runs"
     );
 }
+
+// ============================================================================
+// PMS-751: the caller's own tenant, addressed without an id
+// ============================================================================
+
+/// The organization settings page could neither load nor save, because the SPA
+/// built its URL from the `mokosh_tenant_id` id_token claim and bunyip only
+/// mints that for a client configured with `tenant_claim_name`. Without it the
+/// SPA carried the nil uuid and asked for a tenant that does not exist.
+///
+/// These routes take no id, so the page works whether or not that claim is ever
+/// configured. Asserted end to end because the whole failure was that the id in
+/// the URL was wrong, which no unit test on a service can see.
+#[sqlx::test]
+async fn current_reads_and_renames_the_callers_own_tenant(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let seeded: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("seeded tenant name");
+
+    let body: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get current tenant")
+        .json()
+        .await
+        .expect("current tenant JSON");
+    assert_eq!(body["name"].as_str(), Some(seeded.as_str()));
+    assert_eq!(
+        body["id"].as_str(),
+        Some(common::DEFAULT_TENANT_ID.to_string().as_str()),
+        "`current` must resolve the caller's own tenant, not the first row it finds"
+    );
+
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Acme IT" }))
+        .send()
+        .await
+        .expect("send rename");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The name clients see in request-form and invitation email, so the write
+    // is asserted against the column those read rather than the response body.
+    let stored: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("renamed tenant");
+    assert_eq!(stored, "Acme IT");
+}
+
+/// `current` is not a uuid, and must never be parsed as one: a static segment
+/// has to win over `/{tenant_id}` or the route would 400 on every call.
+#[sqlx::test]
+async fn current_is_not_mistaken_for_a_tenant_id(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get current tenant");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a 400 here means `current` was routed into the uuid path param"
+    );
+}
+
+/// Reading your own tenant needs only a session, but renaming it is tenant-wide
+/// configuration: the name is the "from" on every email a client receives.
+#[sqlx::test]
+async fn a_non_admin_can_read_but_not_rename_their_tenant(pool: PgPool) {
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "pms751-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &tech_email, &tech_password).await;
+
+    let read = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send read");
+    assert_eq!(read.status(), reqwest::StatusCode::OK);
+
+    let write = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Renamed by a technician" }))
+        .send()
+        .await
+        .expect("send rename");
+    assert_eq!(write.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let stored: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("tenant name");
+    assert_ne!(stored, "Renamed by a technician");
+}
+
+/// PMS-751: the new routes address the caller's own tenant and nothing else, so
+/// a second tenant's row must be unreachable through them however the caller is
+/// authenticated.
+#[sqlx::test]
+async fn current_cannot_reach_another_tenant(pool: PgPool) {
+    let (other_tenant, _id, _email, _password) =
+        common::seed_tenant_with_admin(&pool, "pms751-other").await;
+    let (_tech_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "pms751-scoped@example.com",
+        "admin",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    app.client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Only mine" }))
+        .send()
+        .await
+        .expect("send rename");
+
+    let others: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .fetch_one(&pool)
+        .await
+        .expect("other tenant name");
+    assert_ne!(
+        others, "Only mine",
+        "renaming via `current` must touch only the caller's tenant"
+    );
+}
