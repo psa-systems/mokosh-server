@@ -10,7 +10,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
-use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, UserRole};
+use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -41,6 +41,21 @@ pub fn tenant_routes(
     Router::new()
         .route("/", get(list_tenants))
         .route("/", post(create_tenant))
+        // PMS-751: the caller's OWN tenant, addressed without an id.
+        //
+        // Declared before the `{tenant_id}` routes for readability only; axum
+        // matches a static segment ahead of a dynamic one regardless of
+        // declaration order, so `current` can never be parsed as a uuid.
+        //
+        // These exist because the SPA does not reliably know its own tenant id.
+        // It reads one from the `mokosh_tenant_id` id_token claim, which bunyip
+        // only mints for a client configured with `tenant_claim_name`, and
+        // falls back to the nil uuid otherwise. The organization settings page
+        // then asked for tenant 00000000-0000-0000-0000-000000000000 and got a
+        // 404. The server knows the caller's tenant on every request; making
+        // the browser supply it was the defect.
+        .route("/current", get(get_current_tenant))
+        .route("/current", put(update_current_tenant))
         .route("/{tenant_id}", get(get_tenant))
         .route("/{tenant_id}", put(update_tenant))
         .route("/{tenant_id}/suspend", post(suspend_tenant))
@@ -106,6 +121,45 @@ async fn get_tenant(
         .get_tenant(TenantId::from_trusted(tenant_id))
         .await?;
 
+    Ok(Json(tenant.into()))
+}
+
+/// PMS-751: read the caller's own tenant.
+///
+/// No path id and no role gate beyond being signed in: the tenant this returns
+/// is the one the caller is already authenticated against, so there is nothing
+/// here they could not learn from any other tenant-scoped response. The
+/// cross-tenant read stays on `GET /{tenant_id}`, which keeps its super-admin
+/// guard.
+async fn get_current_tenant(
+    State(state): State<TenantRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<TenantResponse>> {
+    let tenant = state.tenant_service.get_tenant(user.tenant()).await?;
+    Ok(Json(tenant.into()))
+}
+
+/// PMS-751: rename the caller's own tenant.
+///
+/// Admin-gated, matching `PUT /{tenant_id}`: the name is customer-facing (it is
+/// the "from" in every request-form and invitation email), so it is tenant-wide
+/// configuration rather than personal preference. A super_admin is an admin for
+/// this purpose, so the check is `is_admin()` alone; the cross-tenant case is
+/// what `PUT /{tenant_id}` is for.
+async fn update_current_tenant(
+    State(state): State<TenantRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<UpdateTenantRequest>,
+) -> AppResult<Json<TenantResponse>> {
+    if !user.role.is_admin() {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+    request.validate()?;
+    let tenant = state
+        .tenant_service
+        .update_tenant(user.tenant(), &request, &ctx)
+        .await?;
     Ok(Json(tenant.into()))
 }
 
