@@ -47,6 +47,13 @@ pub struct AppConfig {
     /// Defaults to `client_origin`, so a single-origin dev stack (where the
     /// SPA and the shell are the same host) needs no new configuration.
     pub spa_base_url: String,
+    /// PMS-748: address a client can report an unwanted request-form email to.
+    ///
+    /// Per deployment rather than per tenant, because the whole point of an
+    /// abuse channel is that it does NOT reach the sender. `None` when unset,
+    /// and the email then carries no report-abuse line at all: a link that
+    /// goes nowhere, or to a noreply address, is worse than no link.
+    pub abuse_contact_email: Option<String>,
     /// All origins permitted to make credentialed CORS requests against
     /// the API. Defaults to `[client_origin]` if `CORS_ORIGIN` is unset.
     /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
@@ -196,6 +203,13 @@ impl AppConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| client_origin.clone());
+        // PMS-748: optional on purpose. An unset value removes the line rather
+        // than defaulting to the SMTP from-address, which is a noreply on every
+        // deployed environment and would send abuse reports into a black hole.
+        let abuse_contact_email = std::env::var("ABUSE_CONTACT_EMAIL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
         // Same fail-loud posture as the other secrets: dev/test may fall back to
         // a hardcoded value, staging/production refuse to boot without a real
@@ -249,6 +263,7 @@ impl AppConfig {
             encryption_key,
             client_origin: client_origin.clone(),
             spa_base_url,
+            abuse_contact_email,
             cors_origins: std::env::var("CORS_ORIGIN")
                 .ok()
                 .map(|raw| {
@@ -613,6 +628,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         geoip,
         ip_enrich,
         config.login_approval_enabled,
+        config.abuse_contact_email,
     );
     let router = psa_router;
 

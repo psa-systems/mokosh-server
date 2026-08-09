@@ -41,6 +41,17 @@ struct RequestLinkEmail<'a> {
     /// MAPPS-425: the MSP's name. The seeded subject asks for it, and without
     /// it the client received a literal `{{tenant_name}}`.
     tenant_name: &'a str,
+    /// PMS-748: the MSP user who issued this link. A client receiving a
+    /// request for personal details is entitled to a person's name, not just
+    /// an organisation's.
+    sender_name: &'a str,
+    /// PMS-748: the client company the link was issued against, so the closing
+    /// line can say who the message was intended for. It replaces "if you were
+    /// not expecting this, you can ignore this message", which gave a
+    /// recipient nothing to check.
+    company_name: &'a str,
+    /// PMS-748: the definition's optional contact details.
+    contact_info: Option<&'a str>,
     form_link: &'a str,
     expires_at: chrono::DateTime<Utc>,
 }
@@ -93,6 +104,20 @@ impl FormsService {
             .bind(tenant_id)
             .fetch_one(&mut *tx)
             .await?;
+
+        // PMS-748: the person doing the asking. Read in the same transaction
+        // as the tenant and the company, so the email is composed from one
+        // consistent picture of who is sending what to whom.
+        let sender: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT first_name, last_name, email FROM users WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(created_by)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let sender_name = sender
+            .map(|(first, last, email)| sender_display_name(&first, &last, &email))
+            .unwrap_or_else(|| tenant_name.clone());
 
         // Resolve the addressee. An explicit contact supplies the address and
         // the greeting; otherwise the caller must give an email outright.
@@ -162,6 +187,9 @@ impl FormsService {
                 display_name: &display_name,
                 form_name: &definition.name,
                 tenant_name: &tenant_name,
+                sender_name: &sender_name,
+                company_name: &company_name,
+                contact_info: definition.contact_info.as_deref(),
                 form_link: &form_link,
                 expires_at,
             },
@@ -188,6 +216,9 @@ impl FormsService {
             display_name,
             form_name,
             tenant_name,
+            sender_name,
+            company_name,
+            contact_info,
             form_link,
             expires_at,
         } = mail;
@@ -197,6 +228,8 @@ impl FormsService {
             );
             return;
         };
+        let (abuse_notice, abuse_notice_html) =
+            abuse_notice(self.abuse_contact_email.as_deref(), form_name);
         let context = json!({
             "recipient_email": recipient_email,
             "display_name": display_name,
@@ -204,6 +237,16 @@ impl FormsService {
             // MAPPS-425: the seeded subject asks for this; without it the
             // client sees the placeholder itself.
             "tenant_name": tenant_name,
+            // PMS-748: every key below is supplied unconditionally, including
+            // the two that can be empty. `render_template` leaves an
+            // unresolved key as literal braces in the delivered message, so
+            // "omit the key when there is nothing to say" is not available:
+            // the value has to be an empty string instead.
+            "sender_name": sender_name,
+            "company_name": company_name,
+            "contact_line": contact_line(tenant_name, contact_info),
+            "abuse_notice": abuse_notice,
+            "abuse_notice_html": abuse_notice_html,
             "form_link": form_link,
             "expires_on": expires_at.format("%Y-%m-%d").to_string(),
         });
@@ -299,9 +342,20 @@ impl FormsService {
         let definition = self
             .get(resolved.tenant_id, resolved.form_definition_id)
             .await?;
+        // PMS-748: who is asking. The page is reached from an email by someone
+        // with no account here, so it has to carry its own attribution rather
+        // than relying on the message that linked to it still being open.
+        let mut tx = self.db.begin_with_tenant(resolved.tenant_id).await?;
+        let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+            .bind(resolved.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(PublicFormResponse {
             name: definition.name,
             description: definition.description,
+            tenant_name,
+            contact_info: definition.contact_info,
             rules: definition.rules,
             fields: definition
                 .fields
@@ -437,6 +491,85 @@ impl FormsService {
             ticket_number: ticket.ticket_number,
         })
     }
+}
+
+/// PMS-748: the name a client should see for the MSP user who sent this.
+///
+/// Falls back to the same email-derived name the JIT user insert uses, which
+/// already refuses to derive one from a UUID local part or mokosh's own
+/// placeholder domain. Both name columns are NOT NULL but may hold empty
+/// strings, so the blank case is real rather than theoretical.
+fn sender_display_name(first_name: &str, last_name: &str, email: &str) -> String {
+    let full = format!("{} {}", first_name.trim(), last_name.trim());
+    let full = full.trim();
+    if !full.is_empty() {
+        return full.to_string();
+    }
+    let (first, last) = crate::modules::auth::synthetic_name_from_email(email);
+    format!("{first} {last}")
+}
+
+/// PMS-748: the "how do I ask about this?" line, which is never empty.
+///
+/// The MSP's NAME is not optional: a client asked for personal details is
+/// always told who is asking. The contact details are, so the sentence has two
+/// shapes rather than one shape with a hole in it. Nothing here promises a
+/// channel the deployment does not have: with no contact details it names the
+/// sender rather than inviting a reply the from-address cannot accept.
+fn contact_line(tenant_name: &str, contact_info: Option<&str>) -> String {
+    match contact_info.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(info) => format!("Questions about this request? Contact {tenant_name} at {info}."),
+        None => format!("Questions about this request? Contact {tenant_name}, who sent it to you."),
+    }
+}
+
+/// PMS-748: the report-abuse line, in text and HTML flavours, or two empty
+/// strings when the deployment has not configured an address.
+///
+/// The HTML flavour carries its own `<p>` wrapper. `render_template` has no
+/// conditionals, so a wrapper written into the template would leave an empty
+/// paragraph dangling on every deployment without an abuse address; composing
+/// the whole element here is what lets the line vanish completely.
+///
+/// The address is escaped for both the attribute and the text, because it
+/// arrives from deployment configuration rather than from this crate.
+fn abuse_notice(abuse_contact_email: Option<&str>, form_name: &str) -> (String, String) {
+    let Some(address) = abuse_contact_email.map(str::trim).filter(|a| !a.is_empty()) else {
+        return (String::new(), String::new());
+    };
+    let text = format!("\n\nDid not expect this? Report it to {address}.");
+    let escaped = html_escape(address);
+    let subject = urlencoded(&format!("Unexpected request form: {form_name}"));
+    let html = format!(
+        "<p>Did not expect this? <a href=\"mailto:{escaped}?subject={subject}\">Report it</a>.</p>"
+    );
+    (text, html)
+}
+
+/// Minimal escaping for the few characters that would break out of an
+/// attribute or an element. Not a general-purpose sanitiser: the only value
+/// passed through it is an operator-configured email address.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Percent-encode a `mailto:` subject. Everything outside the unreserved set
+/// is encoded, so a form name carrying a space, an ampersand or a quote cannot
+/// truncate the URL or escape the attribute.
+fn urlencoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// A one-line summary for the ticket title, taken from the first answered text
@@ -595,6 +728,7 @@ mod tests {
             name: "New user".to_string(),
             slug: "new-user".to_string(),
             description: None,
+            contact_info: None,
             kb_article_id: None,
             kb_article_title: None,
             rules: Vec::new(),
@@ -604,6 +738,73 @@ mod tests {
             updated_at: Utc::now(),
             fields,
         }
+    }
+
+    /// PMS-748: the MSP is always named. Only the channel is optional.
+    #[test]
+    fn the_contact_line_always_names_the_msp() {
+        assert_eq!(
+            contact_line("Acme IT", Some("support@acme.example on 555-0100")),
+            "Questions about this request? Contact Acme IT at support@acme.example on 555-0100."
+        );
+        assert_eq!(
+            contact_line("Acme IT", None),
+            "Questions about this request? Contact Acme IT, who sent it to you.",
+            "with no contact details the line still says who is asking, and promises no channel"
+        );
+        assert_eq!(
+            contact_line("Acme IT", Some("   ")),
+            contact_line("Acme IT", None),
+            "a definition saved with a blank contact field is the same as one without"
+        );
+    }
+
+    /// PMS-748: an abuse link that goes nowhere is worse than none, so an
+    /// unconfigured deployment emits nothing at all, in either flavour.
+    #[test]
+    fn an_unconfigured_abuse_contact_emits_no_line() {
+        assert_eq!(
+            abuse_notice(None, "New user"),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            abuse_notice(Some("  "), "New user"),
+            (String::new(), String::new())
+        );
+    }
+
+    /// The HTML flavour carries its own `<p>`, because `render_template` has no
+    /// conditionals and a wrapper in the template would leave an empty
+    /// paragraph on every deployment that has not configured an address.
+    #[test]
+    fn a_configured_abuse_contact_composes_both_flavours() {
+        let (text, html) = abuse_notice(Some("abuse@example.com"), "New user & leaver");
+
+        assert_eq!(
+            text,
+            "\n\nDid not expect this? Report it to abuse@example.com."
+        );
+        assert_eq!(
+            html,
+            "<p>Did not expect this? <a href=\"mailto:abuse@example.com?subject=Unexpected%20request%20form%3A%20New%20user%20%26%20leaver\">Report it</a>.</p>",
+            "an unencoded space or ampersand in the form name would truncate the mailto or escape the attribute"
+        );
+    }
+
+    /// PMS-748: the sender is a person, and the fallback is the same
+    /// email-derived name the JIT user insert uses rather than a second copy of
+    /// those rules.
+    #[test]
+    fn the_sender_is_named_from_the_user_or_their_email() {
+        assert_eq!(
+            sender_display_name("David", "Randall", "david@example.com"),
+            "David Randall"
+        );
+        assert_eq!(
+            sender_display_name("  ", "", "dana.reid@example.com"),
+            "Dana Reid",
+            "both name columns are NOT NULL but may hold empty strings"
+        );
     }
 
     /// PMS-747: the SPA renders a ticket description as Markdown, where a plain

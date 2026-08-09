@@ -241,6 +241,10 @@ async fn boot_with_db(
         None,  // PMS-657: no geoip DB in tests; login-location alerts disabled
         None,  // BUNYIP-475: no IP2Proxy DB in tests; enrichment lookup reports nothing
         false, // PMS-658: login-approval gate off in the default test router
+        // PMS-748: an abuse address IS configured here, so the request-form
+        // suite can assert the notice appears; the unconfigured case is a unit
+        // test on the composition itself.
+        Some("abuse@test.invalid".to_string()),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
