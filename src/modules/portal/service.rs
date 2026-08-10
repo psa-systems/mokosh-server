@@ -22,6 +22,7 @@ pub struct PortalAuthService {
     db: Database,
     jwt_secret: String,
     access_token_ttl: Duration,
+    refresh_token_ttl: Duration,
 }
 
 impl PortalAuthService {
@@ -29,7 +30,11 @@ impl PortalAuthService {
         Self {
             db,
             jwt_secret,
-            access_token_ttl: Duration::hours(8),
+            // PMS-729 phase 2 H2: access token drops from 8h to 15 min so a
+            // stolen token has a tight useful lifetime; refresh flow keeps
+            // the customer signed in for the full 30-day window.
+            access_token_ttl: Duration::minutes(15),
+            refresh_token_ttl: Duration::days(30),
         }
     }
 
@@ -50,6 +55,8 @@ impl PortalAuthService {
         slug: &str,
         email: &str,
         password: &str,
+        user_agent: Option<&str>,
+        ip_address: Option<std::net::IpAddr>,
     ) -> AppResult<PortalLoginResponse> {
         let row: Option<(
             Uuid,
@@ -136,26 +143,17 @@ impl PortalAuthService {
         .await?;
 
         let now = Utc::now();
-        let expires_at = now + self.access_token_ttl;
-        let claims = PortalJwtClaims {
-            sub: id,
-            tid: tenant_id,
-            cid: company_id,
-            email: email.clone(),
-            iat: now.timestamp(),
-            exp: expires_at.timestamp(),
-            typ: "portal_access".to_string(),
-        };
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
-        )
-        .map_err(|e| AppError::Internal(format!("portal jwt sign: {e}")))?;
+        let (access_token, expires_at) =
+            self.mint_access_token(id, tenant_id, company_id, &email, now)?;
+        let (refresh_token, refresh_expires_at) = self
+            .issue_refresh_token(tenant_id, id, None, now, user_agent, ip_address)
+            .await?;
 
         Ok(PortalLoginResponse {
-            access_token: token,
+            access_token,
             expires_at,
+            refresh_token,
+            refresh_expires_at,
             contact: CurrentContact {
                 id,
                 tenant_id,
@@ -165,6 +163,258 @@ impl PortalAuthService {
                 last_name,
             },
         })
+    }
+
+    /// PMS-729 phase 2 H1+H2: mint a fresh HS256 access JWT for the given
+    /// contact. Extracted so both `login` and `refresh` can call it with
+    /// the same claim shape and TTL.
+    fn mint_access_token(
+        &self,
+        contact_id: Uuid,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        email: &str,
+        now: DateTime<Utc>,
+    ) -> AppResult<(String, DateTime<Utc>)> {
+        let expires_at = now + self.access_token_ttl;
+        let claims = PortalJwtClaims {
+            sub: contact_id,
+            tid: tenant_id,
+            cid: company_id,
+            email: email.to_string(),
+            iat: now.timestamp(),
+            exp: expires_at.timestamp(),
+            typ: "portal_access".to_string(),
+            jti: Uuid::new_v4(),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
+        )
+        .map_err(|e| AppError::Internal(format!("portal jwt sign: {e}")))?;
+        Ok((token, expires_at))
+    }
+
+    /// PMS-729 phase 2 H1+H2: mint a new refresh token for `contact_id`,
+    /// insert its Argon2id hash into `portal_refresh_tokens`, and return
+    /// the plaintext `{token_id}.{secret}` form for the caller to hand
+    /// back to the SPA. Optional `rotated_from` links this row to its
+    /// ancestor in the rotation chain (used by `refresh_access_token`).
+    ///
+    /// SAFETY (PMS-285): pre-auth (login) or refresh-auth (rotate); the
+    /// tenant is a verified column value in both cases, not user input.
+    /// Runs on the migrator pool so a pool that lacks the app-role GUC
+    /// still writes (the login site sets no GUC and the refresh site
+    /// resolves the tenant from the presented token, not the request).
+    async fn issue_refresh_token(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        rotated_from: Option<Uuid>,
+        now: DateTime<Utc>,
+        user_agent: Option<&str>,
+        ip_address: Option<std::net::IpAddr>,
+    ) -> AppResult<(String, DateTime<Utc>)> {
+        // 32 hex chars (128 bits) of collision-resistant randomness plus the
+        // row id in front for O(1) lookup. Full token format matches the
+        // portal setup-token shape (`{id}.{secret}`) so the parse helper
+        // is reusable.
+        let secret = uuid::Uuid::new_v4().simple().to_string();
+        let hash = hash_password(&secret)?;
+        let expires_at = now + self.refresh_token_ttl;
+        // sqlx does not support `Option<IpAddr>` as an `INET` bind
+        // directly, so hand the IP over as text and let Postgres cast.
+        // NULL for an unknown IP (dev harness) so the column stays typed.
+        let ip_text = ip_address.map(|ip| ip.to_string());
+        let (id,): (Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO portal_refresh_tokens (
+                tenant_id, contact_id, token_hash, issued_at, expires_at,
+                rotated_from_id, user_agent, ip_address
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, '')::inet)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&hash)
+        .bind(now)
+        .bind(expires_at)
+        .bind(rotated_from)
+        .bind(user_agent)
+        .bind(ip_text.unwrap_or_default())
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        Ok((format!("{id}.{secret}"), expires_at))
+    }
+
+    /// PMS-729 phase 2 H2: rotate a live refresh token into a new access +
+    /// refresh pair. Replay-safe: presenting an already-rotated token
+    /// causes the extractor to revoke the entire rotation chain (a
+    /// stolen-token signal) and reject the request. Presenting an unknown,
+    /// expired, or explicitly-revoked token also fails closed. All
+    /// failure paths return [`AppError::Unauthorized`] so the wire shape
+    /// stays enumeration-resistant.
+    #[allow(clippy::type_complexity)]
+    #[tracing::instrument(skip_all)]
+    pub async fn refresh_access_token(
+        &self,
+        presented: &str,
+        user_agent: Option<&str>,
+        ip_address: Option<std::net::IpAddr>,
+    ) -> AppResult<PortalRefreshResponse> {
+        let (row_id, secret) =
+            parse_contact_bound_token(presented).ok_or(AppError::Unauthorized)?;
+
+        // Fetch the presented row. Compares the secret against the stored
+        // Argon2id hash; any miss (unknown id, wrong secret, or expired) is
+        // indistinguishable to the caller.
+        let row: Option<(Uuid, Uuid, String, DateTime<Utc>, Option<DateTime<Utc>>)> =
+            sqlx::query_as(
+                r#"
+            SELECT tenant_id, contact_id, token_hash, expires_at, revoked_at
+            FROM portal_refresh_tokens
+            WHERE id = $1
+            "#,
+            )
+            .bind(row_id)
+            .fetch_optional(self.db.migrator_pool())
+            .await?;
+        let Some((tenant_id, contact_id, token_hash, expires_at, revoked_at)) = row else {
+            return Err(AppError::Unauthorized);
+        };
+        if !verify_password(secret, &token_hash)? {
+            return Err(AppError::Unauthorized);
+        }
+        // Replay: an already-rotated (revoked) token being presented is
+        // the classic stolen-token signal. Burn the whole chain so the
+        // attacker who presented the token AND the honest customer who
+        // may have rotated it earlier both get logged out.
+        if revoked_at.is_some() {
+            self.revoke_rotation_chain(row_id).await?;
+            return Err(AppError::Unauthorized);
+        }
+        if expires_at <= Utc::now() {
+            return Err(AppError::Unauthorized);
+        }
+
+        // Read the contact's identity for the fresh access token. The
+        // tenant + company columns move together on the contact row and
+        // are not user input.
+        let contact: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT company_id, email FROM contacts \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((company_id, email)) = contact else {
+            return Err(AppError::Unauthorized);
+        };
+
+        let now = Utc::now();
+        // Stamp the presented token as rotated (i.e. revoked as a live
+        // credential) BEFORE the new one is issued, so a concurrent
+        // presenter racing us onto the same row cannot get two live
+        // successors out of the same ancestor.
+        let rows = sqlx::query(
+            "UPDATE portal_refresh_tokens SET revoked_at = $1 \
+             WHERE id = $2 AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(row_id)
+        .execute(self.db.migrator_pool())
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            // Lost the race, some other refresh already flipped it.
+            // Treat as a replay to fail closed.
+            self.revoke_rotation_chain(row_id).await?;
+            return Err(AppError::Unauthorized);
+        }
+        let (access_token, expires_at) =
+            self.mint_access_token(contact_id, tenant_id, company_id, &email, now)?;
+        let (refresh_token, refresh_expires_at) = self
+            .issue_refresh_token(
+                tenant_id,
+                contact_id,
+                Some(row_id),
+                now,
+                user_agent,
+                ip_address,
+            )
+            .await?;
+        Ok(PortalRefreshResponse {
+            access_token,
+            expires_at,
+            refresh_token,
+            refresh_expires_at,
+        })
+    }
+
+    /// PMS-729 phase 2 H1: revoke the presented refresh token and every
+    /// other live token in its rotation chain. Called by
+    /// `POST /portal/auth/logout` and by the replay-detected branch of
+    /// [`refresh_access_token`].
+    ///
+    /// Unknown or malformed input is silently ignored so an attacker
+    /// with a random token cannot enumerate live rows by counting the
+    /// response latency.
+    #[tracing::instrument(skip_all)]
+    pub async fn logout(&self, presented: &str) -> AppResult<()> {
+        // Unknown / malformed token: silent ok (enumeration-resistant).
+        let Some((row_id, secret)) = parse_contact_bound_token(presented) else {
+            return Ok(());
+        };
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT token_hash FROM portal_refresh_tokens WHERE id = $1")
+                .bind(row_id)
+                .fetch_optional(self.db.migrator_pool())
+                .await?;
+        let Some((token_hash,)) = row else {
+            return Ok(());
+        };
+        if !verify_password(secret, &token_hash)? {
+            return Ok(());
+        }
+        self.revoke_rotation_chain(row_id).await?;
+        Ok(())
+    }
+
+    /// Revoke every live refresh token that shares a rotation chain with
+    /// `seed_id`, walking both directions of the `rotated_from_id` link.
+    /// Used by explicit logout AND by the replay-detected branch of
+    /// `refresh_access_token` (a stolen ancestor + honest descendant
+    /// both need to lose their access at the same moment).
+    ///
+    /// Recursive CTE walks ancestors (`rotated_from_id` chain up) AND
+    /// descendants (any row rotated from one already in the set) so the
+    /// full family is caught regardless of which member was presented.
+    async fn revoke_rotation_chain(&self, seed_id: Uuid) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            WITH RECURSIVE chain(id) AS (
+                SELECT id FROM portal_refresh_tokens WHERE id = $1
+                UNION
+                SELECT r.id
+                FROM portal_refresh_tokens r
+                JOIN chain c ON r.rotated_from_id = c.id OR r.id = (
+                    SELECT rotated_from_id FROM portal_refresh_tokens WHERE id = c.id
+                )
+            )
+            UPDATE portal_refresh_tokens
+            SET revoked_at = NOW()
+            WHERE id IN (SELECT id FROM chain)
+              AND revoked_at IS NULL
+            "#,
+        )
+        .bind(seed_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
     }
 
     /// PMS-729: look up a tenant by slug for the host-to-tenant

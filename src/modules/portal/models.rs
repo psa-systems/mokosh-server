@@ -76,7 +76,54 @@ pub struct PortalLoginRequest {
 pub struct PortalLoginResponse {
     pub access_token: String,
     pub expires_at: DateTime<Utc>,
+    /// PMS-729 phase 2 H1+H2: opaque refresh token (returned only at
+    /// login and refresh time; NEVER stored anywhere but the SPA's
+    /// non-cookie session storage). Present the token to
+    /// `POST /portal/auth/refresh` before the access token expires to
+    /// rotate both tokens and keep the session alive; present it to
+    /// `POST /portal/auth/logout` to revoke the entire rotation chain.
+    ///
+    /// Format: `{token_id}.{secret}`. Only the Argon2id hash of `secret`
+    /// is stored server-side; the plaintext value is unrecoverable.
+    pub refresh_token: String,
+    /// Absolute expiry of `refresh_token`. The SPA uses this to schedule
+    /// its background refresh call before the token expires.
+    pub refresh_expires_at: DateTime<Utc>,
     pub contact: CurrentContact,
+}
+
+/// PMS-729 phase 2 H2: `POST /api/v1/portal/auth/refresh` request body.
+/// The refresh token is presented in the body (NOT the Authorization
+/// header) because it is not a Bearer credential in the OAuth sense.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalRefreshRequest {
+    #[validate(length(min = 1, message = "refresh_token is required"))]
+    pub refresh_token: String,
+}
+
+/// PMS-729 phase 2 H2: `POST /api/v1/portal/auth/refresh` response body.
+/// Rotates BOTH the access token and the refresh token: the caller must
+/// replace both. The old refresh token is revoked as a side effect of
+/// the rotation; presenting it again fails closed (and is treated as a
+/// replay signal that revokes the entire rotation chain).
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalRefreshResponse {
+    pub access_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub refresh_token: String,
+    pub refresh_expires_at: DateTime<Utc>,
+}
+
+/// PMS-729 phase 2 H1: `POST /api/v1/portal/auth/logout` request body.
+/// Revokes the presented refresh token and every other refresh token
+/// currently live in the same rotation chain, so a stolen access token
+/// cannot be refreshed after the customer signs out on their end. The
+/// access token itself is not stored server-side and expires on its
+/// own; logout is defence-in-depth on top of that.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalLogoutRequest {
+    #[validate(length(min = 1, message = "refresh_token is required"))]
+    pub refresh_token: String,
 }
 
 /// Customer-facing ticket creation. Intentionally narrower than the
@@ -163,4 +210,11 @@ pub struct PortalJwtClaims {
     /// Constant `"portal_access"`. Distinguishes portal tokens from
     /// agent tokens minted by `AuthService`.
     pub typ: String,
+    /// PMS-729 phase 2 H2: unique per-token JWT ID (RFC 7519 §4.1.7).
+    /// Guarantees every minted access token has a distinct byte sequence
+    /// even when two mints share the same second-granularity `iat`/`exp`,
+    /// and gives a future revocation-store implementation a stable
+    /// primary key.
+    #[serde(default)]
+    pub jti: Uuid,
 }

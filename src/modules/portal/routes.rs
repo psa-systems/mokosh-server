@@ -24,7 +24,8 @@ use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalHostHint,
-    PortalLoginRequest, PortalSetupPasswordRequest, ResolvedTenant,
+    PortalLoginRequest, PortalLogoutRequest, PortalRefreshRequest, PortalSetupPasswordRequest,
+    ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -91,6 +92,15 @@ pub fn portal_routes(
     Router::new()
         // Public: login. No auth required to call this.
         .route("/auth/login", post(login))
+        // PMS-729 phase 2 H2: rotate the presented refresh token into a
+        // fresh access + refresh pair. Public: the presented refresh
+        // token itself is the credential (server-side revocation store
+        // means a stolen access token cannot renew after logout).
+        .route("/auth/refresh", post(refresh))
+        // PMS-729 phase 2 H1: revoke the presented refresh token and
+        // every other live token in its rotation chain. Public for the
+        // same reason as refresh; the presented token is the credential.
+        .route("/auth/logout", post(logout))
         // Public: redeem a setup token to set the initial portal password
         // (PMS-136). No auth: the customer is not yet a logged-in contact;
         // the single-use token IS the credential proving they own the link.
@@ -182,11 +192,62 @@ async fn login(
         return Ok(resp);
     }
 
+    let ua = user_agent_from(&headers);
     let resp = state
         .service
-        .login(&resolved_slug, &request.email, &request.password)
+        .login(
+            &resolved_slug,
+            &request.email,
+            &request.password,
+            ua.as_deref(),
+            Some(addr.ip()),
+        )
         .await?;
     Ok(Json(resp).into_response())
+}
+
+/// PMS-729 phase 2 H2: rotate a refresh token. Public route because the
+/// presented token IS the credential; the SPA holds no other identifier.
+/// Any failure (unknown token, expired, revoked, replay-detected) folds
+/// to 401 so the wire shape does not leak whether the token was ever
+/// valid, still valid, or freshly detected as stolen.
+async fn refresh(
+    State(state): State<PortalRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<PortalRefreshRequest>,
+) -> Result<Response, AppError> {
+    request.validate()?;
+    let ua = user_agent_from(&headers);
+    let resp = state
+        .service
+        .refresh_access_token(&request.refresh_token, ua.as_deref(), Some(addr.ip()))
+        .await?;
+    Ok(Json(resp).into_response())
+}
+
+/// PMS-729 phase 2 H1: revoke a refresh token and its rotation chain.
+/// Idempotent + enumeration-resistant: an unknown or already-revoked
+/// token still returns 204 so a caller cannot probe whether a specific
+/// token id ever existed. The access token itself expires on its own;
+/// this route revokes the ability to renew.
+async fn logout(
+    State(state): State<PortalRouterState>,
+    Json(request): Json<PortalLogoutRequest>,
+) -> Result<StatusCode, AppError> {
+    request.validate()?;
+    state.service.logout(&request.refresh_token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-729 phase 2 helper: pull the User-Agent header as an owned
+/// string, capping the length to prevent a huge value from bloating the
+/// `portal_refresh_tokens.user_agent` column. Falls back to `None` when
+/// the header is absent or fails UTF-8 (an invalid UA is not worth
+/// failing the login for).
+fn user_agent_from(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::USER_AGENT)?.to_str().ok()?;
+    Some(raw.chars().take(500).collect())
 }
 
 /// PMS-729 helper: pull the resolved slug out of the (host, body) pair.
