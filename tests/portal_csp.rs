@@ -28,8 +28,7 @@ mod common;
 
 use sqlx::PgPool;
 
-const EXPECTED_CSP: &str =
-    "default-src 'none'; style-src 'unsafe-inline'; \
+const EXPECTED_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; \
      frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
 /// Every portal response - authenticated or not, success or error -
@@ -109,7 +108,9 @@ async fn portal_response_ships_full_security_header_set(pool: PgPool) {
         Some("max-age=31536000; includeSubDomains; preload")
     );
     assert_eq!(
-        headers.get("x-content-type-options").and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
         Some("nosniff")
     );
     assert_eq!(

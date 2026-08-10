@@ -317,26 +317,95 @@ pub struct PortalSetupPasswordRequest {
 /// PMS-729: an active tenant resolved from the request Host by
 /// [`super::host_tenant::PortalHostConfig::extract_slug`] +
 /// [`super::service::PortalAuthService::resolve_host_tenant`]. Carries
-/// just enough for the login policy check + the branding-hint response.
+/// enough for the login policy check + the phase 2 §6 branding
+/// response.
 #[derive(Debug, Clone)]
 pub struct ResolvedTenant {
     pub tenant_id: Uuid,
     pub slug: String,
     pub display_name: String,
+    pub branding: PortalBranding,
+}
+
+/// PMS-729 phase 2 §6: full MSP branding surface pulled from
+/// `tenants.branding` JSONB. Every field is optional; empty branding
+/// = the SPA falls back to the generic "Client Portal" look. Every
+/// URL field is stored as a raw string so the SPA can point at any
+/// CDN / data URI / same-origin asset (validation lives in the
+/// branding-editor endpoint that MAPPS-420 will add; this read
+/// contract accepts whatever the writer put on the row).
+///
+/// Color fields use the CSS custom-property model (D10, phase-2-plan
+/// §6.3): the SPA sets `--brand-primary` etc. on `:root` from these
+/// values and validates AA contrast at read time (D11). A missing
+/// color leaves the design-token default in place.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PortalBranding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo_url: Option<String>,
+    /// Optional dark-mode logo variant. When absent, the SPA renders
+    /// `logo_url` regardless of theme (fine for a single-color mark;
+    /// a full-color logo benefits from a dark variant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_url_dark: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon_url: Option<String>,
+    /// CSS color for the primary brand accent (buttons, links). Any
+    /// CSS color value the browser accepts (`#2563eb`, `rgb(...)`,
+    /// `hsl(...)`). The SPA runs a contrast check against the light-
+    /// mode surface tokens; a failing value falls back to the design
+    /// token silently and logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_color: Option<String>,
+    /// Optional dark-mode primary color. When absent, the SPA reuses
+    /// `primary_color` under dark theme (browser handles the
+    /// contrast check the same way).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_color_dark: Option<String>,
+    /// Contact email the SPA shows in the "need help?" section of the
+    /// portal footer + auth pages. Not validated as an email at the
+    /// read layer (MAPPS-420 owns the write validation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_phone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_hours: Option<String>,
+    /// Short MSP-owned footer text. Renders in the portal footer in
+    /// place of the generic "Powered by Mokosh Platform" line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_text: Option<String>,
+    /// Short one-liner above the login credentials block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_message: Option<String>,
+}
+
+impl PortalBranding {
+    /// Parse a `tenants.branding` JSONB blob. A wholly-missing or
+    /// malformed blob returns the empty default rather than erroring
+    /// out - a stray typo in the branding editor must never break a
+    /// login.
+    pub fn from_jsonb(v: &serde_json::Value) -> Self {
+        serde_json::from_value(v.clone()).unwrap_or_default()
+    }
 }
 
 /// PMS-729: response body for `GET /api/v1/portal/host`. Returns the
-/// active tenant's display name + logo URL so the SPA login page can
-/// paint MSP-owned branding above the credential fields before a
-/// session exists. Fail-closed: an unknown or malformed host returns
-/// `404 Not Found` with an empty body so the endpoint cannot be used to
-/// enumerate live MSPs.
+/// active tenant's display name + full branding surface so the SPA
+/// can paint MSP-owned chrome (logo, favicon, primary color, welcome
+/// message, support contact) before a session exists. Fail-closed:
+/// an unknown or malformed host returns `404 Not Found` with an empty
+/// body so the endpoint cannot be used to enumerate live MSPs.
+///
+/// PMS-729 phase 2 §6: extended from `{name, logo_url}` to carry the
+/// full branding shape via [`PortalBranding`] (flattened into the
+/// response body so callers see a flat object, not `{name, branding:
+/// {...}}`).
 #[derive(Debug, Clone, Serialize)]
 pub struct PortalHostHint {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logo_url: Option<String>,
+    #[serde(flatten)]
+    pub branding: PortalBranding,
 }
 
 /// JWT claim shape for portal access tokens. Kept separate from the

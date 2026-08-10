@@ -150,7 +150,7 @@ mod tests {
             tenant_id: Uuid::nil(),
             slug: slug.to_string(),
             display_name: "Test MSP".to_string(),
-            logo_url: None,
+            branding: super::super::models::PortalBranding::default(),
         }
     }
 

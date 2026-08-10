@@ -157,11 +157,21 @@ fn fixture_specs() -> Vec<FixtureSpec> {
             slug: "acme",
             display_name: "Acme MSP",
             status: "active",
-            // A public data-URI PNG so the seed does not depend on any
-            // external CDN or a served asset in the dev SPA image. Renders
-            // an 80x20 blue block; enough to prove the logo path is wired.
+            // PMS-729 phase 2 §6: full branding surface so a dev flow
+            // exercises every field the SPA reads (logo, primary
+            // color, support contact, welcome copy, footer). Logo +
+            // favicon use data-URIs so the seed does not depend on
+            // any external CDN or served asset in the dev SPA image.
             branding: serde_json::json!({
-                "logo_url": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 20'><rect width='80' height='20' fill='%233b82f6'/><text x='40' y='14' font-size='11' text-anchor='middle' fill='white' font-family='sans-serif'>ACME</text></svg>"
+                "logo_url": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 20'><rect width='80' height='20' fill='%233b82f6'/><text x='40' y='14' font-size='11' text-anchor='middle' fill='white' font-family='sans-serif'>ACME</text></svg>",
+                "favicon_url": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%233b82f6'/><text x='8' y='12' font-size='10' text-anchor='middle' fill='white' font-family='sans-serif'>A</text></svg>",
+                "primary_color": "#2563eb",
+                "primary_color_dark": "#60a5fa",
+                "support_email": "help@acme.example",
+                "support_phone": "+1 555 0100",
+                "support_hours": "Mon-Fri 9am-5pm ET",
+                "footer_text": "Powered by Acme MSP",
+                "welcome_message": "Welcome to Acme's client portal"
             }),
             company_name: "Acme Widgets Inc.",
             contact_email: "portal-user@acme.example",

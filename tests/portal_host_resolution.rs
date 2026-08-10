@@ -360,6 +360,73 @@ async fn host_hint_omits_logo_url_when_absent(pool: PgPool) {
     );
 }
 
+// AC (phase 2 §6): `/portal/host` surfaces the full extended branding
+// surface (primary_color, welcome_message, support_email, footer_text,
+// favicon_url, logo_url_dark, primary_color_dark, support_phone,
+// support_hours) alongside `name` + `logo_url`, all flattened at the
+// JSON layer so the SPA reads them as top-level fields.
+#[sqlx::test]
+async fn host_hint_surfaces_full_branding_surface(pool: PgPool) {
+    // Seed a tenant with every branding field populated so a wire
+    // regression here surfaces at once.
+    let branding = serde_json::json!({
+        "logo_url": "https://cdn.example/acme.png",
+        "logo_url_dark": "https://cdn.example/acme-dark.png",
+        "favicon_url": "https://cdn.example/acme.ico",
+        "primary_color": "#2563eb",
+        "primary_color_dark": "#60a5fa",
+        "support_email": "help@acme.example",
+        "support_phone": "+1 555 0100",
+        "support_hours": "Mon-Fri 9am-5pm ET",
+        "footer_text": "Powered by Acme MSP",
+        "welcome_message": "Welcome to Acme's client portal",
+    });
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO tenants (id, name, slug, status, kind, branding)
+        VALUES ($1, 'Acme MSP', 'acme', 'active', 'org', $2)
+        "#,
+    )
+    .bind(id)
+    .bind(&branding)
+    .execute(&pool)
+    .await
+    .expect("seed tenant with full branding");
+    let app = common::boot_with_portal_host(pool, portal_host_enabled()).await;
+
+    let resp = portal_host_hint(&app, "acme.client.a8n.systems").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("host hint body");
+
+    // Name still on top.
+    assert_eq!(body["name"].as_str(), Some("Acme MSP"));
+    // Every branding field surfaces flat (not nested under `branding`).
+    for (key, expected) in [
+        ("logo_url", "https://cdn.example/acme.png"),
+        ("logo_url_dark", "https://cdn.example/acme-dark.png"),
+        ("favicon_url", "https://cdn.example/acme.ico"),
+        ("primary_color", "#2563eb"),
+        ("primary_color_dark", "#60a5fa"),
+        ("support_email", "help@acme.example"),
+        ("support_phone", "+1 555 0100"),
+        ("support_hours", "Mon-Fri 9am-5pm ET"),
+        ("footer_text", "Powered by Acme MSP"),
+        ("welcome_message", "Welcome to Acme's client portal"),
+    ] {
+        assert_eq!(
+            body[key].as_str(),
+            Some(expected),
+            "{key} should surface flat"
+        );
+    }
+    // No nested `branding` wrapper.
+    assert!(
+        body.get("branding").is_none(),
+        "branding must be flattened, not nested: {body}"
+    );
+}
+
 // AC: an unknown Host slug returns 404 with no body. The endpoint cannot
 // be used to enumerate live MSPs by trying candidate slugs.
 #[sqlx::test]

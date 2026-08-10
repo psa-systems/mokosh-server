@@ -887,9 +887,11 @@ impl PortalAuthService {
     /// [`super::host_tenant::PortalHostConfig::extract_slug`] filter has
     /// validated the label shape.
     ///
-    /// Reads `tenants.branding` as JSONB and pulls a `logo_url` key out
-    /// of it when present. The full branding blob stays private; only
-    /// the two fields the login page renders are exposed.
+    /// Reads `tenants.branding` as JSONB and deserializes into a
+    /// [`PortalBranding`] struct (PMS-729 phase 2 §6). Every field is
+    /// optional; a wholly-empty branding blob returns
+    /// `PortalBranding::default()` and the SPA falls back to the
+    /// generic "Client Portal" chrome.
     ///
     /// SAFETY (PMS-285): pre-auth cross-tenant read, same posture as the
     /// login lookup above. Runs on the migrator pool; `tenants` is RLS-
@@ -912,10 +914,7 @@ impl PortalAuthService {
                 tenant_id,
                 slug,
                 display_name,
-                logo_url: branding
-                    .get("logo_url")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
+                branding: PortalBranding::from_jsonb(&branding),
             }),
         )
     }

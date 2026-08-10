@@ -603,9 +603,11 @@ fn effective_host(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// PMS-729: public branding hint for the SPA login page. Returns 200
-/// `{name, logo_url}` when the Host resolves to an active tenant; 404
-/// with an empty body on every other outcome so an unknown or malformed
-/// host is indistinguishable from a legitimately-not-portal host.
+/// with the tenant's display name + full [`PortalBranding`] surface
+/// (flattened at the JSON layer) when the Host resolves to an active
+/// tenant; 404 with an empty body on every other outcome so an unknown
+/// or malformed host is indistinguishable from a legitimately-not-portal
+/// host.
 async fn host_hint(
     State(state): State<PortalRouterState>,
     headers: HeaderMap,
@@ -615,7 +617,7 @@ async fn host_hint(
         .ok_or(AppError::NotFound("portal host".to_string()))?;
     Ok(Json(PortalHostHint {
         name: tenant.display_name,
-        logo_url: tenant.logo_url,
+        branding: tenant.branding,
     }))
 }
 
