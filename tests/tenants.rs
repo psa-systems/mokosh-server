@@ -864,3 +864,81 @@ async fn an_unsupported_image_type_is_refused(pool: PgPool) {
         );
     }
 }
+
+/// PMS-758: `branding` is a JSONB document written by more than one caller.
+///
+/// The organisation settings page sends four contact keys; the logo upload
+/// sends two of its own. A whole-document write meant saving the settings page
+/// deleted `logo_mime`, so the public logo route answered 404 and every client
+/// email rendered a broken image. Merging keeps what a caller did not mention,
+/// and an explicit null still clears.
+#[sqlx::test]
+async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // What the logo upload writes.
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": { "logo_url": "/api/v1/public/tenants/x/logo", "logo_mime": "image/png" }
+        }))
+        .send()
+        .await
+        .expect("send logo branding");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // What the settings page writes: its own keys, and nothing about the logo.
+    let after: serde_json::Value = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": { "support_contact_name": "the service desk", "support_phone": "555-0100" }
+        }))
+        .send()
+        .await
+        .expect("send contact branding")
+        .json()
+        .await
+        .expect("tenant JSON");
+
+    assert_eq!(
+        after["branding"]["logo_mime"].as_str(),
+        Some("image/png"),
+        "the settings page must not delete the content type the logo route needs"
+    );
+    assert_eq!(
+        after["branding"]["logo_url"].as_str(),
+        Some("/api/v1/public/tenants/x/logo")
+    );
+    assert_eq!(
+        after["branding"]["support_contact_name"].as_str(),
+        Some("the service desk")
+    );
+
+    // An explicit null still clears: that is how the settings page empties a
+    // contact field, and why it sends nulls rather than omitting them.
+    let cleared: serde_json::Value = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": { "support_contact_name": null }
+        }))
+        .send()
+        .await
+        .expect("send clearing branding")
+        .json()
+        .await
+        .expect("tenant JSON");
+    assert!(cleared["branding"]["support_contact_name"].is_null());
+    assert_eq!(
+        cleared["branding"]["logo_mime"].as_str(),
+        Some("image/png"),
+        "clearing one key must not disturb another"
+    );
+}

@@ -105,7 +105,18 @@ pub struct UpdateTenantRequest {
     pub billing_email: Option<String>,
     pub billing_contact_name: Option<String>,
     pub settings: Option<serde_json::Value>,
-    pub branding: Option<TenantBranding>,
+    /// PMS-758: a PATCH document, not a whole `TenantBranding`.
+    ///
+    /// `tenants.branding` is written by more than one caller: the organisation
+    /// settings page owns the contact keys, the logo upload owns `logo_url` and
+    /// `logo_mime`. Typed as the struct, serde filled in every field it was not
+    /// given as an explicit null, so saving the settings page deleted the
+    /// logo's content type and the public logo route began answering 404.
+    ///
+    /// As a raw object only the keys a caller actually sent are written, and
+    /// the service merges them (`branding || $n`). A key set to null still
+    /// clears, which is how a contact field is emptied.
+    pub branding: Option<serde_json::Value>,
 }
 
 /// Tenant response for API
