@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::utils::crypto::{hash_password, verify_password};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::password_policy::{self, PasswordPolicy, PasswordPolicyError};
 
 use super::models::*;
 
@@ -538,12 +539,6 @@ impl PortalAuthService {
     ///   stale token is indistinguishable from an expired one.
     #[tracing::instrument(skip_all)]
     pub async fn setup_password(&self, token: &str, new_password: &str) -> AppResult<()> {
-        if new_password.len() < 8 {
-            return Err(AppError::BadRequest(
-                "Password must be at least 8 characters".to_string(),
-            ));
-        }
-
         let (contact_id, secret) = parse_contact_bound_token(token)
             .ok_or_else(|| AppError::BadRequest("Invalid or expired setup token".to_string()))?;
 
@@ -592,6 +587,15 @@ impl PortalAuthService {
             ));
         };
 
+        // PMS-729 phase 2 H5: strict policy runs AFTER the token has
+        // been verified live (not replayed / expired / unknown) so a
+        // customer with a bad token doesn't get a confusing "your
+        // password is too weak" message when the token status is the
+        // real problem. Context hints reduce zxcvbn's score for a
+        // password that quotes the user's own email, name, or tenant.
+        let hints = self.password_context_hints(contact_id).await?;
+        apply_password_policy(new_password, &hints)?;
+
         let hash = hash_password(new_password)?;
         // Tenant-scoped write: set the credential and burn the token in one
         // transaction so a crash cannot leave a usable token behind a set
@@ -624,11 +628,9 @@ impl PortalAuthService {
     #[allow(dead_code)]
     #[tracing::instrument(skip_all)]
     pub async fn set_password(&self, contact_id: Uuid, new_password: &str) -> AppResult<()> {
-        if new_password.len() < 8 {
-            return Err(AppError::BadRequest(
-                "Password must be at least 8 characters".to_string(),
-            ));
-        }
+        // PMS-729 phase 2 H5: strict policy (same rules as setup_password).
+        let hints = self.password_context_hints(contact_id).await?;
+        apply_password_policy(new_password, &hints)?;
         let hash = hash_password(new_password)?;
         // SAFETY (PMS-285): portal account setup on the separate
         // `contacts`-identity plane (portal isolation deferred; see the login
@@ -644,6 +646,65 @@ impl PortalAuthService {
         .await?;
         Ok(())
     }
+
+    /// PMS-729 phase 2 H5: pull the contact-scoped strings that feed
+    /// zxcvbn as context hints, so a candidate password that quotes the
+    /// user's own email / name / tenant slug scores lower than a
+    /// random string of the same length would. Returns `Vec<String>` so
+    /// the caller can pass `hints.iter().map(String::as_str).collect()`
+    /// into the policy helper without an extra allocation dance.
+    ///
+    /// Skips entries that are trivially short (< 3 chars) so a
+    /// single-letter first name doesn't add noise.
+    ///
+    /// SAFETY (PMS-285): reads the target contact row directly by primary
+    /// key on the migrator pool, same posture as the login lookup above
+    /// (the portal plane sets no `app.current_tenant` GUC and `contacts`
+    /// is RLS-covered on the app pool).
+    async fn password_context_hints(&self, contact_id: Uuid) -> AppResult<Vec<String>> {
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT c.email, c.first_name, c.last_name, t.slug
+            FROM contacts c
+            INNER JOIN tenants t ON c.tenant_id = t.id
+            WHERE c.id = $1
+            "#,
+        )
+        .bind(contact_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((email, first, last, slug)) = row else {
+            return Ok(Vec::new());
+        };
+        // Also include the local-part of the email so `alice@acme` is
+        // penalized by both `alice@acme` AND `alice` separately.
+        let email_local: Option<String> = email
+            .split('@')
+            .next()
+            .filter(|s| s.len() >= 3)
+            .map(str::to_string);
+        Ok([
+            Some(email),
+            Some(first),
+            Some(last),
+            Some(slug),
+            email_local,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|s| s.chars().count() >= 3)
+        .collect())
+    }
+}
+
+/// PMS-729 phase 2 H5: bridge the shared [`password_policy`] error
+/// variant onto the portal-facing [`AppError::BadRequest`] so the wire
+/// shape matches every other portal validation failure. The message
+/// content is passed through verbatim (already user-safe by design).
+fn apply_password_policy(new_password: &str, hints: &[String]) -> AppResult<()> {
+    let hints_ref: Vec<&str> = hints.iter().map(String::as_str).collect();
+    password_policy::validate(new_password, &hints_ref, PasswordPolicy::default())
+        .map_err(|PasswordPolicyError::UserMessage(msg)| AppError::BadRequest(msg))
 }
 
 /// Split a portal setup token `{contact_id}.{secret}` into its parts.

@@ -164,7 +164,11 @@ pub struct CreatePortalTicketNoteRequest {
 pub struct PortalSetupPasswordRequest {
     #[validate(length(min = 1, message = "token is required"))]
     pub token: String,
-    #[validate(length(min = 8, message = "Password must be at least 8 characters"))]
+    // Length + strength check lives in `PortalAuthService::setup_password`
+    // via the shared `utils::password_policy` (PMS-729 phase 2 H5). The
+    // validator layer only enforces "not empty" so the strength module
+    // is the single source of truth for the password rules.
+    #[validate(length(min = 1, message = "password is required"))]
     pub password: String,
 }
 

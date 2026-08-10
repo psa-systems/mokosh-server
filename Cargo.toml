@@ -111,6 +111,12 @@ jsonwebtoken = "9"
 # Validation
 validator = { version = "0.19", features = ["derive"] }
 
+# Password-strength scoring. PMS-729 phase 2 H5: portal password policy
+# rejects zxcvbn score < 3 (a fast-crack candidate) alongside the length
+# floor + common-password blocklist. Same primitive Dropbox uses in
+# production; pure-Rust port so no C dep.
+zxcvbn = "3"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

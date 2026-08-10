@@ -524,7 +524,10 @@ async fn portal_setup_password_redeem_replay_expire(pool: PgPool) {
     .await;
     let app = common::boot(pool.clone()).await;
 
-    let new_password = "fresh-portal-pw-9876";
+    // PMS-729 phase 2 H5: password policy requires >= 12 chars, not on
+    // the common-password blocklist, and zxcvbn score >= 3. This value
+    // clears all three.
+    let new_password = "Kq7$mZ2n#PxR9wLf";
 
     // AC4: valid token -> 204 and portal_password_hash is set.
     let ok = app
