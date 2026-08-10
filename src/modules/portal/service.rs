@@ -14,8 +14,11 @@ use crate::modules::audit::{audit_portal_event, AuditAction};
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{hash_password, verify_password};
+use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::geoip::GeoIpService;
 use crate::utils::password_policy::{self, PasswordPolicy, PasswordPolicyError};
+use std::sync::Arc;
 
 use super::models::*;
 
@@ -32,6 +35,19 @@ pub struct PortalAuthService {
     /// `dispatch_password_reset_email`. `None` in fixtures built without
     /// a dispatcher, in which case the mail is logged but not sent.
     notifications: Option<NotificationsService>,
+    /// PMS-729 phase 2 H7: IP -> country resolver for login-location
+    /// alerts. `None` when `IP2LOCATION_DB_PATH` is unset (the feature
+    /// silently disables; login flow is unaffected).
+    geoip: Option<Arc<GeoIpService>>,
+    /// PMS-729 phase 2 H7: direct mailer for the new-sign-in
+    /// notification. Direct rather than via the notifications queue for
+    /// the same reason the agent's login-location alert does: no
+    /// template is seeded, and a queued dispatch would find no rule
+    /// and drop the alert. `None` in fixtures built without a mailer.
+    mailer: Option<Arc<dyn Mailer>>,
+    /// PMS-729 phase 2 H7: SPA origin used as the "review your active
+    /// sessions" link in the new-sign-in email body.
+    portal_origin: String,
 }
 
 impl PortalAuthService {
@@ -45,6 +61,9 @@ impl PortalAuthService {
             access_token_ttl: Duration::minutes(15),
             refresh_token_ttl: Duration::days(30),
             notifications: None,
+            geoip: None,
+            mailer: None,
+            portal_origin: String::new(),
         }
     }
 
@@ -52,6 +71,23 @@ impl PortalAuthService {
     /// dispatcher so the service can queue the password-reset email.
     pub fn with_notifications(mut self, notifications: NotificationsService) -> Self {
         self.notifications = Some(notifications);
+        self
+    }
+
+    /// PMS-729 phase 2 H7: builder that attaches the login-location
+    /// alert pieces. `geoip` may be `None` (feature off; check no-ops
+    /// on every login). `mailer` + `portal_origin` are always required
+    /// together: the alert email body has a "review your sessions"
+    /// link built from the origin.
+    pub fn with_login_alerts(
+        mut self,
+        geoip: Option<Arc<GeoIpService>>,
+        mailer: Arc<dyn Mailer>,
+        portal_origin: String,
+    ) -> Self {
+        self.geoip = geoip;
+        self.mailer = Some(mailer);
+        self.portal_origin = portal_origin;
         self
     }
 
@@ -251,6 +287,13 @@ impl PortalAuthService {
         )
         .await;
 
+        // PMS-729 phase 2 H7: new-sign-in email on a country change.
+        // Best-effort; a failure here never blocks the login. The
+        // check no-ops when the feature is not fully configured
+        // (missing geoip / mailer) or when the client IP is private.
+        self.check_login_location(id, tenant_id, &email, ip_address, user_agent)
+            .await;
+
         Ok(PortalLoginResponse {
             access_token,
             expires_at,
@@ -303,6 +346,141 @@ impl PortalAuthService {
         .await?
         .rows_affected();
         Ok(rows > 0)
+    }
+
+    /// PMS-729 phase 2 H7: on a genuine login, resolve the client IP
+    /// to a country and, when it differs from the country recorded at
+    /// the contact's previous login (and the contact has not opted
+    /// out via `portal_login_location_alerts = FALSE`), email a
+    /// new-sign-in alert then persist the new country. The first
+    /// geolocatable login records the country silently.
+    ///
+    /// Entirely best-effort: every failure is logged and swallowed so
+    /// it can never block a login. No-ops when:
+    /// - no `IP2LOCATION_DB_PATH` set (`geoip` is `None`)
+    /// - no mailer wired (fixtures)
+    /// - the IP is private/loopback/link-local (dev, or behind a
+    ///   proxy that did not populate X-Forwarded-For correctly)
+    /// - `GeoIpService::country_code` returns None
+    async fn check_login_location(
+        &self,
+        contact_id: Uuid,
+        tenant_id: Uuid,
+        email: &str,
+        ip: Option<std::net::IpAddr>,
+        user_agent: Option<&str>,
+    ) {
+        let Some(geoip) = self.geoip.as_ref() else {
+            return;
+        };
+        let Some(parsed) = ip else {
+            return;
+        };
+        if is_non_public_ip(&parsed) {
+            return;
+        }
+        let Some(country) = geoip.country_code(parsed) else {
+            return;
+        };
+
+        // Pull the current stored country + opt-out flag. Failure here
+        // (e.g. RLS mishap) is logged + swallowed so the login flow is
+        // never affected by a broken alert path.
+        let previous: Result<Option<(Option<String>, bool)>, _> = sqlx::query_as(
+            "SELECT portal_last_login_country, portal_login_location_alerts \
+             FROM contacts WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await;
+        let (previous_country, alerts_enabled) = match previous {
+            Ok(Some((c, a))) => (c, a),
+            _ => return,
+        };
+
+        match login_location_decision(previous_country.as_deref(), &country) {
+            LoginLocationDecision::Unchanged => {}
+            LoginLocationDecision::Record => {
+                if let Err(e) = self
+                    .set_last_login_country(contact_id, tenant_id, &country)
+                    .await
+                {
+                    tracing::warn!(contact_id = %contact_id, error = %e,
+                        "portal: failed to record initial login country");
+                }
+            }
+            LoginLocationDecision::Alert => {
+                let previous = previous_country.as_deref().unwrap_or("?");
+                if alerts_enabled {
+                    if let Some(mailer) = self.mailer.clone() {
+                        // Detached: SMTP round-trip must not add
+                        // latency to (or fail) the login. Same pattern
+                        // as the agent-side alert.
+                        let email = email.to_string();
+                        let country = country.clone();
+                        let ip = parsed.to_string();
+                        let when = Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+                        let ua = user_agent.unwrap_or("unknown").to_string();
+                        let security_link = if self.portal_origin.is_empty() {
+                            String::from("(portal)")
+                        } else {
+                            format!(
+                                "{}/portal/settings/sessions",
+                                self.portal_origin.trim_end_matches('/')
+                            )
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) = mailer
+                                .send_new_login_location(
+                                    &email,
+                                    &country,
+                                    &ip,
+                                    &when,
+                                    &ua,
+                                    &security_link,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e,
+                                    "portal: new-login-location email dispatch failed");
+                            }
+                        });
+                    }
+                }
+                tracing::info!(
+                    contact_id = %contact_id, from = %previous, to = %country,
+                    "portal: login country changed"
+                );
+                if let Err(e) = self
+                    .set_last_login_country(contact_id, tenant_id, &country)
+                    .await
+                {
+                    tracing::warn!(contact_id = %contact_id, error = %e,
+                        "portal: failed to update login country");
+                }
+            }
+        }
+    }
+
+    /// PMS-729 phase 2 H7: persist the ISO country of the contact's
+    /// most recent geolocatable login.
+    async fn set_last_login_country(
+        &self,
+        contact_id: Uuid,
+        tenant_id: Uuid,
+        country: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE contacts SET portal_last_login_country = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(country)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
     }
 
     /// PMS-729 phase 2 H1+H2: mint a fresh HS256 access JWT for the given
@@ -1504,6 +1682,108 @@ struct IssuedRefreshToken {
     id: Uuid,
     token: String,
     expires_at: DateTime<Utc>,
+}
+
+/// PMS-729 phase 2 H7: kept-out portal analogue of the agent-side
+/// `LoginLocationDecision` (auth/service.rs). Pure branch logic so the
+/// service method stays readable.
+#[derive(Debug, PartialEq, Eq)]
+enum LoginLocationDecision {
+    /// No prior country on record: store this one silently, no alert.
+    Record,
+    /// Same country as last time: do nothing.
+    Unchanged,
+    /// Country differs from last time: alert the contact, then store the new one.
+    Alert,
+}
+
+fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLocationDecision {
+    match previous {
+        None => LoginLocationDecision::Record,
+        Some(prev) if prev == current => LoginLocationDecision::Unchanged,
+        Some(_) => LoginLocationDecision::Alert,
+    }
+}
+
+/// PMS-729 phase 2 H7: private / loopback / link-local / unspecified /
+/// broadcast addresses can never map to a public country. Skip them so
+/// a request behind an mis-configured proxy (or dev) does not register
+/// as a country change. Same predicate the agent side uses.
+fn is_non_public_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
+    }
+}
+
+#[cfg(test)]
+mod login_location_tests {
+    use super::{is_non_public_ip, login_location_decision, LoginLocationDecision};
+    use std::net::IpAddr;
+
+    #[test]
+    fn decision_records_on_first_login() {
+        assert_eq!(
+            login_location_decision(None, "US"),
+            LoginLocationDecision::Record
+        );
+    }
+
+    #[test]
+    fn decision_unchanged_on_same_country() {
+        assert_eq!(
+            login_location_decision(Some("GB"), "GB"),
+            LoginLocationDecision::Unchanged
+        );
+    }
+
+    #[test]
+    fn decision_alerts_on_country_change() {
+        assert_eq!(
+            login_location_decision(Some("US"), "FR"),
+            LoginLocationDecision::Alert
+        );
+    }
+
+    #[test]
+    fn public_ipv4_is_geolocatable() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(!is_non_public_ip(&ip));
+    }
+
+    #[test]
+    fn private_ipv4_ranges_are_skipped() {
+        for ip in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.0.1",
+            "0.0.0.0",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_non_public_ip(&ip), "{ip} should be non-public");
+        }
+    }
+
+    #[test]
+    fn loopback_and_link_local_ipv6_are_skipped() {
+        for ip in ["::1", "fe80::1", "fc00::1", "::"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_non_public_ip(&ip), "{ip} should be non-public");
+        }
+    }
 }
 
 /// PMS-729 phase 2 H4: hex-SHA-256 of the canonical recovery-code form

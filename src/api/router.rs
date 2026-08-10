@@ -118,7 +118,7 @@ pub fn create_api_router(
         client_origin.clone(),
         notifications_service.clone(),
     )
-    .with_geoip(geoip)
+    .with_geoip(geoip.clone())
     .with_login_approval(login_approval_enabled);
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
@@ -438,11 +438,14 @@ pub fn create_api_router(
     // so this surface runs its own auth middleware (mounted inside
     // `portal_routes`) and never sees `AuthMiddleware` / `AuthState`.
     // PMS-729 phase 2 H3: attach the notifications dispatcher so the
-    // password-reset email path lands. The attachment auth-service
-    // instance below skips it: that clone is used only by the extractor
-    // for portal-attachment routes and never dispatches mail.
+    // password-reset email path lands. PMS-729 phase 2 H7: attach the
+    // geoip + mailer so the new-sign-in email fires on a country
+    // change. The attachment auth-service instance below skips both:
+    // that clone is used only by the extractor for portal-attachment
+    // routes and never dispatches mail.
     let portal_service = PortalAuthService::new(db.clone(), jwt_secret.clone())
-        .with_notifications(notifications_service.clone());
+        .with_notifications(notifications_service.clone())
+        .with_login_alerts(geoip.clone(), mailer.clone(), client_origin.clone());
     // PMS-483: `portal_attachment_routes` needs its own clone of the
     // service so it can build the same `portal_auth_middleware` layer
     // independently (the layer is per-Router in axum, not inherited
