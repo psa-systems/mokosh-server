@@ -84,7 +84,10 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "limit", "request-id"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal"] }
+# PMS-729 phase 2 H6: `ipnetwork` feature enables sqlx's IpNetwork
+# decode for the portal_refresh_tokens.ip_address column so
+# /portal/auth/me/sessions can surface the requesting IP.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal", "ipnetwork"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

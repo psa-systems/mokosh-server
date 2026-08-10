@@ -227,11 +227,16 @@ impl PortalAuthService {
         .await?;
 
         let now = Utc::now();
-        let (access_token, expires_at) =
-            self.mint_access_token(id, tenant_id, company_id, &email, now)?;
-        let (refresh_token, refresh_expires_at) = self
+        // PMS-729 phase 2 H6: issue the refresh token FIRST so the
+        // access token can carry the refresh id as its `sid` claim.
+        // The refresh row IS the session record from the customer's
+        // point of view; the sid claim ties every access token back
+        // to its issuing session for `/portal/auth/me/sessions`.
+        let refresh = self
             .issue_refresh_token(tenant_id, id, None, now, user_agent, ip_address)
             .await?;
+        let (access_token, expires_at) =
+            self.mint_access_token(id, tenant_id, company_id, &email, refresh.id, now)?;
 
         // PMS-729 phase 2 H10: audit successful login. Best-effort; a
         // failed audit write is not a login-flow failure.
@@ -249,8 +254,8 @@ impl PortalAuthService {
         Ok(PortalLoginResponse {
             access_token,
             expires_at,
-            refresh_token,
-            refresh_expires_at,
+            refresh_token: refresh.token,
+            refresh_expires_at: refresh.expires_at,
             contact: Some(CurrentContact {
                 id,
                 tenant_id,
@@ -303,12 +308,18 @@ impl PortalAuthService {
     /// PMS-729 phase 2 H1+H2: mint a fresh HS256 access JWT for the given
     /// contact. Extracted so both `login` and `refresh` can call it with
     /// the same claim shape and TTL.
+    ///
+    /// PMS-729 phase 2 H6: `sid` is the id of the refresh token that
+    /// minted this access token; carried inside the JWT claims so
+    /// `/portal/auth/me/sessions` can tag the caller's own session as
+    /// `current`.
     fn mint_access_token(
         &self,
         contact_id: Uuid,
         tenant_id: Uuid,
         company_id: Uuid,
         email: &str,
+        sid: Uuid,
         now: DateTime<Utc>,
     ) -> AppResult<(String, DateTime<Utc>)> {
         let expires_at = now + self.access_token_ttl;
@@ -321,6 +332,7 @@ impl PortalAuthService {
             exp: expires_at.timestamp(),
             typ: "portal_access".to_string(),
             jti: Uuid::new_v4(),
+            sid,
         };
         let token = encode(
             &Header::default(),
@@ -350,7 +362,7 @@ impl PortalAuthService {
         now: DateTime<Utc>,
         user_agent: Option<&str>,
         ip_address: Option<std::net::IpAddr>,
-    ) -> AppResult<(String, DateTime<Utc>)> {
+    ) -> AppResult<IssuedRefreshToken> {
         // 32 hex chars (128 bits) of collision-resistant randomness plus the
         // row id in front for O(1) lookup. Full token format matches the
         // portal setup-token shape (`{id}.{secret}`) so the parse helper
@@ -382,7 +394,11 @@ impl PortalAuthService {
         .bind(ip_text.unwrap_or_default())
         .fetch_one(self.db.migrator_pool())
         .await?;
-        Ok((format!("{id}.{secret}"), expires_at))
+        Ok(IssuedRefreshToken {
+            id,
+            token: format!("{id}.{secret}"),
+            expires_at,
+        })
     }
 
     /// PMS-729 phase 2 H2: rotate a live refresh token into a new access +
@@ -470,9 +486,10 @@ impl PortalAuthService {
             self.revoke_rotation_chain(row_id).await?;
             return Err(AppError::Unauthorized);
         }
-        let (access_token, expires_at) =
-            self.mint_access_token(contact_id, tenant_id, company_id, &email, now)?;
-        let (refresh_token, refresh_expires_at) = self
+        // PMS-729 phase 2 H6: same ordering as login. Refresh row
+        // is minted first so the new access token can carry its id
+        // as the `sid` claim.
+        let refresh = self
             .issue_refresh_token(
                 tenant_id,
                 contact_id,
@@ -482,11 +499,13 @@ impl PortalAuthService {
                 ip_address,
             )
             .await?;
+        let (access_token, expires_at) =
+            self.mint_access_token(contact_id, tenant_id, company_id, &email, refresh.id, now)?;
         Ok(PortalRefreshResponse {
             access_token,
             expires_at,
-            refresh_token,
-            refresh_expires_at,
+            refresh_token: refresh.token,
+            refresh_expires_at: refresh.expires_at,
         })
     }
 
@@ -565,6 +584,121 @@ impl PortalAuthService {
         .bind(seed_id)
         .execute(self.db.migrator_pool())
         .await?;
+        Ok(())
+    }
+
+    /// PMS-729 phase 2 H6: list live refresh tokens (portal sessions)
+    /// for a contact. Filters out revoked and expired rows so the
+    /// customer only sees things they might actually want to sign out
+    /// of. `current_sid` is the `sid` claim on the caller's own access
+    /// token; the returned rows have `current = true` when their id
+    /// matches (so the SPA can highlight "this browser" and hide the
+    /// delete button for it - self-logout goes through
+    /// `/portal/auth/logout`, not the per-session delete).
+    ///
+    /// SAFETY (PMS-285): both filters are the caller's own tenant +
+    /// contact ids from the verified JWT; the migrator pool is used
+    /// because portal has no per-request RLS GUC set today.
+    #[allow(clippy::type_complexity)]
+    #[tracing::instrument(skip_all)]
+    pub async fn list_sessions(
+        &self,
+        contact_id: Uuid,
+        tenant_id: Uuid,
+        current_sid: Uuid,
+    ) -> AppResult<Vec<PortalSessionResponse>> {
+        let rows: Vec<(
+            Uuid,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<String>,
+            Option<ipnetwork::IpNetwork>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, issued_at, expires_at, user_agent, ip_address
+            FROM portal_refresh_tokens
+            WHERE contact_id = $1
+              AND tenant_id = $2
+              AND revoked_at IS NULL
+              AND expires_at > NOW()
+            ORDER BY issued_at DESC
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_all(self.db.migrator_pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, issued_at, expires_at, user_agent, ip_address)| PortalSessionResponse {
+                    id,
+                    issued_at,
+                    expires_at,
+                    user_agent,
+                    ip_address: ip_address.map(|ip| ip.ip().to_string()),
+                    current: id == current_sid,
+                },
+            )
+            .collect())
+    }
+
+    /// PMS-729 phase 2 H6: revoke ONE refresh token (and its rotation
+    /// chain) belonging to the caller. Scoped by `(contact_id,
+    /// tenant_id)` so a contact cannot revoke another contact's
+    /// session even if they know the id. Returns `Ok(())` regardless
+    /// of whether the row existed / was already revoked (idempotent
+    /// + enumeration-resistant, same posture as `/portal/auth/logout`).
+    ///
+    /// Refuses when the caller tries to revoke their OWN session: a
+    /// self-sign-out has a dedicated endpoint (`/portal/auth/logout`)
+    /// that clears local state on the SPA side too; letting the
+    /// delete route double as self-logout would leave the SPA in a
+    /// broken state with a stale in-memory token.
+    #[tracing::instrument(skip_all)]
+    pub async fn revoke_session(
+        &self,
+        session_id: Uuid,
+        contact_id: Uuid,
+        tenant_id: Uuid,
+        current_sid: Uuid,
+    ) -> AppResult<()> {
+        if session_id == current_sid {
+            return Err(AppError::BadRequest(
+                "Use /portal/auth/logout to sign out of the current session".to_string(),
+            ));
+        }
+        // Verify the row belongs to this contact BEFORE walking the
+        // chain, so a caller cannot revoke another contact's chain by
+        // supplying a foreign id.
+        let owns: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM portal_refresh_tokens \
+             WHERE id = $1 AND contact_id = $2 AND tenant_id = $3)",
+        )
+        .bind(session_id)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if !owns {
+            // Silent ok: matches logout's enumeration-resistant shape.
+            return Ok(());
+        }
+        self.revoke_rotation_chain(session_id).await?;
+        // PMS-729 phase 2 H10: audit the revoke separate from the
+        // customer's own /logout so an admin scan can tell "revoked
+        // another session from the SPA session list" from "signed out
+        // of the browser".
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Logout,
+            "portal.session_revoked",
+            None,
+            None,
+        )
+        .await;
         Ok(())
     }
 
@@ -1359,6 +1493,17 @@ pub struct PasswordResetIssue {
     pub email: String,
     pub token: String,
     pub expires_at: DateTime<Utc>,
+}
+
+/// PMS-729 phase 2 H1+H2: what `issue_refresh_token` returns. The
+/// `id` is the row id (also used as the JWT `sid` claim so an access
+/// token can be tied back to its issuing refresh row for H6). The
+/// `token` is the plaintext `{id}.{secret}` form handed to the SPA.
+#[derive(Debug, Clone)]
+struct IssuedRefreshToken {
+    id: Uuid,
+    token: String,
+    expires_at: DateTime<Utc>,
 }
 
 /// PMS-729 phase 2 H4: hex-SHA-256 of the canonical recovery-code form

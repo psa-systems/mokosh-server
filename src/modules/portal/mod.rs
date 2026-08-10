@@ -47,7 +47,9 @@ pub mod service;
 
 pub use captcha::{TurnstileConfig, TurnstileError, TurnstileGate};
 pub use host_tenant::PortalHostConfig;
-pub use middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
+pub use middleware::{
+    portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth, RequirePortalSession,
+};
 pub use models::*;
 pub use routes::portal_routes;
 pub use service::PortalAuthService;

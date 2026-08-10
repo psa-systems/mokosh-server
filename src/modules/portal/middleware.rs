@@ -49,14 +49,17 @@ pub async fn portal_auth_middleware(
                     .ok()
                     .flatten()
                     .unwrap_or_default();
-                PortalAuthState::authenticated(CurrentContact {
-                    id: claims.sub,
-                    tenant_id: claims.tid,
-                    company_id: claims.cid,
-                    email: claims.email,
-                    first_name,
-                    last_name,
-                })
+                PortalAuthState::authenticated(
+                    CurrentContact {
+                        id: claims.sub,
+                        tenant_id: claims.tid,
+                        company_id: claims.cid,
+                        email: claims.email,
+                        first_name,
+                        last_name,
+                    },
+                    claims.sid,
+                )
             }
             Err(_) => PortalAuthState::default(),
         },
@@ -97,6 +100,43 @@ where
         match auth_state.contact {
             Some(c) => Ok(RequirePortalAuth(c)),
             None => Err(AppError::Unauthorized),
+        }
+    }
+}
+
+/// PMS-729 phase 2 H6: extractor that yields the authenticated
+/// contact + the session id (JWT `sid` claim). Used by
+/// `/portal/auth/me/sessions` (mark current) and
+/// `DELETE /me/sessions/{id}` (refuse self-revoke). 401 when the
+/// request has no valid portal session OR the token lacks `sid`
+/// (pre-H6 tokens still verify but do not carry the claim; they
+/// cannot use the session-management routes until they refresh).
+#[derive(Clone)]
+pub struct RequirePortalSession {
+    pub contact: CurrentContact,
+    pub sid: uuid::Uuid,
+}
+
+impl<S> axum::extract::FromRequestParts<S> for RequirePortalSession
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_state = parts
+            .extensions
+            .get::<PortalAuthState>()
+            .cloned()
+            .unwrap_or_default();
+        match (auth_state.contact, auth_state.sid) {
+            (Some(contact), Some(sid)) if !sid.is_nil() => {
+                Ok(RequirePortalSession { contact, sid })
+            }
+            _ => Err(AppError::Unauthorized),
         }
     }
 }

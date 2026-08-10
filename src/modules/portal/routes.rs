@@ -12,7 +12,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use uuid::Uuid;
@@ -20,7 +20,9 @@ use validator::Validate;
 
 use super::captcha::{TurnstileError, TurnstileGate};
 use super::host_tenant::{resolve_slug, PortalHostConfig};
-use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
+use super::middleware::{
+    portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth, RequirePortalSession,
+};
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
@@ -28,7 +30,7 @@ use super::{
     PortalChangePasswordRequest, PortalForgotPasswordRequest, PortalHostHint, PortalLoginRequest,
     PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
     PortalMfaSetupResponse, PortalRefreshRequest, PortalResetPasswordRequest,
-    PortalSetupPasswordRequest, ResolvedTenant,
+    PortalSessionResponse, PortalSetupPasswordRequest, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -138,6 +140,14 @@ pub fn portal_routes(
         .route("/auth/me/mfa/setup", post(mfa_setup))
         .route("/auth/me/mfa/enable", post(mfa_enable))
         .route("/auth/me/mfa/disable", post(mfa_disable))
+        // PMS-729 phase 2 H6: session listing + per-session revoke.
+        // GET returns the caller's live refresh tokens (portal
+        // sessions) with a `current` flag on the one that minted the
+        // caller's access token. DELETE revokes the whole rotation
+        // chain of a specific session; refuses when the id matches
+        // the caller's own session (self-sign-out is /auth/logout).
+        .route("/auth/me/sessions", get(list_sessions))
+        .route("/auth/me/sessions/{session_id}", delete(revoke_session))
         // PMS-729: public branding hint. The SPA login page calls this on
         // mount to decide (a) whether to hide the slug input and (b) which
         // MSP name + logo to paint above the credential fields. Returns
@@ -486,6 +496,38 @@ async fn mfa_disable(
             &request.current_password,
             &request.code,
         )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-729 phase 2 H6: list the caller's live portal sessions.
+/// Each row is a live (unrevoked, unexpired) refresh token; the
+/// `current` flag marks the one that minted the caller's own access
+/// token so the SPA can highlight "this browser".
+async fn list_sessions(
+    State(state): State<PortalRouterState>,
+    RequirePortalSession { contact, sid }: RequirePortalSession,
+) -> Result<Json<Vec<PortalSessionResponse>>, AppError> {
+    let sessions = state
+        .service
+        .list_sessions(contact.id, contact.tenant_id, sid)
+        .await?;
+    Ok(Json(sessions))
+}
+
+/// PMS-729 phase 2 H6: revoke one of the caller's other sessions.
+/// Refuses when `session_id` matches the caller's own sid (returns
+/// 400 with a message pointing at `/portal/auth/logout`). Unknown or
+/// foreign session ids silently succeed (enumeration-resistant,
+/// mirrors the `/portal/auth/logout` posture).
+async fn revoke_session(
+    State(state): State<PortalRouterState>,
+    RequirePortalSession { contact, sid }: RequirePortalSession,
+    Path(session_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .service
+        .revoke_session(session_id, contact.id, contact.tenant_id, sid)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

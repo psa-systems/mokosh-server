@@ -13,12 +13,20 @@ use validator::Validate;
 #[derive(Debug, Clone, Default)]
 pub struct PortalAuthState {
     pub contact: Option<CurrentContact>,
+    /// PMS-729 phase 2 H6: session id (= id of the refresh token that
+    /// minted the caller's access token, from the JWT `sid` claim).
+    /// `None` for an anonymous request; carried alongside the contact
+    /// so `/portal/auth/me/sessions` can mark the caller's own
+    /// session as `current` and `DELETE /me/sessions/{id}` can refuse
+    /// self-revoke.
+    pub sid: Option<Uuid>,
 }
 
 impl PortalAuthState {
-    pub fn authenticated(contact: CurrentContact) -> Self {
+    pub fn authenticated(contact: CurrentContact, sid: Uuid) -> Self {
         Self {
             contact: Some(contact),
+            sid: Some(sid),
         }
     }
 }
@@ -355,4 +363,37 @@ pub struct PortalJwtClaims {
     /// primary key.
     #[serde(default)]
     pub jti: Uuid,
+    /// PMS-729 phase 2 H6: session id = id of the refresh token that
+    /// minted this access token. Ties an access token to a specific
+    /// row in `portal_refresh_tokens` so `GET /me/sessions` can mark
+    /// the caller's own session as `is_current` and `DELETE
+    /// /me/sessions/{id}` can no-op safely when the caller tries to
+    /// delete their own session. Rotates on every `/refresh` (a new
+    /// refresh token id => a new sid).
+    #[serde(default)]
+    pub sid: Uuid,
+}
+
+/// PMS-729 phase 2 H6: one row on `GET /portal/auth/me/sessions`.
+/// Wraps a live `portal_refresh_tokens` row with just the fields a
+/// customer needs to see + a `current` flag so the SPA can highlight
+/// the session they're viewing from.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalSessionResponse {
+    /// Refresh token id. Matches the `sid` claim on the access token
+    /// that minted this row (per rotation, so this is the id of the
+    /// LIVE refresh token in the chain, not any ancestor).
+    pub id: Uuid,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    /// `true` when this session's rotation chain contains the sid
+    /// claim off the caller's access token. Lets the SPA highlight
+    /// "this browser" and hide the delete button for it (a customer
+    /// signing themselves out uses `/portal/auth/logout`, not the
+    /// per-session delete).
+    pub current: bool,
 }
