@@ -47,6 +47,16 @@ COPY --from=builder /build/target/release/mokosh-server /app/mokosh-server
 COPY --from=builder /build/target/release/mokosh-bootstrap /app/mokosh-bootstrap
 COPY --from=builder /build/migrations /app/migrations
 
+# PMS-757: the uploads directory has to EXIST in the image, owned by the runtime
+# user, before a deployment mounts a volume over it.
+#
+# Docker seeds an empty named volume from whatever the image has at the mount
+# point, ownership included. With no directory there, the fresh volume is
+# root-owned, and this container runs as uid 1001, so every upload would fail
+# the day persistence was added. `ATTACHMENT_DIR` defaults to `./attachments`
+# against WORKDIR /app, so this path is also what a bare `docker run` uses.
+RUN mkdir -p /app/attachments
+
 RUN chown --recursive appuser:appuser /app
 
 USER appuser
