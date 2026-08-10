@@ -26,7 +26,8 @@ use super::service::PortalAuthService;
 use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact,
     PortalChangePasswordRequest, PortalForgotPasswordRequest, PortalHostHint, PortalLoginRequest,
-    PortalLogoutRequest, PortalRefreshRequest, PortalResetPasswordRequest,
+    PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
+    PortalMfaSetupResponse, PortalRefreshRequest, PortalResetPasswordRequest,
     PortalSetupPasswordRequest, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
@@ -130,6 +131,13 @@ pub fn portal_routes(
         // cannot silently rotate the credential. New password runs
         // through the H5 policy.
         .route("/auth/me/password", put(change_password))
+        // PMS-729 phase 2 H4: MFA management. Setup mints a fresh
+        // TOTP secret + provisioning URI (does not enable). Enable
+        // confirms with a code + mints recovery codes. Disable
+        // requires current-password + valid TOTP for re-auth.
+        .route("/auth/me/mfa/setup", post(mfa_setup))
+        .route("/auth/me/mfa/enable", post(mfa_enable))
+        .route("/auth/me/mfa/disable", post(mfa_disable))
         // PMS-729: public branding hint. The SPA login page calls this on
         // mount to decide (a) whether to hide the slug input and (b) which
         // MSP name + logo to paint above the credential fields. Returns
@@ -250,6 +258,8 @@ async fn login(
             &resolved_slug,
             &request.email,
             &request.password,
+            request.mfa_code.as_deref(),
+            request.recovery_code.as_deref(),
             ua.as_deref(),
             Some(addr.ip()),
         )
@@ -420,6 +430,61 @@ async fn change_password(
             contact.tenant_id,
             &request.current_password,
             &request.new_password,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-729 phase 2 H4: start portal MFA enrollment. Requires an
+/// authenticated session; mints a fresh TOTP secret and stores it on
+/// the contact row without flipping `portal_mfa_enabled`. The response
+/// carries the base32 secret + `otpauth://` provisioning URI so the
+/// SPA can render a QR code.
+async fn mfa_setup(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> Result<Json<PortalMfaSetupResponse>, AppError> {
+    let resp = state
+        .service
+        .start_mfa_enrollment(contact.id, contact.tenant_id)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-729 phase 2 H4: confirm MFA enrollment. Verifies a live TOTP
+/// code against the secret set by `/setup`, flips `portal_mfa_enabled`
+/// to TRUE, and returns 10 single-use recovery codes (surfaced once;
+/// server stores only Argon2id hashes).
+async fn mfa_enable(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Json(request): Json<PortalMfaEnableRequest>,
+) -> Result<Json<PortalMfaEnableResponse>, AppError> {
+    request.validate()?;
+    let resp = state
+        .service
+        .enable_mfa(contact.id, contact.tenant_id, &request.code)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-729 phase 2 H4: disable MFA. Requires the current password AND
+/// a valid TOTP code (defence-in-depth: a stolen access token cannot
+/// silently disable the second factor). Clears the secret + recovery
+/// codes on success.
+async fn mfa_disable(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Json(request): Json<PortalMfaDisableRequest>,
+) -> Result<StatusCode, AppError> {
+    request.validate()?;
+    state
+        .service
+        .disable_mfa(
+            contact.id,
+            contact.tenant_id,
+            &request.current_password,
+            &request.code,
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)

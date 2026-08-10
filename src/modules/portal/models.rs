@@ -78,10 +78,25 @@ pub struct PortalLoginRequest {
     /// "not supplied".
     #[serde(default)]
     pub captcha_token: Option<String>,
+    /// PMS-729 phase 2 H4: 6-8 digit TOTP code. Required on the second
+    /// login attempt when the first came back with `mfa_required: true`
+    /// AND the contact has MFA enabled. Ignored for contacts without
+    /// MFA. Same shape as agent's `LoginRequest.mfa_code`.
+    #[serde(default)]
+    pub mfa_code: Option<String>,
+    /// PMS-729 phase 2 H4: single-use recovery code. When supplied
+    /// alongside a valid password + a MFA-enabled contact, bypasses
+    /// `mfa_code`; the matched hash is removed from
+    /// `contacts.portal_mfa_recovery_codes_hashes` on success. Same
+    /// shape as agent's `LoginRequest.recovery_code`.
+    #[serde(default)]
+    pub recovery_code: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct PortalLoginResponse {
+    /// Empty when `mfa_required = true` (the caller must re-POST with
+    /// `mfa_code` or `recovery_code` to actually get a token).
     pub access_token: String,
     pub expires_at: DateTime<Utc>,
     /// PMS-729 phase 2 H1+H2: opaque refresh token (returned only at
@@ -93,11 +108,24 @@ pub struct PortalLoginResponse {
     ///
     /// Format: `{token_id}.{secret}`. Only the Argon2id hash of `secret`
     /// is stored server-side; the plaintext value is unrecoverable.
+    ///
+    /// Empty when `mfa_required = true`.
     pub refresh_token: String,
     /// Absolute expiry of `refresh_token`. The SPA uses this to schedule
     /// its background refresh call before the token expires.
     pub refresh_expires_at: DateTime<Utc>,
-    pub contact: CurrentContact,
+    /// PMS-729 phase 2 H4: contact identity. Omitted (None) while
+    /// `mfa_required` is true so no profile data leaks before the
+    /// second factor is satisfied. Same posture as agent's
+    /// `LoginResponse.user`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact: Option<CurrentContact>,
+    /// PMS-729 phase 2 H4: `true` iff the contact has MFA enabled and
+    /// no valid `mfa_code` / `recovery_code` was supplied. The SPA
+    /// picks this up, collects the code, and re-POSTs the same login
+    /// with the additional field.
+    #[serde(default)]
+    pub mfa_required: bool,
 }
 
 /// PMS-729 phase 2 H2: `POST /api/v1/portal/auth/refresh` request body.
@@ -180,6 +208,56 @@ pub struct PortalChangePasswordRequest {
 pub struct PortalLogoutRequest {
     #[validate(length(min = 1, message = "refresh_token is required"))]
     pub refresh_token: String,
+}
+
+/// PMS-729 phase 2 H4: `POST /api/v1/portal/auth/me/mfa/setup`
+/// response. Called once (before enrollment); returns a fresh TOTP
+/// secret + provisioning URI the SPA displays as a QR code. The
+/// secret is persisted immediately on `contacts.portal_mfa_secret`
+/// but `portal_mfa_enabled` stays FALSE until `/enable` confirms
+/// ownership. Calling this again before `/enable` REPLACES the
+/// stored secret (fine; the customer never got past setup).
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalMfaSetupResponse {
+    /// Base32-encoded secret. Displayed on the SPA for manual entry
+    /// (users who cannot scan the QR code copy this into their
+    /// authenticator app).
+    pub secret: String,
+    /// `otpauth://totp/...` URI suitable for QR-code encoding.
+    pub provisioning_uri: String,
+}
+
+/// PMS-729 phase 2 H4: `POST /api/v1/portal/auth/me/mfa/enable`
+/// request body. The customer types the 6-8 digit code their
+/// authenticator app shows; on success the server flips
+/// `portal_mfa_enabled = TRUE`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalMfaEnableRequest {
+    #[validate(length(min = 6, max = 8, message = "Code must be 6-8 digits"))]
+    pub code: String,
+}
+
+/// PMS-729 phase 2 H4: `POST /api/v1/portal/auth/me/mfa/enable`
+/// response. Carries the freshly-minted recovery codes; the SPA
+/// MUST prompt the customer to save them, because the server
+/// stores only the Argon2id hashes and will never surface them
+/// again.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalMfaEnableResponse {
+    /// 10 single-use codes in `XXXXX-XXXXX` format. Each can be
+    /// submitted as `PortalLoginRequest.recovery_code` exactly once.
+    pub recovery_codes: Vec<String>,
+}
+
+/// PMS-729 phase 2 H4: `POST /api/v1/portal/auth/me/mfa/disable`
+/// request body. Requires the current password AND a valid TOTP so a
+/// stolen access token cannot disable the second factor silently.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalMfaDisableRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+    #[validate(length(min = 6, max = 8, message = "Code must be 6-8 digits"))]
+    pub code: String,
 }
 
 /// Customer-facing ticket creation. Intentionally narrower than the
