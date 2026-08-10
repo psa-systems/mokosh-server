@@ -10,6 +10,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_portal_event, AuditAction};
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{hash_password, verify_password};
@@ -139,6 +140,20 @@ impl PortalAuthService {
         if !verify_password(password, &hash)? {
             // PMS-501: record the failure and (re)arm the lockout window.
             self.register_failed_login(id).await?;
+            // PMS-729 phase 2 H10: audit the failure so admin can see a
+            // brute-force run against a real account. Ignore any write
+            // error - a failed audit must not surface as a login-flow
+            // failure (we are already returning 401).
+            let _ = audit_portal_event(
+                self.db.migrator_pool(),
+                tenant_id,
+                Some(id),
+                AuditAction::Login,
+                "portal.login_failed",
+                ip_address.map(|ip| ip.to_string()),
+                user_agent.map(|s| s.to_string()),
+            )
+            .await;
             return Err(AppError::Unauthorized);
         }
 
@@ -164,6 +179,19 @@ impl PortalAuthService {
         let (refresh_token, refresh_expires_at) = self
             .issue_refresh_token(tenant_id, id, None, now, user_agent, ip_address)
             .await?;
+
+        // PMS-729 phase 2 H10: audit successful login. Best-effort; a
+        // failed audit write is not a login-flow failure.
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(id),
+            AuditAction::Login,
+            "portal.login",
+            ip_address.map(|ip| ip.to_string()),
+            user_agent.map(|s| s.to_string()),
+        )
+        .await;
 
         Ok(PortalLoginResponse {
             access_token,
@@ -385,18 +413,34 @@ impl PortalAuthService {
         let Some((row_id, secret)) = parse_contact_bound_token(presented) else {
             return Ok(());
         };
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT token_hash FROM portal_refresh_tokens WHERE id = $1")
-                .bind(row_id)
-                .fetch_optional(self.db.migrator_pool())
-                .await?;
-        let Some((token_hash,)) = row else {
+        // Pull tenant + contact along with the hash so we can attribute
+        // the audit row correctly (H10). Unknown row: still silent ok.
+        let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
+            "SELECT tenant_id, contact_id, token_hash \
+             FROM portal_refresh_tokens WHERE id = $1",
+        )
+        .bind(row_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((tenant_id, contact_id, token_hash)) = row else {
             return Ok(());
         };
         if !verify_password(secret, &token_hash)? {
             return Ok(());
         }
         self.revoke_rotation_chain(row_id).await?;
+        // PMS-729 phase 2 H10: audit the sign-out so admin can see
+        // "customer signed out" separately from "session expired".
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Logout,
+            "portal.logout",
+            None,
+            None,
+        )
+        .await;
         Ok(())
     }
 
@@ -842,6 +886,20 @@ impl PortalAuthService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        // PMS-729 phase 2 H10: audit the password reset. IP + UA are
+        // not available at this layer (route handler owns those); a
+        // future revision could pass them through, but the reset event
+        // itself matters more than the requester context.
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.password_reset",
+            None,
+            None,
+        )
+        .await;
         Ok(())
     }
 
@@ -897,6 +955,18 @@ impl PortalAuthService {
         // explicit rotate so the client's refresh token stays fresh
         // (documented on the handler).
         tx.commit().await?;
+        // PMS-729 phase 2 H10: audit the change so an admin can see it
+        // in the same audit stream as reset / login events.
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.password_changed",
+            None,
+            None,
+        )
+        .await;
         Ok(())
     }
 
