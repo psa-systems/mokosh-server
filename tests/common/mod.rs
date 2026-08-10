@@ -245,6 +245,9 @@ async fn boot_with_db(
         // suite can assert the notice appears; the unconfigured case is a unit
         // test on the composition itself.
         Some("abuse@test.invalid".to_string()),
+        // MAPPS-429: a public API base IS configured here, so the request-form
+        // suite can assert an emailed logo resolves absolutely.
+        Some("http://api.localhost".to_string()),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

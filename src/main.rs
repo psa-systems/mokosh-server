@@ -54,6 +54,15 @@ pub struct AppConfig {
     /// and the email then carries no report-abuse line at all: a link that
     /// goes nowhere, or to a noreply address, is worse than no link.
     pub abuse_contact_email: Option<String>,
+    /// MAPPS-429: this deployment's own public API base
+    /// (`https://api.msp.a8n.systems`), used to make the tenant logo absolute
+    /// for a mail client, which cannot resolve a relative `src`.
+    ///
+    /// Deliberately NOT derived from `base_url` or `spa_base_url`: on every
+    /// deployed environment those are the apex and the SPA, and the logo is
+    /// served by the API on a third host. `None` omits the logo from the email
+    /// rather than emitting a broken image.
+    pub public_api_base_url: Option<String>,
     /// All origins permitted to make credentialed CORS requests against
     /// the API. Defaults to `[client_origin]` if `CORS_ORIGIN` is unset.
     /// Set via the `CORS_ORIGIN` env var as a comma-separated list (e.g.
@@ -210,6 +219,10 @@ impl AppConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let public_api_base_url = std::env::var("PUBLIC_API_BASE_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
         // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
         // Same fail-loud posture as the other secrets: dev/test may fall back to
         // a hardcoded value, staging/production refuse to boot without a real
@@ -264,6 +277,7 @@ impl AppConfig {
             client_origin: client_origin.clone(),
             spa_base_url,
             abuse_contact_email,
+            public_api_base_url,
             cors_origins: std::env::var("CORS_ORIGIN")
                 .ok()
                 .map(|raw| {
@@ -629,6 +643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ip_enrich,
         config.login_approval_enabled,
         config.abuse_contact_email,
+        config.public_api_base_url,
     );
     let router = psa_router;
 

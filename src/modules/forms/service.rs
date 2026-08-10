@@ -128,6 +128,11 @@ pub struct FormsService {
     /// `None` when unconfigured, and the email then carries no such line at
     /// all, because a report-abuse link that goes nowhere is worse than none.
     pub(super) abuse_contact_email: Option<String>,
+    /// MAPPS-429: this deployment's own public base URL, used to make the
+    /// tenant logo absolute for a mail client. `None` omits the logo: a
+    /// relative `src` in an email is a broken image, so a missing base means no
+    /// image rather than a broken one.
+    pub(super) public_api_base: Option<String>,
 }
 
 impl FormsService {
@@ -137,6 +142,7 @@ impl FormsService {
             notifications: None,
             tickets: None,
             abuse_contact_email: None,
+            public_api_base: None,
         }
     }
 
@@ -153,6 +159,7 @@ impl FormsService {
             notifications: Some(notifications),
             tickets: Some(tickets),
             abuse_contact_email: None,
+            public_api_base: None,
         }
     }
 
@@ -160,6 +167,13 @@ impl FormsService {
     /// to. Left unset, the email carries no abuse line.
     pub fn with_abuse_contact(mut self, email: Option<String>) -> Self {
         self.abuse_contact_email = email.filter(|e| !e.trim().is_empty());
+        self
+    }
+
+    /// MAPPS-429: the public base URL of this deployment's API, so an emailed
+    /// logo has an absolute `src`. Left unset, the email carries no logo.
+    pub fn with_public_api_base(mut self, base: Option<String>) -> Self {
+        self.public_api_base = base.filter(|b| !b.trim().is_empty());
         self
     }
 
