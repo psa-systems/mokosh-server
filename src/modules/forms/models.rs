@@ -308,7 +308,14 @@ pub struct PublicFormResponse {
     /// present: attribution is not optional.
     pub tenant_name: String,
     /// PMS-748: how to reach that MSP, when the definition carries it.
+    ///
+    /// MAPPS-429: falls back to the organisation's own contact, so a form that
+    /// defines nothing still tells the client who to ask.
     pub contact_info: Option<String>,
+    /// MAPPS-429: relative path to the MSP's logo, when it has one. Relative
+    /// because the client renders it against the API base it already resolved
+    /// to fetch this payload.
+    pub logo_url: Option<String>,
     pub rules: Vec<FormRule>,
     pub fields: Vec<PublicFormField>,
 }

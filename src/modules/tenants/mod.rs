@@ -10,6 +10,9 @@ mod models;
 // gate to match drops the unused-code compilation in single-tenant
 // builds (previously the modules compiled as dead code under the
 // looser `feature = "server"` gate).
+// MAPPS-429: tenant logo storage. Gated with the rest of the tenant surface.
+#[cfg(all(feature = "server", feature = "multi-tenant"))]
+pub mod logo;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 mod routes;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
@@ -17,6 +20,6 @@ mod service;
 
 pub use models::*;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
-pub use routes::tenant_routes;
+pub use routes::{public_tenant_routes, tenant_routes};
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 pub use service::TenantService;

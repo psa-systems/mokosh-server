@@ -719,3 +719,148 @@ async fn current_cannot_reach_another_tenant(pool: PgPool) {
         "renaming via `current` must touch only the caller's tenant"
     );
 }
+
+// ============================================================================
+// MAPPS-429: organisation contact + logo
+// ============================================================================
+
+/// The logo has to reach a client's browser AND a client's mail client, neither
+/// of which has a session, so the read side is public. Asserted end to end
+/// because the whole point is the hop from an authenticated upload to an
+/// unauthenticated fetch.
+#[sqlx::test]
+async fn a_logo_is_uploaded_by_an_admin_and_served_to_anyone(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // A one-pixel PNG. Real bytes rather than a stub, so the round trip proves
+    // the file survived rather than that a string did.
+    let png: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89,
+    ];
+    let part = reqwest::multipart::Part::bytes(png.to_vec())
+        .file_name("logo.png")
+        .mime_str("image/png")
+        .expect("mime");
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current/logo"))
+        .bearer_auth(&token)
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .expect("send upload");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("tenant JSON");
+    let logo_url = body["branding"]["logo_url"]
+        .as_str()
+        .expect("branding carries the logo path")
+        .to_string();
+    assert!(
+        logo_url.starts_with("/api/v1/public/"),
+        "the stored path must be the public one, got {logo_url}"
+    );
+
+    // No bearer: this is the client, or their mail client.
+    let served = app
+        .client
+        .get(app.url(&logo_url))
+        .send()
+        .await
+        .expect("send public fetch");
+    assert_eq!(served.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        served
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png"),
+        "the stored mime is what makes this renderable without sniffing"
+    );
+    assert_eq!(served.bytes().await.expect("bytes").as_ref(), png);
+
+    // Deleting clears the pointer, and the public route stops answering.
+    let deleted = app
+        .client
+        .delete(app.url("/api/v1/tenants/current/logo"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+    let after: serde_json::Value = deleted.json().await.expect("tenant JSON");
+    assert!(after["branding"]["logo_url"].is_null());
+
+    let gone = app
+        .client
+        .get(app.url(&logo_url))
+        .send()
+        .await
+        .expect("send public fetch after delete");
+    assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// A logo is what every client sees on this tenant's forms and email, so it is
+/// tenant-wide configuration, gated like the rename.
+#[sqlx::test]
+async fn a_non_admin_cannot_replace_the_logo(pool: PgPool) {
+    let (_tech_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "mapps429-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let part = reqwest::multipart::Part::bytes(vec![1, 2, 3])
+        .file_name("logo.png")
+        .mime_str("image/png")
+        .expect("mime");
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current/logo"))
+        .bearer_auth(&token)
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .expect("send upload");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+/// An unsupported type is refused rather than stored and served back as
+/// `octet-stream`, and SVG is refused specifically: it is a script-capable
+/// document and this route serves it from the API origin to anonymous callers.
+#[sqlx::test]
+async fn an_unsupported_image_type_is_refused(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (mime, name) in [
+        ("application/pdf", "logo.pdf"),
+        ("image/svg+xml", "logo.svg"),
+    ] {
+        let part = reqwest::multipart::Part::bytes(b"not an image".to_vec())
+            .file_name(name)
+            .mime_str(mime)
+            .expect("mime");
+        let resp = app
+            .client
+            .put(app.url("/api/v1/tenants/current/logo"))
+            .bearer_auth(&token)
+            .multipart(reqwest::multipart::Form::new().part("file", part))
+            .send()
+            .await
+            .expect("send upload");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{mime} must be refused"
+        );
+    }
+}
