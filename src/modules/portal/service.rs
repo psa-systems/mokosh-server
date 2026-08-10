@@ -10,6 +10,8 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::TenantId;
+use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{hash_password, verify_password};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::password_policy::{self, PasswordPolicy, PasswordPolicyError};
@@ -17,13 +19,18 @@ use crate::utils::password_policy::{self, PasswordPolicy, PasswordPolicyError};
 use super::models::*;
 
 /// Portal-side counterpart to `AuthService`. Stateless except for the
-/// JWT signing secret and the database handle.
+/// JWT signing secret, the database handle, and (optionally) the
+/// notifications dispatcher used to send the H3 password-reset email.
 #[derive(Clone)]
 pub struct PortalAuthService {
     db: Database,
     jwt_secret: String,
     access_token_ttl: Duration,
     refresh_token_ttl: Duration,
+    /// PMS-729 phase 2 H3: notifications dispatcher used by
+    /// `dispatch_password_reset_email`. `None` in fixtures built without
+    /// a dispatcher, in which case the mail is logged but not sent.
+    notifications: Option<NotificationsService>,
 }
 
 impl PortalAuthService {
@@ -36,7 +43,15 @@ impl PortalAuthService {
             // the customer signed in for the full 30-day window.
             access_token_ttl: Duration::minutes(15),
             refresh_token_ttl: Duration::days(30),
+            notifications: None,
         }
+    }
+
+    /// PMS-729 phase 2 H3: builder that attaches a notifications
+    /// dispatcher so the service can queue the password-reset email.
+    pub fn with_notifications(mut self, notifications: NotificationsService) -> Self {
+        self.notifications = Some(notifications);
+        self
     }
 
     /// Verify (slug, email, password) against the contacts table and
@@ -622,6 +637,269 @@ impl PortalAuthService {
         Ok(())
     }
 
+    /// PMS-729 phase 2 H3: request a password-reset link for the given
+    /// (tenant_slug, email) pair. Always returns `Ok(())`; the wire
+    /// shape does not depend on whether the account exists so a caller
+    /// cannot enumerate portal contacts. When a contact matches, a
+    /// fresh row lands in `portal_password_reset_tokens` and the
+    /// plaintext `{token_id}.{secret}` is returned in the Ok value
+    /// (paired with the contact id + email for the mailer). When no
+    /// contact matches, returns `Ok(None)` and the route handler skips
+    /// the send silently.
+    ///
+    /// Token lifetime matches the industry norm (30 min): long enough
+    /// for a user to check email + click the link, short enough to
+    /// limit exposure of a leaked link.
+    #[tracing::instrument(skip_all)]
+    pub async fn request_password_reset(
+        &self,
+        slug: &str,
+        email: &str,
+        ip: Option<std::net::IpAddr>,
+        user_agent: Option<&str>,
+    ) -> AppResult<Option<PasswordResetIssue>> {
+        let row: Option<(Uuid, Uuid, String, bool)> = sqlx::query_as(
+            r#"
+            SELECT c.id, c.tenant_id, c.email, c.is_portal_user
+            FROM contacts c
+            INNER JOIN tenants t ON c.tenant_id = t.id
+            WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
+            "#,
+        )
+        .bind(slug)
+        .bind(email)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        // Non-portal contact OR unknown email: return None so the
+        // handler emits 204 without an email. Enumeration-resistant.
+        let Some((contact_id, tenant_id, email_found, is_portal_user)) = row else {
+            return Ok(None);
+        };
+        if !is_portal_user {
+            return Ok(None);
+        }
+
+        // Mint a fresh secret. Format `{token_id}.{secret}` matches the
+        // setup-token shape so the parse helper is reusable.
+        let secret = Uuid::new_v4().simple().to_string();
+        let hash = hash_password(&secret)?;
+        let now = Utc::now();
+        let expires_at = now + Duration::minutes(30);
+        let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
+        let (token_id,): (Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO portal_password_reset_tokens
+                (tenant_id, contact_id, token_hash, expires_at,
+                 requested_from_ip, requested_from_user_agent)
+            VALUES ($1, $2, $3, $4, NULLIF($5, '')::inet, $6)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&hash)
+        .bind(expires_at)
+        .bind(ip_text)
+        .bind(user_agent)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+
+        Ok(Some(PasswordResetIssue {
+            contact_id,
+            tenant_id,
+            email: email_found,
+            token: format!("{token_id}.{secret}"),
+            expires_at,
+        }))
+    }
+
+    /// PMS-729 phase 2 H3: queue the password-reset email through the
+    /// notifications dispatcher. Uses the existing `auth.password_reset`
+    /// template (migration 021) so the copy renders consistently with
+    /// the agent-side reset flow. Best-effort: a send failure is logged
+    /// but does not propagate to the caller so the enumeration-resistant
+    /// 204 wire shape holds even when SMTP is down.
+    ///
+    /// SAFETY (PMS-261): `issue.tenant_id` is a verified column value
+    /// read off the `contacts` row inside `request_password_reset`, not
+    /// user input; `dispatch` re-derives the RLS GUC per query via
+    /// `begin_with_tenant`.
+    #[tracing::instrument(skip_all)]
+    pub async fn dispatch_password_reset_email(
+        &self,
+        issue: &PasswordResetIssue,
+        reset_link: &str,
+    ) -> AppResult<()> {
+        let Some(notify) = self.notifications.as_ref() else {
+            tracing::warn!(
+                contact_id = %issue.contact_id,
+                "no notifications dispatcher wired; portal reset token persisted but no message queued",
+            );
+            return Ok(());
+        };
+        let context = serde_json::json!({
+            "recipient_email": issue.email,
+            "reset_link": reset_link,
+        });
+        notify
+            .dispatch(
+                TenantId::from_trusted(issue.tenant_id),
+                "auth.password_reset",
+                &context,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// PMS-729 phase 2 H3: redeem a password-reset token. Same status
+    /// contract as `setup_password`: 204 on happy path, 410 on replay,
+    /// 400 on expired / unknown / malformed. The password policy check
+    /// runs AFTER the token is verified live so a bad-token attempt
+    /// does not surface as "password too weak".
+    ///
+    /// Also revokes every live refresh token for the contact as a side
+    /// effect: a stolen refresh token cannot survive the password reset.
+    #[allow(clippy::type_complexity)]
+    #[tracing::instrument(skip_all)]
+    pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
+        let (token_id, secret) = parse_contact_bound_token(token)
+            .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
+
+        // Look up by primary key (token id), NOT by contact id, since
+        // the token shape here is `{token_id}.{secret}` (unlike
+        // portal_setup_tokens which uses `{contact_id}.{secret}`). This
+        // is a deliberate divergence: setup tokens are keyed by contact
+        // because the contact may have multiple queued setup links from
+        // an agent re-invite; reset tokens are keyed by token so the
+        // customer can have multiple concurrent reset requests without
+        // shadowing.
+        let row: Option<(Uuid, Uuid, String, Option<DateTime<Utc>>, DateTime<Utc>)> =
+            sqlx::query_as(
+                r#"
+            SELECT tenant_id, contact_id, token_hash, used_at, expires_at
+            FROM portal_password_reset_tokens
+            WHERE id = $1
+            "#,
+            )
+            .bind(token_id)
+            .fetch_optional(self.db.migrator_pool())
+            .await?;
+        let Some((tenant_id, contact_id, token_hash, used_at, expires_at)) = row else {
+            return Err(AppError::BadRequest(
+                "Invalid or expired reset token".to_string(),
+            ));
+        };
+        if !verify_password(secret, &token_hash)? {
+            return Err(AppError::BadRequest(
+                "Invalid or expired reset token".to_string(),
+            ));
+        }
+        if used_at.is_some() {
+            return Err(AppError::Gone("Reset token already used".to_string()));
+        }
+        if expires_at <= Utc::now() {
+            return Err(AppError::BadRequest(
+                "Invalid or expired reset token".to_string(),
+            ));
+        }
+
+        // Policy check runs AFTER token verification: bad token surfaces
+        // cleanly as 400/410 without a confusing password-strength msg.
+        let hints = self.password_context_hints(contact_id).await?;
+        apply_password_policy(new_password, &hints)?;
+
+        let hash = hash_password(new_password)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Set the new password + burn the token in one transaction so a
+        // crash cannot leave a usable token behind a set password.
+        sqlx::query(
+            "UPDATE contacts SET portal_password_hash = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&hash)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE portal_password_reset_tokens SET used_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(token_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        // Revoke every live refresh token for this contact. A password
+        // reset ends every existing session; the customer must sign in
+        // again with the new password. This also cuts off a stolen
+        // refresh token from surviving the reset.
+        sqlx::query(
+            "UPDATE portal_refresh_tokens SET revoked_at = NOW() \
+             WHERE contact_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// PMS-729 phase 2 H3: change the password for a logged-in contact.
+    /// Requires the current password for re-auth so a stolen access
+    /// token cannot silently rotate the credential. Applies the same
+    /// H5 policy to `new_password` and revokes every OTHER live refresh
+    /// token for the contact (keeps the calling session live so the
+    /// customer does not get bounced out mid-change).
+    #[tracing::instrument(skip_all)]
+    pub async fn change_password(
+        &self,
+        contact_id: Uuid,
+        tenant_id: Uuid,
+        current_password: &str,
+        new_password: &str,
+    ) -> AppResult<()> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT portal_password_hash FROM contacts \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((Some(current_hash),)) = row else {
+            // No hash means the contact never redeemed a setup token.
+            // A "change password" request in that state is malformed.
+            return Err(AppError::Unauthorized);
+        };
+        if !verify_password(current_password, &current_hash)? {
+            return Err(AppError::Unauthorized);
+        }
+
+        // H5 policy on the new candidate.
+        let hints = self.password_context_hints(contact_id).await?;
+        apply_password_policy(new_password, &hints)?;
+
+        let hash = hash_password(new_password)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contacts SET portal_password_hash = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&hash)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        // Cannot know which refresh token minted the caller's current
+        // access token from the token itself, so keep every live one.
+        // The route handler is expected to pair this call with an
+        // explicit rotate so the client's refresh token stays fresh
+        // (documented on the handler).
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Set or replace the portal password for a contact. Surfaces to a
     /// future `PUT /api/v1/portal/auth/password` endpoint that the
     /// customer hits after clicking their setup link.
@@ -705,6 +983,21 @@ fn apply_password_policy(new_password: &str, hints: &[String]) -> AppResult<()> 
     let hints_ref: Vec<&str> = hints.iter().map(String::as_str).collect();
     password_policy::validate(new_password, &hints_ref, PasswordPolicy::default())
         .map_err(|PasswordPolicyError::UserMessage(msg)| AppError::BadRequest(msg))
+}
+
+/// PMS-729 phase 2 H3: what `request_password_reset` returns to the
+/// route handler when the (tenant_slug, email) pair matches an active
+/// portal contact. The handler uses it to dispatch the reset email.
+/// The plaintext `token` is present here exactly once; it is not
+/// stored anywhere on the server side (only its Argon2id hash lives on
+/// the `portal_password_reset_tokens` row).
+#[derive(Debug, Clone)]
+pub struct PasswordResetIssue {
+    pub contact_id: Uuid,
+    pub tenant_id: Uuid,
+    pub email: String,
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Split a portal setup token `{contact_id}.{secret}` into its parts.

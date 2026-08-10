@@ -12,7 +12,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use uuid::Uuid;
@@ -23,9 +23,10 @@ use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePor
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
-    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalHostHint,
-    PortalLoginRequest, PortalLogoutRequest, PortalRefreshRequest, PortalSetupPasswordRequest,
-    ResolvedTenant,
+    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact,
+    PortalChangePasswordRequest, PortalForgotPasswordRequest, PortalHostHint, PortalLoginRequest,
+    PortalLogoutRequest, PortalRefreshRequest, PortalResetPasswordRequest,
+    PortalSetupPasswordRequest, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -105,6 +106,20 @@ pub fn portal_routes(
         // (PMS-136). No auth: the customer is not yet a logged-in contact;
         // the single-use token IS the credential proving they own the link.
         .route("/auth/setup-password", post(setup_password))
+        // PMS-729 phase 2 H3: request a password-reset email. Always
+        // 204 (enumeration-resistant). If the (host-derived tenant,
+        // email) pair matches a portal contact, a fresh reset token
+        // is minted and emailed; otherwise no email is sent.
+        .route("/auth/forgot-password", post(forgot_password))
+        // PMS-729 phase 2 H3: redeem an emailed reset token to set the
+        // new password. Same 204 / 400 / 410 status contract as
+        // /auth/setup-password.
+        .route("/auth/reset-password", post(reset_password))
+        // PMS-729 phase 2 H3: authenticated password change. Requires
+        // the current password for re-auth so a stolen access token
+        // cannot silently rotate the credential. New password runs
+        // through the H5 policy.
+        .route("/auth/me/password", put(change_password))
         // PMS-729: public branding hint. The SPA login page calls this on
         // mount to decide (a) whether to hide the slug input and (b) which
         // MSP name + logo to paint above the credential fields. Returns
@@ -237,6 +252,106 @@ async fn logout(
 ) -> Result<StatusCode, AppError> {
     request.validate()?;
     state.service.logout(&request.refresh_token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-729 phase 2 H3: request a password-reset email. Always returns
+/// 204 whether the email matches a known portal contact or not so the
+/// response shape cannot be used to enumerate portal accounts. When it
+/// DOES match, the service returns the mint info and the handler
+/// dispatches a `portal.password_reset` email carrying the link.
+async fn forgot_password(
+    State(state): State<PortalRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<PortalForgotPasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    request.validate()?;
+
+    // Resolve the tenant the same way the login handler does: Host
+    // (X-Forwarded-Host) first, body-slug fallback. Missing or invalid
+    // slug fails silently (204) - same enumeration-resistance rule.
+    let Ok(resolved_slug) =
+        resolve_login_slug(&state, &headers, request.tenant_slug.as_deref()).await
+    else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    let ua = user_agent_from(&headers);
+    let Some(issue) = state
+        .service
+        .request_password_reset(
+            &resolved_slug,
+            &request.email,
+            Some(addr.ip()),
+            ua.as_deref(),
+        )
+        .await?
+    else {
+        // Unknown email OR non-portal contact. Still 204.
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    // Dispatch the reset email via the notifications queue. On dev
+    // (LogMailer) this ends up in tracing output; on staging + prod
+    // (SmtpMailer) it lands in the customer's inbox. The reset URL
+    // uses the portal origin the router was constructed with (either
+    // the CLIENT_ORIGIN default or a portal-host-derived value per
+    // PMS-729). Best-effort: a send failure does NOT propagate to the
+    // client (still 204) so enumeration resistance holds.
+    let link = format!(
+        "{}/portal/reset-password?token={}",
+        state.portal_origin.trim_end_matches('/'),
+        issue.token
+    );
+    if let Err(e) = state
+        .service
+        .dispatch_password_reset_email(&issue, &link)
+        .await
+    {
+        tracing::warn!(?e, "portal password_reset email dispatch failed");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-729 phase 2 H3: redeem a password-reset token. 204 on happy
+/// path, 400 on expired / unknown / malformed, 410 on replay.
+/// Password strength is enforced by `utils::password_policy` (H5) and
+/// runs AFTER token verification so a bad-token attempt does not
+/// surface as "password too weak". A successful reset revokes every
+/// live refresh token for the contact as a side effect.
+async fn reset_password(
+    State(state): State<PortalRouterState>,
+    Json(request): Json<PortalResetPasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    request.validate()?;
+    state
+        .service
+        .reset_password(&request.token, &request.password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-729 phase 2 H3: authenticated password change. `RequirePortalAuth`
+/// identifies the caller from the access token, so the body only carries
+/// `current_password` (for re-auth so a stolen access token cannot
+/// silently rotate the credential) and `new_password`.
+async fn change_password(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Json(request): Json<PortalChangePasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    request.validate()?;
+    state
+        .service
+        .change_password(
+            contact.id,
+            contact.tenant_id,
+            &request.current_password,
+            &request.new_password,
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

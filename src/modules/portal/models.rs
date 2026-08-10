@@ -114,6 +114,54 @@ pub struct PortalRefreshResponse {
     pub refresh_expires_at: DateTime<Utc>,
 }
 
+/// PMS-729 phase 2 H3: `POST /api/v1/portal/auth/forgot-password`
+/// request body. `email` is the only credential-adjacent field; the
+/// tenant is resolved from the request Host (PMS-729) or from an
+/// optional `tenant_slug` fallback for the legacy body-slug path.
+///
+/// The endpoint always returns 204 regardless of whether the email
+/// matched any known contact: the response shape MUST NOT leak whether
+/// an address is on the portal (matches the wrong-password
+/// enumeration-resistance posture on `/portal/auth/login`).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalForgotPasswordRequest {
+    #[validate(email(message = "Invalid email address"))]
+    pub email: String,
+    /// Legacy body-slug fallback; ignored when the Host resolves to an
+    /// active tenant. Same shape as [`PortalLoginRequest::tenant_slug`].
+    #[serde(default)]
+    #[validate(length(max = 100, message = "tenant_slug too long"))]
+    pub tenant_slug: Option<String>,
+}
+
+/// PMS-729 phase 2 H3: `POST /api/v1/portal/auth/reset-password`
+/// request body. `token` is the emailed `{token_id}.{secret}` pair;
+/// `password` is the new credential and is validated through the
+/// shared `utils::password_policy` module (H5).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalResetPasswordRequest {
+    #[validate(length(min = 1, message = "token is required"))]
+    pub token: String,
+    // Length + strength check lives in the service layer via
+    // `utils::password_policy` (PMS-729 phase 2 H5). The validator
+    // layer only enforces "not empty" so the strength module is the
+    // single source of truth for the password rules.
+    #[validate(length(min = 1, message = "password is required"))]
+    pub password: String,
+}
+
+/// PMS-729 phase 2 H3: `PUT /api/v1/portal/auth/me/password` request
+/// body. The `RequirePortalAuth` extractor identifies the contact from
+/// the access token, so this body only carries `current_password` (for
+/// re-auth) and `new_password`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalChangePasswordRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+    #[validate(length(min = 1, message = "new_password is required"))]
+    pub new_password: String,
+}
+
 /// PMS-729 phase 2 H1: `POST /api/v1/portal/auth/logout` request body.
 /// Revokes the presented refresh token and every other refresh token
 /// currently live in the same rotation chain, so a stolen access token
