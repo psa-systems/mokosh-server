@@ -12,10 +12,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::logo::{logo_path, TenantLogoConfig, TenantLogoStore};
-use super::{
-    CreateTenantRequest, TenantBranding, TenantResponse, TenantService, TenantUsage,
-    UpdateTenantRequest,
-};
+use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
 use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
@@ -242,12 +239,14 @@ async fn upload_current_logo(
 
     // The bytes land first, so a failed write never leaves branding pointing at
     // a logo that is not there.
-    let existing = state.tenant_service.get_tenant(tenant_id).await?;
-    let branding = TenantBranding {
-        logo_url: Some(logo_path(tenant_id.get())),
-        logo_mime: Some(stored_mime.to_string()),
-        ..existing.branding
-    };
+    //
+    // PMS-758: only the two keys this owns. `branding` is merged, so reading
+    // the document to write it back would be both unnecessary and a way to
+    // clobber a concurrent edit from the settings page.
+    let branding = serde_json::json!({
+        "logo_url": logo_path(tenant_id.get()),
+        "logo_mime": stored_mime,
+    });
     let tenant = state
         .tenant_service
         .update_tenant(
@@ -277,12 +276,8 @@ async fn delete_current_logo(
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
     let tenant_id = user.tenant();
-    let existing = state.tenant_service.get_tenant(tenant_id).await?;
-    let branding = TenantBranding {
-        logo_url: None,
-        logo_mime: None,
-        ..existing.branding
-    };
+    // PMS-758: explicit nulls, which is how a merged document clears a key.
+    let branding = serde_json::json!({ "logo_url": null, "logo_mime": null });
     let tenant = state
         .tenant_service
         .update_tenant(

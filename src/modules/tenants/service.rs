@@ -469,8 +469,29 @@ impl TenantService {
             query.push_str(&format!(", settings = ${}", param_idx));
             param_idx += 1;
         }
+        // PMS-758: an object or nothing. A string or an array here would
+        // replace the document with something no reader can destructure, and
+        // `||` on two non-objects concatenates rather than merges.
+        if let Some(branding) = request.branding.as_ref() {
+            if !branding.is_object() {
+                return Err(AppError::validation_field(
+                    "branding",
+                    "must be an object of branding keys",
+                ));
+            }
+        }
         if request.branding.is_some() {
-            query.push_str(&format!(", branding = ${}", param_idx));
+            // PMS-758: MERGE, not replace. `branding` is a JSONB document and
+            // callers send the subset they own: the organisation settings page
+            // writes four contact keys, the logo upload writes two others. A
+            // whole-document write meant the settings page silently deleted
+            // `logo_mime`, leaving `logo_url` pointing at a route that then
+            // answered 404, which is a broken image in every client email.
+            //
+            // `||` is a top-level key merge with the right side winning, so a
+            // caller still clears a key by sending it as an explicit null. That
+            // is why the SPA sends nulls rather than omitting empty fields.
+            query.push_str(&format!(", branding = branding || ${}::jsonb", param_idx));
             // Invariant: every conditional SET advances `param_idx` so the
             // next field added below is numbered correctly. `branding` is
             // the last field today, so this increment is currently unread
