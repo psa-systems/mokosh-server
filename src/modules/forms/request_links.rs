@@ -372,15 +372,10 @@ impl FormsService {
         // MAPPS-429: the form's own contact wins; the organisation's is the
         // fallback, so an MSP sets a service-desk number once instead of on
         // every definition.
-        let contact_info = definition.contact_info.clone().or_else(|| {
-            let org = OrgContact::from_branding(&branding);
-            match (org.name(), org.phone()) {
-                (Some(name), Some(phone)) => Some(format!("{name} on {phone}")),
-                (Some(name), None) => Some(name.to_string()),
-                (None, Some(phone)) => Some(phone.to_string()),
-                (None, None) => None,
-            }
-        });
+        let contact_info = definition
+            .contact_info
+            .clone()
+            .or_else(|| OrgContact::from_branding(&branding).phrase_for(&tenant_name));
         Ok(PublicFormResponse {
             name: definition.name,
             description: definition.description,
@@ -556,12 +551,12 @@ fn contact_line(tenant_name: &str, contact_info: Option<&str>, org: &OrgContact)
     // none. PMS-748 named this as the obvious follow-up: a per-form line is for
     // the request type that routes somewhere unusual, not for every form to
     // repeat the same service-desk number.
-    match (org.name(), org.phone()) {
-        (Some(name), Some(phone)) => {
-            format!("{opening} Contact {name} at {tenant_name} on {phone}.")
+    match (org.name(), org.channels()) {
+        (Some(name), Some(channels)) => {
+            format!("{opening} Contact {name} at {tenant_name} {channels}.")
         }
         (Some(name), None) => format!("{opening} Contact {name} at {tenant_name}."),
-        (None, Some(phone)) => format!("{opening} Contact {tenant_name} on {phone}."),
+        (None, Some(channels)) => format!("{opening} Contact {tenant_name} {channels}."),
         (None, None) => format!("{opening} Contact {tenant_name}, who sent it to you."),
     }
 }
@@ -575,6 +570,10 @@ fn contact_line(tenant_name: &str, contact_info: Option<&str>, org: &OrgContact)
 struct OrgContact<'a> {
     name: Option<&'a str>,
     phone: Option<&'a str>,
+    /// PMS-755: the channel most clients reach for first. Optional even at
+    /// onboarding, where the phone is required: demanding two channels before
+    /// an MSP can finish setting up is a tax on the common case.
+    email: Option<&'a str>,
 }
 
 impl<'a> OrgContact<'a> {
@@ -582,6 +581,7 @@ impl<'a> OrgContact<'a> {
         Self {
             name: b.support_contact_name.as_deref(),
             phone: b.support_phone.as_deref(),
+            email: b.support_email.as_deref(),
         }
     }
 
@@ -591,6 +591,38 @@ impl<'a> OrgContact<'a> {
 
     fn phone(&self) -> Option<&str> {
         self.phone.map(str::trim).filter(|v| !v.is_empty())
+    }
+
+    fn email(&self) -> Option<&str> {
+        self.email.map(str::trim).filter(|v| !v.is_empty())
+    }
+
+    /// PMS-755: how to reach them, as a phrase that slots after a name.
+    ///
+    /// The preposition belongs to the channel, not to the sentence: "on" reads
+    /// right before a number and wrong before an address. Built here rather
+    /// than at the call sites so the email and the form page cannot word the
+    /// same two facts differently.
+    fn channels(&self) -> Option<String> {
+        match (self.phone(), self.email()) {
+            (Some(p), Some(e)) => Some(format!("on {p} or by email at {e}")),
+            (Some(p), None) => Some(format!("on {p}")),
+            (None, Some(e)) => Some(format!("by email at {e}")),
+            (None, None) => None,
+        }
+    }
+
+    /// The same contact as a bare phrase for the client's form page, which
+    /// writes "Contact {phrase}." and therefore cannot start with a
+    /// preposition. `who` is the organisation name, used when no contact person
+    /// is set, so the sentence never opens on a phone number.
+    fn phrase_for(&self, who: &str) -> Option<String> {
+        let name = self.name().unwrap_or(who);
+        match (self.channels(), self.name().is_some()) {
+            (Some(channels), _) => Some(format!("{name} {channels}")),
+            (None, true) => Some(name.to_string()),
+            (None, false) => None,
+        }
     }
 }
 
@@ -870,6 +902,7 @@ mod tests {
         let org = OrgContact {
             name: Some("the service desk"),
             phone: Some("555-0100"),
+            email: None,
         };
         assert_eq!(
             contact_line("Acme IT", None, &org),
@@ -886,7 +919,8 @@ mod tests {
                 None,
                 &OrgContact {
                     name: None,
-                    phone: Some("555-0100")
+                    phone: Some("555-0100"),
+                    email: None,
                 }
             ),
             "Questions about this request? Contact Acme IT on 555-0100.",
@@ -898,11 +932,72 @@ mod tests {
                 None,
                 &OrgContact {
                     name: Some("  "),
-                    phone: Some("  ")
+                    phone: Some("  "),
+                    email: Some("  "),
                 }
             ),
             contact_line("Acme IT", None, &OrgContact::default()),
             "branding saved with blank strings is the same as branding without them"
+        );
+    }
+
+    /// PMS-755: an email address is the channel most clients reach for, and the
+    /// sentence has to read correctly for every combination of the three parts
+    /// an organisation may have set.
+    #[test]
+    fn the_contact_line_offers_whichever_channels_exist() {
+        let with =
+            |name, phone, email| contact_line("Acme IT", None, &OrgContact { name, phone, email });
+
+        assert_eq!(
+            with(Some("the service desk"), Some("555-0100"), Some("help@acme.example")),
+            "Questions about this request? Contact the service desk at Acme IT on 555-0100 or by email at help@acme.example."
+        );
+        assert_eq!(
+            with(Some("Dana"), None, Some("help@acme.example")),
+            "Questions about this request? Contact Dana at Acme IT by email at help@acme.example.",
+            "`on` reads right before a number and wrong before an address, so the preposition belongs to the channel"
+        );
+        assert_eq!(
+            with(None, None, Some("help@acme.example")),
+            "Questions about this request? Contact Acme IT by email at help@acme.example."
+        );
+        assert_eq!(
+            with(None, None, None),
+            "Questions about this request? Contact Acme IT, who sent it to you.",
+            "an organisation that set nothing still gets a sentence, not a dangling preposition"
+        );
+    }
+
+    /// The form page writes "Contact {phrase}.", so the phrase can never open
+    /// on a preposition. With no contact person the organisation's own name
+    /// stands in, which is why this takes one.
+    #[test]
+    fn the_form_page_phrase_never_opens_on_a_preposition() {
+        let org = OrgContact {
+            name: None,
+            phone: Some("555-0100"),
+            email: None,
+        };
+        assert_eq!(
+            org.phrase_for("Acme IT").as_deref(),
+            Some("Acme IT on 555-0100")
+        );
+
+        let named = OrgContact {
+            name: Some("the service desk"),
+            phone: None,
+            email: Some("help@acme.example"),
+        };
+        assert_eq!(
+            named.phrase_for("Acme IT").as_deref(),
+            Some("the service desk by email at help@acme.example")
+        );
+
+        assert_eq!(
+            OrgContact::default().phrase_for("Acme IT"),
+            None,
+            "nothing set means the page shows no contact line at all, rather than one naming only the sender it already names"
         );
     }
 
