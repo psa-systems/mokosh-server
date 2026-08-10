@@ -37,6 +37,7 @@
 //! `PORTAL_COOKIE_SECURE` env; that suggestion predates the SPA-side
 //! implementation choice and does not apply.
 
+pub mod captcha;
 pub mod host_tenant;
 pub mod middleware;
 pub mod models;
@@ -44,6 +45,7 @@ pub mod rate_limit;
 pub mod routes;
 pub mod service;
 
+pub use captcha::{TurnstileConfig, TurnstileError, TurnstileGate};
 pub use host_tenant::PortalHostConfig;
 pub use middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 pub use models::*;

@@ -70,6 +70,14 @@ pub struct PortalLoginRequest {
     pub email: String,
     #[validate(length(min = 1, message = "Password is required"))]
     pub password: String,
+    /// PMS-729 phase 2 H8: Cloudflare Turnstile response token. Only
+    /// required after the source IP has crossed the failure threshold;
+    /// otherwise ignored. The SPA gets the site key via
+    /// `window.__MOKOSH_CONFIG__.turnstile_site_key` (feature off = key
+    /// absent = widget never renders). Empty string treated as
+    /// "not supplied".
+    #[serde(default)]
+    pub captcha_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

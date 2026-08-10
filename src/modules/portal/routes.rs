@@ -18,6 +18,7 @@ use axum::{
 use uuid::Uuid;
 use validator::Validate;
 
+use super::captcha::{TurnstileError, TurnstileGate};
 use super::host_tenant::{resolve_slug, PortalHostConfig};
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
@@ -63,11 +64,18 @@ pub struct PortalRouterState {
     /// every host lookup returns `None` and the handlers fall back to the
     /// legacy body `tenant_slug` path.
     pub host_config: PortalHostConfig,
+    /// PMS-729 phase 2 H8: Cloudflare Turnstile gate for the login
+    /// route. Per-IP failure counter that requires a CAPTCHA solve on
+    /// the next login attempt once the source IP crosses a threshold
+    /// (100 fails/hour by default). Off unless BOTH TURNSTILE_SITE_KEY
+    /// + TURNSTILE_SECRET_KEY are set.
+    pub captcha: Arc<TurnstileGate>,
 }
 
 /// Build the `/api/v1/portal` router. Wires the portal auth middleware
 /// at the outermost layer so every handler sees either a valid
 /// `PortalAuthState` or the default (unauthenticated) one.
+#[allow(clippy::too_many_arguments)]
 pub fn portal_routes(
     service: PortalAuthService,
     tickets: TicketService,
@@ -76,6 +84,7 @@ pub fn portal_routes(
     quotes: QuotesService,
     portal_origin: String,
     host_config: PortalHostConfig,
+    captcha: Arc<TurnstileGate>,
 ) -> Router {
     let state = PortalRouterState {
         service: Arc::new(service.clone()),
@@ -87,6 +96,7 @@ pub fn portal_routes(
         decision_limiter: PortalDecisionLimiter::new(),
         portal_origin,
         host_config,
+        captcha,
     };
     let mw = PortalAuthMiddleware::new(service);
 
@@ -207,8 +217,34 @@ async fn login(
         return Ok(resp);
     }
 
+    // PMS-729 phase 2 H8: gate against the Turnstile counter for this
+    // IP. When the per-IP failure count is under the threshold this is
+    // a no-op; over the threshold, the SPA has to supply a valid
+    // `captcha_token` to proceed. Off (both env keys unset) = allow.
+    match state
+        .captcha
+        .gate(addr.ip(), request.captcha_token.as_deref())
+        .await
+    {
+        Ok(()) => {}
+        Err(TurnstileError::Required) => {
+            return Ok(captcha_challenge_response(
+                "CAPTCHA_REQUIRED",
+                "Please solve the CAPTCHA challenge and try again.",
+                state.captcha.site_key(),
+            ));
+        }
+        Err(TurnstileError::Invalid) => {
+            return Ok(captcha_challenge_response(
+                "CAPTCHA_INVALID",
+                "The CAPTCHA response was rejected. Please try again.",
+                state.captcha.site_key(),
+            ));
+        }
+    }
+
     let ua = user_agent_from(&headers);
-    let resp = state
+    match state
         .service
         .login(
             &resolved_slug,
@@ -217,8 +253,42 @@ async fn login(
             ua.as_deref(),
             Some(addr.ip()),
         )
-        .await?;
-    Ok(Json(resp).into_response())
+        .await
+    {
+        Ok(resp) => Ok(Json(resp).into_response()),
+        Err(e) => {
+            // PMS-729 phase 2 H8: tick the per-IP failure counter on
+            // 401 so the next attempt from this IP is more likely to
+            // trip the challenge. Only ticks on credential-adjacent
+            // failures (401), NOT on rate-limit (429) or upstream
+            // errors, so a random 500 does not lock down a legit IP.
+            if matches!(e, AppError::Unauthorized) {
+                state.captcha.record_failure(addr.ip()).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// PMS-729 phase 2 H8: render the 403 challenge response the SPA
+/// picks up to render the Turnstile widget. `site_key` is embedded in
+/// the body so the SPA does not need a separate `GET /config` round
+/// trip to know which key to configure the widget with.
+fn captcha_challenge_response(code: &str, message: &str, site_key: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "captcha": {
+                    "provider": "turnstile",
+                    "site_key": site_key,
+                },
+            },
+        })),
+    )
+        .into_response()
 }
 
 /// PMS-729 phase 2 H2: rotate a refresh token. Public route because the

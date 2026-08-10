@@ -457,6 +457,14 @@ pub fn create_api_router(
         notifications_service.clone(),
         client_origin.clone(),
     );
+    // PMS-729 phase 2 H8: Cloudflare Turnstile gate, built once at
+    // router-build time and shared across every request. Both env
+    // keys absent = feature off (gate always allows through), but the
+    // per-IP failure counter still ticks so a future toggle-on picks
+    // up warm state.
+    let portal_captcha = crate::modules::portal::TurnstileGate::new(
+        crate::modules::portal::TurnstileConfig::from_env(),
+    );
     let portal_api = Router::new()
         .route("/health", get(health_check))
         .merge(portal_routes(
@@ -467,6 +475,7 @@ pub fn create_api_router(
             portal_quotes_service,
             client_origin.clone(),
             portal_host_config,
+            portal_captcha,
         ))
         // PMS-483: portal-side ticket-note attachments. Same routes as
         // the agent surface, but behind `RequirePortalAuth` and
