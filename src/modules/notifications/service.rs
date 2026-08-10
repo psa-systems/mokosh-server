@@ -689,6 +689,89 @@ impl NotificationsService {
         Ok(())
     }
 
+    // PMS-729 phase 2 §6 slice 5: branding-context injection ---------------
+
+    /// Fold `{{msp_name}}` / `{{msp_logo_url}}` / `{{msp_primary_color}}`
+    /// / `{{msp_support_email}}` into the render context so every
+    /// template gets tenant-branded output without the dispatch caller
+    /// having to thread the fields in by hand.
+    ///
+    /// Missing branding fields degrade to empty strings so a template
+    /// that references `{{msp_support_email}}` on a tenant that never
+    /// set one renders `""` (empty) rather than a literal placeholder;
+    /// this matches what `render_template` already does for absent
+    /// keys but is more graceful for user-visible copy.
+    /// `{{msp_name}}` defaults to "Mokosh Platform" so subject lines
+    /// like "{{msp_name}} - Reset your password" stay readable even for
+    /// the default/system tenant.
+    ///
+    /// Caller-supplied keys ALWAYS win: a test that passes an explicit
+    /// `msp_name` in context sees that value, not the DB one.
+    async fn enrich_with_branding(
+        &self,
+        tenant_id: TenantId,
+        mut context: serde_json::Value,
+    ) -> AppResult<serde_json::Value> {
+        // The template context must be a JSON object to merge into. If
+        // a caller passed a non-object (empty array, null, primitive),
+        // wrap it in an object so the branding keys can be attached
+        // rather than silently dropped.
+        if !context.is_object() {
+            context = serde_json::json!({});
+        }
+
+        let row: Option<(String, serde_json::Value)> = {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query_as(r#"SELECT name, branding FROM tenants WHERE id = $1"#)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        };
+
+        let (name, branding) = match row {
+            Some(r) => r,
+            None => (String::new(), serde_json::json!({})),
+        };
+
+        let obj = context.as_object_mut().expect("guarded above");
+
+        // helper: only set the key if the caller did not.
+        let mut ensure_key = |k: &str, v: serde_json::Value| {
+            if !obj.contains_key(k) {
+                obj.insert(k.to_string(), v);
+            }
+        };
+
+        let msp_name = if name.is_empty() {
+            "Mokosh Platform".to_string()
+        } else {
+            name
+        };
+        ensure_key("msp_name", serde_json::Value::String(msp_name));
+
+        let branding_str = |field: &str| -> String {
+            branding
+                .get(field)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        ensure_key(
+            "msp_logo_url",
+            serde_json::Value::String(branding_str("logo_url")),
+        );
+        ensure_key(
+            "msp_primary_color",
+            serde_json::Value::String(branding_str("primary_color")),
+        );
+        ensure_key(
+            "msp_support_email",
+            serde_json::Value::String(branding_str("support_email")),
+        );
+
+        Ok(context)
+    }
+
     // PMS-92 dispatcher -------------------------------------------------------
     /// Look up active rules matching `event_type`, expand recipients
     /// (rule-defined + caller-supplied via context), render the template
@@ -722,6 +805,18 @@ impl NotificationsService {
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<u64> {
+        // PMS-729 phase 2 §6 slice 5: enrich the render context with
+        // the MSP's identity (name + branding) so every template can
+        // reference `{{msp_name}}` / `{{msp_logo_url}}` /
+        // `{{msp_primary_color}}` / `{{msp_support_email}}` without
+        // the caller having to thread those values through by hand.
+        // Caller-supplied context keys always win over the branding
+        // defaults so a specific dispatch site can override.
+        let enriched_context = self
+            .enrich_with_branding(tenant_id, context.clone())
+            .await?;
+        let context = &enriched_context;
+
         let rules = {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query_as::<_, RuleRow>(
