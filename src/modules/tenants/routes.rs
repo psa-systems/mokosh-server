@@ -1,15 +1,21 @@
 //! Tenant API routes (Super Admin only)
 
 use axum::{
-    extract::{Path, Query, State},
-    routing::{get, post, put},
+    extract::{Multipart, Path, Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
 
-use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
+use super::logo::{logo_path, TenantLogoConfig, TenantLogoStore};
+use super::{
+    CreateTenantRequest, TenantBranding, TenantResponse, TenantService, TenantUsage,
+    UpdateTenantRequest,
+};
 use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
@@ -18,6 +24,8 @@ use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 #[derive(Clone)]
 pub struct TenantRouterState {
     pub tenant_service: Arc<TenantService>,
+    /// MAPPS-429: on-disk store for the tenant logo.
+    pub logos: Arc<TenantLogoStore>,
     // PMS-113 AC2: the module-config handlers on the tenants surface
     // delegate to SettingsService so there's a single canonical writer
     // for `module_config`. SettingsService is wrapped in an Arc by its
@@ -35,6 +43,7 @@ pub fn tenant_routes(
 ) -> Router {
     let state = TenantRouterState {
         tenant_service: Arc::new(tenant_service),
+        logos: Arc::new(TenantLogoStore::new(TenantLogoConfig::from_env())),
         settings_service,
     };
 
@@ -56,6 +65,12 @@ pub fn tenant_routes(
         // the browser supply it was the defect.
         .route("/current", get(get_current_tenant))
         .route("/current", put(update_current_tenant))
+        // MAPPS-429: the organisation's logo. Written here, read from the
+        // PUBLIC router below, because the two places it has to appear (a
+        // client's browser on the request-form page, a client's mail client)
+        // have no session.
+        .route("/current/logo", put(upload_current_logo))
+        .route("/current/logo", delete(delete_current_logo))
         .route("/{tenant_id}", get(get_tenant))
         .route("/{tenant_id}", put(update_tenant))
         .route("/{tenant_id}/suspend", post(suspend_tenant))
@@ -121,6 +136,168 @@ async fn get_tenant(
         .get_tenant(TenantId::from_trusted(tenant_id))
         .await?;
 
+    Ok(Json(tenant.into()))
+}
+
+/// MAPPS-429: the unauthenticated read side of the tenant logo.
+///
+/// Mounted by the caller under `/api/v1/public`. Separate router because the
+/// authenticated tree sits behind `AuthMiddleware`, and a mail client fetching
+/// an image will never carry a session.
+pub fn public_tenant_routes(tenant_service: TenantService) -> Router {
+    let state = PublicTenantState {
+        tenant_service: Arc::new(tenant_service),
+        logos: Arc::new(TenantLogoStore::new(TenantLogoConfig::from_env())),
+    };
+    Router::new()
+        .route("/tenants/{tenant_id}/logo", get(get_public_logo))
+        .with_state(state)
+}
+
+#[derive(Clone)]
+struct PublicTenantState {
+    tenant_service: Arc<TenantService>,
+    logos: Arc<TenantLogoStore>,
+}
+
+/// Serve a tenant's logo to anyone holding the tenant id.
+///
+/// A company logo is the least private asset an MSP owns, and this is the only
+/// way it can reach an email. A tenant with no logo is a 404, identical to a
+/// tenant id that does not exist, so this does not answer "does this tenant
+/// exist" any more precisely than it has to.
+async fn get_public_logo(
+    State(s): State<PublicTenantState>,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<Response> {
+    // SAFETY (PMS-285): pre-auth, cross-tenant read of the RLS-exempt `tenants`
+    // root, resolved by primary key. There is no session to derive a tenant
+    // from: resolving the tenant IS the request. Nothing tenant-scoped is read.
+    let tenant = s
+        .tenant_service
+        .get_tenant(TenantId::from_trusted(tenant_id))
+        .await
+        .map_err(|_| AppError::NotFound("Logo".to_string()))?;
+    let mime = tenant
+        .branding
+        .logo_mime
+        .clone()
+        .ok_or_else(|| AppError::NotFound("Logo".to_string()))?;
+    let bytes = s.logos.read(tenant_id, &mime).await?;
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime),
+            // Immutable is wrong here (the file is replaced in place), so this
+            // is a short cache: long enough that a mail client rendering the
+            // same message twice does not refetch, short enough that a logo
+            // change is visible the same day.
+            (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// MAPPS-429: replace the caller's organisation logo.
+///
+/// Admin-gated like the rename: the logo is what every client sees on the forms
+/// and email this tenant sends, so it is tenant-wide configuration.
+async fn upload_current_logo(
+    State(state): State<TenantRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    mut multipart: Multipart,
+) -> AppResult<Json<TenantResponse>> {
+    if !user.role.is_admin() {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+
+    let mut file: Option<(String, Vec<u8>)> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("multipart parse: {e}")))?
+    {
+        if field.name().unwrap_or_default() != "file" {
+            continue;
+        }
+        let mime = field
+            .content_type()
+            .map(str::to_string)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("multipart read: {e}")))?;
+        file = Some((mime, bytes.to_vec()));
+        break;
+    }
+    let (mime, bytes) =
+        file.ok_or_else(|| AppError::BadRequest("missing 'file' part in multipart body".into()))?;
+
+    let tenant_id = user.tenant();
+    let stored_mime = state.logos.store(tenant_id.get(), &mime, &bytes).await?;
+
+    // The bytes land first, so a failed write never leaves branding pointing at
+    // a logo that is not there.
+    let existing = state.tenant_service.get_tenant(tenant_id).await?;
+    let branding = TenantBranding {
+        logo_url: Some(logo_path(tenant_id.get())),
+        logo_mime: Some(stored_mime.to_string()),
+        ..existing.branding
+    };
+    let tenant = state
+        .tenant_service
+        .update_tenant(
+            tenant_id,
+            &UpdateTenantRequest {
+                name: None,
+                billing_email: None,
+                billing_contact_name: None,
+                settings: None,
+                branding: Some(branding),
+            },
+            &ctx,
+        )
+        .await?;
+    Ok(Json(tenant.into()))
+}
+
+/// Remove the logo. Clears the branding pointer first: a file left on disk that
+/// nothing points at is invisible, while a pointer to a deleted file is a
+/// broken image in every email the tenant sends.
+async fn delete_current_logo(
+    State(state): State<TenantRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+) -> AppResult<Json<TenantResponse>> {
+    if !user.role.is_admin() {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+    let tenant_id = user.tenant();
+    let existing = state.tenant_service.get_tenant(tenant_id).await?;
+    let branding = TenantBranding {
+        logo_url: None,
+        logo_mime: None,
+        ..existing.branding
+    };
+    let tenant = state
+        .tenant_service
+        .update_tenant(
+            tenant_id,
+            &UpdateTenantRequest {
+                name: None,
+                billing_email: None,
+                billing_contact_name: None,
+                settings: None,
+                branding: Some(branding),
+            },
+            &ctx,
+        )
+        .await?;
+    state.logos.remove(tenant_id.get()).await;
     Ok(Json(tenant.into()))
 }
 

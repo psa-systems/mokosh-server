@@ -61,12 +61,20 @@ pub struct Tenant {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TenantBranding {
     pub logo_url: Option<String>,
+    /// MAPPS-429: content type of the stored logo, so the public serving route
+    /// can answer with the right `Content-Type` without sniffing the bytes or
+    /// encoding the format into the filename.
+    pub logo_mime: Option<String>,
     pub favicon_url: Option<String>,
     pub primary_color: Option<String>,
     pub secondary_color: Option<String>,
     pub company_name: Option<String>,
     pub support_email: Option<String>,
     pub support_phone: Option<String>,
+    /// MAPPS-429: who a client should ask for, as opposed to
+    /// [`Tenant::billing_contact_name`], which is who an invoice goes to. These
+    /// are routinely different people, so the billing column is not reused.
+    pub support_contact_name: Option<String>,
     pub portal_domain: Option<String>,
 }
 

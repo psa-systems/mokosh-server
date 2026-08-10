@@ -44,7 +44,7 @@ use crate::modules::search::{search_routes, SearchService};
 use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
-use crate::modules::tenants::{tenant_routes, TenantService};
+use crate::modules::tenants::{public_tenant_routes, tenant_routes, TenantService};
 use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
     agent_attachment_routes, contact_notes_routes, portal_attachment_routes, ticket_routes,
@@ -98,6 +98,10 @@ pub fn create_api_router(
     // from ABUSE_CONTACT_EMAIL in main.rs. `None` drops the line from the mail
     // rather than pointing it at the noreply from-address.
     abuse_contact_email: Option<String>,
+    // MAPPS-429: this deployment's public API base, from PUBLIC_API_BASE_URL in
+    // main.rs. Only the emailed logo needs it (a mail client cannot resolve a
+    // relative src); `None` omits the logo rather than emitting a broken image.
+    public_api_base_url: Option<String>,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -207,7 +211,8 @@ pub fn create_api_router(
     // PMS-748: only the authenticated surface sends mail, but the public
     // surface is built from the same constructor, so both are given it and
     // neither can drift from the other.
-    .with_abuse_contact(abuse_contact_email.clone());
+    .with_abuse_contact(abuse_contact_email.clone())
+    .with_public_api_base(public_api_base_url.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.clone());
     // PMS-453: per-user saved dashboards.
@@ -587,13 +592,18 @@ pub fn create_api_router(
     // identity, and it resolves its own tenant. Same envelope normalization as
     // the other trees so a 400 here looks like a 400 anywhere else.
     let public_api = Router::new()
+        // MAPPS-429: the tenant logo, readable without a session. A client's
+        // mail client renders it straight out of the request-form email and
+        // will never authenticate.
+        .merge(public_tenant_routes(TenantService::new(db.clone())))
         .merge(public_form_routes(
             FormsService::with_request_links(
                 db.clone(),
                 notifications_service.clone(),
                 TicketService::new(db.clone()),
             )
-            .with_abuse_contact(abuse_contact_email),
+            .with_abuse_contact(abuse_contact_email)
+            .with_public_api_base(public_api_base_url),
         ))
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
