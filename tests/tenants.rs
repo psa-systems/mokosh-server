@@ -942,3 +942,130 @@ async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool
         "clearing one key must not disturb another"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PMS-761: the organisation identity every client-facing email renders
+// ---------------------------------------------------------------------------
+
+/// The identity in a client's email has to be the identity of the tenant that
+/// owns the thing the email is about. `OrgIdentity::load` is the single reader
+/// for all of them, so this is the one place that guarantee is checked.
+#[sqlx::test]
+async fn the_org_identity_loads_the_callers_own_tenant(pool: PgPool) {
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::tenants::OrgIdentity;
+
+    let db = Database::from_pool(pool.clone());
+    let svc = TenantService::new(db.clone());
+
+    let other = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Northwind MSP".into(),
+                slug: "northwind-msp".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "owner-pms761@example.test".into(),
+                admin_first_name: "Owner".into(),
+                admin_last_name: "Pms761".into(),
+            },
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create_tenant must succeed");
+
+    sqlx::query(
+        r#"UPDATE tenants SET branding = '{"support_contact_name":"the service desk","support_phone":"555-0100"}'::jsonb WHERE id = $1"#,
+    )
+    .bind(other.id)
+    .execute(&pool)
+    .await
+    .expect("set branding");
+
+    let loaded = OrgIdentity::load(&db, TenantId::from_trusted(other.id))
+        .await
+        .expect("load the org identity");
+    assert_eq!(loaded.name(), "Northwind MSP");
+    assert_eq!(
+        loaded.contact_line("Questions about this invoice?", None),
+        "Questions about this invoice? Contact the service desk at Northwind MSP on 555-0100."
+    );
+
+    // The default tenant is a different organisation and reads as one, so a
+    // caller that threads the wrong tenant_id produces a visibly wrong email
+    // rather than a plausible one.
+    let default = OrgIdentity::load(&db, TenantId::from_trusted(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("load the default tenant identity");
+    assert_ne!(default.name(), loaded.name());
+    assert_eq!(default.contact_name(), None);
+}
+
+/// PMS-761: `dispatch` resolves rules by (tenant_id, event_type) and skips
+/// silently when a tenant has none, so a client-facing template with no rule is
+/// a message that is never sent. `ticket.note_added` was seeded for the default
+/// tenant only and never copied, and `forms.request_link` had its template
+/// copied but not its rule: both were silent for every tenant created here.
+#[sqlx::test]
+async fn a_new_tenant_can_actually_send_the_client_facing_email(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+
+    let tenant = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Fabrikam IT".into(),
+                slug: "fabrikam-it".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "owner-pms761b@example.test".into(),
+                admin_first_name: "Owner".into(),
+                admin_last_name: "Pms761b".into(),
+            },
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create_tenant must succeed");
+
+    for event in ["ticket.note_added", "forms.request_link"] {
+        let usable: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM notification_rules r
+               JOIN notification_templates t ON t.id = r.template_id AND t.tenant_id = r.tenant_id
+               WHERE r.tenant_id = $1 AND r.event_type = $2 AND r.is_active"#,
+        )
+        .bind(tenant.id)
+        .bind(event)
+        .fetch_one(&pool)
+        .await
+        .expect("count usable rules");
+        assert_eq!(
+            usable, 1,
+            "a new tenant needs an active {event} rule pointing at its own template, or the email is never sent",
+        );
+    }
+}
+
+/// Migration 104: the seeded ticket-note copy names the organisation. The keys
+/// are supplied by `TicketsService::send_note_email`; an unresolved one would
+/// reach the client as literal braces, so template and context are asserted
+/// against each other here rather than trusted to stay in step.
+#[sqlx::test]
+async fn the_ticket_note_template_asks_for_the_organisation_identity(pool: PgPool) {
+    let body: String = sqlx::query_scalar(
+        "SELECT body_text FROM notification_templates \
+         WHERE tenant_id = $1 AND event_type = 'ticket.note_added' AND channel_type = 'email'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("the seeded ticket-note template exists");
+
+    for key in ["{{org_name}}", "{{contact_line}}", "{{content}}"] {
+        assert!(
+            body.contains(key),
+            "the ticket-note body must render {key}: {body}"
+        );
+    }
+}
