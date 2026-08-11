@@ -35,6 +35,35 @@ use uuid::Uuid;
 /// page. Long-random-ish but memorable enough to hand-type.
 pub const PORTAL_DEV_PASSWORD: &str = "portal-dev-password-1234";
 
+/// The dev password every seeded agent user carries. Same posture as
+/// [`PORTAL_DEV_PASSWORD`]: dev-only, printed in the seed summary so a
+/// developer can sign into the agent panel of the fixture tenant and
+/// exercise the "grant portal access" flow (MAPPS-396). The agent panel
+/// mints a `/portal/set-password?token=...` email through the tenant's
+/// own `auth.welcome` template, so both halves have to exist for the
+/// end-to-end wire to reach mailpit.
+pub const AGENT_DEV_PASSWORD: &str = "agent-dev-password-1234";
+
+/// The default tenant that migration 023 seeds. The dev-portal seed
+/// copies its `notification_templates` + `notification_rules` into every
+/// new fixture tenant so `auth.welcome` (the setup-link email) has a
+/// row to render from; without this, the dispatcher silently drops the
+/// send and no mail ever lands in mailpit.
+const DEFAULT_TENANT_ID: Uuid = Uuid::from_u128(1);
+
+/// Which transactional event types the dev-portal seed copies from the
+/// default tenant. Matches the set `TenantService::copy_default_config`
+/// copies for real tenant provisioning so a fixture tenant's mail set
+/// looks the same as a first-run production one.
+const SEEDED_EVENT_TYPES: &[&str] = &[
+    "appointment.reminder",
+    "sla.at_risk",
+    "sla.breached",
+    "auth.password_reset",
+    "auth.welcome",
+    "forms.request_link",
+];
+
 /// One line of the seed's stdout summary. Groups the tenant's slug with
 /// the URLs the developer needs to hit.
 pub struct PortalDevSeedRow {
@@ -42,6 +71,10 @@ pub struct PortalDevSeedRow {
     pub display_name: String,
     pub status: String,
     pub email: String,
+    /// The agent-panel login email, or `None` for tenants where the
+    /// seed skips agent-user provisioning (currently only `inact`,
+    /// which is fixture-inactive on purpose).
+    pub agent_email: Option<String>,
 }
 
 pub struct PortalDevSeedReport {
@@ -68,16 +101,30 @@ impl std::fmt::Display for PortalDevSeedReport {
             f,
             "Portal contact password (all seeded contacts): {PORTAL_DEV_PASSWORD}"
         )?;
+        writeln!(
+            f,
+            "Agent user password  (all seeded agent users):  {AGENT_DEV_PASSWORD}"
+        )?;
         writeln!(f)?;
         for row in &self.rows {
             writeln!(
                 f,
-                "  {slug:<7}  {name:<20}  status={status}  email={email}",
+                "  {slug:<7}  {name:<20}  status={status}  portal={email}",
                 slug = row.slug,
                 name = row.display_name,
                 status = row.status,
                 email = row.email,
             )?;
+            if let Some(ref agent) = row.agent_email {
+                writeln!(
+                    f,
+                    "  {slug:<7}  {pad:<20}  {status:<15}  agent={agent}",
+                    slug = "",
+                    pad = "",
+                    status = "",
+                    agent = agent,
+                )?;
+            }
         }
         writeln!(f)?;
         writeln!(f, "Try these URLs (browser or curl) after `just dev`:")?;
@@ -123,17 +170,38 @@ pub async fn portal_dev_seed(pool: &PgPool) -> anyhow::Result<PortalDevSeedRepor
         let tenant_id = upsert_tenant(pool, &spec, &mut inserted)
             .await
             .with_context(|| format!("seed tenant '{}'", spec.slug))?;
+        // MAPPS-396: copy the default tenant's notification templates +
+        // rules into the fixture tenant so `auth.welcome` (the setup-link
+        // email) has a row to render from. Without this, the dispatcher
+        // silently drops the send and no mail lands in mailpit, which
+        // read as "grant portal access does nothing" during dev testing.
+        copy_notification_templates(pool, tenant_id)
+            .await
+            .with_context(|| format!("seed notification templates for tenant '{}'", spec.slug))?;
         let company_id = upsert_company(pool, tenant_id, &spec, &mut inserted)
             .await
             .with_context(|| format!("seed company for tenant '{}'", spec.slug))?;
         upsert_portal_contact(pool, tenant_id, company_id, &spec, &mut inserted)
             .await
             .with_context(|| format!("seed portal contact for tenant '{}'", spec.slug))?;
+        // MAPPS-396: an agent user under the fixture tenant so a dev can
+        // actually sign into the agent panel and click "Grant portal
+        // access" on a contact. Skipped for suspended tenants (they
+        // exercise the fail-closed path on purpose).
+        let agent_email = if let Some(ref email) = spec.agent_email {
+            upsert_agent_user(pool, tenant_id, spec.slug, email, &mut inserted)
+                .await
+                .with_context(|| format!("seed agent user for tenant '{}'", spec.slug))?;
+            Some(email.to_string())
+        } else {
+            None
+        };
         rows.push(PortalDevSeedRow {
             slug: spec.slug.to_string(),
             display_name: spec.display_name.to_string(),
             status: spec.status.to_string(),
             email: spec.contact_email.to_string(),
+            agent_email,
         });
     }
 
@@ -149,6 +217,10 @@ struct FixtureSpec {
     contact_email: &'static str,
     contact_first: &'static str,
     contact_last: &'static str,
+    /// Agent-panel login for this tenant. `None` skips agent-user
+    /// provisioning (currently only `inact`, which is fixture-inactive
+    /// on purpose so signing in there is not a supported flow).
+    agent_email: Option<&'static str>,
 }
 
 fn fixture_specs() -> Vec<FixtureSpec> {
@@ -177,6 +249,7 @@ fn fixture_specs() -> Vec<FixtureSpec> {
             contact_email: "portal-user@acme.example",
             contact_first: "Acme",
             contact_last: "Portal",
+            agent_email: Some("agent@acme.example"),
         },
         FixtureSpec {
             slug: "beta",
@@ -187,6 +260,7 @@ fn fixture_specs() -> Vec<FixtureSpec> {
             contact_email: "portal-user@beta.example",
             contact_first: "Beta",
             contact_last: "Portal",
+            agent_email: Some("agent@beta.example"),
         },
         FixtureSpec {
             slug: "inact",
@@ -197,6 +271,7 @@ fn fixture_specs() -> Vec<FixtureSpec> {
             contact_email: "portal-user@inact.example",
             contact_first: "Inactive",
             contact_last: "Portal",
+            agent_email: None,
         },
     ]
 }
@@ -268,6 +343,126 @@ async fn upsert_company(
         .await?;
     *inserted = true;
     Ok(id)
+}
+
+/// Copy the default tenant's notification templates + rules for the
+/// transactional event types the portal + agent flows dispatch through.
+/// Mirrors `TenantService::copy_default_config` so a fixture tenant's
+/// mail set matches a production one seeded through the CRUD API.
+///
+/// Idempotent: presence of any template row on the target tenant is
+/// treated as "already seeded" and the copy skips. This means editing
+/// the source templates on the default tenant after a first run does
+/// not clobber the fixture copies (matches the "migrations never
+/// clobber operator edits" contract from migration 096).
+async fn copy_notification_templates(pool: &PgPool, tenant_id: Uuid) -> anyhow::Result<()> {
+    if tenant_id == DEFAULT_TENANT_ID {
+        return Ok(());
+    }
+    let existing: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM notification_templates WHERE tenant_id = $1)",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    if existing {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_templates
+            (tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+        SELECT $1, name, event_type, channel_type, subject, body_text, body_html, is_active
+        FROM notification_templates
+        WHERE tenant_id = $2 AND event_type = ANY($3)
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(SEEDED_EVENT_TYPES)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (tenant_id, name, event_type, channels, recipients, template_id, is_active)
+        SELECT $1, r.name, r.event_type, r.channels, r.recipients, nt.id, r.is_active
+        FROM notification_rules r
+        JOIN notification_templates ot
+          ON ot.id = r.template_id AND ot.tenant_id = $2
+        JOIN notification_templates nt
+          ON nt.tenant_id = $1
+         AND nt.event_type = ot.event_type
+         AND nt.channel_type = ot.channel_type
+        WHERE r.tenant_id = $2 AND r.event_type = ANY($3)
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(SEEDED_EVENT_TYPES)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Insert an agent user (role `admin`) under the fixture tenant so a
+/// developer can sign into the agent panel of that tenant and click
+/// "Grant portal access" on a contact. Keyed by (tenant_id, email) so
+/// re-running is idempotent and does NOT reset an existing password.
+async fn upsert_agent_user(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    slug: &str,
+    email: &str,
+    inserted: &mut bool,
+) -> anyhow::Result<()> {
+    let already: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE tenant_id = $1 AND email = $2")
+            .bind(tenant_id)
+            .bind(email)
+            .fetch_optional(pool)
+            .await?;
+    if already.is_some() {
+        return Ok(());
+    }
+
+    let hash = crate::utils::crypto::hash_password(AGENT_DEV_PASSWORD)
+        .map_err(|e| anyhow!("hash agent seed password: {e}"))?;
+    let (first_name, last_name) = derive_agent_name(slug);
+    sqlx::query(
+        r#"
+        INSERT INTO users (
+            id, tenant_id, email, password_hash,
+            first_name, last_name, role, status, email_verified_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'admin', 'active', NOW())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(email)
+    .bind(&hash)
+    .bind(&first_name)
+    .bind(&last_name)
+    .execute(pool)
+    .await?;
+    *inserted = true;
+    Ok(())
+}
+
+/// Turn the tenant slug into a display first/last name for the seeded
+/// agent user. `acme` -> ("Acme", "Agent"). Keeps the seed output
+/// readable in the agent-panel user list.
+fn derive_agent_name(slug: &str) -> (String, String) {
+    let capitalized = slug
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase().to_string() + &slug[1..])
+        .unwrap_or_else(|| "Fixture".to_string());
+    (capitalized, "Agent".to_string())
 }
 
 /// Insert a portal-enabled contact under the tenant + company. Keyed by
