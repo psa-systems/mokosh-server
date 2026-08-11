@@ -666,3 +666,119 @@ pub struct PortalNotificationsResponse {
     pub notifications: Vec<PortalNotification>,
     pub unread_count: i64,
 }
+
+// PMS-729 phase 2 §7 slice C: assets / contracts / time / projects --------
+
+/// One asset as `GET /portal/assets` returns it. Internal `notes`
+/// (agent scratch), `custom_fields`, RMM integration ids, and
+/// `internal_notes` are dropped so agent-only context never leaks to
+/// the customer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalAsset {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_tag: Option<String>,
+    pub name: String,
+    pub asset_type: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warranty_expiry: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_of_life: Option<chrono::NaiveDate>,
+}
+
+/// One contract as the portal list surface returns it. `internal_notes`
+/// and `custom_fields` are dropped; SLA policy id / hour balance /
+/// billing amount are all customer-facing and stay.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalContract {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_number: Option<String>,
+    pub name: String,
+    pub contract_type: String,
+    pub status: String,
+    pub start_date: chrono::NaiveDate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_cycle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_amount: Option<rust_decimal::Decimal>,
+}
+
+/// One time entry as the portal returns it. Internal notes, hourly
+/// rate, total amount, and approval reasons are dropped so agent
+/// scratch context never reaches the customer. `duration_minutes`
+/// stays because that is what the customer is verifying.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalTimeEntry {
+    pub id: Uuid,
+    pub date: chrono::NaiveDate,
+    pub duration_minutes: i32,
+    pub work_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub billing_status: String,
+    pub approval_status: String,
+    pub is_billable: bool,
+}
+
+/// One project as the portal list / detail returns it. Milestones
+/// (via `PortalProjectPhase`) travel with the detail response only.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalProject {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_number: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_end_date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_end_date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_hours: Option<rust_decimal::Decimal>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalProjectPhase {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub status: String,
+    pub sort_order: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<chrono::NaiveDate>,
+}
+
+/// Detail response for `GET /portal/projects/{id}`. Bundles the
+/// project with its phase list so the SPA can render both without a
+/// second fetch.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalProjectDetail {
+    #[serde(flatten)]
+    pub project: PortalProject,
+    pub phases: Vec<PortalProjectPhase>,
+}

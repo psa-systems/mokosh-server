@@ -2291,6 +2291,424 @@ impl PortalAuthService {
         })
     }
 
+    /// PMS-729 phase 2 §7 slice C / I3: list every asset owned by the
+    /// caller's company. RMM ids, notes, and custom fields are dropped;
+    /// only the customer-facing subset (tag, name, type, status, mfr,
+    /// model, serial, warranty, EOL) surfaces.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_portal_assets(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Vec<PortalAsset>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(
+            Uuid,
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT a.id, a.asset_tag, a.name, at.name AS asset_type, a.status,
+                   a.manufacturer, a.model, a.serial_number,
+                   a.warranty_expiry, a.end_of_life
+            FROM assets a
+            JOIN asset_types at ON at.id = a.asset_type_id
+            WHERE a.tenant_id = $1 AND a.company_id = $2
+            ORDER BY a.name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    asset_tag,
+                    name,
+                    asset_type,
+                    status,
+                    manufacturer,
+                    model,
+                    serial_number,
+                    warranty_expiry,
+                    end_of_life,
+                )| PortalAsset {
+                    id,
+                    asset_tag,
+                    name,
+                    asset_type,
+                    status,
+                    manufacturer,
+                    model,
+                    serial_number,
+                    warranty_expiry,
+                    end_of_life,
+                },
+            )
+            .collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice C / I3: single asset detail for a
+    /// portal caller. Cross-company / unknown ids surface as 404.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, asset_id = %asset_id))]
+    pub async fn get_portal_asset(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        asset_id: Uuid,
+    ) -> AppResult<PortalAsset> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(
+            Uuid,
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT a.id, a.asset_tag, a.name, at.name AS asset_type, a.status,
+                   a.manufacturer, a.model, a.serial_number,
+                   a.warranty_expiry, a.end_of_life
+            FROM assets a
+            JOIN asset_types at ON at.id = a.asset_type_id
+            WHERE a.tenant_id = $1 AND a.company_id = $2 AND a.id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(asset_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some((
+            id,
+            asset_tag,
+            name,
+            asset_type,
+            status,
+            manufacturer,
+            model,
+            serial_number,
+            warranty_expiry,
+            end_of_life,
+        )) = row
+        else {
+            return Err(AppError::NotFound("Asset".to_string()));
+        };
+        Ok(PortalAsset {
+            id,
+            asset_tag,
+            name,
+            asset_type,
+            status,
+            manufacturer,
+            model,
+            serial_number,
+            warranty_expiry,
+            end_of_life,
+        })
+    }
+
+    /// PMS-729 phase 2 §7 slice C / I4: list every contract that
+    /// touches the caller's company. `internal_notes` + `custom_fields`
+    /// are dropped; SLA + billing_amount stay because the customer is
+    /// paying for those.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_portal_contracts(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Vec<PortalContract>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(
+            Uuid,
+            Option<String>,
+            String,
+            String,
+            String,
+            chrono::NaiveDate,
+            Option<chrono::NaiveDate>,
+            Option<String>,
+            Option<rust_decimal::Decimal>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, contract_number, name, contract_type, status,
+                   start_date, end_date, billing_cycle, billing_amount
+            FROM contracts
+            WHERE tenant_id = $1 AND company_id = $2
+            ORDER BY start_date DESC, name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.into_iter().map(build_portal_contract).collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice C / I4: contract detail. 404 for
+    /// cross-company / unknown ids.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, contract_id = %contract_id))]
+    pub async fn get_portal_contract(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        contract_id: Uuid,
+    ) -> AppResult<PortalContract> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(
+            Uuid,
+            Option<String>,
+            String,
+            String,
+            String,
+            chrono::NaiveDate,
+            Option<chrono::NaiveDate>,
+            Option<String>,
+            Option<rust_decimal::Decimal>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, contract_number, name, contract_type, status,
+                   start_date, end_date, billing_cycle, billing_amount
+            FROM contracts
+            WHERE tenant_id = $1 AND company_id = $2 AND id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(contract_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(build_portal_contract)
+            .ok_or_else(|| AppError::NotFound("Contract".to_string()))
+    }
+
+    /// PMS-729 phase 2 §7 slice C / I5: list every billable time entry
+    /// against the caller's company. Internal notes, rate, total, and
+    /// approval reasons are dropped. Only entries the customer would
+    /// see on an invoice are returned: `is_billable = TRUE` and
+    /// `approval_status IN ('approved', 'pending')`; rejected entries
+    /// stay hidden because they will not appear on the customer's bill.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_portal_time_entries(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Vec<PortalTimeEntry>> {
+        const LIMIT: i64 = 200;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            chrono::NaiveDate,
+            i32,
+            String,
+            Option<Uuid>,
+            Option<String>,
+            Option<Uuid>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            bool,
+        )> = sqlx::query_as(
+            r#"
+            SELECT te.id, te.date, te.duration_minutes, wt.name AS work_type,
+                   te.ticket_id, t.ticket_number,
+                   te.project_id, p.name AS project_name,
+                   te.notes,
+                   te.billing_status, te.approval_status, te.is_billable
+            FROM time_entries te
+            JOIN work_types wt ON wt.id = te.work_type_id
+            LEFT JOIN tickets t ON t.id = te.ticket_id
+            LEFT JOIN projects p ON p.id = te.project_id
+            WHERE te.tenant_id = $1
+              AND te.company_id = $2
+              AND te.is_billable = TRUE
+              AND te.approval_status IN ('approved', 'pending')
+            ORDER BY te.date DESC, te.created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(LIMIT)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    date,
+                    duration_minutes,
+                    work_type,
+                    ticket_id,
+                    ticket_number,
+                    project_id,
+                    project_name,
+                    notes,
+                    billing_status,
+                    approval_status,
+                    is_billable,
+                )| PortalTimeEntry {
+                    id,
+                    date,
+                    duration_minutes,
+                    work_type,
+                    ticket_id,
+                    ticket_number,
+                    project_id,
+                    project_name,
+                    notes,
+                    billing_status,
+                    approval_status,
+                    is_billable,
+                },
+            )
+            .collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice C / I6: list every project scoped to
+    /// the caller's company. Internal projects (`project_type =
+    /// 'internal'`) stay hidden.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_portal_projects(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Vec<PortalProject>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+            Option<rust_decimal::Decimal>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, project_number, name, description, status,
+                   start_date, target_end_date, actual_end_date, budget_hours
+            FROM projects
+            WHERE tenant_id = $1 AND company_id = $2
+              AND project_type = 'client'
+            ORDER BY COALESCE(start_date, '1970-01-01'::date) DESC, name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.into_iter().map(build_portal_project).collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice C / I6: project detail (with phases).
+    /// Cross-company / internal-only / unknown ids surface as 404.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, project_id = %project_id))]
+    pub async fn get_portal_project(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        project_id: Uuid,
+    ) -> AppResult<PortalProjectDetail> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            Uuid,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+            Option<rust_decimal::Decimal>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, project_number, name, description, status,
+                   start_date, target_end_date, actual_end_date, budget_hours
+            FROM projects
+            WHERE tenant_id = $1 AND company_id = $2 AND id = $3
+              AND project_type = 'client'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(project_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(project_row) = row else {
+            tx.commit().await?;
+            return Err(AppError::NotFound("Project".to_string()));
+        };
+        let phase_rows: Vec<(
+            Uuid,
+            String,
+            Option<String>,
+            String,
+            i32,
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, name, description, status, sort_order, start_date, end_date
+            FROM project_phases
+            WHERE tenant_id = $1 AND project_id = $2
+            ORDER BY sort_order ASC, name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(PortalProjectDetail {
+            project: build_portal_project(project_row),
+            phases: phase_rows
+                .into_iter()
+                .map(
+                    |(id, name, description, status, sort_order, start_date, end_date)| {
+                        PortalProjectPhase {
+                            id,
+                            name,
+                            description,
+                            status,
+                            sort_order,
+                            start_date,
+                            end_date,
+                        }
+                    },
+                )
+                .collect(),
+        })
+    }
+
     /// PMS-729 phase 2 §7 slice B / I12: mark a portal inbox row as
     /// read. Contact-scoped: another company's contact (or an agent
     /// user row) cannot mark this row read even if they guess the id.
@@ -2355,6 +2773,88 @@ fn apply_password_policy(new_password: &str, hints: &[String]) -> AppResult<()> 
     let hints_ref: Vec<&str> = hints.iter().map(String::as_str).collect();
     password_policy::validate(new_password, &hints_ref, PasswordPolicy::default())
         .map_err(|PasswordPolicyError::UserMessage(msg)| AppError::BadRequest(msg))
+}
+
+/// PMS-729 phase 2 §7 slice C / I4: helper mapping a contract row
+/// tuple into the customer-facing DTO. Extracted so the list and
+/// detail methods share one projection.
+#[allow(clippy::type_complexity)]
+fn build_portal_contract(
+    row: (
+        Uuid,
+        Option<String>,
+        String,
+        String,
+        String,
+        chrono::NaiveDate,
+        Option<chrono::NaiveDate>,
+        Option<String>,
+        Option<rust_decimal::Decimal>,
+    ),
+) -> PortalContract {
+    let (
+        id,
+        contract_number,
+        name,
+        contract_type,
+        status,
+        start_date,
+        end_date,
+        billing_cycle,
+        billing_amount,
+    ) = row;
+    PortalContract {
+        id,
+        contract_number,
+        name,
+        contract_type,
+        status,
+        start_date,
+        end_date,
+        billing_cycle,
+        billing_amount,
+    }
+}
+
+/// PMS-729 phase 2 §7 slice C / I6: helper mapping a project row
+/// tuple into the customer-facing DTO. Detail response wraps this in
+/// [`PortalProjectDetail`] with the phase list.
+#[allow(clippy::type_complexity)]
+fn build_portal_project(
+    row: (
+        Uuid,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        Option<chrono::NaiveDate>,
+        Option<chrono::NaiveDate>,
+        Option<chrono::NaiveDate>,
+        Option<rust_decimal::Decimal>,
+    ),
+) -> PortalProject {
+    let (
+        id,
+        project_number,
+        name,
+        description,
+        status,
+        start_date,
+        target_end_date,
+        actual_end_date,
+        budget_hours,
+    ) = row;
+    PortalProject {
+        id,
+        project_number,
+        name,
+        description,
+        status,
+        start_date,
+        target_end_date,
+        actual_end_date,
+        budget_hours,
+    }
 }
 
 /// PMS-729 phase 2 H3: what `request_password_reset` returns to the

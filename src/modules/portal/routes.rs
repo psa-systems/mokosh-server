@@ -26,13 +26,13 @@ use super::middleware::{
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
-    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact,
-    PortalChangePasswordRequest, PortalDashboardResponse, PortalForgotPasswordRequest,
-    PortalHostHint, PortalInvoicePaymentsResponse, PortalLoginRequest, PortalLogoutRequest,
-    PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
-    PortalMfaSetupResponse, PortalNotificationsResponse, PortalRefreshRequest,
-    PortalResetPasswordRequest, PortalSearchResponse, PortalSessionResponse,
-    PortalSetupPasswordRequest, PortalTicketSlaResponse, ResolvedTenant,
+    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalAsset,
+    PortalChangePasswordRequest, PortalContract, PortalDashboardResponse,
+    PortalForgotPasswordRequest, PortalHostHint, PortalInvoicePaymentsResponse, PortalLoginRequest,
+    PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
+    PortalMfaSetupResponse, PortalNotificationsResponse, PortalProject, PortalProjectDetail,
+    PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse, PortalSessionResponse,
+    PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -217,6 +217,14 @@ pub fn portal_routes(
             "/notifications/{notification_id}/read",
             put(mark_notification_read),
         )
+        // PMS-729 phase 2 §7 slice C: read-only company-scoped views.
+        .route("/assets", get(list_portal_assets))
+        .route("/assets/{asset_id}", get(get_portal_asset))
+        .route("/contracts", get(list_portal_contracts))
+        .route("/contracts/{contract_id}", get(get_portal_contract))
+        .route("/time-entries", get(list_portal_time_entries))
+        .route("/projects", get(list_portal_projects))
+        .route("/projects/{project_id}", get(get_portal_project))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -684,6 +692,97 @@ async fn get_ticket_sla(
         .ticket_sla(contact.tenant(), contact.company_id, ticket_id)
         .await?;
     Ok(Json(payload))
+}
+
+/// PMS-729 phase 2 §7 slice C / I3: portal assets.
+async fn list_portal_assets(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalAsset>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_assets(contact.tenant(), contact.company_id)
+            .await?,
+    ))
+}
+
+async fn get_portal_asset(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(asset_id): Path<Uuid>,
+) -> AppResult<Json<PortalAsset>> {
+    Ok(Json(
+        state
+            .service
+            .get_portal_asset(contact.tenant(), contact.company_id, asset_id)
+            .await?,
+    ))
+}
+
+/// PMS-729 phase 2 §7 slice C / I4: portal contracts.
+async fn list_portal_contracts(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalContract>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_contracts(contact.tenant(), contact.company_id)
+            .await?,
+    ))
+}
+
+async fn get_portal_contract(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(contract_id): Path<Uuid>,
+) -> AppResult<Json<PortalContract>> {
+    Ok(Json(
+        state
+            .service
+            .get_portal_contract(contact.tenant(), contact.company_id, contract_id)
+            .await?,
+    ))
+}
+
+/// PMS-729 phase 2 §7 slice C / I5: portal time entries.
+async fn list_portal_time_entries(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalTimeEntry>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_time_entries(contact.tenant(), contact.company_id)
+            .await?,
+    ))
+}
+
+/// PMS-729 phase 2 §7 slice C / I6: portal projects.
+async fn list_portal_projects(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalProject>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_projects(contact.tenant(), contact.company_id)
+            .await?,
+    ))
+}
+
+async fn get_portal_project(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(project_id): Path<Uuid>,
+) -> AppResult<Json<PortalProjectDetail>> {
+    Ok(Json(
+        state
+            .service
+            .get_portal_project(contact.tenant(), contact.company_id, project_id)
+            .await?,
+    ))
 }
 
 /// PMS-729 phase 2 §7 slice B / I12: portal inbox list. Contact-scoped
