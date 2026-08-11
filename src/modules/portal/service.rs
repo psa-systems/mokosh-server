@@ -1829,6 +1829,9 @@ impl PortalAuthService {
         ticket_id: Uuid,
     ) -> AppResult<PortalTicketSlaResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Row is a tuple of the six datetime columns plus the status
+        // name; the shape matches the SELECT below.
+        #[allow(clippy::type_complexity)]
         let row: Option<(
             Option<DateTime<Utc>>,
             Option<DateTime<Utc>>,
