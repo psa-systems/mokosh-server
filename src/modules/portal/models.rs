@@ -563,3 +563,36 @@ pub struct PortalTicketSlaResponse {
     /// SLA metric without a second fetch.
     pub status_name: String,
 }
+
+// PMS-729 phase 2 §7 slice A / I11: payment history on invoice detail -------
+
+/// One `payments` row as the portal wants to see it. The internal-
+/// note field (`payments.notes`) is deliberately dropped: agents use
+/// it to jot billing context ("bounced, retry Friday") that the
+/// customer should not see. `gateway_response` is also omitted (it
+/// carries raw Stripe / Auth.net payloads).
+///
+/// `reference_number` is included because on a check / wire /
+/// off-portal payment it is the customer's own reference and they
+/// often need to reconcile against their own ledger.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalInvoicePayment {
+    pub id: Uuid,
+    pub payment_date: chrono::NaiveDate,
+    pub amount: rust_decimal::Decimal,
+    pub payment_method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_number: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// `GET /portal/invoices/{id}/payments` response body. Paginated by
+/// convention; the current shape returns the full list (payments per
+/// invoice are bounded by human behaviour, so a full list rarely
+/// exceeds a page). Uses a wrapping object so future pagination
+/// additions are non-breaking.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalInvoicePaymentsResponse {
+    pub payments: Vec<PortalInvoicePayment>,
+    pub total: i64,
+}

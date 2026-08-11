@@ -28,10 +28,10 @@ use super::service::PortalAuthService;
 use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact,
     PortalChangePasswordRequest, PortalDashboardResponse, PortalForgotPasswordRequest,
-    PortalHostHint, PortalLoginRequest, PortalLogoutRequest, PortalMfaDisableRequest,
-    PortalMfaEnableRequest, PortalMfaEnableResponse, PortalMfaSetupResponse, PortalRefreshRequest,
-    PortalResetPasswordRequest, PortalSessionResponse, PortalSetupPasswordRequest,
-    PortalTicketSlaResponse, ResolvedTenant,
+    PortalHostHint, PortalInvoicePaymentsResponse, PortalLoginRequest, PortalLogoutRequest,
+    PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
+    PortalMfaSetupResponse, PortalRefreshRequest, PortalResetPasswordRequest,
+    PortalSessionResponse, PortalSetupPasswordRequest, PortalTicketSlaResponse, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -195,6 +195,13 @@ pub fn portal_routes(
         // actuals, plus the computed on-track / warning / breached label
         // shared with the agent side.
         .route("/tickets/{ticket_id}/sla", get(get_ticket_sla))
+        // PMS-729 phase 2 §7 slice A / I11: payment history on portal
+        // invoice detail. Payment ledger newest-first, safe subset
+        // (no internal notes, no gateway_response blobs).
+        .route(
+            "/invoices/{invoice_id}/payments",
+            get(list_invoice_payments),
+        )
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -660,6 +667,21 @@ async fn get_ticket_sla(
     let payload = state
         .service
         .ticket_sla(contact.tenant(), contact.company_id, ticket_id)
+        .await?;
+    Ok(Json(payload))
+}
+
+/// PMS-729 phase 2 §7 slice A / I11: payment ledger for one of the
+/// caller's invoices. Cross-company / unknown invoice ids surface as
+/// 404, matching `get_invoice`.
+async fn list_invoice_payments(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<PortalInvoicePaymentsResponse>> {
+    let payload = state
+        .service
+        .list_invoice_payments(contact.tenant(), contact.company_id, invoice_id)
         .await?;
     Ok(Json(payload))
 }

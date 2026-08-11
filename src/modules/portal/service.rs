@@ -1895,6 +1895,95 @@ impl PortalAuthService {
             status_name,
         })
     }
+
+    /// PMS-729 phase 2 §7 slice A / I11: payment history for one of the
+    /// caller's invoices. Enforces the (tenant, company, invoice) scope
+    /// via a preflight EXISTS so a cross-company id surfaces as 404
+    /// (same posture as `get_invoice`); the payments read then joins on
+    /// the same three columns so a leaked payment id cannot bypass the
+    /// gate either.
+    ///
+    /// Returns newest-first, capped by the caller's page size (default
+    /// 50). Every payment row surfaces id, date, amount, method, and
+    /// reference number; internal notes and raw gateway payloads are
+    /// deliberately dropped so an agent's "bounced, retry Friday"
+    /// scratch comment never reaches the customer.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, invoice_id = %invoice_id))]
+    pub async fn list_invoice_payments(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        invoice_id: Uuid,
+    ) -> AppResult<PortalInvoicePaymentsResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Preflight: the invoice must exist AND belong to this
+        // company. Missing / cross-company both collapse to 404.
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM invoices
+                WHERE tenant_id = $1 AND company_id = $2 AND id = $3
+            )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(invoice_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            tx.commit().await?;
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+
+        // Payments read: same scope, newest-first. Kept as a `SELECT
+        // ... ORDER BY` so a future pagination adds a bounded LIMIT
+        // without shape churn.
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            chrono::NaiveDate,
+            rust_decimal::Decimal,
+            String,
+            Option<String>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, payment_date, amount, payment_method, reference_number, created_at
+            FROM payments
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND invoice_id = $3
+            ORDER BY payment_date DESC, created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(invoice_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let payments: Vec<PortalInvoicePayment> = rows
+            .into_iter()
+            .map(
+                |(id, payment_date, amount, payment_method, reference_number, created_at)| {
+                    PortalInvoicePayment {
+                        id,
+                        payment_date,
+                        amount,
+                        payment_method,
+                        reference_number,
+                        created_at,
+                    }
+                },
+            )
+            .collect();
+        let total = payments.len() as i64;
+
+        Ok(PortalInvoicePaymentsResponse { payments, total })
+    }
 }
 
 /// PMS-729 phase 2 H5: bridge the shared [`password_policy`] error
