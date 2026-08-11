@@ -39,9 +39,28 @@ use crate::scheduler::Job;
 use crate::utils::error::AppResult;
 
 /// Cap the fanout per tick so a burst of requests does not monopolise
-/// the pooled connection. 10 is generous for phase 2 (the typical
-/// tenant will queue at most a handful of exports a day).
-const MAX_JOBS_PER_TICK: i64 = 10;
+/// the pooled connection. Post-code-review finding #7 lowered this
+/// from 10 to 3 so the in-flight bundle payload memory stays bounded
+/// even when several large tenants queue at once. 3 keeps the tick
+/// interactive on a mid-size box; a heavier deploy can crank it up
+/// once the streaming refactor lands.
+const MAX_JOBS_PER_TICK: i64 = 3;
+
+/// Post-code-review finding #7: per-section row cap. Bundles are held
+/// in memory as one JSON blob before being persisted to
+/// `portal_exports.bundle_json`, so an uncapped fetch on a tenant with
+/// millions of notes could OOM the worker. Each cap here bounds the
+/// bundle at roughly (5k tickets * ~500 bytes) + (20k notes * ~800
+/// bytes) + (10k invoices * ~400 bytes) + (5k quotes * ~400 bytes) =
+/// ~22 MB max per bundle; well within the pod's budget and orders of
+/// magnitude smaller than the pathological pre-fix case. When a
+/// section is truncated we emit a `truncated: true` marker on the
+/// bundle so the customer knows to ask for the residual data via
+/// support rather than assume the export is complete.
+const MAX_TICKETS_PER_BUNDLE: i64 = 5_000;
+const MAX_NOTES_PER_BUNDLE: i64 = 20_000;
+const MAX_INVOICES_PER_BUNDLE: i64 = 10_000;
+const MAX_QUOTES_PER_BUNDLE: i64 = 5_000;
 
 /// 7-day TTL on the finished bundle. Set on the `expires_at` column
 /// at the moment the worker stamps `status = 'ready'`. D19 pinned this
@@ -178,6 +197,11 @@ async fn build_bundle(
     .fetch_one(db.migrator_pool())
     .await?;
 
+    // Post-code-review finding #7: every section carries a hard LIMIT
+    // so a customer at a large tenant does not OOM the worker. A
+    // separate COUNT tells us whether the section was truncated so the
+    // bundle can carry a `truncated: true` marker at the top level.
+
     // Own-company tickets: id, number, title, status name, requested_at.
     let tickets: Vec<(Uuid, String, String, String, DateTime<Utc>)> = sqlx::query_as(
         r#"
@@ -186,11 +210,20 @@ async fn build_bundle(
         JOIN ticket_statuses s ON s.id = t.status_id
         WHERE t.tenant_id = $1 AND t.company_id = $2
         ORDER BY t.created_at DESC
+        LIMIT $3
         "#,
     )
     .bind(tenant_id)
     .bind(company_id)
+    .bind(MAX_TICKETS_PER_BUNDLE)
     .fetch_all(db.migrator_pool())
+    .await?;
+    let tickets_total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM tickets WHERE tenant_id = $1 AND company_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(company_id)
+    .fetch_one(db.migrator_pool())
     .await?;
 
     // Public notes across every own-company ticket.
@@ -203,11 +236,25 @@ async fn build_bundle(
           AND t.company_id = $2
           AND n.note_type = 'public'
         ORDER BY n.created_at DESC
+        LIMIT $3
         "#,
     )
     .bind(tenant_id)
     .bind(company_id)
+    .bind(MAX_NOTES_PER_BUNDLE)
     .fetch_all(db.migrator_pool())
+    .await?;
+    let notes_total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::BIGINT
+        FROM ticket_notes n
+        JOIN tickets t ON t.id = n.ticket_id
+        WHERE n.tenant_id = $1 AND t.company_id = $2 AND n.note_type = 'public'
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(company_id)
+    .fetch_one(db.migrator_pool())
     .await?;
 
     // Invoices (safe subset only).
@@ -227,11 +274,20 @@ async fn build_bundle(
         FROM invoices
         WHERE tenant_id = $1 AND company_id = $2
         ORDER BY invoice_date DESC
+        LIMIT $3
         "#,
     )
     .bind(tenant_id)
     .bind(company_id)
+    .bind(MAX_INVOICES_PER_BUNDLE)
     .fetch_all(db.migrator_pool())
+    .await?;
+    let invoices_total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM invoices WHERE tenant_id = $1 AND company_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(company_id)
+    .fetch_one(db.migrator_pool())
     .await?;
 
     // Quotes (safe subset). Filter to the same statuses `list_quotes_for_company`
@@ -243,15 +299,44 @@ async fn build_bundle(
         WHERE tenant_id = $1 AND company_id = $2
           AND status IN ('sent', 'submitted', 'accepted', 'declined', 'expired', 'converted')
         ORDER BY updated_at DESC
+        LIMIT $3
         "#,
     )
     .bind(tenant_id)
     .bind(company_id)
+    .bind(MAX_QUOTES_PER_BUNDLE)
     .fetch_all(db.migrator_pool())
     .await?;
+    let quotes_total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::BIGINT FROM quotes
+        WHERE tenant_id = $1 AND company_id = $2
+          AND status IN ('sent', 'submitted', 'accepted', 'declined', 'expired', 'converted')
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(company_id)
+    .fetch_one(db.migrator_pool())
+    .await?;
+
+    let truncated = tickets_total > tickets.len() as i64
+        || notes_total > notes.len() as i64
+        || invoices_total > invoices.len() as i64
+        || quotes_total > quotes.len() as i64;
 
     let bundle = json!({
         "generated_at": Utc::now(),
+        // Post-code-review finding #7: signals that at least one
+        // section was capped. The customer can ask support for the
+        // residual data if they need it; the bundle stays a bounded
+        // download either way.
+        "truncated": truncated,
+        "section_totals": {
+            "tickets": tickets_total,
+            "ticket_notes": notes_total,
+            "invoices": invoices_total,
+            "quotes": quotes_total,
+        },
         "contact": {
             "id": contact_id,
             "first_name": first_name,

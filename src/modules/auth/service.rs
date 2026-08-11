@@ -568,26 +568,14 @@ impl AuthService {
         }
     }
 
-    /// True for addresses that can never map to a public country: loopback,
-    /// RFC1918 / unique-local, link-local, unspecified, broadcast. PMS-657 skips
-    /// these so a request arriving without a real client IP does not register as
-    /// a country change.
+    /// Post-code-review finding #10: agent side now delegates to the
+    /// shared `crate::utils::login_location::is_non_public_ip`. The
+    /// previous inherent method was byte-identical to the portal-side
+    /// copy AND missed the IPv4-mapped IPv6 case (finding #9). Keeping
+    /// the associated-function shape so every existing call site
+    /// (`Self::is_non_public_ip(...)`) compiles unchanged.
     fn is_non_public_ip(ip: &IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => {
-                v4.is_private()
-                    || v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local()
-                    || v6.is_unicast_link_local()
-            }
-        }
+        crate::utils::login_location::is_non_public_ip(ip)
     }
 
     /// Authenticate user with email and password
@@ -3271,29 +3259,12 @@ fn synthetic_name_from_email(email: &str) -> (String, String) {
     }
 }
 
-/// PMS-657: the action to take for a resolved login country, given the country
-/// recorded at the user's previous login. Kept pure (no DB, no mailer) so the
-/// branch logic is unit-testable in isolation.
+// Post-code-review finding #10: agent-side login-location types moved
+// to `crate::utils::login_location`. Both the enum and the branch
+// function are aliased through so existing call sites at auth/service.rs
+// keep resolving.
 #[cfg(feature = "server")]
-#[derive(Debug, PartialEq, Eq)]
-enum LoginLocationDecision {
-    /// No prior country on record: store this one silently, no alert.
-    Record,
-    /// Same country as last time: do nothing.
-    Unchanged,
-    /// Country differs from last time: alert the user, then store the new one.
-    Alert,
-}
-
-/// Decide what to do for the `current` login country given the `previous` one.
-#[cfg(feature = "server")]
-fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLocationDecision {
-    match previous {
-        None => LoginLocationDecision::Record,
-        Some(prev) if prev == current => LoginLocationDecision::Unchanged,
-        Some(_) => LoginLocationDecision::Alert,
-    }
-}
+use crate::utils::login_location::{login_location_decision, LoginLocationDecision};
 
 #[cfg(all(test, feature = "server"))]
 mod tests {

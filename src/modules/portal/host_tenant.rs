@@ -105,6 +105,56 @@ impl PortalHostConfig {
     }
 }
 
+/// Post-code-review finding #5: reconstruct the customer-facing portal
+/// origin (`scheme://host`) from the browser Host header when the
+/// portal-host feature is on, so per-tenant reset links, Stripe return
+/// URLs, and login-location security links point at
+/// `{slug}.client.<apex>` instead of the single CLIENT_ORIGIN fallback.
+///
+/// - `forwarded_host` wins over `host_header` (the SPA sends
+///   `X-Forwarded-Host` explicitly on portal-host builds because the
+///   Dioxus dev proxy rewrites the base `Host`).
+/// - If the picked host is empty OR does not end with the configured
+///   suffix (i.e. an agent host or a non-portal deploy), return the
+///   `fallback_origin` unchanged.
+/// - Scheme is `http` for the dev `.localhost` case, `https` everywhere
+///   else. The `:port` suffix is preserved so dev hosts on `:4301` and
+///   the like keep working; production runs on 443/80 and never carries
+///   the port.
+///
+/// Pure function (no request state), keeps unit tests below cheap.
+pub fn portal_origin_from_host(
+    host_config: &PortalHostConfig,
+    forwarded_host: Option<&str>,
+    host_header: Option<&str>,
+    fallback_origin: &str,
+) -> String {
+    if !host_config.is_enabled() {
+        return fallback_origin.to_string();
+    }
+    let picked = forwarded_host
+        .or(host_header)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(host) = picked else {
+        return fallback_origin.to_string();
+    };
+    if host_config.extract_slug(host).is_none() {
+        return fallback_origin.to_string();
+    }
+    let host_lower = host.to_ascii_lowercase();
+    let host_no_port = host_lower
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(&host_lower);
+    let scheme = if host_no_port == "localhost" || host_no_port.ends_with(".localhost") {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{host_lower}")
+}
+
 /// Marker error returned by [`resolve_slug`] when neither the host nor
 /// the body supplied a usable slug, or when they supplied disagreeing
 /// values. The login handler collapses this into
@@ -130,12 +180,21 @@ pub fn resolve_slug(
     host_tenant: Option<&ResolvedTenant>,
     body_slug: Option<&str>,
 ) -> Result<String, SlugResolveError> {
-    let body_norm = body_slug.map(|s| s.trim().to_ascii_lowercase());
+    // Post-code-review finding #8: coerce Some(empty-after-trim) to
+    // None BEFORE the match so a legacy SPA build that emits
+    // `"tenant_slug": ""` on a host-derived deploy is treated the same
+    // as omitting the field. The previous code took the `(Some(t),
+    // Some(""))` arm which forced string equality against the tenant
+    // slug and returned Err(SlugResolveError), producing silent 401 on
+    // login and silent 204 (no email) on forgot-password.
+    let body_norm = body_slug
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
     match (host_tenant, body_norm) {
         (Some(t), Some(s)) if t.slug == s => Ok(t.slug.clone()),
         (Some(_), Some(_)) => Err(SlugResolveError), // cross-tenant credential replay
         (Some(t), None) => Ok(t.slug.clone()),
-        (None, Some(s)) if !s.is_empty() => Ok(s),
+        (None, Some(s)) => Ok(s),
         _ => Err(SlugResolveError),
     }
 }
@@ -279,5 +338,98 @@ mod tests {
     fn resolve_slug_empty_body_treated_as_none() {
         assert_eq!(resolve_slug(None, Some("")), Err(SlugResolveError));
         assert_eq!(resolve_slug(None, Some("   ")), Err(SlugResolveError));
+    }
+
+    // ---- portal_origin_from_host (#5) --------------------------------
+
+    /// Post-code-review finding #8: an empty-after-trim body slug on
+    /// a host-derived deploy must fall back to the host tenant, not
+    /// fail closed.
+    #[test]
+    fn resolve_slug_empty_body_on_host_tenant_deploy_uses_host() {
+        let t = ResolvedTenant {
+            tenant_id: uuid::Uuid::nil(),
+            slug: "acme".to_string(),
+            display_name: "Acme MSP".to_string(),
+            branding: super::super::models::PortalBranding::default(),
+        };
+        assert_eq!(resolve_slug(Some(&t), Some("")), Ok("acme".to_string()));
+        assert_eq!(resolve_slug(Some(&t), Some("   ")), Ok("acme".to_string()));
+    }
+
+    #[test]
+    fn portal_origin_falls_back_when_feature_off() {
+        let cfg = PortalHostConfig::from_suffix("");
+        assert_eq!(
+            portal_origin_from_host(
+                &cfg,
+                Some("acme.client.a8n.systems"),
+                None,
+                "https://fallback"
+            ),
+            "https://fallback"
+        );
+    }
+
+    #[test]
+    fn portal_origin_reconstructs_https_on_matching_host() {
+        let cfg = PortalHostConfig::from_suffix(".client.a8n.systems");
+        assert_eq!(
+            portal_origin_from_host(
+                &cfg,
+                Some("acme.client.a8n.systems"),
+                None,
+                "https://fallback"
+            ),
+            "https://acme.client.a8n.systems"
+        );
+        // Case gets lowercased.
+        assert_eq!(
+            portal_origin_from_host(
+                &cfg,
+                Some("Acme.Client.A8N.Systems"),
+                None,
+                "https://fallback"
+            ),
+            "https://acme.client.a8n.systems"
+        );
+    }
+
+    #[test]
+    fn portal_origin_reconstructs_http_on_dev_localhost() {
+        let cfg = PortalHostConfig::from_suffix(".client.localhost");
+        assert_eq!(
+            portal_origin_from_host(
+                &cfg,
+                Some("acme.client.localhost:4301"),
+                None,
+                "http://fallback"
+            ),
+            "http://acme.client.localhost:4301"
+        );
+    }
+
+    #[test]
+    fn portal_origin_falls_back_on_non_portal_host() {
+        let cfg = PortalHostConfig::from_suffix(".client.a8n.systems");
+        // Agent-side host: does not match the suffix.
+        assert_eq!(
+            portal_origin_from_host(&cfg, Some("msp.a8n.systems"), None, "https://fallback"),
+            "https://fallback"
+        );
+    }
+
+    #[test]
+    fn portal_origin_prefers_forwarded_host_over_host_header() {
+        let cfg = PortalHostConfig::from_suffix(".client.a8n.systems");
+        assert_eq!(
+            portal_origin_from_host(
+                &cfg,
+                Some("acme.client.a8n.systems"),
+                Some("proxy.internal"),
+                "https://fallback"
+            ),
+            "https://acme.client.a8n.systems"
+        );
     }
 }

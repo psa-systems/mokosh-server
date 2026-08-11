@@ -103,6 +103,14 @@ impl PortalAuthService {
     /// know about the request shape.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     #[tracing::instrument(skip_all)]
+    /// Post-code-review finding #5: `portal_origin_override` lets the
+    /// route handler pass the per-request origin (derived from the
+    /// browser Host header on portal-host builds) so the login-location
+    /// security link points at the tenant's own subdomain instead of
+    /// the single CLIENT_ORIGIN fallback. `None` falls back to
+    /// `self.portal_origin` for callers that do not have a request in
+    /// hand (tests, retries).
+    #[allow(clippy::too_many_arguments)]
     pub async fn login(
         &self,
         slug: &str,
@@ -112,6 +120,7 @@ impl PortalAuthService {
         recovery_code: Option<&str>,
         user_agent: Option<&str>,
         ip_address: Option<std::net::IpAddr>,
+        portal_origin_override: Option<&str>,
     ) -> AppResult<PortalLoginResponse> {
         let row: Option<(
             Uuid,
@@ -308,8 +317,15 @@ impl PortalAuthService {
         // Best-effort; a failure here never blocks the login. The
         // check no-ops when the feature is not fully configured
         // (missing geoip / mailer) or when the client IP is private.
-        self.check_login_location(id, tenant_id, &email, ip_address, user_agent)
-            .await;
+        self.check_login_location(
+            id,
+            tenant_id,
+            &email,
+            ip_address,
+            user_agent,
+            portal_origin_override,
+        )
+        .await;
 
         Ok(PortalLoginResponse {
             access_token,
@@ -386,6 +402,7 @@ impl PortalAuthService {
         email: &str,
         ip: Option<std::net::IpAddr>,
         user_agent: Option<&str>,
+        portal_origin_override: Option<&str>,
     ) {
         let Some(geoip) = self.geoip.as_ref() else {
             return;
@@ -439,13 +456,16 @@ impl PortalAuthService {
                         let ip = parsed.to_string();
                         let when = Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
                         let ua = user_agent.unwrap_or("unknown").to_string();
-                        let security_link = if self.portal_origin.is_empty() {
+                        // Post-code-review finding #5: prefer the
+                        // per-request override so a per-tenant subdomain
+                        // deploy links back at the caller's own portal.
+                        let origin = portal_origin_override
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| self.portal_origin.as_str());
+                        let security_link = if origin.is_empty() {
                             String::from("(portal)")
                         } else {
-                            format!(
-                                "{}/portal/settings/sessions",
-                                self.portal_origin.trim_end_matches('/')
-                            )
+                            format!("{}/portal/settings/sessions", origin.trim_end_matches('/'))
                         };
                         tokio::spawn(async move {
                             if let Err(e) = mailer
@@ -2082,11 +2102,20 @@ impl PortalAuthService {
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // Post-code-review finding #6: fold the COUNT into the SELECT
+        // via `COUNT(*) OVER()`. Each section previously ran two round-
+        // trips (SELECT + COUNT); every keystroke was 8 statements
+        // against tables that have no pg_trgm coverage (migration 113
+        // adds that). Now every section is one round-trip; the count
+        // comes back on every row (`row_count`) and we take it from
+        // the first row.
+        //
         // Tickets: number OR title OR description within the caller's
         // company.
-        let ticket_rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+        let ticket_rows: Vec<(Uuid, String, String, Option<String>, i64)> = sqlx::query_as(
             r#"
-            SELECT t.id, t.ticket_number, t.title, s.name
+            SELECT t.id, t.ticket_number, t.title, s.name,
+                   COUNT(*) OVER () AS row_count
             FROM tickets t
             JOIN ticket_statuses s ON s.id = t.status_id
             WHERE t.tenant_id = $1 AND t.company_id = $2
@@ -2101,56 +2130,35 @@ impl PortalAuthService {
         .bind(SECTION_LIMIT)
         .fetch_all(&mut *tx)
         .await?;
-        let tickets_total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::BIGINT
-            FROM tickets t
-            WHERE t.tenant_id = $1 AND t.company_id = $2
-              AND (t.ticket_number ILIKE $3 OR t.title ILIKE $3 OR t.description ILIKE $3)
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(&pattern)
-        .fetch_one(&mut *tx)
-        .await?;
+        let tickets_total: i64 = ticket_rows.first().map(|r| r.4).unwrap_or(0);
 
         // Invoices: number OR PO number (public reference) match.
-        let invoice_rows: Vec<(Uuid, String, String, Option<chrono::NaiveDate>)> = sqlx::query_as(
-            r#"
-            SELECT id, invoice_number, status, due_date
-            FROM invoices
-            WHERE tenant_id = $1 AND company_id = $2
-              AND (invoice_number ILIKE $3 OR po_number ILIKE $3)
-            ORDER BY invoice_date DESC
-            LIMIT $4
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(&pattern)
-        .bind(SECTION_LIMIT)
-        .fetch_all(&mut *tx)
-        .await?;
-        let invoices_total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::BIGINT
-            FROM invoices
-            WHERE tenant_id = $1 AND company_id = $2
-              AND (invoice_number ILIKE $3 OR po_number ILIKE $3)
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(&pattern)
-        .fetch_one(&mut *tx)
-        .await?;
+        let invoice_rows: Vec<(Uuid, String, String, Option<chrono::NaiveDate>, i64)> =
+            sqlx::query_as(
+                r#"
+                SELECT id, invoice_number, status, due_date,
+                       COUNT(*) OVER () AS row_count
+                FROM invoices
+                WHERE tenant_id = $1 AND company_id = $2
+                  AND (invoice_number ILIKE $3 OR po_number ILIKE $3)
+                ORDER BY invoice_date DESC
+                LIMIT $4
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .bind(&pattern)
+            .bind(SECTION_LIMIT)
+            .fetch_all(&mut *tx)
+            .await?;
+        let invoices_total: i64 = invoice_rows.first().map(|r| r.4).unwrap_or(0);
 
         // Quotes: title OR summary. Only issued-and-later statuses
         // (matches `list_quotes_for_company` scope).
-        let quote_rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+        let quote_rows: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
             r#"
-            SELECT id, title, status
+            SELECT id, title, status,
+                   COUNT(*) OVER () AS row_count
             FROM quotes
             WHERE tenant_id = $1 AND company_id = $2
               AND status IN ('sent', 'submitted', 'accepted', 'declined', 'expired', 'converted')
@@ -2165,27 +2173,15 @@ impl PortalAuthService {
         .bind(SECTION_LIMIT)
         .fetch_all(&mut *tx)
         .await?;
-        let quotes_total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::BIGINT
-            FROM quotes
-            WHERE tenant_id = $1 AND company_id = $2
-              AND status IN ('sent', 'submitted', 'accepted', 'declined', 'expired', 'converted')
-              AND (title ILIKE $3 OR summary ILIKE $3)
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(&pattern)
-        .fetch_one(&mut *tx)
-        .await?;
+        let quotes_total: i64 = quote_rows.first().map(|r| r.3).unwrap_or(0);
 
         // KB articles: title OR summary. Published visibility rules
         // mirror `list_kb`: public OR client_specific with the caller's
         // company id in `company_ids`.
-        let kb_rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+        let kb_rows: Vec<(Uuid, String, Option<String>, i64)> = sqlx::query_as(
             r#"
-            SELECT id, title, summary
+            SELECT id, title, summary,
+                   COUNT(*) OVER () AS row_count
             FROM kb_articles
             WHERE tenant_id = $1
               AND status = 'published'
@@ -2204,30 +2200,13 @@ impl PortalAuthService {
         .bind(SECTION_LIMIT)
         .fetch_all(&mut *tx)
         .await?;
-        let kb_total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::BIGINT
-            FROM kb_articles
-            WHERE tenant_id = $1
-              AND status = 'published'
-              AND (
-                  visibility = 'public'
-                  OR (visibility = 'client_specific' AND $2 = ANY(company_ids))
-              )
-              AND (title ILIKE $3 OR summary ILIKE $3 OR content ILIKE $3)
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(&pattern)
-        .fetch_one(&mut *tx)
-        .await?;
+        let kb_total: i64 = kb_rows.first().map(|r| r.3).unwrap_or(0);
 
         tx.commit().await?;
 
         let tickets: Vec<PortalSearchHit> = ticket_rows
             .into_iter()
-            .map(|(id, number, title, status_name)| PortalSearchHit {
+            .map(|(id, number, title, status_name, _)| PortalSearchHit {
                 id,
                 label: format!("#{number} {title}"),
                 secondary: status_name,
@@ -2235,7 +2214,7 @@ impl PortalAuthService {
             .collect();
         let invoices: Vec<PortalSearchHit> = invoice_rows
             .into_iter()
-            .map(|(id, number, status, due)| PortalSearchHit {
+            .map(|(id, number, status, due, _)| PortalSearchHit {
                 id,
                 label: number,
                 secondary: Some(match due {
@@ -2246,7 +2225,7 @@ impl PortalAuthService {
             .collect();
         let quotes: Vec<PortalSearchHit> = quote_rows
             .into_iter()
-            .map(|(id, title, status)| PortalSearchHit {
+            .map(|(id, title, status, _)| PortalSearchHit {
                 id,
                 label: title,
                 secondary: Some(status),
@@ -2254,7 +2233,7 @@ impl PortalAuthService {
             .collect();
         let kb_articles: Vec<PortalSearchHit> = kb_rows
             .into_iter()
-            .map(|(id, title, summary)| PortalSearchHit {
+            .map(|(id, title, summary, _)| PortalSearchHit {
                 id,
                 label: title,
                 secondary: summary,
@@ -3486,107 +3465,15 @@ struct IssuedRefreshToken {
     expires_at: DateTime<Utc>,
 }
 
-/// PMS-729 phase 2 H7: kept-out portal analogue of the agent-side
-/// `LoginLocationDecision` (auth/service.rs). Pure branch logic so the
-/// service method stays readable.
-#[derive(Debug, PartialEq, Eq)]
-enum LoginLocationDecision {
-    /// No prior country on record: store this one silently, no alert.
-    Record,
-    /// Same country as last time: do nothing.
-    Unchanged,
-    /// Country differs from last time: alert the contact, then store the new one.
-    Alert,
-}
-
-fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLocationDecision {
-    match previous {
-        None => LoginLocationDecision::Record,
-        Some(prev) if prev == current => LoginLocationDecision::Unchanged,
-        Some(_) => LoginLocationDecision::Alert,
-    }
-}
-
-/// PMS-729 phase 2 H7: private / loopback / link-local / unspecified /
-/// broadcast addresses can never map to a public country. Skip them so
-/// a request behind an mis-configured proxy (or dev) does not register
-/// as a country change. Same predicate the agent side uses.
-fn is_non_public_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-        }
-    }
-}
-
-#[cfg(test)]
-mod login_location_tests {
-    use super::{is_non_public_ip, login_location_decision, LoginLocationDecision};
-    use std::net::IpAddr;
-
-    #[test]
-    fn decision_records_on_first_login() {
-        assert_eq!(
-            login_location_decision(None, "US"),
-            LoginLocationDecision::Record
-        );
-    }
-
-    #[test]
-    fn decision_unchanged_on_same_country() {
-        assert_eq!(
-            login_location_decision(Some("GB"), "GB"),
-            LoginLocationDecision::Unchanged
-        );
-    }
-
-    #[test]
-    fn decision_alerts_on_country_change() {
-        assert_eq!(
-            login_location_decision(Some("US"), "FR"),
-            LoginLocationDecision::Alert
-        );
-    }
-
-    #[test]
-    fn public_ipv4_is_geolocatable() {
-        let ip: IpAddr = "203.0.113.7".parse().unwrap();
-        assert!(!is_non_public_ip(&ip));
-    }
-
-    #[test]
-    fn private_ipv4_ranges_are_skipped() {
-        for ip in [
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.1.1",
-            "127.0.0.1",
-            "169.254.0.1",
-            "0.0.0.0",
-        ] {
-            let ip: IpAddr = ip.parse().unwrap();
-            assert!(is_non_public_ip(&ip), "{ip} should be non-public");
-        }
-    }
-
-    #[test]
-    fn loopback_and_link_local_ipv6_are_skipped() {
-        for ip in ["::1", "fe80::1", "fc00::1", "::"] {
-            let ip: IpAddr = ip.parse().unwrap();
-            assert!(is_non_public_ip(&ip), "{ip} should be non-public");
-        }
-    }
-}
+// Post-code-review finding #10: the portal `is_non_public_ip`,
+// `login_location_decision`, and `LoginLocationDecision` moved to the
+// shared `crate::utils::login_location` module. Both the agent and
+// portal login paths consume the same helpers now, so a future change
+// to the predicate (finding #9's IPv4-mapped-v6 fix, for example)
+// lands once and applies to both surfaces.
+use crate::utils::login_location::{
+    is_non_public_ip, login_location_decision, LoginLocationDecision,
+};
 
 /// PMS-729 phase 2 H4: hex-SHA-256 of the canonical recovery-code form
 /// so the hash fits a `TEXT[]` column (postgres has no `BYTEA[]` bind

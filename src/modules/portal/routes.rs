@@ -19,7 +19,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::captcha::{TurnstileError, TurnstileGate};
-use super::host_tenant::{resolve_slug, PortalHostConfig};
+use super::host_tenant::{portal_origin_from_host, resolve_slug, PortalHostConfig};
 use super::middleware::{
     portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth, RequirePortalSession,
 };
@@ -323,6 +323,19 @@ async fn login(
     }
 
     let ua = user_agent_from(&headers);
+    // Post-code-review finding #5: derive the origin from the request
+    // so the login-location alert email's "review sessions" link points
+    // at the tenant's own subdomain on per-tenant deploys.
+    let per_request_origin = portal_origin_from_host(
+        &state.host_config,
+        headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+        &state.portal_origin,
+    );
     match state
         .service
         .login(
@@ -333,6 +346,7 @@ async fn login(
             request.recovery_code.as_deref(),
             ua.as_deref(),
             Some(addr.ip()),
+            Some(&per_request_origin),
         )
         .await
     {
@@ -450,9 +464,24 @@ async fn forgot_password(
     // the CLIENT_ORIGIN default or a portal-host-derived value per
     // PMS-729). Best-effort: a send failure does NOT propagate to the
     // client (still 204) so enumeration resistance holds.
+    // Post-code-review finding #5: build the reset link off the
+    // request's own host when the portal-host feature is on, so
+    // per-tenant subdomain deploys email a link at
+    // `{slug}.client.<apex>` instead of the single CLIENT_ORIGIN
+    // fallback (which does not resolve to a tenant on those hosts).
+    let per_request_origin = portal_origin_from_host(
+        &state.host_config,
+        headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+        &state.portal_origin,
+    );
     let link = format!(
         "{}/portal/reset-password?token={}",
-        state.portal_origin.trim_end_matches('/'),
+        per_request_origin.trim_end_matches('/'),
         issue.token
     );
     if let Err(e) = state
@@ -1129,6 +1158,7 @@ async fn pay_invoice(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
     Path(invoice_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> AppResult<Json<PayInvoiceResponse>> {
     // SAFETY (PMS-285): `contact.tenant()` wraps a verified portal-JWT claim,
     // the caller's own authenticated tenant. Portal runs on contact sessions,
@@ -1142,7 +1172,21 @@ async fn pay_invoice(
         return Err(AppError::NotFound("Invoice".to_string()));
     }
 
-    let base = state.portal_origin.trim_end_matches('/');
+    // Post-code-review finding #5: same per-request origin derivation
+    // as forgot_password. A per-tenant subdomain deploy needs Stripe to
+    // return the customer to `{slug}.client.<apex>/portal/invoices/...`
+    // not the single CLIENT_ORIGIN fallback.
+    let per_request_origin = portal_origin_from_host(
+        &state.host_config,
+        headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+        &state.portal_origin,
+    );
+    let base = per_request_origin.trim_end_matches('/');
     let success_url = format!("{base}/portal/invoices/{invoice_id}?paid=1");
     let cancel_url = format!("{base}/portal/invoices/{invoice_id}");
     let session = state
