@@ -2709,6 +2709,503 @@ impl PortalAuthService {
         })
     }
 
+    /// PMS-729 phase 2 §7 slice D / I13: list every portal-enabled
+    /// contact at the caller's own company. Returns id + name + email
+    /// + `is_you` flag; nothing else. Non-portal contacts (i.e.
+    /// `is_portal_user = FALSE`) stay hidden so a roster does not
+    /// leak "person we billed once six years ago".
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, contact_id = %caller_id))]
+    pub async fn list_company_contacts(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        caller_id: Uuid,
+    ) -> AppResult<Vec<PortalCompanyContact>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT id, first_name, last_name, email
+            FROM contacts
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND is_portal_user = TRUE
+            ORDER BY last_name ASC, first_name ASC, email ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, first_name, last_name, email)| PortalCompanyContact {
+                is_you: id == caller_id,
+                id,
+                first_name,
+                last_name,
+                email,
+            })
+            .collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice D / I7: list the caller's pending
+    /// approvals. Rows scoped by (tenant, approver_contact_id) so a
+    /// sibling contact's queue is invisible even inside the same
+    /// company. The `label` column joins the ticket table for the
+    /// phase-1 target so the SPA renders "Ticket #T-1234: Server
+    /// down" without a second fetch; other polymorphic targets fall
+    /// back to `None` (the SPA renders the raw entity id).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn list_portal_approvals(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<PortalApproval>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            String,
+            Uuid,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            DateTime<Utc>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT a.id, a.target, a.entity_id,
+                   t.ticket_number, t.title,
+                   a.notes, a.status, a.requested_at,
+                   a.decision_notes, a.decided_at
+            FROM ticket_approvals a
+            LEFT JOIN tickets t
+              ON t.id = a.entity_id AND a.target = 'ticket'
+            WHERE a.tenant_id = $1
+              AND a.approver_contact_id = $2
+            ORDER BY
+              CASE WHEN a.status = 'pending' THEN 0 ELSE 1 END,
+              a.requested_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    target,
+                    entity_id,
+                    ticket_number,
+                    ticket_title,
+                    notes,
+                    status,
+                    requested_at,
+                    decision_notes,
+                    decided_at,
+                )| {
+                    let label = match (ticket_number, ticket_title) {
+                        (Some(num), Some(title)) => Some(format!("Ticket #{num}: {title}")),
+                        (Some(num), None) => Some(format!("Ticket #{num}")),
+                        _ => None,
+                    };
+                    PortalApproval {
+                        id,
+                        target,
+                        entity_id,
+                        label,
+                        notes,
+                        status,
+                        requested_at,
+                        decision_notes,
+                        decided_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice D / I7: decide a portal approval.
+    /// `decision` must be `"approve"` or `"reject"`; anything else is
+    /// a 400. The row must belong to the caller as approver_contact_id
+    /// AND still be pending; a repeated decide against an already-
+    /// decided row is a 409 (the decision is not idempotent because
+    /// re-deciding would blow away the earlier decision_notes).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id, approval_id = %approval_id))]
+    pub async fn decide_portal_approval(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+        approval_id: Uuid,
+        decision: &str,
+        decision_notes: Option<&str>,
+    ) -> AppResult<()> {
+        let new_status = match decision {
+            "approve" => "approved",
+            "reject" => "rejected",
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "decision must be 'approve' or 'reject', got '{other}'"
+                )));
+            }
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Preflight: locate the row + its current status so a 4xx is
+        // meaningful. The lookup is scoped by contact so a cross-
+        // contact id surfaces as 404.
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT status
+            FROM ticket_approvals
+            WHERE tenant_id = $1
+              AND approver_contact_id = $2
+              AND id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(approval_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((current_status,)) = row else {
+            tx.commit().await?;
+            return Err(AppError::NotFound("Approval".to_string()));
+        };
+        if current_status != "pending" {
+            tx.commit().await?;
+            return Err(AppError::Conflict(format!(
+                "This approval has already been {current_status} and cannot be decided again. A pending approval"
+            )));
+        }
+        sqlx::query(
+            r#"
+            UPDATE ticket_approvals
+            SET status = $1,
+                decision_notes = $2,
+                decided_at = NOW()
+            WHERE tenant_id = $3
+              AND approver_contact_id = $4
+              AND id = $5
+            "#,
+        )
+        .bind(new_status)
+        .bind(decision_notes)
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(approval_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        // Write an audit event so the agent side sees who decided.
+        let event_type = format!("portal.approval_{new_status}");
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id.get(),
+            Some(contact_id),
+            AuditAction::Update,
+            &event_type,
+            Some(approval_id.to_string()),
+            None,
+        )
+        .await;
+
+        Ok(())
+    }
+
+    /// PMS-729 phase 2 §7 slice D / I15: request a data-export job.
+    /// Inserts a `portal_exports` row in `queued` status and returns
+    /// its id. The worker (a follow-up commit) picks the row up,
+    /// builds the JSON bundle, and stamps `signed_url` + `ready_at` +
+    /// `expires_at`. Rate limiting is deferred to that worker's
+    /// concurrency cap; this route inserts the record and returns.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, contact_id = %contact_id))]
+    pub async fn request_portal_export(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<PortalExportJob> {
+        let id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let (id, requested_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+            r#"
+            INSERT INTO portal_exports (id, tenant_id, contact_id, company_id, status)
+            VALUES ($1, $2, $3, $4, 'queued')
+            RETURNING id, requested_at
+            "#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PortalExportJob {
+            id,
+            status: "queued".to_string(),
+            requested_at,
+            ready_at: None,
+            expires_at: None,
+            signed_url: None,
+            error_message: None,
+        })
+    }
+
+    /// PMS-729 phase 2 §7 slice D / I15: poll a data-export job. Rows
+    /// are scoped to the caller so another contact cannot fetch a
+    /// sibling's bundle URL. Expired rows return 410 Gone via the
+    /// route handler (the service returns the row and the handler
+    /// checks the status).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id, job_id = %job_id))]
+    pub async fn get_portal_export(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+        job_id: Uuid,
+    ) -> AppResult<PortalExportJob> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            Uuid,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, status, requested_at, ready_at, expires_at,
+                   signed_url, error_message
+            FROM portal_exports
+            WHERE tenant_id = $1 AND contact_id = $2 AND id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some((id, status, requested_at, ready_at, expires_at, signed_url, error_message)) = row
+        else {
+            return Err(AppError::NotFound("Export job".to_string()));
+        };
+        Ok(PortalExportJob {
+            id,
+            status,
+            requested_at,
+            ready_at,
+            expires_at,
+            signed_url,
+            error_message,
+        })
+    }
+
+    /// PMS-729 phase 2 §7 slice D / I18: list every delegation the
+    /// caller has granted. Only live (non-revoked) rows surface;
+    /// revoked delegations are kept server-side for audit but never
+    /// reach the portal roster.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn list_portal_delegations(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<PortalDelegation>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT d.id, d.delegatee_contact_id,
+                   c.first_name, c.last_name, c.email,
+                   d.scope, d.granted_at, d.expires_at, d.revoked_at
+            FROM portal_delegations d
+            JOIN contacts c ON c.id = d.delegatee_contact_id
+            WHERE d.tenant_id = $1
+              AND d.delegator_contact_id = $2
+              AND d.revoked_at IS NULL
+            ORDER BY d.granted_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    delegatee_contact_id,
+                    first_name,
+                    last_name,
+                    email,
+                    scope,
+                    granted_at,
+                    expires_at,
+                    revoked_at,
+                )| PortalDelegation {
+                    id,
+                    delegatee_contact_id,
+                    delegatee_name: format!("{first_name} {last_name}"),
+                    delegatee_email: email,
+                    scope,
+                    granted_at,
+                    expires_at,
+                    revoked_at,
+                },
+            )
+            .collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice D / I18: grant a delegation. Delegatee
+    /// must be a portal-enabled contact under the delegator's own
+    /// company; anything else is a 400 (the SPA picker only lists
+    /// same-company contacts, but a hand-typed request could ask for
+    /// any id).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, delegator = %delegator_id, delegatee = %delegatee_id))]
+    pub async fn grant_portal_delegation(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        delegator_id: Uuid,
+        delegatee_id: Uuid,
+        scope: serde_json::Value,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> AppResult<PortalDelegation> {
+        if delegator_id == delegatee_id {
+            return Err(AppError::BadRequest(
+                "You cannot delegate to yourself.".to_string(),
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Delegatee must live in the same company AND be portal-enabled.
+        let ok: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM contacts
+                WHERE tenant_id = $1 AND company_id = $2 AND id = $3
+                  AND is_portal_user = TRUE
+            )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(delegatee_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !ok {
+            tx.commit().await?;
+            return Err(AppError::BadRequest(
+                "The delegatee must be a portal contact at your company.".to_string(),
+            ));
+        }
+        let id = Uuid::new_v4();
+        let (id, granted_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+            r#"
+            INSERT INTO portal_delegations
+                (id, tenant_id, delegator_contact_id, delegatee_contact_id, scope, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, granted_at
+            "#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(delegator_id)
+        .bind(delegatee_id)
+        .bind(&scope)
+        .bind(expires_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        // Read back the delegatee metadata for the response so the SPA
+        // renders the newly-granted row without a second fetch.
+        let (first_name, last_name, email): (String, String, String) =
+            sqlx::query_as("SELECT first_name, last_name, email FROM contacts WHERE id = $1")
+                .bind(delegatee_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(PortalDelegation {
+            id,
+            delegatee_contact_id: delegatee_id,
+            delegatee_name: format!("{first_name} {last_name}"),
+            delegatee_email: email,
+            scope,
+            granted_at,
+            expires_at,
+            revoked_at: None,
+        })
+    }
+
+    /// PMS-729 phase 2 §7 slice D / I18: revoke a delegation. Only
+    /// the delegator can revoke their own row; a cross-delegator id
+    /// returns 404. Idempotent: re-revoking a revoked row is a 204
+    /// (matches the mark-read posture).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, delegator = %delegator_id, delegation_id = %delegation_id))]
+    pub async fn revoke_portal_delegation(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        delegator_id: Uuid,
+        delegation_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM portal_delegations
+                WHERE tenant_id = $1
+                  AND delegator_contact_id = $2
+                  AND id = $3
+            )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(delegator_id)
+        .bind(delegation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            tx.commit().await?;
+            return Err(AppError::NotFound("Delegation".to_string()));
+        }
+        sqlx::query(
+            r#"
+            UPDATE portal_delegations
+            SET revoked_at = COALESCE(revoked_at, NOW())
+            WHERE tenant_id = $1
+              AND delegator_contact_id = $2
+              AND id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(delegator_id)
+        .bind(delegation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// PMS-729 phase 2 §7 slice B / I12: mark a portal inbox row as
     /// read. Contact-scoped: another company's contact (or an agent
     /// user row) cannot mark this row read even if they guess the id.

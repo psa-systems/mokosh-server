@@ -26,13 +26,15 @@ use super::middleware::{
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
-    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalAsset,
-    PortalChangePasswordRequest, PortalContract, PortalDashboardResponse,
-    PortalForgotPasswordRequest, PortalHostHint, PortalInvoicePaymentsResponse, PortalLoginRequest,
-    PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
-    PortalMfaSetupResponse, PortalNotificationsResponse, PortalProject, PortalProjectDetail,
-    PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse, PortalSessionResponse,
-    PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry, ResolvedTenant,
+    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalApproval,
+    PortalApprovalDecisionRequest, PortalAsset, PortalChangePasswordRequest, PortalCompanyContact,
+    PortalContract, PortalDashboardResponse, PortalDelegation, PortalDelegationGrantRequest,
+    PortalExportJob, PortalForgotPasswordRequest, PortalHostHint, PortalInvoicePaymentsResponse,
+    PortalLoginRequest, PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest,
+    PortalMfaEnableResponse, PortalMfaSetupResponse, PortalNotificationsResponse, PortalProject,
+    PortalProjectDetail, PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse,
+    PortalSessionResponse, PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry,
+    ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -225,6 +227,23 @@ pub fn portal_routes(
         .route("/time-entries", get(list_portal_time_entries))
         .route("/projects", get(list_portal_projects))
         .route("/projects/{project_id}", get(get_portal_project))
+        // PMS-729 phase 2 §7 slice D.
+        .route("/approvals", get(list_portal_approvals))
+        .route(
+            "/approvals/{approval_id}/decide",
+            post(decide_portal_approval),
+        )
+        .route("/company/contacts", get(list_company_contacts))
+        .route(
+            "/company/delegations",
+            get(list_portal_delegations).post(grant_portal_delegation),
+        )
+        .route(
+            "/company/delegations/{delegation_id}",
+            delete(revoke_portal_delegation),
+        )
+        .route("/export", post(request_portal_export))
+        .route("/export/{job_id}", get(get_portal_export))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -783,6 +802,132 @@ async fn get_portal_project(
             .get_portal_project(contact.tenant(), contact.company_id, project_id)
             .await?,
     ))
+}
+
+// --------- Slice D handlers ---------
+
+async fn list_portal_approvals(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalApproval>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_approvals(contact.tenant(), contact.id)
+            .await?,
+    ))
+}
+
+async fn decide_portal_approval(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(approval_id): Path<Uuid>,
+    Json(body): Json<PortalApprovalDecisionRequest>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .decide_portal_approval(
+            contact.tenant(),
+            contact.id,
+            approval_id,
+            &body.decision,
+            body.decision_notes.as_deref(),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_company_contacts(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalCompanyContact>>> {
+    Ok(Json(
+        state
+            .service
+            .list_company_contacts(contact.tenant(), contact.company_id, contact.id)
+            .await?,
+    ))
+}
+
+async fn list_portal_delegations(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalDelegation>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_delegations(contact.tenant(), contact.id)
+            .await?,
+    ))
+}
+
+async fn grant_portal_delegation(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Json(body): Json<PortalDelegationGrantRequest>,
+) -> AppResult<(StatusCode, Json<PortalDelegation>)> {
+    let scope = if body.scope.is_null() {
+        serde_json::json!({})
+    } else {
+        body.scope
+    };
+    let d = state
+        .service
+        .grant_portal_delegation(
+            contact.tenant(),
+            contact.company_id,
+            contact.id,
+            body.delegatee_contact_id,
+            scope,
+            body.expires_at,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(d)))
+}
+
+async fn revoke_portal_delegation(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(delegation_id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .revoke_portal_delegation(contact.tenant(), contact.id, delegation_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn request_portal_export(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<(StatusCode, Json<PortalExportJob>)> {
+    let job = state
+        .service
+        .request_portal_export(contact.tenant(), contact.company_id, contact.id)
+        .await?;
+    Ok((StatusCode::CREATED, Json(job)))
+}
+
+async fn get_portal_export(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(job_id): Path<Uuid>,
+) -> AppResult<Response> {
+    let mut job = state
+        .service
+        .get_portal_export(contact.tenant(), contact.id, job_id)
+        .await?;
+    // PMS-729 phase 2 §7 slice D / I15: bundle URLs expire at D19's
+    // 7-day mark. Once past that, blank the URL client-side and mark
+    // the status so the SPA can render "expired, please re-request".
+    // The row stays server-side for audit.
+    if let Some(exp) = job.expires_at {
+        if exp <= chrono::Utc::now() {
+            job.status = "expired".to_string();
+            job.signed_url = None;
+        }
+    }
+    Ok((StatusCode::OK, Json(job)).into_response())
 }
 
 /// PMS-729 phase 2 §7 slice B / I12: portal inbox list. Contact-scoped

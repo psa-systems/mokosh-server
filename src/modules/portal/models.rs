@@ -782,3 +782,109 @@ pub struct PortalProjectDetail {
     pub project: PortalProject,
     pub phases: Vec<PortalProjectPhase>,
 }
+
+// PMS-729 phase 2 §7 slice D / I13: multi-contact company view -------------
+
+/// One sibling portal contact as `GET /portal/company/contacts` returns
+/// them. Deliberately narrow: name + email + a boolean flag telling the
+/// SPA which row is the caller. No phone, no title, no notes, no
+/// activity - other people in the same company do not need those on a
+/// portal roster.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalCompanyContact {
+    pub id: Uuid,
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+    /// `true` for the currently-authenticated contact. Lets the SPA
+    /// highlight "this is you" and hide the "invite" affordance next
+    /// to the caller's own row.
+    pub is_you: bool,
+}
+
+// PMS-729 phase 2 §7 slice D / I7: approvals ------------------------------
+
+/// One approval assigned to the caller. Mirrors the customer-visible
+/// subset of `ticket_approvals`: the entity kind + id, a title, the
+/// asking notes, requested_at, and the current status. Internal
+/// requester id and role approver context are dropped.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalApproval {
+    pub id: Uuid,
+    pub target: String,
+    pub entity_id: Uuid,
+    /// A short label the SPA renders in the list ("Ticket #T-1234:
+    /// Server down"). Cheap to derive server-side by joining tickets
+    /// (the phase-1 target); other polymorphic targets fall back to
+    /// the raw entity id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub status: String,
+    pub requested_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
+/// `POST /portal/approvals/{id}/decide` request body. `decision` is
+/// the discriminant; `decision_notes` is optional but encouraged.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PortalApprovalDecisionRequest {
+    pub decision: String,
+    #[serde(default)]
+    pub decision_notes: Option<String>,
+}
+
+// PMS-729 phase 2 §7 slice D / I15: data export ---------------------------
+
+/// One export job as `POST /portal/export` or `GET /portal/export/{id}`
+/// returns it. `signed_url` is populated only after the worker finishes
+/// (`status = 'ready'`) and blanks out again once `expires_at` passes
+/// (the worker or the polling route also updates `status = 'expired'`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalExportJob {
+    pub id: Uuid,
+    pub status: String,
+    pub requested_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+// PMS-729 phase 2 §7 slice D / I18: delegation ----------------------------
+
+/// One delegation as the portal returns it. Scope is echoed back
+/// verbatim so the SPA renders the checkbox row per key it knows.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalDelegation {
+    pub id: Uuid,
+    pub delegatee_contact_id: Uuid,
+    pub delegatee_name: String,
+    pub delegatee_email: String,
+    pub scope: serde_json::Value,
+    pub granted_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// `POST /portal/company/delegations` request body. `scope` is an
+/// opaque JSON object; the server does not validate its shape today
+/// (the SPA controls the key set).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PortalDelegationGrantRequest {
+    pub delegatee_contact_id: Uuid,
+    #[serde(default)]
+    pub scope: serde_json::Value,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+}
