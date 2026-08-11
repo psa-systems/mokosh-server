@@ -11,6 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 use validator::Validate;
 
+use super::drafts::{FormDraftResponse, UpsertFormDraftRequest};
 use super::models::{
     CreateFormDefinitionRequest, FormDefinitionResponse, FormSubmissionResponse,
     IssueRequestLinkRequest, RequestLinkResponse, SubmitFormRequest, UpdateFormDefinitionRequest,
@@ -42,6 +43,9 @@ pub fn forms_routes(service: FormsService, app_url: String) -> Router {
     };
     Router::new()
         .route("/forms", get(list).post(create))
+        // PMS-759: before `/forms/{id}`, so `drafts` is not parsed as a form id.
+        .route("/forms/drafts", get(list_drafts).put(upsert_draft))
+        .route("/forms/drafts/{id}", axum::routing::delete(delete_draft))
         .route("/forms/{id}", get(get_one).patch(update).delete(delete_one))
         .route(
             "/forms/{id}/submissions",
@@ -86,7 +90,15 @@ async fn create(
     Json(body): Json<CreateFormDefinitionRequest>,
 ) -> AppResult<Json<FormDefinitionResponse>> {
     body.validate()?;
-    Ok(Json(s.service.create(u.tenant(), u.id, body).await?))
+    let created = s.service.create(u.tenant(), u.id, body).await?;
+    // PMS-759: the work is on the server now, so the "new form" draft has
+    // nothing left to protect. Cleared here rather than left to the SPA: a
+    // draft exists to survive the browser going away, so it cannot depend on
+    // the browser to tidy up.
+    s.service
+        .clear_form_draft_after_save(u.tenant(), u.id, None)
+        .await;
+    Ok(Json(created))
 }
 
 async fn update(
@@ -96,7 +108,11 @@ async fn update(
     Json(body): Json<UpdateFormDefinitionRequest>,
 ) -> AppResult<Json<FormDefinitionResponse>> {
     body.validate()?;
-    Ok(Json(s.service.update(u.tenant(), id, body).await?))
+    let updated = s.service.update(u.tenant(), id, body).await?;
+    s.service
+        .clear_form_draft_after_save(u.tenant(), u.id, Some(id))
+        .await;
+    Ok(Json(updated))
 }
 
 async fn delete_one(
@@ -105,6 +121,35 @@ async fn delete_one(
     Path(id): Path<Uuid>,
 ) -> AppResult<axum::http::StatusCode> {
     s.service.delete(u.tenant(), id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// PMS-759: the caller's own drafts. Admin-gated to match `create` / `update`:
+/// a draft is a half-written definition, and the people who can author one are
+/// the people who can hold one.
+async fn list_drafts(
+    State(s): State<FormsRouterState>,
+    RequireAdminUser(u): RequireAdminUser,
+) -> AppResult<Json<Vec<FormDraftResponse>>> {
+    Ok(Json(s.service.list_form_drafts(u.tenant(), u.id).await?))
+}
+
+async fn upsert_draft(
+    State(s): State<FormsRouterState>,
+    RequireAdminUser(u): RequireAdminUser,
+    Json(body): Json<UpsertFormDraftRequest>,
+) -> AppResult<Json<FormDraftResponse>> {
+    Ok(Json(
+        s.service.upsert_form_draft(u.tenant(), u.id, &body).await?,
+    ))
+}
+
+async fn delete_draft(
+    State(s): State<FormsRouterState>,
+    RequireAdminUser(u): RequireAdminUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<axum::http::StatusCode> {
+    s.service.delete_form_draft(u.tenant(), u.id, id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
