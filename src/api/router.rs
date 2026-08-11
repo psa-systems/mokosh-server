@@ -31,7 +31,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
-use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
+use crate::modules::forms::{forms_routes, portal_form_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
@@ -490,6 +490,18 @@ pub fn create_api_router(
         .merge(portal_attachment_routes(
             AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
             portal_attachment_auth_service,
+        ))
+        // PMS-729 phase 2 §7 slice B / I8: authenticated portal form
+        // list / detail / submit. The middleware is layered inside the
+        // builder for the same reason `portal_attachment_routes` does
+        // (a merged sub-router does not inherit the parent's layers).
+        .merge(portal_form_routes(
+            FormsService::with_request_links(
+                db.clone(),
+                notifications_service.clone(),
+                TicketService::new(db.clone()),
+            ),
+            PortalAuthService::new(db.clone(), jwt_secret.clone()),
         ))
         // PMS-298: same envelope normalization for the portal surface.
         .layer(middleware::from_fn(

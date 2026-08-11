@@ -407,7 +407,7 @@ impl FormsService {
 /// field in display order. Falls back to the company-agnostic form name alone
 /// when the form has no text field, which keeps the title deterministic rather
 /// than guessing at semantics the definition does not declare.
-fn summarise(
+pub(super) fn summarise(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
@@ -426,7 +426,7 @@ fn summarise(
 /// Render the answers as the ticket description, in the form's own field
 /// order and using its labels, so whoever works the ticket reads what the
 /// client saw rather than raw payload keys.
-fn render_answers(
+pub(super) fn render_answers(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
