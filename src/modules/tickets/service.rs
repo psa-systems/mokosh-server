@@ -969,9 +969,31 @@ impl TicketService {
             return;
         };
 
+        // PMS-761: the recipient is a client contact, so the message says who
+        // is writing to them and how to ask about it. The subject is left
+        // alone: it is the thread key for a ticket the client already
+        // associates with this MSP, unlike a quote or an invoice, which arrive
+        // cold and name the organisation in the subject line too.
+        let org = match crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await {
+            Ok(org) => org,
+            Err(e) => {
+                tracing::warn!(?e, %ticket_id, "organisation identity unreadable; note email not sent");
+                return;
+            }
+        };
+        let contact_line = org.contact_line("Questions about this ticket?", None);
         let subject = format!("[{ticket_number}] {title}");
-        let body =
-            format!("A new update has been added to ticket {ticket_number}:\n\n{content}\n",);
+        // This wording is a second copy of the `ticket.note_added` template
+        // (migration 104), reachable only by the no-dispatcher fallback below.
+        // PMS-700 removed exactly this duplication for the auth emails and
+        // `scripts/check-no-duplicate-mail-copy.nu` guards their phrases; this
+        // one survives because the fallback has no template to read. Change one
+        // and change the other, or which document a client receives depends on
+        // how the service was constructed.
+        let body = format!(
+            "{} has added an update to ticket {ticket_number}:\n\n{content}\n\n{contact_line}\n",
+            org.name()
+        );
 
         // Prefer the notifications dispatcher so the row is durable
         // and the worker retries on transient SMTP failures. Fall
@@ -984,6 +1006,12 @@ impl TicketService {
                     "ticket_number": ticket_number,
                     "ticket_title": title,
                     "content": content,
+                    // PMS-761 / migration 104. Supplied unconditionally:
+                    // `render_template` leaves an unresolved key as literal
+                    // braces in the delivered message, so a key that a
+                    // template might reference has to always have a value.
+                    "org_name": org.name(),
+                    "contact_line": contact_line,
                 });
                 notify
                     .dispatch(tenant_id, "ticket.note_added", &context)

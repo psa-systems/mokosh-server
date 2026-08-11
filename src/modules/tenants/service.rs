@@ -1088,7 +1088,15 @@ impl TenantService {
                                  -- here on would silently send no request-form
                                  -- link email at all, since the dispatcher is
                                  -- the only delivery path (migration 097).
-                                 'forms.request_link')
+                                 'forms.request_link',
+                                 -- PMS-761: seeded for the default tenant by
+                                 -- migration 021 and never copied, so the
+                                 -- public ticket-note email has been fanning
+                                 -- out to zero recipients for every real
+                                 -- tenant while the note row was still marked
+                                 -- sent. Migration 104 backfills the tenants
+                                 -- created before this line existed.
+                                 'ticket.note_added')
             "#,
         )
         .bind(new_tenant_id)
@@ -1114,7 +1122,13 @@ impl TenantService {
              AND nt.channel_type = ot.channel_type
             WHERE r.tenant_id = $2
               AND r.event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached',
-                                   'auth.password_reset', 'auth.welcome')
+                                   'auth.password_reset', 'auth.welcome',
+                                   -- PMS-761: the two client-facing events.
+                                   -- Their templates were copied above and
+                                   -- their rules were not, and `dispatch`
+                                   -- iterates RULES: a template with no rule
+                                   -- is a message that is never sent.
+                                   'forms.request_link', 'ticket.note_added')
             "#,
         )
         .bind(new_tenant_id)
