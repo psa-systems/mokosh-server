@@ -2216,6 +2216,135 @@ impl PortalAuthService {
             counts,
         })
     }
+
+    /// PMS-729 phase 2 §7 slice B / I12: portal notifications inbox.
+    /// Returns the newest 50 `in_app` rows scoped to the caller, plus a
+    /// separate unread count so the SPA renders the top-bar badge
+    /// without walking the row list.
+    ///
+    /// Scoping is by (tenant, contact_id): a row without a contact_id
+    /// belongs to a `users` recipient and never surfaces here. RLS on
+    /// the notifications table already enforces the tenant scope; the
+    /// contact filter guarantees a cross-contact leak within the same
+    /// tenant is impossible.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn list_portal_inbox(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<PortalNotificationsResponse> {
+        const PORTAL_INBOX_LIMIT: i64 = 50;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(
+            Uuid,
+            Option<String>,
+            String,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, subject, body, read_at, created_at
+            FROM notifications
+            WHERE tenant_id = $1
+              AND contact_id = $2
+              AND channel_type = 'in_app'
+            ORDER BY created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(PORTAL_INBOX_LIMIT)
+        .fetch_all(&mut *tx)
+        .await?;
+        let (unread_count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM notifications
+            WHERE tenant_id = $1
+              AND contact_id = $2
+              AND channel_type = 'in_app'
+              AND read_at IS NULL
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let notifications = rows
+            .into_iter()
+            .map(
+                |(id, subject, body, read_at, created_at)| PortalNotification {
+                    id,
+                    subject,
+                    body,
+                    read_at,
+                    created_at,
+                },
+            )
+            .collect();
+        Ok(PortalNotificationsResponse {
+            notifications,
+            unread_count,
+        })
+    }
+
+    /// PMS-729 phase 2 §7 slice B / I12: mark a portal inbox row as
+    /// read. Contact-scoped: another company's contact (or an agent
+    /// user row) cannot mark this row read even if they guess the id.
+    /// Idempotent - a re-mark leaves the earlier `read_at` intact.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id, notification_id = %notification_id))]
+    pub async fn mark_portal_notification_read(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+        notification_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE notifications
+            SET read_at = NOW()
+            WHERE tenant_id = $1
+              AND contact_id = $2
+              AND id = $3
+              AND read_at IS NULL
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(notification_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        // Re-fetch to distinguish "already read" (idempotent success) from
+        // "does not exist / cross-contact" (404).
+        if updated == 0 {
+            let exists: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM notifications
+                    WHERE tenant_id = $1 AND contact_id = $2 AND id = $3
+                )
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .bind(notification_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            if !exists {
+                return Err(AppError::NotFound("Notification".to_string()));
+            }
+            // Already marked: idempotent success, no error.
+            return Ok(());
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// PMS-729 phase 2 H5: bridge the shared [`password_policy`] error

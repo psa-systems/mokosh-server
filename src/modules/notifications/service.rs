@@ -838,6 +838,16 @@ impl NotificationsService {
             .get("recipient_email")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // PMS-729 phase 2 §7 slice B / I12: portal-inbox recipient. When a
+        // caller stamps `recipient_contact_id` into the context, the
+        // dispatcher writes an in_app row against `notifications.contact_id`
+        // so the portal inbox picks it up. Rule-level contact recipients
+        // (a `contacts` array under `notification_rules.recipients` JSONB)
+        // are supported alongside the ctx key.
+        let ctx_contact_id: Option<Uuid> = context
+            .get("recipient_contact_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
 
         let mut fanout = 0u64;
         for rule in rules {
@@ -907,6 +917,27 @@ impl NotificationsService {
             if let Some(addr) = ctx_email.as_ref() {
                 if !emails.iter().any(|e| e == addr) {
                     emails.push(addr.clone());
+                }
+            }
+
+            // PMS-729 phase 2 §7 slice B / I12: contact recipients. Same
+            // shape as user_ids / emails; a rule can enumerate
+            // `contacts: [uuid, ...]` in its recipients JSONB, and the
+            // dispatch caller can add one more via
+            // `recipient_contact_id`. Deduplicated so a caller stamping
+            // the same contact twice does not double the fanout.
+            let mut contact_ids: Vec<Uuid> = rule
+                .recipients
+                .get("contacts")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect();
+            if let Some(cid) = ctx_contact_id {
+                if !contact_ids.contains(&cid) {
+                    contact_ids.push(cid);
                 }
             }
 
@@ -997,6 +1028,34 @@ impl NotificationsService {
                         .bind(channel)
                         .bind(template.id)
                         .bind(addr)
+                        .bind(&subject)
+                        .bind(&body)
+                        .bind(&body_html)
+                        .execute(&mut *tx)
+                        .await?;
+                        tx.commit().await?;
+                        fanout += 1;
+                    }
+                }
+
+                // PMS-729 phase 2 §7 slice B / I12: portal-inbox fanout.
+                // Only the `in_app` channel writes a contact row; email
+                // to a contact still routes through the caller-supplied
+                // `recipient_email` path so an SMTP send does not need
+                // to consult the contacts table here.
+                if channel == "in_app" {
+                    for cid in &contact_ids {
+                        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                        sqlx::query(
+                            r#"INSERT INTO notifications
+                               (tenant_id, contact_id, channel_type, template_id,
+                                subject, body, body_html, status)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
+                        )
+                        .bind(tenant_id)
+                        .bind(cid)
+                        .bind(channel)
+                        .bind(template.id)
                         .bind(&subject)
                         .bind(&body)
                         .bind(&body_html)

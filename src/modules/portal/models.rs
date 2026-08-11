@@ -639,3 +639,30 @@ pub struct PortalSearchCounts {
     pub quotes: i64,
     pub kb_articles: i64,
 }
+
+// PMS-729 phase 2 §7 slice B / I12: portal notifications inbox -------------
+
+/// One in-app notification a contact can see in their portal inbox.
+/// Payload is a stable projection over the shared `notifications` table:
+/// subject + body (rendered per template), `read_at`, `created_at`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalNotification {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// `GET /portal/notifications` response body. Returns the newest 50
+/// rows and a separate `unread_count` so the SPA can render the
+/// top-bar badge without walking the row list. Caps at 50 to keep the
+/// portal inbox from bloating; older rows still exist server-side for
+/// audit purposes but never surface here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalNotificationsResponse {
+    pub notifications: Vec<PortalNotification>,
+    pub unread_count: i64,
+}

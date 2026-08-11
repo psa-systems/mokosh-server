@@ -30,8 +30,9 @@ use super::{
     PortalChangePasswordRequest, PortalDashboardResponse, PortalForgotPasswordRequest,
     PortalHostHint, PortalInvoicePaymentsResponse, PortalLoginRequest, PortalLogoutRequest,
     PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
-    PortalMfaSetupResponse, PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse,
-    PortalSessionResponse, PortalSetupPasswordRequest, PortalTicketSlaResponse, ResolvedTenant,
+    PortalMfaSetupResponse, PortalNotificationsResponse, PortalRefreshRequest,
+    PortalResetPasswordRequest, PortalSearchResponse, PortalSessionResponse,
+    PortalSetupPasswordRequest, PortalTicketSlaResponse, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -208,6 +209,14 @@ pub fn portal_routes(
         // same public / client_specific visibility rules the list
         // endpoint uses. NEVER cross-company (D18).
         .route("/search", get(portal_search))
+        // PMS-729 phase 2 §7 slice B / I12: portal notifications inbox.
+        // Contact-scoped list of the newest 50 in_app rows with an
+        // unread count; PUT marks one read.
+        .route("/notifications", get(list_notifications))
+        .route(
+            "/notifications/{notification_id}/read",
+            put(mark_notification_read),
+        )
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -675,6 +684,34 @@ async fn get_ticket_sla(
         .ticket_sla(contact.tenant(), contact.company_id, ticket_id)
         .await?;
     Ok(Json(payload))
+}
+
+/// PMS-729 phase 2 §7 slice B / I12: portal inbox list. Contact-scoped
+/// via the JWT-verified `CurrentContact`; a caller cannot enumerate
+/// another contact's inbox.
+async fn list_notifications(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<PortalNotificationsResponse>> {
+    let payload = state
+        .service
+        .list_portal_inbox(contact.tenant(), contact.id)
+        .await?;
+    Ok(Json(payload))
+}
+
+/// PMS-729 phase 2 §7 slice B / I12: mark one portal inbox row read.
+/// Contact-scoped; a cross-contact id returns 404.
+async fn mark_notification_read(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(notification_id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .mark_portal_notification_read(contact.tenant(), contact.id, notification_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// PMS-729 phase 2 §7 slice A / I11: payment ledger for one of the
