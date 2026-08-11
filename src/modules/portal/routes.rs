@@ -27,10 +27,10 @@ use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact,
-    PortalChangePasswordRequest, PortalForgotPasswordRequest, PortalHostHint, PortalLoginRequest,
-    PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
-    PortalMfaSetupResponse, PortalRefreshRequest, PortalResetPasswordRequest,
-    PortalSessionResponse, PortalSetupPasswordRequest, ResolvedTenant,
+    PortalChangePasswordRequest, PortalDashboardResponse, PortalForgotPasswordRequest,
+    PortalHostHint, PortalLoginRequest, PortalLogoutRequest, PortalMfaDisableRequest,
+    PortalMfaEnableRequest, PortalMfaEnableResponse, PortalMfaSetupResponse, PortalRefreshRequest,
+    PortalResetPasswordRequest, PortalSessionResponse, PortalSetupPasswordRequest, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -184,6 +184,11 @@ pub fn portal_routes(
         .route("/quotes/{quote_id}/accept", post(accept_quote))
         .route("/quotes/{quote_id}/decline", post(decline_quote))
         .route("/kb", get(list_kb))
+        // PMS-729 phase 2 §7 slice A / I17: portal home dashboard.
+        // Aggregated counts + latest activity for the caller's company,
+        // scoped by the JWT-verified tenant + company. Fixed set of
+        // four cards per D17; no query params.
+        .route("/dashboard", get(get_dashboard))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -619,6 +624,22 @@ async fn host_hint(
         name: tenant.display_name,
         branding: tenant.branding,
     }))
+}
+
+/// PMS-729 phase 2 §7 slice A / I17: portal home dashboard payload.
+/// Delegates to `PortalAuthService::dashboard` which forces the company
+/// scope from the authenticated `CurrentContact`.
+async fn get_dashboard(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<PortalDashboardResponse>> {
+    // SAFETY (PMS-285): verified contact-JWT claims. `dashboard`
+    // pins every query to `contact.company_id`.
+    let payload = state
+        .service
+        .dashboard(contact.tenant(), contact.company_id)
+        .await?;
+    Ok(Json(payload))
 }
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {

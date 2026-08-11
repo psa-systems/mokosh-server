@@ -466,3 +466,60 @@ pub struct PortalSessionResponse {
     /// per-session delete).
     pub current: bool,
 }
+
+// PMS-729 phase 2 §7 slice A / I17: portal dashboard payload -----------------
+
+/// One row on the "Open tickets by priority" card. Includes the
+/// priority's own display metadata (name, color, sort_order) so the SPA
+/// can render an ordered list of chips without a second round-trip;
+/// zero-count priorities are emitted so the axis stays stable as the
+/// counts move over the day. Only OPEN tickets (`status.is_closed = false`)
+/// contribute to `count`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DashboardTicketPriorityBucket {
+    pub id: Uuid,
+    pub name: String,
+    pub color: String,
+    pub sort_order: i32,
+    pub count: i64,
+}
+
+/// The single "Next invoice due" card. Returns the earliest-due unpaid
+/// invoice for the contact's company, or `None` when there is nothing
+/// outstanding.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DashboardNextInvoiceDue {
+    pub id: Uuid,
+    pub invoice_number: String,
+    pub total: rust_decimal::Decimal,
+    pub balance_due: rust_decimal::Decimal,
+    pub due_date: chrono::NaiveDate,
+    pub currency: String,
+}
+
+/// One row on the "Recent activity" card. `kind` is a stable
+/// machine-readable tag (`"ticket"`, `"invoice"`, `"quote"`) so the SPA
+/// picks the right icon + link target without parsing the subject line;
+/// `entity_id` is what the SPA appends to the entity's list URL for the
+/// detail-view deep link.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DashboardRecentActivity {
+    pub kind: String,
+    pub entity_id: Uuid,
+    pub label: String,
+    pub summary: String,
+    pub at: DateTime<Utc>,
+}
+
+/// `GET /portal/dashboard` response body. D17 from the plan doc pins
+/// four cards for phase 2 (open tickets by priority, next invoice due,
+/// open quotes awaiting decision, recent activity); this DTO is the
+/// wire shape for all four. No pagination: the numbers are aggregate
+/// summaries and the activity feed caps at the last ten events.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalDashboardResponse {
+    pub tickets_by_priority: Vec<DashboardTicketPriorityBucket>,
+    pub next_invoice_due: Option<DashboardNextInvoiceDue>,
+    pub open_quotes_awaiting_decision: i64,
+    pub recent_activity: Vec<DashboardRecentActivity>,
+}

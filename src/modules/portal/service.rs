@@ -1645,6 +1645,169 @@ impl PortalAuthService {
         .filter(|s| s.chars().count() >= 3)
         .collect())
     }
+
+    /// PMS-729 phase 2 §7 slice A / I17: aggregate the four dashboard
+    /// cards D17 pins for phase 2 (open tickets by priority, next
+    /// invoice due, open quotes awaiting decision, recent activity).
+    /// Every query is scoped by tenant AND `company_id` so a portal
+    /// caller only ever sees their own company's data; every cross-
+    /// company row is silently absent (never a 403 or a leaked count).
+    ///
+    /// Returns `PortalDashboardResponse`. Empty sets for a company with
+    /// no tickets / invoices / quotes still return the zero-filled
+    /// priority axis so the SPA layout stays stable.
+    ///
+    /// SAFETY (PMS-261 / PMS-285): every query runs inside
+    /// `begin_with_tenant` and pins `company_id` to the caller's
+    /// authenticated value. The dashboard endpoint is authenticated
+    /// (`RequirePortalAuth`), so `tenant_id` is a verified JWT claim,
+    /// not user input.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn dashboard(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+    ) -> AppResult<PortalDashboardResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Card 1: open tickets by priority. LEFT JOIN keeps zero-count
+        // priorities in the axis; the status subquery limits the join
+        // to non-closed statuses only.
+        let priorities: Vec<(Uuid, String, String, i32, i64)> = sqlx::query_as(
+            r#"
+            SELECT p.id, p.name, p.color, p.sort_order,
+                   COUNT(t.id) FILTER (WHERE t.id IS NOT NULL)::BIGINT AS count
+            FROM ticket_priorities p
+            LEFT JOIN tickets t
+              ON t.priority_id = p.id
+             AND t.tenant_id = $1
+             AND t.company_id = $2
+             AND EXISTS (
+                 SELECT 1 FROM ticket_statuses s
+                  WHERE s.id = t.status_id AND s.is_closed = FALSE
+             )
+            WHERE p.tenant_id = $1
+            GROUP BY p.id, p.name, p.color, p.sort_order
+            ORDER BY p.sort_order, p.name
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let tickets_by_priority: Vec<DashboardTicketPriorityBucket> = priorities
+            .into_iter()
+            .map(
+                |(id, name, color, sort_order, count)| DashboardTicketPriorityBucket {
+                    id,
+                    name,
+                    color,
+                    sort_order,
+                    count,
+                },
+            )
+            .collect();
+
+        // Card 2: next invoice due. Only invoices with an outstanding
+        // balance in a chargeable status count.
+        let next: Option<(
+            Uuid,
+            String,
+            rust_decimal::Decimal,
+            rust_decimal::Decimal,
+            chrono::NaiveDate,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, invoice_number, total, balance_due, due_date, currency
+            FROM invoices
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND status IN ('sent', 'pending', 'partially_paid')
+              AND balance_due > 0
+            ORDER BY due_date ASC, invoice_number ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let next_invoice_due = next.map(
+            |(id, invoice_number, total, balance_due, due_date, currency)| {
+                DashboardNextInvoiceDue {
+                    id,
+                    invoice_number,
+                    total,
+                    balance_due,
+                    due_date,
+                    currency: currency.unwrap_or_else(|| "USD".to_string()),
+                }
+            },
+        );
+
+        // Card 3: open quotes awaiting the customer's decision. Statuses
+        // 'sent' and 'submitted' are the ones an MSP has actually surfaced
+        // to the customer and is waiting on. Everything else (draft,
+        // approved, rejected, accepted, declined, expired, converted,
+        // cancelled) either has not reached the customer yet or already
+        // has a terminal decision.
+        let (open_quotes_awaiting_decision,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM quotes
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND status IN ('sent', 'submitted')
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Card 4: recent activity (last 10 ticket updates). Portal-scoped
+        // to the contact's company so nothing from a sibling company can
+        // leak into the feed. `updated_at` fires whenever the status
+        // changes, a note lands, or the assignee flips, so it is a
+        // reasonable "what changed recently" proxy without a JOIN across
+        // ticket_notes / status_history.
+        let recent: Vec<(Uuid, String, String, String, chrono::DateTime<Utc>)> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.ticket_number, t.title, s.name, t.updated_at
+            FROM tickets t
+            JOIN ticket_statuses s ON s.id = t.status_id
+            WHERE t.tenant_id = $1 AND t.company_id = $2
+            ORDER BY t.updated_at DESC
+            LIMIT 10
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let recent_activity: Vec<DashboardRecentActivity> = recent
+            .into_iter()
+            .map(
+                |(id, ticket_number, title, status_name, updated_at)| DashboardRecentActivity {
+                    kind: "ticket".to_string(),
+                    entity_id: id,
+                    label: format!("#{ticket_number} {title}"),
+                    summary: format!("Status: {status_name}"),
+                    at: updated_at,
+                },
+            )
+            .collect();
+
+        tx.commit().await?;
+
+        Ok(PortalDashboardResponse {
+            tickets_by_priority,
+            next_invoice_due,
+            open_quotes_awaiting_decision,
+            recent_activity,
+        })
+    }
 }
 
 /// PMS-729 phase 2 H5: bridge the shared [`password_policy`] error
