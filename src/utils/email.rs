@@ -18,6 +18,51 @@ use uuid::Uuid;
 
 use crate::utils::error::{AppError, AppResult};
 
+/// PMS-761: who a client-facing message is from, as the client reads it.
+///
+/// Two plain strings rather than the `OrgIdentity` they are composed from, so
+/// the mail layer keeps knowing nothing about tenants: this module owns
+/// transport and body copy, `modules::tenants::identity` owns who the
+/// organisation is and how its contact details are worded.
+///
+/// Both fields are required, because the defect this fixes was messages that
+/// left them out. `contact_line` is never empty (`OrgIdentity::contact_line`
+/// always names the organisation), so a body can append it unconditionally.
+#[derive(Debug, Clone, Copy)]
+pub struct SenderIdentity<'a> {
+    /// The organisation's name, as shown to clients.
+    pub org_name: &'a str,
+    /// A complete sentence telling the client how to ask about this message.
+    pub contact_line: &'a str,
+}
+
+/// What the quote sign-off email renders, beyond who it is from.
+///
+/// A struct rather than five positional `&str`s: four of them are strings in a
+/// row, so a transposed pair would email the title as the total and nothing
+/// would fail. Named fields make that impossible to write by accident, and
+/// they keep the method under clippy's argument limit as the copy grows.
+#[derive(Debug, Clone, Copy)]
+pub struct QuoteReady<'a> {
+    pub quote_number: &'a str,
+    pub title: &'a str,
+    pub total: &'a str,
+    /// `None` when the quote carries no expiry, in which case the body omits
+    /// the deadline line rather than printing a date the customer might act on.
+    pub valid_until: Option<&'a str>,
+    pub portal_link: &'a str,
+}
+
+/// What the invoice "Pay Now" email renders, beyond who it is from.
+/// Same reasoning as [`QuoteReady`].
+#[derive(Debug, Clone, Copy)]
+pub struct InvoicePayNow<'a> {
+    pub invoice_number: &'a str,
+    pub amount_due: &'a str,
+    pub due_date: &'a str,
+    pub portal_link: &'a str,
+}
+
 /// Anything that can send mokosh's transactional emails.
 #[async_trait]
 pub trait Mailer: Send + Sync {
@@ -48,31 +93,43 @@ pub trait Mailer: Send + Sync {
     /// `valid_until` is optional because a quote need not carry an expiry;
     /// when absent the body simply omits the deadline line rather than
     /// printing a placeholder date the customer might act on.
+    ///
+    /// PMS-761: `from` is required. This message asks a client to commit money
+    /// to a piece of work, and it used to do so without naming who was asking.
     async fn send_quote_ready(
         &self,
         to: &str,
-        quote_number: &str,
-        title: &str,
-        total: &str,
-        valid_until: Option<&str>,
-        portal_link: &str,
+        from: SenderIdentity<'_>,
+        quote: QuoteReady<'_>,
     ) -> AppResult<()> {
+        let SenderIdentity {
+            org_name,
+            contact_line,
+        } = from;
+        let QuoteReady {
+            quote_number,
+            title,
+            total,
+            valid_until,
+            portal_link,
+        } = quote;
         let deadline = match valid_until {
             Some(d) => format!("This quote is valid until {d}.\n\n"),
             None => String::new(),
         };
         let body = format!(
-            "A quote is ready for your review and approval.\n\n\
+            "{org_name} has sent you a quote for your review and approval.\n\n\
              Quote: {quote_number}\n\
              For: {title}\n\
              Total: {total}\n\n\
              {deadline}\
              Review the full scope and accept or decline it here:\n\n\
-             {portal_link}"
+             {portal_link}\n\n\
+             {contact_line}"
         );
         self.send_text(
             to,
-            &format!("Quote {quote_number} for your approval"),
+            &format!("Quote {quote_number} from {org_name} for your approval"),
             &body,
         )
         .await
@@ -83,30 +140,49 @@ pub trait Mailer: Send + Sync {
     /// provider checkout session. The default composes a plain-text body and
     /// routes it through [`Mailer::send_text`], so every mailer inherits it
     /// without a per-impl override.
+    ///
+    /// PMS-761: `from` is required, for the same reason as the quote. An email
+    /// asking someone to pay, from nobody in particular, is indistinguishable
+    /// from the invoice fraud it would be mistaken for.
     async fn send_invoice_pay_now(
         &self,
         to: &str,
-        invoice_number: &str,
-        amount_due: &str,
-        due_date: &str,
-        portal_link: &str,
+        from: SenderIdentity<'_>,
+        invoice: InvoicePayNow<'_>,
     ) -> AppResult<()> {
+        let SenderIdentity {
+            org_name,
+            contact_line,
+        } = from;
+        let InvoicePayNow {
+            invoice_number,
+            amount_due,
+            due_date,
+            portal_link,
+        } = invoice;
         let body = format!(
-            "An invoice is ready for payment.\n\n\
+            "{org_name} has sent you an invoice, ready for payment.\n\n\
              Invoice: {invoice_number}\n\
              Amount due: {amount_due}\n\
              Due: {due_date}\n\n\
              Review the invoice and pay online here:\n\n\
-             {portal_link}"
+             {portal_link}\n\n\
+             {contact_line}"
         );
         self.send_text(
             to,
-            &format!("Invoice {invoice_number} is ready to pay"),
+            &format!("Invoice {invoice_number} from {org_name} is ready to pay"),
             &body,
         )
         .await
     }
 
+    /// PMS-761: the two methods below take no [`SenderIdentity`], and should
+    /// not be given one. They are mokosh speaking to its own user about their
+    /// account, not an MSP speaking to a client. Dressing a "confirm this
+    /// sign-in" message in a tenant's name and logo makes it look like the
+    /// phishing it exists to prevent.
+    ///
     /// PMS-657: alert the user that a sign-in came from a country they have not
     /// signed in from before. The default composes a plain-text body and routes
     /// it through [`Mailer::send_text`], so every mailer inherits it without a
@@ -640,5 +716,165 @@ mod tests {
             1,
             "new mailer receives the send"
         );
+    }
+
+    /// Captures the last message so the trait's default bodies can be asserted
+    /// without SMTP, a database or a router.
+    #[derive(Default)]
+    struct Capturing(std::sync::Mutex<Option<(String, String, String)>>);
+
+    #[async_trait]
+    impl Mailer for Capturing {
+        async fn send_multipart(
+            &self,
+            to: &str,
+            subject: &str,
+            text: &str,
+            _html: Option<&str>,
+        ) -> AppResult<()> {
+            *self.0.lock().unwrap() = Some((to.to_string(), subject.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    impl Capturing {
+        fn taken(&self) -> (String, String, String) {
+            self.0.lock().unwrap().clone().expect("a message was sent")
+        }
+    }
+
+    fn contoso() -> SenderIdentity<'static> {
+        SenderIdentity {
+            org_name: "Contoso IT",
+            contact_line:
+                "Questions about this? Contact the service desk at Contoso IT on 555-0100.",
+        }
+    }
+
+    /// PMS-761: a client asked to approve spend is told who is asking, in the
+    /// subject as well as the body. The subject matters on its own: it is what
+    /// the recipient decides to open on, and "Quote Q-1001 for your approval"
+    /// from an unknown sender reads like the fraud it is not.
+    #[tokio::test]
+    async fn the_quote_email_names_the_organisation_and_how_to_reach_it() {
+        let mailer = Capturing::default();
+        mailer
+            .send_quote_ready(
+                "client@recipient.example",
+                contoso(),
+                QuoteReady {
+                    quote_number: "Q-1001",
+                    title: "Network refresh",
+                    total: "4500.00 USD",
+                    valid_until: Some("2026-09-01"),
+                    portal_link: "http://portal.example/portal/quotes/1",
+                },
+            )
+            .await
+            .unwrap();
+
+        let (to, subject, body) = mailer.taken();
+        assert_eq!(to, "client@recipient.example");
+        assert_eq!(subject, "Quote Q-1001 from Contoso IT for your approval");
+        assert!(
+            body.starts_with("Contoso IT has sent you a quote"),
+            "the body opens by naming the sender:\n{body}"
+        );
+        assert!(
+            body.ends_with(contoso().contact_line),
+            "the contact line closes the message:\n{body}"
+        );
+        assert!(body.contains("valid until 2026-09-01"), "{body}");
+    }
+
+    /// The deadline line is the one optional piece; without an expiry it must
+    /// vanish rather than print a date the customer might act on.
+    #[tokio::test]
+    async fn a_quote_without_an_expiry_omits_the_deadline() {
+        let mailer = Capturing::default();
+        mailer
+            .send_quote_ready(
+                "client@recipient.example",
+                contoso(),
+                QuoteReady {
+                    quote_number: "Q-1002",
+                    title: "Ad-hoc work",
+                    total: "100.00 USD",
+                    valid_until: None,
+                    portal_link: "http://portal.example/portal/quotes/2",
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, _, body) = mailer.taken();
+        assert!(!body.contains("valid until"), "{body}");
+        assert!(body.contains("Contoso IT"), "{body}");
+    }
+
+    /// PMS-761: same for the invoice. An unattributed request for payment is
+    /// the exact shape of invoice fraud, so the organisation is named in the
+    /// subject and the opening sentence both.
+    #[tokio::test]
+    async fn the_invoice_email_names_the_organisation_and_how_to_reach_it() {
+        let mailer = Capturing::default();
+        mailer
+            .send_invoice_pay_now(
+                "client@recipient.example",
+                contoso(),
+                InvoicePayNow {
+                    invoice_number: "INV-2050",
+                    amount_due: "1200.00 USD",
+                    due_date: "2026-09-30",
+                    portal_link: "http://portal.example/portal/invoices/1",
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, subject, body) = mailer.taken();
+        assert_eq!(subject, "Invoice INV-2050 from Contoso IT is ready to pay");
+        assert!(
+            body.starts_with("Contoso IT has sent you an invoice"),
+            "the body opens by naming the sender:\n{body}"
+        );
+        assert!(body.ends_with(contoso().contact_line), "{body}");
+    }
+
+    /// PMS-761: the account-security emails are mokosh speaking to its own
+    /// user, not an MSP speaking to a client, and must stay unbranded. A tenant
+    /// name and logo on "approve your sign-in" is what phishing looks like.
+    #[tokio::test]
+    async fn the_security_emails_carry_no_organisation_identity() {
+        let mailer = Capturing::default();
+        mailer
+            .send_login_approval_code(
+                "user@msp.example",
+                "123456",
+                Some("NZ"),
+                Some("203.0.113.7"),
+                "2026-08-11 10:00 UTC",
+                "Firefox on Linux",
+            )
+            .await
+            .unwrap();
+        let (_, subject, body) = mailer.taken();
+        assert_eq!(subject, "Approve your sign-in");
+        assert!(!body.contains("Contoso"), "{body}");
+
+        mailer
+            .send_new_login_location(
+                "user@msp.example",
+                "NZ",
+                "203.0.113.7",
+                "2026-08-11 10:00 UTC",
+                "Firefox on Linux",
+                "http://spa.example/settings/security",
+            )
+            .await
+            .unwrap();
+        let (_, subject, body) = mailer.taken();
+        assert_eq!(subject, "New sign-in to your account");
+        assert!(!body.contains("Contoso"), "{body}");
     }
 }
