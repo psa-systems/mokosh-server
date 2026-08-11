@@ -30,7 +30,7 @@ use super::{
     PortalChangePasswordRequest, PortalDashboardResponse, PortalForgotPasswordRequest,
     PortalHostHint, PortalInvoicePaymentsResponse, PortalLoginRequest, PortalLogoutRequest,
     PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
-    PortalMfaSetupResponse, PortalRefreshRequest, PortalResetPasswordRequest,
+    PortalMfaSetupResponse, PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse,
     PortalSessionResponse, PortalSetupPasswordRequest, PortalTicketSlaResponse, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
@@ -202,6 +202,12 @@ pub fn portal_routes(
             "/invoices/{invoice_id}/payments",
             get(list_invoice_payments),
         )
+        // PMS-729 phase 2 §7 slice A / I14: portal-scoped search.
+        // Query param `q`. Every query enforces
+        // `company_id = contact.company_id` and, for KB, honors the
+        // same public / client_specific visibility rules the list
+        // endpoint uses. NEVER cross-company (D18).
+        .route("/search", get(portal_search))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -682,6 +688,28 @@ async fn list_invoice_payments(
     let payload = state
         .service
         .list_invoice_payments(contact.tenant(), contact.company_id, invoice_id)
+        .await?;
+    Ok(Json(payload))
+}
+
+/// PMS-729 phase 2 §7 slice A / I14: portal-scoped grouped search.
+/// Query params: `q` (required, trimmed; blank returns the empty
+/// default). Company scope is forced from `RequirePortalAuth`, never
+/// user input.
+#[derive(serde::Deserialize)]
+struct PortalSearchQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn portal_search(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Query(PortalSearchQuery { q }): Query<PortalSearchQuery>,
+) -> AppResult<Json<PortalSearchResponse>> {
+    let payload = state
+        .service
+        .portal_search(contact.tenant(), contact.company_id, &q)
         .await?;
     Ok(Json(payload))
 }

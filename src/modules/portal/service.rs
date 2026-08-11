@@ -1984,6 +1984,238 @@ impl PortalAuthService {
 
         Ok(PortalInvoicePaymentsResponse { payments, total })
     }
+
+    /// PMS-729 phase 2 §7 slice A / I14: portal-scoped search across
+    /// the four entities a customer can already view: tickets,
+    /// invoices, quotes, and KB articles they are permitted to see.
+    /// D18 pins the scoping rule: NEVER cross-company. Every query
+    /// forces `company_id = contact.company_id` (or, for KB, the
+    /// visibility gate the KB list endpoint already uses).
+    ///
+    /// The blank / whitespace-only query returns the empty default so
+    /// the SPA can safely mount a "search box that fires on every
+    /// keystroke" pattern without shipping an empty query all the way
+    /// to Postgres. `%` and `_` in the user input are escaped so a
+    /// literal typed underscore matches a literal underscore, not a
+    /// wildcard.
+    ///
+    /// Each section caps at 5 rows for the preview and reports the
+    /// uncapped count in `counts`, matching the agent-side search
+    /// helper convention.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, q_len = q.len()))]
+    pub async fn portal_search(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        q: &str,
+    ) -> AppResult<PortalSearchResponse> {
+        const SECTION_LIMIT: i64 = 5;
+        let trimmed = q.trim();
+        if trimmed.is_empty() {
+            return Ok(PortalSearchResponse::default());
+        }
+        let escaped = trimmed
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Tickets: number OR title OR description within the caller's
+        // company.
+        let ticket_rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.ticket_number, t.title, s.name
+            FROM tickets t
+            JOIN ticket_statuses s ON s.id = t.status_id
+            WHERE t.tenant_id = $1 AND t.company_id = $2
+              AND (t.ticket_number ILIKE $3 OR t.title ILIKE $3 OR t.description ILIKE $3)
+            ORDER BY t.updated_at DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .bind(SECTION_LIMIT)
+        .fetch_all(&mut *tx)
+        .await?;
+        let tickets_total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM tickets t
+            WHERE t.tenant_id = $1 AND t.company_id = $2
+              AND (t.ticket_number ILIKE $3 OR t.title ILIKE $3 OR t.description ILIKE $3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Invoices: number OR PO number (public reference) match.
+        let invoice_rows: Vec<(Uuid, String, String, Option<chrono::NaiveDate>)> = sqlx::query_as(
+            r#"
+            SELECT id, invoice_number, status, due_date
+            FROM invoices
+            WHERE tenant_id = $1 AND company_id = $2
+              AND (invoice_number ILIKE $3 OR po_number ILIKE $3)
+            ORDER BY invoice_date DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .bind(SECTION_LIMIT)
+        .fetch_all(&mut *tx)
+        .await?;
+        let invoices_total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM invoices
+            WHERE tenant_id = $1 AND company_id = $2
+              AND (invoice_number ILIKE $3 OR po_number ILIKE $3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Quotes: title OR summary. Only issued-and-later statuses
+        // (matches `list_quotes_for_company` scope).
+        let quote_rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            r#"
+            SELECT id, title, status
+            FROM quotes
+            WHERE tenant_id = $1 AND company_id = $2
+              AND status IN ('sent', 'submitted', 'accepted', 'declined', 'expired', 'converted')
+              AND (title ILIKE $3 OR summary ILIKE $3)
+            ORDER BY updated_at DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .bind(SECTION_LIMIT)
+        .fetch_all(&mut *tx)
+        .await?;
+        let quotes_total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM quotes
+            WHERE tenant_id = $1 AND company_id = $2
+              AND status IN ('sent', 'submitted', 'accepted', 'declined', 'expired', 'converted')
+              AND (title ILIKE $3 OR summary ILIKE $3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // KB articles: title OR summary. Published visibility rules
+        // mirror `list_kb`: public OR client_specific with the caller's
+        // company id in `company_ids`.
+        let kb_rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, title, summary
+            FROM kb_articles
+            WHERE tenant_id = $1
+              AND status = 'published'
+              AND (
+                  visibility = 'public'
+                  OR (visibility = 'client_specific' AND $2 = ANY(company_ids))
+              )
+              AND (title ILIKE $3 OR summary ILIKE $3 OR content ILIKE $3)
+            ORDER BY published_at DESC NULLS LAST
+            LIMIT $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .bind(SECTION_LIMIT)
+        .fetch_all(&mut *tx)
+        .await?;
+        let kb_total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM kb_articles
+            WHERE tenant_id = $1
+              AND status = 'published'
+              AND (
+                  visibility = 'public'
+                  OR (visibility = 'client_specific' AND $2 = ANY(company_ids))
+              )
+              AND (title ILIKE $3 OR summary ILIKE $3 OR content ILIKE $3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&pattern)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        let tickets: Vec<PortalSearchHit> = ticket_rows
+            .into_iter()
+            .map(|(id, number, title, status_name)| PortalSearchHit {
+                id,
+                label: format!("#{number} {title}"),
+                secondary: status_name,
+            })
+            .collect();
+        let invoices: Vec<PortalSearchHit> = invoice_rows
+            .into_iter()
+            .map(|(id, number, status, due)| PortalSearchHit {
+                id,
+                label: number,
+                secondary: Some(match due {
+                    Some(d) => format!("{status} - due {d}"),
+                    None => status,
+                }),
+            })
+            .collect();
+        let quotes: Vec<PortalSearchHit> = quote_rows
+            .into_iter()
+            .map(|(id, title, status)| PortalSearchHit {
+                id,
+                label: title,
+                secondary: Some(status),
+            })
+            .collect();
+        let kb_articles: Vec<PortalSearchHit> = kb_rows
+            .into_iter()
+            .map(|(id, title, summary)| PortalSearchHit {
+                id,
+                label: title,
+                secondary: summary,
+            })
+            .collect();
+
+        let counts = PortalSearchCounts {
+            tickets: tickets_total,
+            invoices: invoices_total,
+            quotes: quotes_total,
+            kb_articles: kb_total,
+        };
+
+        Ok(PortalSearchResponse {
+            tickets,
+            invoices,
+            quotes,
+            kb_articles,
+            counts,
+        })
+    }
 }
 
 /// PMS-729 phase 2 H5: bridge the shared [`password_policy`] error

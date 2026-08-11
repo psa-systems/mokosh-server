@@ -596,3 +596,46 @@ pub struct PortalInvoicePaymentsResponse {
     pub payments: Vec<PortalInvoicePayment>,
     pub total: i64,
 }
+
+// PMS-729 phase 2 §7 slice A / I14: portal search --------------------------
+
+/// One matched row across every portal-searchable entity kind. Shape
+/// matches the agent-side `SearchHit` so the SPA's grouped dropdown
+/// can share the same primitive without a translation layer.
+///
+/// - `id` is the entity's primary key. The SPA composes the detail
+///   URL per group (`/portal/tickets/<id>`, `/portal/invoices/<id>`).
+/// - `label` is the primary line ("[T-1234] Server down", "INV-9002",
+///   "How to reset your password").
+/// - `secondary` is the small grey line beneath (status, due date,
+///   article summary snippet) or `None` when the hit does not carry
+///   secondary context.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalSearchHit {
+    pub id: Uuid,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<String>,
+}
+
+/// Grouped response for `GET /portal/search`. Four sections in D18's
+/// order (tickets, invoices, quotes, kb) so the SPA renders them
+/// consistently. `counts` reports the true match count per section
+/// (uncapped) so the SPA can render a "5+ tickets" affordance when
+/// the top-5 preview clips the set.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PortalSearchResponse {
+    pub tickets: Vec<PortalSearchHit>,
+    pub invoices: Vec<PortalSearchHit>,
+    pub quotes: Vec<PortalSearchHit>,
+    pub kb_articles: Vec<PortalSearchHit>,
+    pub counts: PortalSearchCounts,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PortalSearchCounts {
+    pub tickets: i64,
+    pub invoices: i64,
+    pub quotes: i64,
+    pub kb_articles: i64,
+}
