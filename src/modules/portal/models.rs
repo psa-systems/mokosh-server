@@ -235,14 +235,29 @@ pub struct PortalMfaSetupResponse {
     pub provisioning_uri: String,
 }
 
+/// PMS-729 phase 2 H4: `POST /api/v1/portal/auth/me/mfa/setup`
+/// request body. Post-code-review finding #3: setup + enable BOTH
+/// require the caller's current password so a stolen access token
+/// cannot enroll attacker-controlled MFA and lock the legitimate
+/// user out. Same re-auth posture the change-password route uses.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalMfaSetupRequest {
+    #[validate(length(min = 1, message = "Password is required"))]
+    pub current_password: String,
+}
+
 /// PMS-729 phase 2 H4: `POST /api/v1/portal/auth/me/mfa/enable`
 /// request body. The customer types the 6-8 digit code their
 /// authenticator app shows; on success the server flips
-/// `portal_mfa_enabled = TRUE`.
+/// `portal_mfa_enabled = TRUE`. Post-code-review finding #3: also
+/// re-verifies the current password so a stolen access token cannot
+/// finish an enrollment the attacker started.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PortalMfaEnableRequest {
     #[validate(length(min = 6, max = 8, message = "Code must be 6-8 digits"))]
     pub code: String,
+    #[validate(length(min = 1, message = "Password is required"))]
+    pub current_password: String,
 }
 
 /// PMS-729 phase 2 H4: `POST /api/v1/portal/auth/me/mfa/enable`

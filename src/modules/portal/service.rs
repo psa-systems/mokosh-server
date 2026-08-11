@@ -133,7 +133,15 @@ impl PortalAuthService {
                        c.portal_mfa_enabled, c.portal_mfa_secret
                 FROM contacts c
                 INNER JOIN tenants t ON c.tenant_id = t.id
-                WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
+                -- Post-code-review finding #4: email match is case-
+                -- insensitive so `Alice@Example.com` stored + `alice@
+                -- example.com` typed still resolves. The rate limiter
+                -- keys on lowercased email already, so aligning the DB
+                -- lookup with the same case rule also closes the
+                -- bucket-poisoning vector.
+                WHERE t.slug = $1
+                  AND LOWER(c.email) = LOWER($2)
+                  AND t.status = 'active'
                 "#,
         )
         .bind(slug)
@@ -230,6 +238,15 @@ impl PortalAuthService {
                 crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_some()
             };
             if !mfa_ok {
+                // Post-PMS-729 code-review finding #1: a wrong TOTP
+                // or a bad recovery-code claim MUST also arm the
+                // persistent PMS-501 lockout. The password-branch above
+                // already does this; a second-factor grinder was
+                // previously throttled only by the in-memory 5/min
+                // per-replica limiter, so a multi-replica or
+                // restart-loop attacker could brute a 6-digit TOTP
+                // window unimpeded.
+                self.register_failed_login(id).await?;
                 // PMS-729 phase 2 H10: MFA-failure audit so a brute-force
                 // against the second factor is visible.
                 let _ = audit_portal_event(
@@ -632,15 +649,33 @@ impl PortalAuthService {
         // Read the contact's identity for the fresh access token. The
         // tenant + company columns move together on the contact row and
         // are not user input.
+        //
+        // Post-PMS-729 code-review finding #2: the SELECT MUST also
+        // enforce the PMS-698 principal gate. Before this fix, revoking
+        // portal access (`is_portal_user = FALSE`) or suspending a
+        // tenant (`tenants.status <> 'active'`) left live refresh
+        // tokens rotating happily - a fresh 15-min access token every
+        // 12 min. CLAUDE.md says deactivation must take effect on the
+        // very next request; this now applies to refresh as well as
+        // login.
         let contact: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT company_id, email FROM contacts \
-             WHERE id = $1 AND tenant_id = $2",
+            "SELECT c.company_id, c.email \
+             FROM contacts c \
+             INNER JOIN tenants t ON t.id = c.tenant_id \
+             WHERE c.id = $1 \
+               AND c.tenant_id = $2 \
+               AND c.is_portal_user = TRUE \
+               AND t.status = 'active'",
         )
         .bind(contact_id)
         .bind(tenant_id)
         .fetch_optional(self.db.migrator_pool())
         .await?;
         let Some((company_id, email)) = contact else {
+            // Deactivated / suspended: burn the whole chain so a
+            // reactivation does not resurrect a live refresh token
+            // the caller may still be holding.
+            self.revoke_rotation_chain(row_id).await?;
             return Err(AppError::Unauthorized);
         };
 
@@ -1109,7 +1144,12 @@ impl PortalAuthService {
             SELECT c.id, c.tenant_id, c.email, c.is_portal_user
             FROM contacts c
             INNER JOIN tenants t ON c.tenant_id = t.id
-            WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
+            -- Post-code-review finding #4: match email case-
+            -- insensitively so a mixed-case stored contact receives
+            -- the reset link for a canonical-cased request.
+            WHERE t.slug = $1
+              AND LOWER(c.email) = LOWER($2)
+              AND t.status = 'active'
             "#,
         )
         .bind(slug)
@@ -1388,20 +1428,30 @@ impl PortalAuthService {
         &self,
         contact_id: Uuid,
         tenant_id: Uuid,
+        current_password: &str,
     ) -> AppResult<PortalMfaSetupResponse> {
-        let row: Option<(bool, Option<String>)> = sqlx::query_as(
-            "SELECT portal_mfa_enabled, email FROM contacts \
+        let row: Option<(bool, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT portal_mfa_enabled, email, portal_password_hash FROM contacts \
              WHERE id = $1 AND tenant_id = $2",
         )
         .bind(contact_id)
         .bind(tenant_id)
         .fetch_optional(self.db.migrator_pool())
         .await?;
-        let Some((enabled, email)) = row else {
+        let Some((enabled, email, password_hash)) = row else {
             return Err(AppError::Unauthorized);
         };
         if enabled {
             return Err(AppError::Conflict("MFA is already enabled".to_string()));
+        }
+        // Post-code-review finding #3: re-auth before mutating a
+        // security-relevant flag. A stolen access token cannot cross
+        // this gate.
+        let Some(hash) = password_hash else {
+            return Err(AppError::Unauthorized);
+        };
+        if !verify_password(current_password, &hash)? {
+            return Err(AppError::Unauthorized);
         }
         let email = email.unwrap_or_default();
 
@@ -1441,18 +1491,28 @@ impl PortalAuthService {
         contact_id: Uuid,
         tenant_id: Uuid,
         code: &str,
+        current_password: &str,
     ) -> AppResult<PortalMfaEnableResponse> {
-        let row: Option<(bool, Option<String>)> = sqlx::query_as(
-            "SELECT portal_mfa_enabled, portal_mfa_secret FROM contacts \
+        let row: Option<(bool, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT portal_mfa_enabled, portal_mfa_secret, portal_password_hash FROM contacts \
              WHERE id = $1 AND tenant_id = $2",
         )
         .bind(contact_id)
         .bind(tenant_id)
         .fetch_optional(self.db.migrator_pool())
         .await?;
-        let Some((enabled, secret_b32)) = row else {
+        let Some((enabled, secret_b32, password_hash)) = row else {
             return Err(AppError::Unauthorized);
         };
+        // Post-code-review finding #3: re-verify the password so an
+        // attacker who setup an alternate secret with a stolen access
+        // token cannot also finish the flip.
+        let Some(hash) = password_hash else {
+            return Err(AppError::Unauthorized);
+        };
+        if !verify_password(current_password, &hash)? {
+            return Err(AppError::Unauthorized);
+        }
         if enabled {
             return Err(AppError::Conflict("MFA is already enabled".to_string()));
         }

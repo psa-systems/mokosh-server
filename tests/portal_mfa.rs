@@ -92,6 +92,7 @@ async fn mfa_setup_returns_secret_and_stays_disabled(pool: PgPool) {
         .client
         .post(app.url("/api/v1/portal/auth/me/mfa/setup"))
         .bearer_auth(&access_token)
+        .json(&serde_json::json!({ "current_password": PORTAL_PASSWORD }))
         .send()
         .await
         .expect("setup");
@@ -134,6 +135,7 @@ async fn mfa_enable_with_valid_code_flips_flag_and_returns_recovery_codes(pool: 
         .client
         .post(app.url("/api/v1/portal/auth/me/mfa/setup"))
         .bearer_auth(&access_token)
+        .json(&serde_json::json!({ "current_password": PORTAL_PASSWORD }))
         .send()
         .await
         .expect("setup")
@@ -148,7 +150,7 @@ async fn mfa_enable_with_valid_code_flips_flag_and_returns_recovery_codes(pool: 
         .client
         .post(app.url("/api/v1/portal/auth/me/mfa/enable"))
         .bearer_auth(&access_token)
-        .json(&serde_json::json!({ "code": code }))
+        .json(&serde_json::json!({ "code": code, "current_password": PORTAL_PASSWORD }))
         .send()
         .await
         .expect("enable");
@@ -193,6 +195,7 @@ async fn mfa_enable_with_wrong_code_returns_400(pool: PgPool) {
         .client
         .post(app.url("/api/v1/portal/auth/me/mfa/setup"))
         .bearer_auth(&access_token)
+        .json(&serde_json::json!({ "current_password": PORTAL_PASSWORD }))
         .send()
         .await
         .expect("setup")
@@ -206,7 +209,7 @@ async fn mfa_enable_with_wrong_code_returns_400(pool: PgPool) {
         .client
         .post(app.url("/api/v1/portal/auth/me/mfa/enable"))
         .bearer_auth(&access_token)
-        .json(&serde_json::json!({ "code": "000000" }))
+        .json(&serde_json::json!({ "code": "000000", "current_password": PORTAL_PASSWORD }))
         .send()
         .await
         .expect("enable");

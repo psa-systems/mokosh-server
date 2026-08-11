@@ -31,10 +31,10 @@ use super::{
     PortalContract, PortalDashboardResponse, PortalDelegation, PortalDelegationGrantRequest,
     PortalExportJob, PortalForgotPasswordRequest, PortalHostHint, PortalInvoicePaymentsResponse,
     PortalLoginRequest, PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest,
-    PortalMfaEnableResponse, PortalMfaSetupResponse, PortalNotificationsResponse, PortalProject,
-    PortalProjectDetail, PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse,
-    PortalSessionResponse, PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry,
-    ResolvedTenant,
+    PortalMfaEnableResponse, PortalMfaSetupRequest, PortalMfaSetupResponse,
+    PortalNotificationsResponse, PortalProject, PortalProjectDetail, PortalRefreshRequest,
+    PortalResetPasswordRequest, PortalSearchResponse, PortalSessionResponse,
+    PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -514,10 +514,12 @@ async fn change_password(
 async fn mfa_setup(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
+    Json(request): Json<PortalMfaSetupRequest>,
 ) -> Result<Json<PortalMfaSetupResponse>, AppError> {
+    request.validate()?;
     let resp = state
         .service
-        .start_mfa_enrollment(contact.id, contact.tenant_id)
+        .start_mfa_enrollment(contact.id, contact.tenant_id, &request.current_password)
         .await?;
     Ok(Json(resp))
 }
@@ -534,7 +536,12 @@ async fn mfa_enable(
     request.validate()?;
     let resp = state
         .service
-        .enable_mfa(contact.id, contact.tenant_id, &request.code)
+        .enable_mfa(
+            contact.id,
+            contact.tenant_id,
+            &request.code,
+            &request.current_password,
+        )
         .await?;
     Ok(Json(resp))
 }
