@@ -523,3 +523,43 @@ pub struct PortalDashboardResponse {
     pub open_quotes_awaiting_decision: i64,
     pub recent_activity: Vec<DashboardRecentActivity>,
 }
+
+// PMS-729 phase 2 §7 slice A / I10: SLA visibility on portal ticket ---------
+
+/// A computed SLA-status label with the same three states the agent
+/// side uses (`on_track`, `warning`, `breached`), plus `not_applicable`
+/// for a closed ticket or one that never had an SLA policy applied.
+/// Serialised as snake_case so the wire matches the agent's
+/// `mokosh_types::SlaStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalSlaStatus {
+    OnTrack,
+    Warning,
+    Breached,
+    NotApplicable,
+}
+
+/// `GET /portal/tickets/{id}/sla` response. Surfaces both SLA legs a
+/// customer cares about (first-response and resolution) with the
+/// due date and, when reached, the actual event timestamp, so the SPA
+/// can render "target vs actual" side by side. `closed_at` is included
+/// because it collapses both status fields to `not_applicable`.
+///
+/// Missing values (a ticket with no SLA policy) come back as `null` so
+/// the SPA can hide those rows rather than render a spurious "no
+/// target" placeholder.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalTicketSlaResponse {
+    pub sla_due_date: Option<DateTime<Utc>>,
+    pub first_response_due: Option<DateTime<Utc>>,
+    pub first_response_at: Option<DateTime<Utc>>,
+    pub resolution_due: Option<DateTime<Utc>>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub status: PortalSlaStatus,
+    /// The current ticket status name ("Open", "In Progress",
+    /// "Resolved"...). Handy for the customer to see alongside the
+    /// SLA metric without a second fetch.
+    pub status_name: String,
+}

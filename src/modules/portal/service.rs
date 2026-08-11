@@ -1808,6 +1808,90 @@ impl PortalAuthService {
             recent_activity,
         })
     }
+
+    /// PMS-729 phase 2 §7 slice A / I10: SLA metrics for one of the
+    /// caller's tickets. Enforces the (tenant, company, ticket) scope in
+    /// SQL so a cross-company ticket id returns `AppError::NotFound`,
+    /// matching every other portal detail-view posture.
+    ///
+    /// The `PortalSlaStatus` label follows the shared rule the agent
+    /// side already implements: closed tickets or tickets with no
+    /// `sla_due_date` are `not_applicable`; the remaining tickets are
+    /// `on_track` / `warning` / `breached` at the same 25%-remaining
+    /// threshold `mokosh_types::compute_sla_status` uses. Kept in sync
+    /// with that function by importing it directly so a future
+    /// threshold change lands on both surfaces at once.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, ticket_id = %ticket_id))]
+    pub async fn ticket_sla(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        ticket_id: Uuid,
+    ) -> AppResult<PortalTicketSlaResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            String,
+        )> = sqlx::query_as(
+            r#"
+            SELECT t.sla_due_date,
+                   t.first_response_due, t.first_response_at,
+                   t.resolution_due, t.resolved_at, t.closed_at,
+                   s.name
+            FROM tickets t
+            JOIN ticket_statuses s ON s.id = t.status_id
+            WHERE t.tenant_id = $1
+              AND t.company_id = $2
+              AND t.id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let Some((
+            sla_due_date,
+            first_response_due,
+            first_response_at,
+            resolution_due,
+            resolved_at,
+            closed_at,
+            status_name,
+        )) = row
+        else {
+            return Err(AppError::NotFound("Ticket".to_string()));
+        };
+
+        // Share the exact status logic the agent side uses so a portal
+        // caller and an agent looking at the same ticket disagree only
+        // about layout, not truth.
+        let agent_status = mokosh_types::tickets::compute_sla_status(closed_at, sla_due_date);
+        let status = match agent_status {
+            mokosh_types::tickets::SlaStatus::OnTrack => PortalSlaStatus::OnTrack,
+            mokosh_types::tickets::SlaStatus::Warning => PortalSlaStatus::Warning,
+            mokosh_types::tickets::SlaStatus::Breached => PortalSlaStatus::Breached,
+            mokosh_types::tickets::SlaStatus::NotApplicable => PortalSlaStatus::NotApplicable,
+        };
+
+        Ok(PortalTicketSlaResponse {
+            sla_due_date,
+            first_response_due,
+            first_response_at,
+            resolution_due,
+            resolved_at,
+            closed_at,
+            status,
+            status_name,
+        })
+    }
 }
 
 /// PMS-729 phase 2 H5: bridge the shared [`password_policy`] error

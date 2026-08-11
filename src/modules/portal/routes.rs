@@ -30,7 +30,8 @@ use super::{
     PortalChangePasswordRequest, PortalDashboardResponse, PortalForgotPasswordRequest,
     PortalHostHint, PortalLoginRequest, PortalLogoutRequest, PortalMfaDisableRequest,
     PortalMfaEnableRequest, PortalMfaEnableResponse, PortalMfaSetupResponse, PortalRefreshRequest,
-    PortalResetPasswordRequest, PortalSessionResponse, PortalSetupPasswordRequest, ResolvedTenant,
+    PortalResetPasswordRequest, PortalSessionResponse, PortalSetupPasswordRequest,
+    PortalTicketSlaResponse, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -189,6 +190,11 @@ pub fn portal_routes(
         // scoped by the JWT-verified tenant + company. Fixed set of
         // four cards per D17; no query params.
         .route("/dashboard", get(get_dashboard))
+        // PMS-729 phase 2 §7 slice A / I10: SLA visibility on portal
+        // ticket detail. Returns first-response + resolution targets and
+        // actuals, plus the computed on-track / warning / breached label
+        // shared with the agent side.
+        .route("/tickets/{ticket_id}/sla", get(get_ticket_sla))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -638,6 +644,22 @@ async fn get_dashboard(
     let payload = state
         .service
         .dashboard(contact.tenant(), contact.company_id)
+        .await?;
+    Ok(Json(payload))
+}
+
+/// PMS-729 phase 2 §7 slice A / I10: SLA card payload for a portal
+/// ticket. Cross-company / unknown ids surface as 404 (`NotFound`),
+/// same posture as `get_ticket`, so the endpoint never confirms the
+/// existence of another company's ticket.
+async fn get_ticket_sla(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(ticket_id): Path<Uuid>,
+) -> AppResult<Json<PortalTicketSlaResponse>> {
+    let payload = state
+        .service
+        .ticket_sla(contact.tenant(), contact.company_id, ticket_id)
         .await?;
     Ok(Json(payload))
 }
