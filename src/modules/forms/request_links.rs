@@ -20,8 +20,10 @@ use super::models::{
 };
 use super::service::FormsService;
 use crate::modules::auth::TenantId;
+use crate::modules::tenants::OrgIdentity;
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::html::{html_escape, urlencoded};
 
 /// PMS-730 assumes a 7 day expiry, revisable once the flow has been used in
 /// anger. Long enough for a client to get to it after a weekend, short enough
@@ -38,9 +40,10 @@ struct RequestLinkEmail<'a> {
     recipient_email: &'a str,
     display_name: &'a str,
     form_name: &'a str,
-    /// MAPPS-425: the MSP's name. The seeded subject asks for it, and without
-    /// it the client received a literal `{{tenant_name}}`.
-    tenant_name: &'a str,
+    /// PMS-761: the MSP as the client sees them: name (MAPPS-425, without
+    /// which the client received a literal `{{tenant_name}}`), contact details
+    /// for when the form defines none (MAPPS-429), and the logo.
+    org: &'a OrgIdentity,
     /// PMS-748: the MSP user who issued this link. A client receiving a
     /// request for personal details is entitled to a person's name, not just
     /// an organisation's.
@@ -50,12 +53,9 @@ struct RequestLinkEmail<'a> {
     /// not expecting this, you can ignore this message", which gave a
     /// recipient nothing to check.
     company_name: &'a str,
-    /// PMS-748: the definition's optional contact details.
+    /// PMS-748: the definition's optional contact details, which win over the
+    /// organisation's general ones when the form routes somewhere unusual.
     contact_info: Option<&'a str>,
-    /// MAPPS-429: the organisation's own contact, used when the form has none.
-    org: OrgContact<'a>,
-    /// MAPPS-429: relative path to the tenant's logo, when it has one.
-    logo_path: Option<&'a str>,
     form_link: &'a str,
     expires_at: chrono::DateTime<Utc>,
 }
@@ -106,14 +106,16 @@ impl FormsService {
         // transaction, matching `InvitationsService`.
         // MAPPS-429: branding rides along with the name, in the same read, so
         // the contact line and the logo cannot describe a different tenant than
-        // the one the message says it is from.
+        // the one the message says it is from. PMS-761 folds both into
+        // `OrgIdentity`; read here rather than through `OrgIdentity::load` so
+        // it stays inside the transaction that already has the row.
         let (tenant_name, branding): (String, serde_json::Value) =
             sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
                 .bind(tenant_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+        let org = OrgIdentity::from_row(tenant_name, branding);
+        let tenant_name = org.name().to_string();
 
         // PMS-748: the person doing the asking. Read in the same transaction
         // as the tenant and the company, so the email is composed from one
@@ -196,12 +198,10 @@ impl FormsService {
                 recipient_email: &recipient_email,
                 display_name: &display_name,
                 form_name: &definition.name,
-                tenant_name: &tenant_name,
+                org: &org,
                 sender_name: &sender_name,
                 company_name: &company_name,
                 contact_info: definition.contact_info.as_deref(),
-                org: OrgContact::from_branding(&branding),
-                logo_path: branding.logo_url.as_deref(),
                 form_link: &form_link,
                 expires_at,
             },
@@ -227,12 +227,10 @@ impl FormsService {
             recipient_email,
             display_name,
             form_name,
-            tenant_name,
+            org,
             sender_name,
             company_name,
             contact_info,
-            org,
-            logo_path,
             form_link,
             expires_at,
         } = mail;
@@ -250,7 +248,7 @@ impl FormsService {
             "form_name": form_name,
             // MAPPS-425: the seeded subject asks for this; without it the
             // client sees the placeholder itself.
-            "tenant_name": tenant_name,
+            "tenant_name": org.name(),
             // PMS-748: every key below is supplied unconditionally, including
             // the two that can be empty. `render_template` leaves an
             // unresolved key as literal braces in the delivered message, so
@@ -258,8 +256,8 @@ impl FormsService {
             // the value has to be an empty string instead.
             "sender_name": sender_name,
             "company_name": company_name,
-            "contact_line": contact_line(tenant_name, contact_info, &org),
-            "logo_html": logo_html(self.public_api_base.as_deref(), logo_path, tenant_name),
+            "contact_line": org.contact_line("Questions about this request?", contact_info),
+            "logo_html": org.logo_html(self.public_api_base.as_deref()),
             "abuse_notice": abuse_notice,
             "abuse_notice_html": abuse_notice_html,
             "form_link": form_link,
@@ -360,28 +358,17 @@ impl FormsService {
         // PMS-748: who is asking. The page is reached from an email by someone
         // with no account here, so it has to carry its own attribution rather
         // than relying on the message that linked to it still being open.
-        let mut tx = self.db.begin_with_tenant(resolved.tenant_id).await?;
-        let (tenant_name, branding): (String, serde_json::Value) =
-            sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
-                .bind(resolved.tenant_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        tx.commit().await?;
-        let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+        let org = OrgIdentity::load(&self.db, resolved.tenant_id).await?;
         // MAPPS-429: the form's own contact wins; the organisation's is the
         // fallback, so an MSP sets a service-desk number once instead of on
         // every definition.
-        let contact_info = definition
-            .contact_info
-            .clone()
-            .or_else(|| OrgContact::from_branding(&branding).phrase_for(&tenant_name));
+        let contact_info = definition.contact_info.clone().or_else(|| org.phrase());
         Ok(PublicFormResponse {
             name: definition.name,
             description: definition.description,
-            tenant_name,
+            tenant_name: org.name().to_string(),
             contact_info,
-            logo_url: branding.logo_url,
+            logo_url: org.logo_path().map(str::to_string),
             rules: definition.rules,
             fields: definition
                 .fields
@@ -535,124 +522,6 @@ fn sender_display_name(first_name: &str, last_name: &str, email: &str) -> String
     format!("{first} {last}")
 }
 
-/// PMS-748: the "how do I ask about this?" line, which is never empty.
-///
-/// The MSP's NAME is not optional: a client asked for personal details is
-/// always told who is asking. The contact details are, so the sentence has two
-/// shapes rather than one shape with a hole in it. Nothing here promises a
-/// channel the deployment does not have: with no contact details it names the
-/// sender rather than inviting a reply the from-address cannot accept.
-fn contact_line(tenant_name: &str, contact_info: Option<&str>, org: &OrgContact) -> String {
-    let opening = "Questions about this request?";
-    if let Some(info) = contact_info.map(str::trim).filter(|c| !c.is_empty()) {
-        return format!("{opening} Contact {tenant_name} at {info}.");
-    }
-    // MAPPS-429: the organisation's own contact, used when the form defines
-    // none. PMS-748 named this as the obvious follow-up: a per-form line is for
-    // the request type that routes somewhere unusual, not for every form to
-    // repeat the same service-desk number.
-    match (org.name(), org.channels()) {
-        (Some(name), Some(channels)) => {
-            format!("{opening} Contact {name} at {tenant_name} {channels}.")
-        }
-        (Some(name), None) => format!("{opening} Contact {name} at {tenant_name}."),
-        (None, Some(channels)) => format!("{opening} Contact {tenant_name} {channels}."),
-        (None, None) => format!("{opening} Contact {tenant_name}, who sent it to you."),
-    }
-}
-
-/// MAPPS-429: the tenant-level contact, as `tenants.branding` holds it.
-///
-/// A borrowed view rather than the whole `TenantBranding`, so the composition
-/// above cannot reach for a field (colours, portal domain) that has nothing to
-/// do with the sentence it is writing.
-#[derive(Default, Clone, Copy)]
-struct OrgContact<'a> {
-    name: Option<&'a str>,
-    phone: Option<&'a str>,
-    /// PMS-755: the channel most clients reach for first. Optional even at
-    /// onboarding, where the phone is required: demanding two channels before
-    /// an MSP can finish setting up is a tax on the common case.
-    email: Option<&'a str>,
-}
-
-impl<'a> OrgContact<'a> {
-    fn from_branding(b: &'a mokosh_types::tenants::TenantBranding) -> Self {
-        Self {
-            name: b.support_contact_name.as_deref(),
-            phone: b.support_phone.as_deref(),
-            email: b.support_email.as_deref(),
-        }
-    }
-
-    fn name(&self) -> Option<&str> {
-        self.name.map(str::trim).filter(|v| !v.is_empty())
-    }
-
-    fn phone(&self) -> Option<&str> {
-        self.phone.map(str::trim).filter(|v| !v.is_empty())
-    }
-
-    fn email(&self) -> Option<&str> {
-        self.email.map(str::trim).filter(|v| !v.is_empty())
-    }
-
-    /// PMS-755: how to reach them, as a phrase that slots after a name.
-    ///
-    /// The preposition belongs to the channel, not to the sentence: "on" reads
-    /// right before a number and wrong before an address. Built here rather
-    /// than at the call sites so the email and the form page cannot word the
-    /// same two facts differently.
-    fn channels(&self) -> Option<String> {
-        match (self.phone(), self.email()) {
-            (Some(p), Some(e)) => Some(format!("on {p} or by email at {e}")),
-            (Some(p), None) => Some(format!("on {p}")),
-            (None, Some(e)) => Some(format!("by email at {e}")),
-            (None, None) => None,
-        }
-    }
-
-    /// The same contact as a bare phrase for the client's form page, which
-    /// writes "Contact {phrase}." and therefore cannot start with a
-    /// preposition. `who` is the organisation name, used when no contact person
-    /// is set, so the sentence never opens on a phone number.
-    fn phrase_for(&self, who: &str) -> Option<String> {
-        let name = self.name().unwrap_or(who);
-        match (self.channels(), self.name().is_some()) {
-            (Some(channels), _) => Some(format!("{name} {channels}")),
-            (None, true) => Some(name.to_string()),
-            (None, false) => None,
-        }
-    }
-}
-
-/// MAPPS-429: the logo block for the HTML email, or an empty string.
-///
-/// Empty whenever the deployment has not been told its own public base URL, or
-/// the tenant has no logo. Same reasoning as PMS-748's abuse notice: the
-/// template renderer has no conditionals, so an element that must sometimes
-/// disappear has to be composed whole here, and a key that can be empty must
-/// still always be supplied or the client receives literal braces.
-///
-/// A mail client cannot resolve a relative `src`, so this is the one caller
-/// that needs an absolute URL. It is deliberately NOT built from `BASE_URL` or
-/// `SPA_BASE_URL`: on every deployed environment those are the apex and the
-/// SPA, and the logo is served by the API on a third host.
-fn logo_html(public_api_base: Option<&str>, logo_path: Option<&str>, alt: &str) -> String {
-    let (Some(base), Some(path)) = (
-        public_api_base.map(str::trim).filter(|b| !b.is_empty()),
-        logo_path.map(str::trim).filter(|p| !p.is_empty()),
-    ) else {
-        return String::new();
-    };
-    let src = format!("{}{}", base.trim_end_matches('/'), path);
-    format!(
-        "<p><img src=\"{}\" alt=\"{}\" style=\"max-height:56px;max-width:220px\"></p>",
-        html_escape(&src),
-        html_escape(alt)
-    )
-}
-
 /// PMS-748: the report-abuse line, in text and HTML flavours, or two empty
 /// strings when the deployment has not configured an address.
 ///
@@ -674,32 +543,6 @@ fn abuse_notice(abuse_contact_email: Option<&str>, form_name: &str) -> (String, 
         "<p>Did not expect this? <a href=\"mailto:{escaped}?subject={subject}\">Report it</a>.</p>"
     );
     (text, html)
-}
-
-/// Minimal escaping for the few characters that would break out of an
-/// attribute or an element. Not a general-purpose sanitiser: the only value
-/// passed through it is an operator-configured email address.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// Percent-encode a `mailto:` subject. Everything outside the unreserved set
-/// is encoded, so a form name carrying a space, an ampersand or a quote cannot
-/// truncate the URL or escape the attribute.
-fn urlencoded(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// A one-line summary for the ticket title, taken from the first answered text
@@ -871,167 +714,6 @@ mod tests {
     }
 
     /// PMS-748: the MSP is always named. Only the channel is optional.
-    #[test]
-    fn the_contact_line_always_names_the_msp() {
-        assert_eq!(
-            contact_line(
-                "Acme IT",
-                Some("support@acme.example on 555-0100"),
-                &OrgContact::default()
-            ),
-            "Questions about this request? Contact Acme IT at support@acme.example on 555-0100."
-        );
-        assert_eq!(
-            contact_line("Acme IT", None, &OrgContact::default()),
-            "Questions about this request? Contact Acme IT, who sent it to you.",
-            "with no contact details the line still says who is asking, and promises no channel"
-        );
-        assert_eq!(
-            contact_line("Acme IT", Some("   "), &OrgContact::default()),
-            contact_line("Acme IT", None, &OrgContact::default()),
-            "a definition saved with a blank contact field is the same as one without"
-        );
-    }
-
-    /// MAPPS-429: a form defines its own contact only when the request type
-    /// routes somewhere unusual. Otherwise the organisation's own contact
-    /// answers, so an MSP sets a service-desk number once rather than on every
-    /// definition.
-    #[test]
-    fn the_organisation_contact_answers_when_a_form_defines_none() {
-        let org = OrgContact {
-            name: Some("the service desk"),
-            phone: Some("555-0100"),
-            email: None,
-        };
-        assert_eq!(
-            contact_line("Acme IT", None, &org),
-            "Questions about this request? Contact the service desk at Acme IT on 555-0100."
-        );
-        assert_eq!(
-            contact_line("Acme IT", Some("Dana on 555-0199"), &org),
-            "Questions about this request? Contact Acme IT at Dana on 555-0199.",
-            "the form's own contact wins; that is what defining one is for"
-        );
-        assert_eq!(
-            contact_line(
-                "Acme IT",
-                None,
-                &OrgContact {
-                    name: None,
-                    phone: Some("555-0100"),
-                    email: None,
-                }
-            ),
-            "Questions about this request? Contact Acme IT on 555-0100.",
-            "half an organisation contact is still better than none"
-        );
-        assert_eq!(
-            contact_line(
-                "Acme IT",
-                None,
-                &OrgContact {
-                    name: Some("  "),
-                    phone: Some("  "),
-                    email: Some("  "),
-                }
-            ),
-            contact_line("Acme IT", None, &OrgContact::default()),
-            "branding saved with blank strings is the same as branding without them"
-        );
-    }
-
-    /// PMS-755: an email address is the channel most clients reach for, and the
-    /// sentence has to read correctly for every combination of the three parts
-    /// an organisation may have set.
-    #[test]
-    fn the_contact_line_offers_whichever_channels_exist() {
-        let with =
-            |name, phone, email| contact_line("Acme IT", None, &OrgContact { name, phone, email });
-
-        assert_eq!(
-            with(Some("the service desk"), Some("555-0100"), Some("help@acme.example")),
-            "Questions about this request? Contact the service desk at Acme IT on 555-0100 or by email at help@acme.example."
-        );
-        assert_eq!(
-            with(Some("Dana"), None, Some("help@acme.example")),
-            "Questions about this request? Contact Dana at Acme IT by email at help@acme.example.",
-            "`on` reads right before a number and wrong before an address, so the preposition belongs to the channel"
-        );
-        assert_eq!(
-            with(None, None, Some("help@acme.example")),
-            "Questions about this request? Contact Acme IT by email at help@acme.example."
-        );
-        assert_eq!(
-            with(None, None, None),
-            "Questions about this request? Contact Acme IT, who sent it to you.",
-            "an organisation that set nothing still gets a sentence, not a dangling preposition"
-        );
-    }
-
-    /// The form page writes "Contact {phrase}.", so the phrase can never open
-    /// on a preposition. With no contact person the organisation's own name
-    /// stands in, which is why this takes one.
-    #[test]
-    fn the_form_page_phrase_never_opens_on_a_preposition() {
-        let org = OrgContact {
-            name: None,
-            phone: Some("555-0100"),
-            email: None,
-        };
-        assert_eq!(
-            org.phrase_for("Acme IT").as_deref(),
-            Some("Acme IT on 555-0100")
-        );
-
-        let named = OrgContact {
-            name: Some("the service desk"),
-            phone: None,
-            email: Some("help@acme.example"),
-        };
-        assert_eq!(
-            named.phrase_for("Acme IT").as_deref(),
-            Some("the service desk by email at help@acme.example")
-        );
-
-        assert_eq!(
-            OrgContact::default().phrase_for("Acme IT"),
-            None,
-            "nothing set means the page shows no contact line at all, rather than one naming only the sender it already names"
-        );
-    }
-
-    /// MAPPS-429: a mail client cannot resolve a relative `src`, so the logo is
-    /// absolute or absent. Absent covers both an unconfigured deployment and a
-    /// tenant that never uploaded one.
-    #[test]
-    fn the_emailed_logo_is_absolute_or_not_there_at_all() {
-        assert_eq!(
-            logo_html(
-                Some("https://api.msp.example/"),
-                Some("/api/v1/public/tenants/1/logo"),
-                "Acme & Co"
-            ),
-            concat!(
-                "<p><img src=\"https://api.msp.example/api/v1/public/tenants/1/logo\"",
-                " alt=\"Acme &amp; Co\" style=\"max-height:56px;max-width:220px\"></p>"
-            ),
-            "a trailing slash on the base must not double up, and the alt text is escaped"
-        );
-        assert_eq!(
-            logo_html(None, Some("/api/v1/public/tenants/1/logo"), "Acme"),
-            "",
-            "no public base means no absolute URL, so no image rather than a broken one"
-        );
-        assert_eq!(
-            logo_html(Some("https://api.msp.example"), None, "Acme"),
-            "",
-            "a tenant without a logo contributes nothing"
-        );
-    }
-
-    /// PMS-748: an abuse link that goes nowhere is worse than none, so an
-    /// unconfigured deployment emits nothing at all, in either flavour.
     #[test]
     fn an_unconfigured_abuse_contact_emits_no_line() {
         assert_eq!(

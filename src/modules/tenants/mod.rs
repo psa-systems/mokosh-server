@@ -2,6 +2,11 @@
 //!
 //! Handles tenant provisioning, configuration, and management.
 
+// PMS-761: the organisation identity every client-facing email renders.
+// Deliberately outside the `multi-tenant` gate below: its callers (quotes,
+// billing, tickets, forms) are unconditional, and a single-tenant build still
+// has an organisation with a name.
+pub mod identity;
 mod models;
 
 // PMS-21 AC3: `routes` and `service` only need to exist when this
@@ -18,6 +23,7 @@ mod routes;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 mod service;
 
+pub use identity::OrgIdentity;
 pub use models::*;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 pub use routes::{public_tenant_routes, tenant_routes};
