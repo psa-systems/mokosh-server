@@ -2960,6 +2960,52 @@ impl PortalAuthService {
         })
     }
 
+    /// PMS-729 phase 2 §7 slice D / I15 follow-up: fetch the finished
+    /// JSON bundle for a caller's export job. Returns `None` when the
+    /// bundle is not yet ready (queued / running / failed) OR when the
+    /// row has expired past its 7-day TTL. Cross-contact ids return
+    /// [`AppError::NotFound`].
+    ///
+    /// The bundle body is stored in `portal_exports.bundle_json` at
+    /// worker-completion time; older rows may have been scrubbed by a
+    /// future retention cron but the auditable row stays.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id, job_id = %job_id))]
+    pub async fn get_portal_export_bundle(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+        job_id: Uuid,
+    ) -> AppResult<Option<serde_json::Value>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, Option<DateTime<Utc>>, Option<serde_json::Value>)> =
+            sqlx::query_as(
+                r#"
+            SELECT status, expires_at, bundle_json
+            FROM portal_exports
+            WHERE tenant_id = $1 AND contact_id = $2 AND id = $3
+            "#,
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .bind(job_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        let Some((status, expires_at, bundle_json)) = row else {
+            return Err(AppError::NotFound("Export job".to_string()));
+        };
+        // Not ready yet, or already expired past its 7-day TTL.
+        if status != "ready" {
+            return Ok(None);
+        }
+        if let Some(exp) = expires_at {
+            if exp <= chrono::Utc::now() {
+                return Ok(None);
+            }
+        }
+        Ok(bundle_json)
+    }
+
     /// PMS-729 phase 2 §7 slice D / I15: poll a data-export job. Rows
     /// are scoped to the caller so another contact cannot fetch a
     /// sibling's bundle URL. Expired rows return 410 Gone via the

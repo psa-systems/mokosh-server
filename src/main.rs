@@ -521,6 +521,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduled_dashboards_worker,
         std::time::Duration::from_secs(60),
     );
+    // PMS-729 phase 2 §7 slice D / I15 follow-up: portal data-export
+    // worker. 60s tick is generous - customers rarely request more
+    // than a handful per tenant per day - and matches the neighbours'
+    // cadence so the log lines line up.
+    let portal_export_worker =
+        mokosh_server::modules::portal::export_worker::PortalExportWorker::new(db.clone());
+    scheduler.register(portal_export_worker, std::time::Duration::from_secs(60));
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.

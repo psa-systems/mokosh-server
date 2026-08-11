@@ -38,6 +38,7 @@
 //! implementation choice and does not apply.
 
 pub mod captcha;
+pub mod export_worker;
 pub mod host_tenant;
 pub mod middleware;
 pub mod models;

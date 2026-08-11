@@ -244,6 +244,7 @@ pub fn portal_routes(
         )
         .route("/export", post(request_portal_export))
         .route("/export/{job_id}", get(get_portal_export))
+        .route("/export/{job_id}/download", get(download_portal_export))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             mw,
@@ -921,13 +922,57 @@ async fn get_portal_export(
     // 7-day mark. Once past that, blank the URL client-side and mark
     // the status so the SPA can render "expired, please re-request".
     // The row stays server-side for audit.
-    if let Some(exp) = job.expires_at {
-        if exp <= chrono::Utc::now() {
-            job.status = "expired".to_string();
-            job.signed_url = None;
-        }
+    let expired = job
+        .expires_at
+        .map(|exp| exp <= chrono::Utc::now())
+        .unwrap_or(false);
+    if expired {
+        job.status = "expired".to_string();
+        job.signed_url = None;
+    } else if job.status == "ready" {
+        // Server hands the SPA the portal-authed download path; the
+        // SPA hits it with the bearer via `get_portal_authed_bytes`
+        // (a plain <a href> would 401 because the bearer only lives
+        // in WASM memory).
+        job.signed_url = Some(format!("/portal/export/{job_id}/download"));
     }
     Ok((StatusCode::OK, Json(job)).into_response())
+}
+
+/// PMS-729 phase 2 §7 slice D / I15 follow-up: download the JSON bundle
+/// for a caller's ready export. `AppError::NotFound` when the job id
+/// is cross-contact or unknown; 410 Gone when the row exists but the
+/// bundle is not yet ready OR has expired past its 7-day TTL.
+async fn download_portal_export(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(job_id): Path<Uuid>,
+) -> AppResult<Response> {
+    let bundle = state
+        .service
+        .get_portal_export_bundle(contact.tenant(), contact.id, job_id)
+        .await?;
+    let Some(bundle) = bundle else {
+        return Ok((StatusCode::GONE, "Bundle unavailable").into_response());
+    };
+    let body = serde_json::to_vec_pretty(&bundle).unwrap_or_else(|_| b"{}".to_vec());
+    let filename = format!("mokosh-portal-export-{job_id}.json");
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                    .unwrap_or(HeaderValue::from_static("attachment")),
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 /// PMS-729 phase 2 §7 slice B / I12: portal inbox list. Contact-scoped
