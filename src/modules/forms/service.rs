@@ -26,6 +26,7 @@ struct DefinitionRow {
     name: String,
     slug: String,
     description: Option<String>,
+    contact_info: Option<String>,
     kb_article_id: Option<Uuid>,
     kb_article_title: Option<String>,
     rules: serde_json::Value,
@@ -96,7 +97,7 @@ impl From<SubmissionRow> for FormSubmissionResponse {
 }
 
 const DEFINITION_SELECT: &str = "
-    d.id, d.name, d.slug, d.description, d.kb_article_id,
+    d.id, d.name, d.slug, d.description, d.contact_info, d.kb_article_id,
     a.title AS kb_article_title,
     d.rules, d.is_active, d.created_by_id, d.created_at, d.updated_at
 ";
@@ -120,6 +121,18 @@ pub struct FormsService {
     /// Turns a submission into a ticket (PMS-730). `None` on the
     /// definition-only surface, where submissions are stored but not converted.
     pub(super) tickets: Option<crate::modules::tickets::TicketService>,
+    /// PMS-748: where a client reports an unwanted request-form email.
+    ///
+    /// A per-deployment fact (`ABUSE_CONTACT_EMAIL`), not a per-tenant one:
+    /// the point of an abuse channel is that it does NOT reach the sender.
+    /// `None` when unconfigured, and the email then carries no such line at
+    /// all, because a report-abuse link that goes nowhere is worse than none.
+    pub(super) abuse_contact_email: Option<String>,
+    /// MAPPS-429: this deployment's own public base URL, used to make the
+    /// tenant logo absolute for a mail client. `None` omits the logo: a
+    /// relative `src` in an email is a broken image, so a missing base means no
+    /// image rather than a broken one.
+    pub(super) public_api_base: Option<String>,
 }
 
 impl FormsService {
@@ -128,6 +141,8 @@ impl FormsService {
             db,
             notifications: None,
             tickets: None,
+            abuse_contact_email: None,
+            public_api_base: None,
         }
     }
 
@@ -143,7 +158,23 @@ impl FormsService {
             db,
             notifications: Some(notifications),
             tickets: Some(tickets),
+            abuse_contact_email: None,
+            public_api_base: None,
         }
+    }
+
+    /// PMS-748: the address a client can report an unwanted request-form email
+    /// to. Left unset, the email carries no abuse line.
+    pub fn with_abuse_contact(mut self, email: Option<String>) -> Self {
+        self.abuse_contact_email = email.filter(|e| !e.trim().is_empty());
+        self
+    }
+
+    /// MAPPS-429: the public base URL of this deployment's API, so an emailed
+    /// logo has an absolute `src`. Left unset, the email carries no logo.
+    pub fn with_public_api_base(mut self, base: Option<String>) -> Self {
+        self.public_api_base = base.filter(|b| !b.trim().is_empty());
+        self
     }
 
     pub async fn list(
@@ -247,14 +278,15 @@ impl FormsService {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO form_definitions \
-             (id, tenant_id, name, slug, description, kb_article_id, rules, is_active, created_by_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             (id, tenant_id, name, slug, description, contact_info, kb_article_id, rules, is_active, created_by_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(id)
         .bind(tenant_id)
         .bind(&req.name)
         .bind(&req.slug)
         .bind(&req.description)
+        .bind(&req.contact_info)
         .bind(req.kb_article_id)
         .bind(serde_json::to_value(&req.rules).unwrap_or_else(|_| serde_json::json!([])))
         .bind(req.is_active)
@@ -306,9 +338,10 @@ impl FormsService {
             "UPDATE form_definitions SET \
                name = COALESCE($3, name), \
                description = CASE WHEN $4 THEN $5 ELSE description END, \
-               kb_article_id = CASE WHEN $6 THEN $7 ELSE kb_article_id END, \
-               rules = COALESCE($8, rules), \
-               is_active = COALESCE($9, is_active), \
+               contact_info = CASE WHEN $6 THEN $7 ELSE contact_info END, \
+               kb_article_id = CASE WHEN $8 THEN $9 ELSE kb_article_id END, \
+               rules = COALESCE($10, rules), \
+               is_active = COALESCE($11, is_active), \
                updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2",
         )
@@ -317,6 +350,8 @@ impl FormsService {
         .bind(&req.name)
         .bind(req.description.is_some())
         .bind(req.description.clone().flatten())
+        .bind(req.contact_info.is_some())
+        .bind(req.contact_info.clone().flatten())
         .bind(req.kb_article_id.is_some())
         .bind(req.kb_article_id.flatten())
         .bind(
@@ -490,9 +525,20 @@ impl FormsService {
         // just `get(...)` re-wrapped for the token flow, so we reuse
         // `get` directly here).
         let def = self.get(tenant_id, form_id).await?;
+        // MAPPS-429 + PMS-748: the wire shape needs tenant name / contact /
+        // logo. The portal SPA already carries branding from `/portal/host`
+        // so it never renders these three fields, but the shared type
+        // requires them; load the org identity the same way the magic-link
+        // path does so the payload stays a superset that a future portal
+        // surface (or SDK consumer) can render if it wants.
+        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
+        let contact_info = def.contact_info.clone().or_else(|| org.phrase());
         Ok(super::models::PublicFormResponse {
             name: def.name,
             description: def.description,
+            tenant_name: org.name().to_string(),
+            contact_info,
+            logo_url: org.logo_path().map(str::to_string),
             rules: def.rules,
             fields: def
                 .fields
@@ -649,6 +695,7 @@ fn build_response(d: DefinitionRow, fields: Vec<FormFieldResponse>) -> FormDefin
         name: d.name,
         slug: d.slug,
         description: d.description,
+        contact_info: d.contact_info,
         kb_article_id: d.kb_article_id,
         kb_article_title: d.kb_article_title,
         // A rule shape this build does not understand is dropped rather than

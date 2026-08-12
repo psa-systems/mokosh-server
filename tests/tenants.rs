@@ -36,7 +36,7 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
 
     let tenants = TenantService::new(Database::from_pool(pool.clone()));
     let org_tenant = tenants
-        .ensure_personal_tenant(uuid::Uuid::new_v4())
+        .ensure_personal_tenant(uuid::Uuid::new_v4(), None, None)
         .await
         .expect("provision target tenant");
 
@@ -72,7 +72,7 @@ async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
     let owner_b = uuid::Uuid::new_v4();
 
     let first = svc
-        .ensure_personal_tenant(owner_a)
+        .ensure_personal_tenant(owner_a, None, None)
         .await
         .expect("provision tenant");
 
@@ -106,13 +106,13 @@ async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
 
     // Second call resolves the same tenant; a different owner gets a different one.
     let again = svc
-        .ensure_personal_tenant(owner_a)
+        .ensure_personal_tenant(owner_a, None, None)
         .await
         .expect("resolve tenant");
     assert_eq!(again, first, "idempotent for the same owner");
 
     let other = svc
-        .ensure_personal_tenant(owner_b)
+        .ensure_personal_tenant(owner_b, None, None)
         .await
         .expect("provision second owner");
     assert_ne!(other, first, "distinct owner gets a distinct tenant");
@@ -522,12 +522,14 @@ async fn create_tenant_persists_optional_branding(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let branding = mokosh_types::tenants::TenantBranding {
         logo_url: Some("https://cdn.example/logo.svg".to_string()),
+        logo_mime: None,
         favicon_url: None,
         primary_color: Some("#2563eb".to_string()),
         secondary_color: None,
         company_name: None,
         support_email: Some("help@acme-mapps396.example".to_string()),
         support_phone: None,
+        support_contact_name: None,
         portal_domain: None,
     };
     let req = CreateTenantRequest {
@@ -651,4 +653,516 @@ async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) 
         internal_count, 1,
         "exactly one own-company, even after two runs"
     );
+}
+
+// ============================================================================
+// PMS-751: the caller's own tenant, addressed without an id
+// ============================================================================
+
+/// The organization settings page could neither load nor save, because the SPA
+/// built its URL from the `mokosh_tenant_id` id_token claim and bunyip only
+/// mints that for a client configured with `tenant_claim_name`. Without it the
+/// SPA carried the nil uuid and asked for a tenant that does not exist.
+///
+/// These routes take no id, so the page works whether or not that claim is ever
+/// configured. Asserted end to end because the whole failure was that the id in
+/// the URL was wrong, which no unit test on a service can see.
+#[sqlx::test]
+async fn current_reads_and_renames_the_callers_own_tenant(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let seeded: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("seeded tenant name");
+
+    let body: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get current tenant")
+        .json()
+        .await
+        .expect("current tenant JSON");
+    assert_eq!(body["name"].as_str(), Some(seeded.as_str()));
+    assert_eq!(
+        body["id"].as_str(),
+        Some(common::DEFAULT_TENANT_ID.to_string().as_str()),
+        "`current` must resolve the caller's own tenant, not the first row it finds"
+    );
+
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Acme IT" }))
+        .send()
+        .await
+        .expect("send rename");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The name clients see in request-form and invitation email, so the write
+    // is asserted against the column those read rather than the response body.
+    let stored: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("renamed tenant");
+    assert_eq!(stored, "Acme IT");
+}
+
+/// `current` is not a uuid, and must never be parsed as one: a static segment
+/// has to win over `/{tenant_id}` or the route would 400 on every call.
+#[sqlx::test]
+async fn current_is_not_mistaken_for_a_tenant_id(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get current tenant");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a 400 here means `current` was routed into the uuid path param"
+    );
+}
+
+/// Reading your own tenant needs only a session, but renaming it is tenant-wide
+/// configuration: the name is the "from" on every email a client receives.
+#[sqlx::test]
+async fn a_non_admin_can_read_but_not_rename_their_tenant(pool: PgPool) {
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "pms751-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &tech_email, &tech_password).await;
+
+    let read = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send read");
+    assert_eq!(read.status(), reqwest::StatusCode::OK);
+
+    let write = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Renamed by a technician" }))
+        .send()
+        .await
+        .expect("send rename");
+    assert_eq!(write.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let stored: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("tenant name");
+    assert_ne!(stored, "Renamed by a technician");
+}
+
+/// PMS-751: the new routes address the caller's own tenant and nothing else, so
+/// a second tenant's row must be unreachable through them however the caller is
+/// authenticated.
+#[sqlx::test]
+async fn current_cannot_reach_another_tenant(pool: PgPool) {
+    let (other_tenant, _id, _email, _password) =
+        common::seed_tenant_with_admin(&pool, "pms751-other").await;
+    let (_tech_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "pms751-scoped@example.com",
+        "admin",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    app.client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Only mine" }))
+        .send()
+        .await
+        .expect("send rename");
+
+    let others: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .fetch_one(&pool)
+        .await
+        .expect("other tenant name");
+    assert_ne!(
+        others, "Only mine",
+        "renaming via `current` must touch only the caller's tenant"
+    );
+}
+
+// ============================================================================
+// MAPPS-429: organisation contact + logo
+// ============================================================================
+
+/// The logo has to reach a client's browser AND a client's mail client, neither
+/// of which has a session, so the read side is public. Asserted end to end
+/// because the whole point is the hop from an authenticated upload to an
+/// unauthenticated fetch.
+#[sqlx::test]
+async fn a_logo_is_uploaded_by_an_admin_and_served_to_anyone(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // A one-pixel PNG. Real bytes rather than a stub, so the round trip proves
+    // the file survived rather than that a string did.
+    let png: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89,
+    ];
+    let part = reqwest::multipart::Part::bytes(png.to_vec())
+        .file_name("logo.png")
+        .mime_str("image/png")
+        .expect("mime");
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current/logo"))
+        .bearer_auth(&token)
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .expect("send upload");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("tenant JSON");
+    let logo_url = body["branding"]["logo_url"]
+        .as_str()
+        .expect("branding carries the logo path")
+        .to_string();
+    assert!(
+        logo_url.starts_with("/api/v1/public/"),
+        "the stored path must be the public one, got {logo_url}"
+    );
+
+    // No bearer: this is the client, or their mail client.
+    let served = app
+        .client
+        .get(app.url(&logo_url))
+        .send()
+        .await
+        .expect("send public fetch");
+    assert_eq!(served.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        served
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png"),
+        "the stored mime is what makes this renderable without sniffing"
+    );
+    assert_eq!(served.bytes().await.expect("bytes").as_ref(), png);
+
+    // Deleting clears the pointer, and the public route stops answering.
+    let deleted = app
+        .client
+        .delete(app.url("/api/v1/tenants/current/logo"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+    let after: serde_json::Value = deleted.json().await.expect("tenant JSON");
+    assert!(after["branding"]["logo_url"].is_null());
+
+    let gone = app
+        .client
+        .get(app.url(&logo_url))
+        .send()
+        .await
+        .expect("send public fetch after delete");
+    assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// A logo is what every client sees on this tenant's forms and email, so it is
+/// tenant-wide configuration, gated like the rename.
+#[sqlx::test]
+async fn a_non_admin_cannot_replace_the_logo(pool: PgPool) {
+    let (_tech_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "mapps429-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let part = reqwest::multipart::Part::bytes(vec![1, 2, 3])
+        .file_name("logo.png")
+        .mime_str("image/png")
+        .expect("mime");
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current/logo"))
+        .bearer_auth(&token)
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .expect("send upload");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+/// An unsupported type is refused rather than stored and served back as
+/// `octet-stream`, and SVG is refused specifically: it is a script-capable
+/// document and this route serves it from the API origin to anonymous callers.
+#[sqlx::test]
+async fn an_unsupported_image_type_is_refused(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (mime, name) in [
+        ("application/pdf", "logo.pdf"),
+        ("image/svg+xml", "logo.svg"),
+    ] {
+        let part = reqwest::multipart::Part::bytes(b"not an image".to_vec())
+            .file_name(name)
+            .mime_str(mime)
+            .expect("mime");
+        let resp = app
+            .client
+            .put(app.url("/api/v1/tenants/current/logo"))
+            .bearer_auth(&token)
+            .multipart(reqwest::multipart::Form::new().part("file", part))
+            .send()
+            .await
+            .expect("send upload");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{mime} must be refused"
+        );
+    }
+}
+
+/// PMS-758: `branding` is a JSONB document written by more than one caller.
+///
+/// The organisation settings page sends four contact keys; the logo upload
+/// sends two of its own. A whole-document write meant saving the settings page
+/// deleted `logo_mime`, so the public logo route answered 404 and every client
+/// email rendered a broken image. Merging keeps what a caller did not mention,
+/// and an explicit null still clears.
+#[sqlx::test]
+async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // What the logo upload writes.
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": { "logo_url": "/api/v1/public/tenants/x/logo", "logo_mime": "image/png" }
+        }))
+        .send()
+        .await
+        .expect("send logo branding");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // What the settings page writes: its own keys, and nothing about the logo.
+    let after: serde_json::Value = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": { "support_contact_name": "the service desk", "support_phone": "555-0100" }
+        }))
+        .send()
+        .await
+        .expect("send contact branding")
+        .json()
+        .await
+        .expect("tenant JSON");
+
+    assert_eq!(
+        after["branding"]["logo_mime"].as_str(),
+        Some("image/png"),
+        "the settings page must not delete the content type the logo route needs"
+    );
+    assert_eq!(
+        after["branding"]["logo_url"].as_str(),
+        Some("/api/v1/public/tenants/x/logo")
+    );
+    assert_eq!(
+        after["branding"]["support_contact_name"].as_str(),
+        Some("the service desk")
+    );
+
+    // An explicit null still clears: that is how the settings page empties a
+    // contact field, and why it sends nulls rather than omitting them.
+    let cleared: serde_json::Value = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": { "support_contact_name": null }
+        }))
+        .send()
+        .await
+        .expect("send clearing branding")
+        .json()
+        .await
+        .expect("tenant JSON");
+    assert!(cleared["branding"]["support_contact_name"].is_null());
+    assert_eq!(
+        cleared["branding"]["logo_mime"].as_str(),
+        Some("image/png"),
+        "clearing one key must not disturb another"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PMS-761: the organisation identity every client-facing email renders
+// ---------------------------------------------------------------------------
+
+/// The identity in a client's email has to be the identity of the tenant that
+/// owns the thing the email is about. `OrgIdentity::load` is the single reader
+/// for all of them, so this is the one place that guarantee is checked.
+#[sqlx::test]
+async fn the_org_identity_loads_the_callers_own_tenant(pool: PgPool) {
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::tenants::OrgIdentity;
+
+    let db = Database::from_pool(pool.clone());
+    let svc = TenantService::new(db.clone());
+
+    let other = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Northwind MSP".into(),
+                slug: "northwind-msp".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "owner-pms761@example.test".into(),
+                admin_first_name: "Owner".into(),
+                admin_last_name: "Pms761".into(),
+                branding: None,
+            },
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create_tenant must succeed");
+
+    sqlx::query(
+        r#"UPDATE tenants SET branding = '{"support_contact_name":"the service desk","support_phone":"555-0100"}'::jsonb WHERE id = $1"#,
+    )
+    .bind(other.id)
+    .execute(&pool)
+    .await
+    .expect("set branding");
+
+    let loaded = OrgIdentity::load(&db, TenantId::from_trusted(other.id))
+        .await
+        .expect("load the org identity");
+    assert_eq!(loaded.name(), "Northwind MSP");
+    assert_eq!(
+        loaded.contact_line("Questions about this invoice?", None),
+        "Questions about this invoice? Contact the service desk at Northwind MSP on 555-0100."
+    );
+
+    // The default tenant is a different organisation and reads as one, so a
+    // caller that threads the wrong tenant_id produces a visibly wrong email
+    // rather than a plausible one.
+    let default = OrgIdentity::load(&db, TenantId::from_trusted(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("load the default tenant identity");
+    assert_ne!(default.name(), loaded.name());
+    assert_eq!(default.contact_name(), None);
+}
+
+/// PMS-761: `dispatch` resolves rules by (tenant_id, event_type) and skips
+/// silently when a tenant has none, so a client-facing template with no rule is
+/// a message that is never sent. `ticket.note_added` was seeded for the default
+/// tenant only and never copied, and `forms.request_link` had its template
+/// copied but not its rule: both were silent for every tenant created here.
+#[sqlx::test]
+async fn a_new_tenant_can_actually_send_the_client_facing_email(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+
+    let tenant = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Fabrikam IT".into(),
+                slug: "fabrikam-it".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "owner-pms761b@example.test".into(),
+                admin_first_name: "Owner".into(),
+                admin_last_name: "Pms761b".into(),
+                branding: None,
+            },
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create_tenant must succeed");
+
+    for event in ["ticket.note_added", "forms.request_link"] {
+        let usable: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM notification_rules r
+               JOIN notification_templates t ON t.id = r.template_id AND t.tenant_id = r.tenant_id
+               WHERE r.tenant_id = $1 AND r.event_type = $2 AND r.is_active"#,
+        )
+        .bind(tenant.id)
+        .bind(event)
+        .fetch_one(&pool)
+        .await
+        .expect("count usable rules");
+        assert_eq!(
+            usable, 1,
+            "a new tenant needs an active {event} rule pointing at its own template, or the email is never sent",
+        );
+    }
+}
+
+/// Migration 104: the seeded ticket-note copy names the organisation. The keys
+/// are supplied by `TicketsService::send_note_email`; an unresolved one would
+/// reach the client as literal braces, so template and context are asserted
+/// against each other here rather than trusted to stay in step.
+#[sqlx::test]
+async fn the_ticket_note_template_asks_for_the_organisation_identity(pool: PgPool) {
+    let body: String = sqlx::query_scalar(
+        "SELECT body_text FROM notification_templates \
+         WHERE tenant_id = $1 AND event_type = 'ticket.note_added' AND channel_type = 'email'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("the seeded ticket-note template exists");
+
+    for key in ["{{org_name}}", "{{contact_line}}", "{{content}}"] {
+        assert!(
+            body.contains(key),
+            "the ticket-note body must render {key}: {body}"
+        );
+    }
 }

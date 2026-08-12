@@ -2258,6 +2258,34 @@ impl AuthService {
         Ok(found.map(|(is_deleted,)| is_deleted).unwrap_or(false))
     }
 
+    /// PMS-752: stamp `profile_completed_at` for a user who has been through
+    /// the SPA's onboarding screen.
+    ///
+    /// PMS-512 left `upsert_user_from_oidc` as the only writer of this column,
+    /// stamping it on a login whose bunyip claims carry both names. A user
+    /// whose claims did not carry them landed on the onboarding screen with no
+    /// way to leave it: the screen's `PUT /auth/me` cannot set names (bunyip
+    /// owns them) and therefore could not complete the profile either.
+    ///
+    /// `COALESCE` keeps the first timestamp, so this is idempotent: a double
+    /// submit records when onboarding was actually finished, not when it was
+    /// last re-submitted.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn mark_profile_completed(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<User> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE users SET profile_completed_at = COALESCE(profile_completed_at, NOW()), \
+                              updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_user_by_id(tenant_id, user_id).await
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_user_by_id(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<User> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -3251,9 +3279,15 @@ pub fn is_unresolved_placeholder_email(email: &str) -> bool {
 /// which then surfaced on the profile page as a UUID-fragment name.
 /// The fallback name is meant to be a clearly-placeholder string the
 /// user is expected to overwrite from the profile screen.
+/// The `(first, last)` this helper returns when it could not derive anything
+/// real. PMS-743 reads it so tenant naming can tell "derived from the user"
+/// from "gave up", rather than naming a tenant after the placeholder.
 #[cfg(feature = "server")]
-fn synthetic_name_from_email(email: &str) -> (String, String) {
-    const FALLBACK: (&str, &str) = ("Mokosh", "User");
+pub(crate) const SYNTHETIC_NAME_FALLBACK: (&str, &str) = ("Mokosh", "User");
+
+#[cfg(feature = "server")]
+pub(crate) fn synthetic_name_from_email(email: &str) -> (String, String) {
+    const FALLBACK: (&str, &str) = SYNTHETIC_NAME_FALLBACK;
 
     let local = email.split_once('@').map(|(l, _)| l).unwrap_or(email);
 

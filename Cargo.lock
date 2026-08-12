@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "mokosh-server"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

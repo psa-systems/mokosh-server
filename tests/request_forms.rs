@@ -162,6 +162,157 @@ fn field_codes(body: &serde_json::Value) -> Vec<(String, String)> {
     pairs
 }
 
+/// MAPPS-425: the client received a link to the apex and a subject reading
+/// `... request form from {{tenant_name}}`.
+///
+/// The link host is the whole defect: `/request-forms/:token` exists only in
+/// mokosh-apps, and on every deployed environment `CLIENT_ORIGIN` is the apex
+/// (bunyip-web hosts login and the OAuth popup there), so a link built from it
+/// landed on bunyip's 404. The test harness sets `spa_base_url` to a host that
+/// differs from `client_origin` precisely so this cannot pass by coincidence.
+#[sqlx::test]
+async fn the_emailed_link_points_at_the_spa_and_names_the_tenant(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _article_id) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+    let _ = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    let (subject, body): (String, String) = sqlx::query_as(
+        "SELECT subject, body FROM notifications WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("a request-link email was queued");
+
+    assert!(
+        body.contains("http://spa.localhost/request-forms/"),
+        "the link must be built from the SPA origin, not the login origin; got body={body}"
+    );
+    assert!(
+        !body.contains("http://localhost/request-forms/"),
+        "a link on the login origin is the MAPPS-425 404; got body={body}"
+    );
+
+    let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded tenant has a name");
+    assert!(
+        subject.contains(&tenant_name),
+        "the subject must name the MSP; got subject={subject}"
+    );
+    assert!(
+        !subject.contains("{{") && !body.contains("{{"),
+        "an unresolved placeholder must never reach a client; subject={subject} body={body}"
+    );
+}
+
+/// PMS-748: the email has to say who sent it, who it was meant for, how to ask
+/// a question, and how to complain. Before this it said none of the four: a
+/// client received a request for personal details from an organisation name
+/// alone, closing with "if you were not expecting this, you can ignore this
+/// message".
+///
+/// Also the end-to-end check on migration 102, which rewrites the template
+/// seeded by 101. The suite applies both, so a mismatch between the copy and
+/// the keys the sender supplies fails here as an unresolved placeholder.
+#[sqlx::test]
+async fn the_email_names_the_sender_the_client_and_how_to_get_help(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _article_id) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+
+    // Give the definition contact details, the optional half of the footer.
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&agent_token)
+        .json(&json!({ "contact_info": "the service desk on 555-0100" }))
+        .send()
+        .await
+        .expect("patch contact_info");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let _ = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    let (subject, body): (String, String) = sqlx::query_as(
+        "SELECT subject, body FROM notifications WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("a request-link email was queued");
+
+    assert!(
+        body.contains("Test Admin"),
+        "the client must be told which PERSON is asking; got body={body}"
+    );
+    assert!(
+        body.contains("Acme Co"),
+        "the closing line must say who the message was intended for; got body={body}"
+    );
+    assert!(
+        body.contains("the service desk on 555-0100"),
+        "a definition carrying contact details must offer them; got body={body}"
+    );
+    assert!(
+        body.contains("abuse@test.invalid"),
+        "the harness configures an abuse address, so the notice must appear; got body={body}"
+    );
+    assert!(
+        !body.contains("you can ignore this message"),
+        "the replaced line gave a recipient nothing to check; got body={body}"
+    );
+    assert!(
+        !subject.contains("{{") && !body.contains("{{"),
+        "an unresolved placeholder must never reach a client; subject={subject} body={body}"
+    );
+}
+
+/// The form page is reached from an email by someone with no account here, so
+/// it carries its own attribution rather than relying on the message that
+/// linked to it still being open.
+#[sqlx::test]
+async fn the_public_form_names_the_msp(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _article_id) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+    let (token, _link_id) = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    let form: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/public/request-forms/{token}")))
+        .send()
+        .await
+        .expect("send public get")
+        .json()
+        .await
+        .expect("public form JSON");
+
+    let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded tenant has a name");
+    assert_eq!(
+        form["tenant_name"].as_str(),
+        Some(tenant_name.as_str()),
+        "a client must be able to see who is asking without going back to the email"
+    );
+    assert!(
+        form["contact_info"].is_null(),
+        "this definition carries no contact details, and none must be invented"
+    );
+}
+
 #[sqlx::test]
 async fn a_link_resolves_to_the_form_without_leaking_internals(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -330,16 +481,22 @@ async fn a_valid_submission_creates_a_ticket_carrying_the_data_and_the_article(p
 
     // The description renders the answers under the form's own labels, in the
     // form's order, so whoever works the ticket reads what the client saw.
+    // PMS-747: as a Markdown list. The SPA renders this field as Markdown,
+    // where the plain newlines this used to emit are not line breaks, so every
+    // answer collapsed into one run-on paragraph.
     let description = db_description.expect("description");
     assert!(
-        description.contains("First name: Dana"),
+        description.contains("- **First name:** Dana"),
         "got {description}"
     );
     assert!(
-        description.contains("Start date: 2099-06-01"),
+        description.contains("- **Start date:** 2099-06-01"),
         "got {description}"
     );
-    assert!(description.contains("Laptop: new"), "got {description}");
+    assert!(
+        description.contains("- **Laptop:** new"),
+        "got {description}"
+    );
 
     // The chain link -> submission -> ticket is traceable in both directions.
     let (used_at, submission_id): (Option<chrono::DateTime<chrono::Utc>>, Option<Uuid>) =

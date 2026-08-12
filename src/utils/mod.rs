@@ -6,6 +6,7 @@ pub mod datetime;
 pub mod email;
 pub mod error;
 pub mod geoip;
+pub mod html;
 pub mod login_location;
 pub mod pagination;
 // PMS-729 phase 2 H5: shared password-strength policy consumed by every

@@ -773,14 +773,38 @@ impl QuotesService {
         );
         let number = quote.quote_number.as_deref().unwrap_or("(unnumbered)");
         let valid_until = quote.valid_until.map(|d| d.to_string());
+
+        // PMS-761: the client is being asked to approve spend, so the message
+        // says who is asking. A failure to read the identity is not a reason to
+        // withhold the quote, but it IS a reason not to send an anonymous one,
+        // so the send is skipped and logged rather than degraded.
+        let org = match crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await {
+            Ok(org) => org,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e, quote_id = %quote.id,
+                    "could not read the organisation identity; quote sign-off mail not sent",
+                );
+                return;
+            }
+        };
+        let contact_line = org.contact_line("Questions about this quote?", None);
+        let from = crate::utils::email::SenderIdentity {
+            org_name: org.name(),
+            contact_line: &contact_line,
+        };
+
         if let Err(e) = mailer
             .send_quote_ready(
                 &email,
-                number,
-                &quote.title,
-                &quote.total.to_string(),
-                valid_until.as_deref(),
-                &link,
+                from,
+                crate::utils::email::QuoteReady {
+                    quote_number: number,
+                    title: &quote.title,
+                    total: &quote.total.to_string(),
+                    valid_until: valid_until.as_deref(),
+                    portal_link: &link,
+                },
             )
             .await
         {

@@ -245,6 +245,9 @@ async fn boot_with_db(
         "test-jwt-secret-that-is-clearly-not-for-prod".into(),
         google_oauth,
         "http://localhost".into(),
+        // MAPPS-425 spa_base_url: deliberately different from client_origin so
+        // a test asserting an emailed link's host cannot pass by accident.
+        "http://spa.localhost".into(),
         vec!["http://localhost".into()],
         Vec::new(),
         false,  // cookie_secure: irrelevant for bearer-token tests
@@ -260,6 +263,13 @@ async fn boot_with_db(
         None,  // BUNYIP-475: no IP2Proxy DB in tests; enrichment lookup reports nothing
         false, // PMS-658: login-approval gate off in the default test router
         portal_host_config, // PMS-729: caller supplies the portal host config
+        // PMS-748: an abuse address IS configured here, so the request-form
+        // suite can assert the notice appears; the unconfigured case is a unit
+        // test on the composition itself.
+        Some("abuse@test.invalid".to_string()),
+        // MAPPS-429: a public API base IS configured here, so the request-form
+        // suite can assert an emailed logo resolves absolutely.
+        Some("http://api.localhost".to_string()),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

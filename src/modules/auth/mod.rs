@@ -42,4 +42,9 @@ pub use service::AuthService;
 // against the Rust one.
 #[cfg(feature = "server")]
 pub use service::{mfa_lock_seconds_sql, mfa_lockout_until};
+// PMS-743: tenant naming derives a personal tenant's display name from the
+// same email-to-name logic the JIT user insert uses, rather than growing a
+// second copy of the UUID / placeholder rejection rules.
+#[cfg(feature = "server")]
+pub(crate) use service::{synthetic_name_from_email, SYNTHETIC_NAME_FALLBACK};
 pub use tenant::{TenantId, TenantScoped};

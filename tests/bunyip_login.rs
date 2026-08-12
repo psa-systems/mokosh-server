@@ -84,7 +84,7 @@ async fn invited_user_lands_in_inviting_tenant_as_admin(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations
@@ -293,7 +293,7 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations
@@ -575,6 +575,61 @@ async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
     );
 }
 
+/// PMS-752: a user whose bunyip claims carried no names lands on the SPA's
+/// onboarding screen, and until now could not leave it. The screen's
+/// `PUT /auth/me` cannot set names (PMS-512 gave those to bunyip), so nothing
+/// stamped `profile_completed_at` and the AuthGuard sent the user straight
+/// back. `POST /auth/me/complete-onboarding` is what lets the screen finish.
+#[sqlx::test]
+async fn complete_onboarding_stamps_the_profile_once(pool: PgPool) {
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("nameless@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("placed");
+
+    let (tenant, _) = user_tenant_role(&pool, sub).await;
+    let before: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT profile_completed_at FROM users WHERE id = $1")
+            .bind(sub)
+            .fetch_one(&pool)
+            .await
+            .expect("read user");
+    assert!(
+        before.is_none(),
+        "no name claims, so the SPA gates this user"
+    );
+
+    let user = auth
+        .mark_profile_completed(tenant, sub)
+        .await
+        .expect("complete onboarding");
+    assert!(
+        user.profile_completed_at.is_some(),
+        "the screen must be able to complete itself"
+    );
+
+    // Idempotent: a double submit records when onboarding was finished, not
+    // when it was last re-submitted.
+    let stamped = user.profile_completed_at;
+    let again = auth
+        .mark_profile_completed(tenant, sub)
+        .await
+        .expect("second call");
+    assert_eq!(again.profile_completed_at, stamped);
+}
+
 /// PMS-512: bunyip owns the profile names, so the local columns are a
 /// read-only cache refreshed on EVERY login, not just the JIT one. A rename in
 /// bunyip lands in `users.first_name` / `last_name` on the next placement.
@@ -796,7 +851,7 @@ async fn userinfo_is_fetched_when_a_pending_invite_matches(pool: PgPool) {
     .expect("first placement");
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations
@@ -1138,7 +1193,7 @@ async fn a_repaired_user_can_then_consume_a_pending_invite(pool: PgPool) {
     .expect("first placement");
 
     let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4())
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
         .await
         .expect("org tenant");
     invitations

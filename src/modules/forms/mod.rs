@@ -14,6 +14,10 @@
 //! types and five rules, with numeric range and file upload deliberately
 //! absent because nothing in that list needs them. See migration 100.
 
+// PMS-759: server-side builder drafts, so a half-built form survives a
+// different machine and not just a different tab.
+#[cfg(feature = "server")]
+mod drafts;
 mod models;
 #[cfg(feature = "server")]
 mod portal_routes;
@@ -27,6 +31,8 @@ mod routes;
 mod service;
 mod validation;
 
+#[cfg(feature = "server")]
+pub use drafts::{FormDraftResponse, UpsertFormDraftRequest};
 pub use models::*;
 #[cfg(feature = "server")]
 pub use portal_routes::portal_form_routes;

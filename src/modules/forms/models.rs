@@ -103,6 +103,8 @@ pub struct FormDefinitionResponse {
     pub name: String,
     pub slug: String,
     pub description: Option<String>,
+    /// PMS-748: how a client reaches the MSP about this request.
+    pub contact_info: Option<String>,
     pub kb_article_id: Option<Uuid>,
     /// Resolved title for `kb_article_id`, so a client can render the
     /// procedure link without a second fetch (the PMS-344 asset pattern).
@@ -161,6 +163,11 @@ pub struct CreateFormDefinitionRequest {
     )]
     pub slug: String,
     pub description: Option<String>,
+    /// PMS-748: how a client reaches the MSP about this request, shown on the
+    /// form page and in the email. Optional; the MSP's NAME is shown either
+    /// way, so a form without this is still attributable.
+    #[validate(length(max = 200))]
+    pub contact_info: Option<String>,
     pub kb_article_id: Option<Uuid>,
     #[serde(default)]
     pub rules: Vec<FormRule>,
@@ -183,6 +190,10 @@ pub struct UpdateFormDefinitionRequest {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     pub description: Option<Option<String>>,
+    /// PMS-748. Double-optioned like `description`, so a form's contact line
+    /// can be cleared as well as changed.
+    #[serde(default, deserialize_with = "double_option")]
+    pub contact_info: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub kb_article_id: Option<Option<Uuid>>,
     pub rules: Option<Vec<FormRule>>,
@@ -292,6 +303,19 @@ pub struct ResolvedRequestToken {
 pub struct PublicFormResponse {
     pub name: String,
     pub description: Option<String>,
+    /// PMS-748: the MSP asking for this. A client arriving from an email link
+    /// otherwise reads a page of personal questions with no name on it. Always
+    /// present: attribution is not optional.
+    pub tenant_name: String,
+    /// PMS-748: how to reach that MSP, when the definition carries it.
+    ///
+    /// MAPPS-429: falls back to the organisation's own contact, so a form that
+    /// defines nothing still tells the client who to ask.
+    pub contact_info: Option<String>,
+    /// MAPPS-429: relative path to the MSP's logo, when it has one. Relative
+    /// because the client renders it against the API base it already resolved
+    /// to fetch this payload.
+    pub logo_url: Option<String>,
     pub rules: Vec<FormRule>,
     pub fields: Vec<PublicFormField>,
 }

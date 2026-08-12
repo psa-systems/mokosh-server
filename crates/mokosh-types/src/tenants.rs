@@ -61,12 +61,20 @@ pub struct Tenant {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TenantBranding {
     pub logo_url: Option<String>,
+    /// MAPPS-429: content type of the stored logo, so the public serving route
+    /// can answer with the right `Content-Type` without sniffing the bytes or
+    /// encoding the format into the filename.
+    pub logo_mime: Option<String>,
     pub favicon_url: Option<String>,
     pub primary_color: Option<String>,
     pub secondary_color: Option<String>,
     pub company_name: Option<String>,
     pub support_email: Option<String>,
     pub support_phone: Option<String>,
+    /// MAPPS-429: who a client should ask for, as opposed to
+    /// [`Tenant::billing_contact_name`], which is who an invoice goes to. These
+    /// are routinely different people, so the billing column is not reused.
+    pub support_contact_name: Option<String>,
     pub portal_domain: Option<String>,
 }
 
@@ -105,7 +113,18 @@ pub struct UpdateTenantRequest {
     pub billing_email: Option<String>,
     pub billing_contact_name: Option<String>,
     pub settings: Option<serde_json::Value>,
-    pub branding: Option<TenantBranding>,
+    /// PMS-758: a PATCH document, not a whole `TenantBranding`.
+    ///
+    /// `tenants.branding` is written by more than one caller: the organisation
+    /// settings page owns the contact keys, the logo upload owns `logo_url` and
+    /// `logo_mime`. Typed as the struct, serde filled in every field it was not
+    /// given as an explicit null, so saving the settings page deleted the
+    /// logo's content type and the public logo route began answering 404.
+    ///
+    /// As a raw object only the keys a caller actually sent are written, and
+    /// the service merges them (`branding || $n`). A key set to null still
+    /// clears, which is how a contact field is emptied.
+    pub branding: Option<serde_json::Value>,
 }
 
 /// Tenant response for API

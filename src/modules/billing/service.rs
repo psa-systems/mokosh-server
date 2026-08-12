@@ -2477,13 +2477,37 @@ impl BillingService {
         let currency = invoice.currency.as_deref().unwrap_or("USD");
         let amount_due = format!("{} {}", invoice.balance_due, currency);
         let due_date = invoice.due_date.to_string();
+
+        // PMS-761: an email asking someone to pay has to say who is asking.
+        // Skipped rather than sent anonymously if the identity cannot be read:
+        // the invoice is already visible in the portal, and an unattributed
+        // payment request is the shape of invoice fraud.
+        let org = match crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await {
+            Ok(org) => org,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mokosh_server.billing", error = %e,
+                    "pay-now email: organisation identity unreadable, not sending",
+                );
+                return;
+            }
+        };
+        let contact_line = org.contact_line("Questions about this invoice?", None);
+        let from = crate::utils::email::SenderIdentity {
+            org_name: org.name(),
+            contact_line: &contact_line,
+        };
+
         if let Err(e) = mailer
             .send_invoice_pay_now(
                 &email,
-                &invoice.invoice_number,
-                &amount_due,
-                &due_date,
-                &link,
+                from,
+                crate::utils::email::InvoicePayNow {
+                    invoice_number: &invoice.invoice_number,
+                    amount_due: &amount_due,
+                    due_date: &due_date,
+                    portal_link: &link,
+                },
             )
             .await
         {

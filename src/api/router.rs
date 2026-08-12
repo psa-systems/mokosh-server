@@ -46,7 +46,7 @@ use crate::modules::search::{search_routes, SearchService};
 use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
-use crate::modules::tenants::{tenant_routes, TenantService};
+use crate::modules::tenants::{public_tenant_routes, tenant_routes, TenantService};
 use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
     agent_attachment_routes, contact_notes_routes, portal_attachment_routes, ticket_routes,
@@ -67,6 +67,10 @@ pub fn create_api_router(
     jwt_secret: String,
     google_oauth: Arc<google_oauth_flow::Client>,
     client_origin: String,
+    // MAPPS-425: base for emailed links to pages that exist only in the
+    // mokosh-apps SPA. Distinct from `client_origin`, which is the apex on
+    // every deployed environment because bunyip-web hosts login there.
+    spa_base_url: String,
     cors_origins: Vec<String>,
     super_admin_emails: Vec<String>,
     cookie_secure: bool,
@@ -98,6 +102,14 @@ pub fn create_api_router(
     // empty suffix keeps the feature off; the login handler then reads the
     // slug from the body exactly like the pre-PMS-729 path.
     portal_host_config: crate::modules::portal::PortalHostConfig,
+    // PMS-748: address a client can report an unwanted request-form email to,
+    // from ABUSE_CONTACT_EMAIL in main.rs. `None` drops the line from the mail
+    // rather than pointing it at the noreply from-address.
+    abuse_contact_email: Option<String>,
+    // MAPPS-429: this deployment's public API base, from PUBLIC_API_BASE_URL in
+    // main.rs. Only the emailed logo needs it (a mail client cannot resolve a
+    // relative src); `None` omits the logo rather than emitting a broken image.
+    public_api_base_url: Option<String>,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
@@ -115,6 +127,12 @@ pub fn create_api_router(
         jwt_secret.clone(),
         super_admin_emails,
         mailer.clone(),
+        // MAPPS-425: stays on `client_origin` deliberately. This is the base
+        // for `/reset-password/{token}`, and bunyip-web at the apex owns the
+        // canonical reset page; mokosh-apps' route only redirects there. Same
+        // for the invitation link, the OAuth postMessage origin and the
+        // not-a-frontend fallback below. Only links to pages that exist ONLY
+        // in mokosh-apps take `spa_base_url`.
         client_origin.clone(),
         notifications_service.clone(),
     )
@@ -129,7 +147,10 @@ pub fn create_api_router(
     // than the mailer.
     let contact_service = ContactService::with_dispatcher(
         db.clone(),
-        client_origin.clone(),
+        // MAPPS-425: `/portal/set-password` is a mokosh-apps route, so it takes
+        // the SPA origin. Built from `client_origin` it landed on the apex,
+        // which has no portal.
+        spa_base_url.clone(),
         notifications_service.clone(),
     );
     let ticket_service =
@@ -141,7 +162,9 @@ pub fn create_api_router(
         db.clone(),
         encryption_key,
         mailer.clone(),
-        client_origin.clone(),
+        // MAPPS-425: the Pay Now link is `/portal/invoices/{id}`, a mokosh-apps
+        // route, so it takes the SPA origin.
+        spa_base_url.clone(),
     );
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
@@ -160,7 +183,9 @@ pub fn create_api_router(
         db.clone(),
         mailer.clone(),
         notifications_service.clone(),
-        client_origin.clone(),
+        // MAPPS-425: the emailed quote link is `/portal/quotes/{id}`, a
+        // mokosh-apps route, so it takes the SPA origin.
+        spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
     let kb_service = KbService::new(db.clone());
@@ -183,7 +208,12 @@ pub fn create_api_router(
         db.clone(),
         notifications_service.clone(),
         TicketService::new(db.clone()),
-    );
+    )
+    // PMS-748: only the authenticated surface sends mail, but the public
+    // surface is built from the same constructor, so both are given it and
+    // neither can drift from the other.
+    .with_abuse_contact(abuse_contact_email.clone())
+    .with_public_api_base(public_api_base_url.clone());
     // MAPPS-298: cross-entity tenant-scoped search.
     let search_service = SearchService::new(db.clone());
     // PMS-453: per-user saved dashboards.
@@ -362,7 +392,10 @@ pub fn create_api_router(
         // PMS-448 AC4: ticket-template CRUD (new-ticket pre-fills).
         .merge(ticket_template_routes(ticket_templates_service))
         // PMS-731: form-definition CRUD + validated submissions.
-        .merge(forms_routes(forms_service, client_origin.clone()))
+        // MAPPS-425: the emailed link must resolve against the SPA, not the
+        // apex. `/request-forms/:token` exists only in mokosh-apps, so the
+        // apex serves bunyip's 404 for it.
+        .merge(forms_routes(forms_service, spa_base_url.clone()))
         // MAPPS-298: cross-entity tenant-scoped global search.
         .merge(search_routes(search_service))
         // PMS-453: per-user saved dashboards (Phase 1; scheduled
@@ -458,7 +491,7 @@ pub fn create_api_router(
         db.clone(),
         shared_mailer.clone(),
         notifications_service.clone(),
-        client_origin.clone(),
+        spa_base_url.clone(),
     );
     // PMS-729 phase 2 H8: Cloudflare Turnstile gate, built once at
     // router-build time and shared across every request. Both env
@@ -476,7 +509,10 @@ pub fn create_api_router(
             portal_kb_service,
             portal_billing_service,
             portal_quotes_service,
-            client_origin.clone(),
+            // MAPPS-425: the Stripe checkout success/cancel URLs are
+            // `/portal/invoices/{id}`, mokosh-apps routes, so the portal
+            // origin is the SPA origin and not the apex.
+            spa_base_url.clone(),
             portal_host_config,
             portal_captcha,
         ))
@@ -596,11 +632,19 @@ pub fn create_api_router(
     // identity, and it resolves its own tenant. Same envelope normalization as
     // the other trees so a 400 here looks like a 400 anywhere else.
     let public_api = Router::new()
-        .merge(public_form_routes(FormsService::with_request_links(
-            db.clone(),
-            notifications_service.clone(),
-            TicketService::new(db.clone()),
-        )))
+        // MAPPS-429: the tenant logo, readable without a session. A client's
+        // mail client renders it straight out of the request-form email and
+        // will never authenticate.
+        .merge(public_tenant_routes(TenantService::new(db.clone())))
+        .merge(public_form_routes(
+            FormsService::with_request_links(
+                db.clone(),
+                notifications_service.clone(),
+                TicketService::new(db.clone()),
+            )
+            .with_abuse_contact(abuse_contact_email)
+            .with_public_api_base(public_api_base_url),
+        ))
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));

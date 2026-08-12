@@ -31,6 +31,62 @@ fn seed_source_tenant_id() -> AppResult<Uuid> {
     }
 }
 
+/// Name a personal tenant gets when nothing about its owner is usable.
+///
+/// PMS-743: this used to be the name EVERY personal tenant got. It is
+/// customer-facing (it renders in the client request-form email subject and in
+/// invitation mail), so eight staging tenants meant eight MSPs whose clients
+/// received mail from "My workspace". Now it is the last resort.
+const DEFAULT_PERSONAL_TENANT_NAME: &str = "My workspace";
+
+/// `tenants.name` is `VARCHAR(255)` (migration 002), and `UpdateTenantRequest`
+/// validates the same bound, so a derived name is truncated to fit rather than
+/// failing the insert that provisions someone's first login.
+const MAX_TENANT_NAME_LEN: usize = 255;
+
+/// Display name for a freshly provisioned personal tenant (PMS-743).
+///
+/// Order of preference, and why:
+///
+/// 1. the IdP's `given_name`, which is a real name the owner chose;
+/// 2. the first name synthesised from a real email address, reusing
+///    [`synthetic_name_from_email`] so a UUID local-part or mokosh's own
+///    `@unresolved.invalid` placeholder is rejected by logic that is already
+///    tested, rather than by a second copy of it here;
+/// 3. [`DEFAULT_PERSONAL_TENANT_NAME`].
+///
+/// Falling back is deliberate rather than clever: a tenant named "Mokosh
+/// User's workspace" or "7fa2b249's workspace" reads worse to a client than
+/// the honest generic, and the owner can rename it in Settings either way.
+///
+/// The possessive is always `'s`, including after a trailing s ("Chris's
+/// workspace"), which is the common style and avoids branching on spelling.
+fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String {
+    let from_given = given_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let from_email = || {
+        let first = crate::modules::auth::synthetic_name_from_email(email?).0;
+        // The helper returns its own fallback when it could not derive
+        // anything; that is a signal, not a name.
+        (first != crate::modules::auth::SYNTHETIC_NAME_FALLBACK.0 && !first.is_empty())
+            .then_some(first)
+    };
+
+    match from_given.or_else(from_email) {
+        Some(owner) => {
+            let mut name = format!("{owner}'s workspace");
+            if name.chars().count() > MAX_TENANT_NAME_LEN {
+                name = name.chars().take(MAX_TENANT_NAME_LEN).collect();
+            }
+            name
+        }
+        None => DEFAULT_PERSONAL_TENANT_NAME.to_string(),
+    }
+}
+
 /// Tenant management service
 #[derive(Clone)]
 pub struct TenantService {
@@ -249,8 +305,18 @@ impl TenantService {
     /// same sequences + default config (`copy_default_config`) a normally
     /// created tenant does, so it works out of the box; the owning user is
     /// JIT-mirrored separately.
+    ///
+    /// PMS-743: `given_name` and `email` are the IdP's, passed straight through
+    /// from the placement path, and name the tenant. They are optional because
+    /// neither claim is guaranteed; see [`personal_tenant_name`] for what each
+    /// absence costs.
     #[tracing::instrument(skip_all, fields(owner_id = %owner_id))]
-    pub async fn ensure_personal_tenant(&self, owner_id: Uuid) -> AppResult<Uuid> {
+    pub async fn ensure_personal_tenant(
+        &self,
+        owner_id: Uuid,
+        given_name: Option<&str>,
+        email: Option<&str>,
+    ) -> AppResult<Uuid> {
         if let Some(id) = self.personal_tenant_for_owner(owner_id).await? {
             return Ok(id);
         }
@@ -270,7 +336,7 @@ impl TenantService {
                RETURNING id"#,
         )
         .bind(tenant_id)
-        .bind("My workspace")
+        .bind(personal_tenant_name(given_name, email))
         .bind(&slug)
         .bind(owner_id)
         // SAFETY (PMS-285): personal-tenant provisioning runs on the pre-session
@@ -413,8 +479,29 @@ impl TenantService {
             query.push_str(&format!(", settings = ${}", param_idx));
             param_idx += 1;
         }
+        // PMS-758: an object or nothing. A string or an array here would
+        // replace the document with something no reader can destructure, and
+        // `||` on two non-objects concatenates rather than merges.
+        if let Some(branding) = request.branding.as_ref() {
+            if !branding.is_object() {
+                return Err(AppError::validation_field(
+                    "branding",
+                    "must be an object of branding keys",
+                ));
+            }
+        }
         if request.branding.is_some() {
-            query.push_str(&format!(", branding = ${}", param_idx));
+            // PMS-758: MERGE, not replace. `branding` is a JSONB document and
+            // callers send the subset they own: the organisation settings page
+            // writes four contact keys, the logo upload writes two others. A
+            // whole-document write meant the settings page silently deleted
+            // `logo_mime`, leaving `logo_url` pointing at a route that then
+            // answered 404, which is a broken image in every client email.
+            //
+            // `||` is a top-level key merge with the right side winning, so a
+            // caller still clears a key by sending it as an explicit null. That
+            // is why the SPA sends nulls rather than omitting empty fields.
+            query.push_str(&format!(", branding = branding || ${}::jsonb", param_idx));
             // Invariant: every conditional SET advances `param_idx` so the
             // next field added below is numbered correctly. `branding` is
             // the last field today, so this increment is currently unread
@@ -1011,7 +1098,15 @@ impl TenantService {
                                  -- here on would silently send no request-form
                                  -- link email at all, since the dispatcher is
                                  -- the only delivery path (migration 097).
-                                 'forms.request_link')
+                                 'forms.request_link',
+                                 -- PMS-761: seeded for the default tenant by
+                                 -- migration 021 and never copied, so the
+                                 -- public ticket-note email has been fanning
+                                 -- out to zero recipients for every real
+                                 -- tenant while the note row was still marked
+                                 -- sent. Migration 104 backfills the tenants
+                                 -- created before this line existed.
+                                 'ticket.note_added')
             "#,
         )
         .bind(new_tenant_id)
@@ -1037,7 +1132,13 @@ impl TenantService {
              AND nt.channel_type = ot.channel_type
             WHERE r.tenant_id = $2
               AND r.event_type IN ('appointment.reminder', 'sla.at_risk', 'sla.breached',
-                                   'auth.password_reset', 'auth.welcome')
+                                   'auth.password_reset', 'auth.welcome',
+                                   -- PMS-761: the two client-facing events.
+                                   -- Their templates were copied above and
+                                   -- their rules were not, and `dispatch`
+                                   -- iterates RULES: a template with no rule
+                                   -- is a message that is never sent.
+                                   'forms.request_link', 'ticket.note_added')
             "#,
         )
         .bind(new_tenant_id)
@@ -1085,5 +1186,73 @@ impl From<TenantRow> for Tenant {
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_real_given_name_wins() {
+        assert_eq!(
+            personal_tenant_name(Some("Long"), Some("long@example.com")),
+            "Long's workspace"
+        );
+    }
+
+    #[test]
+    fn a_missing_given_name_falls_back_to_the_email() {
+        assert_eq!(
+            personal_tenant_name(None, Some("dana.reid@example.com")),
+            "Dana's workspace"
+        );
+    }
+
+    #[test]
+    fn a_blank_given_name_is_treated_as_absent() {
+        // The IdP can return an empty string rather than omitting the claim;
+        // "'s workspace" would be worse than the generic.
+        assert_eq!(
+            personal_tenant_name(Some("   "), Some("dana@example.com")),
+            "Dana's workspace"
+        );
+    }
+
+    #[test]
+    fn an_unusable_owner_keeps_the_generic_name() {
+        // mokosh's own JIT placeholder address, and a UUID local-part: naming a
+        // tenant "Mokosh User's workspace" or "7fa2b249's workspace" in front of
+        // a client is worse than saying nothing about the owner.
+        let sub = "7fa2b249-6132-4abc-90de-1f2e3d4c5b6a";
+        assert_eq!(
+            personal_tenant_name(None, Some(&format!("{sub}@unresolved.invalid"))),
+            DEFAULT_PERSONAL_TENANT_NAME
+        );
+        assert_eq!(
+            personal_tenant_name(None, Some(&format!("{sub}@example.com"))),
+            DEFAULT_PERSONAL_TENANT_NAME
+        );
+        assert_eq!(
+            personal_tenant_name(None, None),
+            DEFAULT_PERSONAL_TENANT_NAME
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_truncated_to_the_column_width() {
+        // Provisioning runs on someone's first login; a name too long for
+        // VARCHAR(255) must not be the thing that fails it.
+        let long = "a".repeat(400);
+        let name = personal_tenant_name(Some(&long), None);
+        assert_eq!(name.chars().count(), MAX_TENANT_NAME_LEN);
+    }
+
+    #[test]
+    fn a_trailing_s_still_takes_an_apostrophe_s() {
+        assert_eq!(
+            personal_tenant_name(Some("Chris"), None),
+            "Chris's workspace"
+        );
     }
 }

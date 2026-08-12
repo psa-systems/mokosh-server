@@ -20,13 +20,45 @@ use super::models::{
 };
 use super::service::FormsService;
 use crate::modules::auth::TenantId;
+use crate::modules::tenants::OrgIdentity;
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::html::{html_escape, urlencoded};
 
 /// PMS-730 assumes a 7 day expiry, revisable once the flow has been used in
 /// anger. Long enough for a client to get to it after a weekend, short enough
 /// that a link forwarded onward goes stale.
 const REQUEST_LINK_TTL_DAYS: i64 = 7;
+
+/// Everything the `forms.request_link` template renders.
+///
+/// A struct rather than a row of positional `&str`s: the fields are five
+/// strings in a row, so a transposed pair would email the tenant's name as the
+/// form's and nothing would fail. Named fields make that impossible to write
+/// by accident.
+struct RequestLinkEmail<'a> {
+    recipient_email: &'a str,
+    display_name: &'a str,
+    form_name: &'a str,
+    /// PMS-761: the MSP as the client sees them: name (MAPPS-425, without
+    /// which the client received a literal `{{tenant_name}}`), contact details
+    /// for when the form defines none (MAPPS-429), and the logo.
+    org: &'a OrgIdentity,
+    /// PMS-748: the MSP user who issued this link. A client receiving a
+    /// request for personal details is entitled to a person's name, not just
+    /// an organisation's.
+    sender_name: &'a str,
+    /// PMS-748: the client company the link was issued against, so the closing
+    /// line can say who the message was intended for. It replaces "if you were
+    /// not expecting this, you can ignore this message", which gave a
+    /// recipient nothing to check.
+    company_name: &'a str,
+    /// PMS-748: the definition's optional contact details, which win over the
+    /// organisation's general ones when the form routes somewhere unusual.
+    contact_info: Option<&'a str>,
+    form_link: &'a str,
+    expires_at: chrono::DateTime<Utc>,
+}
 
 impl FormsService {
     /// Mint a link for `company_id` against `form_definition_id` and queue the
@@ -63,6 +95,41 @@ impl FormsService {
                 .fetch_optional(&mut *tx)
                 .await?;
         let company_name = company_name.ok_or_else(|| AppError::NotFound("Company".to_string()))?;
+
+        // MAPPS-425: the seeded subject is
+        // `{{form_name}} request form from {{tenant_name}}`, and the context
+        // never carried `tenant_name`, so clients received a literal
+        // `{{tenant_name}}`. Supplied here rather than fixed by a new
+        // migration: `101_form_request_tokens.sql` is already applied
+        // everywhere and immutable, so filling the value repairs every tenant
+        // that already holds the seeded template. Read inside the tenant
+        // transaction, matching `InvitationsService`.
+        // MAPPS-429: branding rides along with the name, in the same read, so
+        // the contact line and the logo cannot describe a different tenant than
+        // the one the message says it is from. PMS-761 folds both into
+        // `OrgIdentity`; read here rather than through `OrgIdentity::load` so
+        // it stays inside the transaction that already has the row.
+        let (tenant_name, branding): (String, serde_json::Value) =
+            sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let org = OrgIdentity::from_row(tenant_name, branding);
+        let tenant_name = org.name().to_string();
+
+        // PMS-748: the person doing the asking. Read in the same transaction
+        // as the tenant and the company, so the email is composed from one
+        // consistent picture of who is sending what to whom.
+        let sender: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT first_name, last_name, email FROM users WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(created_by)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let sender_name = sender
+            .map(|(first, last, email)| sender_display_name(&first, &last, &email))
+            .unwrap_or_else(|| tenant_name.clone());
 
         // Resolve the addressee. An explicit contact supplies the address and
         // the greeting; otherwise the caller must give an email outright.
@@ -127,11 +194,17 @@ impl FormsService {
         let form_link = format!("{}/request-forms/{}", app_url.trim_end_matches('/'), token);
         self.queue_request_link_email(
             tenant_id,
-            &recipient_email,
-            &display_name,
-            &definition.name,
-            &form_link,
-            expires_at,
+            RequestLinkEmail {
+                recipient_email: &recipient_email,
+                display_name: &display_name,
+                form_name: &definition.name,
+                org: &org,
+                sender_name: &sender_name,
+                company_name: &company_name,
+                contact_info: definition.contact_info.as_deref(),
+                form_link: &form_link,
+                expires_at,
+            },
         )
         .await;
 
@@ -149,25 +222,44 @@ impl FormsService {
         })
     }
 
-    async fn queue_request_link_email(
-        &self,
-        tenant_id: TenantId,
-        recipient_email: &str,
-        display_name: &str,
-        form_name: &str,
-        form_link: &str,
-        expires_at: chrono::DateTime<Utc>,
-    ) {
+    async fn queue_request_link_email(&self, tenant_id: TenantId, mail: RequestLinkEmail<'_>) {
+        let RequestLinkEmail {
+            recipient_email,
+            display_name,
+            form_name,
+            org,
+            sender_name,
+            company_name,
+            contact_info,
+            form_link,
+            expires_at,
+        } = mail;
         let Some(notify) = self.notifications.as_ref() else {
             tracing::warn!(
                 "no notifications dispatcher wired; request-link token persisted but no message queued",
             );
             return;
         };
+        let (abuse_notice, abuse_notice_html) =
+            abuse_notice(self.abuse_contact_email.as_deref(), form_name);
         let context = json!({
             "recipient_email": recipient_email,
             "display_name": display_name,
             "form_name": form_name,
+            // MAPPS-425: the seeded subject asks for this; without it the
+            // client sees the placeholder itself.
+            "tenant_name": org.name(),
+            // PMS-748: every key below is supplied unconditionally, including
+            // the two that can be empty. `render_template` leaves an
+            // unresolved key as literal braces in the delivered message, so
+            // "omit the key when there is nothing to say" is not available:
+            // the value has to be an empty string instead.
+            "sender_name": sender_name,
+            "company_name": company_name,
+            "contact_line": org.contact_line("Questions about this request?", contact_info),
+            "logo_html": org.logo_html(self.public_api_base.as_deref()),
+            "abuse_notice": abuse_notice,
+            "abuse_notice_html": abuse_notice_html,
             "form_link": form_link,
             "expires_on": expires_at.format("%Y-%m-%d").to_string(),
         });
@@ -263,9 +355,20 @@ impl FormsService {
         let definition = self
             .get(resolved.tenant_id, resolved.form_definition_id)
             .await?;
+        // PMS-748: who is asking. The page is reached from an email by someone
+        // with no account here, so it has to carry its own attribution rather
+        // than relying on the message that linked to it still being open.
+        let org = OrgIdentity::load(&self.db, resolved.tenant_id).await?;
+        // MAPPS-429: the form's own contact wins; the organisation's is the
+        // fallback, so an MSP sets a service-desk number once instead of on
+        // every definition.
+        let contact_info = definition.contact_info.clone().or_else(|| org.phrase());
         Ok(PublicFormResponse {
             name: definition.name,
             description: definition.description,
+            tenant_name: org.name().to_string(),
+            contact_info,
+            logo_url: org.logo_path().map(str::to_string),
             rules: definition.rules,
             fields: definition
                 .fields
@@ -403,6 +506,45 @@ impl FormsService {
     }
 }
 
+/// PMS-748: the name a client should see for the MSP user who sent this.
+///
+/// Falls back to the same email-derived name the JIT user insert uses, which
+/// already refuses to derive one from a UUID local part or mokosh's own
+/// placeholder domain. Both name columns are NOT NULL but may hold empty
+/// strings, so the blank case is real rather than theoretical.
+fn sender_display_name(first_name: &str, last_name: &str, email: &str) -> String {
+    let full = format!("{} {}", first_name.trim(), last_name.trim());
+    let full = full.trim();
+    if !full.is_empty() {
+        return full.to_string();
+    }
+    let (first, last) = crate::modules::auth::synthetic_name_from_email(email);
+    format!("{first} {last}")
+}
+
+/// PMS-748: the report-abuse line, in text and HTML flavours, or two empty
+/// strings when the deployment has not configured an address.
+///
+/// The HTML flavour carries its own `<p>` wrapper. `render_template` has no
+/// conditionals, so a wrapper written into the template would leave an empty
+/// paragraph dangling on every deployment without an abuse address; composing
+/// the whole element here is what lets the line vanish completely.
+///
+/// The address is escaped for both the attribute and the text, because it
+/// arrives from deployment configuration rather than from this crate.
+fn abuse_notice(abuse_contact_email: Option<&str>, form_name: &str) -> (String, String) {
+    let Some(address) = abuse_contact_email.map(str::trim).filter(|a| !a.is_empty()) else {
+        return (String::new(), String::new());
+    };
+    let text = format!("\n\nDid not expect this? Report it to {address}.");
+    let escaped = html_escape(address);
+    let subject = urlencoded(&format!("Unexpected request form: {form_name}"));
+    let html = format!(
+        "<p>Did not expect this? <a href=\"mailto:{escaped}?subject={subject}\">Report it</a>.</p>"
+    );
+    (text, html)
+}
+
 /// A one-line summary for the ticket title, taken from the first answered text
 /// field in display order. Falls back to the company-agnostic form name alone
 /// when the form has no text field, which keeps the title deterministic rather
@@ -426,6 +568,20 @@ pub(super) fn summarise(
 /// Render the answers as the ticket description, in the form's own field
 /// order and using its labels, so whoever works the ticket reads what the
 /// client saw rather than raw payload keys.
+///
+/// PMS-747: emitted as a Markdown list, because the ticket description is
+/// RENDERED as Markdown by the SPA. Separating the answers with plain newlines
+/// put every one of them in a single paragraph, so a three-field submission
+/// arrived as `First name: David Last name: Randall Phone number: 919...` on
+/// one run-on line, and got worse the more the form asked for.
+///
+/// A textarea answer carries its own newlines. Those become hard breaks
+/// (two trailing spaces) and the continuation is indented into the list item,
+/// so the client's paragraphing survives instead of collapsing the same way.
+///
+/// PMS-729 phase 2 §7 slice B / I8: `pub(super)` so the portal form-submit
+/// handler in `super::service::submit_from_portal` can call this too - the
+/// portal path renders the same description shape as the request-link path.
 pub(super) fn render_answers(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,
@@ -440,7 +596,8 @@ pub(super) fn render_answers(
             serde_json::Value::Bool(b) => if *b { "Yes" } else { "No" }.to_string(),
             other => other.to_string(),
         };
-        out.push_str(&format!("{}: {}\n", field.label, rendered));
+        let rendered = rendered.replace('\n', "  \n  ");
+        out.push_str(&format!("- **{}:** {}\n", field.label, rendered));
     }
     out
 }
@@ -518,5 +675,150 @@ impl From<LinkRow> for RequestLinkResponse {
             used_at: r.used_at,
             submission_id: r.submission_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::forms::models::{FieldType, FormDefinitionResponse, FormFieldResponse};
+
+    fn field(name: &str, label: &str, field_type: FieldType) -> FormFieldResponse {
+        FormFieldResponse {
+            id: Uuid::nil(),
+            name: name.to_string(),
+            label: label.to_string(),
+            help_text: None,
+            field_type,
+            is_required: false,
+            min_length: None,
+            max_length: None,
+            options: None,
+            date_not_in_past: false,
+            sort_order: 0,
+        }
+    }
+
+    fn definition(fields: Vec<FormFieldResponse>) -> FormDefinitionResponse {
+        FormDefinitionResponse {
+            id: Uuid::nil(),
+            name: "New user".to_string(),
+            slug: "new-user".to_string(),
+            description: None,
+            contact_info: None,
+            kb_article_id: None,
+            kb_article_title: None,
+            rules: Vec::new(),
+            is_active: true,
+            created_by_id: Uuid::nil(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            fields,
+        }
+    }
+
+    /// PMS-748: the MSP is always named. Only the channel is optional.
+    #[test]
+    fn an_unconfigured_abuse_contact_emits_no_line() {
+        assert_eq!(
+            abuse_notice(None, "New user"),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            abuse_notice(Some("  "), "New user"),
+            (String::new(), String::new())
+        );
+    }
+
+    /// The HTML flavour carries its own `<p>`, because `render_template` has no
+    /// conditionals and a wrapper in the template would leave an empty
+    /// paragraph on every deployment that has not configured an address.
+    #[test]
+    fn a_configured_abuse_contact_composes_both_flavours() {
+        let (text, html) = abuse_notice(Some("abuse@example.com"), "New user & leaver");
+
+        assert_eq!(
+            text,
+            "\n\nDid not expect this? Report it to abuse@example.com."
+        );
+        assert_eq!(
+            html,
+            "<p>Did not expect this? <a href=\"mailto:abuse@example.com?subject=Unexpected%20request%20form%3A%20New%20user%20%26%20leaver\">Report it</a>.</p>",
+            "an unencoded space or ampersand in the form name would truncate the mailto or escape the attribute"
+        );
+    }
+
+    /// PMS-748: the sender is a person, and the fallback is the same
+    /// email-derived name the JIT user insert uses rather than a second copy of
+    /// those rules.
+    #[test]
+    fn the_sender_is_named_from_the_user_or_their_email() {
+        assert_eq!(
+            sender_display_name("David", "Randall", "david@example.com"),
+            "David Randall"
+        );
+        assert_eq!(
+            sender_display_name("  ", "", "dana.reid@example.com"),
+            "Dana Reid",
+            "both name columns are NOT NULL but may hold empty strings"
+        );
+    }
+
+    /// PMS-747: the SPA renders a ticket description as Markdown, where a plain
+    /// newline is not a break. Joining answers with one meant a three-field
+    /// submission arrived as a single run-on line.
+    #[test]
+    fn each_answer_is_its_own_line_in_the_rendered_description() {
+        let def = definition(vec![
+            field("first_name", "First name", FieldType::Text),
+            field("last_name", "Last name", FieldType::Text),
+            field("needs_laptop", "Needs a laptop", FieldType::Boolean),
+        ]);
+        let answers = serde_json::json!({
+            "first_name": "David",
+            "last_name": "Randall",
+            "needs_laptop": true,
+        });
+
+        let rendered = render_answers(&def, answers.as_object().expect("object"));
+
+        assert_eq!(
+            rendered,
+            "- **First name:** David\n- **Last name:** Randall\n- **Needs a laptop:** Yes\n"
+        );
+    }
+
+    /// A textarea answer carries the client's own paragraphing, which must not
+    /// collapse for the same reason the answers themselves must not.
+    #[test]
+    fn a_multi_line_answer_keeps_its_breaks() {
+        let def = definition(vec![field("detail", "Detail", FieldType::Textarea)]);
+        let answers = serde_json::json!({ "detail": "Line one\nLine two" });
+
+        let rendered = render_answers(&def, answers.as_object().expect("object"));
+
+        assert_eq!(
+            rendered, "- **Detail:** Line one  \n  Line two\n",
+            "two trailing spaces are the Markdown hard break; the indent keeps the continuation in the list item"
+        );
+    }
+
+    /// The form's field order is the order the client answered in, and a field
+    /// left blank is dropped rather than rendered as an empty line.
+    #[test]
+    fn unanswered_fields_are_left_out_and_order_follows_the_form() {
+        let def = definition(vec![
+            field("first_name", "First name", FieldType::Text),
+            field("nickname", "Nickname", FieldType::Text),
+            field("last_name", "Last name", FieldType::Text),
+        ]);
+        let answers = serde_json::json!({ "last_name": "Randall", "first_name": "David" });
+
+        let rendered = render_answers(&def, answers.as_object().expect("object"));
+
+        assert_eq!(
+            rendered,
+            "- **First name:** David\n- **Last name:** Randall\n"
+        );
     }
 }
