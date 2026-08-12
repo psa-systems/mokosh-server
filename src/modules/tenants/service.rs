@@ -77,6 +77,15 @@ impl TenantService {
         // WITH CHECK policies see app.current_tenant. PMS-256.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // MAPPS-396: fold caller-supplied branding into the initial
+        // insert so the tenant lands with its logo / colors already set,
+        // rather than a create-then-update pair. `None` maps to the
+        // empty-object default so `branding` never lands NULL (the
+        // column is NOT NULL DEFAULT '{}').
+        let branding_json = match &request.branding {
+            Some(b) => serde_json::to_value(b).unwrap_or_else(|_| serde_json::json!({})),
+            None => serde_json::json!({}),
+        };
         sqlx::query(
             // `kind = 'org'` is set explicitly: migration 019_tenant_kind dropped
             // the column default, so every caller must supply it. This is the
@@ -84,8 +93,8 @@ impl TenantService {
             // omitting it inserts NULL and violates the NOT NULL constraint (PMS-287).
             r#"
             INSERT INTO tenants (id, name, slug, status, kind, billing_email, billing_contact_name,
-                                 subscription_plan, subscription_status, trial_ends_at)
-            VALUES ($1, $2, $3, 'active', 'org', $4, $5, $6, 'trialing', $7)
+                                 subscription_plan, subscription_status, trial_ends_at, branding)
+            VALUES ($1, $2, $3, 'active', 'org', $4, $5, $6, 'trialing', $7, $8)
             "#,
         )
         .bind(tenant_id)
@@ -95,6 +104,7 @@ impl TenantService {
         .bind(&request.billing_contact_name)
         .bind(&request.subscription_plan)
         .bind(trial_ends_at)
+        .bind(&branding_json)
         .execute(&mut *tx)
         .await?;
 

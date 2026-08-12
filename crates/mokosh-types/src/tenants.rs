@@ -86,6 +86,14 @@ pub struct CreateTenantRequest {
     pub admin_email: String,
     pub admin_first_name: String,
     pub admin_last_name: String,
+    /// MAPPS-396: optional branding at creation time so the SPA can
+    /// set the logo, primary color, and support email in a single
+    /// round-trip rather than a create-then-update pair. When omitted
+    /// (`None`) the tenant lands with the empty-object default and the
+    /// portal renders the generic wordmark, matching pre-MAPPS-396
+    /// behavior.
+    #[serde(default)]
+    pub branding: Option<TenantBranding>,
 }
 
 /// Update tenant request

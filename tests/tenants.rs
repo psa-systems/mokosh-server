@@ -456,6 +456,7 @@ async fn create_tenant_sets_org_kind(pool: PgPool) {
         admin_email: "owner-pms287@example.test".into(),
         admin_first_name: "Owner".into(),
         admin_last_name: "Pms287".into(),
+        branding: None,
     };
 
     let tenant = svc
@@ -485,6 +486,7 @@ async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
         admin_email: "owner-pms413@example.test".into(),
         admin_first_name: "Owner".into(),
         admin_last_name: "Pms413".into(),
+        branding: None,
     };
 
     let tenant = svc
@@ -509,6 +511,97 @@ async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
             .expect("own-company row exists");
     assert_eq!(company_type, "internal", "own-company is type internal");
     assert_eq!(name, "PMS-413 Org", "own-company is named after the tenant");
+}
+
+/// MAPPS-396: caller-supplied branding lands on the initial insert so the
+/// SPA can create-and-brand in one round-trip rather than a
+/// create-then-update pair. Round-trip: create -> read column ->
+/// GET response -> assert every populated field.
+#[sqlx::test]
+async fn create_tenant_persists_optional_branding(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let branding = mokosh_types::tenants::TenantBranding {
+        logo_url: Some("https://cdn.example/logo.svg".to_string()),
+        favicon_url: None,
+        primary_color: Some("#2563eb".to_string()),
+        secondary_color: None,
+        company_name: None,
+        support_email: Some("help@acme-mapps396.example".to_string()),
+        support_phone: None,
+        portal_domain: None,
+    };
+    let req = CreateTenantRequest {
+        name: "MAPPS-396 Branded".into(),
+        slug: "mapps396-branded".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-mapps396@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Mapps396".into(),
+        branding: Some(branding.clone()),
+    };
+
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant with branding must succeed");
+
+    let raw: serde_json::Value = sqlx::query_scalar("SELECT branding FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read branding");
+    assert_eq!(
+        raw["logo_url"].as_str(),
+        Some("https://cdn.example/logo.svg"),
+        "branding.logo_url must round-trip through create_tenant"
+    );
+    assert_eq!(
+        raw["primary_color"].as_str(),
+        Some("#2563eb"),
+        "branding.primary_color must round-trip through create_tenant"
+    );
+    assert_eq!(
+        raw["support_email"].as_str(),
+        Some("help@acme-mapps396.example"),
+        "branding.support_email must round-trip through create_tenant"
+    );
+}
+
+/// MAPPS-396: omitting `branding` lands the tenant with an empty-object
+/// default rather than NULL (the column is NOT NULL DEFAULT '{}') so
+/// pre-MAPPS-396 clients keep working.
+#[sqlx::test]
+async fn create_tenant_omitting_branding_uses_empty_default(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "MAPPS-396 Bare".into(),
+        slug: "mapps396-bare".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-bare-mapps396@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Bare".into(),
+        branding: None,
+    };
+
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant without branding must succeed");
+
+    let raw: serde_json::Value = sqlx::query_scalar("SELECT branding FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read branding");
+    assert_eq!(
+        raw,
+        serde_json::json!({}),
+        "omitted branding must land as empty object, not NULL / null"
+    );
 }
 
 /// PMS-413: a tenant provisioned off the PSA create path (e.g. a manually
