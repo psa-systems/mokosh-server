@@ -127,6 +127,44 @@ impl PortalDecisionLimiter {
     }
 }
 
+/// Per-IP limiter for the pre-auth `GET /portal/host` branding endpoint.
+///
+/// PMS-729 nice-to-have: the endpoint is unauthenticated and DB-hitting
+/// (one `SELECT ... WHERE slug = $1 AND status = 'active'` per call). A
+/// scanner probing many Host headers against the same IP could otherwise
+/// walk the tenant list at unlimited RPS; a per-IP bucket keeps that
+/// cheap without penalising a legitimate browser (the SPA calls this
+/// once per page load).
+///
+/// Roomier than login (60/min per IP) because a real user's SPA can
+/// legitimately re-fetch the hint on every route change; the intent
+/// here is to blunt a script, not gate a human. In-memory / per-replica
+/// like the other portal limiters.
+pub struct PortalHostLimiter {
+    by_ip: IpLimiter,
+    clock: DefaultClock,
+}
+
+impl PortalHostLimiter {
+    pub fn new() -> Arc<Self> {
+        let ip_quota = Quota::per_minute(NonZeroU32::new(60).expect("60 is non-zero"));
+        Arc::new(Self {
+            by_ip: RateLimiter::keyed(ip_quota),
+            clock: DefaultClock::default(),
+        })
+    }
+
+    /// Returns `Err(retry_after_seconds)` when the IP bucket is empty,
+    /// always at least 1 so a client honouring `Retry-After` never
+    /// retries too soon.
+    pub fn check(&self, ip: IpAddr) -> Result<(), u64> {
+        match self.by_ip.check_key(&ip) {
+            Ok(()) => Ok(()),
+            Err(neg) => Err(seconds_until(&neg, &self.clock)),
+        }
+    }
+}
+
 /// Normalised `(tenant_slug, email)` bucket key. Both halves are trimmed
 /// and lowercased so casing/whitespace cannot dodge the quota; a NUL byte
 /// separates them so `("ab", "c")` and `("a", "bc")` never collide.
@@ -175,6 +213,20 @@ mod tests {
     fn account_key_no_split_collision() {
         // The NUL separator prevents ("ab","c") colliding with ("a","bc").
         assert_ne!(account_key("ab", "c"), account_key("a", "bc"));
+    }
+
+    #[test]
+    fn host_limiter_blocks_after_quota() {
+        let limiter = PortalHostLimiter::new();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        // 60/min per IP quota: first 60 pass, 61st is throttled.
+        for _ in 0..60 {
+            assert!(limiter.check(ip).is_ok());
+        }
+        assert!(limiter.check(ip).is_err());
+        // A different IP is unaffected.
+        let other: IpAddr = "198.51.100.3".parse().unwrap();
+        assert!(limiter.check(other).is_ok());
     }
 
     #[test]

@@ -23,7 +23,7 @@ use super::host_tenant::{portal_origin_from_host, resolve_slug, PortalHostConfig
 use super::middleware::{
     portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth, RequirePortalSession,
 };
-use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
+use super::rate_limit::{PortalDecisionLimiter, PortalHostLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalApproval,
@@ -62,6 +62,12 @@ pub struct PortalRouterState {
     /// `login_limiter` so a burst of decisions cannot lock a contact out of
     /// logging back in.
     pub decision_limiter: Arc<PortalDecisionLimiter>,
+    /// PMS-729 nice-to-have: per-IP throttle for `GET /portal/host`. The
+    /// endpoint is unauthenticated and DB-hitting, so a scanner probing
+    /// many Host headers against the same IP could otherwise walk the
+    /// tenant list at unlimited RPS. 60/min per IP; a real SPA fires this
+    /// once per page load and never trips the bucket.
+    pub host_limiter: Arc<PortalHostLimiter>,
     /// PMS-711: SPA origin the invoice "Pay Now" success / cancel return URLs
     /// are built from (the base of the portal invoice pages).
     pub portal_origin: String,
@@ -101,6 +107,7 @@ pub fn portal_routes(
         quotes: Arc::new(quotes),
         login_limiter: PortalLoginLimiter::new(),
         decision_limiter: PortalDecisionLimiter::new(),
+        host_limiter: PortalHostLimiter::new(),
         portal_origin,
         host_config,
         captcha,
@@ -705,17 +712,42 @@ fn effective_host(headers: &HeaderMap) -> Option<&str> {
 /// tenant; 404 with an empty body on every other outcome so an unknown
 /// or malformed host is indistinguishable from a legitimately-not-portal
 /// host.
+///
+/// Nice-to-have: per-IP rate limit (60/min via `PortalHostLimiter`) so
+/// this pre-auth DB-hitting endpoint cannot be script-walked to
+/// enumerate slugs at unlimited RPS. Over-quota returns 429 with a
+/// `Retry-After` header and the same JSON envelope shape as the login
+/// route's rate-limit response.
 async fn host_hint(
     State(state): State<PortalRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> Result<Json<PortalHostHint>, AppError> {
+) -> Result<Response, AppError> {
+    if let Err(retry_after) = state.host_limiter.check(addr.ip()) {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate_limited",
+                "message": "Too many portal host lookups, please try again later",
+                "retry_after_seconds": retry_after,
+            })),
+        )
+            .into_response();
+        let h = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+            h.insert(header::RETRY_AFTER, v);
+        }
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(resp);
+    }
     let tenant = lookup_host_tenant(&state, &headers)
         .await?
         .ok_or(AppError::NotFound("portal host".to_string()))?;
     Ok(Json(PortalHostHint {
         name: tenant.display_name,
         branding: tenant.branding,
-    }))
+    })
+    .into_response())
 }
 
 /// PMS-729 phase 2 §7 slice A / I17: portal home dashboard payload.

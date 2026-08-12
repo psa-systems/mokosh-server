@@ -547,3 +547,45 @@ async fn malformed_host_label_fails_closed(pool: PgPool) {
         assert_unauthorized_envelope(login, host).await;
     }
 }
+
+// PMS-729 nice-to-have: per-IP rate limit on `/portal/host` blunts a
+// scanner probing many Host headers against the same source. Quota is
+// 60/min per IP; the 61st call in the burst returns 429 with a
+// `Retry-After` header. A real SPA fires this once per page load and
+// never trips the bucket.
+#[sqlx::test]
+async fn host_hint_rate_limits_per_ip(pool: PgPool) {
+    seed_tenant(&pool, "acme", "Acme MSP", None).await;
+    let app = common::boot_with_portal_host(pool, portal_host_enabled()).await;
+
+    // First 60 succeed. The endpoint 200s on the resolved slug and 404s
+    // on a miss - both count against the same bucket, so a scanner
+    // cannot bypass the limiter by only asking for known-bad hosts.
+    for _ in 0..60 {
+        let resp = portal_host_hint(&app, "acme.client.a8n.systems").await;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "expected within-quota calls to succeed"
+        );
+    }
+
+    // 61st call is throttled.
+    let over = portal_host_hint(&app, "acme.client.a8n.systems").await;
+    assert_eq!(
+        over.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the 61st /portal/host call in a minute must be rate-limited"
+    );
+    let retry_after = over
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    assert!(
+        retry_after.is_some(),
+        "429 response must carry a Retry-After header"
+    );
+    let body: serde_json::Value = over.json().await.expect("429 body");
+    assert_eq!(body["error"].as_str(), Some("rate_limited"));
+}
