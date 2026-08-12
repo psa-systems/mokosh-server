@@ -401,6 +401,15 @@ pub struct LoginRequest {
     /// `00000000-0000-0000-0000-000000000001`. PMS-138.
     #[serde(default)]
     pub tenant_id: Option<Uuid>,
+    /// MAPPS-396: alternative to `tenant_id` for the standalone SPA
+    /// login form, where the operator types the tenant slug (e.g.
+    /// `acme`) rather than a UUID. The server resolves the slug against
+    /// `tenants.slug WHERE status = 'active'` before running the
+    /// email/password lookup; when both are supplied `tenant_id` wins
+    /// so a host-derived hint is not silently overridden by a
+    /// mistyped slug field.
+    #[serde(default)]
+    pub tenant_slug: Option<String>,
 }
 
 /// Login response

@@ -1376,6 +1376,150 @@ async fn login_wrong_tenant_hint_returns_401(pool: PgPool) {
     );
 }
 
+// ============================================================================
+// MAPPS-396: tenant_slug hint (standalone SPA login form)
+// ============================================================================
+
+/// MAPPS-396: the standalone login form types a slug rather than a UUID,
+/// so `tenant_slug: "acme"` on the login body must resolve to acme's
+/// tenant_id server-side and authenticate the acme-tenant user.
+#[sqlx::test]
+async fn login_with_tenant_slug_resolves_to_correct_tenant(pool: PgPool) {
+    let (tenant_id, user_id, email, password) =
+        common::seed_tenant_with_admin(&pool, "acme-mapps396").await;
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "acme-mapps396",
+        }))
+        .send()
+        .await
+        .expect("send login (tenant_slug hint)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "tenant_slug=acme-mapps396 must resolve to acme's tenant and authenticate"
+    );
+    let body: serde_json::Value = resp.json().await.expect("login body");
+    assert_eq!(
+        body["user"]["id"].as_str(),
+        Some(user_id.to_string().as_str()),
+        "tenant_slug hint must land on the acme-tenant user"
+    );
+    assert_eq!(
+        body["user"]["tenant_id"].as_str(),
+        Some(tenant_id.to_string().as_str()),
+        "tenant_slug hint must return acme's tenant_id"
+    );
+}
+
+/// MAPPS-396: `tenant_id` wins when both are set, so a host-derived
+/// UUID hint is not silently overridden by a mistyped slug field.
+#[sqlx::test]
+async fn login_with_both_tenant_id_and_slug_prefers_id(pool: PgPool) {
+    let (tenant_a_id, user_a_id, email_a, password_a) =
+        common::seed_tenant_with_admin(&pool, "acme-both-a").await;
+    let (_tenant_b_id, _user_b_id, _email_b, _password_b) =
+        common::seed_tenant_with_admin(&pool, "beta-both-b").await;
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email_a,
+            "password": password_a,
+            "tenant_id": tenant_a_id,
+            "tenant_slug": "beta-both-b",
+        }))
+        .send()
+        .await
+        .expect("send login (both hints)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "tenant_id must win over tenant_slug"
+    );
+    let body: serde_json::Value = resp.json().await.expect("login body");
+    assert_eq!(
+        body["user"]["id"].as_str(),
+        Some(user_a_id.to_string().as_str()),
+        "tenant_id must be the effective hint when both are set"
+    );
+}
+
+/// MAPPS-396: an unknown slug must 401 (fail-closed), never
+/// leak-through as "default tenant" and let the wrong user in.
+#[sqlx::test]
+async fn login_with_unknown_tenant_slug_401s(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "nope-does-not-exist",
+        }))
+        .send()
+        .await
+        .expect("send login (unknown slug)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "unknown slug must 401 (fail-closed), never leak-through as default tenant"
+    );
+}
+
+/// MAPPS-396: a slug that names a suspended tenant must 401 the same
+/// way an unknown slug does, so the endpoint cannot be walked to
+/// enumerate active-vs-suspended tenants.
+#[sqlx::test]
+async fn login_with_suspended_tenant_slug_401s(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+
+    // Insert a suspended tenant directly - the seed helper only makes
+    // active ones.
+    sqlx::query(
+        r#"
+        INSERT INTO tenants (id, name, slug, status, kind)
+        VALUES ($1, 'Suspended MSP', 'suspended-mapps396', 'suspended', 'org')
+        "#,
+    )
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("seed suspended tenant");
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "suspended-mapps396",
+        }))
+        .send()
+        .await
+        .expect("send login (suspended slug)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "suspended slug must 401 (matches unknown-slug shape so tenant status is not enumerable)"
+    );
+}
+
 /// PMS-138 forgot-password sibling fix: with the same email under two
 /// tenants the `tenant_id` hint on `/api/v1/auth/forgot-password` must
 /// route the reset token to the user in the named tenant.

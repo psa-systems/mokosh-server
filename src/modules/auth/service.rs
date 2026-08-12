@@ -596,7 +596,23 @@ impl AuthService {
         // hint. Replaces the prior email-only lookup with
         // `ORDER BY created_at ASC LIMIT 1` tiebreaker that silently
         // routed multi-tenant collisions to the wrong account.
-        let tenant_id = Self::resolve_tenant_for_login(request.tenant_id);
+        //
+        // MAPPS-396: the standalone login form types a tenant slug
+        // (e.g. `acme`) rather than a UUID, so the request may carry
+        // `tenant_slug` instead of `tenant_id`. Resolve the slug here
+        // to the same `tenant_id` shape the downstream lookup already
+        // expects. When both are set `tenant_id` wins so a
+        // host-derived hint is not silently overridden by a mistyped
+        // slug. Falls closed (401) on an unknown or suspended slug so
+        // the endpoint cannot enumerate valid tenants.
+        let tenant_hint = match request.tenant_id {
+            Some(id) => Some(id),
+            None => match request.tenant_slug.as_deref().map(str::trim) {
+                Some(slug) if !slug.is_empty() => Some(self.resolve_tenant_slug(slug).await?),
+                _ => None,
+            },
+        };
+        let tenant_id = Self::resolve_tenant_for_login(tenant_hint);
         let user = self
             .find_user_by_email_for_tenant(tenant_id, &request.email)
             .await?;
@@ -2663,6 +2679,27 @@ impl AuthService {
     /// been removed; the default tenant is now infra-only.
     fn resolve_tenant_for_login(hint: Option<Uuid>) -> Uuid {
         hint.unwrap_or_else(|| Uuid::from_u128(1))
+    }
+
+    /// MAPPS-396: resolve a tenant slug (e.g. `acme`) to its `tenant_id`
+    /// for the standalone login form. Only `status = 'active'` rows
+    /// match so a suspended tenant reads as "not a tenant" from the
+    /// login endpoint's point of view, matching the fail-closed posture
+    /// the portal side already uses for its host-to-tenant mapping
+    /// (`src/modules/portal/host_tenant.rs`). Runs on the migrator pool
+    /// because the request is pre-auth (no session GUC to set).
+    ///
+    /// Returns `AppError::Unauthorized` on an unknown or suspended
+    /// slug so the response is indistinguishable from a wrong password
+    /// (same status the downstream password-verify path returns), so
+    /// the endpoint cannot be walked to enumerate tenant slugs.
+    async fn resolve_tenant_slug(&self, slug: &str) -> AppResult<Uuid> {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM tenants WHERE slug = $1 AND status = 'active'")
+                .bind(slug)
+                .fetch_optional(self.db.migrator_pool())
+                .await?;
+        row.map(|(id,)| id).ok_or(AppError::Unauthorized)
     }
 
     /// Validate token and return claims.
