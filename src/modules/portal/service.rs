@@ -2105,7 +2105,7 @@ impl PortalAuthService {
         // Post-code-review finding #6: fold the COUNT into the SELECT
         // via `COUNT(*) OVER()`. Each section previously ran two round-
         // trips (SELECT + COUNT); every keystroke was 8 statements
-        // against tables that have no pg_trgm coverage (migration 113
+        // against tables that have no pg_trgm coverage (migration 117
         // adds that). Now every section is one round-trip; the count
         // comes back on every row (`row_count`) and we take it from
         // the first row.

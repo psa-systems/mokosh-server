@@ -61,21 +61,21 @@ async fn dispatch_injects_tenant_branding_into_render_context(pool: PgPool) {
         .await
         .expect("default password-reset template exists");
 
-    // Sanity check: the migration 106 UPDATE landed.
+    // Sanity check: the migration 110 UPDATE landed.
     assert!(
         subject.as_deref().unwrap_or("").contains("{{msp_name}}"),
-        "migration 106 did not rewrite the subject: {subject:?}"
+        "migration 110 did not rewrite the subject: {subject:?}"
     );
     assert!(
         body_text.contains("{{msp_name}}"),
-        "migration 106 did not rewrite the plain-text body: {body_text}"
+        "migration 110 did not rewrite the plain-text body: {body_text}"
     );
     assert!(
         body_html
             .as_deref()
             .unwrap_or("")
             .contains("{{msp_primary_color}}"),
-        "migration 106 did not rewrite the html body: {body_html:?}"
+        "migration 110 did not rewrite the html body: {body_html:?}"
     );
 
     let new_tpl = Uuid::new_v4();

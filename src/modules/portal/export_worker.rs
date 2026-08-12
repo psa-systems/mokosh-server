@@ -141,7 +141,7 @@ pub async fn tick_once(db: &Database) -> AppResult<()> {
                 let ready_at: DateTime<Utc> = Utc::now();
                 let expires_at: DateTime<Utc> = ready_at + ChronoDuration::days(BUNDLE_TTL_DAYS);
                 // I15 follow-up: persist `truncated` + `section_totals`
-                // to their own columns (migration 114) so the SPA
+                // to their own columns (migration 118) so the SPA
                 // status endpoint can surface the truncation warning
                 // without downloading and parsing the full bundle.
                 sqlx::query(
@@ -191,7 +191,7 @@ pub async fn tick_once(db: &Database) -> AppResult<()> {
 }
 
 /// Worker output: the finished bundle plus the two fields the SPA
-/// surfaces on the export status row (see migration 114).
+/// surfaces on the export status row (see migration 118).
 ///
 /// - `bundle` is the full JSONB persisted to `portal_exports.bundle_json`.
 /// - `truncated` mirrors the `bundle.truncated` marker; hoisted onto its
