@@ -133,16 +133,26 @@ pub async fn tick_once(db: &Database) -> AppResult<()> {
         // 3 + 4 + 5) Build + persist. A failure inside `build_bundle`
         // stamps status='failed' with a short user-safe message.
         match build_bundle(db, tenant_id, company_id, contact_id).await {
-            Ok(bundle) => {
+            Ok(BundleBuildResult {
+                bundle,
+                truncated,
+                section_totals,
+            }) => {
                 let ready_at: DateTime<Utc> = Utc::now();
                 let expires_at: DateTime<Utc> = ready_at + ChronoDuration::days(BUNDLE_TTL_DAYS);
+                // I15 follow-up: persist `truncated` + `section_totals`
+                // to their own columns (migration 114) so the SPA
+                // status endpoint can surface the truncation warning
+                // without downloading and parsing the full bundle.
                 sqlx::query(
                     r#"
                     UPDATE portal_exports
                     SET status = 'ready',
                         bundle_json = $2,
                         ready_at = $3,
-                        expires_at = $4
+                        expires_at = $4,
+                        bundle_truncated = $5,
+                        bundle_section_totals = $6
                     WHERE id = $1
                     "#,
                 )
@@ -150,6 +160,8 @@ pub async fn tick_once(db: &Database) -> AppResult<()> {
                 .bind(&bundle)
                 .bind(ready_at)
                 .bind(expires_at)
+                .bind(truncated)
+                .bind(&section_totals)
                 .execute(db.migrator_pool())
                 .await?;
             }
@@ -178,6 +190,21 @@ pub async fn tick_once(db: &Database) -> AppResult<()> {
     Ok(())
 }
 
+/// Worker output: the finished bundle plus the two fields the SPA
+/// surfaces on the export status row (see migration 114).
+///
+/// - `bundle` is the full JSONB persisted to `portal_exports.bundle_json`.
+/// - `truncated` mirrors the `bundle.truncated` marker; hoisted onto its
+///   own column so `GET /portal/export/{id}` can render the warning
+///   without downloading the whole bundle.
+/// - `section_totals` mirrors `bundle.section_totals`; hoisted for the
+///   same reason.
+pub(crate) struct BundleBuildResult {
+    pub bundle: serde_json::Value,
+    pub truncated: bool,
+    pub section_totals: serde_json::Value,
+}
+
 /// Build the customer-visible JSON bundle. The shape is a stable
 /// top-level object with named sections so a future addition (assets,
 /// contracts, projects) can slot in without breaking downstream
@@ -187,7 +214,7 @@ async fn build_bundle(
     tenant_id: Uuid,
     company_id: Uuid,
     contact_id: Uuid,
-) -> AppResult<serde_json::Value> {
+) -> AppResult<BundleBuildResult> {
     // Contact profile (self).
     let (first_name, last_name, email): (String, String, String) = sqlx::query_as(
         "SELECT first_name, last_name, email FROM contacts WHERE tenant_id = $1 AND id = $2",
@@ -324,6 +351,18 @@ async fn build_bundle(
         || invoices_total > invoices.len() as i64
         || quotes_total > quotes.len() as i64;
 
+    // I15 follow-up: hoisted onto its own return field (BundleBuildResult)
+    // so the worker can write it to portal_exports.bundle_section_totals
+    // for the SPA status endpoint, without the SPA parsing the whole
+    // bundle. Bundled a second time inside `bundle` so a downloaded
+    // bundle also carries the counts.
+    let section_totals = json!({
+        "tickets": tickets_total,
+        "ticket_notes": notes_total,
+        "invoices": invoices_total,
+        "quotes": quotes_total,
+    });
+
     let bundle = json!({
         "generated_at": Utc::now(),
         // Post-code-review finding #7: signals that at least one
@@ -331,12 +370,7 @@ async fn build_bundle(
         // residual data if they need it; the bundle stays a bounded
         // download either way.
         "truncated": truncated,
-        "section_totals": {
-            "tickets": tickets_total,
-            "ticket_notes": notes_total,
-            "invoices": invoices_total,
-            "quotes": quotes_total,
-        },
+        "section_totals": section_totals,
         "contact": {
             "id": contact_id,
             "first_name": first_name,
@@ -386,5 +420,9 @@ async fn build_bundle(
             .collect::<Vec<_>>(),
     });
 
-    Ok(bundle)
+    Ok(BundleBuildResult {
+        bundle,
+        truncated,
+        section_totals,
+    })
 }

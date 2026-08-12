@@ -2996,6 +2996,12 @@ impl PortalAuthService {
             expires_at: None,
             signed_url: None,
             error_message: None,
+            // I15 follow-up: default off / None until the worker
+            // finishes the bundle. Migration 114's DEFAULT FALSE keeps
+            // an already-queued row consistent with what the SPA reads
+            // here.
+            bundle_truncated: false,
+            bundle_section_totals: None,
         })
     }
 
@@ -3067,10 +3073,13 @@ impl PortalAuthService {
             Option<DateTime<Utc>>,
             Option<String>,
             Option<String>,
+            bool,
+            Option<serde_json::Value>,
         )> = sqlx::query_as(
             r#"
             SELECT id, status, requested_at, ready_at, expires_at,
-                   signed_url, error_message
+                   signed_url, error_message,
+                   bundle_truncated, bundle_section_totals
             FROM portal_exports
             WHERE tenant_id = $1 AND contact_id = $2 AND id = $3
             "#,
@@ -3081,7 +3090,17 @@ impl PortalAuthService {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        let Some((id, status, requested_at, ready_at, expires_at, signed_url, error_message)) = row
+        let Some((
+            id,
+            status,
+            requested_at,
+            ready_at,
+            expires_at,
+            signed_url,
+            error_message,
+            bundle_truncated,
+            bundle_section_totals,
+        )) = row
         else {
             return Err(AppError::NotFound("Export job".to_string()));
         };
@@ -3093,6 +3112,8 @@ impl PortalAuthService {
             expires_at,
             signed_url,
             error_message,
+            bundle_truncated,
+            bundle_section_totals,
         })
     }
 

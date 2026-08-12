@@ -872,6 +872,19 @@ pub struct PortalExportJob {
     pub signed_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Post-code-review finding #7 follow-up: TRUE when any per-section
+    /// fetch hit its cap and the bundle is incomplete. Always emitted
+    /// (`skip_serializing_if` omitted deliberately) so the SPA can rely
+    /// on the field's presence rather than treating the missing case as
+    /// "unknown".
+    #[serde(default)]
+    pub bundle_truncated: bool,
+    /// Per-section row counts observed at bundle time (`{tickets, notes,
+    /// invoices, quotes}`). `None` until the worker generates the
+    /// bundle; kept `None` on failed / never-run rows so the SPA does
+    /// not render a zero-count table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle_section_totals: Option<serde_json::Value>,
 }
 
 // PMS-729 phase 2 §7 slice D / I18: delegation ----------------------------
