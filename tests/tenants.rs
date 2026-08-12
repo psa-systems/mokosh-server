@@ -125,6 +125,60 @@ async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
     assert_eq!(tenant_total, 3, "no duplicate tenants provisioned");
 }
 
+/// PMS-729 finalize: `copy_default_config` MUST propagate the
+/// transactional notification templates + rules that portal flows
+/// dispatch through. Without `auth.welcome` on a fresh tenant, the
+/// "grant portal access" write mints a setup token but the follow-on
+/// email dispatch silently drops (no template row -> nothing to
+/// render), so the customer never gets the setup link and the flow
+/// looks broken end-to-end. This regression test pins the template
+/// AND the delivery rule; either missing = red.
+#[sqlx::test]
+async fn create_tenant_copies_auth_welcome_template_and_rule(pool: PgPool) {
+    let svc = TenantService::new(mokosh_server::Database::from_pool(pool.clone()));
+    let req = mokosh_server::modules::tenants::CreateTenantRequest {
+        name: "PMS-729 Welcome-Template Check".into(),
+        slug: "pms729-welcome-copy".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-pms729-welcome@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Pms729Welcome".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant with default seed");
+
+    let template_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_templates \
+         WHERE tenant_id = $1 AND event_type = 'auth.welcome' AND channel_type = 'email'",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count auth.welcome template");
+    assert_eq!(
+        template_count, 1,
+        "fresh tenant must have exactly one auth.welcome email template so the portal setup email has something to render"
+    );
+
+    let rule_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_rules \
+         WHERE tenant_id = $1 AND event_type = 'auth.welcome' AND is_active = TRUE",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count auth.welcome rule");
+    assert_eq!(
+        rule_count, 1,
+        "fresh tenant must have exactly one active auth.welcome delivery rule so the dispatcher actually fires"
+    );
+}
+
 #[sqlx::test]
 async fn list_tenants_returns_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;

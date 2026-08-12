@@ -1053,6 +1053,143 @@ async fn granting_portal_access_mints_setup_token(pool: PgPool) {
     );
 }
 
+/// PMS-729 finalize: `send_setup_email` context shape. Granting portal
+/// access enqueues an `auth.welcome` notification whose rendered body
+/// carries the actual `/portal/set-password?token=...` link the
+/// customer clicks. Pins the wire: without this test a future context
+/// rename (e.g. `setup_link` -> `set_password_url`) would render an
+/// empty link and no test would flag it.
+#[sqlx::test]
+async fn granting_portal_access_enqueues_setup_link_email(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Wire Co").await;
+
+    let created = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Wire",
+            "last_name": "Check",
+            "email": "wire-check@acme.example",
+            "create_portal_access": true,
+        }))
+        .send()
+        .await
+        .expect("create + grant portal");
+    assert!(created.status().is_success());
+
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT channel_type, recipient, body FROM notifications \
+         WHERE tenant_id = $1 AND channel_type = 'email' AND recipient = $2",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("wire-check@acme.example")
+    .fetch_optional(&pool)
+    .await
+    .expect("query notification");
+
+    let (channel, recipient, body) = row.expect("an auth.welcome email was enqueued for the grant");
+    assert_eq!(channel, "email");
+    assert_eq!(recipient.as_deref(), Some("wire-check@acme.example"));
+    assert!(
+        body.contains("/portal/set-password?token="),
+        "body must carry the /portal/set-password?token=... link so the customer can complete signup, got: {body}"
+    );
+    // The token has the {contact_id}.{secret} shape (mirrors
+    // parse_contact_bound_token). If the format ever changes the SPA
+    // URL parser and this assertion both need to move together.
+    assert!(
+        body.contains("token="),
+        "body must carry a token= query parameter, got: {body}"
+    );
+}
+
+/// PMS-729 finalize: both `create_portal_access: true` on create and
+/// `is_portal_user: true` on update write an `audit_log` row against
+/// the `contacts` entity so an admin can see who granted portal access
+/// to whom. Pins the audit-side of the grant flow: without this, a
+/// future refactor that skips the audit_write inside the create/update
+/// tx would go undetected.
+#[sqlx::test]
+async fn granting_portal_access_writes_audit_row(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Audit Co").await;
+
+    // (1) Create with create_portal_access=true -> one Create audit row.
+    let created = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Portal",
+            "last_name": "Grantee",
+            "email": "audit-grant@acme.example",
+            "create_portal_access": true,
+        }))
+        .send()
+        .await
+        .expect("create + grant portal");
+    assert!(created.status().is_success());
+    let created_json: serde_json::Value = created.json().await.expect("created JSON");
+    let contact_id: uuid::Uuid = created_json["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .expect("contact id");
+
+    let create_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE tenant_id = $1 AND entity_type = 'contacts' AND entity_id = $2 AND action = 'create'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit create rows");
+    assert_eq!(
+        create_audit_count, 1,
+        "create_portal_access grant must write exactly one Create audit row so the grant is discoverable"
+    );
+
+    // (2) Toggle the flag off then on again -> two Update audit rows
+    //     (the revoke + the grant); asserts the update path audits too.
+    let _revoke = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_portal_user": false }))
+        .send()
+        .await
+        .expect("revoke");
+    let _regrant = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_portal_user": true }))
+        .send()
+        .await
+        .expect("re-grant");
+    let update_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE tenant_id = $1 AND entity_type = 'contacts' AND entity_id = $2 AND action = 'update'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit update rows");
+    assert_eq!(
+        update_audit_count, 2,
+        "revoke + re-grant must write two Update audit rows so the toggle history is discoverable"
+    );
+}
+
 // ============================================================================
 // PMS-17 AC4 (F9 regression pin)
 // ============================================================================

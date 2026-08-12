@@ -42,6 +42,9 @@ pub use service::AuthService;
 // against the Rust one.
 #[cfg(feature = "server")]
 pub use service::{mfa_lock_seconds_sql, mfa_lockout_until};
+// PMS-729 finalize (MAPPS-334 parity): re-exported so the portal-side
+// JWT mint stamps the same `iss` / `aud` values as the agent side does.
+pub use service::{MOKOSH_JWT_AUDIENCE, MOKOSH_JWT_ISSUER};
 // PMS-743: tenant naming derives a personal tenant's display name from the
 // same email-to-name logic the JIT user insert uses, rather than growing a
 // second copy of the UUID / placeholder rejection rules.

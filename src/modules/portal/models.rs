@@ -456,6 +456,23 @@ pub struct PortalJwtClaims {
     /// refresh token id => a new sid).
     #[serde(default)]
     pub sid: Uuid,
+    /// PMS-729 finalize: not-before, matches agent posture (MAPPS-334).
+    /// Same second as `iat`; the leeway on the decode side absorbs
+    /// clock skew. Defaulted for tokens minted before this claim was
+    /// added so a rolling access-token TTL flushes cleanly.
+    #[serde(default)]
+    pub nbf: i64,
+    /// PMS-729 finalize: token issuer (MAPPS-334 parity). Mint side
+    /// always stamps `MOKOSH_JWT_ISSUER`; the decode side does not
+    /// pin the value yet (see `decode_token` doc) so the strict
+    /// flip is a no-op after the migration window rotates every
+    /// live token.
+    #[serde(default)]
+    pub iss: String,
+    /// PMS-729 finalize: intended audience (MAPPS-334 parity). Same
+    /// migration posture as `iss`: minted now, validated later.
+    #[serde(default)]
+    pub aud: String,
 }
 
 /// PMS-729 phase 2 H6: one row on `GET /portal/auth/me/sessions`.

@@ -6,7 +6,7 @@
 //! tokens.
 
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -538,6 +538,10 @@ impl PortalAuthService {
         now: DateTime<Utc>,
     ) -> AppResult<(String, DateTime<Utc>)> {
         let expires_at = now + self.access_token_ttl;
+        // PMS-729 finalize (MAPPS-334 parity): stamp `nbf` + `iss` + `aud`
+        // at mint time so the future strict-validation flip on the decode
+        // side lands as a no-op after a rolling access-token TTL has
+        // rotated every live token.
         let claims = PortalJwtClaims {
             sub: contact_id,
             tid: tenant_id,
@@ -548,9 +552,15 @@ impl PortalAuthService {
             typ: "portal_access".to_string(),
             jti: Uuid::new_v4(),
             sid,
+            nbf: now.timestamp(),
+            iss: crate::modules::auth::MOKOSH_JWT_ISSUER.to_string(),
+            aud: crate::modules::auth::MOKOSH_JWT_AUDIENCE.to_string(),
         };
+        // PMS-729 finalize: explicit HS256 header so a future
+        // jsonwebtoken bump that changes `Header::default()` does not
+        // silently downgrade the mint algorithm. Matches agent posture.
         let token = encode(
-            &Header::default(),
+            &Header::new(Algorithm::HS256),
             &claims,
             &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
         )
@@ -734,6 +744,20 @@ impl PortalAuthService {
             .await?;
         let (access_token, expires_at) =
             self.mint_access_token(contact_id, tenant_id, company_id, &email, refresh.id, now)?;
+        // PMS-729 finalize (H10 parity): audit the successful refresh so
+        // an admin can see the token rotation cadence + spot a
+        // suspicious refresh from an unexpected IP. Best-effort; a
+        // failed audit write is not a refresh-flow failure.
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.refresh",
+            ip_address.map(|ip| ip.to_string()),
+            user_agent.map(|s| s.to_string()),
+        )
+        .await;
         Ok(PortalRefreshResponse {
             access_token,
             expires_at,
@@ -1028,11 +1052,26 @@ impl PortalAuthService {
     /// Decode + validate a portal JWT. Rejects anything that isn't
     /// `typ = "portal_access"` so an agent's access token cannot be
     /// replayed against the portal surface.
+    ///
+    /// PMS-729 finalize (MAPPS-334 parity): explicit `Validation::new(
+    /// Algorithm::HS256)` instead of `Validation::default()`. The
+    /// default already defaults to HS256 today, but pinning it makes
+    /// the algorithm choice greppable and stops a future jsonwebtoken
+    /// bump from silently changing it. 30s leeway matches the agent
+    /// side + the Bunyip RS verifier. `validate_aud` is explicitly
+    /// disabled for the migration window: portal tokens minted before
+    /// this commit carry no `aud`, so pinning today would 401 every
+    /// live token; the strict flip is a follow-up ticket once the
+    /// access-TTL rotation has burned through legacy tokens.
     pub fn decode_token(&self, token: &str) -> AppResult<PortalJwtClaims> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.validate_aud = false;
+        validation.leeway = 30;
         let data = decode::<PortalJwtClaims>(
             token,
             &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
-            &Validation::default(),
+            &validation,
         )
         .map_err(|_| AppError::Unauthorized)?;
         if data.claims.typ != "portal_access" {
@@ -1135,6 +1174,22 @@ impl PortalAuthService {
         .await?;
         tx.commit().await?;
 
+        // PMS-729 finalize (H10 parity): audit the successful setup-
+        // password redemption. This is the moment a new portal user
+        // enters the system, so an admin reviewing the audit stream
+        // sees "contact X set their portal password at Y" alongside
+        // login / reset events.
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.setup_password",
+            None,
+            None,
+        )
+        .await;
+
         Ok(())
     }
 
@@ -1210,6 +1265,23 @@ impl PortalAuthService {
         .bind(user_agent)
         .fetch_one(self.db.migrator_pool())
         .await?;
+
+        // PMS-729 finalize (H10 parity): audit the password-reset
+        // request AFTER the row is minted (so a probe against a
+        // non-existent account leaves no audit row - the earlier
+        // `return Ok(None)` bypasses this line). Keeps the
+        // enumeration-resistant wire shape intact while giving an
+        // admin a real "reset requested" event in the audit stream.
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Create,
+            "portal.password_reset_requested",
+            ip.map(|ip| ip.to_string()),
+            user_agent.map(|s| s.to_string()),
+        )
+        .await;
 
         Ok(Some(PasswordResetIssue {
             contact_id,
@@ -1493,6 +1565,20 @@ impl PortalAuthService {
         // nicer but is scope for the phase 2 §6 branding pass.
         let label = format!("Mokosh:{email}");
         let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, "Mokosh");
+        // PMS-729 finalize (H10 parity): audit MFA-setup so an admin
+        // sees the enrollment start in the same stream as
+        // portal.mfa_enabled / .mfa_disabled / .password_changed.
+        // Best-effort; a failed audit write is not a setup failure.
+        let _ = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.mfa_setup_started",
+            None,
+            None,
+        )
+        .await;
         Ok(PortalMfaSetupResponse {
             secret: secret_b32,
             provisioning_uri,
