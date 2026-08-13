@@ -796,11 +796,20 @@ static INFISICAL_PROBE: std::sync::OnceLock<Option<InfisicalProbe>> = std::sync:
 
 fn infisical_probe() -> Option<&'static InfisicalProbe> {
     INFISICAL_PROBE
-        .get_or_init(|| build_infisical_probe(std::env::var("INFISICAL_BASE_URL").ok()))
+        .get_or_init(|| {
+            // GOV-50: prefer the canonical INFISICAL_ADDRESS; fall back to the
+            // legacy INFISICAL_BASE_URL for one release.
+            let raw = std::env::var("INFISICAL_ADDRESS")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| std::env::var("INFISICAL_BASE_URL").ok());
+            build_infisical_probe(raw)
+        })
         .as_ref()
 }
 
-/// Build the probe from the raw `INFISICAL_BASE_URL` value. Split out of
+/// Build the probe from the resolved Infisical address (`INFISICAL_ADDRESS`, or
+/// the legacy `INFISICAL_BASE_URL`). Split out of
 /// [`infisical_probe`] so the blank-is-unconfigured rule is unit testable
 /// without mutating the process-global env behind the `OnceLock`.
 ///

@@ -28,7 +28,11 @@ use sqlx::PgPool;
 /// single call for the whole binary.
 fn unconfigure_infisical() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::set_var("INFISICAL_BASE_URL", ""));
+    ONCE.call_once(|| {
+        // GOV-50: blank both the canonical and legacy names so the probe reads unconfigured.
+        std::env::set_var("INFISICAL_ADDRESS", "");
+        std::env::set_var("INFISICAL_BASE_URL", "");
+    });
 }
 
 #[sqlx::test]
