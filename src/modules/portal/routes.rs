@@ -196,6 +196,11 @@ pub fn portal_routes(
         .route("/quotes/{quote_id}/accept", post(accept_quote))
         .route("/quotes/{quote_id}/decline", post(decline_quote))
         .route("/kb", get(list_kb))
+        // Portal-scoped single-article read. Enforces the same
+        // status='published' + visibility check the list feed uses, so a
+        // stored-but-not-visible article 404s rather than confirming its
+        // existence to the caller.
+        .route("/kb/{id}", get(get_kb_article))
         // PMS-729 phase 2 §7 slice A / I17: portal home dashboard.
         // Aggregated counts + latest activity for the caller's company,
         // scoped by the JWT-verified tenant + company. Fixed set of
@@ -1272,6 +1277,26 @@ async fn pay_invoice(
     Ok(Json(PayInvoiceResponse {
         checkout_url: session.url,
     }))
+}
+
+/// Portal-scoped single KB article read. Enforces the same publish +
+/// visibility rules the feed uses; a stored-but-not-visible article
+/// returns 404 rather than confirming its existence outside the
+/// caller's scope.
+async fn get_kb_article(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(article_id): Path<Uuid>,
+) -> AppResult<Json<KbArticleResponse>> {
+    // SAFETY (PMS-285): `contact.tenant()` wraps a verified portal-JWT
+    // claim, the caller's own authenticated tenant. Portal cannot use
+    // `TenantScoped`; `from_trusted` is the sanctioned bridge (same
+    // rationale as `list_kb`).
+    let article = state
+        .kb
+        .get_portal_article(contact.tenant(), contact.company_id, article_id)
+        .await?;
+    Ok(Json(article))
 }
 
 async fn list_kb(
