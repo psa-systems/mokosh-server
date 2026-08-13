@@ -29,7 +29,8 @@ use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalApproval,
     PortalApprovalDecisionRequest, PortalAsset, PortalChangePasswordRequest, PortalCompanyContact,
     PortalContract, PortalDashboardResponse, PortalDelegation, PortalDelegationGrantRequest,
-    PortalExportJob, PortalForgotPasswordRequest, PortalHostHint, PortalInvoicePaymentsResponse,
+    PortalExportJob, PortalForgotPasswordRequest, PortalHostHint,
+    PortalInviteColleagueRequest, PortalInviteColleagueResponse, PortalInvoicePaymentsResponse,
     PortalLoginRequest, PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest,
     PortalMfaEnableResponse, PortalMfaSetupRequest, PortalMfaSetupResponse,
     PortalNotificationsResponse, PortalProject, PortalProjectDetail, PortalRefreshRequest,
@@ -240,7 +241,10 @@ pub fn portal_routes(
             "/approvals/{approval_id}/decide",
             post(decide_portal_approval),
         )
-        .route("/company/contacts", get(list_company_contacts))
+        .route(
+            "/company/contacts",
+            get(list_company_contacts).post(invite_colleague),
+        )
         .route(
             "/company/delegations",
             get(list_portal_delegations).post(grant_portal_delegation),
@@ -916,6 +920,46 @@ async fn list_company_contacts(
             .list_company_contacts(contact.tenant(), contact.company_id, contact.id)
             .await?,
     ))
+}
+
+/// PMS-729 follow-up: portal-side invite-a-colleague. Adds a new
+/// portal-visible contact under the caller's own company + tenant
+/// (both from the verified JWT, never body input) and dispatches the
+/// same `auth.welcome` setup-link email an agent-side grant fires.
+/// The response echoes only the new contact id; the setup token is
+/// emailed rather than returned.
+async fn invite_colleague(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    headers: HeaderMap,
+    Json(request): Json<PortalInviteColleagueRequest>,
+) -> AppResult<Json<PortalInviteColleagueResponse>> {
+    // Per-request origin so the setup-link email points at the
+    // tenant's own subdomain (`acme.client.<apex>`) on per-tenant
+    // deploys - matches the login-location alert path (finding #5).
+    let per_request_origin = portal_origin_from_host(
+        &state.host_config,
+        headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+        &state.portal_origin,
+    );
+    let id = state
+        .service
+        .invite_colleague(
+            contact.tenant(),
+            contact.company_id,
+            contact.id,
+            &request.first_name,
+            &request.last_name,
+            &request.email,
+            &per_request_origin,
+        )
+        .await?;
+    Ok(Json(PortalInviteColleagueResponse { id }))
 }
 
 async fn list_portal_delegations(

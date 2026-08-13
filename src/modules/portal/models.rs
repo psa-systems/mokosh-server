@@ -834,6 +834,25 @@ pub struct PortalCompanyContact {
     pub is_you: bool,
 }
 
+/// PMS-729 follow-up: `POST /portal/company/contacts` body. Portal-side
+/// invite-a-colleague. Caller identity + tenant + company come from the
+/// verified JWT; the body carries only what the new contact IS
+/// (name + email), never the tenant / company / role.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PortalInviteColleagueRequest {
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+}
+
+/// Response for `POST /portal/company/contacts`. Only the id is echoed;
+/// the setup token goes out over email so the wire never carries the
+/// credential a colleague uses to sign in.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalInviteColleagueResponse {
+    pub id: Uuid,
+}
+
 // PMS-729 phase 2 §7 slice D / I7: approvals ------------------------------
 
 /// One approval assigned to the caller. Mirrors the customer-visible

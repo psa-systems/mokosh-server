@@ -2834,6 +2834,164 @@ impl PortalAuthService {
         })
     }
 
+    /// PMS-729 follow-up: portal-side invite-a-colleague.
+    ///
+    /// Lets a portal contact add another person from their own company to
+    /// the portal so they can then be delegated to (or just so they can
+    /// sign in on their own). Mirrors the agent-side
+    /// `contacts::ContactService::create_contact` + `create_portal_access:
+    /// true` path but bounded to the caller's own tenant + company (JWT-
+    /// verified), so a portal user cannot mint contacts under a sibling
+    /// company or another MSP.
+    ///
+    /// Fires the same `auth.welcome` email (setup-token link) as the agent
+    /// grant, so the new colleague gets the same customer-facing message
+    /// they'd get if the agent had added them.
+    ///
+    /// Fails with `AppError::Conflict` when an existing contact under this
+    /// tenant already carries the email (RFC-5321 case-insensitive local
+    /// part), so a portal user cannot silently create a duplicate row that
+    /// diverges from the agent-side CRM.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, invited_by = %invited_by))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invite_colleague(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        invited_by: Uuid,
+        first_name: &str,
+        last_name: &str,
+        email: &str,
+        portal_origin: &str,
+    ) -> AppResult<Uuid> {
+        let first = first_name.trim();
+        let last = last_name.trim();
+        let email_norm = email.trim().to_ascii_lowercase();
+        if first.is_empty() || last.is_empty() || email_norm.is_empty() {
+            return Err(AppError::BadRequest(
+                "first_name, last_name and email are required".to_string(),
+            ));
+        }
+        if !email_norm.contains('@') {
+            return Err(AppError::BadRequest(
+                "email must include an @ sign".to_string(),
+            ));
+        }
+        if first.chars().count() > 100
+            || last.chars().count() > 100
+            || email_norm.chars().count() > 255
+        {
+            return Err(AppError::BadRequest(
+                "first_name / last_name capped at 100 chars, email at 255".to_string(),
+            ));
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Uniqueness (case-insensitive) at the tenant level so the portal
+        // path cannot create a contact row that already exists agent-side
+        // under a different case. Same guarantee the agent create path
+        // relies on: (tenant_id, LOWER(email)) is effectively unique for
+        // portal-visible contacts.
+        let already: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM contacts WHERE tenant_id = $1 AND LOWER(email) = $2 LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(&email_norm)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if already.is_some() {
+            return Err(AppError::conflict(
+                "A contact with this email already exists.",
+            ));
+        }
+
+        let contact_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO contacts (
+                id, tenant_id, company_id, first_name, last_name, email,
+                is_portal_user, contact_type
+            ) VALUES ($1, $2, $3, $4, $5, $6, TRUE, 'other')
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(first)
+        .bind(last)
+        .bind(&email_norm)
+        .execute(&mut *tx)
+        .await?;
+
+        // Mint the setup token in the SAME tx so a rollback cleans up
+        // both. Format `{contact_id}.{secret}` matches the shape the
+        // /portal/set-password endpoint parses.
+        let secret = crate::utils::crypto::generate_token(64);
+        let token_hash = crate::utils::crypto::hash_password(&secret)?;
+        let token = format!("{contact_id}.{secret}");
+        let expires_at = Utc::now() + Duration::hours(72);
+        sqlx::query(
+            r#"
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        // Best-effort audit (H10 parity with agent-side portal.setup / grant).
+        let _ = crate::modules::audit::audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id.get(),
+            Some(invited_by),
+            crate::modules::audit::AuditAction::Create,
+            "portal.invite_colleague",
+            None,
+            None,
+        )
+        .await;
+
+        // Best-effort email dispatch AFTER the commit so a mailer outage
+        // does not roll back the contact + token.
+        if let Some(notify) = self.notifications.as_ref() {
+            let setup_link = format!(
+                "{}/portal/set-password?token={}",
+                portal_origin.trim_end_matches('/'),
+                token,
+            );
+            let context = serde_json::json!({
+                "recipient_email": email_norm,
+                "display_name": first,
+                "setup_link": setup_link,
+            });
+            match notify.dispatch(tenant_id, "auth.welcome", &context).await {
+                Ok(_) => tracing::info!(
+                    contact_id = %contact_id,
+                    "portal invite email queued"
+                ),
+                Err(e) => tracing::warn!(
+                    contact_id = %contact_id,
+                    error = ?e,
+                    "portal invite email dispatch failed; token persisted but link unreachable"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                contact_id = %contact_id,
+                "no notifications dispatcher wired; portal invite token persisted but no message queued"
+            );
+        }
+
+        Ok(contact_id)
+    }
+
     /// PMS-729 phase 2 §7 slice D / I13: list every portal-enabled
     /// contact at the caller's own company. Returns id + name + email
     /// + `is_you` flag; nothing else. Non-portal contacts (i.e.
