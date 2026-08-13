@@ -1,7 +1,7 @@
 //! Integration test for the readiness probe (PMS-130).
 //!
 //! `/api/v1/ready` runs a live DB ping plus a best-effort Infisical
-//! probe gated on `INFISICAL_BASE_URL`. The integration harness
+//! probe gated on `INFISICAL_ADDRESS`. The integration harness
 //! provisions a fresh per-test database via `#[sqlx::test]` and does
 //! not configure Infisical, so the expected payload is:
 //!   `{"status":"ready","checks":{"db":"ok","infisical":"skipped"}}`
@@ -16,7 +16,7 @@ use sqlx::PgPool;
 
 /// Pin the harness premise: Infisical is unconfigured. `just
 /// test-integration` runs inside the dev compose `server` container,
-/// which exports `INFISICAL_BASE_URL` (compose.dev.yml) while the
+/// which exports `INFISICAL_ADDRESS` (compose.dev.yml) while the
 /// `infisical` service itself is an opt-in profile, so the probe hit
 /// an absent host and 503'd after its 1s timeout (PMS-685). PMS-707
 /// made that export EMPTY by default, so set the empty value here
@@ -29,9 +29,8 @@ use sqlx::PgPool;
 fn unconfigure_infisical() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        // GOV-50: blank both the canonical and legacy names so the probe reads unconfigured.
+        // GOV-50: blank the canonical INFISICAL_ADDRESS so the probe reads unconfigured.
         std::env::set_var("INFISICAL_ADDRESS", "");
-        std::env::set_var("INFISICAL_BASE_URL", "");
     });
 }
 

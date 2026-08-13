@@ -279,7 +279,7 @@ pub fn create_api_router(
         // orchestrators to decide whether to restart the container.
         .route("/health", get(health_check))
         // Readiness probe (PMS-130): also pings the DB, and best-effort
-        // pings Infisical when `INFISICAL_BASE_URL` is set. Returns 503
+        // pings Infisical when `INFISICAL_ADDRESS` is set. Returns 503
         // with a JSON breakdown when a dependency is down so the
         // orchestrator drains traffic until the probe goes green.
         .route(
@@ -683,7 +683,7 @@ async fn health_check() -> &'static str {
 ///   distinguishes a process that booted from one that can actually
 ///   serve a request.
 /// - **Infisical** (best-effort): if the operator set
-///   `INFISICAL_BASE_URL` at process start, a 1-second HTTP probe
+///   `INFISICAL_ADDRESS` at process start, a 1-second HTTP probe
 ///   against `<base>/api/status`. Mokosh-server loads Infisical
 ///   secrets at boot only, so a transient Infisical outage does
 ///   not break in-flight requests; the probe still surfaces the
@@ -773,7 +773,7 @@ async fn bounded_db_ping(
 }
 
 /// Captured-at-boot Infisical probe state. The handler used to read
-/// `INFISICAL_BASE_URL` and build a fresh `reqwest::Client` on every
+/// `INFISICAL_ADDRESS` and build a fresh `reqwest::Client` on every
 /// request, which leaked file descriptors and re-resolved DNS under
 /// repeated orchestrator polling. Cache the parsed config + the HTTP
 /// client in a `OnceLock` so subsequent probes reuse the connection
@@ -787,7 +787,7 @@ struct InfisicalProbe {
     /// Sanitised display form of `<base>` (scheme + host[:port] only,
     /// no userinfo or query string) used inside error strings so the
     /// response body and access log do not echo credentials the
-    /// operator may have embedded in `INFISICAL_BASE_URL`.
+    /// operator may have embedded in `INFISICAL_ADDRESS`.
     display: String,
     client: reqwest::Client,
 }
@@ -797,19 +797,18 @@ static INFISICAL_PROBE: std::sync::OnceLock<Option<InfisicalProbe>> = std::sync:
 fn infisical_probe() -> Option<&'static InfisicalProbe> {
     INFISICAL_PROBE
         .get_or_init(|| {
-            // GOV-50: prefer the canonical INFISICAL_ADDRESS; fall back to the
-            // legacy INFISICAL_BASE_URL for one release.
+            // GOV-50: the Infisical instance URL is read from the canonical
+            // INFISICAL_ADDRESS only.
             let raw = std::env::var("INFISICAL_ADDRESS")
                 .ok()
-                .filter(|v| !v.trim().is_empty())
-                .or_else(|| std::env::var("INFISICAL_BASE_URL").ok());
+                .filter(|v| !v.trim().is_empty());
             build_infisical_probe(raw)
         })
         .as_ref()
 }
 
-/// Build the probe from the resolved Infisical address (`INFISICAL_ADDRESS`, or
-/// the legacy `INFISICAL_BASE_URL`). Split out of
+/// Build the probe from the resolved Infisical address (`INFISICAL_ADDRESS`).
+/// Split out of
 /// [`infisical_probe`] so the blank-is-unconfigured rule is unit testable
 /// without mutating the process-global env behind the `OnceLock`.
 ///
@@ -824,7 +823,7 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
     }
     let trimmed = base.trim_end_matches('/').to_string();
     // Best-effort credential scrub for error strings. If
-    // `INFISICAL_BASE_URL` does not parse as a URL, fall back
+    // `INFISICAL_ADDRESS` does not parse as a URL, fall back
     // to the literal trimmed string (no leak path exists for
     // a value that does not parse anyway, but stay defensive).
     let display = match url::Url::parse(&trimmed) {
@@ -849,7 +848,7 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
 }
 
 /// Probe Infisical's `/api/status` endpoint when the operator opted
-/// in via `INFISICAL_BASE_URL`. Returns:
+/// in via `INFISICAL_ADDRESS`. Returns:
 ///
 /// - `Ok(true)` - probe ran and got a 2xx response
 /// - `Ok(false)` - probe skipped (env var unset or blank)

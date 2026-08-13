@@ -260,8 +260,8 @@ dev-infisical *args: ensure-env
     let updated = (
         open .env --raw
         | lines
-        | where not ($it | str starts-with 'MOKOSH_SERVER_INFISICAL_BASE_URL=')
-        | append 'MOKOSH_SERVER_INFISICAL_BASE_URL=http://infisical:8080'
+        | where not ($it | str starts-with 'MOKOSH_SERVER_INFISICAL_ADDRESS=')
+        | append 'MOKOSH_SERVER_INFISICAL_ADDRESS=http://infisical:8080'
         | str join "\n"
     )
     if ('.env.new' | path exists) { rm .env.new }
