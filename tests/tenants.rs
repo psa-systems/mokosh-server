@@ -12,6 +12,7 @@ use sqlx::PgPool;
 
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::AuthService;
+use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::modules::tenants::{CreateTenantRequest, TenantService};
 use mokosh_server::Database;
 
@@ -176,6 +177,85 @@ async fn create_tenant_copies_auth_welcome_template_and_rule(pool: PgPool) {
     assert_eq!(
         rule_count, 1,
         "fresh tenant must have exactly one active auth.welcome delivery rule so the dispatcher actually fires"
+    );
+}
+
+/// PMS-729 follow-up: a super-admin `create_tenant` call must produce an
+/// emailed setup link for the fresh admin, matching the
+/// `AuthService::create_user(send_welcome_email = true)` path. Without
+/// this, a newly provisioned tenant lands with a `status = 'pending'`
+/// admin user who has no password and no way to activate: legal in the
+/// schema, unreachable from a browser.
+///
+/// Pinned end-to-end: the token row that redeems the link, and the
+/// queued notification row the dispatcher will drain into an SMTP send.
+/// Either missing = the admin has no way in.
+#[sqlx::test]
+async fn create_tenant_emails_admin_setup_link(pool: PgPool) {
+    let notifications =
+        NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
+    let svc = TenantService::new(Database::from_pool(pool.clone()))
+        .with_dispatcher(notifications, "https://spa.test".into());
+
+    let req = CreateTenantRequest {
+        name: "PMS-729 Admin Welcome".into(),
+        slug: "pms729-admin-welcome".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "admin-pms729-welcome@example.test".into(),
+        admin_first_name: "Ada".into(),
+        admin_last_name: "Admin".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant with dispatcher");
+
+    let admin_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = $1 AND email = $2")
+            .bind(tenant.id)
+            .bind(&req.admin_email)
+            .fetch_one(&pool)
+            .await
+            .expect("read admin user id");
+
+    let token_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM password_reset_tokens \
+         WHERE tenant_id = $1 AND user_id = $2 AND used_at IS NULL",
+    )
+    .bind(tenant.id)
+    .bind(admin_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count admin setup tokens");
+    assert_eq!(
+        token_count, 1,
+        "create_tenant must mint exactly one redeemable setup token for the admin"
+    );
+
+    let queued: (String, String, String) = sqlx::query_as(
+        "SELECT recipient, subject, body FROM notifications \
+         WHERE tenant_id = $1 AND channel_type = 'email' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read queued welcome notification");
+    assert_eq!(
+        queued.0, req.admin_email,
+        "queued email must be addressed to the freshly-created admin"
+    );
+    assert!(
+        queued.2.contains("https://spa.test/reset-password/"),
+        "queued body must carry the SPA-origin setup link, got: {}",
+        queued.2
+    );
+    assert!(
+        !queued.1.is_empty(),
+        "queued subject must be non-empty so the mail client renders a subject line"
     );
 }
 

@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::notifications::NotificationsService;
+use crate::utils::crypto::{generate_token, hash_password};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::slugify;
 
@@ -91,11 +93,43 @@ fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String
 #[derive(Clone)]
 pub struct TenantService {
     db: Database,
+    // PMS-729 finalize: when the notifications dispatcher and the SPA base
+    // URL are wired in, `create_tenant` mints a `password_reset_tokens` row
+    // for the freshly created admin user and dispatches `auth.welcome` so
+    // the admin gets an emailed setup link (same pattern
+    // `AuthService::create_user(send_welcome_email = true)` already uses).
+    // The default `new()` constructor leaves both `None` so the test
+    // fixtures and the bunyip placement path stay untouched; only the
+    // production wire path opts in via `with_dispatcher`.
+    notifications: Option<NotificationsService>,
+    frontend_base_url: Option<String>,
 }
 
 impl TenantService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            notifications: None,
+            frontend_base_url: None,
+        }
+    }
+
+    /// Attach the notifications dispatcher + SPA origin so `create_tenant`
+    /// emails a `/reset-password/{token}` setup link to the fresh admin
+    /// user, matching the `AuthService::create_user` welcome path.
+    ///
+    /// Not required for the seed / placement paths that also construct
+    /// this service; the admin welcome email is a super-admin
+    /// tenant-provisioning affordance.
+    #[must_use]
+    pub fn with_dispatcher(
+        mut self,
+        notifications: NotificationsService,
+        frontend_base_url: String,
+    ) -> Self {
+        self.notifications = Some(notifications);
+        self.frontend_base_url = Some(frontend_base_url.trim_end_matches('/').to_string());
+        self
     }
 
     /// Create a new tenant
@@ -226,9 +260,144 @@ impl TenantService {
         // overhead time entries have a stable company_id. Idempotent.
         self.ensure_own_company(tenant_id).await?;
 
+        // PMS-729 finalize: send the admin an emailed setup link so they can
+        // choose a password and sign in. Best-effort: a failed dispatch is
+        // logged but not fatal, matching `AuthService::create_user`'s welcome
+        // path. Runs only when both the notifications dispatcher and the SPA
+        // origin were wired via `with_dispatcher`; the seed / placement paths
+        // that construct a bare service skip it and stay on their
+        // pre-existing behaviour.
+        self.send_admin_welcome(tenant_id, admin_id, request).await;
+
         // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
         // is the same minted id, bridged via `from_trusted`.
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
+    }
+
+    /// Emit an `auth.welcome` message with a `/reset-password/{token}` link
+    /// for the freshly created tenant's admin.
+    ///
+    /// Reuses the `password_reset_tokens` table + token shape
+    /// (`{user_id}.{secret}`) so the existing `reset_password` handler can
+    /// redeem it without a parallel setup-token pipeline. The token gets a
+    /// 7-day window, matching `create_user`.
+    ///
+    /// Best-effort: absence of a dispatcher, a dispatch failure, and even
+    /// a token-insert failure all log-and-return. The tenant + admin user
+    /// are already committed; refusing to return them because their mail
+    /// did not send would strand the super-admin with a half-created
+    /// tenant that already exists in the DB. The admin can still trigger
+    /// a password-reset from the login page as a fallback.
+    async fn send_admin_welcome(
+        &self,
+        tenant_id: Uuid,
+        admin_id: Uuid,
+        request: &CreateTenantRequest,
+    ) {
+        let (Some(notify), Some(base_url)) =
+            (self.notifications.as_ref(), self.frontend_base_url.as_ref())
+        else {
+            return;
+        };
+
+        let secret = generate_token(64);
+        let token_hash = match hash_password(&secret) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    admin_id = %admin_id,
+                    error = ?e,
+                    "hash_password failed while minting admin welcome token",
+                );
+                return;
+            }
+        };
+        let token = format!("{}.{}", admin_id, secret);
+        let expires_at = Utc::now() + Duration::days(7);
+
+        let mut tx = match self.db.begin_with_tenant(tenant_id).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    admin_id = %admin_id,
+                    error = ?e,
+                    "begin_with_tenant failed while minting admin welcome token",
+                );
+                return;
+            }
+        };
+        let insert = sqlx::query(
+            r#"
+            INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(admin_id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await;
+        if let Err(e) = insert {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                admin_id = %admin_id,
+                error = ?e,
+                "failed to insert admin welcome password_reset_tokens row",
+            );
+            return;
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                admin_id = %admin_id,
+                error = ?e,
+                "commit failed on admin welcome password_reset_tokens tx",
+            );
+            return;
+        }
+
+        let setup_link = format!("{}/reset-password/{}", base_url, token);
+        let display_name = match (
+            request.admin_first_name.trim(),
+            request.admin_last_name.trim(),
+        ) {
+            ("", "") => String::new(),
+            (f, "") => f.to_string(),
+            ("", l) => l.to_string(),
+            (f, l) => format!("{f} {l}"),
+        };
+        let context = serde_json::json!({
+            "recipient_user_id": admin_id.to_string(),
+            "recipient_email": request.admin_email,
+            "display_name": display_name,
+            "setup_link": setup_link,
+        });
+        // SAFETY (PMS-261): `tenant_id` is freshly minted for the tenant just
+        // created; `from_trusted` bridges it into the typed scope, and
+        // `dispatch` sets the GUC per query via `begin_with_tenant`.
+        match notify
+            .dispatch(TenantId::from_trusted(tenant_id), "auth.welcome", &context)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    tenant_id = %tenant_id,
+                    admin_id = %admin_id,
+                    "admin welcome email queued via notifications dispatcher",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    admin_id = %admin_id,
+                    error = ?e,
+                    "welcome dispatch failed; setup token persisted but no message queued",
+                );
+            }
+        }
     }
 
     /// Idempotently seed the PSA per-tenant lookup/config set (ticket statuses,

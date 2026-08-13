@@ -139,7 +139,16 @@ pub fn create_api_router(
     .with_geoip(geoip.clone())
     .with_login_approval(login_approval_enabled);
     #[cfg(feature = "multi-tenant")]
-    let tenant_service = TenantService::new(db.clone());
+    // PMS-729 finalize: attach the dispatcher + SPA origin so a super-admin
+    // creating a tenant produces an emailed setup link for the fresh admin
+    // (mirrors `AuthService::create_user(send_welcome_email = true)`; same
+    // `client_origin`-based reset-password link the rest of the auth flow
+    // already builds against). The pre-session bunyip placement path
+    // (`auth_middleware.with_tenants(...)`) keeps its own bare
+    // `TenantService::new` because it does not create tenants that need an
+    // admin welcome.
+    let tenant_service = TenantService::new(db.clone())
+        .with_dispatcher(notifications_service.clone(), client_origin.clone());
     // PMS-136: ContactService emails a `/portal/set-password` setup link when
     // an agent grants portal access, so it holds the SPA origin (the link
     // base). PMS-700: that mail is queued through the same `auth.welcome`

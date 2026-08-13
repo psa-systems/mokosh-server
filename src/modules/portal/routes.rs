@@ -29,13 +29,13 @@ use super::{
     CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalApproval,
     PortalApprovalDecisionRequest, PortalAsset, PortalChangePasswordRequest, PortalCompanyContact,
     PortalContract, PortalDashboardResponse, PortalDelegation, PortalDelegationGrantRequest,
-    PortalExportJob, PortalForgotPasswordRequest, PortalHostHint,
-    PortalInviteColleagueRequest, PortalInviteColleagueResponse, PortalInvoicePaymentsResponse,
-    PortalLoginRequest, PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest,
-    PortalMfaEnableResponse, PortalMfaSetupRequest, PortalMfaSetupResponse,
-    PortalNotificationsResponse, PortalProject, PortalProjectDetail, PortalRefreshRequest,
-    PortalResetPasswordRequest, PortalSearchResponse, PortalSessionResponse,
-    PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry, ResolvedTenant,
+    PortalExportJob, PortalForgotPasswordRequest, PortalHostHint, PortalInviteColleagueRequest,
+    PortalInviteColleagueResponse, PortalInvoicePaymentsResponse, PortalLoginRequest,
+    PortalLogoutRequest, PortalMfaDisableRequest, PortalMfaEnableRequest, PortalMfaEnableResponse,
+    PortalMfaSetupRequest, PortalMfaSetupResponse, PortalNotificationsResponse, PortalProject,
+    PortalProjectDetail, PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse,
+    PortalSessionResponse, PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry,
+    ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
