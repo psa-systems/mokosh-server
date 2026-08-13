@@ -57,6 +57,26 @@ impl CurrentContact {
     }
 }
 
+/// Response body for `GET /api/v1/portal/auth/me`. Wraps the JWT-decoded
+/// [`CurrentContact`] with account-state fields the SPA needs to render
+/// the Settings page (currently MFA status) without a second round-trip.
+/// Kept as a separate DTO so [`CurrentContact`] can stay the pure
+/// JWT-claims snapshot everywhere else it is threaded.
+#[derive(Debug, Clone, Serialize)]
+pub struct CurrentContactMe {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub company_id: Uuid,
+    pub email: String,
+    pub first_name: String,
+    pub last_name: String,
+    /// `contacts.portal_mfa_enabled`. Drives the "Set up two-factor
+    /// auth" vs "Two-factor auth is on" affordance on Settings and
+    /// lets the login SPA decide (later) whether to short-circuit the
+    /// MFA prompt entirely.
+    pub mfa_enabled: bool,
+}
+
 /// `POST /api/v1/portal/auth/login` request body.
 ///
 /// `tenant_slug` was mandatory before PMS-729; it is now optional so the

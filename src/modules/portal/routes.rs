@@ -26,7 +26,7 @@ use super::middleware::{
 use super::rate_limit::{PortalDecisionLimiter, PortalHostLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
 use super::{
-    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalApproval,
+    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContactMe, PortalApproval,
     PortalApprovalDecisionRequest, PortalAsset, PortalChangePasswordRequest, PortalCompanyContact,
     PortalContract, PortalDashboardResponse, PortalDelegation, PortalDelegationGrantRequest,
     PortalExportJob, PortalForgotPasswordRequest, PortalHostHint, PortalInviteColleagueRequest,
@@ -1157,8 +1157,28 @@ async fn portal_search(
     Ok(Json(payload))
 }
 
-async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {
-    Ok(Json(contact))
+async fn me(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<CurrentContactMe>> {
+    // MFA flag is a DB read rather than a JWT claim so it stays
+    // consistent with the next request the moment the customer flips
+    // it on/off; caching it on the token would leave the SPA
+    // showing "Enable MFA" on a session that already has it.
+    let mfa_enabled = state
+        .service
+        .contact_mfa_enabled(contact.tenant_id, contact.id)
+        .await
+        .unwrap_or(false);
+    Ok(Json(CurrentContactMe {
+        id: contact.id,
+        tenant_id: contact.tenant_id,
+        company_id: contact.company_id,
+        email: contact.email,
+        first_name: contact.first_name,
+        last_name: contact.last_name,
+        mfa_enabled,
+    }))
 }
 
 /// Redeem a setup token and set the contact's portal password (PMS-136).

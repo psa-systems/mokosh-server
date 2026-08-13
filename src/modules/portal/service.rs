@@ -1504,6 +1504,24 @@ impl PortalAuthService {
         Ok(())
     }
 
+    /// Cheap DB read of `contacts.portal_mfa_enabled` for the
+    /// authenticated contact. Feeds the `mfa_enabled` field on
+    /// `GET /portal/auth/me` so the Settings page can render the
+    /// "Set up two-factor auth" vs "Two-factor auth is on" affordance
+    /// without a second round-trip.
+    #[tracing::instrument(skip_all, fields(contact_id = %contact_id))]
+    pub async fn contact_mfa_enabled(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT portal_mfa_enabled FROM contacts WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(enabled.unwrap_or(false))
+    }
+
     /// PMS-729 phase 2 H4: start portal MFA enrollment. Generates a
     /// fresh TOTP secret, stores it on the contact row, and returns
     /// the base32 secret + `otpauth://` provisioning URI for the SPA
