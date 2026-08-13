@@ -249,7 +249,7 @@ services:
       # name; the plain INFISICAL_BASE_URL in .env is the host-side
       # localhost URL that `just infisical-bootstrap` consumes, so the
       # two contexts need two names.
-      INFISICAL_BASE_URL: ${MOKOSH_SERVER_INFISICAL_BASE_URL:-}
+      INFISICAL_ADDRESS: ${MOKOSH_SERVER_INFISICAL_ADDRESS:-}
       INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
