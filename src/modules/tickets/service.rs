@@ -37,6 +37,13 @@ impl TicketService {
         Self::with_mailer(db, Arc::new(LogMailer))
     }
 
+    /// Handle to the wrapped [`Database`] for callers (e.g. the portal
+    /// invoice-PDF route) that need to reuse the same pool without
+    /// having to thread a second Database clone through router state.
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
     /// Build a TicketService wired to a specific mailer. Used from
     /// `create_api_router` so add-note notifications and the
     /// automation-rule send_notification action share the SMTP path as

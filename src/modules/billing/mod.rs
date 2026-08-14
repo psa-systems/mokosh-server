@@ -27,6 +27,7 @@
 //! `/payments` path unchanged.
 
 pub mod models;
+pub mod pdf;
 pub mod provider;
 pub mod routes;
 pub mod service;

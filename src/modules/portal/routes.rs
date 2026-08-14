@@ -198,6 +198,10 @@ pub fn portal_routes(
         // for the invoice balance and returns its URL for the SPA to redirect
         // to. Company-scoped exactly like `get_invoice`.
         .route("/invoices/{invoice_id}/pay", post(pay_invoice))
+        // PDF render of the invoice. Streams application/pdf with a
+        // Content-Disposition filename. Same company + tenant scoping
+        // as GET /invoices/{invoice_id} (a cross-company id 404s).
+        .route("/invoices/{invoice_id}/pdf", get(get_invoice_pdf))
         // PMS-673: client-facing quote sign-off. Reads are scoped to the
         // contact's own company and to statuses that were actually issued;
         // accept / decline are the client's decision and are the only way
@@ -1449,6 +1453,50 @@ async fn get_invoice(
         ));
     }
     Ok(Json(invoice))
+}
+
+/// Server-rendered invoice PDF. Same company + tenant scoping as
+/// `get_invoice` (a cross-company id 404s). Streams
+/// `application/pdf` with a `Content-Disposition: attachment;
+/// filename="invoice-<number>.pdf"` so the browser prompts for a
+/// download. Rendered via `crate::modules::billing::pdf` and its
+/// bundled Helvetica; no external font provisioning needed.
+async fn get_invoice_pdf(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(invoice_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let invoice = state
+        .billing
+        .get_invoice(contact.tenant(), invoice_id)
+        .await?;
+    if invoice.company_id != contact.company_id {
+        return Err(AppError::NotFound("Invoice".to_string()));
+    }
+    // MSP name off the tenant identity. Falls back to a generic
+    // header when the tenant name is unreadable rather than 500ing;
+    // the invoice itself remains renderable.
+    let msp_name = match crate::modules::tenants::OrgIdentity::load(
+        state.tickets.database(),
+        contact.tenant(),
+    )
+    .await
+    {
+        Ok(org) => org.name().to_string(),
+        Err(_) => "Your MSP".to_string(),
+    };
+    let bytes = crate::modules::billing::pdf::render_invoice_pdf(&msp_name, &invoice)?;
+    let filename = format!("invoice-{}.pdf", invoice.invoice_number);
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/pdf"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(resp)
 }
 
 /// PMS-711: client-facing "Pay Now". Mints a provider checkout session for the
