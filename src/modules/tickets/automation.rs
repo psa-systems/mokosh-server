@@ -319,6 +319,9 @@ impl AutomationEngine {
                                     "subject": subject,
                                     "body": body,
                                     "ticket_id": ticket_id.to_string(),
+                                    // Per-entity deep-link metadata (migration 121).
+                                    "entity_type": "ticket",
+                                    "entity_id": ticket_id.to_string(),
                                 });
                                 if let Err(e) = notify
                                     .dispatch(tenant_id, "ticket.automation.notify", &context)

@@ -187,6 +187,11 @@ impl SlaSweepWorker {
                     "ticket_id": t.id.to_string(),
                     "kind": kind,
                     "due": due.to_rfc3339(),
+                    // Per-entity deep-link metadata (migration 121). Persisted
+                    // onto the notification row so the SPA inbox click-through
+                    // lands on the ticket detail page.
+                    "entity_type": "ticket",
+                    "entity_id": t.id.to_string(),
                 });
                 // SAFETY (PMS-261): `t.tenant_id` is projected off the
                 // `tickets` row by the cross-tenant scan above (a real tenant

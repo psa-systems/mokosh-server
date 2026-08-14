@@ -2512,6 +2512,7 @@ impl PortalAuthService {
         let offset = (page - 1) * per_page;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(
             Uuid,
             Option<String>,
@@ -2519,9 +2520,12 @@ impl PortalAuthService {
             Option<DateTime<Utc>>,
             DateTime<Utc>,
             Option<String>,
+            Option<String>,
+            Option<Uuid>,
         )> = sqlx::query_as(
             r#"
-            SELECT n.id, n.subject, n.body, n.read_at, n.created_at, t.event_type
+            SELECT n.id, n.subject, n.body, n.read_at, n.created_at,
+                   t.event_type, n.entity_type, n.entity_id
             FROM notifications n
             LEFT JOIN notification_templates t ON t.id = n.template_id
             WHERE n.tenant_id = $1
@@ -2557,13 +2561,17 @@ impl PortalAuthService {
         let notifications = rows
             .into_iter()
             .map(
-                |(id, subject, body, read_at, created_at, event_type)| PortalNotification {
-                    id,
-                    subject,
-                    body,
-                    read_at,
-                    created_at,
-                    event_type,
+                |(id, subject, body, read_at, created_at, event_type, entity_type, entity_id)| {
+                    PortalNotification {
+                        id,
+                        subject,
+                        body,
+                        read_at,
+                        created_at,
+                        event_type,
+                        entity_type,
+                        entity_id,
+                    }
                 },
             )
             .collect();

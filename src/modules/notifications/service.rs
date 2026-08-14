@@ -849,6 +849,24 @@ impl NotificationsService {
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok());
 
+        // Per-entity deep-link metadata. When the caller stamps
+        // `entity_type` (`ticket` / `invoice` / `quote` / ...) and
+        // `entity_id` into the context, the dispatcher persists both
+        // onto every notification row so the portal inbox can render
+        // a click-through link straight to the entity's detail page.
+        // Absent / malformed values simply skip the columns and leave
+        // NULL (matches the auth.* / system-event case, where there
+        // is no single entity to deep-link).
+        let ctx_entity_type: Option<String> = context
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty() && s.chars().count() <= 50);
+        let ctx_entity_id: Option<Uuid> = context
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
         let mut fanout = 0u64;
         for rule in rules {
             // PMS-261: scope the template lookup through `begin_with_tenant`
@@ -1004,8 +1022,9 @@ impl NotificationsService {
                     let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                     sqlx::query(
                         r#"INSERT INTO notifications
-                           (tenant_id, user_id, channel_type, template_id, subject, body, body_html, status)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
+                           (tenant_id, user_id, channel_type, template_id, subject, body, body_html, status,
+                            entity_type, entity_id)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)"#,
                     )
                     .bind(tenant_id)
                     .bind(user_id)
@@ -1014,6 +1033,8 @@ impl NotificationsService {
                     .bind(&subject)
                     .bind(&body)
                     .bind(&body_html)
+                    .bind(&ctx_entity_type)
+                    .bind(ctx_entity_id)
                     .execute(&mut *tx)
                     .await?;
                     tx.commit().await?;
@@ -1028,8 +1049,9 @@ impl NotificationsService {
                         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                         sqlx::query(
                             r#"INSERT INTO notifications
-                               (tenant_id, channel_type, template_id, recipient, subject, body, body_html, status)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
+                               (tenant_id, channel_type, template_id, recipient, subject, body, body_html, status,
+                                entity_type, entity_id)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)"#,
                         )
                         .bind(tenant_id)
                         .bind(channel)
@@ -1038,6 +1060,8 @@ impl NotificationsService {
                         .bind(&subject)
                         .bind(&body)
                         .bind(&body_html)
+                        .bind(&ctx_entity_type)
+                        .bind(ctx_entity_id)
                         .execute(&mut *tx)
                         .await?;
                         tx.commit().await?;
@@ -1059,8 +1083,9 @@ impl NotificationsService {
                         sqlx::query(
                             r#"INSERT INTO notifications
                                (tenant_id, contact_id, channel_type, template_id,
-                                subject, body, body_html, status)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
+                                subject, body, body_html, status,
+                                entity_type, entity_id)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)"#,
                         )
                         .bind(tenant_id)
                         .bind(cid)
@@ -1069,6 +1094,8 @@ impl NotificationsService {
                         .bind(&subject)
                         .bind(&body)
                         .bind(&body_html)
+                        .bind(&ctx_entity_type)
+                        .bind(ctx_entity_id)
                         .execute(&mut *tx)
                         .await?;
                         tx.commit().await?;

@@ -1012,6 +1012,12 @@ impl TicketService {
                     // template might reference has to always have a value.
                     "org_name": org.name(),
                     "contact_line": contact_line,
+                    // Per-entity deep-link metadata (migration 121). The
+                    // dispatcher persists these onto every notification
+                    // row so the portal inbox can click through straight
+                    // to the ticket detail page.
+                    "entity_type": "ticket",
+                    "entity_id": ticket_id.to_string(),
                 });
                 notify
                     .dispatch(tenant_id, "ticket.note_added", &context)

@@ -753,6 +753,18 @@ pub struct PortalNotification {
     /// template was deleted after the row landed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
+    /// Kind of entity this notification is about (`ticket`, `invoice`,
+    /// `quote`, ...). Written by the dispatcher when the render
+    /// context carried an `entity_type` string. Empty for
+    /// auth/system events with no single entity target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
+    /// Id of the entity this notification is about. Paired with
+    /// `entity_type` so the SPA can construct a per-entity deep-link
+    /// (e.g. `PortalTicketDetail { id: entity_id }`) instead of a
+    /// section-level one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<Uuid>,
 }
 
 /// `GET /portal/notifications` response body. Carries the newest
