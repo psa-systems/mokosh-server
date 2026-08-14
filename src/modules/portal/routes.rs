@@ -843,15 +843,39 @@ async fn get_portal_contract(
     ))
 }
 
+/// Query parameters for `GET /portal/time-entries`. All optional; empty
+/// query mirrors the pre-filter behaviour (first page of 100).
+#[derive(Debug, serde::Deserialize)]
+struct PortalTimeEntriesQuery {
+    #[serde(default)]
+    from: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    to: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(default)]
+    per_page: Option<i64>,
+}
+
 /// PMS-729 phase 2 §7 slice C / I5: portal time entries.
 async fn list_portal_time_entries(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
+    Query(query): Query<PortalTimeEntriesQuery>,
 ) -> AppResult<Json<Vec<PortalTimeEntry>>> {
+    let page = query.page.unwrap_or(1);
+    let per_page = query.per_page.unwrap_or(100);
     Ok(Json(
         state
             .service
-            .list_portal_time_entries(contact.tenant(), contact.company_id)
+            .list_portal_time_entries(
+                contact.tenant(),
+                contact.company_id,
+                query.from,
+                query.to,
+                page,
+                per_page,
+            )
             .await?,
     ))
 }

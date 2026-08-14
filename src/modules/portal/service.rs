@@ -2661,13 +2661,22 @@ impl PortalAuthService {
     /// see on an invoice are returned: `is_billable = TRUE` and
     /// `approval_status IN ('approved', 'pending')`; rejected entries
     /// stay hidden because they will not appear on the customer's bill.
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, from = ?from, to = ?to, page, per_page))]
     pub async fn list_portal_time_entries(
         &self,
         tenant_id: crate::modules::auth::TenantId,
         company_id: Uuid,
+        from: Option<chrono::NaiveDate>,
+        to: Option<chrono::NaiveDate>,
+        page: i64,
+        per_page: i64,
     ) -> AppResult<Vec<PortalTimeEntry>> {
-        const LIMIT: i64 = 200;
+        // Same clamp posture as the notifications inbox: bound the page
+        // size so a caller-supplied `per_page` cannot scan an entire
+        // year of entries in one shot.
+        let per_page = per_page.clamp(1, 200);
+        let page = page.max(1);
+        let offset = (page - 1) * per_page;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
@@ -2698,13 +2707,18 @@ impl PortalAuthService {
               AND te.company_id = $2
               AND te.is_billable = TRUE
               AND te.approval_status IN ('approved', 'pending')
+              AND ($3::date IS NULL OR te.date >= $3)
+              AND ($4::date IS NULL OR te.date <= $4)
             ORDER BY te.date DESC, te.created_at DESC
-            LIMIT $3
+            LIMIT $5 OFFSET $6
             "#,
         )
         .bind(tenant_id)
         .bind(company_id)
-        .bind(LIMIT)
+        .bind(from)
+        .bind(to)
+        .bind(per_page)
+        .bind(offset)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
