@@ -3582,6 +3582,75 @@ impl PortalAuthService {
     }
 
     /// PMS-729 phase 2 §7 slice D / I15: poll a data-export job. Rows
+    /// History of every data-export job the caller has ever requested.
+    /// Newest first, capped at 50 (matches the shape the notifications
+    /// inbox uses for a "reasonable single-page list"). Bundle
+    /// contents / signed URLs are NOT joined here: the list is a
+    /// pointer set the SPA renders as a table. Any row still in-flight
+    /// keeps the SPA polling `GET /portal/export/{id}` on the detail
+    /// panel; a finished row's download URL is fetched on demand.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn list_portal_exports(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<PortalExportJob>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<serde_json::Value>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, status, requested_at, ready_at, expires_at,
+                   signed_url, error_message,
+                   bundle_truncated, bundle_section_totals
+            FROM portal_exports
+            WHERE tenant_id = $1 AND contact_id = $2
+            ORDER BY requested_at DESC
+            LIMIT 50
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    status,
+                    requested_at,
+                    ready_at,
+                    expires_at,
+                    signed_url,
+                    error_message,
+                    bundle_truncated,
+                    bundle_section_totals,
+                )| PortalExportJob {
+                    id,
+                    status,
+                    requested_at,
+                    ready_at,
+                    expires_at,
+                    signed_url,
+                    error_message,
+                    bundle_truncated,
+                    bundle_section_totals,
+                },
+            )
+            .collect())
+    }
+
     /// are scoped to the caller so another contact cannot fetch a
     /// sibling's bundle URL. Expired rows return 410 Gone via the
     /// route handler (the service returns the row and the handler
@@ -3645,6 +3714,72 @@ impl PortalAuthService {
             bundle_truncated,
             bundle_section_totals,
         })
+    }
+
+    /// Inverse of [`Self::list_portal_delegations`]: list every live
+    /// delegation another colleague has granted TO the caller. Feeds
+    /// the "Access shared with you" panel on /portal/company so a
+    /// customer can see what their teammates delegated to them
+    /// without having to ask around.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn list_portal_incoming_delegations(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<PortalIncomingDelegation>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT d.id, d.delegator_contact_id,
+                   c.first_name, c.last_name, c.email,
+                   d.scope, d.granted_at, d.expires_at
+            FROM portal_delegations d
+            JOIN contacts c ON c.id = d.delegator_contact_id
+            WHERE d.tenant_id = $1
+              AND d.delegatee_contact_id = $2
+              AND d.revoked_at IS NULL
+              AND (d.expires_at IS NULL OR d.expires_at > NOW())
+            ORDER BY d.granted_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    delegator_contact_id,
+                    first_name,
+                    last_name,
+                    email,
+                    scope,
+                    granted_at,
+                    expires_at,
+                )| PortalIncomingDelegation {
+                    id,
+                    delegator_contact_id,
+                    delegator_name: format!("{first_name} {last_name}"),
+                    delegator_email: email,
+                    scope,
+                    granted_at,
+                    expires_at,
+                },
+            )
+            .collect())
     }
 
     /// PMS-729 phase 2 §7 slice D / I18: list every delegation the

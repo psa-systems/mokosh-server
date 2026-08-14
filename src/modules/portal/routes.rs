@@ -264,11 +264,21 @@ pub fn portal_routes(
             "/company/delegations",
             get(list_portal_delegations).post(grant_portal_delegation),
         )
+        // Delegations granted TO the caller. Read-only: only the
+        // colleague who granted a delegation can revoke it, via the
+        // regular /company/delegations/{id} DELETE.
+        .route(
+            "/company/delegations/received",
+            get(list_portal_incoming_delegations),
+        )
         .route(
             "/company/delegations/{delegation_id}",
             delete(revoke_portal_delegation),
         )
-        .route("/export", post(request_portal_export))
+        .route(
+            "/export",
+            get(list_portal_exports).post(request_portal_export),
+        )
         .route("/export/{job_id}", get(get_portal_export))
         .route("/export/{job_id}/download", get(download_portal_export))
         .with_state(state)
@@ -1061,6 +1071,18 @@ async fn list_portal_delegations(
     ))
 }
 
+async fn list_portal_incoming_delegations(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<crate::modules::portal::PortalIncomingDelegation>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_incoming_delegations(contact.tenant(), contact.id)
+            .await?,
+    ))
+}
+
 async fn grant_portal_delegation(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
@@ -1106,6 +1128,22 @@ async fn request_portal_export(
         .request_portal_export(contact.tenant(), contact.company_id, contact.id)
         .await?;
     Ok((StatusCode::CREATED, Json(job)))
+}
+
+/// History of the caller's data-export jobs, newest first, capped at
+/// 50 rows. The SPA uses this to render a "Past exports" table so a
+/// customer can see what they requested last month without having to
+/// remember the job id.
+async fn list_portal_exports(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<Json<Vec<PortalExportJob>>> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_exports(contact.tenant(), contact.id)
+            .await?,
+    ))
 }
 
 async fn get_portal_export(

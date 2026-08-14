@@ -984,6 +984,22 @@ pub struct PortalDelegation {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// Inverse of [`PortalDelegation`]: one delegation another colleague
+/// has granted TO the caller. Same scope shape; identifies the
+/// granting colleague so the SPA can render a "Access shared by ..."
+/// panel next to the outgoing-grants list.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalIncomingDelegation {
+    pub id: Uuid,
+    pub delegator_contact_id: Uuid,
+    pub delegator_name: String,
+    pub delegator_email: String,
+    pub scope: serde_json::Value,
+    pub granted_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 /// `POST /portal/company/delegations` request body. `scope` is an
 /// opaque JSON object; the server does not validate its shape today
 /// (the SPA controls the key set).
