@@ -24,7 +24,7 @@
 
 use super::models::{InvoiceLineType, InvoiceResponse};
 use crate::utils::error::{AppError, AppResult};
-use printpdf::{BuiltinFont, Mm, PdfDocument};
+use printpdf::{BuiltinFont, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference};
 use rust_decimal::Decimal;
 
 /// Points-per-mm at 72 DPI; used to convert a raw font size in points
@@ -49,6 +49,15 @@ const COL_TOTAL_X: f32 = 175.0;
 /// advance for the printpdf built-in fonts). One point == 1/72 inch.
 fn line_height_mm(font_pt: f32) -> f32 {
     font_pt * MM_PER_POINT * 1.25
+}
+
+/// Add a fresh A4 page to `doc`, return its layer + the reset Y
+/// position at the top margin. Used by the line-item loop when a row
+/// would spill past the totals-reserved footer band.
+fn new_page(doc: &PdfDocumentReference, _y: f32) -> (PdfLayerReference, f32) {
+    let (page_idx, layer_idx) = doc.add_page(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "layer1");
+    let layer = doc.get_page(page_idx).get_layer(layer_idx);
+    (layer, PAGE_HEIGHT_MM - MARGIN_MM)
 }
 
 /// Render `invoice` as a single-page A4 PDF and return the bytes.
@@ -148,12 +157,21 @@ pub fn render_invoice_pdf(msp_name: &str, invoice: &InvoiceResponse) -> AppResul
 
     // Line items table.
     let table_pt = 10.0_f32;
-    layer.use_text("Description", table_pt, Mm(COL_DESC_X), Mm(y), &font_bold);
-    layer.use_text("Qty", table_pt, Mm(COL_QTY_X), Mm(y), &font_bold);
-    layer.use_text("Unit price", table_pt, Mm(COL_UNIT_X), Mm(y), &font_bold);
-    layer.use_text("Total", table_pt, Mm(COL_TOTAL_X), Mm(y), &font_bold);
+    let header_row = |layer: &PdfLayerReference, y: f32| {
+        layer.use_text("Description", table_pt, Mm(COL_DESC_X), Mm(y), &font_bold);
+        layer.use_text("Qty", table_pt, Mm(COL_QTY_X), Mm(y), &font_bold);
+        layer.use_text("Unit price", table_pt, Mm(COL_UNIT_X), Mm(y), &font_bold);
+        layer.use_text("Total", table_pt, Mm(COL_TOTAL_X), Mm(y), &font_bold);
+    };
+    header_row(&layer, y);
     y -= line_height_mm(table_pt);
 
+    // Space we must keep below the last line so the totals stack +
+    // notes still fit on the SAME page as the final line item.
+    // Overshooting by a line is fine; undershooting clips content.
+    let totals_reserved_mm = 80.0;
+
+    let mut layer = layer;
     let lines = invoice.lines.as_deref().unwrap_or(&[]);
     if lines.is_empty() {
         layer.use_text(
@@ -165,11 +183,23 @@ pub fn render_invoice_pdf(msp_name: &str, invoice: &InvoiceResponse) -> AppResul
         );
         y -= line_height_mm(table_pt);
     } else {
-        for line in lines {
-            // Truncate long descriptions rather than wrap: single-
-            // page layout would otherwise overflow. Follow-up would
-            // paginate; the print-from-browser path handles long
-            // invoices in the meantime.
+        for (idx, line) in lines.iter().enumerate() {
+            // Spill onto a new page when the CURRENT row would leave
+            // no room for the totals block. `idx > 0` guarantees we
+            // never spill before the first row (which would land on
+            // an empty page 2).
+            let remaining_lines = lines.len() - idx;
+            let last_item = remaining_lines == 1;
+            let threshold = if last_item {
+                MARGIN_MM + totals_reserved_mm
+            } else {
+                MARGIN_MM + line_height_mm(table_pt) + 5.0
+            };
+            if idx > 0 && y < threshold {
+                (layer, y) = new_page(&doc, y);
+                header_row(&layer, y);
+                y -= line_height_mm(table_pt);
+            }
             let mut desc = line.description.clone();
             if desc.chars().count() > 60 {
                 desc = desc.chars().take(57).collect::<String>() + "...";
@@ -201,21 +231,12 @@ pub fn render_invoice_pdf(msp_name: &str, invoice: &InvoiceResponse) -> AppResul
                 &font_regular,
             );
             y -= line_height_mm(table_pt);
-            if y < MARGIN_MM + 60.0 {
-                // Reserve enough vertical room for the totals stack
-                // + notes below. Truncate the line list rather than
-                // spill onto page 2 for this MVP.
-                layer.use_text(
-                    "(more items not shown)",
-                    table_pt,
-                    Mm(COL_DESC_X),
-                    Mm(y),
-                    &font_regular,
-                );
-                y -= line_height_mm(table_pt);
-                break;
-            }
         }
+    }
+    // After the last line, if the totals stack does not fit, push it
+    // to a fresh page too rather than clipping.
+    if y < MARGIN_MM + totals_reserved_mm {
+        (layer, y) = new_page(&doc, y);
     }
     y -= line_height_mm(table_pt);
 
@@ -404,6 +425,46 @@ mod tests {
         );
         // PDF files start with `%PDF-`.
         assert_eq!(&bytes[..5], b"%PDF-", "not a pdf: prefix {:?}", &bytes[..8]);
+    }
+
+    #[test]
+    fn paginates_long_invoice_beyond_single_page() {
+        use super::super::models::*;
+        use rust_decimal::Decimal;
+        let mut inv = sample_invoice();
+        // 60 line items - well past a single A4 page's line capacity.
+        // Renderer used to truncate with "(more items not shown)"; now
+        // it should spill onto page 2+ so a real customer's invoice
+        // is not silently clipped.
+        let mut lines = Vec::new();
+        for i in 0..60 {
+            lines.push(InvoiceLineResponse {
+                id: uuid::Uuid::nil(),
+                line_type: InvoiceLineType::Service,
+                description: format!("Service line {i}"),
+                quantity: Decimal::new(1, 0),
+                unit_price: Decimal::new(10000, 2),
+                total: Decimal::new(10000, 2),
+                ticket_id: None,
+                project_id: None,
+                sort_order: i,
+            });
+        }
+        inv.lines = Some(lines);
+        let bytes = render_invoice_pdf("Test MSP", &inv).expect("render");
+        // Compare against the single-line baseline. 60 lines
+        // materially exceed a single page's capacity, so the
+        // rendered PDF must be considerably larger than the
+        // baseline. printpdf uses compressed content streams, so
+        // grepping for /Type /Page inside the raw bytes is
+        // unreliable; the size delta is the surer signal.
+        let baseline = render_invoice_pdf("Test MSP", &sample_invoice()).expect("baseline");
+        assert!(
+            bytes.len() > baseline.len() * 2,
+            "expected paginated output to be much larger than the single-page baseline: {} vs {}",
+            bytes.len(),
+            baseline.len()
+        );
     }
 
     #[test]
