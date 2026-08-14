@@ -1044,8 +1044,34 @@ impl NotificationsService {
                 // row, no preferences to consult). in_app rows must
                 // always belong to a user, so skip standalone recipients
                 // on that channel.
+                //
+                // Preference gating: the standalone list is normally
+                // rule-supplied addresses with no portal identity so
+                // there is nothing to gate on. When the caller stamped
+                // `recipient_contact_id` AND `recipient_email` at the
+                // same time (the common portal case - a ticket note
+                // fired at both the contact's inbox AND their email),
+                // the email address here IS the ctx contact and we
+                // should honour that contact's preference. Any other
+                // address in the list stays ungated.
                 if channel != "in_app" {
+                    let ctx_email_lower =
+                        ctx_email.as_deref().map(|s| s.to_ascii_lowercase());
                     for addr in &emails {
+                        // Skip when the address matches the ctx contact
+                        // AND that contact opted out of this channel.
+                        // A rule-supplied address that happens to equal
+                        // the ctx email STILL gets gated - the customer
+                        // is opting out of receiving this event, not
+                        // just of the ctx-recipient path.
+                        if let Some(cid) = ctx_contact_id {
+                            if ctx_email_lower.as_deref()
+                                == Some(addr.to_ascii_lowercase().as_str())
+                                && !accepts_channel(contact_prefs.get(&cid), channel)
+                            {
+                                continue;
+                            }
+                        }
                         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                         sqlx::query(
                             r#"INSERT INTO notifications
