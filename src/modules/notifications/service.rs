@@ -867,29 +867,33 @@ impl NotificationsService {
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok());
 
+        // Batch-load every distinct template id off the rules in one
+        // round-trip. Previously the loop below opened one
+        // `begin_with_tenant` tx PER rule to fetch the template by id
+        // (N+1 against `notification_templates`); a busy dispatch with
+        // 4-5 rules on the same event would spend most of its wall-
+        // clock on template lookups. One IN() call keyed by tenant
+        // still passes the RLS policy (same GUC posture per PMS-261).
+        let template_ids: Vec<Uuid> = rules.iter().filter_map(|r| r.template_id).collect();
+        let template_index: HashMap<Uuid, TemplateRow> = if template_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            let rows: Vec<TemplateRow> = sqlx::query_as(
+                "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
+                 FROM notification_templates WHERE id = ANY($1)",
+            )
+            .bind(&template_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            rows.into_iter().map(|t| (t.id, t)).collect()
+        };
+
         let mut fanout = 0u64;
         for rule in rules {
-            // PMS-261: scope the template lookup through `begin_with_tenant`
-            // so the RLS GUC is set. `notification_templates` carries a
-            // `tenant_id` and is covered by the fail-closed policy (migration
-            // 038); the previous bare `self.db.pool()` read ran with NO GUC,
-            // which under an unprivileged (NOBYPASSRLS) connection matches zero
-            // rows and would silently drop the template, falling back to the
-            // default subject/body. The `template_id` came off this tenant's
-            // own rule, so the row lives under this same tenant.
-            let template = match rule.template_id {
-                Some(tid) => {
-                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-                    sqlx::query_as::<_, TemplateRow>(
-                        "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
-                         FROM notification_templates WHERE id = $1",
-                    )
-                    .bind(tid)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                }
-                None => None,
-            };
+            let template = rule
+                .template_id
+                .and_then(|tid| template_index.get(&tid).cloned());
 
             // PMS-701: no template means nothing renderable. The old
             // fallback body was the whole dispatch JSON (recipient
@@ -1055,8 +1059,7 @@ impl NotificationsService {
                 // should honour that contact's preference. Any other
                 // address in the list stays ungated.
                 if channel != "in_app" {
-                    let ctx_email_lower =
-                        ctx_email.as_deref().map(|s| s.to_ascii_lowercase());
+                    let ctx_email_lower = ctx_email.as_deref().map(|s| s.to_ascii_lowercase());
                     for addr in &emails {
                         // Skip when the address matches the ctx contact
                         // AND that contact opted out of this channel.
@@ -1387,7 +1390,7 @@ struct ChannelRow {
     is_default: Option<bool>,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 struct TemplateRow {
     id: Uuid,
     name: String,

@@ -397,7 +397,11 @@ mod tests {
     fn renders_pdf_bytes() {
         let inv = sample_invoice();
         let bytes = render_invoice_pdf("Test MSP", &inv).expect("render");
-        assert!(bytes.len() > 500, "pdf smaller than a header alone: {}", bytes.len());
+        assert!(
+            bytes.len() > 500,
+            "pdf smaller than a header alone: {}",
+            bytes.len()
+        );
         // PDF files start with `%PDF-`.
         assert_eq!(&bytes[..5], b"%PDF-", "not a pdf: prefix {:?}", &bytes[..8]);
     }

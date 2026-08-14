@@ -2242,19 +2242,23 @@ impl TicketService {
     ) -> AppResult<TicketNote> {
         self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
             .await?;
+        let note_id = Uuid::new_v4();
+        // Single tx for the fallback-creator lookup + note INSERT +
+        // ticket first_response_at bump. Previously the fallback
+        // lookup opened its own throwaway tx (extra GUC round-trip)
+        // before the write tx below.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let fallback_creator: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
              AND role IN ('super_admin', 'admin', 'manager') \
              ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
+        .fetch_optional(&mut *tx)
         .await?;
         let fallback_creator = fallback_creator.ok_or(AppError::Configuration(
             "Cannot accept portal note: tenant has no admin/manager user to attribute it to".into(),
         ))?;
-        let note_id = Uuid::new_v4();
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO ticket_notes
@@ -2285,19 +2289,34 @@ impl TicketService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        // Fetch the inserted row through the list path so the
-        // returned DTO carries the resolved `created_by_name`.
-        let pagination = PaginationParams {
-            page: 1,
-            per_page: 200,
-            sort: None,
-            sort_dir: "asc".to_string(),
-        };
-        let (rows, _) = self
-            .list_portal_ticket_notes(tenant_id, company_id, ticket_id, &pagination)
-            .await?;
-        rows.into_iter()
-            .find(|n| n.id == note_id)
+        // Fetch just the row we inserted (by id) with the same
+        // author-name resolution the list path uses. Previously this
+        // routed through `list_portal_ticket_notes` with a per_page=200
+        // sweep and filtered in-memory for a single row; on a busy
+        // ticket that meant loading 200 notes to return 1.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, TicketNoteRow>(
+            r#"
+            SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
+                   n.is_email_sent, n.email_sent_at, n.created_by_id,
+                   n.created_by_contact_id,
+                   n.created_at, n.updated_at,
+                   COALESCE(
+                       NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
+                       NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                   ) AS created_by_name
+            FROM ticket_notes n
+            LEFT JOIN users u ON n.created_by_id = u.id
+            LEFT JOIN contacts c ON n.created_by_contact_id = c.id
+            WHERE n.tenant_id = $1 AND n.id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(TicketNote::from)
             .ok_or(AppError::NotFound("TicketNote".to_string()))
     }
 
@@ -2321,9 +2340,14 @@ impl TicketService {
         self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
             .await?;
 
+        // Single transaction covers: is-closed probe, default-status
+        // lookup, UPDATE, and audit-note INSERT. Previously each of
+        // the first three ran in its own tx (three round-trips + two
+        // GUC set-plus-commits) with no correctness benefit; the
+        // consolidated tx also gives the whole reopen atomicity so a
+        // mid-flow crash cannot leave the status flipped without the
+        // audit note (or vice versa).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // Determine whether the current status is a closed one; if
-        // not, treat as a no-op and return the current ticket state.
         let currently_closed: Option<bool> = sqlx::query_scalar(
             "SELECT s.is_closed
              FROM tickets t
@@ -2337,18 +2361,13 @@ impl TicketService {
         let Some(is_closed) = currently_closed else {
             return Err(AppError::NotFound("Ticket".to_string()));
         };
-        tx.commit().await?;
         if !is_closed {
             // Already open (or a status the customer would not call
             // "closed"). Nothing to do; return the current state.
+            drop(tx);
             return self.get_ticket_response(tenant_id, ticket_id).await;
         }
 
-        // Look up the tenant's default open status. Every tenant has
-        // one via `copy_default_config`; the guard here is defensive
-        // in case a customer somehow hits reopen against a tenant
-        // whose lookup got wiped.
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let default_status_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
         )
