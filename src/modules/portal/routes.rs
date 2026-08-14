@@ -171,6 +171,10 @@ pub fn portal_routes(
         .route("/auth/me", get(me).patch(update_me))
         .route("/tickets", get(list_tickets).post(create_ticket))
         .route("/tickets/{ticket_id}", get(get_ticket))
+        // Customer-initiated reopen. Only meaningful when the current
+        // status is `is_closed = TRUE` (resolved / closed); the service
+        // returns the ticket unchanged when it is already open.
+        .route("/tickets/{ticket_id}/reopen", post(reopen_ticket))
         // PMS-449: portal ticket comments. GET lists `note_type='public'`
         // notes (internal / resolution / time_entry are filtered server-
         // side). POST accepts a fresh contact-authored comment that the
@@ -1498,6 +1502,38 @@ async fn list_kb(
         &pagination,
         total,
     )))
+}
+
+/// Optional reopen body. `reason` is a short free-text note the SPA
+/// posts alongside the click so the agent side sees WHY the customer
+/// reopened; empty / missing is fine and produces a generic audit
+/// note.
+#[derive(Debug, Default, serde::Deserialize)]
+struct PortalReopenTicketRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn reopen_ticket(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(ticket_id): Path<Uuid>,
+    Json(request): Json<PortalReopenTicketRequest>,
+) -> AppResult<Json<TicketResponse>> {
+    // SAFETY (PMS-261): verified contact-JWT claims, not user input.
+    // `reopen_portal_ticket` scopes by both tenant and company, so a
+    // guessed cross-company id surfaces as 404 (matches `get_ticket`).
+    let resp = state
+        .tickets
+        .reopen_portal_ticket(
+            contact.tenant(),
+            contact.company_id,
+            contact.id,
+            ticket_id,
+            request.reason.as_deref(),
+        )
+        .await?;
+    Ok(Json(resp))
 }
 
 async fn get_ticket(

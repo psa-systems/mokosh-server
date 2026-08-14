@@ -2288,6 +2288,115 @@ impl TicketService {
             .ok_or(AppError::NotFound("TicketNote".to_string()))
     }
 
+    /// Portal contact reopens one of their own company's tickets. Only
+    /// legal when the ticket is currently in a `is_closed = TRUE`
+    /// status (resolved / closed / declined-etc.); flips it back to
+    /// the tenant's `is_default` (open) status, clears
+    /// `closed_at` / `resolved_at`, and appends a public
+    /// `note_type = 'public'` audit trail so the agent sees WHY the
+    /// ticket came back. A ticket already in an open status stays
+    /// unchanged (idempotent) so a double-click does not thrash.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, ticket_id = %ticket_id, contact_id = %contact_id))]
+    pub async fn reopen_portal_ticket(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Uuid,
+        ticket_id: Uuid,
+        reason: Option<&str>,
+    ) -> AppResult<TicketResponse> {
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Determine whether the current status is a closed one; if
+        // not, treat as a no-op and return the current ticket state.
+        let currently_closed: Option<bool> = sqlx::query_scalar(
+            "SELECT s.is_closed
+             FROM tickets t
+             JOIN ticket_statuses s ON s.id = t.status_id
+             WHERE t.tenant_id = $1 AND t.id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(is_closed) = currently_closed else {
+            return Err(AppError::NotFound("Ticket".to_string()));
+        };
+        tx.commit().await?;
+        if !is_closed {
+            // Already open (or a status the customer would not call
+            // "closed"). Nothing to do; return the current state.
+            return self.get_ticket_response(tenant_id, ticket_id).await;
+        }
+
+        // Look up the tenant's default open status. Every tenant has
+        // one via `copy_default_config`; the guard here is defensive
+        // in case a customer somehow hits reopen against a tenant
+        // whose lookup got wiped.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let default_status_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(default_status_id) = default_status_id else {
+            return Err(AppError::Configuration(
+                "No default ticket status configured for this tenant".to_string(),
+            ));
+        };
+
+        sqlx::query(
+            "UPDATE tickets SET status_id = $1,
+                                closed_at = NULL,
+                                resolved_at = NULL,
+                                updated_at = NOW()
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(default_status_id)
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Append a public audit-trail note so the agent side sees the
+        // reopen (and any reason) in the same thread the SPA renders.
+        let fallback_creator: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
+             AND role IN ('super_admin', 'admin', 'manager') \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let creator_id = fallback_creator.unwrap_or_else(Uuid::nil);
+        let content = match reason {
+            Some(r) if !r.trim().is_empty() => {
+                format!("Ticket reopened by customer. Reason: {}", r.trim())
+            }
+            _ => "Ticket reopened by customer.".to_string(),
+        };
+        let _ = sqlx::query(
+            "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type,
+                                       content, created_by_id, created_by_contact_id)
+             VALUES ($1, $2, $3, 'public', $4, $5, $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(&content)
+        .bind(creator_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await;
+
+        tx.commit().await?;
+
+        self.get_ticket_response(tenant_id, ticket_id).await
+    }
+
     /// Verify the ticket belongs to the portal contact's company within the
     /// caller's tenant. Surfaces 404 on miss to avoid confirming the existence
     /// of another company's ticket.
