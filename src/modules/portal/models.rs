@@ -716,6 +716,13 @@ pub struct PortalNotification {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Joined from the row's `template_id` on read so the SPA can render
+    /// a section-level deep-link (`ticket.note_added` -> Tickets,
+    /// `sla.at_risk` -> Tickets, `invoice.due` -> Invoices, ...). Empty
+    /// when the row has no template (legacy manual sends) or the
+    /// template was deleted after the row landed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
 }
 
 /// `GET /portal/notifications` response body. Carries the newest

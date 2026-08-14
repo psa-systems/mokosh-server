@@ -2392,14 +2392,16 @@ impl PortalAuthService {
             String,
             Option<DateTime<Utc>>,
             DateTime<Utc>,
+            Option<String>,
         )> = sqlx::query_as(
             r#"
-            SELECT id, subject, body, read_at, created_at
-            FROM notifications
-            WHERE tenant_id = $1
-              AND contact_id = $2
-              AND channel_type = 'in_app'
-            ORDER BY created_at DESC
+            SELECT n.id, n.subject, n.body, n.read_at, n.created_at, t.event_type
+            FROM notifications n
+            LEFT JOIN notification_templates t ON t.id = n.template_id
+            WHERE n.tenant_id = $1
+              AND n.contact_id = $2
+              AND n.channel_type = 'in_app'
+            ORDER BY n.created_at DESC
             LIMIT $3 OFFSET $4
             "#,
         )
@@ -2429,12 +2431,13 @@ impl PortalAuthService {
         let notifications = rows
             .into_iter()
             .map(
-                |(id, subject, body, read_at, created_at)| PortalNotification {
+                |(id, subject, body, read_at, created_at, event_type)| PortalNotification {
                     id,
                     subject,
                     body,
                     read_at,
                     created_at,
+                    event_type,
                 },
             )
             .collect();
