@@ -2370,13 +2370,21 @@ impl PortalAuthService {
     /// the notifications table already enforces the tenant scope; the
     /// contact filter guarantees a cross-contact leak within the same
     /// tenant is impossible.
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id, page, per_page))]
     pub async fn list_portal_inbox(
         &self,
         tenant_id: crate::modules::auth::TenantId,
         contact_id: Uuid,
+        page: i64,
+        per_page: i64,
     ) -> AppResult<PortalNotificationsResponse> {
-        const PORTAL_INBOX_LIMIT: i64 = 50;
+        // Bound the page size so a caller-supplied `per_page` cannot
+        // trigger a large scan against the inbox. 100 matches the
+        // portal ticket-list cap used elsewhere.
+        let per_page = per_page.clamp(1, 100);
+        let page = page.max(1);
+        let offset = (page - 1) * per_page;
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(
             Uuid,
@@ -2392,22 +2400,24 @@ impl PortalAuthService {
               AND contact_id = $2
               AND channel_type = 'in_app'
             ORDER BY created_at DESC
-            LIMIT $3
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id)
         .bind(contact_id)
-        .bind(PORTAL_INBOX_LIMIT)
+        .bind(per_page)
+        .bind(offset)
         .fetch_all(&mut *tx)
         .await?;
-        let (unread_count,): (i64,) = sqlx::query_as(
+        let (unread_count, total): (i64, i64) = sqlx::query_as(
             r#"
-            SELECT COUNT(*)::BIGINT
+            SELECT
+              COUNT(*) FILTER (WHERE read_at IS NULL)::BIGINT AS unread,
+              COUNT(*)::BIGINT AS total
             FROM notifications
             WHERE tenant_id = $1
               AND contact_id = $2
               AND channel_type = 'in_app'
-              AND read_at IS NULL
             "#,
         )
         .bind(tenant_id)
@@ -2431,6 +2441,7 @@ impl PortalAuthService {
         Ok(PortalNotificationsResponse {
             notifications,
             unread_count,
+            total,
         })
     }
 

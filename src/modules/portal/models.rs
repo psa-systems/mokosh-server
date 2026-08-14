@@ -708,15 +708,21 @@ pub struct PortalNotification {
     pub created_at: DateTime<Utc>,
 }
 
-/// `GET /portal/notifications` response body. Returns the newest 50
-/// rows and a separate `unread_count` so the SPA can render the
-/// top-bar badge without walking the row list. Caps at 50 to keep the
-/// portal inbox from bloating; older rows still exist server-side for
-/// audit purposes but never surface here.
+/// `GET /portal/notifications` response body. Carries the newest
+/// `per_page` rows for the requested `page` (defaults 1 / 20), the
+/// `unread_count` so the SPA can render the top-bar badge without
+/// walking the row list, and a `total` so the notifications page can
+/// render pagination controls. The bell menu keeps calling without
+/// query params and gets the first page of 20; the dedicated
+/// `/portal/notifications` page paginates.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PortalNotificationsResponse {
     pub notifications: Vec<PortalNotification>,
     pub unread_count: i64,
+    /// Total number of in-app notifications for the caller across
+    /// every page. Feeds pagination footer + "N more" affordance.
+    #[serde(default)]
+    pub total: i64,
 }
 
 // PMS-729 phase 2 §7 slice C: assets / contracts / time / projects --------

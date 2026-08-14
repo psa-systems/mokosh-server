@@ -1095,13 +1095,26 @@ async fn download_portal_export(
 /// PMS-729 phase 2 §7 slice B / I12: portal inbox list. Contact-scoped
 /// via the JWT-verified `CurrentContact`; a caller cannot enumerate
 /// another contact's inbox.
+/// Query parameters for `GET /portal/notifications`. Both are optional;
+/// omitting them returns the first page of 20 (bell menu default).
+#[derive(Debug, serde::Deserialize)]
+struct PortalNotificationsQuery {
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(default)]
+    per_page: Option<i64>,
+}
+
 async fn list_notifications(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
+    Query(query): Query<PortalNotificationsQuery>,
 ) -> AppResult<Json<PortalNotificationsResponse>> {
+    let page = query.page.unwrap_or(1);
+    let per_page = query.per_page.unwrap_or(20);
     let payload = state
         .service
-        .list_portal_inbox(contact.tenant(), contact.id)
+        .list_portal_inbox(contact.tenant(), contact.id, page, per_page)
         .await?;
     Ok(Json(payload))
 }
