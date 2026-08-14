@@ -205,6 +205,17 @@ fn validate_value(
                 ));
             }
         }
+        FieldType::File => {
+            // The JSON payload carries a placeholder (typically a
+            // filename or a comma-separated list) so the submission
+            // remains valid; the actual bytes ride the follow-up
+            // per-note multipart upload the SPA fires with the
+            // returned ticket_id. `is_required` semantics live on
+            // the SPA side: an unchecked file input renders an empty
+            // string, which trips the required-if-empty rule the
+            // same way any other field does.
+            let _ = as_string(field, value)?;
+        }
     }
     Ok(())
 }

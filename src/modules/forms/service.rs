@@ -665,6 +665,7 @@ impl FormsService {
 
         Ok(super::models::PublicSubmissionReceipt {
             ticket_number: ticket.ticket_number,
+            ticket_id: Some(ticket.id),
         })
     }
 

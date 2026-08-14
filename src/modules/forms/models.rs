@@ -24,6 +24,12 @@ pub enum FieldType {
     Date,
     Select,
     Boolean,
+    /// Binary attachment. The JSON payload only carries the customer's
+    /// selection intent (a placeholder marker string or a filename
+    /// echo); actual bytes are uploaded to the created ticket's
+    /// first note via the existing per-note multipart endpoint in a
+    /// second request, since JSON cannot ship binary.
+    File,
 }
 
 impl FieldType {
@@ -35,6 +41,7 @@ impl FieldType {
             "date" => Some(Self::Date),
             "select" => Some(Self::Select),
             "boolean" => Some(Self::Boolean),
+            "file" => Some(Self::File),
             _ => None,
         }
     }
@@ -47,6 +54,7 @@ impl FieldType {
             Self::Date => "date",
             Self::Select => "select",
             Self::Boolean => "boolean",
+            Self::File => "file",
         }
     }
 
@@ -333,11 +341,17 @@ pub struct PublicFormField {
     pub date_not_in_past: bool,
 }
 
-/// What the client gets back after a successful submission: the ticket number
-/// to quote, and nothing else about the tenant's internals.
+/// What the client gets back after a successful submission: the ticket
+/// number to quote for the customer AND the ticket id so the SPA can
+/// upload any `file`-typed form fields as attachments in a second
+/// step (the JSON payload has no channel for binary uploads). Kept
+/// nullable on `ticket_id` for compatibility with any historic
+/// caller that only reads `ticket_number`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicSubmissionReceipt {
     pub ticket_number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<uuid::Uuid>,
 }
 
 /// PMS-729 phase 2 §7 slice B / I8: one row on `GET /portal/forms`. Just
