@@ -57,6 +57,16 @@ impl CurrentContact {
     }
 }
 
+/// Request body for `PATCH /api/v1/portal/auth/me`. First / last name
+/// only for now; email and phone stay under agent-side ownership.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalUpdateMeRequest {
+    #[validate(length(min = 1, max = 100, message = "First name is required (1-100 chars)"))]
+    pub first_name: String,
+    #[validate(length(min = 1, max = 100, message = "Last name is required (1-100 chars)"))]
+    pub last_name: String,
+}
+
 /// Response body for `GET /api/v1/portal/auth/me`. Wraps the JWT-decoded
 /// [`CurrentContact`] with account-state fields the SPA needs to render
 /// the Settings page (currently MFA status) without a second round-trip.

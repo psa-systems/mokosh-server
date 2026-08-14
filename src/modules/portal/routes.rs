@@ -35,7 +35,7 @@ use super::{
     PortalMfaSetupRequest, PortalMfaSetupResponse, PortalNotificationsResponse, PortalProject,
     PortalProjectDetail, PortalRefreshRequest, PortalResetPasswordRequest, PortalSearchResponse,
     PortalSessionResponse, PortalSetupPasswordRequest, PortalTicketSlaResponse, PortalTimeEntry,
-    ResolvedTenant,
+    PortalUpdateMeRequest, ResolvedTenant,
 };
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
@@ -168,7 +168,7 @@ pub fn portal_routes(
         .route("/host", get(host_hint))
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
-        .route("/auth/me", get(me))
+        .route("/auth/me", get(me).patch(update_me))
         .route("/tickets", get(list_tickets).post(create_ticket))
         .route("/tickets/{ticket_id}", get(get_ticket))
         // PMS-449: portal ticket comments. GET lists `note_type='public'`
@@ -250,6 +250,16 @@ pub fn portal_routes(
             "/company/contacts",
             get(list_company_contacts).post(invite_colleague),
         )
+        // Re-mint the setup token + re-dispatch auth.welcome for a
+        // pending colleague whose original invite email never arrived.
+        .route(
+            "/company/contacts/{contact_id}/resend-invite",
+            post(resend_invite),
+        )
+        // Soft-deactivate a colleague (flips `is_portal_user = FALSE`,
+        // clears credentials, revokes live sessions). Ticket + invoice
+        // history still points at the row so nothing is orphaned.
+        .route("/company/contacts/{contact_id}", delete(deactivate_contact))
         .route(
             "/company/delegations",
             get(list_portal_delegations).post(grant_portal_delegation),
@@ -991,6 +1001,54 @@ async fn invite_colleague(
     Ok(Json(PortalInviteColleagueResponse { id }))
 }
 
+/// Re-mint a setup token + resend the auth.welcome email for a
+/// pending portal colleague. Same origin-derivation as
+/// `invite_colleague` so per-tenant subdomain deploys land on
+/// `{slug}.client.<apex>/portal/set-password`.
+async fn resend_invite(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(target_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> AppResult<StatusCode> {
+    let per_request_origin = portal_origin_from_host(
+        &state.host_config,
+        headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+        &state.portal_origin,
+    );
+    state
+        .service
+        .resend_portal_invite(
+            contact.tenant(),
+            contact.company_id,
+            contact.id,
+            target_id,
+            &per_request_origin,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Soft-deactivate a portal colleague at the caller's own company.
+/// Row-level scoping enforced service-side; self-deactivation is
+/// refused (the customer should use /auth/logout for that).
+async fn deactivate_contact(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Path(target_id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .deactivate_portal_contact(contact.tenant(), contact.company_id, contact.id, target_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_portal_delegations(
     State(state): State<PortalRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
@@ -1192,6 +1250,27 @@ async fn portal_search(
         .portal_search(contact.tenant(), contact.company_id, &q)
         .await?;
     Ok(Json(payload))
+}
+
+/// PATCH /portal/auth/me: update the caller's own first / last name.
+/// Email stays under agent-side ownership. Returns 204; the SPA
+/// re-fetches `/auth/me` to reflect the change in the cached snapshot.
+async fn update_me(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Json(request): Json<PortalUpdateMeRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    state
+        .service
+        .update_own_profile(
+            contact.tenant(),
+            contact.id,
+            &request.first_name,
+            &request.last_name,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn me(

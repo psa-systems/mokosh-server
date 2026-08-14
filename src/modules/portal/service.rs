@@ -3035,6 +3035,246 @@ impl PortalAuthService {
         Ok(contact_id)
     }
 
+    /// Re-mint a portal setup token for an existing portal contact at
+    /// the caller's own company + re-dispatch the `auth.welcome` email.
+    /// Same shape as `invite_colleague`'s tail half, extracted so
+    /// resend does not duplicate the token / email machinery.
+    ///
+    /// Scoped by `(tenant_id, company_id)` so a contact cannot resend
+    /// an invite for someone at another company (even in the same
+    /// tenant); a mismatch returns 404 rather than confirming the row
+    /// exists elsewhere.
+    ///
+    /// Refuses when the target contact has already set a password
+    /// (`portal_password_hash IS NOT NULL`): the setup token would
+    /// silently overwrite the credential on redemption, letting the
+    /// caller lock their colleague out.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, contact_id = %target_id))]
+    pub async fn resend_portal_invite(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        caller_id: Uuid,
+        target_id: Uuid,
+        portal_origin: &str,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT first_name, email, portal_password_hash
+            FROM contacts
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND id = $3
+              AND is_portal_user = TRUE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(target_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (first_name, email, existing_hash) =
+            row.ok_or_else(|| AppError::NotFound("Contact".to_string()))?;
+        if existing_hash.is_some() {
+            return Err(AppError::conflict(
+                "This colleague has already set a password. They can use the Forgot password link instead.",
+            ));
+        }
+
+        // Fresh token; the schema stamps its own `created_at`, so a new
+        // row supersedes the last one for status-list purposes but
+        // does not invalidate a still-live prior token. That is fine:
+        // both tokens redeem to the same contact and are single-use.
+        let secret = crate::utils::crypto::generate_token(64);
+        let token_hash = crate::utils::crypto::hash_password(&secret)?;
+        let token = format!("{target_id}.{secret}");
+        let expires_at = Utc::now() + Duration::hours(72);
+        sqlx::query(
+            r#"
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(target_id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let _ = crate::modules::audit::audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id.get(),
+            Some(caller_id),
+            crate::modules::audit::AuditAction::Create,
+            "portal.resend_invite",
+            None,
+            None,
+        )
+        .await;
+
+        if let Some(notify) = self.notifications.as_ref() {
+            let setup_link = format!(
+                "{}/portal/set-password?token={}",
+                portal_origin.trim_end_matches('/'),
+                token,
+            );
+            let context = serde_json::json!({
+                "recipient_email": email,
+                "display_name": first_name,
+                "setup_link": setup_link,
+            });
+            if let Err(e) = notify.dispatch(tenant_id, "auth.welcome", &context).await {
+                tracing::warn!(
+                    contact_id = %target_id,
+                    error = ?e,
+                    "portal resend-invite dispatch failed; token persisted but link unreachable"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Deactivate a portal contact at the caller's own company (soft:
+    /// flips `is_portal_user = FALSE` on the row rather than deleting
+    /// it, so tickets / invoices / history keep pointing at a real
+    /// record and the agent-side CRM entry survives).
+    ///
+    /// Scoped by `(tenant_id, company_id)` so a caller cannot
+    /// deactivate a sibling company's contact. Refuses to deactivate
+    /// the caller (self-signout uses `/portal/auth/logout`). Best-
+    /// effort revocation of the target's live portal sessions rides
+    /// in the same tx.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, caller_id = %caller_id, target_id = %target_id))]
+    pub async fn deactivate_portal_contact(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        company_id: Uuid,
+        caller_id: Uuid,
+        target_id: Uuid,
+    ) -> AppResult<()> {
+        if target_id == caller_id {
+            return Err(AppError::conflict(
+                "You cannot remove your own portal access. Sign out from the top-right menu instead.",
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE contacts
+            SET is_portal_user = FALSE,
+                portal_password_hash = NULL,
+                portal_mfa_enabled = FALSE,
+                portal_mfa_secret = NULL,
+                updated_at = NOW()
+            WHERE tenant_id = $1
+              AND company_id = $2
+              AND id = $3
+              AND is_portal_user = TRUE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(AppError::NotFound("Contact".to_string()));
+        }
+
+        // Revoke any live sessions so the deactivated contact cannot
+        // keep making requests through an already-issued access token
+        // until it expires. Best-effort: a failure here does not
+        // block the deactivation, but the row-flip does.
+        let _ = sqlx::query(
+            r#"
+            UPDATE portal_refresh_tokens
+            SET revoked_at = NOW()
+            WHERE tenant_id = $1 AND contact_id = $2 AND revoked_at IS NULL
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await;
+
+        tx.commit().await?;
+
+        let _ = crate::modules::audit::audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id.get(),
+            Some(caller_id),
+            crate::modules::audit::AuditAction::Update,
+            "portal.deactivate_contact",
+            None,
+            None,
+        )
+        .await;
+
+        Ok(())
+    }
+
+    /// Update the caller's own portal profile (first / last name).
+    /// Email stays under agent-side ownership (identity is keyed on
+    /// it) so no self-edit path here; the schema also tracks phone
+    /// / title but those are agent-side CRM fields that a customer
+    /// should not silently overwrite.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn update_own_profile(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+        first_name: &str,
+        last_name: &str,
+    ) -> AppResult<()> {
+        let first = first_name.trim();
+        let last = last_name.trim();
+        if first.is_empty() || last.is_empty() {
+            return Err(AppError::BadRequest(
+                "first_name and last_name are required".to_string(),
+            ));
+        }
+        if first.chars().count() > 100 || last.chars().count() > 100 {
+            return Err(AppError::BadRequest(
+                "first_name and last_name capped at 100 chars".to_string(),
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE contacts
+            SET first_name = $1,
+                last_name = $2,
+                updated_at = NOW()
+            WHERE tenant_id = $3 AND id = $4
+            "#,
+        )
+        .bind(first)
+        .bind(last)
+        .bind(tenant_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(AppError::NotFound("Contact".to_string()));
+        }
+        tx.commit().await?;
+        let _ = crate::modules::audit::audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id.get(),
+            Some(contact_id),
+            crate::modules::audit::AuditAction::Update,
+            "portal.update_profile",
+            None,
+            None,
+        )
+        .await;
+        Ok(())
+    }
+
     /// PMS-729 phase 2 §7 slice D / I13: list every portal-enabled
     /// contact at the caller's own company. Returns id + name + email
     /// + `is_you` flag; nothing else. Non-portal contacts (i.e.
