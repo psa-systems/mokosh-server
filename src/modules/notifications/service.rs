@@ -947,6 +947,13 @@ impl NotificationsService {
             let prefs = self
                 .load_user_preferences(tenant_id, &user_ids, event_type)
                 .await?;
+            // Portal notification-preferences: same shape as user prefs
+            // but keyed on contact_id (see contact_notification_preferences,
+            // migration 120). A contact who opted out sees no fanout on
+            // in_app or email for this event.
+            let contact_prefs = self
+                .load_contact_preferences(tenant_id, &contact_ids, event_type)
+                .await?;
 
             for channel in &rule.channels {
                 // A template with no subject (in_app rows need none) leaves
@@ -1045,6 +1052,9 @@ impl NotificationsService {
                 // to consult the contacts table here.
                 if channel == "in_app" {
                     for cid in &contact_ids {
+                        if !accepts_channel(contact_prefs.get(cid), channel) {
+                            continue;
+                        }
                         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                         sqlx::query(
                             r#"INSERT INTO notifications
@@ -1068,6 +1078,36 @@ impl NotificationsService {
             }
         }
         Ok(fanout)
+    }
+
+    /// Portal parallel of [`Self::load_user_preferences`]: batch-load
+    /// every recipient contact's `contact_notification_preferences`
+    /// row for the current event_type, keyed by `contact_id`. A
+    /// contact with no row is absent from the map (accept-all).
+    async fn load_contact_preferences(
+        &self,
+        tenant_id: TenantId,
+        contact_ids: &[Uuid],
+        event_type: &str,
+    ) -> AppResult<HashMap<Uuid, (Option<bool>, Vec<String>)>> {
+        if contact_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, Option<bool>, Vec<String>)> = sqlx::query_as(
+            r#"SELECT contact_id, is_enabled, channel_types
+               FROM contact_notification_preferences
+               WHERE tenant_id = $1 AND contact_id = ANY($2) AND event_type = $3"#,
+        )
+        .bind(tenant_id)
+        .bind(contact_ids)
+        .bind(event_type)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(cid, enabled, channels)| (cid, (enabled, channels)))
+            .collect())
     }
 
     /// Batch-load the `user_notification_preferences` rows for every

@@ -160,6 +160,13 @@ pub fn portal_routes(
         // the caller's own session (self-sign-out is /auth/logout).
         .route("/auth/me/sessions", get(list_sessions))
         .route("/auth/me/sessions/{session_id}", delete(revoke_session))
+        // Per-event notification opt-in. GET lists every rule the
+        // tenant has active + the caller's own preferences; PUT
+        // upserts one preference row.
+        .route(
+            "/auth/me/notification-preferences",
+            get(list_notification_preferences).put(set_notification_preference),
+        )
         // PMS-729: public branding hint. The SPA login page calls this on
         // mount to decide (a) whether to hide the slug input and (b) which
         // MSP name + logo to paint above the credential fields. Returns
@@ -665,6 +672,42 @@ async fn revoke_session(
     state
         .service
         .revoke_session(session_id, contact.id, contact.tenant_id, sid)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Portal notification-preferences read. Returns every rule the
+/// tenant has active + the caller's opt-out rows so the SPA can
+/// render one toggle per event.
+async fn list_notification_preferences(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> Result<Json<crate::modules::portal::PortalNotificationPreferencesResponse>, AppError> {
+    Ok(Json(
+        state
+            .service
+            .list_portal_notification_preferences(contact.tenant(), contact.id)
+            .await?,
+    ))
+}
+
+/// Portal notification-preferences upsert. One event_type per call so
+/// the SPA toggles one row at a time; the caller who wants a bulk
+/// change simply fires several PUTs.
+async fn set_notification_preference(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+    Json(request): Json<crate::modules::portal::PortalNotificationPreference>,
+) -> Result<StatusCode, AppError> {
+    state
+        .service
+        .set_portal_notification_preference(
+            contact.tenant(),
+            contact.id,
+            &request.event_type,
+            request.is_enabled,
+            request.channel_types,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

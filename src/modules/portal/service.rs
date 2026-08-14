@@ -1504,6 +1504,132 @@ impl PortalAuthService {
         Ok(())
     }
 
+    /// List every event_type the caller's tenant has an active rule
+    /// for that could reach a customer contact (i.e. any rule whose
+    /// event_type is customer-facing), together with the caller's
+    /// own opt-out preferences from `contact_notification_preferences`.
+    ///
+    /// Returns two parallel structures the SPA composes on Settings:
+    ///
+    /// - `available[]` = the union of active rule event_types the
+    ///   customer could receive. Each row carries the event_type
+    ///   plus the union of channels the rules use so the SPA can
+    ///   render "You'll receive X via email + in-app".
+    /// - `preferences[]` = one row per event_type the caller has
+    ///   explicitly opted out of. Empty when the caller has never
+    ///   touched the toggles (accept-all default).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn list_portal_notification_preferences(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<super::models::PortalNotificationPreferencesResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Event types with active rules on this tenant, unioned with
+        // the channels each rule fires on. We aggregate to one row per
+        // event so the SPA renders a single toggle even when multiple
+        // rules fan the same event out to different recipient sets.
+        let available_rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+            r#"
+            SELECT event_type,
+                   ARRAY(
+                     SELECT DISTINCT unnest(channels)
+                   ) AS channels
+            FROM notification_rules
+            WHERE tenant_id = $1
+              AND is_active = TRUE
+            GROUP BY event_type
+            ORDER BY event_type
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let prefs_rows: Vec<(String, bool, Vec<String>)> = sqlx::query_as(
+            r#"
+            SELECT event_type, is_enabled, channel_types
+            FROM contact_notification_preferences
+            WHERE tenant_id = $1 AND contact_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(super::models::PortalNotificationPreferencesResponse {
+            available: available_rows
+                .into_iter()
+                .map(
+                    |(event_type, channels)| super::models::PortalNotificationEventOption {
+                        event_type,
+                        channels,
+                    },
+                )
+                .collect(),
+            preferences: prefs_rows
+                .into_iter()
+                .map(|(event_type, is_enabled, channel_types)| {
+                    super::models::PortalNotificationPreference {
+                        event_type,
+                        is_enabled,
+                        channel_types,
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    /// Upsert one preference row. `is_enabled = FALSE` opts the
+    /// caller out of the event entirely across every channel;
+    /// `is_enabled = TRUE` + non-empty `channel_types` restricts to
+    /// specific channels (matches the shape of
+    /// `user_notification_preferences`).
+    ///
+    /// The SPA's Settings page today only exposes an on/off toggle
+    /// per event, so `channel_types` typically arrives empty (accept
+    /// every channel when enabled).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id, event_type = %event_type))]
+    pub async fn set_portal_notification_preference(
+        &self,
+        tenant_id: crate::modules::auth::TenantId,
+        contact_id: Uuid,
+        event_type: &str,
+        is_enabled: bool,
+        channel_types: Vec<String>,
+    ) -> AppResult<()> {
+        let event_type = event_type.trim();
+        if event_type.is_empty() || event_type.chars().count() > 100 {
+            return Err(AppError::BadRequest(
+                "event_type is required (1-100 chars)".to_string(),
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO contact_notification_preferences
+                (tenant_id, contact_id, event_type, is_enabled, channel_types)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (contact_id, event_type) DO UPDATE
+                SET is_enabled = EXCLUDED.is_enabled,
+                    channel_types = EXCLUDED.channel_types,
+                    updated_at = NOW()
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(event_type)
+        .bind(is_enabled)
+        .bind(&channel_types)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Cheap DB read of `contacts.portal_mfa_enabled` for the
     /// authenticated contact. Feeds the `mfa_enabled` field on
     /// `GET /portal/auth/me` so the Settings page can render the

@@ -702,6 +702,36 @@ pub struct PortalSearchCounts {
     pub kb_articles: i64,
 }
 
+// Portal notification-preferences -------------------------------------------
+
+/// One event_type the caller's tenant has an active rule for. `channels`
+/// is the union of channels those rules fire on (`email`, `in_app`,
+/// ...) so the SPA can render "You'll receive X via email + in-app"
+/// alongside the on/off toggle.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalNotificationEventOption {
+    pub event_type: String,
+    pub channels: Vec<String>,
+}
+
+/// One preference row from `contact_notification_preferences`. `is_enabled
+/// = FALSE` suppresses the whole event; `channel_types` non-empty
+/// restricts to specific channels when enabled.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PortalNotificationPreference {
+    pub event_type: String,
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub channel_types: Vec<String>,
+}
+
+/// `GET /portal/auth/me/notification-preferences` response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalNotificationPreferencesResponse {
+    pub available: Vec<PortalNotificationEventOption>,
+    pub preferences: Vec<PortalNotificationPreference>,
+}
+
 // PMS-729 phase 2 §7 slice B / I12: portal notifications inbox -------------
 
 /// One in-app notification a contact can see in their portal inbox.
