@@ -8,6 +8,7 @@ use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{generate_token, hash_password};
+use crate::utils::email::salutation;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -879,6 +880,11 @@ impl ContactService {
         };
         let context = serde_json::json!({
             "recipient_email": email,
+            // PMS-774: `contacts.first_name` is NOT NULL but may hold an empty
+            // string, so the greeting word comes from `salutation` rather than
+            // from the name. `display_name` stays the bare name so a customised
+            // tenant template that names it keeps rendering.
+            "salutation": salutation(&contact.first_name),
             "display_name": contact.first_name,
             "setup_link": setup_link,
         });

@@ -30,7 +30,7 @@ use crate::modules::notifications::NotificationsService;
 #[cfg(feature = "server")]
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
 #[cfg(feature = "server")]
-use crate::utils::email::{LogMailer, Mailer};
+use crate::utils::email::{salutation, LogMailer, Mailer};
 #[cfg(feature = "server")]
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::geoip::GeoIpService;
@@ -1604,6 +1604,12 @@ impl AuthService {
                     let context = serde_json::json!({
                         "recipient_user_id": user_id.to_string(),
                         "recipient_email": request.email,
+                        // PMS-774: the template opens with `{{salutation}}`,
+                        // which reads correctly for a user created with no
+                        // names. `display_name` stays the bare name so a
+                        // customised tenant template that names it keeps
+                        // rendering rather than showing literal braces.
+                        "salutation": salutation(&display_name),
                         "display_name": display_name,
                         "setup_link": setup_link,
                     });
