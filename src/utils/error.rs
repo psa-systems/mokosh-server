@@ -52,6 +52,14 @@ pub enum AppError {
     #[error("Account has been deleted.")]
     AccountDeleted,
 
+    /// A Bearer credential was presented and rejected because it had
+    /// expired. 401 with the distinct code `TOKEN_EXPIRED` (PMS-769) so a
+    /// client can tell "renew your token" apart from "you sent no
+    /// credential" without string-matching the message. Only the auth
+    /// extractors raise it; every other 401 stays `Unauthorized`.
+    #[error("Your session has expired.")]
+    TokenExpired,
+
     /// Rate limit exceeded
     #[error("Rate limit exceeded. Please try again later.")]
     RateLimited,
@@ -184,6 +192,7 @@ impl AppError {
             Self::BadRequest(_) => 400,
             Self::Gone(_) => 410,
             Self::AccountDeleted => 410,
+            Self::TokenExpired => 401,
             Self::RateLimited => 429,
             Self::Database(_) => 500,
             Self::ExternalService { .. } => 502,
@@ -209,6 +218,7 @@ impl AppError {
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Gone(_) => "GONE",
             Self::AccountDeleted => "ACCOUNT_DELETED",
+            Self::TokenExpired => "TOKEN_EXPIRED",
             Self::RateLimited => "RATE_LIMITED",
             Self::Database(_) => "DATABASE_ERROR",
             Self::ExternalService { .. } => "EXTERNAL_SERVICE_ERROR",
@@ -601,6 +611,9 @@ mod tests {
         assert_eq!(AppError::BadRequest("test".to_string()).status_code(), 400);
         assert_eq!(AppError::RateLimited.status_code(), 429);
         assert_eq!(AppError::Payment("test".to_string()).status_code(), 402);
+        assert_eq!(AppError::AccountDeleted.status_code(), 410);
+        // PMS-769: RFC 6750 puts an expired bearer at 401, not 403.
+        assert_eq!(AppError::TokenExpired.status_code(), 401);
     }
 
     #[test]
@@ -615,6 +628,34 @@ mod tests {
             "NOT_FOUND"
         );
         assert_eq!(AppError::RateLimited.error_code(), "RATE_LIMITED");
+        assert_eq!(AppError::AccountDeleted.error_code(), "ACCOUNT_DELETED");
+        // PMS-769: the stable machine-readable code the SPA branches on.
+        assert_eq!(AppError::TokenExpired.error_code(), "TOKEN_EXPIRED");
+        assert_eq!(
+            AppError::TokenExpired.to_string(),
+            "Your session has expired."
+        );
+    }
+
+    /// PMS-769: the RFC 6750 challenge is attached by the auth extractors'
+    /// `AuthRejection`, never by `AppError` itself. The webhook HMAC gates
+    /// (`bunyip_webhook.rs`, `stripe_webhook.rs`) and the portal password
+    /// checks (`portal/service.rs`) return `AppError::Unauthorized` straight
+    /// out of an `AppResult` handler, so this is the exact response they
+    /// render: a plain `UNAUTHORIZED` envelope with no `WWW-Authenticate`.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn unauthorized_response_carries_no_bearer_challenge() {
+        use axum::response::IntoResponse;
+
+        for error in [AppError::Unauthorized, AppError::TokenExpired] {
+            let response = error.into_response();
+            assert_eq!(response.status(), 401);
+            assert!(
+                response.headers().get("www-authenticate").is_none(),
+                "AppError must not attach a bearer challenge on its own"
+            );
+        }
     }
 
     #[test]
