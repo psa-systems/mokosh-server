@@ -560,6 +560,100 @@ async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) 
     );
 }
 
+/// PMS-777: `ensure_default_config` runs on the per-request bunyip auth path,
+/// where its three `SELECT EXISTS` guards were three round trips on every
+/// authenticated request forever, to answer a question that flips at most once
+/// per tenant. A tenant this process has already seeded is memoized, so the
+/// second call issues no statement at all.
+///
+/// Proving "no statement" without reading the server log: empty the tables the
+/// guards read, then call again. A call that still probed would find them empty
+/// and re-seed; a memoized call cannot, so the tables stay empty.
+#[sqlx::test]
+async fn a_seeded_tenant_is_not_probed_again(pool: PgPool) {
+    let tenant = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind)
+         VALUES ($1, 'Memoized', 'memoized-777', 'active', 'org')",
+    )
+    .bind(tenant)
+    .execute(&pool)
+    .await
+    .expect("insert bare tenant");
+
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    svc.ensure_default_config(tenant).await.expect("first seed");
+
+    let statuses = |p: PgPool| async move {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(&p)
+            .await
+            .expect("count statuses")
+    };
+    assert!(
+        statuses(pool.clone()).await > 0,
+        "first sight of a tenant still runs the seeding in full"
+    );
+
+    // Empty everything the three guards read.
+    for table in ["ticket_statuses", "ticket_sequences"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE tenant_id = $1"))
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .expect("clear guard table");
+    }
+    sqlx::query("UPDATE tenants SET own_company_id = NULL WHERE id = $1")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .expect("clear own_company_id");
+
+    svc.ensure_default_config(tenant)
+        .await
+        .expect("second ensure_default_config");
+
+    assert_eq!(
+        statuses(pool.clone()).await,
+        0,
+        "a memoized tenant must issue no statement, so nothing is re-seeded"
+    );
+    let seq_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ticket_sequences WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("count sequence rows");
+    assert_eq!(seq_rows, 0, "the sequence guard is not re-probed either");
+
+    // The memo is keyed per tenant, not a global "seeding is done" switch: the
+    // very same service still runs the full guarded path for a tenant it has
+    // not seen.
+    let unseen = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind)
+         VALUES ($1, 'Unseen', 'unseen-777', 'active', 'org')",
+    )
+    .bind(unseen)
+    .execute(&pool)
+    .await
+    .expect("insert second bare tenant");
+    svc.ensure_default_config(unseen)
+        .await
+        .expect("first sight of a second tenant");
+    let unseen_statuses: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
+            .bind(unseen)
+            .fetch_one(&pool)
+            .await
+            .expect("count statuses for the second tenant");
+    assert!(
+        unseen_statuses > 0,
+        "a tenant this process has not seen is seeded in full"
+    );
+}
+
 // ============================================================================
 // PMS-751: the caller's own tenant, addressed without an id
 // ============================================================================

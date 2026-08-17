@@ -1599,15 +1599,24 @@ async fn logout_all_is_tenant_scoped(pool: PgPool) {
     );
 }
 
-/// PMS-260: the two intentionally-cross-tenant login helpers
-/// (`auth::find_user_placement`, `invitations::newest_pending_for`) read across
-/// tenants by design and are only safe because the sole caller is the
-/// pre-session bunyip login/placement path (`middleware::place_bunyip_user`).
-/// This guard pins that invariant: no HTTP route handler (`*/routes.rs`) may
-/// reference them, where an authenticated caller could probe other tenants.
+/// PMS-260: the intentionally-cross-tenant login helpers
+/// (`auth::find_user_placement`, `auth::find_bunyip_principal`,
+/// `invitations::newest_pending_for`) read across tenants by design and are
+/// only safe because the sole caller is the pre-session bunyip login/placement
+/// path (`middleware::place_bunyip_user`). This guard pins that invariant: no
+/// HTTP route handler (`*/routes.rs`) may reference them, where an
+/// authenticated caller could probe other tenants.
+///
+/// PMS-777 added `find_bunyip_principal`, which merges the `users` read and the
+/// invite probe into one statement on the same privileged pool, so it inherits
+/// the same restriction.
 #[test]
 fn routes_do_not_reach_global_login_helpers() {
-    const FORBIDDEN: [&str; 2] = ["find_user_placement", "newest_pending_for"];
+    const FORBIDDEN: [&str; 3] = [
+        "find_user_placement",
+        "find_bunyip_principal",
+        "newest_pending_for",
+    ];
 
     let modules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules");
 
