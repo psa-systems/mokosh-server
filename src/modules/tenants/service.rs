@@ -9,6 +9,7 @@ use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::slugify;
 
+use super::branding::validate_branding_patch;
 use super::models::*;
 
 /// Resolve the tenant whose migration-`023` seed rows are copied into every
@@ -469,16 +470,13 @@ impl TenantService {
             query.push_str(&format!(", settings = ${}", param_idx));
             param_idx += 1;
         }
-        // PMS-758: an object or nothing. A string or an array here would
-        // replace the document with something no reader can destructure, and
-        // `||` on two non-objects concatenates rather than merges.
+        // PMS-776: check the document before it is merged. These keys are read
+        // by a client, not by us: three of them compose the contact sentence in
+        // a client's email and `logo_url` becomes an `<img src>` in the same
+        // message, so a malformed value is one the MSP appears to have
+        // published. Includes the PMS-758 object check.
         if let Some(branding) = request.branding.as_ref() {
-            if !branding.is_object() {
-                return Err(AppError::validation_field(
-                    "branding",
-                    "must be an object of branding keys",
-                ));
-            }
+            validate_branding_patch(branding)?;
         }
         if request.branding.is_some() {
             // PMS-758: MERGE, not replace. `branding` is a JSONB document and

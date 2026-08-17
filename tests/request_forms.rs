@@ -311,6 +311,34 @@ async fn the_public_form_names_the_msp(pool: PgPool) {
         form["contact_info"].is_null(),
         "this definition carries no contact details, and none must be invented"
     );
+
+    // PMS-776: the other branch of the same field. A definition carrying its
+    // own contact used to be returned raw, so "the service desk on 555-0100"
+    // reached a client with nothing saying whose service desk it is.
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&agent_token)
+        .json(&json!({ "contact_info": "the service desk on 555-0100" }))
+        .send()
+        .await
+        .expect("patch contact_info");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let (token, _link_id) = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+    let framed: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/public/request-forms/{token}")))
+        .send()
+        .await
+        .expect("send public get")
+        .json()
+        .await
+        .expect("public form JSON");
+    assert_eq!(
+        framed["contact_info"].as_str(),
+        Some(format!("{tenant_name} at the service desk on 555-0100").as_str()),
+        "both branches of this field name the organisation"
+    );
 }
 
 #[sqlx::test]
