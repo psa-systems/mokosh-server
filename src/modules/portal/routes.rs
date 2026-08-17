@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -31,7 +31,7 @@ use crate::modules::quotes::{
     ClientDecision, PortalQuoteDecisionRequest, QuoteResponse, QuotesService,
 };
 use crate::modules::tickets::{TicketNoteResponse, TicketResponse, TicketService};
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -128,7 +128,9 @@ pub fn portal_routes(
 /// with a `Retry-After` header (PMS-501). The check runs inline because
 /// tower middleware cannot read the JSON body without buffering it. A
 /// persistent failed-attempt lockout lives in `PortalAuthService::login`
-/// and surfaces here as `AppError::RateLimited` (429) as well.
+/// and surfaces here as `AppError::RateLimited` (429) as well - deliberately
+/// without a wait, unlike its MFA counterpart: the caller has proved nothing
+/// about the account, so the window would confirm the address exists.
 async fn login(
     State(state): State<PortalRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -141,21 +143,10 @@ async fn login(
             .login_limiter
             .check(addr.ip(), &request.tenant_slug, &request.email)
     {
-        let mut resp = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "rate_limited",
-                "message": "Too many login attempts, please try again later",
-                "retry_after_seconds": retry_after,
-            })),
-        )
-            .into_response();
-        let h = resp.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-            h.insert(header::RETRY_AFTER, v);
-        }
-        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return Ok(resp);
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many login attempts, please try again later",
+        ));
     }
 
     let resp = state.service.login(&request).await?;
@@ -512,21 +503,10 @@ async fn decide(
     request.validate()?;
 
     if let Err(retry_after) = state.decision_limiter.check(addr.ip(), contact.id) {
-        let mut resp = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "rate_limited",
-                "message": "Too many quote decisions, please try again shortly",
-                "retry_after_seconds": retry_after,
-            })),
-        )
-            .into_response();
-        let h = resp.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-            h.insert(header::RETRY_AFTER, v);
-        }
-        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return Ok(resp);
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many quote decisions, please try again shortly",
+        ));
     }
 
     let decision = ClientDecision {

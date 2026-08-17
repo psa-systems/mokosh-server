@@ -788,6 +788,26 @@ async fn mfa_failed_codes_lock_account(pool: PgPool) {
         reqwest::StatusCode::TOO_MANY_REQUESTS,
         "a correct code is still rejected while the account is locked"
     );
+    // PMS-773: the lockout knows exactly when it lifts, so the refusal says so
+    // in the header and in the body rather than "try again later".
+    let retry_after: u64 = locked
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("the MFA lockout 429 carries a Retry-After header");
+    assert!(retry_after >= 1, "the wait is at least one second");
+    assert_eq!(
+        locked
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "a refusal must never be cached"
+    );
+    let body: serde_json::Value = locked.json().await.expect("429 body is JSON");
+    assert_eq!(body["error"], "rate_limited");
+    assert_eq!(body["retry_after_seconds"], retry_after);
 }
 
 // ============================================================================
@@ -871,7 +891,7 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
         match h.await.expect("login task joins") {
             None => panic!("a wrong second-factor code must never log in"),
             Some(AppError::Unauthorized) => evaluated += 1,
-            Some(AppError::RateLimited) => {}
+            Some(AppError::RateLimited { .. }) => {}
             Some(other) => panic!("unexpected login failure: {other:?}"),
         }
     }
@@ -901,9 +921,10 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
         .login(&login_request(&email, &password, &codes[20]), None, None)
         .await
         .expect_err("21st attempt must fail");
+    // PMS-773: and it carries the wait, so the caller is told when to return.
     assert!(
-        matches!(err, AppError::RateLimited),
-        "the lockout is armed, so the next attempt is rate-limited, got {err:?}"
+        matches!(err, AppError::RateLimited { retry_after_seconds: Some(secs) } if secs >= 1),
+        "the lockout is armed, so the next attempt is rate-limited with its remaining wait, got {err:?}"
     );
 }
 
@@ -1038,9 +1059,10 @@ async fn failed_recovery_codes_lock_account(pool: PgPool) {
         )
         .await
         .expect_err("4th attempt must fail");
+    // PMS-773: and it carries the wait, so the caller is told when to return.
     assert!(
-        matches!(err, AppError::RateLimited),
-        "the lockout is armed, so the next attempt is rate-limited, got {err:?}"
+        matches!(err, AppError::RateLimited { retry_after_seconds: Some(secs) } if secs >= 1),
+        "the lockout is armed, so the next attempt is rate-limited with its remaining wait, got {err:?}"
     );
 }
 

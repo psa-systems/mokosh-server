@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header, header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
+    http::{header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -21,7 +21,7 @@ use super::{
     ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::{RequireAuth, RequireManager};
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 /// Application state for auth routes
@@ -110,28 +110,6 @@ pub fn auth_routes(
         .with_state(state)
 }
 
-/// Build the 429 response shared by the rate-limited auth endpoints (login and
-/// forgot-password): a `rate_limited` JSON body plus a `Retry-After` header and
-/// a `no-store` cache directive. `retry_after` is the limiter's suggested wait
-/// in seconds.
-fn rate_limited_response(retry_after: u64, message: &str) -> Response {
-    let mut resp = (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(serde_json::json!({
-            "error": "rate_limited",
-            "message": message,
-            "retry_after_seconds": retry_after,
-        })),
-    )
-        .into_response();
-    let h = resp.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-        h.insert(header::RETRY_AFTER, v);
-    }
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
-}
-
 /// Login endpoint. Rate-limited per `(source IP, lowercased email)`
 /// at 20/min per IP + 5/min per email; over-quota returns 429 with
 /// a `Retry-After` header. The check has to run inline because tower
@@ -166,10 +144,25 @@ async fn login(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let response = state
+    let response = match state
         .auth_service
         .login(&request, ip_address, user_agent)
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        // PMS-773: the persistent second-factor lockout knows exactly when it
+        // lifts, so it answers with the same Retry-After contract as the
+        // limiter above instead of a bare 429.
+        Err(AppError::RateLimited {
+            retry_after_seconds: Some(retry_after),
+        }) => {
+            return Ok(rate_limited_response(
+                retry_after,
+                "Too many failed verification codes, please try again later",
+            ))
+        }
+        Err(other) => return Err(other),
+    };
 
     Ok(Json(response).into_response())
 }

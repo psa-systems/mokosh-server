@@ -46,7 +46,7 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-runner-labels check-oci-cache
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
@@ -59,6 +59,13 @@ check-migrations:
 [group: 'check']
 check-mail-copy:
     nu scripts/check-no-duplicate-mail-copy.nu
+
+# Keep every 429 coming from the one shared builder (PMS-773). Fails if a route
+# file constructs a TOO_MANY_REQUESTS response itself, or if a handler computes
+# a retry delay and discards it.
+[group: 'check']
+check-rate-limit-helper:
+    nu scripts/check-rate-limit-helper.nu
 
 # Keep CI jobs on the right runner label (PMS-719). Fails if a compiling job
 # requests the base label, if a workflow installs a C toolchain at run time,

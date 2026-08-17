@@ -668,8 +668,14 @@ impl AuthService {
             // across replicas (it lives in Postgres), and is budgeted
             // independently of the password-attempt bucket.
             let locked_until = self.mfa_locked_until(user.tenant_id, user.id).await?;
-            if locked_until.is_some_and(|until| until > Utc::now()) {
-                return Err(AppError::RateLimited);
+            if let Some(until) = locked_until.filter(|until| *until > Utc::now()) {
+                // PMS-773: the window's own remaining time is the wait the
+                // caller is owed, floored at 1 so a sub-second remainder is
+                // never reported as "retry immediately".
+                let retry_after = (until - Utc::now()).num_seconds().max(1) as u64;
+                return Err(AppError::RateLimited {
+                    retry_after_seconds: Some(retry_after),
+                });
             }
 
             if let Some(rc) = request.recovery_code.as_deref() {
