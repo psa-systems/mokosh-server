@@ -166,7 +166,7 @@ impl RmmService {
         .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
-            .ok_or_else(|| AppError::NotFound("RmmConnection".to_string()))
+            .ok_or_else(|| AppError::NotFound("RMM connection".to_string()))
     }
 
     /// `PUT /api/v1/rmm/connections/{id}`. Missing fields on the
@@ -214,7 +214,7 @@ impl RmmService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmConnection".to_string()));
+            return Err(AppError::NotFound("RMM connection".to_string()));
         }
         tx.commit().await?;
         self.get_connection(tenant_id, id).await
@@ -230,7 +230,7 @@ impl RmmService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmConnection".to_string()));
+            return Err(AppError::NotFound("RMM connection".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -251,7 +251,7 @@ impl RmmService {
         ).bind(tenant_id).bind(id).fetch_optional(&mut *read_tx).await?;
         drop(read_tx);
         let Some((url, key_enc)) = row else {
-            return Err(AppError::NotFound("RmmConnection".to_string()));
+            return Err(AppError::NotFound("RMM connection".to_string()));
         };
         let _api_key = crate::utils::crypto::decrypt(&key_enc, &self.encryption_key)?;
         let client = reqwest::Client::builder()
@@ -406,7 +406,7 @@ impl RmmService {
         .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
-            .ok_or_else(|| AppError::NotFound("RmmDeviceMapping".to_string()))
+            .ok_or_else(|| AppError::NotFound("RMM device mapping".to_string()))
     }
 
     /// `PUT /api/v1/rmm/device-mappings/{id}`. Missing fields on the
@@ -439,7 +439,7 @@ impl RmmService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmDeviceMapping".to_string()));
+            return Err(AppError::NotFound("RMM device mapping".to_string()));
         }
         tx.commit().await?;
         self.get_device_mapping(tenant_id, id).await
@@ -455,7 +455,7 @@ impl RmmService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmDeviceMapping".to_string()));
+            return Err(AppError::NotFound("RMM device mapping".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -596,7 +596,7 @@ impl RmmService {
         .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
-            .ok_or_else(|| AppError::NotFound("RmmAlertRule".to_string()))
+            .ok_or_else(|| AppError::NotFound("RMM alert rule".to_string()))
     }
 
     /// `PUT /api/v1/rmm/alert-rules/{id}`. Missing fields on the request
@@ -635,7 +635,7 @@ impl RmmService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmAlertRule".to_string()));
+            return Err(AppError::NotFound("RMM alert rule".to_string()));
         }
         tx.commit().await?;
         self.get_alert_rule(tenant_id, id).await
@@ -651,7 +651,7 @@ impl RmmService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmAlertRule".to_string()));
+            return Err(AppError::NotFound("RMM alert rule".to_string()));
         }
         tx.commit().await?;
         Ok(())

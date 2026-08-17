@@ -553,6 +553,9 @@ pub type RequireFinance = RequireRole<FinanceRoles>;
 /// The blanket `FromRequestParts` below does the DB lookup.
 pub trait ModuleGate: Send + Sync + 'static {
     const NAME: &'static str;
+    /// Human noun for the 404 message. `NAME` is the `module_config` key
+    /// (`rmm_integration`), which must not reach a user (PMS-775).
+    const LABEL: &'static str;
 }
 
 /// Extractor that authenticates the caller AND verifies their tenant
@@ -619,7 +622,7 @@ where
             .is_module_enabled(super::tenant::TenantScoped::tenant(&user), G::NAME)
             .await?;
         if !enabled {
-            return Err(AppError::NotFound(format!("module {}", G::NAME)).into());
+            return Err(AppError::NotFound(format!("{} module", G::LABEL)).into());
         }
         Ok(Self {
             user,
@@ -632,24 +635,35 @@ where
 /// `ModuleGate` on it, and exposes a `RequireFoo` type alias for the
 /// extractor.
 macro_rules! gated_module {
-    ($struct_name:ident, $module_name:expr, $alias:ident) => {
+    ($struct_name:ident, $module_name:expr, $label:expr, $alias:ident) => {
         pub struct $struct_name;
         impl ModuleGate for $struct_name {
             const NAME: &'static str = $module_name;
+            const LABEL: &'static str = $label;
         }
         pub type $alias = RequireModuleEnabled<$struct_name>;
     };
 }
 
-gated_module!(BillingModule, "billing", RequireBilling);
-gated_module!(ProjectsModule, "projects", RequireProjects);
-gated_module!(CalendarModule, "calendar", RequireCalendar);
-gated_module!(ContractsModule, "contracts", RequireContracts);
-gated_module!(AssetsModule, "assets", RequireAssets);
-gated_module!(KnowledgeBaseModule, "knowledge_base", RequireKnowledgeBase);
-gated_module!(RmmModule, "rmm_integration", RequireRmm);
-gated_module!(ReportsModule, "reports", RequireReports);
-gated_module!(TimeTrackingModule, "time_tracking", RequireTimeTracking);
+gated_module!(BillingModule, "billing", "Billing", RequireBilling);
+gated_module!(ProjectsModule, "projects", "Projects", RequireProjects);
+gated_module!(CalendarModule, "calendar", "Calendar", RequireCalendar);
+gated_module!(ContractsModule, "contracts", "Contracts", RequireContracts);
+gated_module!(AssetsModule, "assets", "Assets", RequireAssets);
+gated_module!(
+    KnowledgeBaseModule,
+    "knowledge_base",
+    "Knowledge base",
+    RequireKnowledgeBase
+);
+gated_module!(RmmModule, "rmm_integration", "RMM integration", RequireRmm);
+gated_module!(ReportsModule, "reports", "Reports", RequireReports);
+gated_module!(
+    TimeTrackingModule,
+    "time_tracking",
+    "Time tracking",
+    RequireTimeTracking
+);
 
 // ── Bunyip RS helper ─────────────────────────────────────────────────────────
 

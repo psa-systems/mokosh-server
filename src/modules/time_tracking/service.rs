@@ -142,7 +142,7 @@ impl TimeTrackingService {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("WorkType".to_string()));
+            return Err(AppError::NotFound("Work type".to_string()));
         }
         tx.commit().await?;
         Ok(WorkTypeResponse {
@@ -166,7 +166,7 @@ impl TimeTrackingService {
             .await?
             .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("WorkType".to_string()));
+            return Err(AppError::NotFound("Work type".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -434,7 +434,7 @@ impl TimeTrackingService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("TimeEntry".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Time entry".to_string()))?;
         Ok(row.into())
     }
 
@@ -558,7 +558,7 @@ impl TimeTrackingService {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("TimeEntry".to_string()));
+            return Err(AppError::NotFound("Time entry".to_string()));
         }
         tx.commit().await?;
         self.get_time_entry(tenant_id, id).await
@@ -574,7 +574,7 @@ impl TimeTrackingService {
             .await?
             .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("TimeEntry".to_string()));
+            return Err(AppError::NotFound("Time entry".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -1205,7 +1205,7 @@ impl TimeTrackingService {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(timer) = timer else {
-            return Err(AppError::NotFound("ActiveTimer".to_string()));
+            return Err(AppError::NotFound("Active timer".to_string()));
         };
 
         let now = Utc::now();
@@ -1438,7 +1438,7 @@ impl TimeTrackingService {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("TimeRoundingRule".to_string()));
+            return Err(AppError::NotFound("Time rounding rule".to_string()));
         }
         tx.commit().await?;
         Ok(TimeRoundingRuleResponse {
@@ -1462,7 +1462,7 @@ impl TimeTrackingService {
                 .await?
                 .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("TimeRoundingRule".to_string()));
+            return Err(AppError::NotFound("Time rounding rule".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -1511,7 +1511,7 @@ where
     .fetch_optional(exec)
     .await?;
     let (default_rate, default_billable) =
-        row.ok_or_else(|| AppError::NotFound("WorkType".to_string()))?;
+        row.ok_or_else(|| AppError::NotFound("Work type".to_string()))?;
     Ok(WorkTypeDefaults {
         default_rate,
         default_billable,

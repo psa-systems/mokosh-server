@@ -828,7 +828,7 @@ impl CalendarService {
             r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
                FROM time_off WHERE tenant_id = $1 AND id = $2"#,
         ).bind(tenant_id).bind(id).fetch_optional(&mut *tx).await?
-        .ok_or_else(|| AppError::NotFound("TimeOff".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Time off request".to_string()))?;
         Ok(row.into())
     }
 
@@ -858,7 +858,7 @@ impl CalendarService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TimeOff".to_string()));
+            return Err(AppError::NotFound("Time off request".to_string()));
         }
         tx.commit().await?;
         self.get_time_off(tenant_id, id).await
@@ -874,7 +874,7 @@ impl CalendarService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TimeOff".to_string()));
+            return Err(AppError::NotFound("Time off request".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -988,7 +988,7 @@ impl CalendarService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("OnCallSchedule".to_string()));
+            return Err(AppError::NotFound("On-call schedule".to_string()));
         }
         tx.commit().await?;
         Ok(OnCallScheduleResponse {
@@ -1011,7 +1011,7 @@ impl CalendarService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("OnCallSchedule".to_string()));
+            return Err(AppError::NotFound("On-call schedule".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -1239,7 +1239,7 @@ impl CalendarService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("SchedulingTemplate".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Scheduling template".to_string()))?;
         Ok(row.into())
     }
 
@@ -1318,7 +1318,7 @@ impl CalendarService {
         .fetch_optional(&mut *tx)
         .await?;
         if before.is_none() {
-            return Err(AppError::NotFound("SchedulingTemplate".to_string()));
+            return Err(AppError::NotFound("Scheduling template".to_string()));
         }
         sqlx::query(
             r#"UPDATE scheduling_templates SET
@@ -1381,7 +1381,7 @@ impl CalendarService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("SchedulingTemplate".to_string()));
+            return Err(AppError::NotFound("Scheduling template".to_string()));
         }
         tx.commit().await?;
         Ok(())

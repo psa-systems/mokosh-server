@@ -108,7 +108,7 @@ impl SettingsService {
         .bind(key)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("TenantSetting".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Tenant setting".to_string()))?;
         Ok(row.into())
     }
 
@@ -164,7 +164,7 @@ impl SettingsService {
         .rows_affected();
         tx.commit().await?;
         if n == 0 {
-            return Err(AppError::NotFound("TenantSetting".to_string()));
+            return Err(AppError::NotFound("Tenant setting".to_string()));
         }
         Ok(())
     }

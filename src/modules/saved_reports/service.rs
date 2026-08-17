@@ -144,7 +144,7 @@ impl SavedReportsService {
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(AppError::NotFound("SavedReport".into()))?;
+            .ok_or(AppError::NotFound("Saved report".into()))?;
         Ok(row.into())
     }
 
@@ -199,7 +199,7 @@ impl SavedReportsService {
         .fetch_optional(&mut *tx)
         .await?;
         if owner.is_none() {
-            return Err(AppError::NotFound("SavedReport".into()));
+            return Err(AppError::NotFound("Saved report".into()));
         }
         sqlx::query(
             "UPDATE saved_reports SET \
@@ -243,7 +243,7 @@ impl SavedReportsService {
         .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("SavedReport".into()));
+            return Err(AppError::NotFound("Saved report".into()));
         }
         Ok(())
     }
@@ -515,7 +515,7 @@ impl SavedReportsService {
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(AppError::NotFound("ScheduledReport".into()))?;
+            .ok_or(AppError::NotFound("Scheduled report".into()))?;
         Ok(row.into())
     }
 
@@ -558,7 +558,7 @@ impl SavedReportsService {
         .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("ScheduledReport".into()));
+            return Err(AppError::NotFound("Scheduled report".into()));
         }
         self.schedule_get(tenant_id, id).await
     }
@@ -577,7 +577,7 @@ impl SavedReportsService {
         .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("ScheduledReport".into()));
+            return Err(AppError::NotFound("Scheduled report".into()));
         }
         Ok(())
     }

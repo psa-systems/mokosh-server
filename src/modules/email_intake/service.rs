@@ -534,7 +534,7 @@ impl EmailIntakeService {
         .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
-            .ok_or(AppError::NotFound("EmailIntakeLog".into()))
+            .ok_or(AppError::NotFound("Email intake log".into()))
     }
 
     async fn find_by_message_id(
@@ -652,7 +652,7 @@ impl EmailIntakeService {
         .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("IntakeToken".into()));
+            return Err(AppError::NotFound("Intake token".into()));
         }
         Ok(())
     }
