@@ -91,7 +91,7 @@ async fn create_connection(
         "tactical_rmm" | "mesh_central" | "datto" | "connectwise" | "ninja_rmm"
     ) {
         return Err(AppError::BadRequest(format!(
-            "provider {:?} not supported; pick tactical_rmm | mesh_central | datto | connectwise | ninja_rmm",
+            "Provider {:?} not supported; pick tactical_rmm | mesh_central | datto | connectwise | ninja_rmm",
             req.provider
         )));
     }

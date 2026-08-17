@@ -301,14 +301,14 @@ async fn import_tenant_data(
 ) -> AppResult<Json<Value>> {
     if req.export.schema_version != SCHEMA_VERSION {
         return Err(AppError::BadRequest(format!(
-            "unsupported schema_version {} (expected {SCHEMA_VERSION})",
+            "Unsupported schema_version {} (expected {SCHEMA_VERSION})",
             req.export.schema_version
         )));
     }
     for table in req.export.entities.keys() {
         if !is_safe_identifier(table) || EXCLUDE_TABLES.contains(&table.as_str()) {
             return Err(AppError::BadRequest(format!(
-                "envelope contains an unexpected table: {table}"
+                "Envelope contains an unexpected table: {table}"
             )));
         }
     }
@@ -331,7 +331,7 @@ async fn import_tenant_data(
         .await?;
     if req.confirm.trim() != tenant_name.trim() {
         return Err(AppError::BadRequest(
-            "confirmation does not match the tenant name".to_string(),
+            "Confirmation does not match the tenant name".to_string(),
         ));
     }
 
@@ -347,7 +347,7 @@ async fn import_tenant_data(
     for table in req.export.entities.keys() {
         if !tenant_table_set.contains(table.as_str()) {
             return Err(AppError::BadRequest(format!(
-                "envelope table {table} is not a current tenant table (schema drift)"
+                "Envelope table {table} is not a current tenant table (schema drift)"
             )));
         }
     }

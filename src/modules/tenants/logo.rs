@@ -111,7 +111,7 @@ pub fn check_mime(raw: &str) -> AppResult<&'static str> {
         .map(|(m, _)| *m)
         .ok_or_else(|| {
             AppError::BadRequest(format!(
-                "unsupported image type `{base}`; use PNG, JPEG, WebP or GIF"
+                "Unsupported image type `{base}`; use PNG, JPEG, WebP or GIF"
             ))
         })
 }
@@ -143,11 +143,11 @@ impl TenantLogoStore {
     ) -> AppResult<&'static str> {
         let mime = check_mime(mime)?;
         if bytes.is_empty() {
-            return Err(AppError::BadRequest("the uploaded file is empty".into()));
+            return Err(AppError::BadRequest("The uploaded file is empty".into()));
         }
         if bytes.len() as u64 > self.config.max_bytes {
             return Err(AppError::BadRequest(format!(
-                "logo is larger than the {} KiB limit",
+                "Logo is larger than the {} KiB limit",
                 self.config.max_bytes / 1024
             )));
         }

@@ -646,7 +646,7 @@ impl BillingService {
 
         if entries.is_empty() && mileage.is_empty() {
             return Err(AppError::BadRequest(
-                "no billable time or mileage entries found for this company".to_string(),
+                "No billable time or mileage entries found for this company".to_string(),
             ));
         }
 
@@ -1513,7 +1513,7 @@ impl BillingService {
         let encrypted = match request.config.as_ref() {
             Some(config) => {
                 let plaintext = serde_json::to_string(config).map_err(|e| {
-                    AppError::BadRequest(format!("config must serialise to JSON: {e}"))
+                    AppError::BadRequest(format!("Config must serialise to JSON: {e}"))
                 })?;
                 Some(crate::utils::crypto::encrypt(
                     &plaintext,
@@ -1572,7 +1572,7 @@ impl BillingService {
             None => {
                 if before.is_none() {
                     return Err(AppError::BadRequest(
-                        "config is required when first configuring a gateway".to_string(),
+                        "Config is required when first configuring a gateway".to_string(),
                     ));
                 }
                 // Preserve the stored secret: update metadata only, leave
@@ -1779,19 +1779,19 @@ impl BillingService {
             InvoiceStatus::Void | InvoiceStatus::WrittenOff
         ) {
             return Err(AppError::Conflict(format!(
-                "invoice {} cannot be paid in status '{}'",
+                "Invoice {} cannot be paid in status '{}'",
                 invoice.invoice_number,
                 invoice.status.as_str()
             )));
         }
         if invoice.balance_due <= Decimal::ZERO {
             return Err(AppError::BadRequest(
-                "invoice has no outstanding balance to pay".to_string(),
+                "Invoice has no outstanding balance to pay".to_string(),
             ));
         }
         let Some(creds) = self.active_stripe_credentials(tenant_id).await? else {
             return Err(AppError::BadRequest(
-                "no active payment provider is configured for this account".to_string(),
+                "No active payment provider is configured for this account".to_string(),
             ));
         };
 
@@ -2096,7 +2096,7 @@ impl BillingService {
             let remaining = total - prior_paid;
             if request.amount > remaining {
                 return Err(AppError::BadRequest(format!(
-                    "payment amount {} exceeds invoice balance due {}",
+                    "Payment amount {} exceeds invoice balance due {}",
                     request.amount, remaining
                 )));
             }

@@ -472,7 +472,7 @@ where
         if R::allowed_roles().contains(&user_role) {
             Ok(RequireRole(user, std::marker::PhantomData))
         } else {
-            Err(AppError::Forbidden("Insufficient permissions".to_string()).into())
+            Err(AppError::Forbidden("You do not have permission to do that".to_string()).into())
         }
     }
 }
@@ -1352,7 +1352,7 @@ mod tests {
         // 500 all reach the client through `AuthRejection` too, but none of
         // them concerns a bearer credential, so none gets a challenge.
         for error in [
-            AppError::Forbidden("Insufficient permissions".to_string()),
+            AppError::Forbidden("You do not have permission to do that".to_string()),
             AppError::NotFound("module billing".to_string()),
             AppError::Internal("SettingsService extension missing".to_string()),
         ] {

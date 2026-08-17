@@ -98,7 +98,7 @@ impl FormsService {
         // Measured on the serialised form, which is what is stored and what a
         // caller controls, rather than on any in-memory size.
         let size = serde_json::to_vec(&req.payload)
-            .map_err(|e| AppError::BadRequest(format!("draft payload is not storable: {e}")))?
+            .map_err(|e| AppError::BadRequest(format!("Draft payload is not storable: {e}")))?
             .len();
         if size > MAX_PAYLOAD_BYTES {
             return Err(AppError::BadRequest(format!(

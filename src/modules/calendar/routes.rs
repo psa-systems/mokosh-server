@@ -104,7 +104,7 @@ async fn dispatch_view(
         (Some(from), Some(to)) => (from, to),
         _ => {
             return Err(crate::utils::error::AppError::BadRequest(
-                "dispatch view requires both `from` and `to` query parameters".to_string(),
+                "Dispatch view requires both `from` and `to` query parameters".to_string(),
             ))
         }
     };

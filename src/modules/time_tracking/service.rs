@@ -600,7 +600,7 @@ impl TimeTrackingService {
             Some("rejected") => Some("rejected"),
             Some(other) => {
                 return Err(AppError::BadRequest(format!(
-                    "unknown timesheet status filter `{other}`; expected one of pending | approved | rejected | all",
+                    "Unknown timesheet status filter `{other}`; expected one of pending | approved | rejected | all",
                 )));
             }
         };
@@ -622,7 +622,7 @@ impl TimeTrackingService {
             let span_weeks = (to - from).num_days() / 7 + 1;
             if span_weeks > MAX_RANGE_WEEKS {
                 return Err(AppError::BadRequest(format!(
-                    "timesheet range capped at {MAX_RANGE_WEEKS} weeks; got {span_weeks}"
+                    "Timesheet range capped at {MAX_RANGE_WEEKS} weeks; got {span_weeks}"
                 )));
             }
             Some((from, to))

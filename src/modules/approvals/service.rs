@@ -234,7 +234,7 @@ impl ApprovalsService {
             "reject" => "rejected",
             _ => {
                 return Err(AppError::BadRequest(
-                    "decision must be 'approve' or 'reject'".into(),
+                    "Decision must be 'approve' or 'reject'".into(),
                 ));
             }
         };

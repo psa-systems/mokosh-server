@@ -240,7 +240,7 @@ async fn delete_payment_gateway(
     Path(provider): Path<String>,
 ) -> AppResult<()> {
     let provider = GatewayProvider::from_str(&provider).ok_or_else(|| {
-        crate::utils::error::AppError::BadRequest(format!("unknown provider {provider:?}"))
+        crate::utils::error::AppError::BadRequest(format!("Unknown provider {provider:?}"))
     })?;
     state
         .service

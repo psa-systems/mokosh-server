@@ -120,7 +120,9 @@ async fn get_tenant(
 ) -> AppResult<Json<TenantResponse>> {
     // Super admin can view any tenant, others can only view their own
     if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // SAFETY (PMS-261): this super-admin surface deliberately addresses an
@@ -208,14 +210,16 @@ async fn upload_current_logo(
     mut multipart: Multipart,
 ) -> AppResult<Json<TenantResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     let mut file: Option<(String, Vec<u8>)> = None;
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::BadRequest(format!("multipart parse: {e}")))?
+        .map_err(|e| AppError::BadRequest(format!("Multipart parse: {e}")))?
     {
         if field.name().unwrap_or_default() != "file" {
             continue;
@@ -227,12 +231,12 @@ async fn upload_current_logo(
         let bytes = field
             .bytes()
             .await
-            .map_err(|e| AppError::BadRequest(format!("multipart read: {e}")))?;
+            .map_err(|e| AppError::BadRequest(format!("Multipart read: {e}")))?;
         file = Some((mime, bytes.to_vec()));
         break;
     }
     let (mime, bytes) =
-        file.ok_or_else(|| AppError::BadRequest("missing 'file' part in multipart body".into()))?;
+        file.ok_or_else(|| AppError::BadRequest("Missing 'file' part in multipart body".into()))?;
 
     let tenant_id = user.tenant();
     let stored_mime = state.logos.store(tenant_id.get(), &mime, &bytes).await?;
@@ -273,7 +277,9 @@ async fn delete_current_logo(
     ctx: crate::modules::audit::AuditCtx,
 ) -> AppResult<Json<TenantResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
     let tenant_id = user.tenant();
     // PMS-758: explicit nulls, which is how a merged document clears a key.
@@ -325,7 +331,9 @@ async fn update_current_tenant(
     Json(request): Json<UpdateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
     request.validate()?;
     let tenant = state
@@ -345,7 +353,9 @@ async fn update_tenant(
 ) -> AppResult<Json<TenantResponse>> {
     // Super admin can update any tenant, admins can update their own
     if user.role != UserRole::SuperAdmin && !(user.tenant_id == tenant_id && user.role.is_admin()) {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     request.validate()?;
@@ -404,7 +414,9 @@ async fn get_tenant_usage(
 ) -> AppResult<Json<TenantUsage>> {
     // Super admin can view any tenant, admins can view their own
     if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
@@ -430,7 +442,9 @@ async fn get_module_config(
     Path((tenant_id, module)): Path<(Uuid, String)>,
 ) -> AppResult<Json<ModuleConfigResponse>> {
     if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
@@ -452,7 +466,9 @@ async fn update_module_config(
     Json(request): Json<UpsertModuleConfigRequest>,
 ) -> AppResult<Json<ModuleConfigResponse>> {
     if user.role != UserRole::SuperAdmin && !(user.tenant_id == tenant_id && user.role.is_admin()) {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by

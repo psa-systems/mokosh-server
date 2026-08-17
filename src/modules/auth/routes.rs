@@ -524,7 +524,9 @@ async fn create_user(
 ) -> AppResult<Json<UserResponse>> {
     // Check admin permission
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // Role ceiling (PMS-503): a caller may only create a user whose role is at
@@ -555,7 +557,9 @@ async fn get_user(
     Path(user_id): Path<Uuid>,
 ) -> AppResult<Json<UserResponse>> {
     if !user.role.is_admin() && user.id != user_id {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     let target_user = state
@@ -575,7 +579,9 @@ async fn update_user(
     Json(request): Json<UpdateUserRequest>,
 ) -> AppResult<Json<UserResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // Role ceiling (PMS-503 / PMS-625): a caller may only assign a role at or

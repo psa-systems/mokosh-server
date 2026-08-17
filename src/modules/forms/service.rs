@@ -270,7 +270,7 @@ impl FormsService {
         .await?;
         if taken {
             return Err(AppError::Conflict(format!(
-                "A form with slug `{}`",
+                "A form with slug `{}` already exists",
                 req.slug
             )));
         }
@@ -394,7 +394,7 @@ impl FormsService {
         .await?;
         if submitted > 0 {
             return Err(AppError::Conflict(format!(
-                "This form has {submitted} submission(s) and cannot be deleted; set is_active to false to retire it. A conflicting form"
+                "This form has {submitted} submission(s) and cannot be deleted; set is_active to false to retire it."
             )));
         }
         let affected = sqlx::query("DELETE FROM form_definitions WHERE tenant_id = $1 AND id = $2")
@@ -425,8 +425,7 @@ impl FormsService {
         let definition = self.get(tenant_id, definition_id).await?;
         if !definition.is_active {
             return Err(AppError::Conflict(
-                "This form has been retired and is no longer accepting submissions. An active form"
-                    .to_string(),
+                "This form has been retired and is no longer accepting submissions.".to_string(),
             ));
         }
 

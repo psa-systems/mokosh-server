@@ -388,7 +388,7 @@ fn reject_undeliverable_recipient(to: &Mailbox) -> AppResult<()> {
     let domain = to.email.domain().to_ascii_lowercase();
     if domain == "invalid" || domain.ends_with(".invalid") {
         return Err(AppError::BadRequest(format!(
-            "refusing to send to the reserved non-routable address {}",
+            "Refusing to send to the reserved non-routable address {}",
             to.email
         )));
     }
@@ -428,7 +428,7 @@ impl Mailer for SmtpMailer {
     ) -> AppResult<()> {
         let to_mailbox: Mailbox = to
             .parse()
-            .map_err(|e| AppError::BadRequest(format!("invalid recipient {to}: {e}")))?;
+            .map_err(|e| AppError::BadRequest(format!("Invalid recipient {to}: {e}")))?;
         reject_undeliverable_recipient(&to_mailbox)?;
         let msg = build_message(&self.from, to_mailbox, subject, text, html)?;
         self.transport.send(msg).await?;

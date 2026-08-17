@@ -129,7 +129,7 @@ impl QuotesService {
                 .await?;
         exists
             .map(|_| ())
-            .ok_or_else(|| AppError::BadRequest(format!("unknown company {company_id}")))
+            .ok_or_else(|| AppError::BadRequest(format!("Unknown company {company_id}")))
     }
 
     /// Same cross-tenant guard for the billing contact.
@@ -146,7 +146,7 @@ impl QuotesService {
                 .await?;
         exists
             .map(|_| ())
-            .ok_or_else(|| AppError::BadRequest(format!("unknown contact {contact_id}")))
+            .ok_or_else(|| AppError::BadRequest(format!("Unknown contact {contact_id}")))
     }
 
     /// Resolve company ids to display names so responses never carry a
