@@ -240,7 +240,7 @@ impl MileageTrackingService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("MileageEntry".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Mileage entry".to_string()))?;
         Ok(row.into())
     }
 
@@ -310,7 +310,7 @@ impl MileageTrackingService {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("MileageEntry".to_string()));
+            return Err(AppError::NotFound("Mileage entry".to_string()));
         }
         tx.commit().await?;
         self.get_mileage_entry(tenant_id, id).await
@@ -326,7 +326,7 @@ impl MileageTrackingService {
             .await?
             .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("MileageEntry".to_string()));
+            return Err(AppError::NotFound("Mileage entry".to_string()));
         }
         tx.commit().await?;
         Ok(())

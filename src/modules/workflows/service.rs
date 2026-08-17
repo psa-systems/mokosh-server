@@ -126,7 +126,7 @@ impl WorkflowsService {
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(AppError::NotFound("WorkflowRule".into()))?;
+            .ok_or(AppError::NotFound("Workflow rule".into()))?;
         Ok(row.into())
     }
 
@@ -184,7 +184,7 @@ impl WorkflowsService {
                 .fetch_optional(&mut *tx)
                 .await?;
         if existing.is_none() {
-            return Err(AppError::NotFound("WorkflowRule".into()));
+            return Err(AppError::NotFound("Workflow rule".into()));
         }
         sqlx::query(
             "UPDATE workflow_rules SET \
@@ -221,7 +221,7 @@ impl WorkflowsService {
             .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("WorkflowRule".into()));
+            return Err(AppError::NotFound("Workflow rule".into()));
         }
         Ok(())
     }

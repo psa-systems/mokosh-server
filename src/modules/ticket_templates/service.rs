@@ -104,7 +104,7 @@ impl TicketTemplatesService {
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(AppError::NotFound("TicketTemplate".into()))?;
+            .ok_or(AppError::NotFound("Ticket template".into()))?;
         Ok(row.into())
     }
 
@@ -193,7 +193,7 @@ impl TicketTemplatesService {
             .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("TicketTemplate".into()));
+            return Err(AppError::NotFound("Ticket template".into()));
         }
         Ok(())
     }

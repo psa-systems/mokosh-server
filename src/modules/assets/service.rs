@@ -128,7 +128,7 @@ impl AssetsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("AssetType".to_string()));
+            return Err(AppError::NotFound("Asset type".to_string()));
         }
         tx.commit().await?;
         Ok(AssetTypeResponse {
@@ -151,7 +151,7 @@ impl AssetsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("AssetType".to_string()));
+            return Err(AppError::NotFound("Asset type".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -674,7 +674,7 @@ impl AssetsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("AssetRelationship".to_string()));
+            return Err(AppError::NotFound("Asset relationship".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -745,7 +745,7 @@ impl AssetsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("ConfigurationItem".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Configuration item".to_string()))?;
         let value = crate::utils::crypto::decrypt(&r.value_encrypted, &self.encryption_key)?;
         sqlx::query(
             r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
@@ -834,7 +834,7 @@ impl AssetsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("ConfigurationItem".to_string()));
+            return Err(AppError::NotFound("Configuration item".to_string()));
         }
         tx.commit().await?;
         Ok(())

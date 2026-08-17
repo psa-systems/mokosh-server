@@ -289,7 +289,9 @@ async fn export_report(
             }
             csv_for_clients(&s.service.clients(u.tenant()).await?)
         }
-        other => return Err(AppError::NotFound(format!("report {other:?}"))),
+        // Plain `{other}`, not `{other:?}`: Debug quoted the name inside the
+        // sentence, so the 404 read `report "widgets" not found` (PMS-775).
+        other => return Err(AppError::NotFound(format!("Report {other}"))),
     };
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],

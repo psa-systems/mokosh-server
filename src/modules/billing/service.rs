@@ -1331,7 +1331,7 @@ impl BillingService {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("TaxRate".to_string()));
+            return Err(AppError::NotFound("Tax rate".to_string()));
         }
 
         // Audit row in the same transaction. PMS-117.
@@ -1388,7 +1388,7 @@ impl BillingService {
             .await?
             .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("TaxRate".to_string()));
+            return Err(AppError::NotFound("Tax rate".to_string()));
         }
         audit_write(
             &mut *tx,
@@ -1443,7 +1443,7 @@ impl BillingService {
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("TaxRate".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Tax rate".to_string()))?;
         Ok(fallback.into())
     }
 
@@ -2677,7 +2677,7 @@ impl BillingService {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
-            return Err(AppError::NotFound("PaymentTerm".to_string()));
+            return Err(AppError::NotFound("Payment term".to_string()));
         };
         tx.commit().await?;
         Ok(row.into())
@@ -2705,7 +2705,7 @@ impl BillingService {
             }
         };
         if affected == 0 {
-            return Err(AppError::NotFound("PaymentTerm".to_string()));
+            return Err(AppError::NotFound("Payment term".to_string()));
         }
         tx.commit().await?;
         Ok(())

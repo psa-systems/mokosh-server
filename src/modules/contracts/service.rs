@@ -469,7 +469,7 @@ impl ContractsService {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(cid) = contract_id else {
-            return Err(AppError::NotFound("ContractItem".to_string()));
+            return Err(AppError::NotFound("Contract item".to_string()));
         };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -534,7 +534,7 @@ impl ContractsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("ContractItem".to_string()));
+            return Err(AppError::NotFound("Contract item".to_string()));
         }
         audit_write(
             &mut *tx,
@@ -626,7 +626,7 @@ impl ContractsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("RateCard".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Rate card".to_string()))?;
         Ok(row.into())
     }
 
@@ -730,7 +730,7 @@ impl ContractsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RateCard".to_string()));
+            return Err(AppError::NotFound("Rate card".to_string()));
         }
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM rate_cards t WHERE tenant_id = $1 AND id = $2",
@@ -784,7 +784,7 @@ impl ContractsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RateCard".to_string()));
+            return Err(AppError::NotFound("Rate card".to_string()));
         }
         audit_write(
             &mut *tx,
@@ -856,7 +856,7 @@ impl ContractsService {
         .fetch_one(&mut *tx)
         .await?;
         if !exists {
-            return Err(AppError::NotFound("RateCard".to_string()));
+            return Err(AppError::NotFound("Rate card".to_string()));
         }
 
         // Mutation + audit row in one transaction. PMS-117.
@@ -958,7 +958,7 @@ impl ContractsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RateCardItem".to_string()));
+            return Err(AppError::NotFound("Rate card item".to_string()));
         }
         audit_write(
             &mut *tx,
@@ -1028,7 +1028,7 @@ impl ContractsService {
         .bind(contract_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("block_hours contract item".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Block hours contract item".to_string()))?;
 
         let included = item.included_hours.unwrap_or(Decimal::ZERO);
         let overage_rate = item.overage_rate.unwrap_or(Decimal::ZERO);
@@ -1148,7 +1148,7 @@ impl ContractsService {
         .bind(contract_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("block_hours contract item".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Block hours contract item".to_string()))?;
 
         if !item.rollover_enabled.unwrap_or(false) {
             tx.commit().await?;
@@ -1299,7 +1299,7 @@ impl ContractsService {
         .bind(work_type_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("RateCardItem".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Rate card item".to_string()))?;
 
         let rate = if emergency {
             row.emergency_rate.unwrap_or(row.hourly_rate)

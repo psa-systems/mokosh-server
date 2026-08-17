@@ -457,7 +457,7 @@ impl ProjectsService {
         .await?;
         tx.commit().await?;
         let Some(project_id) = project_id else {
-            return Err(AppError::NotFound("ProjectPhase".to_string()));
+            return Err(AppError::NotFound("Project phase".to_string()));
         };
         Ok(ProjectPhaseResponse {
             id,
@@ -481,7 +481,7 @@ impl ProjectsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("ProjectPhase".to_string()));
+            return Err(AppError::NotFound("Project phase".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -590,7 +590,7 @@ impl ProjectsService {
         .rows_affected();
         tx.commit().await?;
         if n == 0 {
-            return Err(AppError::NotFound("TaskStatus".to_string()));
+            return Err(AppError::NotFound("Task status".to_string()));
         }
         Ok(TaskStatusResponse {
             id,
@@ -611,7 +611,7 @@ impl ProjectsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TaskStatus".to_string()));
+            return Err(AppError::NotFound("Task status".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -738,7 +738,7 @@ impl ProjectsService {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
-            return Err(AppError::NotFound("ProjectType".to_string()));
+            return Err(AppError::NotFound("Project type".to_string()));
         };
         tx.commit().await?;
         Ok(row.into())
@@ -757,7 +757,7 @@ impl ProjectsService {
         .fetch_optional(&mut *tx)
         .await?;
         match is_system {
-            None => return Err(AppError::NotFound("ProjectType".to_string())),
+            None => return Err(AppError::NotFound("Project type".to_string())),
             Some(true) => {
                 return Err(AppError::Conflict(
                     "Cannot delete a system project type".to_string(),

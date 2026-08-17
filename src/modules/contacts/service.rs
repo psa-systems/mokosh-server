@@ -1292,7 +1292,7 @@ impl ContactService {
         .bind(request.is_active)
         .fetch_optional(&mut *tx)
         .await?;
-        let row = row.ok_or_else(|| AppError::NotFound("CompanyIndustry".to_string()))?;
+        let row = row.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
         tx.commit().await?;
         Ok(row.into())
     }
@@ -1307,7 +1307,7 @@ impl ContactService {
             .execute(&mut *tx)
             .await?;
         if res.rows_affected() == 0 {
-            return Err(AppError::NotFound("CompanyIndustry".to_string()));
+            return Err(AppError::NotFound("Company industry".to_string()));
         }
         tx.commit().await?;
         Ok(())

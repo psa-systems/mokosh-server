@@ -905,6 +905,134 @@ mod tests {
         assert_eq!(format_bound(&value), "255");
     }
 
+    /// PMS-775: a 404 names the thing a user would recognise ("KB article"),
+    /// never the type or table behind it. The identifier shapes are an
+    /// interior capital after a lowercase letter and an underscore; a single
+    /// capitalised word ("Ticket") and an uppercased acronym ("SLA policy")
+    /// are the canonical human form and must pass.
+    fn is_identifier_shaped(noun: &str) -> bool {
+        noun.contains('_')
+            || noun
+                .chars()
+                .zip(noun.chars().skip(1))
+                .any(|(a, b)| a.is_lowercase() && b.is_uppercase())
+    }
+
+    /// Recursively collect every `.rs` file under `dir`.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read source dir") {
+            let path = entry.expect("read dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Pull the string-literal argument of every `AppError::NotFound`
+    /// construction out of `source`, with its 1-based line number. Call sites
+    /// passing a variable are skipped: only a literal is checkable statically.
+    fn not_found_literals(source: &str) -> Vec<(usize, String)> {
+        // Split so this scanner does not match its own marker literal.
+        const MARKER: &str = concat!("NotFound", "(");
+        let bytes = source.as_bytes();
+        let mut found = Vec::new();
+        let mut search = 0usize;
+        while let Some(offset) = source[search..].find(MARKER) {
+            let mut i = search + offset + MARKER.len();
+            search = i;
+            let skip_space = |i: &mut usize| {
+                while bytes.get(*i).is_some_and(|c| c.is_ascii_whitespace()) {
+                    *i += 1;
+                }
+            };
+            skip_space(&mut i);
+            if source[i..].starts_with("format!(") {
+                i += "format!(".len();
+                skip_space(&mut i);
+            }
+            if bytes.get(i) != Some(&b'"') {
+                continue;
+            }
+            i += 1;
+            let start = i;
+            while let Some(&c) = bytes.get(i) {
+                match c {
+                    b'\\' => i += 2,
+                    b'"' => break,
+                    _ => i += 1,
+                }
+            }
+            found.push((
+                source[..start].lines().count(),
+                source[start..i].to_string(),
+            ));
+        }
+        found
+    }
+
+    #[test]
+    fn identifier_shape_detects_type_names_not_human_nouns() {
+        for identifier in ["KbArticle", "RmmDeviceMapping", "block_hours", "timeOff"] {
+            assert!(is_identifier_shaped(identifier), "{identifier:?}");
+        }
+        for noun in [
+            "Ticket",
+            "KB article",
+            "SLA policy",
+            "On-call schedule",
+            "API key",
+            "Report {other}",
+        ] {
+            assert!(!is_identifier_shaped(noun), "{noun:?}");
+        }
+    }
+
+    /// PMS-775: the enforcement. Every literal handed to `AppError::NotFound`
+    /// anywhere in the crate must be a human noun, so a new call site cannot
+    /// reintroduce a type or table name in a user-facing 404. The second half
+    /// bans a `Debug` placeholder, which quotes the interpolated value inside
+    /// the sentence (`report "widgets" not found`).
+    #[test]
+    fn not_found_arguments_are_human_nouns() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(
+            !files.is_empty(),
+            "no sources found under {}",
+            src.display()
+        );
+
+        let mut offenders = Vec::new();
+        let mut debug_quoted = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source file");
+            for (line, literal) in not_found_literals(&source) {
+                let site = format!("{}:{line}: {literal:?}", file.display());
+                if is_identifier_shaped(&literal) {
+                    offenders.push(site.clone());
+                }
+                if literal.contains(":?}") {
+                    debug_quoted.push(site);
+                }
+            }
+        }
+        assert!(
+            debug_quoted.is_empty(),
+            "AppError::NotFound must interpolate with Display, not Debug, so the \
+             value is not quoted inside the message:\n{}",
+            debug_quoted.join("\n")
+        );
+        assert!(
+            offenders.is_empty(),
+            "AppError::NotFound must name the thing a user would recognise \
+             (\"KB article\"), not the type or table behind it:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn test_not_found_error() {
         let error = AppError::not_found("User");

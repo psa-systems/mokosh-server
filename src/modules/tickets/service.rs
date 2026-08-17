@@ -1417,7 +1417,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketStatus".to_string()));
+            return Err(AppError::NotFound("Ticket status".to_string()));
         }
         tx.commit().await?;
         Ok(TicketStatus {
@@ -1434,7 +1434,7 @@ impl TicketService {
     /// Delete a ticket status. 409 if still referenced by a ticket.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_status(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        self.delete_lookup(tenant_id, "ticket_statuses", id, "TicketStatus", "status")
+        self.delete_lookup(tenant_id, "ticket_statuses", id, "Ticket status", "status")
             .await
     }
 
@@ -1532,7 +1532,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketPriority".to_string()));
+            return Err(AppError::NotFound("Ticket priority".to_string()));
         }
         tx.commit().await?;
         Ok(TicketPriority {
@@ -1554,7 +1554,7 @@ impl TicketService {
             tenant_id,
             "ticket_priorities",
             id,
-            "TicketPriority",
+            "Ticket priority",
             "priority",
         )
         .await
@@ -1638,7 +1638,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketType".to_string()));
+            return Err(AppError::NotFound("Ticket type".to_string()));
         }
         tx.commit().await?;
         Ok(TicketType {
@@ -1655,7 +1655,7 @@ impl TicketService {
     /// Delete a ticket type. 409 if still referenced by a ticket.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        self.delete_lookup(tenant_id, "ticket_types", id, "TicketType", "type")
+        self.delete_lookup(tenant_id, "ticket_types", id, "Ticket type", "type")
             .await
     }
 
@@ -1753,7 +1753,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketQueue".to_string()));
+            return Err(AppError::NotFound("Ticket queue".to_string()));
         }
         tx.commit().await?;
         Ok(TicketQueue {
@@ -1771,7 +1771,7 @@ impl TicketService {
     /// Delete a ticket queue. 409 if still referenced by a ticket.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_queue(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        self.delete_lookup(tenant_id, "ticket_queues", id, "TicketQueue", "queue")
+        self.delete_lookup(tenant_id, "ticket_queues", id, "Ticket queue", "queue")
             .await
     }
 
@@ -1930,7 +1930,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketCategory".to_string()));
+            return Err(AppError::NotFound("Ticket category".to_string()));
         }
         tx.commit().await?;
         Ok(TicketCategoryResponse {
@@ -1951,7 +1951,7 @@ impl TicketService {
             tenant_id,
             "ticket_categories",
             id,
-            "TicketCategory",
+            "Ticket category",
             "category",
         )
         .await
@@ -2285,7 +2285,7 @@ impl TicketService {
             .await?;
         rows.into_iter()
             .find(|n| n.id == note_id)
-            .ok_or(AppError::NotFound("TicketNote".to_string()))
+            .ok_or(AppError::NotFound("Ticket note".to_string()))
     }
 
     /// Verify the ticket belongs to the portal contact's company within the

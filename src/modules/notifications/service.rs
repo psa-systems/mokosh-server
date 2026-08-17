@@ -182,7 +182,7 @@ impl NotificationsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("NotificationChannel".to_string()));
+            return Err(AppError::NotFound("Notification channel".to_string()));
         }
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM notification_channels t WHERE tenant_id = $1 AND id = $2",
@@ -223,7 +223,7 @@ impl NotificationsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("NotificationChannel".to_string()));
+            return Err(AppError::NotFound("Notification channel".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -344,7 +344,7 @@ impl NotificationsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("NotificationTemplate".to_string()));
+            return Err(AppError::NotFound("Notification template".to_string()));
         }
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM notification_templates t WHERE tenant_id = $1 AND id = $2",
@@ -387,7 +387,7 @@ impl NotificationsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("NotificationTemplate".to_string()));
+            return Err(AppError::NotFound("Notification template".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -640,7 +640,7 @@ impl NotificationsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("NotificationRule".to_string()));
+            return Err(AppError::NotFound("Notification rule".to_string()));
         }
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM notification_rules t WHERE tenant_id = $1 AND id = $2",
@@ -683,7 +683,7 @@ impl NotificationsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("NotificationRule".to_string()));
+            return Err(AppError::NotFound("Notification rule".to_string()));
         }
         tx.commit().await?;
         Ok(())
