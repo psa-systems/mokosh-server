@@ -362,7 +362,11 @@ impl FormsService {
         // MAPPS-429: the form's own contact wins; the organisation's is the
         // fallback, so an MSP sets a service-desk number once instead of on
         // every definition.
-        let contact_info = definition.contact_info.clone().or_else(|| org.phrase());
+        //
+        // PMS-776: framed either way. The form-supplied branch used to be
+        // returned raw, so only one of the two branches of this one field told
+        // the client who was asking.
+        let contact_info = org.phrase_with(definition.contact_info.as_deref());
         Ok(PublicFormResponse {
             name: definition.name,
             description: definition.description,

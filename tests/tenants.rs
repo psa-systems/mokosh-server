@@ -943,6 +943,126 @@ async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool
     );
 }
 
+/// PMS-776: the PATCH document is checked before it is merged.
+///
+/// These keys are read by a client, not by us: three of them compose the
+/// contact sentence in a client's email and `logo_url` becomes an `<img src>`
+/// in the same message, so a malformed value is one the MSP appears to have
+/// published over its own SMTP identity.
+#[sqlx::test]
+async fn branding_a_client_will_read_is_validated_on_write(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (case, branding) in [
+        (
+            "an address that is not an address",
+            serde_json::json!({ "support_email": "call us on 555-0100" }),
+        ),
+        (
+            "a logo pointing outside the public route",
+            serde_json::json!({ "logo_url": "https://evil.example/logo.png" }),
+        ),
+        (
+            "a key no reader destructures",
+            serde_json::json!({ "supprt_email": "help@acme.example" }),
+        ),
+        (
+            "a colour that is not a colour",
+            serde_json::json!({ "primary_color": "red" }),
+        ),
+        (
+            "a phone number that is a sentence",
+            serde_json::json!({ "support_phone": "call the service desk" }),
+        ),
+    ] {
+        let resp = app
+            .client
+            .put(app.url("/api/v1/tenants/current"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "branding": branding }))
+            .send()
+            .await
+            .expect("send branding");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{case} must be refused, got {}",
+            resp.status()
+        );
+    }
+
+    // The values the settings page and the logo upload actually send still go
+    // through untouched.
+    let ok = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": {
+                "support_email": "help@acme.example",
+                "support_phone": "+1 555-0100",
+                "support_contact_name": "Dana",
+                "primary_color": "#0066cc",
+            }
+        }))
+        .send()
+        .await
+        .expect("send valid branding");
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+
+    // Nothing was merged from the refused writes.
+    let current: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get current")
+        .json()
+        .await
+        .expect("tenant JSON");
+    assert_eq!(
+        current["branding"]["support_email"].as_str(),
+        Some("help@acme.example")
+    );
+    assert!(current["branding"]["logo_url"].is_null());
+}
+
+/// PMS-776: the two endpoints that write a branding value agree about it.
+/// They still write to different stores (PMS-703 F18); what they no longer do
+/// is disagree about which values are legal.
+#[sqlx::test]
+async fn the_settings_endpoint_validates_branding_like_the_tenants_endpoint(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (key, value, expected) in [
+        ("support_email", "call us on 555-0100", false),
+        ("support_email", "help@acme.example", true),
+        ("logo_url", "https://evil.example/logo.png", false),
+        ("secondary_color", "#00AA55", true),
+        ("supprt_email", "help@acme.example", false),
+    ] {
+        let resp = app
+            .client
+            .put(app.url(&format!("/api/v1/settings/branding/{key}")))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "value": value }))
+            .send()
+            .await
+            .expect("send setting");
+        assert_eq!(
+            resp.status().is_success(),
+            expected,
+            "branding/{key} = {value} got {}",
+            resp.status()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PMS-761: the organisation identity every client-facing email renders
 // ---------------------------------------------------------------------------

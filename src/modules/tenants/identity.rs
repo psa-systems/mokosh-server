@@ -139,6 +139,23 @@ impl OrgIdentity {
         }
     }
 
+    /// PMS-776: the phrase with a per-message contact standing in for the
+    /// organisation's own channels, as the request-form page needs.
+    ///
+    /// The same two branches as [`OrgIdentity::contact_line`], which is the
+    /// point: the page used to return a form definition's own `contact_info`
+    /// raw, so "call the service desk on 555-0100" reached a client with
+    /// nothing saying whose service desk it is, while the fallback branch of
+    /// the same field always named someone. `{name} at {info}` matches the
+    /// email's override branch ("Contact {org} at {info}."), so one form with
+    /// its own contact and one without produce the same shape.
+    pub fn phrase_with(&self, override_info: Option<&str>) -> Option<String> {
+        match clean(override_info) {
+            Some(info) => Some(format!("{} at {}", self.name, info)),
+            None => self.phrase(),
+        }
+    }
+
     /// PMS-748: the "how do I ask about this?" line, which is never empty.
     ///
     /// The organisation's NAME is not optional: a client asked to hand over
@@ -286,6 +303,26 @@ mod tests {
             "Dana on 555-0100"
         );
         assert_eq!(org(None, None, None).phrase(), None);
+    }
+
+    #[test]
+    fn both_branches_of_the_form_pages_contact_line_name_the_organisation() {
+        let org = org(None, Some("555-0100"), None);
+        // A form definition carrying its own contact used to be returned raw.
+        assert_eq!(
+            org.phrase_with(Some(" call the service desk on 555-0199 ")),
+            Some("Contoso IT at call the service desk on 555-0199".to_string())
+        );
+        // No definition contact: the shared phrase, unchanged.
+        assert_eq!(org.phrase_with(None), org.phrase());
+        assert_eq!(org.phrase_with(Some("   ")), org.phrase());
+        // Both shapes open on a name, which is the finding.
+        for phrase in [org.phrase_with(Some("555-0199")), org.phrase_with(None)] {
+            assert!(
+                phrase.expect("a phrase").starts_with("Contoso IT"),
+                "a client is always told who is asking"
+            );
+        }
     }
 
     #[test]

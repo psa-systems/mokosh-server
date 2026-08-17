@@ -1,0 +1,321 @@
+//! PMS-776: the shape of a branding value a client will be shown.
+//!
+//! `tenants.branding` is a PATCH document (PMS-758) whose keys reach people who
+//! have no account here: `support_contact_name`, `support_phone` and
+//! `support_email` compose the contact sentence in a client's email, and
+//! `logo_url` is interpolated into an `<img src>` in the same message. Both
+//! writers used to take those keys verbatim, so a malformed address, a phone
+//! number that was a sentence, or a path pointing anywhere the public API base
+//! can be joined to went out over the MSP's own SMTP identity.
+//!
+//! One table, two callers: `PUT /api/v1/tenants/:id` merges a whole document
+//! ([`validate_branding_patch`], called from `TenantService::update_tenant`) and
+//! `PUT /api/v1/settings/{category}/{key}` writes one key at a time
+//! ([`validate_branding_value`], called from
+//! `settings::models::validate_setting_value`). They still write to different
+//! stores, which is the seam PMS-703 F18 names; what they no longer do is
+//! disagree about what a valid value is.
+//!
+//! Ungated, unlike the rest of the tenant surface: the settings validator is
+//! not gated on `multi-tenant`, and a single-tenant build has branding too.
+
+use serde_json::Value;
+
+use crate::modules::settings::models::is_hex_color;
+use crate::utils::error::{AppError, AppResult};
+use crate::utils::validation::validate_email;
+
+use super::logo::check_mime;
+
+/// The only path prefix this API serves a tenant image from (see
+/// [`super::logo::logo_path`]). A `logo_url` outside it is a broken image in
+/// every email the tenant sends, or a pointer at something the public API base
+/// was never meant to reach.
+pub const PUBLIC_TENANT_PATH_PREFIX: &str = "/api/v1/public/tenants/";
+
+/// Caps, in characters, for the free-text keys. Chosen from where each value is
+/// rendered rather than from the column: the contact sentence and the form
+/// page's contact line are one line in a client's mail client.
+const MAX_NAME: usize = 120;
+const MAX_PHONE: usize = 40;
+const MAX_EMAIL: usize = 254;
+const MAX_PATH: usize = 200;
+const MAX_DOMAIN: usize = 253;
+
+/// Validate a whole `branding` PATCH document.
+///
+/// Every key is checked against the table below and an unknown key is refused
+/// rather than merged: the document is read back as [`mokosh_types::tenants::TenantBranding`],
+/// so a key outside it is silently invisible to every reader while still
+/// sitting in the JSONB the next writer merges into.
+pub fn validate_branding_patch(patch: &Value) -> AppResult<()> {
+    // PMS-758: an object or nothing. A string or an array here would replace
+    // the document with something no reader can destructure, and `||` on two
+    // non-objects concatenates rather than merges.
+    let Some(obj) = patch.as_object() else {
+        return Err(AppError::validation_field(
+            "branding",
+            "must be an object of branding keys",
+        ));
+    };
+    for (key, value) in obj {
+        validate_branding_value(key, value)
+            .map_err(|message| AppError::validation_field(format!("branding.{key}"), message))?;
+    }
+    Ok(())
+}
+
+/// Validate one branding key.
+///
+/// `Err` carries the human message and no field name, because the two callers
+/// hang it on different request fields (`branding.{key}` for the tenants PATCH,
+/// `value` for the per-key settings write) and one table has to serve both.
+pub fn validate_branding_value(key: &str, value: &Value) -> Result<(), String> {
+    // PMS-758: an explicit null is how a merged document clears a key, and the
+    // logo-delete route sends two of them.
+    if value.is_null() {
+        return Ok(());
+    }
+    match key {
+        // `accent_color` is the deprecated alias for `secondary_color`, kept
+        // accepted per PMS-703 F18 because the settings endpoint has written it
+        // since PMS-113.
+        "primary_color" | "secondary_color" | "accent_color" => {
+            let s = text(key, value, 7)?;
+            if is_hex_color(s) {
+                Ok(())
+            } else {
+                Err(format!("`{key}` must be a hex colour like #0066cc"))
+            }
+        }
+        "support_email" => {
+            let s = text(key, value, MAX_EMAIL)?;
+            validate_email(s.trim()).map_err(|_| format!("`{key}` must be an email address"))
+        }
+        "support_phone" => {
+            let s = text(key, value, MAX_PHONE)?;
+            if s.chars().any(|c| c.is_ascii_digit()) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "`{key}` must be a phone number; it reads as \"on {{number}}\" in a client's email"
+                ))
+            }
+        }
+        "support_contact_name" | "company_name" => text(key, value, MAX_NAME).map(|_| ()),
+        // `logo_url` is what the upload route writes and what the email
+        // composer joins to the public API base. `favicon_url` has no reader
+        // yet; holding it to the same prefix stops it becoming an arbitrary
+        // URL before one arrives.
+        "logo_url" | "favicon_url" => {
+            let s = text(key, value, MAX_PATH)?;
+            if s.starts_with(PUBLIC_TENANT_PATH_PREFIX) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "`{key}` must be a public tenant path beginning `{PUBLIC_TENANT_PATH_PREFIX}`"
+                ))
+            }
+        }
+        // The content type the public logo route answers with, so it is the
+        // same set the upload accepts.
+        "logo_mime" => {
+            let s = text(key, value, 100)?;
+            check_mime(s).map(|_| ()).map_err(|_| {
+                format!("`{key}` must be an image type the logo route can serve (PNG, JPEG, WebP or GIF)")
+            })
+        }
+        "portal_domain" => {
+            let s = text(key, value, MAX_DOMAIN)?;
+            if is_hostname(s.trim()) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "`{key}` must be a bare hostname like portal.acme.example"
+                ))
+            }
+        }
+        _ => Err(format!(
+            "`{key}` is not a branding key; the known keys are {}",
+            KNOWN_KEYS.join(", ")
+        )),
+    }
+}
+
+/// Every key the table above accepts, for the message an unknown key gets.
+/// Kept beside the match by [`known_keys_match_the_table`].
+const KNOWN_KEYS: &[&str] = &[
+    "company_name",
+    "favicon_url",
+    "logo_mime",
+    "logo_url",
+    "portal_domain",
+    "primary_color",
+    "secondary_color",
+    "accent_color",
+    "support_contact_name",
+    "support_email",
+    "support_phone",
+];
+
+/// A string value that will be rendered: present, not blank, within its
+/// rendered length, and free of control characters. Blank is refused rather
+/// than stored because an operator clearing a field means null, and
+/// `OrgIdentity` would read `Some("")` back as unset anyway.
+fn text<'a>(key: &str, value: &'a Value, max: usize) -> Result<&'a str, String> {
+    let Some(s) = value.as_str() else {
+        return Err(format!("`{key}` must be a string"));
+    };
+    if s.trim().is_empty() {
+        return Err(format!("`{key}` must not be blank; send null to clear it"));
+    }
+    if s.chars().count() > max {
+        return Err(format!("`{key}` must be at most {max} characters"));
+    }
+    if s.chars().any(char::is_control) {
+        return Err(format!("`{key}` must be a single line"));
+    }
+    Ok(s)
+}
+
+/// A bare hostname: no scheme, no path, no port.
+fn is_hostname(s: &str) -> bool {
+    s.contains('.')
+        && !s.starts_with(['.', '-'])
+        && !s.ends_with(['.', '-'])
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn patch(v: Value) -> Result<(), String> {
+        validate_branding_patch(&v).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_support_email_must_be_an_email_address() {
+        assert!(patch(json!({ "support_email": "help@acme.example" })).is_ok());
+        assert!(patch(json!({ "support_email": "call us on 555-0100" })).is_err());
+        assert!(patch(json!({ "support_email": "help@acme" })).is_err());
+        assert!(patch(json!({ "support_email": 42 })).is_err());
+    }
+
+    #[test]
+    fn a_logo_url_must_be_a_public_logo_path() {
+        // What the upload route writes is what the validator accepts.
+        let written = super::super::logo::logo_path(Uuid::nil());
+        assert!(patch(json!({ "logo_url": written })).is_ok());
+        assert!(patch(json!({ "logo_url": "https://evil.example/logo.png" })).is_err());
+        assert!(patch(json!({ "logo_url": "/etc/passwd" })).is_err());
+        assert!(
+            patch(json!({ "logo_url": null })).is_ok(),
+            "the delete-logo route clears the pointer with an explicit null"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_rejected_rather_than_merged() {
+        assert!(patch(json!({ "supprt_email": "help@acme.example" })).is_err());
+        assert!(patch(json!({ "branding": {} })).is_err());
+        let err = validate_branding_value("supprt_email", &json!("help@acme.example")).unwrap_err();
+        assert!(err.contains("is not a branding key"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn known_keys_match_the_table() {
+        for key in KNOWN_KEYS {
+            assert!(
+                validate_branding_value(key, &Value::Null).is_ok(),
+                "`{key}` is advertised as known but has no arm"
+            );
+            let err = validate_branding_value(key, &json!(false)).unwrap_err();
+            assert!(
+                !err.contains("is not a branding key"),
+                "`{key}` is advertised as known but falls through: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_branding_field_the_readers_destructure_is_writable() {
+        // A key `TenantBranding` reads but this table refuses would make the
+        // field unsettable through either endpoint.
+        let full = json!({
+            "logo_url": "/api/v1/public/tenants/x/logo",
+            "logo_mime": "image/png",
+            "favicon_url": "/api/v1/public/tenants/x/favicon",
+            "primary_color": "#0066cc",
+            "secondary_color": "#00AA55",
+            "company_name": "Acme IT",
+            "support_email": "help@acme.example",
+            "support_phone": "555-0100",
+            "support_contact_name": "Dana",
+            "portal_domain": "portal.acme.example",
+        });
+        assert!(patch(full.clone()).is_ok());
+        let fields: Vec<String> = full
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| format!("\"{k}\""))
+            .collect();
+        let branding = serde_json::to_string(&mokosh_types::tenants::TenantBranding::default())
+            .expect("serialize branding");
+        for field in fields {
+            assert!(
+                branding.contains(&field),
+                "{field} is accepted but no reader destructures it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rendered_value_stays_one_short_line() {
+        assert!(patch(json!({ "support_contact_name": "Dana" })).is_ok());
+        assert!(patch(json!({ "support_contact_name": "   " })).is_err());
+        assert!(patch(json!({ "support_contact_name": "Dana\nX" })).is_err());
+        assert!(patch(json!({ "support_contact_name": "D".repeat(MAX_NAME + 1) })).is_err());
+        assert!(patch(json!({ "support_phone": "+1 555-0100 ext. 2" })).is_ok());
+        assert!(
+            patch(json!({ "support_phone": "call the service desk" })).is_err(),
+            "the email renders this as \"on {{phone}}\", so a sentence reads as a number"
+        );
+    }
+
+    #[test]
+    fn the_colour_keys_take_a_hex_colour() {
+        assert!(patch(json!({ "primary_color": "#0066cc" })).is_ok());
+        assert!(patch(json!({ "secondary_color": "#00AA55" })).is_ok());
+        assert!(
+            patch(json!({ "accent_color": "#0066cc" })).is_ok(),
+            "the deprecated alias stays writable (PMS-703 F18)"
+        );
+        assert!(patch(json!({ "primary_color": "red" })).is_err());
+        assert!(patch(json!({ "primary_color": "#0066cz" })).is_err());
+    }
+
+    #[test]
+    fn a_logo_mime_is_one_the_public_route_can_serve() {
+        assert!(patch(json!({ "logo_mime": "image/png" })).is_ok());
+        assert!(patch(json!({ "logo_mime": "image/svg+xml" })).is_err());
+    }
+
+    #[test]
+    fn a_portal_domain_is_a_bare_hostname() {
+        assert!(patch(json!({ "portal_domain": "portal.acme.example" })).is_ok());
+        assert!(patch(json!({ "portal_domain": "https://portal.acme.example/x" })).is_err());
+        assert!(patch(json!({ "portal_domain": "localhost" })).is_err());
+    }
+
+    #[test]
+    fn the_patch_itself_must_be_an_object() {
+        assert!(validate_branding_patch(&json!("not-an-object")).is_err());
+        assert!(validate_branding_patch(&json!([])).is_err());
+        assert!(validate_branding_patch(&json!({})).is_ok());
+    }
+}

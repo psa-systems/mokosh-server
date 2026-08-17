@@ -121,6 +121,10 @@ async fn upsert_setting(
     Json(req): Json<UpsertTenantSettingRequest>,
 ) -> AppResult<Json<TenantSettingResponse>> {
     req.validate()?;
+    // PMS-776: the body-carried write of the same rows the per-key route below
+    // validates. Without this a branding value reached `tenant_settings`
+    // unchecked through the older URL shape.
+    validate_setting_value(&req.category, &req.key, &req.value)?;
     Ok(Json(
         s.service.upsert_tenant_setting(u.tenant(), &req).await?,
     ))

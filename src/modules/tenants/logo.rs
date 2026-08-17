@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
+use super::branding::PUBLIC_TENANT_PATH_PREFIX;
 use crate::utils::error::{AppError, AppResult};
 
 /// Formats a browser and a mail client both render without a plugin. Anything
@@ -183,7 +184,7 @@ impl TenantLogoStore {
 /// with the API base it already knows, and the email composer joins it with the
 /// public API base it is configured with. Nothing here can know both.
 pub fn logo_path(tenant_id: Uuid) -> String {
-    format!("/api/v1/public/tenants/{tenant_id}/logo")
+    format!("{PUBLIC_TENANT_PATH_PREFIX}{tenant_id}/logo")
 }
 
 #[cfg(test)]
