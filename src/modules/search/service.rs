@@ -66,10 +66,17 @@ impl SearchService {
     /// string is sanitised at the SQL boundary: every `%` and `_` is
     /// escaped so a user typing those literally matches them
     /// literally (no accidental wildcards). The five table scans run
-    /// sequentially against the same pool connection - each is cheap
-    /// (per-table ILIKE on indexed name / title / number columns,
-    /// LIMIT 5) so parallelising them would not amortise meaningfully
-    /// and would multiply pool-connection pressure for no win.
+    /// sequentially against the same pool connection, so parallelising
+    /// them would not amortise meaningfully and would multiply
+    /// pool-connection pressure for no win.
+    ///
+    /// PMS-778: every column named in an `ILIKE` below carries its own
+    /// `gin_trgm_ops` index, so the planner can BitmapOr the `OR` branches
+    /// instead of sequentially scanning the tenant slice. That coverage is
+    /// what keeps these statements cheap - especially the `COUNT(*)` half,
+    /// which has no `LIMIT` and reads every match. Adding an `ILIKE` on an
+    /// unindexed column silently reinstates the seq scan; add the index in
+    /// the same change (see `migrations/107_search_trigram_indexes.sql`).
     ///
     /// PMS-692: every scanned table (`tickets`/`contacts`/`companies`/
     /// `assets`/`projects`) is RLS-covered, so all ten statements run inside a
