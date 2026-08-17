@@ -668,3 +668,68 @@ async fn an_expired_or_guessed_link_is_refused_identically(pool: PgPool) {
         .expect("send wrong secret");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
+
+/// PMS-773 AC1: the public request-form surface is the least tolerant of a
+/// bare refusal (an external client mid-form, with no account, several of whom
+/// can share one NAT address), so its 429 carries the wait the limiter already
+/// computed instead of logging it and dropping it. The quota check runs before
+/// the token is resolved, so a bogus token is enough to exhaust the bucket.
+#[sqlx::test]
+async fn the_public_form_429_carries_the_wait(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let token = format!("{}.{}", Uuid::new_v4(), "x".repeat(64));
+    let url = app.url(&format!("/api/v1/public/request-forms/{token}"));
+
+    // 30/min per IP: spend the bucket, then the next read is refused.
+    let mut refused_read = None;
+    for _ in 0..40 {
+        let resp = app
+            .client
+            .get(&url)
+            .send()
+            .await
+            .expect("send public form read");
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            refused_read = Some(resp);
+            break;
+        }
+    }
+    assert_rate_limited(refused_read.expect("40 reads must exhaust a 30/min bucket")).await;
+
+    // The submit handler shares the bucket, so it is refused the same way.
+    let refused_write = app
+        .client
+        .post(&url)
+        .json(&json!({ "payload": {} }))
+        .send()
+        .await
+        .expect("send public form submit");
+    assert_rate_limited(refused_write).await;
+}
+
+/// The 429 contract every rate-limited surface shares (PMS-773): the wait in
+/// the header and in the body, and never cached.
+async fn assert_rate_limited(resp: reqwest::Response) {
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("a 429 carries a Retry-After header");
+    assert!(retry_after >= 1, "the wait is at least one second");
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "a refusal must never be cached"
+    );
+    let body: serde_json::Value = resp.json().await.expect("429 body is JSON");
+    assert_eq!(body["error"], "rate_limited");
+    assert_eq!(
+        body["message"],
+        "Too many requests, please try again shortly"
+    );
+    assert_eq!(body["retry_after_seconds"], retry_after);
+}

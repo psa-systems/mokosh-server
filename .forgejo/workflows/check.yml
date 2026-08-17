@@ -79,6 +79,16 @@ jobs:
         run: |
           nu scripts/check-pool-safety.nu
 
+      - name: Rate-limit helper
+        # PMS-773: `rate_limited_response` builds every 429 (body, Retry-After,
+        # no-store). It was copied instead of called three times because it was
+        # a private fn in a route file, and the fourth site agreed with none of
+        # the copies. Fails loud if a route builds a 429 itself again, or if a
+        # handler computes a retry delay and drops it.
+        shell: nu {0}
+        run: |
+          nu scripts/check-rate-limit-helper.nu
+
       - name: Runner labels
         # PMS-719: a job that compiles on the runner must request the dev label
         # (the only image with cc/gcc/ld + OpenSSL headers); base is for

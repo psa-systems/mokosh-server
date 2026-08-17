@@ -94,7 +94,12 @@ impl PortalAuthService {
         // the lockout actually cuts the attacker's guess rate (and survives a
         // process restart, unlike the in-memory limiter).
         if locked_until.is_some_and(|until| until > Utc::now()) {
-            return Err(AppError::RateLimited);
+            // No wait is disclosed here on purpose: unlike the MFA lockout the
+            // caller has not proved possession of the password, so the window
+            // would tell an enumerator which addresses are real accounts.
+            return Err(AppError::RateLimited {
+                retry_after_seconds: None,
+            });
         }
 
         if !is_portal_user {

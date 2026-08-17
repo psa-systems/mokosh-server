@@ -60,9 +60,13 @@ pub enum AppError {
     #[error("Your session has expired.")]
     TokenExpired,
 
-    /// Rate limit exceeded
+    /// Rate limit exceeded. `retry_after_seconds` carries the wait the
+    /// limiter (or lockout window) already computed, when there is one;
+    /// handlers on a rate-limited surface render it through
+    /// [`rate_limited_response`] so the client gets `Retry-After` rather than
+    /// the bare envelope (PMS-773).
     #[error("Rate limit exceeded. Please try again later.")]
-    RateLimited,
+    RateLimited { retry_after_seconds: Option<u64> },
 
     /// Database error
     #[error("Database error: {0}")]
@@ -193,7 +197,7 @@ impl AppError {
             Self::Gone(_) => 410,
             Self::AccountDeleted => 410,
             Self::TokenExpired => 401,
-            Self::RateLimited => 429,
+            Self::RateLimited { .. } => 429,
             Self::Database(_) => 500,
             Self::ExternalService { .. } => 502,
             Self::Internal(_) => 500,
@@ -219,7 +223,7 @@ impl AppError {
             Self::Gone(_) => "GONE",
             Self::AccountDeleted => "ACCOUNT_DELETED",
             Self::TokenExpired => "TOKEN_EXPIRED",
-            Self::RateLimited => "RATE_LIMITED",
+            Self::RateLimited { .. } => "RATE_LIMITED",
             Self::Database(_) => "DATABASE_ERROR",
             Self::ExternalService { .. } => "EXTERNAL_SERVICE_ERROR",
             Self::Internal(_) => "INTERNAL_ERROR",
@@ -267,14 +271,40 @@ impl From<AppError> for ErrorResponse {
 
 // Server-side conversions
 #[cfg(feature = "server")]
-pub use server_impl::normalize_error_envelope;
+pub use server_impl::{normalize_error_envelope, rate_limited_response};
 
 #[cfg(feature = "server")]
 mod server_impl {
     use super::*;
-    use axum::http::StatusCode;
+    use axum::http::{header, HeaderValue, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::Json;
+
+    /// Build the 429 every rate-limited handler returns: a `rate_limited`
+    /// JSON body plus a `Retry-After` header and a `no-store` cache
+    /// directive. `retry_after` is the wait in seconds the limiter (or
+    /// lockout window) computed.
+    ///
+    /// PMS-773: the single definition. It lives beside the envelope it emits
+    /// so route files import it instead of hand-rolling a fourth variant of
+    /// the same thirteen lines.
+    pub fn rate_limited_response(retry_after: u64, message: &str) -> Response {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate_limited",
+                "message": message,
+                "retry_after_seconds": retry_after,
+            })),
+        )
+            .into_response();
+        let h = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+            h.insert(header::RETRY_AFTER, v);
+        }
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        resp
+    }
 
     impl IntoResponse for AppError {
         fn into_response(self) -> Response {
@@ -609,7 +639,13 @@ mod tests {
         );
         assert_eq!(AppError::Conflict("test".to_string()).status_code(), 409);
         assert_eq!(AppError::BadRequest("test".to_string()).status_code(), 400);
-        assert_eq!(AppError::RateLimited.status_code(), 429);
+        assert_eq!(
+            AppError::RateLimited {
+                retry_after_seconds: None
+            }
+            .status_code(),
+            429
+        );
         assert_eq!(AppError::Payment("test".to_string()).status_code(), 402);
         assert_eq!(AppError::AccountDeleted.status_code(), 410);
         // PMS-769: RFC 6750 puts an expired bearer at 401, not 403.
@@ -627,7 +663,13 @@ mod tests {
             AppError::NotFound("test".to_string()).error_code(),
             "NOT_FOUND"
         );
-        assert_eq!(AppError::RateLimited.error_code(), "RATE_LIMITED");
+        assert_eq!(
+            AppError::RateLimited {
+                retry_after_seconds: Some(42)
+            }
+            .error_code(),
+            "RATE_LIMITED"
+        );
         assert_eq!(AppError::AccountDeleted.error_code(), "ACCOUNT_DELETED");
         // PMS-769: the stable machine-readable code the SPA branches on.
         assert_eq!(AppError::TokenExpired.error_code(), "TOKEN_EXPIRED");
@@ -656,6 +698,43 @@ mod tests {
                 "AppError must not attach a bearer challenge on its own"
             );
         }
+    }
+
+    /// PMS-773: the contract every rate-limited surface now shares. The body
+    /// shape is pinned field by field because four call sites already ship it
+    /// and a client parses `retry_after_seconds`.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn rate_limited_response_carries_the_wait() {
+        let response = rate_limited_response(37, "Too many requests, please try again shortly");
+        assert_eq!(response.status(), 429);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("37"),
+            "the computed wait reaches the client as a header"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "a refusal must never be cached"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read the 429 body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("429 body is JSON");
+        assert_eq!(body["error"], "rate_limited");
+        assert_eq!(
+            body["message"],
+            "Too many requests, please try again shortly"
+        );
+        assert_eq!(body["retry_after_seconds"], 37);
     }
 
     #[test]
