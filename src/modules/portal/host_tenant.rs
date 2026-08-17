@@ -62,6 +62,14 @@ impl PortalHostConfig {
         !self.suffix.is_empty()
     }
 
+    /// Configured suffix (with leading dot), or the empty string when
+    /// the feature is off. Exposed so services that need to build a
+    /// portal URL for a specific slug (e.g. the tenant admin welcome
+    /// email) can reuse the same value the router configured.
+    pub fn suffix(&self) -> &str {
+        &self.suffix
+    }
+
     /// Extract the candidate slug label from a Host header value. Returns
     /// `None` on any failure mode, so the caller only has to check for
     /// `Some`. Kept pure (no DB, no async) so unit tests cover every case

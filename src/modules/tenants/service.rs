@@ -103,6 +103,13 @@ pub struct TenantService {
     // production wire path opts in via `with_dispatcher`.
     notifications: Option<NotificationsService>,
     frontend_base_url: Option<String>,
+    /// Trailing portal host suffix (`.client.a8n.systems` in prod,
+    /// `.client.localhost:PORT` in dev). Threaded through so the
+    /// admin welcome email can compute + stamp the tenant's own
+    /// client-portal URL into the render context (templates
+    /// reference it as `{{client_portal_url}}` when they want to
+    /// tell the admin where to send their clients).
+    portal_host_suffix: Option<String>,
 }
 
 impl TenantService {
@@ -111,6 +118,7 @@ impl TenantService {
             db,
             notifications: None,
             frontend_base_url: None,
+            portal_host_suffix: None,
         }
     }
 
@@ -129,6 +137,17 @@ impl TenantService {
     ) -> Self {
         self.notifications = Some(notifications);
         self.frontend_base_url = Some(frontend_base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Attach the portal host suffix so the admin welcome context
+    /// carries a `client_portal_url` the template can reference.
+    /// Empty string / unset -> no URL in the context (matches the
+    /// legacy-deploy case).
+    #[must_use]
+    pub fn with_portal_host_suffix(mut self, suffix: impl Into<String>) -> Self {
+        let s = suffix.into().trim().to_ascii_lowercase();
+        self.portal_host_suffix = if s.is_empty() { None } else { Some(s) };
         self
     }
 
@@ -369,11 +388,30 @@ impl TenantService {
             ("", l) => l.to_string(),
             (f, l) => format!("{f} {l}"),
         };
+        // Client-portal URL a template can reference to tell the fresh
+        // admin where to send their own clients. Absent (`""`) on a
+        // legacy deploy that has no portal host suffix configured; a
+        // template that references `{{client_portal_url}}` will still
+        // render, just with the placeholder braces (harmless).
+        let client_portal_url = self
+            .portal_host_suffix
+            .as_deref()
+            .map(|suffix| {
+                let scheme = if suffix.contains("localhost") {
+                    "http"
+                } else {
+                    "https"
+                };
+                let slug = slugify(&request.slug);
+                format!("{scheme}://{slug}{suffix}")
+            })
+            .unwrap_or_default();
         let context = serde_json::json!({
             "recipient_user_id": admin_id.to_string(),
             "recipient_email": request.admin_email,
             "display_name": display_name,
             "setup_link": setup_link,
+            "client_portal_url": client_portal_url,
         });
         // SAFETY (PMS-261): `tenant_id` is freshly minted for the tenant just
         // created; `from_trusted` bridges it into the typed scope, and
