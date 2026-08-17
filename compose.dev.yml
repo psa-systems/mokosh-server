@@ -208,6 +208,14 @@ services:
       ENVIRONMENT: development
       BASE_URL: http://${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}
 
+      # Serialise rustc so the final mokosh_server lib compile does
+      # not race a codegen unit against another peaking process on a
+      # memory-constrained dev box (earlyoom SIGTERMs the whole
+      # container at ~1.5 GB free). Paired with the profile.dev
+      # tuning in Cargo.toml (debug=0, codegen-units=256): together
+      # they keep rustc peak RSS under the OOM ceiling.
+      CARGO_BUILD_JOBS: "1"
+
       # Reach the in-stack postgres by service-DNS name. PMS-285: the split
       # roles activate RLS at runtime. DATABASE_URL connects as the privileged
       # `mokosh_migrator` (BYPASSRLS) - it runs migrations + bootstrap + the

@@ -236,6 +236,20 @@ strip = true
 
 [profile.dev]
 opt-level = 0
+# Memory-constrained dev containers (e.g. 15 GiB box with earlyoom at
+# the ~1.5 GB free threshold) SIGTERM the final mokosh_server lib
+# compile with default `debug = 2`. The linked rmeta unit for a crate
+# this large (~50 deps, ~130 modules, printpdf tree) needs to fit its
+# whole IR + DWARF in RAM at once. Dropping to `debug = 0` and
+# splitting into more codegen units keeps rustc peak RSS well under
+# the OOM ceiling; the client-side `[profile.wasm-dev]` uses the same
+# posture (see mokosh-clients Cargo.toml). Debuggers still work on
+# release builds; dev is for iteration speed, not stepping through.
+debug = 0
+codegen-units = 256
+# Stack unwinding is off in release (`panic = "abort"`) but stays on
+# in dev so a panic in a test prints the row. `overflow-checks` and
+# `debug-assertions` stay ON so a dev-time bug is loud.
 
 [profile.dev.package."*"]
 opt-level = 3
