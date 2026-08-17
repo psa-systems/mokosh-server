@@ -7,10 +7,115 @@ use axum::{
 };
 use std::sync::Arc;
 
-use super::oidc_rs::Verifier as BunyipVerifier;
+use super::oidc_rs::{Verifier as BunyipVerifier, VerifyError};
 use super::service::{is_unresolved_placeholder_email, UNRESOLVED_EMAIL_DOMAIN};
 use super::{AuthService, AuthState, CurrentUser, UserRole};
 use crate::utils::error::AppError;
+
+/// PMS-769: what happened to the `Authorization: Bearer` credential on this
+/// request. Recorded on the request extensions by [`auth_middleware`] (and by
+/// the portal middleware) so the extractors can render the RFC 6750
+/// `WWW-Authenticate` challenge that matches the actual failure instead of a
+/// single opaque 401.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BearerOutcome {
+    /// No `Authorization: Bearer` header was presented.
+    #[default]
+    Absent,
+    /// A bearer was presented and accepted by one of the auth paths.
+    Accepted,
+    /// A bearer was presented and rejected because it had expired.
+    Expired,
+    /// A bearer was presented and rejected for any other reason (bad
+    /// signature, wrong audience, unknown kid, unusable principal, ...).
+    Rejected,
+}
+
+impl BearerOutcome {
+    /// Classify a bunyip verification failure. Only `Expired` is singled out;
+    /// every other variant is an ordinary `invalid_token` rejection as far as
+    /// RFC 6750 section 3.1 is concerned.
+    fn from_verify_error(error: &VerifyError) -> Self {
+        match error {
+            VerifyError::Expired => Self::Expired,
+            _ => Self::Rejected,
+        }
+    }
+
+    /// The `WWW-Authenticate` value a 401 for this outcome must carry
+    /// (RFC 6750 section 3).
+    fn challenge(self) -> &'static str {
+        match self {
+            Self::Expired => {
+                r#"Bearer error="invalid_token", error_description="The access token expired""#
+            }
+            Self::Rejected => r#"Bearer error="invalid_token""#,
+            // No credential was presented (or one was accepted and the 401
+            // came from somewhere else): the bare challenge just names the
+            // scheme the resource server expects.
+            Self::Absent | Self::Accepted => "Bearer",
+        }
+    }
+}
+
+/// PMS-769: extractor rejection for the credential gates. Renders exactly the
+/// same `AppError` envelope as before and adds the RFC 6750 challenge when the
+/// 401 actually concerns a bearer credential. Kept out of
+/// `impl IntoResponse for AppError` on purpose: the webhook HMAC gates and the
+/// portal password checks also return `AppError::Unauthorized` and must stay
+/// challenge-free.
+#[derive(Debug)]
+pub struct AuthRejection {
+    error: AppError,
+    challenge: Option<&'static str>,
+}
+
+impl AuthRejection {
+    /// A 401 raised by a credential gate: carries the challenge for `outcome`.
+    pub(crate) fn challenged(error: AppError, outcome: BearerOutcome) -> Self {
+        Self {
+            error,
+            challenge: Some(outcome.challenge()),
+        }
+    }
+}
+
+impl From<AppError> for AuthRejection {
+    /// Errors an extractor raises *after* the credential resolved (403
+    /// Forbidden, the 404 module gate, the 500 wiring bug) never concern a
+    /// bearer, so they render unchanged with no challenge. This also carries
+    /// the `?` conversions inside the extractor bodies.
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            challenge: None,
+        }
+    }
+}
+
+impl axum::response::IntoResponse for AuthRejection {
+    fn into_response(self) -> Response {
+        let mut response = self.error.into_response();
+        if let Some(challenge) = self.challenge {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(challenge),
+            );
+        }
+        response
+    }
+}
+
+/// Read the bearer outcome the middleware recorded. Defaults to `Absent`, so a
+/// route somehow mounted without the middleware still answers a bare `Bearer`
+/// challenge rather than claiming a credential was rejected.
+pub(crate) fn bearer_outcome(parts: &axum::http::request::Parts) -> BearerOutcome {
+    parts
+        .extensions
+        .get::<BearerOutcome>()
+        .copied()
+        .unwrap_or_default()
+}
 
 /// Extension to hold the current auth state
 #[derive(Clone)]
@@ -83,8 +188,13 @@ pub async fn auth_middleware(
     // instead of the generic 401. Distinguishes "your bunyip account was
     // deleted" from "your session expired / please refresh" at the SPA.
     let mut candidate_sub: Option<uuid::Uuid> = None;
+    // PMS-769: which bearer outcome the extractors should challenge on.
+    let mut outcome = BearerOutcome::Absent;
     let auth_state = match bearer(&request) {
         Some(token) => {
+            // A credential was presented; assume it is rejected until a path
+            // accepts it (settled after both branches have run).
+            outcome = BearerOutcome::Rejected;
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
             //    bunyip-api carry typ=at+jwt + iss=bunyip's OIDC_ISSUER.
             let from_bunyip = match auth_middleware.bunyip.as_ref() {
@@ -101,7 +211,25 @@ pub async fn auth_middleware(
                         )
                         .await
                     }
-                    Err(_) => None,
+                    // PMS-769: this error used to be dropped on the floor, so
+                    // an expired token, a wrong-audience token, a forged
+                    // signature and a JWKS outage were indistinguishable in
+                    // the log (they all ended as a bare 401). Control flow is
+                    // unchanged - `None` still falls through to the legacy
+                    // branch below - but the cause is now recorded. A routine
+                    // expiry stays at `debug` so a junk-token spray cannot
+                    // flood the warn stream; everything else is `warn`,
+                    // because a misconfiguration or a JWKS outage must be
+                    // loud.
+                    Err(e) => {
+                        outcome = BearerOutcome::from_verify_error(&e);
+                        if outcome == BearerOutcome::Expired {
+                            tracing::debug!(error = %e, "bunyip bearer rejected");
+                        } else {
+                            tracing::warn!(error = %e, "bunyip bearer rejected");
+                        }
+                        None
+                    }
                 },
                 None => None,
             };
@@ -139,10 +267,30 @@ pub async fn auth_middleware(
                             Ok(user) => {
                                 AuthState::authenticated(user.to_current_user(), claims.tid)
                             }
-                            Err(_) => AuthState::default(),
+                            // PMS-769: the cause (deactivated user, suspended
+                            // tenant, post-password-change `iat`) is logged
+                            // rather than discarded, so a support report of
+                            // "it just 401s" has server-side evidence. `debug`,
+                            // not `warn`: every one of these is an expected
+                            // revocation, and the 401 itself is the loud part.
+                            Err(e) => {
+                                tracing::debug!(error = %e, user = %claims.sub, "legacy bearer principal rejected");
+                                AuthState::default()
+                            }
                         }
                     }
-                    _ => AuthState::default(),
+                    // A decoded token with the wrong `typ` (e.g. a refresh
+                    // token used as a Bearer).
+                    Ok(claims) => {
+                        tracing::debug!(typ = %claims.typ, "legacy bearer is not an access token");
+                        AuthState::default()
+                    }
+                    // Suppressed deliberately: `decode_token`'s error is
+                    // already logged with its cause by
+                    // `From<jsonwebtoken::errors::Error> for AppError`, and
+                    // every bunyip at+jwt reaching this fallback trips it, so
+                    // re-logging here would only double the line.
+                    Err(_) => AuthState::default(),
                 }
             }
         }
@@ -170,7 +318,11 @@ pub async fn auth_middleware(
     };
 
     // Insert auth state into request extensions
+    if auth_state.is_authenticated {
+        outcome = BearerOutcome::Accepted;
+    }
     request.extensions_mut().insert(auth_state);
+    request.extensions_mut().insert(outcome);
 
     next.run(request).await
 }
@@ -189,11 +341,25 @@ fn bearer(req: &Request) -> Option<&str> {
 /// circuit BEFORE the generic 401 path, so the SPA sees 410 Gone
 /// (`ACCOUNT_DELETED`) and can render the terminal modal instead of
 /// falling into its 401-refresh-and-retry loop.
-fn user_or_auth_error(auth_state: &AuthState) -> Result<CurrentUser, AppError> {
+///
+/// PMS-769: when the request does end at a 401, `outcome` decides both the
+/// error code (`TOKEN_EXPIRED` for a presented-but-expired bearer, else
+/// `UNAUTHORIZED`) and the RFC 6750 challenge attached to the response.
+fn user_or_auth_error(
+    auth_state: &AuthState,
+    outcome: BearerOutcome,
+) -> Result<CurrentUser, AuthRejection> {
     if auth_state.deleted {
-        return Err(AppError::AccountDeleted);
+        // 410 Gone, and no challenge: the credential itself verified fine.
+        return Err(AppError::AccountDeleted.into());
     }
-    auth_state.user.clone().ok_or(AppError::Unauthorized)
+    match auth_state.user.clone() {
+        Some(user) => Ok(user),
+        None if outcome == BearerOutcome::Expired => {
+            Err(AuthRejection::challenged(AppError::TokenExpired, outcome))
+        }
+        None => Err(AuthRejection::challenged(AppError::Unauthorized, outcome)),
+    }
 }
 
 /// Extractor for requiring authentication
@@ -204,7 +370,7 @@ impl<S> axum::extract::FromRequestParts<S> for RequireAuth
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -216,7 +382,10 @@ where
             .cloned()
             .unwrap_or_default();
 
-        Ok(RequireAuth(user_or_auth_error(&auth_state)?))
+        Ok(RequireAuth(user_or_auth_error(
+            &auth_state,
+            bearer_outcome(parts),
+        )?))
     }
 }
 
@@ -252,7 +421,7 @@ impl<S> axum::extract::FromRequestParts<S> for TenantScope
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -264,7 +433,7 @@ where
             .cloned()
             .unwrap_or_default();
 
-        let user = user_or_auth_error(&auth_state)?;
+        let user = user_or_auth_error(&auth_state, bearer_outcome(parts))?;
         Ok(TenantScope {
             tenant_id: super::tenant::TenantScoped::tenant(&user),
             user,
@@ -286,7 +455,7 @@ where
     S: Send + Sync,
     R: RoleRequirement,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -298,12 +467,12 @@ where
             .cloned()
             .unwrap_or_default();
 
-        let user = user_or_auth_error(&auth_state)?;
+        let user = user_or_auth_error(&auth_state, bearer_outcome(parts))?;
         let user_role = user.role.as_str();
         if R::allowed_roles().contains(&user_role) {
             Ok(RequireRole(user, std::marker::PhantomData))
         } else {
-            Err(AppError::Forbidden("Insufficient permissions".to_string()))
+            Err(AppError::Forbidden("Insufficient permissions".to_string()).into())
         }
     }
 }
@@ -328,7 +497,7 @@ impl<S> axum::extract::FromRequestParts<S> for RequireAdminUser
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -414,7 +583,7 @@ impl<G: ModuleGate, S> axum::extract::FromRequestParts<S> for RequireModuleEnabl
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -429,7 +598,7 @@ where
             .get::<AuthState>()
             .cloned()
             .unwrap_or_default();
-        let user = user_or_auth_error(&auth_state)?;
+        let user = user_or_auth_error(&auth_state, bearer_outcome(parts))?;
 
         // Read the SettingsService from request extensions. Wired in
         // via `.layer(Extension(settings_service))` on the API v1
@@ -450,7 +619,7 @@ where
             .is_module_enabled(super::tenant::TenantScoped::tenant(&user), G::NAME)
             .await?;
         if !enabled {
-            return Err(AppError::NotFound(format!("module {}", G::NAME)));
+            return Err(AppError::NotFound(format!("module {}", G::NAME)).into());
         }
         Ok(Self {
             user,
@@ -955,10 +1124,31 @@ fn is_stuck_in_default(
 mod tests {
     use super::{
         default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default,
-        user_or_auth_error, AuthState, CurrentUser, UserRole,
+        user_or_auth_error, AuthRejection, AuthState, BearerOutcome, CurrentUser, UserRole,
+        VerifyError,
     };
     use crate::utils::error::AppError;
+    use axum::response::IntoResponse;
     use uuid::Uuid;
+
+    /// Render a rejection and return `(status, WWW-Authenticate, error code)`.
+    async fn rendered(rejection: AuthRejection) -> (u16, Option<String>, String) {
+        let response = rejection.into_response();
+        let status = response.status().as_u16();
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .map(|v| v.to_str().expect("ascii challenge").to_string());
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json envelope");
+        let code = envelope["error"]["code"]
+            .as_str()
+            .expect("error code")
+            .to_string();
+        (status, challenge, code)
+    }
 
     fn stub_user() -> CurrentUser {
         CurrentUser {
@@ -984,10 +1174,22 @@ mod tests {
         // short-circuit to `AccountDeleted` (410 Gone) instead of falling
         // through to the generic `Unauthorized` (401). Pins the ordering the
         // SPA relies on to distinguish "account gone" from "session expired".
+        // PMS-769: still true for an EXPIRED bearer, which now has its own
+        // error - the 410 keeps precedence over both TokenExpired and
+        // Unauthorized, and carries no bearer challenge.
         let deleted = AuthState::deleted();
-        match user_or_auth_error(&deleted) {
-            Err(AppError::AccountDeleted) => {}
-            other => panic!("expected AccountDeleted, got {other:?}"),
+        for outcome in [
+            BearerOutcome::Absent,
+            BearerOutcome::Expired,
+            BearerOutcome::Rejected,
+        ] {
+            match user_or_auth_error(&deleted, outcome) {
+                Err(AuthRejection {
+                    error: AppError::AccountDeleted,
+                    challenge: None,
+                }) => {}
+                other => panic!("expected unchallenged AccountDeleted, got {other:?}"),
+            }
         }
     }
 
@@ -996,8 +1198,11 @@ mod tests {
         // Default AuthState (no bearer, malformed token, verified-but-missing
         // sub) keeps the pre-348 behaviour: plain 401.
         let empty = AuthState::default();
-        match user_or_auth_error(&empty) {
-            Err(AppError::Unauthorized) => {}
+        match user_or_auth_error(&empty, BearerOutcome::Absent) {
+            Err(AuthRejection {
+                error: AppError::Unauthorized,
+                ..
+            }) => {}
             other => panic!("expected Unauthorized, got {other:?}"),
         }
     }
@@ -1008,8 +1213,138 @@ mod tests {
         // and no error path fires.
         let user = stub_user();
         let authed = AuthState::authenticated(user.clone(), Uuid::from_u128(2));
-        let got = user_or_auth_error(&authed).expect("authenticated");
+        let got = user_or_auth_error(&authed, BearerOutcome::Accepted).expect("authenticated");
         assert_eq!(got.id, user.id);
+    }
+
+    #[test]
+    fn only_expired_verification_maps_to_the_expired_outcome() {
+        // PMS-769: `VerifyError::Expired` is the one variant that earns
+        // `TOKEN_EXPIRED` + the `error_description` challenge; every other
+        // cause is a plain `invalid_token`.
+        assert_eq!(
+            BearerOutcome::from_verify_error(&VerifyError::Expired),
+            BearerOutcome::Expired
+        );
+        for error in [
+            VerifyError::Malformed("bad header".into()),
+            VerifyError::InvalidSignature,
+            VerifyError::UnknownKid,
+            VerifyError::InvalidIssuer,
+            VerifyError::InvalidAudience,
+            VerifyError::JwksFetch("boom".into()),
+            VerifyError::DiscoveryFetch("boom".into()),
+        ] {
+            assert_eq!(
+                BearerOutcome::from_verify_error(&error),
+                BearerOutcome::Rejected,
+                "unexpected outcome for {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_bearer_yields_token_expired_with_the_rfc6750_challenge() {
+        // PMS-769 incident case: the SPA presented a bunyip token 32 hours past
+        // `exp`. The response must name the cause instead of collapsing into
+        // the same 401 a credential-less request gets.
+        let rejection =
+            user_or_auth_error(&AuthState::default(), BearerOutcome::Expired).unwrap_err();
+        let (status, challenge, code) = rendered(rejection).await;
+        assert_eq!(status, 401);
+        assert_eq!(code, "TOKEN_EXPIRED");
+        assert_eq!(
+            challenge.as_deref(),
+            Some(r#"Bearer error="invalid_token", error_description="The access token expired""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_credential_yields_the_bare_bearer_challenge() {
+        // No `Authorization` header: RFC 6750 section 3 wants the bare scheme
+        // challenge, and no `error` parameter (nothing was rejected).
+        let rejection =
+            user_or_auth_error(&AuthState::default(), BearerOutcome::Absent).unwrap_err();
+        let (status, challenge, code) = rendered(rejection).await;
+        assert_eq!(status, 401);
+        assert_eq!(code, "UNAUTHORIZED");
+        assert_eq!(challenge.as_deref(), Some("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn rejected_bearer_yields_invalid_token_challenge() {
+        // A presented-but-invalid bearer (bad signature, wrong audience,
+        // unusable principal) is `invalid_token` without the expiry detail.
+        let rejection =
+            user_or_auth_error(&AuthState::default(), BearerOutcome::Rejected).unwrap_err();
+        let (status, challenge, code) = rendered(rejection).await;
+        assert_eq!(status, 401);
+        assert_eq!(code, "UNAUTHORIZED");
+        assert_eq!(
+            challenge.as_deref(),
+            Some(r#"Bearer error="invalid_token""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn require_auth_extractor_attaches_the_challenge_end_to_end() {
+        // The pieces above are wired through the real `RequireAuth` extractor
+        // and axum's response path, so the header survives `IntoResponse` and
+        // is not an artefact of the helper.
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        for (outcome, expected_challenge, expected_code) in [
+            (BearerOutcome::Absent, "Bearer", "UNAUTHORIZED"),
+            (
+                BearerOutcome::Rejected,
+                r#"Bearer error="invalid_token""#,
+                "UNAUTHORIZED",
+            ),
+            (
+                BearerOutcome::Expired,
+                r#"Bearer error="invalid_token", error_description="The access token expired""#,
+                "TOKEN_EXPIRED",
+            ),
+        ] {
+            let app = Router::new()
+                .route("/", get(|_: super::RequireAuth| async { "ok" }))
+                .layer(axum::middleware::from_fn(
+                    move |mut request: Request<Body>, next: axum::middleware::Next| async move {
+                        request.extensions_mut().insert(outcome);
+                        next.run(request).await
+                    },
+                ));
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401);
+            assert_eq!(
+                response.headers().get("www-authenticate").unwrap(),
+                expected_challenge
+            );
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(envelope["error"]["code"], expected_code);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_authentication_errors_carry_no_challenge() {
+        // A 403 from the role gate, the module gate's 404 and the wiring-bug
+        // 500 all reach the client through `AuthRejection` too, but none of
+        // them concerns a bearer credential, so none gets a challenge.
+        for error in [
+            AppError::Forbidden("Insufficient permissions".to_string()),
+            AppError::NotFound("module billing".to_string()),
+            AppError::Internal("SettingsService extension missing".to_string()),
+        ] {
+            let (_, challenge, _) = rendered(AuthRejection::from(error)).await;
+            assert_eq!(challenge, None);
+        }
     }
 
     #[test]
