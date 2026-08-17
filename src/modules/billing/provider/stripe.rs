@@ -70,7 +70,7 @@ impl PaymentProvider for StripeProvider {
         params: &CheckoutParams<'_>,
     ) -> AppResult<CheckoutSession> {
         let unit_amount = to_minor_units(params.amount).map_err(|_| {
-            AppError::BadRequest(format!("amount {} is out of range", params.amount))
+            AppError::BadRequest(format!("Amount {} is out of range", params.amount))
         })?;
         let currency = params.currency.to_ascii_lowercase();
         let tenant = params.tenant_id.to_string();
@@ -176,7 +176,7 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
     // dunite-stripe-core crate; mokosh maps `data.object` to its own
     // PaymentEvent below.
     let event = parse_event_envelope(raw_body)
-        .map_err(|_| AppError::BadRequest("malformed Stripe event body".to_string()))?;
+        .map_err(|_| AppError::BadRequest("Malformed Stripe event body".to_string()))?;
     let kind = event.kind.clone();
     let object = &event.raw["data"]["object"];
 

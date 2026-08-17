@@ -425,7 +425,7 @@ async fn read_multipart_file(mut multipart: Multipart) -> AppResult<(String, Str
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::BadRequest(format!("multipart parse: {e}")))?
+        .map_err(|e| AppError::BadRequest(format!("Multipart parse: {e}")))?
     {
         let field_name = field.name().map(str::to_string).unwrap_or_default();
         if field_name != "file" {
@@ -442,11 +442,11 @@ async fn read_multipart_file(mut multipart: Multipart) -> AppResult<(String, Str
         let bytes = field
             .bytes()
             .await
-            .map_err(|e| AppError::BadRequest(format!("multipart read: {e}")))?;
+            .map_err(|e| AppError::BadRequest(format!("Multipart read: {e}")))?;
         return Ok((file_name, mime_type, bytes.to_vec()));
     }
     Err(AppError::BadRequest(
-        "missing 'file' part in multipart body".into(),
+        "Missing 'file' part in multipart body".into(),
     ))
 }
 
@@ -655,7 +655,7 @@ async fn delete_portal(
     let (row, _) = s.service.get(contact.tenant_id, attachment_id).await?;
     if row.created_by_contact_id != Some(contact.id) {
         return Err(AppError::Forbidden(
-            "portal contacts can only delete their own uploads".into(),
+            "Portal contacts can only delete their own uploads".into(),
         ));
     }
     s.service

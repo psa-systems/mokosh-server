@@ -50,7 +50,7 @@ impl InvitationsService {
     ) -> AppResult<InvitationResponse> {
         if !INVITABLE_ROLES.contains(&request.role.as_str()) {
             return Err(AppError::BadRequest(format!(
-                "role must be one of {}",
+                "Role must be one of {}",
                 INVITABLE_ROLES.join(", ")
             )));
         }

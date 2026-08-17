@@ -280,7 +280,9 @@ impl PortalAuthService {
         for (token_id, tenant_id, token_hash, used_at, expires_at) in &candidates {
             if verify_password(secret, token_hash)? {
                 if used_at.is_some() {
-                    return Err(AppError::Gone("Setup token already used".to_string()));
+                    return Err(AppError::Gone(
+                        "This setup token has already been used".to_string(),
+                    ));
                 }
                 if *expires_at <= Utc::now() {
                     return Err(AppError::BadRequest(

@@ -15,8 +15,11 @@ pub enum AppError {
     #[error("Authentication required")]
     Unauthorized,
 
-    /// Authorization error - user doesn't have permission
-    #[error("Access denied: {0}")]
+    /// Authorization error - user doesn't have permission.
+    /// The call site writes the whole sentence: the variant adds no copy, so a
+    /// site passing "Access denied" cannot render "Access denied: Access
+    /// denied" (PMS-771).
+    #[error("{0}")]
     Forbidden(String),
 
     /// Resource not found
@@ -30,17 +33,21 @@ pub enum AppError {
         errors: Vec<FieldError>,
     },
 
-    /// Duplicate resource error
-    #[error("{0} already exists")]
+    /// State conflict, of which a duplicate is only one kind. The call site
+    /// writes the whole sentence (PMS-771): the old " already exists" suffix
+    /// doubled itself on the sites that said it and contradicted the majority
+    /// that report something else entirely.
+    #[error("{0}")]
     Conflict(String),
 
-    /// Bad request with message
-    #[error("Bad request: {0}")]
+    /// Bad request with message. `code` is the machine half of the envelope,
+    /// so the message carries no "Bad request:" protocol prefix (PMS-771).
+    #[error("{0}")]
     BadRequest(String),
 
     /// Resource is gone - the target existed but is no longer usable
     /// (e.g. a one-time token that was already redeemed). 410 Gone.
-    #[error("Gone: {0}")]
+    #[error("{0}")]
     Gone(String),
 
     /// The authenticated principal's user row is soft-deleted (Bunyip
@@ -396,7 +403,7 @@ mod server_impl {
                     // Check for unique constraint violations
                     if let Some(code) = db_err.code() {
                         if code == "23505" {
-                            return Self::Conflict("Record already exists".to_string());
+                            return Self::Conflict("That record already exists".to_string());
                         }
                     }
                     // Log the actual error but return a generic message
@@ -1009,17 +1016,17 @@ mod tests {
         }
     }
 
-    /// Pull the string-literal argument of every `AppError::NotFound`
+    /// Pull the string-literal argument of every `AppError::<variant>`
     /// construction out of `source`, with its 1-based line number. Call sites
     /// passing a variable are skipped: only a literal is checkable statically.
-    fn not_found_literals(source: &str) -> Vec<(usize, String)> {
-        // Split so this scanner does not match its own marker literal.
-        const MARKER: &str = concat!("NotFound", "(");
+    fn variant_literals(source: &str, variant: &str) -> Vec<(usize, String)> {
+        let marker = format!("{variant}(");
+        let marker = marker.as_str();
         let bytes = source.as_bytes();
         let mut found = Vec::new();
         let mut search = 0usize;
-        while let Some(offset) = source[search..].find(MARKER) {
-            let mut i = search + offset + MARKER.len();
+        while let Some(offset) = source[search..].find(marker) {
+            let mut i = search + offset + marker.len();
             search = i;
             let skip_space = |i: &mut usize| {
                 while bytes.get(*i).is_some_and(|c| c.is_ascii_whitespace()) {
@@ -1088,7 +1095,7 @@ mod tests {
         let mut debug_quoted = Vec::new();
         for file in files {
             let source = std::fs::read_to_string(&file).expect("read source file");
-            for (line, literal) in not_found_literals(&source) {
+            for (line, literal) in variant_literals(&source, "NotFound") {
                 let site = format!("{}:{line}: {literal:?}", file.display());
                 if is_identifier_shaped(&literal) {
                     offenders.push(site.clone());
@@ -1112,6 +1119,163 @@ mod tests {
         );
     }
 
+    /// Cut a file at its top-level `#[cfg(test)]` module so a scanner sees
+    /// only shipping call sites. Every `#[cfg(test)]` in `src/` is at column 0
+    /// and no file has two, so the first one is the boundary.
+    fn without_test_module(source: &str) -> &str {
+        match source.find("\n#[cfg(test)]") {
+            Some(offset) => &source[..offset],
+            None => source,
+        }
+    }
+
+    /// PMS-771: the four variants whose Display template used to prepend or
+    /// append copy of its own. They now render the call site's string verbatim,
+    /// so the message can neither double itself ("... already exists already
+    /// exists") nor contradict it, and no message carries a protocol prefix
+    /// that `error.code` already states.
+    const VERBATIM_VARIANTS: [&str; 4] = ["Conflict", "Forbidden", "BadRequest", "Gone"];
+
+    #[test]
+    fn verbatim_variants_add_no_copy_of_their_own() {
+        let sentence = "A company with this name already exists";
+        assert_eq!(
+            AppError::Conflict(sentence.to_string()).to_string(),
+            sentence
+        );
+        assert_eq!(
+            AppError::Forbidden("Access denied".to_string()).to_string(),
+            "Access denied"
+        );
+        assert_eq!(
+            AppError::BadRequest("Invalid or expired request link".to_string()).to_string(),
+            "Invalid or expired request link"
+        );
+        assert_eq!(
+            AppError::Gone("This request link has already been used.".to_string()).to_string(),
+            "This request link has already been used."
+        );
+
+        // The codes are the machine half and are untouched by all of this.
+        assert_eq!(AppError::Conflict(String::new()).error_code(), "CONFLICT");
+        assert_eq!(AppError::Forbidden(String::new()).error_code(), "FORBIDDEN");
+        assert_eq!(
+            AppError::BadRequest(String::new()).error_code(),
+            "BAD_REQUEST"
+        );
+        assert_eq!(AppError::Gone(String::new()).error_code(), "GONE");
+    }
+
+    /// PMS-771: the rendered envelope must never repeat itself. Driven off the
+    /// real call-site strings of the sites the old templates completed.
+    #[test]
+    fn rendered_messages_never_double_a_phrase() {
+        for error in [
+            AppError::Conflict("A company with this name already exists".to_string()),
+            AppError::Conflict("That record already exists".to_string()),
+            AppError::Conflict("Invoice in status 'paid' cannot be edited".to_string()),
+            AppError::Forbidden("Access denied".to_string()),
+            AppError::Forbidden("You do not have permission to do that".to_string()),
+        ] {
+            let message = ErrorResponse::from(error).error.message;
+            assert!(
+                !message.contains("already exists already exists"),
+                "doubled message: {message:?}"
+            );
+            assert!(
+                !message.contains("Access denied: Access denied"),
+                "doubled message: {message:?}"
+            );
+            assert!(
+                !message.starts_with("Bad request:") && !message.starts_with("Gone:"),
+                "message carries a protocol prefix `code` already states: {message:?}"
+            );
+        }
+    }
+
+    /// A message may open in lower case only when its first word is the field
+    /// or parameter it is about (`end_time must be after start_time`,
+    /// `columns[0].field is required`, `{slug} is not a form`). Any other
+    /// lower-case opener is an English fragment written to sit after the
+    /// removed "Bad request: " / "Access denied: " colon.
+    fn opens_with_a_fragment(literal: &str) -> bool {
+        let first = literal
+            .split([' ', ':'])
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(',');
+        let identifier_shaped = first.contains('_')
+            || first.contains('{')
+            || first.contains('[')
+            || first.contains('.');
+        first.starts_with(|c: char| c.is_ascii_lowercase()) && !identifier_shaped
+    }
+
+    #[test]
+    fn fragment_detector_spares_field_named_openers() {
+        for fragment in [
+            "the uploaded file is empty",
+            "multipart parse: {e}",
+            "unknown company {company_id}",
+            "config serialise: {e}",
+        ] {
+            assert!(opens_with_a_fragment(fragment), "{fragment:?}");
+        }
+        for sentence in [
+            "end_time must be after start_time",
+            "columns[{idx}].field is required",
+            "saved_reports.columns must be a JSON array",
+            "{slug} is not a known form",
+            "A company with this name already exists",
+        ] {
+            assert!(!opens_with_a_fragment(sentence), "{sentence:?}");
+        }
+    }
+
+    /// PMS-771: the enforcement. Every literal handed to one of the four
+    /// verbatim variants anywhere in the crate must read as a complete sentence
+    /// on its own, because nothing completes it any more. An English fragment
+    /// opener or a protocol prefix is copy written to sit inside a template
+    /// that no longer exists.
+    #[test]
+    fn verbatim_variant_arguments_are_whole_sentences() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(
+            !files.is_empty(),
+            "no sources found under {}",
+            src.display()
+        );
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source file");
+            for variant in VERBATIM_VARIANTS {
+                for (line, literal) in variant_literals(without_test_module(&source), variant) {
+                    let site = format!("{}:{line}: {variant}({literal:?})", file.display());
+                    if opens_with_a_fragment(&literal) {
+                        offenders.push(format!("{site} -- opens with a sentence fragment"));
+                    }
+                    for prefix in ["Access denied", "Bad request:", "Gone:"] {
+                        if literal.starts_with(prefix) {
+                            offenders.push(format!("{site} -- repeats the old {prefix:?} prefix"));
+                        }
+                    }
+                    if literal.ends_with(" already exists") && variant != "Conflict" {
+                        offenders.push(format!("{site} -- duplicate copy on a non-409"));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these variants render the call-site string verbatim (PMS-771), so each \
+             string must be a complete sentence and must not restate the code:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn test_not_found_error() {
         let error = AppError::not_found("User");
@@ -1126,11 +1290,9 @@ mod tests {
         let error = AppError::NotFound("Ticket".to_string());
         assert_eq!(error.to_string(), "Ticket not found");
 
+        // PMS-771: the variant adds no copy; the call site's sentence is it.
         let forbidden = AppError::Forbidden("You cannot access this resource".to_string());
-        assert_eq!(
-            forbidden.to_string(),
-            "Access denied: You cannot access this resource"
-        );
+        assert_eq!(forbidden.to_string(), "You cannot access this resource");
     }
 
     #[test]

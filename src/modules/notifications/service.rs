@@ -95,7 +95,7 @@ impl NotificationsService {
         ctx: &AuditCtx,
     ) -> AppResult<NotificationChannelResponse> {
         let plain = serde_json::to_string(&request.config)
-            .map_err(|e| AppError::BadRequest(format!("config serialise: {e}")))?;
+            .map_err(|e| AppError::BadRequest(format!("Config serialise: {e}")))?;
         let encrypted = crate::utils::crypto::encrypt(&plain, &self.encryption_key)?;
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -155,7 +155,7 @@ impl NotificationsService {
         ctx: &AuditCtx,
     ) -> AppResult<NotificationChannelResponse> {
         let plain = serde_json::to_string(&request.config)
-            .map_err(|e| AppError::BadRequest(format!("config serialise: {e}")))?;
+            .map_err(|e| AppError::BadRequest(format!("Config serialise: {e}")))?;
         let encrypted = crate::utils::crypto::encrypt(&plain, &self.encryption_key)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> = sqlx::query_scalar(

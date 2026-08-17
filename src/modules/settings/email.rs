@@ -187,7 +187,7 @@ pub async fn put_email_settings(
     }
     if let Some(from) = input.from.as_deref().filter(|s| !s.is_empty()) {
         from.parse::<lettre::message::Mailbox>().map_err(|e| {
-            AppError::BadRequest(format!("from {from:?} is not a valid address: {e}"))
+            AppError::BadRequest(format!("From {from:?} is not a valid address: {e}"))
         })?;
     }
 

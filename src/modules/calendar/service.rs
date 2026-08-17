@@ -842,7 +842,7 @@ impl CalendarService {
     ) -> AppResult<TimeOffResponse> {
         if !matches!(status, "approved" | "rejected") {
             return Err(AppError::BadRequest(format!(
-                "status must be approved | rejected; got {status:?}"
+                "Status must be approved | rejected; got {status:?}"
             )));
         }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;

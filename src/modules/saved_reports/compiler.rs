@@ -496,7 +496,7 @@ fn compile_filter(
     if let Some(arr) = value.as_array() {
         if arr.is_empty() {
             return Err(AppError::BadRequest(format!(
-                "filter '{field}' is an empty array; remove the key or supply at least one value"
+                "Filter '{field}' is an empty array; remove the key or supply at least one value"
             )));
         }
         // IN. One bind for the whole array. Postgres `= ANY($N)`
@@ -530,7 +530,7 @@ fn coerce_bind_scalar(field: &str, ty: ColumnType, value: &Value) -> AppResult<B
         (ColumnType::Uuid, Value::String(s)) => {
             Uuid::parse_str(s).map(BindValue::Uuid).map_err(|e| {
                 AppError::BadRequest(format!(
-                    "filter '{field}' expects a UUID; '{s}' is not one ({e})"
+                    "Filter '{field}' expects a UUID; '{s}' is not one ({e})"
                 ))
             })
         }
@@ -538,11 +538,11 @@ fn coerce_bind_scalar(field: &str, ty: ColumnType, value: &Value) -> AppResult<B
         (ColumnType::Int, Value::Number(n)) => n
             .as_i64()
             .map(BindValue::Int)
-            .ok_or_else(|| AppError::BadRequest(format!("filter '{field}' must fit in i64"))),
+            .ok_or_else(|| AppError::BadRequest(format!("Filter '{field}' must fit in i64"))),
         (ColumnType::Bool, Value::Bool(b)) => Ok(BindValue::Bool(*b)),
         (ColumnType::Timestamp, Value::String(s)) => Ok(BindValue::Text(s.clone())),
         _ => Err(AppError::BadRequest(format!(
-            "filter '{field}' has an unexpected value type for its column"
+            "Filter '{field}' has an unexpected value type for its column"
         ))),
     }
 }
@@ -553,10 +553,10 @@ fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<Bi
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
                 let s = v.as_str().ok_or_else(|| {
-                    AppError::BadRequest(format!("filter '{field}' UUID values must be strings"))
+                    AppError::BadRequest(format!("Filter '{field}' UUID values must be strings"))
                 })?;
                 out.push(Uuid::parse_str(s).map_err(|e| {
-                    AppError::BadRequest(format!("filter '{field}': '{s}' is not a UUID ({e})"))
+                    AppError::BadRequest(format!("Filter '{field}': '{s}' is not a UUID ({e})"))
                 })?);
             }
             Ok(BindValue::UuidList(out))
@@ -565,14 +565,14 @@ fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<Bi
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
                 let s = v.as_str().ok_or_else(|| {
-                    AppError::BadRequest(format!("filter '{field}' values must be strings"))
+                    AppError::BadRequest(format!("Filter '{field}' values must be strings"))
                 })?;
                 out.push(s.to_string());
             }
             Ok(BindValue::TextList(out))
         }
         ColumnType::Int | ColumnType::Bool => Err(AppError::BadRequest(format!(
-            "filter '{field}' does not support array values for its column type"
+            "Filter '{field}' does not support array values for its column type"
         ))),
     }
 }

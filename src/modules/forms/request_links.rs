@@ -80,8 +80,7 @@ impl FormsService {
         let definition = self.get(tenant_id, req.form_definition_id).await?;
         if !definition.is_active {
             return Err(AppError::Conflict(
-                "This form has been retired and cannot be sent to a client. An active form"
-                    .to_string(),
+                "This form has been retired and cannot be sent to a client.".to_string(),
             ));
         }
 
@@ -415,8 +414,7 @@ impl FormsService {
         let definition = self.get(tenant_id, resolved.form_definition_id).await?;
         if !definition.is_active {
             return Err(AppError::Conflict(
-                "This form has been retired and is no longer accepting submissions. An active form"
-                    .to_string(),
+                "This form has been retired and is no longer accepting submissions.".to_string(),
             ));
         }
 

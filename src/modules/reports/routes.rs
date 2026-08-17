@@ -263,7 +263,7 @@ async fn export_report(
 ) -> AppResult<Response> {
     if !q.format.eq_ignore_ascii_case("csv") {
         return Err(AppError::BadRequest(format!(
-            "format {:?} not yet supported; only 'csv' is implemented",
+            "Format {:?} not yet supported; only 'csv' is implemented",
             q.format
         )));
     }
@@ -286,7 +286,9 @@ async fn export_report(
             // rather than letting any reports-enabled role read it (PMS-350:
             // closing the export side-door around the financial report gate).
             if !u.role.can_manage_billing() {
-                return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+                return Err(AppError::Forbidden(
+                    "You do not have permission to do that".to_string(),
+                ));
             }
             csv_for_billing(&s.service.billing(u.tenant(), q.company_id).await?)
         }
@@ -297,7 +299,9 @@ async fn export_report(
             // so it enforces the same finance gate as the billing export above
             // rather than leaving a CSV side-door open (PMS-350).
             if !u.role.can_manage_billing() {
-                return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+                return Err(AppError::Forbidden(
+                    "You do not have permission to do that".to_string(),
+                ));
             }
             csv_for_clients(&s.service.clients(u.tenant()).await?)
         }
