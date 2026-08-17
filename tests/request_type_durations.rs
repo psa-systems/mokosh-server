@@ -379,3 +379,102 @@ async fn the_article_surfaces_the_measured_duration_and_excludes_ad_hoc_tickets(
         .expect("send measured-duration for a missing article");
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+/// PMS-772: the report is discoverable in the registry and exportable through
+/// the shared exporter, and the registry names the one key that is not.
+#[sqlx::test]
+async fn the_report_is_registered_and_exports_csv(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let (form, _) = seed_form(&app, &token, &pool, admin_id, "New starter", "new-starter").await;
+    let ticket = request_ticket(&app, &token, &pool, &form, company_id, "Dana").await;
+    track_time(&pool, admin_id, company_id, ticket, day(2026, 3, 10), 90).await;
+    // A request type with no tracked time, so the export has to carry the
+    // no-data case too.
+    seed_form(&app, &token, &pool, admin_id, "Departure", "departure").await;
+
+    let registry: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/reports"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list reports")
+        .json()
+        .await
+        .expect("registry JSON");
+    let entries = registry.as_array().expect("registry is an array");
+    let descriptor = entries
+        .iter()
+        .find(|r| r["key"] == "request-types")
+        .unwrap_or_else(|| panic!("registry lists request-types, got {registry}"));
+    let params: Vec<&str> = descriptor["parameters"]
+        .as_array()
+        .expect("parameters[]")
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert_eq!(
+        params,
+        vec!["from", "to"],
+        "the date parameters are advertised"
+    );
+
+    // Every key the registry advertises exports, except the ones whose
+    // descriptions say they do not and why.
+    let custom = entries
+        .iter()
+        .find(|r| r["key"] == "custom")
+        .expect("custom");
+    let reason = custom["description"].as_str().expect("description");
+    assert!(
+        reason.contains("cannot") && reason.contains("POST body"),
+        "the registry states why custom cannot be exported, got {reason}"
+    );
+
+    let resp =
+        app.client
+            .get(app.url(
+                "/api/v1/reports/request-types/export?format=csv&from=2026-03-01&to=2026-03-31",
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("send request-types export");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "export is not a 404"
+    );
+    let csv = resp.text().await.expect("csv body");
+
+    let header = csv
+        .lines()
+        .find(|l| l.starts_with("request_type,"))
+        .unwrap_or_else(|| panic!("no data header in {csv}"));
+    let columns: Vec<&str> = header.split(',').collect();
+    assert!(
+        columns.contains(&"count"),
+        "the grouped-count column is named count, got {header}"
+    );
+    assert!(
+        !columns.contains(&"ticket_count"),
+        "no fourth spelling of count, got {header}"
+    );
+
+    assert!(
+        csv.contains("New starter,new-starter,How to: New starter,1,90,90.0"),
+        "the measured row is exported, got {csv}"
+    );
+    assert!(
+        csv.contains("Departure,departure,How to: Departure,,,\n"),
+        "no data stays empty rather than becoming a zero measurement, got {csv}"
+    );
+    assert!(
+        csv.contains("from,to\n2026-03-01,2026-03-31"),
+        "the period is stated, got {csv}"
+    );
+}

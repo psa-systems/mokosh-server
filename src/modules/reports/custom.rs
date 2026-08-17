@@ -527,7 +527,7 @@ pub fn to_csv(r: &CustomReportResponse) -> String {
 }
 
 /// Quote a CSV cell if it contains a comma, quote, or newline.
-fn csv_cell(v: &str) -> String {
+pub(super) fn csv_cell(v: &str) -> String {
     if v.contains([',', '"', '\n']) {
         format!("\"{}\"", v.replace('"', "\"\""))
     } else {
