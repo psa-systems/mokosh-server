@@ -92,7 +92,7 @@ repo is on the hook for.
 | 12 | Reports | 501 | aggregate over many | n/a | `reports` module | P2 |
 | 13 | Settings (6 sub-pages) | 501; module-config helpers exist on `tenant_service` but unrouted | `tenant_settings`, `module_config`, `rmm_*`, `notification_*` | n/a | F5 (expose module config) | P2 |
 | 14 | Admin (`/admin/tenants`) | real `/api/v1/tenants/*` (7 endpoints) | `tenants`, `tenant_settings`, `module_config` | yes | nothing | P2 |
-| 15 | Portal (7 routes) | all `/api/v1/portal/*` 501; client has a critical GET-leak bug to fix in parallel | `contacts` (portal identity), tickets / invoices / kb tables | n/a | **F6** (portal contact-scoped session) | **P0** |
+| 15 | Portal (host-derived per tenant) | fully shipped end-to-end: login (MFA + recovery + Turnstile), tickets (list/create/reopen/attach/notes), invoices (list/detail/pay/PDF), quotes, KB reader, forms w/ file uploads, settings (MFA + sessions + notif prefs), export, delegations. See `src/modules/portal/`. | `contacts`, `portal_setup_tokens`, `portal_refresh_tokens`, `portal_delegations`, `contact_notification_preferences`, tickets/invoices/quotes/kb tables | n/a | done - see `docs/mokosh-client-login/remaining.md` for the polish list | done |
 | 16 | RMM (lives in `/settings/integrations`) | 501 | `rmm_connections`, `rmm_device_mappings`, `rmm_alert_rules` | n/a | `rmm` module | P3 |
 | 17 | Notifications (bell + `/settings/notifications`) | 501 | `notification_channels`, `notification_templates`, `user_notification_preferences`, `notifications`, `notification_rules` | n/a | `notifications` module | P2 |
 
@@ -133,8 +133,8 @@ To unblock the client without doing wasted work:
    (`list_users`)**. These are tiny patches and they make the
    already-real endpoints actually return what the client needs.
 2. **F2 (login rate limit)**. Cheap, P0.
-3. **F6 (portal contact-scoped session + minimal portal endpoints)**.
-   Unblocks the customer-facing surface.
+3. ~~**F6 (portal contact-scoped session + minimal portal endpoints)**.~~
+   Done - the portal is fully shipped. Section 15 above.
 4. **F7 (`billing` module read-only)**. The client has a heavy
    invoices UI with no backend.
 5. **F8 (`time_tracking` module)**. Same reason; user-produced data.

@@ -97,7 +97,12 @@ pub struct CurrentContactMe {
 /// still fill this field continue to authenticate.
 #[derive(Debug, Clone, Deserialize, Validate, Default)]
 pub struct PortalLoginRequest {
-    /// Deprecated for new clients; kept for the legacy `?tenant=` path.
+    /// Wire-shape back-compat vestige: no shipped SPA fills this. Every
+    /// portal deploy is host-derived; the SPA always sends an empty
+    /// slug + `skip_serializing_if` drops the field. Kept so a hand-
+    /// crafted client posting a body slug on a non-portal host still
+    /// authenticates (the `portal_host_resolution.rs` integration
+    /// tests cover the shim).
     /// Missing OR present-and-matching-host both authenticate; a body
     /// slug that disagrees with the host slug fails closed with the
     /// wrong-password envelope (PMS-729 AC).
@@ -188,10 +193,11 @@ pub struct PortalRefreshResponse {
     pub refresh_expires_at: DateTime<Utc>,
 }
 
-/// PMS-729 phase 2 H3: `POST /api/v1/portal/auth/forgot-password`
-/// request body. `email` is the only credential-adjacent field; the
-/// tenant is resolved from the request Host (PMS-729) or from an
-/// optional `tenant_slug` fallback for the legacy body-slug path.
+/// `POST /api/v1/portal/auth/forgot-password` request body. `email` is
+/// the only credential-adjacent field; the tenant is resolved from
+/// the request Host on every deploy. `tenant_slug` is a wire-shape
+/// back-compat vestige (see `PortalLoginRequest` for the full story);
+/// the SPA always sends it empty.
 ///
 /// The endpoint always returns 204 regardless of whether the email
 /// matched any known contact: the response shape MUST NOT leak whether

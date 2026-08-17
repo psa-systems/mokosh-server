@@ -182,7 +182,7 @@ pub struct SlugResolveError;
 /// |-------------|-----------|---------|
 /// | Some(t)     | Some(s)   | Ok if `t.slug == s.trim().to_lowercase()`, else Err |
 /// | Some(t)     | None      | Ok, use `t.slug` |
-/// | None        | Some(s)   | Ok, use `s.trim().to_lowercase()` (legacy path) |
+/// | None        | Some(s)   | Ok, use `s.trim().to_lowercase()` (compat shim; no shipped SPA hits this arm) |
 /// | None        | None      | Err (fail-closed) |
 pub fn resolve_slug(
     host_tenant: Option<&ResolvedTenant>,
