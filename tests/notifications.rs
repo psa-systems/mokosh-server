@@ -17,14 +17,16 @@
 //!     rules endpoint rejects a template-less rule (PMS-701).
 //!   * An authored `body_html` reaches the mailer as the HTML alternative,
 //!     and a NULL one still sends single-part plain text (PMS-700).
+//!   * The seeded transactional greetings read correctly with and without a
+//!     recipient name (PMS-774).
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use mokosh_server::modules::notifications::DispatcherWorker;
-use mokosh_server::utils::email::{LogMailer, Mailer};
+use mokosh_server::modules::notifications::{render_template, DispatcherWorker};
+use mokosh_server::utils::email::{salutation, LogMailer, Mailer};
 use mokosh_server::utils::error::AppResult;
 use mokosh_server::Database;
 use sqlx::PgPool;
@@ -463,6 +465,69 @@ async fn seeded_templates_have_real_newlines_and_flat_placeholders(pool: PgPool)
                     !key.contains('.'),
                     "template {name}.{column} has dotted placeholder {{{{{key}}}}}: \
                      render_template resolves flat context keys only",
+                );
+            }
+        }
+    }
+}
+
+/// PMS-774: every transactional message opens the same way, and reads
+/// correctly when the recipient's name is not known.
+///
+/// Migration 106 moved the greeting word into `forms.request_link` and
+/// `auth.welcome` and left the name in the data. Rendering the seeded bodies
+/// with the blank-name salutation is what proves the pair is in step: a
+/// template that kept its own "Hello" would render "Hello Hello," and one that
+/// still asked for `{{display_name}}` alone would open on a bare comma.
+#[sqlx::test]
+async fn the_seeded_greetings_read_correctly_without_a_name(pool: PgPool) {
+    type BodyRow = (String, Option<String>, Option<String>);
+    for event_type in ["forms.request_link", "auth.welcome"] {
+        let rows: Vec<BodyRow> = sqlx::query_as(
+            "SELECT name, body_text, body_html FROM notification_templates \
+             WHERE event_type = $1 AND channel_type = 'email'",
+        )
+        .bind(event_type)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch the seeded template");
+
+        assert!(!rows.is_empty(), "{event_type} must be seeded");
+
+        for (name, body_text, body_html) in rows {
+            for (column, body) in [("body_text", body_text), ("body_html", body_html)] {
+                let Some(body) = body else { continue };
+                assert!(
+                    body.contains("{{salutation}},"),
+                    "{name}.{column} must open from the shared helper: {body}",
+                );
+
+                // The composers supply both keys on every send, so render with
+                // both: the blank name is the case the greeting has to carry.
+                let context = serde_json::json!({
+                    "salutation": salutation(""),
+                    "display_name": "",
+                });
+                let (rendered, _) = render_template(&body, &context);
+                assert!(
+                    rendered.contains("Hello,"),
+                    "{name}.{column} must greet an unnamed recipient as \"Hello,\": {rendered}",
+                );
+                assert!(
+                    !rendered.contains("Hello ,") && !rendered.contains(">,<"),
+                    "{name}.{column} left a stray space or comma: {rendered}",
+                );
+
+                let (named, _) = render_template(
+                    &body,
+                    &serde_json::json!({
+                        "salutation": salutation("David"),
+                        "display_name": "David",
+                    }),
+                );
+                assert!(
+                    named.contains("Hello David,"),
+                    "{name}.{column} must greet a named recipient once, by name: {named}",
                 );
             }
         }

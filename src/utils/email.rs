@@ -340,6 +340,24 @@ impl SmtpMailer {
     }
 }
 
+/// PMS-774: the greeting every transactional message opens with.
+///
+/// The greeting WORD lives here and in the templates; only the name travels as
+/// data. Both name columns this is fed from are `NOT NULL` but may hold empty
+/// strings, so the blank case is real rather than theoretical, and a template
+/// that appended a comma to a bare name opened on a stray comma.
+///
+/// Returns `Hello {name}` for a non-blank trimmed name and `Hello` otherwise;
+/// the template supplies the punctuation that follows.
+pub fn salutation(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        "Hello".to_string()
+    } else {
+        format!("Hello {name}")
+    }
+}
+
 /// Generate a fresh, globally-unique `Message-ID` header value of the form
 /// `<uuid@from-domain>`. lettre only emits a `Message-ID` when one is set
 /// explicitly (its `hostname` feature is disabled here, so the `None` path
@@ -540,6 +558,64 @@ mod tests {
 
     fn test_from() -> Mailbox {
         "Mokosh <noreply@mokosh.example>".parse().unwrap()
+    }
+
+    /// PMS-774: the templates append the punctuation, so the helper must never
+    /// return a trailing space or comma of its own, and a blank name must not
+    /// leave one behind either.
+    #[test]
+    fn salutation_covers_the_blank_and_named_cases() {
+        assert_eq!(salutation("David"), "Hello David");
+        assert_eq!(salutation("  David  "), "Hello David");
+        assert_eq!(salutation(""), "Hello");
+        assert_eq!(salutation("   "), "Hello");
+        assert_eq!(salutation("\t\n"), "Hello");
+
+        // The comma the templates add lands directly after the greeting in
+        // both cases, which is the whole point of returning it unpunctuated.
+        assert_eq!(format!("{},", salutation("")), "Hello,");
+        assert_eq!(format!("{},", salutation("David")), "Hello David,");
+    }
+
+    /// PMS-774: the greeting word belongs to the template, never to the data.
+    ///
+    /// `forms.request_link` used to pass the WORD "Hello" as the recipient's
+    /// NAME when there was no contact, so the same placeholder rendered a
+    /// greeting for one recipient and a bare name for another. Fail if any
+    /// dispatch site puts a greeting back into its context; the templates all
+    /// take `{{salutation}}` now, so a name that is also a greeting renders
+    /// twice.
+    #[test]
+    fn no_dispatch_context_supplies_a_greeting_word() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dispatchers = [
+            "src/modules/forms/request_links.rs",
+            "src/modules/auth/service.rs",
+            "src/modules/contacts/service.rs",
+        ];
+        // Split so the needles never match this guard's own source file.
+        let needles = [
+            concat!("\"Hel", "lo"),
+            concat!("\"H", "i "),
+            concat!("\"De", "ar "),
+        ];
+
+        let mut hits: Vec<String> = Vec::new();
+        for file in dispatchers {
+            let path = root.join(file);
+            let text = std::fs::read_to_string(&path).expect("read dispatch source");
+            for needle in needles {
+                if text.contains(needle) {
+                    hits.push(format!("{file}: {needle}"));
+                }
+            }
+        }
+
+        assert!(
+            hits.is_empty(),
+            "a greeting word is back in a dispatch context; the template owns the \
+             greeting and `salutation` composes it: {hits:?}",
+        );
     }
 
     #[test]
