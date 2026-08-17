@@ -191,7 +191,14 @@ dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc
 # ip2location), so it is pinned to the dunite rev that introduced it independently
 # of dunite-stripe-core above.
 dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c276ab187852578daad1c4b9c823579b194a" }
-printpdf = "0.7"
+# Server-side invoice PDF renderer (added in the portal PDF batch).
+# `default-features = false` drops the `js-sys` default: printpdf's
+# default pulls wasm-bindgen for browser callers, and every transitive
+# proc-macro crate that comes with it (wasm-bindgen-macro-support,
+# wasm-bindgen-shared, etc.). None of that is needed on the native
+# axum build; disabling it shrinks the rustc peak RSS enough to keep
+# the dev-container build under earlyoom's SIGTERM threshold.
+printpdf = { version = "0.7", default-features = false }
 
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
