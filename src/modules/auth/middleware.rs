@@ -8,7 +8,7 @@ use axum::{
 use std::sync::Arc;
 
 use super::oidc_rs::{Verifier as BunyipVerifier, VerifyError};
-use super::service::{is_unresolved_placeholder_email, UNRESOLVED_EMAIL_DOMAIN};
+use super::service::{is_unresolved_placeholder_email, BunyipPrincipal, UNRESOLVED_EMAIL_DOMAIN};
 use super::{AuthService, AuthState, CurrentUser, UserRole};
 use crate::utils::error::AppError;
 
@@ -710,49 +710,58 @@ async fn ensure_user_from_bunyip(
     // invite needs none of it: `place_bunyip_user` resolves them from local state
     // with `None` email/name, still running the PMS-698 principal gate and the
     // role reconcile. Skip the hop for that (overwhelmingly common) case.
+    //
+    // PMS-777: the decision below is made from local state, and that state is
+    // exactly what `place_bunyip_user` needs next. Carry it across instead of
+    // re-reading it (the skip path used to read `users` twice and
+    // `tenant_invitations` once, then throw all three results away).
     let (email, email_verified, given_name, family_name) =
-        if bunyip_userinfo_needed(auth_service, invitations, sub).await {
-            let info = verifier.userinfo(bearer).await;
-            // MAPPS-335: bind the userinfo response to the verified at+jwt by
-            // asserting `info.sub == claims.sub` before reading any other field.
-            // Without this guard a misbehaving / compromised /oauth2/userinfo
-            // response (load-balancing bug at the OP, attacker-influenced
-            // response, etc.) injects ANOTHER user's `email` / `email_verified` /
-            // `given_name` / `family_name` into the JIT row keyed on `claims.sub`.
-            // The at+jwt's signature is already validated; sub is the canonical
-            // join key. Drop the userinfo response (treat as unverified email + no
-            // name hints) on mismatch so we never JIT a wrong-identity row, but
-            // keep the request alive so a transient OP glitch does not 401 the
-            // user across the whole site.
-            let info = info.filter(|i| {
-                if i.sub == claims.sub {
-                    true
-                } else {
-                    tracing::warn!(
-                        claims_sub = %claims.sub,
-                        userinfo_sub = %i.sub,
-                        "userinfo sub does not match at+jwt sub; dropping userinfo claims"
-                    );
-                    false
-                }
-            });
-            let email = info.as_ref().and_then(|i| i.email.clone());
-            let email_verified = info
-                .as_ref()
-                .and_then(|i| i.email_verified)
-                .unwrap_or(false);
-            // BUNYIP-141: standard profile claims off the same userinfo round-trip.
-            // Bunyip emits them only when the at+jwt's scope set covers `profile`
-            // AND the bunyip-side column is non-NULL (BUNYIP-140); absent here
-            // means either "scope not requested" or "user has not filled it in",
-            // in both cases the JIT path falls back to `synthetic_name_from_email`.
-            let given_name = info.as_ref().and_then(|i| i.given_name.clone());
-            let family_name = info.as_ref().and_then(|i| i.family_name.clone());
-            (email, email_verified, given_name, family_name)
-        } else {
-            // Fast path: skip the network round-trip. `place_bunyip_user` resolves
-            // the existing, placed user entirely from local state.
-            (None, false, None, None)
+        match place_bunyip_user_from_local_state(auth_service, tenants, invitations, sub, claims)
+            .await
+        {
+            LocalPlacement::Placed(state) => return *state,
+            LocalPlacement::UserinfoNeeded => {
+                let info = verifier.userinfo(bearer).await;
+                // MAPPS-335: bind the userinfo response to the verified at+jwt by
+                // asserting `info.sub == claims.sub` before reading any other field.
+                // Without this guard a misbehaving / compromised /oauth2/userinfo
+                // response (load-balancing bug at the OP, attacker-influenced
+                // response, etc.) injects ANOTHER user's `email` / `email_verified` /
+                // `given_name` / `family_name` into the JIT row keyed on `claims.sub`.
+                // The at+jwt's signature is already validated; sub is the canonical
+                // join key. Drop the userinfo response (treat as unverified email + no
+                // name hints) on mismatch so we never JIT a wrong-identity row, but
+                // keep the request alive so a transient OP glitch does not 401 the
+                // user across the whole site.
+                let info = info.filter(|i| {
+                    if i.sub == claims.sub {
+                        true
+                    } else {
+                        tracing::warn!(
+                            claims_sub = %claims.sub,
+                            userinfo_sub = %i.sub,
+                            "userinfo sub does not match at+jwt sub; dropping userinfo claims"
+                        );
+                        false
+                    }
+                });
+                let email = info.as_ref().and_then(|i| i.email.clone());
+                let email_verified = info
+                    .as_ref()
+                    .and_then(|i| i.email_verified)
+                    .unwrap_or(false);
+                // BUNYIP-141: standard profile claims off the same userinfo round-trip.
+                // Bunyip emits them only when the at+jwt's scope set covers `profile`
+                // AND the bunyip-side column is non-NULL (BUNYIP-140); absent here
+                // means either "scope not requested" or "user has not filled it in",
+                // in both cases the JIT path falls back to `synthetic_name_from_email`.
+                let given_name = info.as_ref().and_then(|i| i.given_name.clone());
+                let family_name = info.as_ref().and_then(|i| i.family_name.clone());
+                // Nothing is carried across on this branch: the userinfo
+                // response can change the placement answer, so the full path
+                // re-resolves from scratch exactly as it always did.
+                (email, email_verified, given_name, family_name)
+            }
         };
 
     place_bunyip_user(
@@ -769,54 +778,140 @@ async fn ensure_user_from_bunyip(
     .await
 }
 
+/// PMS-777: how far [`place_bunyip_user_from_local_state`] got.
+pub enum LocalPlacement {
+    /// Local state was enough: the caller is placed (or rejected by the
+    /// PMS-698 principal gate) with no `/oauth2/userinfo` hop. Boxed so the
+    /// `AuthState` (which carries a whole `CurrentUser`) does not set the size
+    /// of the empty `UserinfoNeeded` variant.
+    Placed(Box<Option<AuthState>>),
+    /// Local state was not enough - a first-sight user, a user stuck in the
+    /// legacy default tenant, a placeholder email, or a waiting invite - so the
+    /// caller must fetch `/oauth2/userinfo` and run the full path.
+    UserinfoNeeded,
+}
+
+/// PMS-777: the whole userinfo-free request path, in two statements.
+///
+/// `resolve_bunyip_caller` reads the caller's `users` row and the waiting-invite
+/// flag in one statement, and hands that row straight to `place_bunyip_caller`,
+/// which used to re-read both. The only other statement left is the PMS-698
+/// principal gate's tenant-status check, which is security-relevant and
+/// deliberately still runs on every request.
+///
+/// Public because it is the branch production takes for an already-provisioned
+/// caller, and the query-budget regression test
+/// (`tests/bunyip_query_budget.rs`) asserts its cost directly.
+pub async fn place_bunyip_user_from_local_state(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    claims: &super::oidc_rs::AtClaims,
+) -> LocalPlacement {
+    let principal = match resolve_bunyip_caller(auth_service, invitations, sub).await {
+        UserinfoDecision::Needed => return LocalPlacement::UserinfoNeeded,
+        UserinfoDecision::Skip(principal) => *principal,
+    };
+    LocalPlacement::Placed(Box::new(
+        place_bunyip_caller(
+            auth_service,
+            tenants,
+            invitations,
+            sub,
+            // No userinfo, so no email / name hints: the placement, the
+            // placeholder repair and the name refresh all no-op, and the row
+            // comes from `principal`.
+            None,
+            false,
+            None,
+            None,
+            claims,
+            Some(principal),
+        )
+        .await,
+    ))
+}
+
+/// PMS-777: what `resolve_bunyip_caller` decided, and the state it read to
+/// decide it. `Skip` carries the caller forward so `place_bunyip_caller` does
+/// not read the same rows again.
+enum UserinfoDecision {
+    Needed,
+    // Boxed: the principal carries a whole `User`, and `Needed` (the rarer but
+    // still routine variant) would otherwise pay for it on every request.
+    Skip(Box<BunyipPrincipal>),
+}
+
 /// Whether the Bunyip RS path must fetch `/oauth2/userinfo` for this request
 /// (PMS-713). userinfo is a per-request network hop to Bunyip; it is only needed
 /// to JIT-provision a first-sight user, back-fill a user stuck in the legacy
 /// default tenant, or match a pending invite - all of which key on the IdP
 /// email/name. An already-provisioned user placed in a real tenant with no
 /// pending invite needs none of it and is resolved from local state, so the hop
-/// is skipped for that (overwhelmingly common) case. Every check here is a local
-/// DB read - cheap next to the network round-trip it avoids.
+/// is skipped for that (overwhelmingly common) case. PMS-777: every check runs
+/// off one local `users` read - cheap next to the round-trip it avoids.
 pub async fn bunyip_userinfo_needed(
     auth_service: &Arc<AuthService>,
     invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
     sub: uuid::Uuid,
 ) -> bool {
-    // First sight: no local placement yet, so the user must be JIT-provisioned
-    // (needs email + name from userinfo).
-    let Some((tenant, role)) = auth_service.find_user_placement(sub).await.ok().flatten() else {
-        return true;
+    matches!(
+        resolve_bunyip_caller(auth_service, invitations, sub).await,
+        UserinfoDecision::Needed
+    )
+}
+
+/// The decision above, plus the state it was made from (PMS-777).
+///
+/// One statement, one pool checkout: [`AuthService::find_bunyip_principal`]
+/// reads the caller's `users` row and the "is an invite waiting" flag together.
+/// Everything after that is a pure function of that row, so a `Skip` hands the
+/// row straight to [`place_bunyip_caller`] rather than making it re-read.
+async fn resolve_bunyip_caller(
+    auth_service: &Arc<AuthService>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+) -> UserinfoDecision {
+    // First sight: no local row yet, so the user must be JIT-provisioned (needs
+    // email + name from userinfo). A read error reads the same way it did when
+    // this was `find_user_placement(..).ok().flatten()`: no placement, so the
+    // full path runs and re-reads.
+    let principal = match auth_service.find_bunyip_principal(sub).await {
+        Ok(Some(principal)) => principal,
+        Ok(None) => return UserinfoDecision::Needed,
+        Err(e) => {
+            tracing::warn!(error = %e, sub = %sub, "bunyip principal lookup failed");
+            return UserinfoDecision::Needed;
+        }
     };
+    let (tenant, role) = &principal.placement;
     // Stuck in the legacy default tenant: PMS-245 re-homes them to their own
     // personal tenant via the full placement path.
-    if is_stuck_in_default(Some(tenant), default_bunyip_tenant_id(), &role, false) {
-        return true;
+    if is_stuck_in_default(Some(*tenant), default_bunyip_tenant_id(), role, false) {
+        return UserinfoDecision::Needed;
     }
-    let Ok(user) = auth_service.get_user_by_id(tenant, sub).await else {
-        return false;
-    };
     // PMS-635: the row still carries the `{sub}@unresolved.invalid` JIT
     // placeholder, so it holds no usable address (every mokosh email to it
     // bounces) and no invite can ever match it. Only userinfo can tell us
     // whether bunyip has since verified the address, so keep fetching it until
     // the row is repaired. This costs the PMS-713 hop for as long as the user
     // stays unverified, which is a bounded, self-clearing state.
-    if is_unresolved_placeholder_email(&user.email) {
-        return true;
+    if is_unresolved_placeholder_email(&principal.user.email) {
+        return UserinfoDecision::Needed;
     }
     // A pending invite for the user's verified email re-homes them, so the full
     // path must run. Match on the user's LOCAL verified email (no userinfo): a
     // JIT row carries a verified email only when the IdP reported it verified,
     // which is exactly the condition the invite-consumption path already requires
     // (place_bunyip_user gates the invite match on `email_verified`).
-    if let Some(invs) = invitations {
-        if user.email_verified_at.is_some()
-            && matches!(invs.newest_pending_for(&user.email).await, Ok(Some(_)))
-        {
-            return true;
-        }
+    // `has_pending_invite` already encodes the `email_verified_at IS NOT NULL`
+    // half of that gate. The `invitations` check stays because a wiring without
+    // the service handles no invites at all, and must not start now.
+    if invitations.is_some() && principal.has_pending_invite {
+        return UserinfoDecision::Needed;
     }
-    false
+    UserinfoDecision::Skip(Box::new(principal))
 }
 
 /// PMS-249: the testable core of the bunyip login path. Given the verified
@@ -845,7 +940,44 @@ pub async fn place_bunyip_user(
     family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
 ) -> Option<AuthState> {
-    let placement = auth_service.find_user_placement(sub).await.ok().flatten();
+    place_bunyip_caller(
+        auth_service,
+        tenants,
+        invitations,
+        sub,
+        email,
+        email_verified,
+        given_name,
+        family_name,
+        claims,
+        None,
+    )
+    .await
+}
+
+/// [`place_bunyip_user`] with the PMS-777 fast path: `resolved` is the caller
+/// `resolve_bunyip_caller` already read this request. When it is `Some` and
+/// the user turns out to stay in the tenant they are already in, the placement
+/// and the user row are taken from it instead of being read again. `None`
+/// (every test call site, and the userinfo branch) resolves from the database
+/// exactly as before.
+#[allow(clippy::too_many_arguments)]
+async fn place_bunyip_caller(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    email: Option<String>,
+    email_verified: bool,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    claims: &super::oidc_rs::AtClaims,
+    resolved: Option<BunyipPrincipal>,
+) -> Option<AuthState> {
+    let placement = match resolved.as_ref() {
+        Some(principal) => Some(principal.placement.clone()),
+        None => auth_service.find_user_placement(sub).await.ok().flatten(),
+    };
     let current = placement.as_ref().map(|(t, _)| *t);
 
     // An invite to address X is consumed only by a Bunyip user with verified X.
@@ -930,38 +1062,47 @@ pub async fn place_bunyip_user(
         .as_ref()
         .and_then(|i| UserRole::from_str(&i.role))
         .unwrap_or(UserRole::Admin);
-    let mut user = match auth_service.get_user_by_id(target, sub).await {
-        Ok(user) => user,
-        Err(_) => {
-            // Persist the IdP-supplied email on the JIT insert ONLY when the
-            // IdP reports it verified, matching the Google path.
-            // `upsert_user_from_oidc` (MAPPS-335) now binds
-            // `email_verified_at` to the actual `email_verified` flag, so
-            // an unverified address lands with NULL instead of NOW();
-            // writing the placeholder under `sub@unresolved.invalid` keeps
-            // the auto-link/capture path against the real owner closed.
-            let email_for_insert = match (email.clone(), email_verified) {
-                (Some(em), true) => em,
-                _ => format!("{sub}@{UNRESOLVED_EMAIL_DOMAIN}"),
-            };
-            // BUNYIP-141: hand the userinfo profile claims to the JIT path
-            // so a bunyip-provisioned user lands with their real name on
-            // first sight. Both are Option<String>; None falls back to
-            // `synthetic_name_from_email` inside the service.
-            auth_service
-                .upsert_user_from_oidc(
-                    sub,
-                    target,
-                    &email_for_insert,
-                    initial_role,
-                    given_name.as_deref(),
-                    family_name.as_deref(),
-                    email_verified,
-                )
-                .await
-                .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
-                .ok()?
-        }
+    // PMS-777: the pre-resolved row is only usable when the user did not move
+    // (no invite, no backfill); a re-home means the row must be re-read from
+    // the tenant it landed in.
+    let already_loaded = resolved
+        .map(|principal| principal.user)
+        .filter(|user| user.tenant_id == target);
+    let mut user = match already_loaded {
+        Some(user) => user,
+        None => match auth_service.get_user_by_id(target, sub).await {
+            Ok(user) => user,
+            Err(_) => {
+                // Persist the IdP-supplied email on the JIT insert ONLY when the
+                // IdP reports it verified, matching the Google path.
+                // `upsert_user_from_oidc` (MAPPS-335) now binds
+                // `email_verified_at` to the actual `email_verified` flag, so
+                // an unverified address lands with NULL instead of NOW();
+                // writing the placeholder under `sub@unresolved.invalid` keeps
+                // the auto-link/capture path against the real owner closed.
+                let email_for_insert = match (email.clone(), email_verified) {
+                    (Some(em), true) => em,
+                    _ => format!("{sub}@{UNRESOLVED_EMAIL_DOMAIN}"),
+                };
+                // BUNYIP-141: hand the userinfo profile claims to the JIT path
+                // so a bunyip-provisioned user lands with their real name on
+                // first sight. Both are Option<String>; None falls back to
+                // `synthetic_name_from_email` inside the service.
+                auth_service
+                    .upsert_user_from_oidc(
+                        sub,
+                        target,
+                        &email_for_insert,
+                        initial_role,
+                        given_name.as_deref(),
+                        family_name.as_deref(),
+                        email_verified,
+                    )
+                    .await
+                    .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
+                    .ok()?
+            }
+        },
     };
 
     // PMS-635: heal a row still holding the `{sub}@unresolved.invalid`

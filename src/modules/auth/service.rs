@@ -2241,6 +2241,74 @@ impl AuthService {
         .await?)
     }
 
+    /// PMS-777: everything the bunyip RS path needs to know about the caller,
+    /// in ONE statement on ONE pool checkout.
+    ///
+    /// The path used to read `users` twice (`find_user_placement` on the
+    /// migrator pool, then `get_user_by_id` inside a `begin_with_tenant`
+    /// transaction) and `tenant_invitations` once, and then threw the results
+    /// away and re-read them. This returns the same three facts together so the
+    /// caller resolves once and passes the result down.
+    ///
+    /// The invite answer is an EXISTS probe only, gated in SQL on the same
+    /// `email_verified_at IS NOT NULL` condition the Rust caller used: it says
+    /// *whether* a live invite is waiting, never which tenant sent it.
+    /// Consuming an invite still goes through
+    /// `InvitationsService::newest_pending_for`, which stays the only reader of
+    /// the invite payload.
+    ///
+    /// PMS-260: like [`Self::find_user_placement`], this is deliberately NOT
+    /// tenant-scoped, so it must NEVER be wired into a request handler; the
+    /// `routes_do_not_reach_global_login_helpers` regression test
+    /// (`tests/auth.rs`) pins that no `routes.rs` references it.
+    pub async fn find_bunyip_principal(&self, user_id: Uuid) -> AppResult<Option<BunyipPrincipal>> {
+        // SAFETY (PMS-285/PMS-260/PMS-777): both tables this reads are already
+        // read on the migrator (BYPASSRLS) pool on this exact path
+        // (`find_user_placement`, `newest_pending_for`), for the same reason:
+        // the caller is not yet placed in a tenant, so there is no
+        // `app.current_tenant` GUC to set and both tables are RLS-covered.
+        // Merging them crosses no pool boundary. `id = $1` is the JWT-verified
+        // `sub`, so the widened column list still exposes exactly one row - the
+        // caller's own.
+        // PMS-591: `deleted_at IS NULL` keeps a tombstoned account unresolvable,
+        // matching `find_user_placement`.
+        let row = sqlx::query_as::<_, BunyipPrincipalRow>(
+            r#"
+            SELECT u.id, u.tenant_id, u.email, u.password_hash, u.first_name, u.last_name,
+                   u.phone, u.mobile, u.title, u.avatar_url, u.timezone, u.locale,
+                   u.date_format_string, u.theme_base_mode, u.theme_accent_id, u.role,
+                   u.status, u.email_verified_at, u.last_login_at, u.last_login_country,
+                   u.login_location_alerts, u.mfa_enabled,
+                   u.mfa_secret, u.notification_preferences, u.settings,
+                   u.created_at, u.updated_at, u.password_changed_at, u.profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = u.tenant_id) AS own_company_id,
+                   EXISTS (
+                       SELECT 1 FROM tenant_invitations i
+                       WHERE u.email_verified_at IS NOT NULL
+                         AND lower(i.email) = lower(btrim(u.email))
+                         AND i.status = 'pending'
+                         AND i.expires_at > NOW()
+                   ) AS has_pending_invite
+            FROM users u
+            WHERE u.id = $1 AND u.deleted_at IS NULL
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        Ok(row.map(|row| {
+            // The raw `users.role` text, so the placement tuple is byte-for-byte
+            // what `find_user_placement` would have returned.
+            let placement = (row.user.tenant_id, row.user.role.clone());
+            BunyipPrincipal {
+                placement,
+                user: row.user.into(),
+                has_pending_invite: row.has_pending_invite,
+            }
+        }))
+    }
+
     /// MAPPS-348: probe whether a user row exists in the tombstoned state.
     /// The auth middleware runs this on the error path (when the normal
     /// `deleted_at IS NULL` lookup returned nothing) to distinguish
@@ -2983,6 +3051,31 @@ impl AuthService {
 
         Ok(())
     }
+}
+
+/// PMS-777: the caller of a bunyip-issued token, resolved in one statement by
+/// [`AuthService::find_bunyip_principal`].
+#[cfg(feature = "server")]
+pub struct BunyipPrincipal {
+    /// `(tenant_id, raw users.role)` - identical to what
+    /// [`AuthService::find_user_placement`] returns for the same `sub`.
+    pub placement: (Uuid, String),
+    /// The full local shadow row, as [`AuthService::get_user_by_id`] would
+    /// have loaded it.
+    pub user: User,
+    /// Whether a live (pending, unexpired) invite is waiting for the user's
+    /// verified local address. `false` when the address is unverified.
+    pub has_pending_invite: bool,
+}
+
+/// Wire shape behind [`AuthService::find_bunyip_principal`]: the `users` row
+/// plus the invite EXISTS flag selected alongside it.
+#[cfg(feature = "server")]
+#[derive(sqlx::FromRow)]
+struct BunyipPrincipalRow {
+    #[sqlx(flatten)]
+    user: UserRow,
+    has_pending_invite: bool,
 }
 
 // Database row types for sqlx

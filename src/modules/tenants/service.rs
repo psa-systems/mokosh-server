@@ -88,15 +88,36 @@ fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String
     }
 }
 
+/// How long a tenant stays memoized as "already seeded" (PMS-777). The entry
+/// is a pure memoization of an idempotent guard, so the only failure mode is a
+/// stale positive after somebody empties a lookup table by hand; it clears
+/// within the TTL and a restart re-checks everything.
+const SEEDED_TENANT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Cap on memoized tenants (PMS-777). Bounds the map on a deployment with many
+/// tenants; an evicted entry just costs one more probe.
+const SEEDED_TENANT_CAPACITY: u64 = 10_000;
+
 /// Tenant management service
 #[derive(Clone)]
 pub struct TenantService {
     db: Database,
+    /// PMS-777: tenants this process has already seen `ensure_default_config`
+    /// succeed for. `ensure_default_config` runs on the per-request bunyip auth
+    /// path, where its three `SELECT EXISTS` guards cost round trips forever to
+    /// answer a question that flips at most once per tenant.
+    seeded_tenants: moka::future::Cache<Uuid, ()>,
 }
 
 impl TenantService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            seeded_tenants: moka::future::Cache::builder()
+                .max_capacity(SEEDED_TENANT_CAPACITY)
+                .time_to_live(SEEDED_TENANT_TTL)
+                .build(),
+        }
     }
 
     /// Create a new tenant
@@ -236,8 +257,24 @@ impl TenantService {
     /// (`tickets/service.rs`) - 500s. The placement path calls this so any
     /// tenant a user actually lands in is seeded.
     pub async fn ensure_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
-        // This runs on the per-request bunyip auth path (place_bunyip_user), so
-        // the already-seeded common case must stay cheap: a couple of
+        // PMS-777: this runs on the per-request bunyip auth path
+        // (place_bunyip_user). "Cheap" still meant three round-trip-bearing
+        // probes on every authenticated request, forever, for a condition that
+        // flips at most once per tenant. Memoize the Ok answer in process so a
+        // tenant is probed once per TTL instead of once per request; a tenant
+        // this process has not seen still runs the full guarded path below.
+        if self.seeded_tenants.get(&tenant_id).await.is_some() {
+            return Ok(());
+        }
+        self.seed_default_config(tenant_id).await?;
+        self.seeded_tenants.insert(tenant_id, ()).await;
+        Ok(())
+    }
+
+    /// The guarded seeding itself, split out of [`Self::ensure_default_config`]
+    /// so the PMS-777 memo wraps exactly one success path.
+    async fn seed_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
+        // The already-seeded case stays cheap on its own terms too: a couple of
         // `SELECT EXISTS` and no write transaction. The sequence step is guarded
         // here; the lookup step is guarded inside `copy_default_config`.
         //
