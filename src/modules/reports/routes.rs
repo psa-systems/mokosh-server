@@ -109,10 +109,17 @@ async fn list_reports(
             }],
         },
         ReportDescriptor {
+            key: "request-types",
+            name: "Request Type Durations",
+            description:
+                "How long each client-request type actually takes, measured from the time tracked against the tickets those requests produced.",
+            parameters: vec![date("from", false), date("to", false)],
+        },
+        ReportDescriptor {
             key: "custom",
             name: "Custom Report Builder",
             description:
-                "Build a report from a whitelisted catalog of sources, dimensions, and measures. Discover the catalog at GET /reports/custom/schema and run via POST /reports/custom.",
+                "Build a report from a whitelisted catalog of sources, dimensions, and measures. Discover the catalog at GET /reports/custom/schema and run via POST /reports/custom. This is the only report key GET /reports/{key}/export cannot serve: the spec travels in a POST body, which a GET export cannot carry, so ask POST /reports/custom for CSV with \"format\": \"csv\" instead. Every other key in this registry exports.",
             parameters: vec![],
         },
         ReportDescriptor {
@@ -268,6 +275,11 @@ async fn export_report(
         ),
         "tickets" => csv_for_tickets(&s.service.tickets(u.tenant(), q.from, q.to).await?),
         "time" => csv_for_time(&s.service.time(u.tenant(), q.from, q.to).await?),
+        "request-types" => csv_for_request_types(
+            &s.service
+                .request_type_durations(u.tenant(), q.from, q.to)
+                .await?,
+        ),
         "billing" => {
             // The billing export carries the same revenue / A/R figures as
             // GET /reports/billing, so it enforces the same finance gate
@@ -343,6 +355,31 @@ fn csv_for_time(r: &TimeReportResponse) -> String {
     s.push_str("\nwork_type_id,minutes\n");
     for i in &r.minutes_by_work_type {
         s.push_str(&format!("{},{}\n", i.id, i.count));
+    }
+    s
+}
+
+/// PMS-772. `count` is the grouped-count header every other export uses.
+/// A request type with no tracked time in the period leaves the three
+/// measurement cells empty rather than writing 0: no data is not a zero
+/// measurement, which is the distinction the JSON nulls carry (PMS-732).
+fn csv_for_request_types(r: &RequestTypeDurationsResponse) -> String {
+    let mut s = format!(
+        "from,to\n{},{}\n\nrequest_type,slug,kb_article,count,total_minutes,average_minutes\n",
+        r.from, r.to
+    );
+    for t in &r.request_types {
+        s.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            custom::csv_cell(&t.form_name),
+            custom::csv_cell(&t.form_slug),
+            custom::csv_cell(t.kb_article_title.as_deref().unwrap_or("")),
+            t.ticket_count.map(|c| c.to_string()).unwrap_or_default(),
+            t.total_minutes.map(|m| m.to_string()).unwrap_or_default(),
+            t.average_minutes
+                .map(|m| format!("{m:.1}"))
+                .unwrap_or_default(),
+        ));
     }
     s
 }
