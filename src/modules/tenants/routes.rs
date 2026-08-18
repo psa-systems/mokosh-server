@@ -12,7 +12,10 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::logo::{logo_path, TenantLogoConfig, TenantLogoStore};
-use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
+use super::{
+    CreateTenantRequest, TenantAdminInfo, TenantResponse, TenantService, TenantUsage,
+    UpdateTenantAdminRequest, UpdateTenantRequest,
+};
 use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
@@ -78,6 +81,12 @@ pub fn tenant_routes(
             "/{tenant_id}/admin/resend-welcome",
             post(resend_admin_welcome),
         )
+        // MAPPS-450: read + edit the tenant admin's `users` row (email,
+        // first_name, last_name). Both super-admin-only. The PUT also
+        // accepts `resend_welcome: bool` so an email-change common case
+        // is a single round-trip.
+        .route("/{tenant_id}/admin", get(get_tenant_admin))
+        .route("/{tenant_id}/admin", put(update_tenant_admin))
         .route("/{tenant_id}/usage", get(get_tenant_usage))
         // Audit F5: expose existing service-level module-config helpers
         // over HTTP so the client's settings/integrations page can read
@@ -385,6 +394,40 @@ async fn suspend_tenant(
         .await?;
 
     Ok(())
+}
+
+/// MAPPS-450: read the tenant admin's `users` row (super admin only).
+async fn get_tenant_admin(
+    State(state): State<TenantRouterState>,
+    _super_admin: RequireSuperAdmin,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<Json<TenantAdminInfo>> {
+    // SAFETY (PMS-261): super-admin-only path; the arbitrary `tenant_id`
+    // is an administrative target, bridged via `from_trusted`.
+    let admin = state
+        .tenant_service
+        .get_tenant_admin(TenantId::from_trusted(tenant_id))
+        .await?;
+    Ok(Json(admin))
+}
+
+/// MAPPS-450: super-admin edits the tenant admin's email + name pair.
+async fn update_tenant_admin(
+    State(state): State<TenantRouterState>,
+    _super_admin: RequireSuperAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(tenant_id): Path<Uuid>,
+    Json(request): Json<UpdateTenantAdminRequest>,
+) -> AppResult<Json<TenantAdminInfo>> {
+    request.validate()?;
+    // SAFETY (PMS-261): super-admin-only path via RequireSuperAdmin; the
+    // arbitrary `tenant_id` is an administrative target, bridged via
+    // `from_trusted`.
+    let admin = state
+        .tenant_service
+        .update_tenant_admin(TenantId::from_trusted(tenant_id), &request, &ctx)
+        .await?;
+    Ok(Json(admin))
 }
 
 /// MAPPS-448: re-issue the tenant admin's welcome email (super admin only).

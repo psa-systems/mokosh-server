@@ -136,6 +136,39 @@ pub struct UpdateTenantRequest {
     pub branding: Option<serde_json::Value>,
 }
 
+/// MAPPS-450: request body for `PUT /api/v1/tenants/{id}/admin`.
+///
+/// Every field is optional so the caller sends only what changed; the
+/// server rejects an empty PATCH so a stray click cannot audit-write a
+/// no-op update. `resend_welcome` piggybacks on the same call so the
+/// email-changed common case is a single round-trip; the server ignores
+/// it when the admin has already redeemed (status != 'pending').
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateTenantAdminRequest {
+    #[validate(email)]
+    pub email: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    #[serde(default)]
+    pub resend_welcome: bool,
+}
+
+/// MAPPS-450: view of the tenant's admin `users` row that the tenant
+/// management modal renders. Returned from `GET /tenants/{id}/admin` and
+/// from the PUT above. `status` is the raw column so the SPA can gate
+/// the email-editable UI on `pending` vs `active`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantAdminInfo {
+    pub user_id: Uuid,
+    pub email: String,
+    pub first_name: String,
+    pub last_name: String,
+    /// Raw `users.status` column value: `pending`, `active`, `suspended`,
+    /// etc. Only `pending` allows super-admin email edits and welcome
+    /// re-sends.
+    pub status: String,
+}
+
 /// Tenant response for API
 #[derive(Debug, Clone, Serialize)]
 pub struct TenantResponse {

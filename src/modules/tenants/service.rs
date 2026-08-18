@@ -928,6 +928,177 @@ impl TenantService {
         self.get_tenant(tenant_id).await
     }
 
+    /// MAPPS-450: read the tenant admin's `users` row for the tenant
+    /// management modal. Returns the single `role='admin'` row seeded by
+    /// [`create_tenant`], projected down to what the SPA needs (id, email,
+    /// name pair, raw status).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_tenant_admin(&self, tenant_id: TenantId) -> AppResult<TenantAdminInfo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let admin: Option<(Uuid, String, String, String, String)> = sqlx::query_as(
+            "SELECT id, email, first_name, last_name, status FROM users \
+             WHERE tenant_id = $1 AND role = 'admin' \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(*tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((user_id, email, first_name, last_name, status)) = admin else {
+            return Err(AppError::not_found("No admin user found for this tenant"));
+        };
+        Ok(TenantAdminInfo {
+            user_id,
+            email,
+            first_name,
+            last_name,
+            status,
+        })
+    }
+
+    /// MAPPS-450: super-admin edits the tenant admin's email + name pair.
+    ///
+    /// Guards:
+    /// - Empty request (nothing to change and `resend_welcome=false`) -> 400.
+    ///   Prevents a stray audit-write for a no-op call.
+    /// - Email change on `users.status = 'active'` -> 409. The admin has
+    ///   already redeemed and is signing in; renaming their inbox is a
+    ///   hijack surface the super-admin does not own. Copy points them at
+    ///   the tenant admin's own Settings for a self-serve change.
+    /// - Name changes are allowed at any status; they carry no auth impact.
+    ///
+    /// After the field updates commit, if `resend_welcome == true` AND the
+    /// admin is still `pending`, delegates to [`resend_admin_welcome`] so
+    /// the new email address receives a fresh setup link and any prior
+    /// unredeemed token is invalidated. The client sets this flag when the
+    /// email field is dirty; on name-only edits the resend is skipped.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_tenant_admin(
+        &self,
+        tenant_id: TenantId,
+        request: &UpdateTenantAdminRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<TenantAdminInfo> {
+        let has_any_change = request.email.is_some()
+            || request.first_name.is_some()
+            || request.last_name.is_some();
+        if !has_any_change && !request.resend_welcome {
+            return Err(AppError::validation_field(
+                "email",
+                "at least one field must be supplied",
+            ));
+        }
+
+        // Load current row + status guard, all under the tenant GUC so the
+        // SELECT sees the row and any subsequent UPDATE + audit-write on
+        // the same tx share the scope.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let existing: Option<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, email, status FROM users \
+             WHERE tenant_id = $1 AND role = 'admin' \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(*tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((admin_id, current_email, current_status)) = existing else {
+            return Err(AppError::not_found("No admin user found for this tenant"));
+        };
+
+        let email_changed = request
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some_and(|e| !e.eq_ignore_ascii_case(&current_email));
+        if email_changed && current_status == "active" {
+            return Err(AppError::conflict(
+                "This tenant admin has already activated their account; the admin themselves must change their own email from Settings.",
+            ));
+        }
+
+        // Snapshot before, apply the dynamic UPDATE, snapshot after, then
+        // audit_write - same shape create_tenant uses. Each optional field
+        // becomes a `COALESCE`-shaped ternary so callers can send just the
+        // fields that changed without threading a builder.
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(u) FROM users u WHERE id = $1")
+                .bind(admin_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        if has_any_change {
+            sqlx::query(
+                "UPDATE users SET \
+                 email = COALESCE($2, email), \
+                 first_name = COALESCE($3, first_name), \
+                 last_name = COALESCE($4, last_name), \
+                 updated_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(admin_id)
+            .bind(request.email.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .bind(
+                request
+                    .first_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .bind(
+                request
+                    .last_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(u) FROM users u WHERE id = $1")
+                .bind(admin_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "users",
+            Some(admin_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+
+        // Resend after commit so the token invalidation + re-send happens
+        // against the freshly-written email address. `resend_admin_welcome`
+        // 409s if status != 'pending', so a caller that flipped the flag
+        // by mistake (e.g. edit-name-only) gets a soft rejection rather
+        // than a mail queued to no purpose.
+        if request.resend_welcome {
+            if let Err(e) = self.resend_admin_welcome(tenant_id, ctx).await {
+                match e {
+                    AppError::Conflict(_) => {
+                        // Admin is no longer pending; the field update
+                        // still committed. Log but do not fail the call.
+                        tracing::info!(
+                            tenant_id = %tenant_id,
+                            admin_id = %admin_id,
+                            "update_tenant_admin: skipped resend, admin not pending",
+                        );
+                    }
+                    other => return Err(other),
+                }
+            }
+        }
+
+        self.get_tenant_admin(tenant_id).await
+    }
+
     /// Suspend tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn suspend_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
