@@ -16,7 +16,10 @@
 //!   * `resolve_rate` honours the emergency > after_hours > hourly
 //!     precedence.
 //!   * `expire_due_contracts` renews an auto_renew contract past its
-//!     end_date (advancing the dates) and expires a non-auto_renew one.
+//!     end_date (advancing the dates) and expires a non-auto_renew one,
+//!     and records the pre-update row as the audit `old_values` and the
+//!     post-update row as `new_values` (PMS-779, now both taken from the
+//!     batch read and the `UPDATE ... RETURNING` rather than extra reads).
 
 mod common;
 
@@ -694,6 +697,45 @@ async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
         .await
         .expect("expire row");
     assert_eq!(status, "expired");
+
+    // PMS-779: both audit snapshots survive the fold into the batch read and
+    // the `UPDATE ... RETURNING`. `old_values` is the whole pre-update row,
+    // `new_values` the whole post-update row.
+    for (id, before_status, after_status) in [
+        (renew_id, "active", "renewed"),
+        (expire_id, "active", "expired"),
+    ] {
+        let (old_values, new_values): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            sqlx::query_as(
+                r#"SELECT old_values, new_values FROM audit_log
+                   WHERE entity_type = 'contracts' AND entity_id = $1 AND action = 'update'"#,
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("sweep audit row");
+        let old = old_values.expect("sweep records the pre-update snapshot");
+        let new = new_values.expect("sweep records the post-update snapshot");
+        assert_eq!(old["id"].as_str(), Some(id.to_string().as_str()));
+        assert_eq!(old["status"].as_str(), Some(before_status));
+        assert_eq!(new["status"].as_str(), Some(after_status));
+        // The snapshot is the whole row, not the sweep's projection.
+        assert!(
+            old.get("name").is_some() && old.get("company_id").is_some(),
+            "the `before` snapshot carries every column: {old}"
+        );
+    }
+
+    // The renewal's dates are captured on both sides of the update.
+    let old_values: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT old_values FROM audit_log
+           WHERE entity_type = 'contracts' AND entity_id = $1 AND action = 'update'"#,
+    )
+    .bind(renew_id)
+    .fetch_one(&pool)
+    .await
+    .expect("renewal audit row");
+    assert_eq!(old_values["end_date"].as_str(), Some("2025-12-31"));
 }
 
 #[sqlx::test]

@@ -1365,8 +1365,12 @@ impl ContractsService {
             // done and the loop terminates.
             loop {
                 let mut tx = self.db.migrator_pool().begin().await?;
+                // PMS-779: `to_jsonb(contracts)` rides along on the locked
+                // batch read, so the audit `before` snapshot costs no extra
+                // round trip and is taken from the same read as the update.
                 let due = sqlx::query_as::<_, DueContractRow>(
-                    r#"SELECT id, start_date, end_date, auto_renew, renewal_terms
+                    r#"SELECT id, start_date, end_date, auto_renew, renewal_terms,
+                              to_jsonb(contracts) AS before_snapshot
                        FROM contracts
                        WHERE tenant_id = $1 AND status = 'active'
                          AND end_date IS NOT NULL AND end_date < $2
@@ -1391,13 +1395,12 @@ impl ContractsService {
                         None => continue,
                     };
 
-                    let before: Option<serde_json::Value> =
-                        sqlx::query_scalar("SELECT to_jsonb(t) FROM contracts t WHERE id = $1")
-                            .bind(c.id)
-                            .fetch_optional(&mut *tx)
-                            .await?;
+                    let before = c.before_snapshot;
 
-                    if c.auto_renew.unwrap_or(false) {
+                    // `RETURNING to_jsonb(contracts)` yields the post-update
+                    // row, so the audit `after` snapshot rides on the write
+                    // instead of a follow-up read (PMS-779).
+                    let after: Option<serde_json::Value> = if c.auto_renew.unwrap_or(false) {
                         // Renewal length: explicit term_months override, else
                         // the span of the closing term in whole months (>= 1).
                         let term_months = c
@@ -1414,37 +1417,35 @@ impl ContractsService {
                             .and_then(|d| d.pred_opt())
                             .unwrap_or(new_start);
 
-                        sqlx::query(
+                        let after = sqlx::query_scalar(
                             r#"UPDATE contracts
                                SET status = 'renewed',
                                    start_date = $2,
                                    end_date = $3,
                                    updated_at = NOW()
-                               WHERE id = $1"#,
+                               WHERE id = $1
+                               RETURNING to_jsonb(contracts)"#,
                         )
                         .bind(c.id)
                         .bind(new_start)
                         .bind(new_end)
-                        .execute(&mut *tx)
+                        .fetch_optional(&mut *tx)
                         .await?;
                         renewed += 1;
+                        after
                     } else {
-                        sqlx::query(
+                        let after = sqlx::query_scalar(
                             r#"UPDATE contracts
                                SET status = 'expired', updated_at = NOW()
-                               WHERE id = $1"#,
+                               WHERE id = $1
+                               RETURNING to_jsonb(contracts)"#,
                         )
                         .bind(c.id)
-                        .execute(&mut *tx)
+                        .fetch_optional(&mut *tx)
                         .await?;
                         expired += 1;
-                    }
-
-                    let after: Option<serde_json::Value> =
-                        sqlx::query_scalar("SELECT to_jsonb(t) FROM contracts t WHERE id = $1")
-                            .bind(c.id)
-                            .fetch_optional(&mut *tx)
-                            .await?;
+                        after
+                    };
 
                     audit_write(
                         &mut *tx,
@@ -1693,7 +1694,8 @@ struct RateTierRow {
     emergency_rate: Option<Decimal>,
 }
 
-/// Contract fields needed by the lifecycle sweep.
+/// Contract fields needed by the lifecycle sweep, including the pre-update
+/// whole-row snapshot the audit log records as `old_values` (PMS-779).
 #[derive(sqlx::FromRow)]
 struct DueContractRow {
     id: Uuid,
@@ -1701,4 +1703,5 @@ struct DueContractRow {
     end_date: Option<chrono::NaiveDate>,
     auto_renew: Option<bool>,
     renewal_terms: Option<serde_json::Value>,
+    before_snapshot: Option<serde_json::Value>,
 }
