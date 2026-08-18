@@ -88,6 +88,12 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# PMS-783: `ReaderStream` turns an open file into a chunked response body so an
+# attachment download never buffers the whole blob. `tokio-stream` supplies the
+# `map` combinator that logs a mid-stream read failure instead of letting the
+# body abort silently. Both were already in the lock file transitively.
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
