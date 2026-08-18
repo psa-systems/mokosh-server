@@ -963,4 +963,50 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// Drive the same `CompressionLayer::new()` the router applies globally and
+    /// report the `content-encoding` it negotiated for `accept_encoding`.
+    async fn negotiated_encoding(accept_encoding: &str) -> String {
+        use tower::ServiceExt;
+
+        // Well past the compression predicate's 32-byte floor, so the layer
+        // actually encodes instead of passing the body through.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async { "a body long enough to clear the compression size floor" }),
+            )
+            .layer(CompressionLayer::new());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header(header::ACCEPT_ENCODING, accept_encoding)
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .map(|v| v.to_str().expect("encoding is ascii").to_owned())
+            .unwrap_or_default()
+    }
+
+    /// PMS-780: `CompressionLayer::new()` only offers the algorithms whose
+    /// tower-http cargo features are compiled in, so dropping `compression-br`
+    /// from Cargo.toml would silently downgrade every brotli client to gzip
+    /// with no code change to review. This is the guard that fails instead.
+    #[tokio::test]
+    async fn brotli_is_negotiated_when_the_client_advertises_it() {
+        assert_eq!(negotiated_encoding("br,gzip").await, "br");
+    }
+
+    /// The gzip-only client keeps getting gzip: brotli is added, not swapped.
+    #[tokio::test]
+    async fn gzip_only_client_still_gets_gzip() {
+        assert_eq!(negotiated_encoding("gzip").await, "gzip");
+    }
 }

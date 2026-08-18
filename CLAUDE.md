@@ -11,14 +11,15 @@ Mokosh Server: PSA (Professional Services Automation) REST API for MSPs. Rust + 
 
 ## Common commands
 
-All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust stable, `sqlx-cli` for migrations.
+All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust stable, `sqlx-cli` for migrations, `cargo-machete` for the unused-dependency gate (`cargo install --locked cargo-machete`).
 
 ```
 just                       # list recipes
-just check                 # cargo check + clippy + fmt --check (run before pushing)
+just check                 # cargo check + clippy + fmt --check + repo guards (run before pushing)
 just check-compile         # cargo check --all-targets
 just check-clippy          # cargo clippy --all-targets
 just check-fmt             # cargo fmt --all --check
+just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
@@ -124,6 +125,7 @@ Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 imple
 - Branches: `fix/...`, `feat/...`, `chore/...`. Forgejo PRs via `fj pr create` (host `dev.a8n.run`). `gh` is not installed.
 - CI runner labels (PMS-719, GOV-43): a job that compiles on the runner requests `RUNS_ON_OPENSUSE_DEV_LATEST` (only that image ships `cc` / `gcc` / `ld` plus glibc and OpenSSL headers); everything else stays on `RUNS_ON_OPENSUSE_BASE_LATEST`. Base plus a compile fails at `linker cc not found` on a cold cache (PMS-705, PMS-706); the fix is the label, never a run-time `zypper install gcc`. `scripts/check-runner-labels.nu` (in `just check` and `check.yml`) enforces this and requires every `runs-on:` to carry a comment justifying its label.
 - OCI build cache (PMS-720, GOV-20): `build-oci-image.yml` builds on a `docker-container` buildx driver and caches to the runner's built-in Actions cache server (`cache_from type=gha`, `cache_to type=gha,mode=max,ignore-error=true`), with `crazy-max/ghaction-github-runtime@v3` re-exporting `ACTIONS_CACHE_URL` / `ACTIONS_RUNTIME_TOKEN` so a raw `docker buildx build` can reach it. The retired `type=inline` and `type=registry` `:buildcache` backends are banned. `scripts/check-oci-build-cache.nu` (in `just check` and `check.yml`) enforces this; because `ignore-error=true` makes a dead cache go green silently, read freshness from the build log's `importing cache manifest from gha` line, not the exit code.
+- Unused dependencies (PMS-780): `cargo machete` runs in `just check` and `check.yml` as a blocking gate, so a crate declared in `Cargo.toml` with no call site fails the PR. `pulldown-cmark` and `minijinja` had been compiled on every cold build for nothing. Response compression is brotli-then-gzip: `CompressionLayer::new()` offers only the algorithms whose `tower-http` cargo features are compiled in, so `compression-br` must stay in the feature list (guarded by the negotiation tests in `src/api/router.rs`).
 - Releases: `just create-release <major|minor|hotfix>` bumps `Cargo.toml`, pushes a `release/v<X.Y.Z>` branch, opens the PR. CI tags + publishes on merge.
 - Email backend selection: `MailerConfig::from_env().build()` returns `SmtpMailer` if `SMTP_HOST` is set, `LogMailer` otherwise. `SMTP_USERNAME` without `SMTP_PASSWORD` is a hard error at startup (fail-loud, not silent degrade).
 - `ENCRYPTION_KEY` must parse as 32 bytes (raw or 64 hex chars) via `utils::crypto::parse_encryption_key`. Used for AES-256-GCM at-rest encryption of per-tenant secrets (e.g. payment-gateway configs).

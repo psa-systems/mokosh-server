@@ -132,7 +132,7 @@ just dev-down                # stop, keep volumes
 just down                    # stop both LAN-IP and SSO stacks, remove orphans
 just dev-clean               # stop + drop volumes + remove .env (leaves .env.infisical; next `just dev` regenerates .env)
 
-just check                   # cargo check + clippy + fmt --check (run before pushing)
+just check                   # cargo check + clippy + fmt --check + repo guards (run before pushing)
 just test                    # cargo test workspace-wide
 just fmt                     # cargo fmt --all
 just migrate-run             # sqlx migrate run against $DATABASE_URL (host)
