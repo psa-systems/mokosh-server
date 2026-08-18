@@ -313,6 +313,36 @@ impl TenantService {
         admin_id: Uuid,
         request: &CreateTenantRequest,
     ) {
+        self.mint_and_send_welcome(
+            tenant_id,
+            admin_id,
+            &request.admin_email,
+            &request.admin_first_name,
+            &request.admin_last_name,
+            &request.slug,
+        )
+        .await;
+    }
+
+    /// Mint a fresh `password_reset_tokens` row for the tenant admin and
+    /// dispatch the `auth.welcome` email. Shared by [`send_admin_welcome`]
+    /// (create path) and [`resend_admin_welcome`] (MAPPS-448 re-issue path),
+    /// so both paths use the same token shape, expiry, template context, and
+    /// best-effort failure semantics.
+    ///
+    /// Best-effort: absence of a dispatcher, a dispatch failure, and even a
+    /// token-insert failure all log-and-return. Callers that need to know
+    /// whether the mail was queued should read tracing spans; the on-disk
+    /// state (the token row) is committed before this returns success.
+    async fn mint_and_send_welcome(
+        &self,
+        tenant_id: Uuid,
+        admin_id: Uuid,
+        admin_email: &str,
+        admin_first_name: &str,
+        admin_last_name: &str,
+        tenant_slug: &str,
+    ) {
         let (Some(notify), Some(base_url)) =
             (self.notifications.as_ref(), self.frontend_base_url.as_ref())
         else {
@@ -379,10 +409,7 @@ impl TenantService {
         }
 
         let setup_link = format!("{}/reset-password/{}", base_url, token);
-        let display_name = match (
-            request.admin_first_name.trim(),
-            request.admin_last_name.trim(),
-        ) {
+        let display_name = match (admin_first_name.trim(), admin_last_name.trim()) {
             ("", "") => String::new(),
             (f, "") => f.to_string(),
             ("", l) => l.to_string(),
@@ -402,13 +429,13 @@ impl TenantService {
                 } else {
                     "https"
                 };
-                let slug = slugify(&request.slug);
+                let slug = slugify(tenant_slug);
                 format!("{scheme}://{slug}{suffix}")
             })
             .unwrap_or_default();
         let context = serde_json::json!({
             "recipient_user_id": admin_id.to_string(),
-            "recipient_email": request.admin_email,
+            "recipient_email": admin_email,
             "display_name": display_name,
             "setup_link": setup_link,
             "client_portal_url": client_portal_url,
@@ -436,6 +463,91 @@ impl TenantService {
                 );
             }
         }
+    }
+
+    /// MAPPS-448: re-issue the tenant admin's setup token and re-send the
+    /// `auth.welcome` email. Super-admin path, invoked when the original mail
+    /// went missing (SMTP outage, wrong-address typo caught later, admin lost
+    /// the email) and the admin is still `status='pending'`.
+    ///
+    /// Steps:
+    /// 1. Resolve the tenant's single `role='admin'` user; 404 if absent.
+    /// 2. 409 if the admin has already redeemed (`status != 'pending'`) - a
+    ///    resend against an active account would be a mystery mail from the
+    ///    caller's perspective and a security-adjacent surface (super-admin
+    ///    forcing a password-reset link to someone else's inbox).
+    /// 3. Invalidate every unredeemed `password_reset_tokens` row for that
+    ///    admin so the old email's link stops working (single one-shot token).
+    /// 4. Audit an `Update` on the users row so the log names the super-admin
+    ///    who re-issued the invite.
+    /// 5. Mint + dispatch via [`mint_and_send_welcome`], same helper the
+    ///    create path uses.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn resend_admin_welcome(
+        &self,
+        tenant_id: TenantId,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Cross-tenant super-admin read against the RLS-protected `users`
+        // table: run under the tenant GUC so the SELECT sees the row.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let admin: Option<(Uuid, String, String, String, String)> = sqlx::query_as(
+            "SELECT id, email, first_name, last_name, status FROM users \
+             WHERE tenant_id = $1 AND role = 'admin' \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(*tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((admin_id, admin_email, admin_first_name, admin_last_name, status)) = admin
+        else {
+            return Err(AppError::not_found("No admin user found for this tenant"));
+        };
+        if status != "pending" {
+            return Err(AppError::conflict(
+                "Tenant admin has already activated their account; no resend needed",
+            ));
+        }
+        // Slug is on the RLS-exempt `tenants` root row, but reading it under
+        // the same tenant GUC is fine; keeps this in one tx.
+        let slug: String = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+            .bind(*tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        // Invalidate any prior unredeemed setup link so only the freshly
+        // emailed one works. Redeemed rows are deleted at redeem-time so
+        // this DELETE is bounded to at most a handful of pending tokens.
+        sqlx::query("DELETE FROM password_reset_tokens WHERE tenant_id = $1 AND user_id = $2")
+            .bind(*tenant_id)
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "users",
+            Some(admin_id),
+            None,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+
+        // mint_and_send_welcome is best-effort: on dispatch failure the
+        // token is committed but the mail is not queued (same posture as
+        // the create path). A follow-up resend can be triggered.
+        self.mint_and_send_welcome(
+            *tenant_id,
+            admin_id,
+            &admin_email,
+            &admin_first_name,
+            &admin_last_name,
+            &slug,
+        )
+        .await;
+        Ok(())
     }
 
     /// Idempotently seed the PSA per-tenant lookup/config set (ticket statuses,

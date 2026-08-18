@@ -72,6 +72,12 @@ pub fn tenant_routes(
         .route("/{tenant_id}", put(update_tenant))
         .route("/{tenant_id}/suspend", post(suspend_tenant))
         .route("/{tenant_id}/activate", post(activate_tenant))
+        // MAPPS-448: super-admin re-issues the tenant admin's welcome email
+        // (fresh setup token, invalidating any prior unredeemed one).
+        .route(
+            "/{tenant_id}/admin/resend-welcome",
+            post(resend_admin_welcome),
+        )
         .route("/{tenant_id}/usage", get(get_tenant_usage))
         // Audit F5: expose existing service-level module-config helpers
         // over HTTP so the client's settings/integrations page can read
@@ -374,6 +380,24 @@ async fn suspend_tenant(
     state
         .tenant_service
         .suspend_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
+
+    Ok(())
+}
+
+/// MAPPS-448: re-issue the tenant admin's welcome email (super admin only).
+async fn resend_admin_welcome(
+    State(state): State<TenantRouterState>,
+    _super_admin: RequireSuperAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<()> {
+    // SAFETY (PMS-261): super-admin-only path via RequireSuperAdmin; the
+    // arbitrary `tenant_id` is an administrative target, not the caller's
+    // claim, so `from_trusted` is the sanctioned bridge.
+    state
+        .tenant_service
+        .resend_admin_welcome(TenantId::from_trusted(tenant_id), &ctx)
         .await?;
 
     Ok(())
