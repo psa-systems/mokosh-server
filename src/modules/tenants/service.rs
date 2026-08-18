@@ -779,11 +779,48 @@ impl TenantService {
         request: &UpdateTenantRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Tenant> {
+        // MAPPS-449: normalise + validate the requested slug BEFORE the
+        // dynamic query builder runs. Slugify collapses casing / spaces /
+        // punctuation the same way create_tenant does, then the uniqueness
+        // probe rejects a collision with any OTHER tenant. `WHERE ... AND
+        // id != $2` scopes the probe to peer rows, so re-submitting the
+        // same slug is a no-op (idempotent, not a conflict against self).
+        // Empty-post-slugify is a 400 because the extractor at
+        // PortalHostConfig::extract_slug refuses empty labels.
+        let normalized_slug = if let Some(raw) = request.slug.as_deref() {
+            let candidate = slugify(raw);
+            if candidate.is_empty() {
+                return Err(AppError::validation_field(
+                    "slug",
+                    "must contain at least one URL-safe character",
+                ));
+            }
+            let collision: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tenants WHERE slug = $1 AND id != $2)",
+            )
+            .bind(&candidate)
+            .bind(tenant_id)
+            .fetch_one(self.db.migrator_pool())
+            .await?;
+            if collision {
+                return Err(AppError::conflict(
+                    "A tenant with this slug already exists",
+                ));
+            }
+            Some(candidate)
+        } else {
+            None
+        };
+
         let mut query = String::from("UPDATE tenants SET updated_at = NOW()");
         let mut param_idx = 2;
 
         if request.name.is_some() {
             query.push_str(&format!(", name = ${}", param_idx));
+            param_idx += 1;
+        }
+        if normalized_slug.is_some() {
+            query.push_str(&format!(", slug = ${}", param_idx));
             param_idx += 1;
         }
         if request.billing_email.is_some() {
@@ -835,6 +872,9 @@ impl TenantService {
 
         if let Some(ref name) = request.name {
             query_builder = query_builder.bind(name);
+        }
+        if let Some(ref slug) = normalized_slug {
+            query_builder = query_builder.bind(slug);
         }
         if let Some(ref email) = request.billing_email {
             query_builder = query_builder.bind(email);

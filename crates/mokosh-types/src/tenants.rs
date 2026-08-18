@@ -109,6 +109,15 @@ pub struct CreateTenantRequest {
 pub struct UpdateTenantRequest {
     #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
+    /// MAPPS-449: renames the tenant's portal subdomain.
+    /// [`crate::modules::tenants::TenantService::update_tenant`] runs the
+    /// same `slugify()` normalisation `create_tenant` uses and re-checks
+    /// uniqueness against every OTHER tenant. Immediate-404 policy on the
+    /// old slug: no aliasing, no redirect. Pending contact-portal invites
+    /// carrying the old slug in their setup link break loudly; the SPA
+    /// surfaces a warning banner so the super-admin knows to re-send them.
+    #[validate(length(min = 1, max = 100))]
+    pub slug: Option<String>,
     #[validate(email)]
     pub billing_email: Option<String>,
     pub billing_contact_name: Option<String>,

@@ -259,6 +259,7 @@ async fn upload_current_logo(
             tenant_id,
             &UpdateTenantRequest {
                 name: None,
+                slug: None,
                 billing_email: None,
                 billing_contact_name: None,
                 settings: None,
@@ -290,6 +291,7 @@ async fn delete_current_logo(
             tenant_id,
             &UpdateTenantRequest {
                 name: None,
+                slug: None,
                 billing_email: None,
                 billing_contact_name: None,
                 settings: None,
