@@ -28,12 +28,14 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -50,6 +52,13 @@ const DEFAULT_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// relative to the server's CWD; production should set the env to an
 /// absolute path on a mounted volume.
 const DEFAULT_DIR: &str = "./attachments";
+/// PMS-783: an attachment blob is addressed by a v4 uuid and is never rewritten
+/// in place (a replacement is a new row under a new uuid, and `delete_one`
+/// removes it), so the bytes behind one URL are immutable and a year is safe.
+/// `private` because both download routes are authenticated and company-scoped:
+/// no shared cache may keep a copy. Revise the `immutable` half if in-place
+/// replacement is ever added.
+const CACHE_CONTROL_VALUE: &str = "private, max-age=31536000, immutable";
 
 #[derive(Clone, Debug)]
 pub struct AttachmentConfig {
@@ -332,12 +341,15 @@ impl AttachmentService {
         Ok(row.into())
     }
 
-    async fn get(
-        &self,
-        tenant_id: Uuid,
-        attachment_id: Uuid,
-    ) -> AppResult<(AttachmentRow, Vec<u8>)> {
-        let row: AttachmentRow = sqlx::query_as(
+    /// Metadata only: the row, never the blob.
+    ///
+    /// PMS-783: this used to be a `get` that also read the file into a `Vec`,
+    /// which made every caller pay up to `ATTACHMENT_MAX_BYTES` of heap even
+    /// when it only wanted one column (the portal delete's ownership check
+    /// reads `created_by_contact_id` and nothing else). The download handlers
+    /// now stream the blob straight off disk in `attachment_response`.
+    async fn get_row(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<AttachmentRow> {
+        sqlx::query_as(
             "SELECT id, ticket_id, note_id, file_name, file_size, mime_type, \
                     storage_path, uploaded_by_id, created_by_contact_id, created_at \
              FROM ticket_attachments \
@@ -347,11 +359,7 @@ impl AttachmentService {
         .bind(attachment_id)
         .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?
-        .ok_or_else(|| AppError::NotFound("attachment not found".into()))?;
-        let bytes = tokio::fs::read(&row.storage_path)
-            .await
-            .map_err(|e| AppError::Internal(format!("attachment blob missing: {e}")))?;
-        Ok((row, bytes))
+        .ok_or_else(|| AppError::NotFound("attachment not found".into()))
     }
 
     async fn delete_one(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<()> {
@@ -548,16 +556,17 @@ async fn download_agent(
     State(s): State<AttachmentsRouterState>,
     RequireAuth(user): RequireAuth,
     Path((ticket_id, note_id, attachment_id)): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
 ) -> AppResult<Response> {
     let tenant_uuid = user.tenant().get();
     s.service
         .assert_note_in_ticket(tenant_uuid, ticket_id, note_id)
         .await?;
-    let (row, bytes) = s.service.get(tenant_uuid, attachment_id).await?;
+    let row = s.service.get_row(tenant_uuid, attachment_id).await?;
     if row.ticket_id != ticket_id || row.note_id != Some(note_id) {
         return Err(AppError::NotFound("attachment not on this note".into()));
     }
-    Ok(attachment_response(row, bytes))
+    attachment_response(row, &headers).await
 }
 
 async fn delete_agent(
@@ -625,6 +634,7 @@ async fn download_portal(
     State(s): State<AttachmentsRouterState>,
     RequirePortalAuth(contact): RequirePortalAuth,
     Path((ticket_id, note_id, attachment_id)): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
 ) -> AppResult<Response> {
     s.service
         .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
@@ -632,11 +642,11 @@ async fn download_portal(
     s.service
         .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
         .await?;
-    let (row, bytes) = s.service.get(contact.tenant_id, attachment_id).await?;
+    let row = s.service.get_row(contact.tenant_id, attachment_id).await?;
     if row.ticket_id != ticket_id || row.note_id != Some(note_id) {
         return Err(AppError::NotFound("attachment not on this note".into()));
     }
-    Ok(attachment_response(row, bytes))
+    attachment_response(row, &headers).await
 }
 
 async fn delete_portal(
@@ -652,7 +662,8 @@ async fn delete_portal(
         .await?;
     // Portal contacts can only delete their own uploads. Look up the
     // row first to enforce the constraint before delete_one runs.
-    let (row, _) = s.service.get(contact.tenant_id, attachment_id).await?;
+    // PMS-783: the row only, so a delete no longer reads a blob it discards.
+    let row = s.service.get_row(contact.tenant_id, attachment_id).await?;
     if row.created_by_contact_id != Some(contact.id) {
         return Err(AppError::Forbidden(
             "Portal contacts can only delete their own uploads".into(),
@@ -664,18 +675,142 @@ async fn delete_portal(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn attachment_response(row: AttachmentRow, bytes: Vec<u8>) -> Response {
+/// Strong validator for an immutable blob: the uuid that addresses it plus the
+/// size recorded on the row. Deliberately not a content hash, because hashing
+/// would read the whole file to answer a conditional request, which is the very
+/// cost this change removes.
+fn attachment_etag(id: Uuid, file_size: i32) -> String {
+    format!("\"{id}-{file_size}\"")
+}
+
+/// RFC 9110 compares `If-None-Match` with the WEAK function, so `W/"x"` matches
+/// `"x"`, `*` matches any existing representation, and the value may be a list.
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    // A missing or non-ASCII header is "no usable validator", which the
+    // standard lets a server treat as no conditional request at all: the caller
+    // then gets the full 200 it would have got anyway, so nothing is hidden.
+    let Some(raw) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+/// PMS-783: stream the blob and let the client revalidate.
+///
+/// The body is a `ReaderStream` over the open file, so the response holds one
+/// chunk at a time instead of the whole attachment; `content-length` comes from
+/// the row rather than from a buffer. A conditional request that already has
+/// the bytes gets a 304 without the file ever being opened.
+async fn attachment_response(row: AttachmentRow, headers: &HeaderMap) -> AppResult<Response> {
+    let etag = attachment_etag(row.id, row.file_size);
+    if if_none_match_matches(headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::CACHE_CONTROL, CACHE_CONTROL_VALUE.to_string()),
+                (header::ETAG, etag),
+            ],
+        )
+            .into_response());
+    }
+
+    let attachment_id = row.id;
+    let file = tokio::fs::File::open(&row.storage_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("attachment blob missing: {e}")))?;
+    // A read that fails mid-body aborts the response (the declared
+    // content-length is never reached), which the client sees as a truncated
+    // download; log the cause so the failure is diagnosable server-side too.
+    let stream = ReaderStream::new(file).map(move |chunk| {
+        chunk.inspect_err(|e| {
+            tracing::error!(%attachment_id, "attachment stream read failed: {e}");
+        })
+    });
+
     let disposition = format!(
         "attachment; filename=\"{}\"",
         row.file_name.replace('"', "")
     );
-    (
+    Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, row.mime_type),
             (header::CONTENT_DISPOSITION, disposition),
+            (header::CONTENT_LENGTH, row.file_size.to_string()),
+            (header::CACHE_CONTROL, CACHE_CONTROL_VALUE.to_string()),
+            (header::ETAG, etag),
         ],
-        Body::from(bytes),
+        Body::from_stream(stream),
     )
-        .into_response()
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with(if_none_match: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::IF_NONE_MATCH, if_none_match.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn an_etag_is_the_uuid_and_the_size() {
+        let id = Uuid::nil();
+        assert_eq!(
+            attachment_etag(id, 42),
+            "\"00000000-0000-0000-0000-000000000000-42\""
+        );
+        assert_ne!(
+            attachment_etag(id, 42),
+            attachment_etag(id, 43),
+            "a differently-sized blob must not validate against a cached copy"
+        );
+    }
+
+    #[test]
+    fn if_none_match_honours_weak_lists_and_star() {
+        let etag = attachment_etag(Uuid::nil(), 7);
+        assert!(if_none_match_matches(&headers_with(&etag), &etag));
+        assert!(if_none_match_matches(
+            &headers_with(&format!("W/{etag}")),
+            &etag
+        ));
+        assert!(if_none_match_matches(
+            &headers_with(&format!("\"other\", {etag}")),
+            &etag
+        ));
+        assert!(if_none_match_matches(&headers_with("*"), &etag));
+        assert!(!if_none_match_matches(&headers_with("\"other\""), &etag));
+        assert!(
+            !if_none_match_matches(&HeaderMap::new(), &etag),
+            "no header means no conditional request, so never a 304"
+        );
+    }
+
+    #[test]
+    fn a_download_never_buffers_the_whole_blob() {
+        // The finding this file fixes (PMS-783 F6) was a `tokio::fs::read` of
+        // up to ATTACHMENT_MAX_BYTES on every download. Guard the shape, not
+        // just the incident: a re-added whole-file read would compile fine.
+        let source = include_str!("attachments.rs");
+        let body = source
+            .split_once("mod tests {")
+            .expect("this test module")
+            .0;
+        assert!(
+            !body.contains("tokio::fs::read("),
+            "the download path must stream, not read the blob into a Vec"
+        );
+        assert!(
+            body.contains("Body::from_stream("),
+            "the response body must come from a ReaderStream over the open file"
+        );
+    }
 }

@@ -42,6 +42,15 @@ const ALLOWED_MIME: &[(&str, &str)] = &[
 /// email a client receives, so it is a size that has to stay polite.
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 
+/// PMS-783 (F10): the box a rendered logo occupies, in CSS pixels. One pair of
+/// numbers for every renderer: [`super::identity::OrgIdentity::logo_html`] uses
+/// it for both the CSS box and the intrinsic `width` / `height` attributes, so
+/// a client can reserve the space before the bytes arrive instead of reflowing
+/// the message around it. If the box ever moves, a downscale-on-upload step
+/// (PMS-784) takes its target from here too.
+pub const LOGO_BOX_WIDTH: u32 = 220;
+pub const LOGO_BOX_HEIGHT: u32 = 56;
+
 /// Subdirectory under the shared upload root. Sharing the root with attachments
 /// keeps deployments to one mounted volume; the subdirectory keeps a logo from
 /// ever colliding with a `{tenant_id}/{attachment_id}` path.
@@ -135,6 +144,11 @@ impl TenantLogoStore {
     ///
     /// The previous file is removed first, because a format change leaves the
     /// old extension behind and two files for one tenant is one file too many.
+    ///
+    /// PMS-783 decision: the bytes are stored at whatever resolution was
+    /// uploaded, because downscaling means an image decoder in this path and
+    /// that dependency call is a person's, not this change's. Tracked in
+    /// PMS-784; until it lands, `max_bytes` is the only bound on a logo.
     pub async fn store(
         &self,
         tenant_id: Uuid,
