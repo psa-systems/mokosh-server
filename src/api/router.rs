@@ -110,6 +110,10 @@ pub fn create_api_router(
     // main.rs. Only the emailed logo needs it (a mail client cannot resolve a
     // relative src); `None` omits the logo rather than emitting a broken image.
     public_api_base_url: Option<String>,
+    // MAPPS-457: instance-wide tenant creation cap, from MOKOSH_MAX_TENANTS.
+    // `None` = uncapped (production today); `Some(N)` = 409 on further creates
+    // once `SELECT COUNT(*) FROM tenants` reaches N.
+    max_tenants: Option<usize>,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
@@ -153,7 +157,10 @@ pub fn create_api_router(
         // welcome email context carries a computed `client_portal_url`
         // (`{slug}.client.<apex>`). Templates that reference it
         // render the URL inline; templates that don't ignore it.
-        .with_portal_host_suffix(portal_host_config.suffix());
+        .with_portal_host_suffix(portal_host_config.suffix())
+        // MAPPS-457: attach the instance-wide tenant cap. `None` (unset
+        // env) leaves the service uncapped, matching production today.
+        .with_max_tenants(max_tenants);
     // PMS-136: ContactService emails a `/portal/set-password` setup link when
     // an agent grants portal access, so it holds the SPA origin (the link
     // base). PMS-700: that mail is queued through the same `auth.welcome`

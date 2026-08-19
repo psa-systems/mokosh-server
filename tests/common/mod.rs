@@ -270,6 +270,10 @@ async fn boot_with_db(
         // MAPPS-429: a public API base IS configured here, so the request-form
         // suite can assert an emailed logo resolves absolutely.
         Some("http://api.localhost".to_string()),
+        // MAPPS-457: default test router has no tenant cap so integration
+        // suites that spin up dozens of tenants stay unblocked. Cap-behavior
+        // specs override this by building their own router.
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

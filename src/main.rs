@@ -93,6 +93,16 @@ pub struct AppConfig {
     /// PMS-658: opt-in switch for the suspicious-login notify-and-approve gate
     /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
     pub login_approval_enabled: bool,
+    /// MAPPS-457: instance-wide hard cap on how many tenants a super-admin can
+    /// create. Unset (or `<=0`) leaves creation uncapped, matching production
+    /// today. Positive integer rejects further `create_tenant` calls with 409
+    /// once `SELECT COUNT(*) FROM tenants` reaches the value.
+    ///
+    /// Set via `MOKOSH_MAX_TENANTS`. Bumped without a code change so an
+    /// operator can raise the ceiling on the running instance and see the
+    /// effect on the next create call (no restart needed for lowering /
+    /// raising - re-read at each create request).
+    pub max_tenants: Option<usize>,
 }
 
 /// Dev-only fallback for `JWT_SECRET`. Accepted only in dev/test
@@ -309,6 +319,15 @@ impl AppConfig {
             login_approval_enabled: std::env::var("LOGIN_APPROVAL_ENABLED")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
+            // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Empty,
+            // unset, unparseable, or non-positive -> None (uncapped). Positive
+            // usize -> Some(N). The value is threaded into `TenantService` via
+            // its builder so the service layer probes `COUNT(*)` before
+            // insert.
+            max_tenants: std::env::var("MOKOSH_MAX_TENANTS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0),
         })
     }
 
@@ -652,6 +671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::portal::PortalHostConfig::from_env(),
         config.abuse_contact_email,
         config.public_api_base_url,
+        config.max_tenants,
     );
     let router = psa_router;
 

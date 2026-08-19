@@ -1278,6 +1278,246 @@ async fn a_new_tenant_can_actually_send_the_client_facing_email(pool: PgPool) {
     }
 }
 
+/// MAPPS-457: instance-wide creation cap set via `with_max_tenants`. When the
+/// current count is >= cap, `create_tenant` returns `AppError::Conflict` and
+/// commits no rows. Below-cap creates succeed and increment the count.
+#[sqlx::test]
+async fn create_tenant_enforces_max_tenants_cap(pool: PgPool) {
+    // Count the seed tenants the schema ships with so the cap math is against
+    // the real starting point, not a hardcoded expectation.
+    let seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+        .fetch_one(&pool)
+        .await
+        .expect("count seeded tenants");
+    let cap = (seeded as usize) + 1;
+
+    let svc = TenantService::new(Database::from_pool(pool.clone())).with_max_tenants(Some(cap));
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    // First create fits under the cap (count -> cap - 1 + 1 = cap).
+    svc.create_tenant(
+        &CreateTenantRequest {
+            name: "MAPPS-457 Under Cap".into(),
+            slug: "mapps457-under".into(),
+            billing_email: None,
+            billing_contact_name: None,
+            subscription_plan: None,
+            admin_email: "under@example.test".into(),
+            admin_first_name: "Under".into(),
+            admin_last_name: "Cap".into(),
+            branding: None,
+        },
+        &ctx,
+    )
+    .await
+    .expect("first create should succeed (count < cap)");
+
+    // Second create is at cap, must be rejected 409.
+    let err = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "MAPPS-457 Over Cap".into(),
+                slug: "mapps457-over".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "over@example.test".into(),
+                admin_first_name: "Over".into(),
+                admin_last_name: "Cap".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("second create should be rejected at cap");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("cap reached"),
+        "err must name the cap: {msg}"
+    );
+
+    // Row-count guard: the rejected create must not have partially inserted.
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+        .fetch_one(&pool)
+        .await
+        .expect("count after rejection");
+    assert_eq!(
+        after as usize, cap,
+        "rejected create must leave the count at exactly the cap"
+    );
+}
+
+/// MAPPS-457: `with_max_tenants(None)` (unset env) leaves creation uncapped.
+/// Regression guard so future work does not accidentally default to a ceiling.
+#[sqlx::test]
+async fn create_tenant_uncapped_by_default(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone())).with_max_tenants(None);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+    for i in 0..3 {
+        svc.create_tenant(
+            &CreateTenantRequest {
+                name: format!("MAPPS-457 Uncapped {i}"),
+                slug: format!("mapps457-uncapped-{i}"),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: format!("uncapped-{i}@example.test"),
+                admin_first_name: "Un".into(),
+                admin_last_name: "Capped".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("uncapped create {i} should succeed: {e:?}"));
+    }
+}
+
+/// MAPPS-457: two non-personal tenants cannot share a name (case-insensitive).
+/// The second create returns 409 with the documented copy; no rows on the
+/// losing side. Personal tenants are exempt (covered by a peer test below).
+#[sqlx::test]
+async fn create_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    svc.create_tenant(
+        &CreateTenantRequest {
+            name: "Acme Corp".into(),
+            slug: "acme-1".into(),
+            billing_email: None,
+            billing_contact_name: None,
+            subscription_plan: None,
+            admin_email: "acme1@example.test".into(),
+            admin_first_name: "A".into(),
+            admin_last_name: "One".into(),
+            branding: None,
+        },
+        &ctx,
+    )
+    .await
+    .expect("first create succeeds");
+
+    let err = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                // Case-insensitive collision must trip the guard.
+                name: "acme corp".into(),
+                slug: "acme-2".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "acme2@example.test".into(),
+                admin_first_name: "A".into(),
+                admin_last_name: "Two".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("case-insensitive name collision must be rejected");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("name"), "err must mention name: {msg}");
+}
+
+/// MAPPS-457: personal tenants (auto-generated names from user first names) are
+/// exempt from the case-insensitive name uniqueness constraint. Two users named
+/// "Chris" can both provision a "Chris's workspace" tenant.
+#[sqlx::test]
+async fn create_personal_tenant_allows_duplicate_names(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let owner_a = uuid::Uuid::new_v4();
+    let owner_b = uuid::Uuid::new_v4();
+    svc.ensure_personal_tenant(owner_a, Some("Chris"), None)
+        .await
+        .expect("first personal tenant provisions");
+    svc.ensure_personal_tenant(owner_b, Some("Chris"), None)
+        .await
+        .expect("second personal tenant with the same auto-generated name still provisions");
+}
+
+/// MAPPS-457: rename via `update_tenant` also enforces case-insensitive
+/// uniqueness against every OTHER non-personal tenant; renaming to the row's
+/// own name is a no-op (idempotent).
+#[sqlx::test]
+async fn update_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::tenants::UpdateTenantRequest;
+
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let a = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Bravo LLC".into(),
+                slug: "bravo".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "bravo@example.test".into(),
+                admin_first_name: "B".into(),
+                admin_last_name: "One".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("create A");
+    let b = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Charlie LLC".into(),
+                slug: "charlie".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "charlie@example.test".into(),
+                admin_first_name: "C".into(),
+                admin_last_name: "One".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("create B");
+
+    // Renaming B to A's name (case-insensitively) must be rejected.
+    let err = svc
+        .update_tenant(
+            TenantId::from_trusted(b.id),
+            &UpdateTenantRequest {
+                name: Some("bravo llc".into()),
+                slug: None,
+                billing_email: None,
+                billing_contact_name: None,
+                settings: None,
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("cross-row rename to a peer's name must be rejected");
+    assert!(format!("{err:?}").contains("name"));
+
+    // Renaming A to its own current name (case flipped) is a no-op, not a
+    // conflict against self.
+    svc.update_tenant(
+        TenantId::from_trusted(a.id),
+        &UpdateTenantRequest {
+            name: Some("BRAVO LLC".into()),
+            slug: None,
+            billing_email: None,
+            billing_contact_name: None,
+            settings: None,
+            branding: None,
+        },
+        &ctx,
+    )
+    .await
+    .expect("self-rename is idempotent");
+}
+
 /// Migration 104: the seeded ticket-note copy names the organisation. The keys
 /// are supplied by `TicketsService::send_note_email`; an unresolved one would
 /// reach the client as literal braces, so template and context are asserted

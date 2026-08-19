@@ -110,6 +110,14 @@ pub struct TenantService {
     /// reference it as `{{client_portal_url}}` when they want to
     /// tell the admin where to send their clients).
     portal_host_suffix: Option<String>,
+    /// MAPPS-457: instance-wide hard ceiling on total tenants. `None`
+    /// leaves creation uncapped (production default). `Some(N)` makes
+    /// [`create_tenant`] probe `SELECT COUNT(*) FROM tenants` before
+    /// insert and return 409 when the current count is >= N. The value
+    /// is re-read from `self` on every create call, so raising / lowering
+    /// the env at boot re-boots into the new ceiling with no restart of
+    /// downstream services.
+    max_tenants: Option<usize>,
 }
 
 impl TenantService {
@@ -119,6 +127,7 @@ impl TenantService {
             notifications: None,
             frontend_base_url: None,
             portal_host_suffix: None,
+            max_tenants: None,
         }
     }
 
@@ -151,6 +160,16 @@ impl TenantService {
         self
     }
 
+    /// MAPPS-457: attach an instance-wide tenant creation cap. `None`
+    /// leaves creation uncapped; `Some(N)` (N > 0) makes
+    /// [`create_tenant`] return `AppError::Conflict` once the tenants
+    /// row count reaches N.
+    #[must_use]
+    pub fn with_max_tenants(mut self, cap: Option<usize>) -> Self {
+        self.max_tenants = cap.filter(|n| *n > 0);
+        self
+    }
+
     /// Create a new tenant
     #[tracing::instrument(skip_all)]
     pub async fn create_tenant(
@@ -172,6 +191,40 @@ impl TenantService {
 
         if exists {
             return Err(AppError::conflict("A tenant with this slug already exists"));
+        }
+
+        // MAPPS-457: enforce instance-wide tenant creation cap when
+        // `MOKOSH_MAX_TENANTS` is configured. Count is on the migrator
+        // pool for the same RLS-exempt reason the uniqueness probe uses.
+        // Skipped entirely when uncapped so the common case does not
+        // pay for an extra COUNT(*).
+        if let Some(cap) = self.max_tenants {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+                .fetch_one(self.db.migrator_pool())
+                .await?;
+            if (count as usize) >= cap {
+                return Err(AppError::conflict(format!(
+                    "Tenant creation cap reached ({cap}); contact your operator to raise MOKOSH_MAX_TENANTS."
+                )));
+            }
+        }
+
+        // MAPPS-457: enforce case-insensitive name uniqueness across
+        // non-personal tenants. The DB-level partial unique index (see
+        // migration `..._tenants_unique_name`) is the ultimate guard;
+        // this probe just yields a nicer error message than the raw
+        // sqlx unique-violation. Personal tenants have auto-generated
+        // names ("Chris's workspace") that can genuinely collide, so
+        // they are exempt from both this probe and the index.
+        let name_taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tenants \
+             WHERE LOWER(name) = LOWER($1) AND personal_owner_id IS NULL)",
+        )
+        .bind(&request.name)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if name_taken {
+            return Err(AppError::conflict("A tenant with this name already exists"));
         }
 
         // Create tenant
@@ -779,6 +832,26 @@ impl TenantService {
         request: &UpdateTenantRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Tenant> {
+        // MAPPS-457: rename collision guard. Same case-insensitive
+        // "non-personal-only" scope as create_tenant, plus `id != $2`
+        // so re-submitting the same name against the same row is a
+        // no-op (idempotent, not a conflict against self).
+        if let Some(new_name) = request.name.as_deref() {
+            let collision: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tenants \
+                 WHERE LOWER(name) = LOWER($1) AND id != $2 AND personal_owner_id IS NULL)",
+            )
+            .bind(new_name)
+            .bind(tenant_id)
+            .fetch_one(self.db.migrator_pool())
+            .await?;
+            if collision {
+                return Err(AppError::conflict(
+                    "A tenant with this name already exists",
+                ));
+            }
+        }
+
         // MAPPS-449: normalise + validate the requested slug BEFORE the
         // dynamic query builder runs. Slugify collapses casing / spaces /
         // punctuation the same way create_tenant does, then the uniqueness
