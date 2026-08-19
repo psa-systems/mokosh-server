@@ -105,7 +105,15 @@ pub fn dec(s: &str) -> Decimal {
 #[allow(dead_code)]
 pub async fn boot(pool: PgPool) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None, None, portal_host_disabled()).await
+    boot_with_db(
+        pool,
+        db,
+        None,
+        None,
+        portal_host_disabled(),
+        agent_host_disabled(),
+    )
+    .await
 }
 
 /// PMS-729: bring up the API with a specific `PortalHostConfig` (built
@@ -117,7 +125,35 @@ pub async fn boot_with_portal_host(
     portal_host_config: mokosh_server::modules::portal::PortalHostConfig,
 ) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None, None, portal_host_config).await
+    boot_with_db(
+        pool,
+        db,
+        None,
+        None,
+        portal_host_config,
+        agent_host_disabled(),
+    )
+    .await
+}
+
+/// MAPPS-473: bring up the API with a specific `AgentHostConfig`, so a
+/// host-derived-agent-login test can exercise the extractor without
+/// mutating the process env. Portal side stays disabled.
+#[allow(dead_code)]
+pub async fn boot_with_agent_host(
+    pool: PgPool,
+    agent_host_config: mokosh_server::modules::auth::AgentHostConfig,
+) -> TestApp {
+    let db = Database::from_pool(pool.clone());
+    boot_with_db(
+        pool,
+        db,
+        None,
+        None,
+        portal_host_disabled(),
+        agent_host_config,
+    )
+    .await
 }
 
 /// PMS-698: bring up the API with the bunyip Resource-Server verifier mounted,
@@ -128,7 +164,15 @@ pub async fn boot_with_bunyip(
     verifier: mokosh_server::modules::auth::oidc_rs::Verifier,
 ) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None, Some(verifier), portal_host_disabled()).await
+    boot_with_db(
+        pool,
+        db,
+        None,
+        Some(verifier),
+        portal_host_disabled(),
+        agent_host_disabled(),
+    )
+    .await
 }
 
 /// The default `PortalHostConfig` for tests that do not care about the
@@ -137,6 +181,15 @@ pub async fn boot_with_bunyip(
 #[allow(dead_code)]
 fn portal_host_disabled() -> mokosh_server::modules::portal::PortalHostConfig {
     mokosh_server::modules::portal::PortalHostConfig::from_suffix("")
+}
+
+/// MAPPS-473: default `AgentHostConfig` for tests that do not care about
+/// host-based agent-tenant derivation. Empty suffix disables the feature
+/// (matches pre-MAPPS-473 behaviour where a login body always carried
+/// its own tenant_slug or tenant_id).
+#[allow(dead_code)]
+fn agent_host_disabled() -> mokosh_server::modules::auth::AgentHostConfig {
+    mokosh_server::modules::auth::AgentHostConfig::from_suffix("")
 }
 
 /// PMS-285: bring up the API with the request-serving connection running as an
@@ -153,7 +206,15 @@ fn portal_host_disabled() -> mokosh_server::modules::portal::PortalHostConfig {
 pub async fn boot_rls(pool: PgPool) -> TestApp {
     let app_pool = build_app_role_pool(&pool).await;
     let db = Database::from_pools(app_pool.clone(), pool.clone());
-    boot_with_db(pool, db, Some(app_pool), None, portal_host_disabled()).await
+    boot_with_db(
+        pool,
+        db,
+        Some(app_pool),
+        None,
+        portal_host_disabled(),
+        agent_host_disabled(),
+    )
+    .await
 }
 
 /// Create a per-test `NOSUPERUSER NOBYPASSRLS` role, grant it the same
@@ -211,6 +272,7 @@ async fn boot_with_db(
     app_pool: Option<PgPool>,
     bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
     portal_host_config: mokosh_server::modules::portal::PortalHostConfig,
+    agent_host_config: mokosh_server::modules::auth::AgentHostConfig,
 ) -> TestApp {
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
@@ -263,6 +325,7 @@ async fn boot_with_db(
         None,  // BUNYIP-475: no IP2Proxy DB in tests; enrichment lookup reports nothing
         false, // PMS-658: login-approval gate off in the default test router
         portal_host_config, // PMS-729: caller supplies the portal host config
+        agent_host_config,  // MAPPS-473: caller supplies the agent host config
         // PMS-748: an abuse address IS configured here, so the request-form
         // suite can assert the notice appears; the unconfigured case is a unit
         // test on the composition itself.

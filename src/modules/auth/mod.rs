@@ -4,6 +4,7 @@
 
 #[cfg(feature = "server")]
 pub mod bootstrap;
+pub mod host_tenant;
 // PMS-591: receiver for Bunyip's `account_deleted` webhook. Wired outside
 // the JWT auth chain in `create_api_router`.
 #[cfg(feature = "server")]
@@ -51,3 +52,4 @@ pub use service::{MOKOSH_JWT_AUDIENCE, MOKOSH_JWT_ISSUER};
 #[cfg(feature = "server")]
 pub(crate) use service::{synthetic_name_from_email, SYNTHETIC_NAME_FALLBACK};
 pub use tenant::{TenantId, TenantScoped};
+pub use host_tenant::AgentHostConfig;

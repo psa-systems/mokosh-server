@@ -669,6 +669,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ip_enrich,
         config.login_approval_enabled,
         mokosh_server::modules::portal::PortalHostConfig::from_env(),
+        mokosh_server::modules::auth::AgentHostConfig::from_env(),
         config.abuse_contact_email,
         config.public_api_base_url,
         config.max_tenants,

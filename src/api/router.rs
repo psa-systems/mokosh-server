@@ -103,6 +103,13 @@ pub fn create_api_router(
     // empty suffix keeps the feature off; the login handler then reads the
     // slug from the body exactly like the pre-PMS-729 path.
     portal_host_config: crate::modules::portal::PortalHostConfig,
+    // MAPPS-473 (PMS-728 followup): host-to-tenant resolution config for
+    // the AGENT-side admin login. Deploying at `{slug}.msp.<apex>` +
+    // setting `AGENT_HOST_SUFFIX=.msp.<apex>` lets the login handler pull
+    // the tenant slug from the browser Host so no operator types it.
+    // Empty suffix keeps the feature off; the standalone form's slug
+    // input remains the fallback.
+    agent_host_config: crate::modules::auth::AgentHostConfig,
     // PMS-748: address a client can report an unwanted request-form email to,
     // from ABUSE_CONTACT_EMAIL in main.rs. `None` drops the line from the mail
     // rather than pointing it at the noreply from-address.
@@ -328,6 +335,7 @@ pub fn create_api_router(
                 client_origin.clone(),
                 jwt_secret.clone(),
                 cookie_secure,
+                agent_host_config.clone(),
             ),
         )
         // Tenant management. Only mounted in multi-tenant builds: in a
