@@ -470,10 +470,20 @@ pub async fn seed_tenant_with_admin(
 /// [`seed_admin`]: not every integration-test binary authenticates.
 #[allow(dead_code)]
 pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
+    // PMS-728 AC1: the local password path rejects a credential presented
+    // without an explicit tenant identifier. This helper backs the whole
+    // suite's default-admin login path (which uses `seed_admin`, populating
+    // the default tenant, slug `default`, seeded by migration 002), so
+    // threading the slug in here keeps the change localised: the callers
+    // don't need to know the tenant lookup semantics.
     let resp = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "default",
+        }))
         .send()
         .await
         .expect("send /login request");

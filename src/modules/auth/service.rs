@@ -591,11 +591,10 @@ impl AuthService {
         let audit_ip = ip_address.clone();
         let audit_ua = user_agent.clone();
 
-        // PMS-138: bind the lookup to (tenant_id, email), falling
-        // back to the default tenant when the SPA didn't supply a
-        // hint. Replaces the prior email-only lookup with
-        // `ORDER BY created_at ASC LIMIT 1` tiebreaker that silently
-        // routed multi-tenant collisions to the wrong account.
+        // PMS-138: bind the lookup to (tenant_id, email). Replaces
+        // the prior email-only lookup with `ORDER BY created_at ASC
+        // LIMIT 1` tiebreaker that silently routed multi-tenant
+        // collisions to the wrong account.
         //
         // MAPPS-396: the standalone login form types a tenant slug
         // (e.g. `acme`) rather than a UUID, so the request may carry
@@ -605,6 +604,19 @@ impl AuthService {
         // host-derived hint is not silently overridden by a mistyped
         // slug. Falls closed (401) on an unknown or suspended slug so
         // the endpoint cannot enumerate valid tenants.
+        //
+        // PMS-728 AC1: the local password path now REJECTS a
+        // credential presented without an explicit tenant identifier.
+        // The historical fallback to the default tenant
+        // (`00000000-0000-0000-0000-000000000001`) let a bare
+        // email/password reach the default tenant's admin bootstrap
+        // by accident; making the identifier mandatory closes that
+        // seam and matches how `PortalAuthService::login` already
+        // resolves its tenant. Google OAuth (`login_with_google`) is
+        // unaffected: its JIT path still uses
+        // `resolve_tenant_for_login(None)` deliberately, so that
+        // helper is left untouched and only this local-password
+        // branch takes the stricter posture.
         let tenant_hint = match request.tenant_id {
             Some(id) => Some(id),
             None => match request.tenant_slug.as_deref().map(str::trim) {
@@ -612,7 +624,12 @@ impl AuthService {
                 _ => None,
             },
         };
-        let tenant_id = Self::resolve_tenant_for_login(tenant_hint);
+        let Some(tenant_id) = tenant_hint else {
+            // Fail-closed with the same 401 shape as a bad-password
+            // outcome so the endpoint does not distinguish "no tenant
+            // identifier" from "wrong credentials" to an unauth caller.
+            return Err(AppError::Unauthorized);
+        };
         let user = self
             .find_user_by_email_for_tenant(tenant_id, &request.email)
             .await?;

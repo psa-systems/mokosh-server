@@ -495,7 +495,7 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
     let resp = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }))
         .send()
         .await
         .expect("send login without mfa");
@@ -514,6 +514,7 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": code_now,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -578,6 +579,7 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": first,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -598,6 +600,7 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": first,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -616,6 +619,7 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": second,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -684,6 +688,7 @@ async fn mfa_totp_code_cannot_be_replayed(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": code,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -703,6 +708,7 @@ async fn mfa_totp_code_cannot_be_replayed(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": code,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -742,6 +748,7 @@ async fn mfa_failed_codes_lock_account(pool: PgPool) {
                 "email": email,
                 "password": password,
                 "mfa_code": bad,
+                "tenant_slug": "default",
             }))
             .send()
             .await
@@ -779,6 +786,7 @@ async fn mfa_failed_codes_lock_account(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": fresh,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -812,10 +820,16 @@ async fn seed_mfa_enabled(pool: &PgPool, user_id: Uuid) -> Vec<u8> {
 }
 
 fn login_request(email: &str, password: &str, mfa_code: &str) -> LoginRequest {
+    // PMS-728 AC1: the local password path rejects a credential
+    // presented without an explicit tenant identifier. The seed admin
+    // used by this suite lives in the default tenant (slug `default`,
+    // seeded by migration 002), so tests thread that slug in unchanged
+    // rather than papering over the guard with `tenant_id`.
     serde_json::from_value(serde_json::json!({
         "email": email,
         "password": password,
         "mfa_code": mfa_code,
+        "tenant_slug": "default",
     }))
     .expect("build LoginRequest")
 }
@@ -969,10 +983,13 @@ async fn mfa_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
 // ============================================================================
 
 fn recovery_login_request(email: &str, password: &str, recovery_code: &str) -> LoginRequest {
+    // PMS-728 AC1: see `login_request` above; the seed admin lives in
+    // the default tenant so the local login path resolves via that slug.
     serde_json::from_value(serde_json::json!({
         "email": email,
         "password": password,
         "recovery_code": recovery_code,
+        "tenant_slug": "default",
     }))
     .expect("build recovery LoginRequest")
 }
@@ -1103,6 +1120,7 @@ async fn recovery_code_success_clears_mfa_counters(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": recovery,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -1153,6 +1171,7 @@ async fn login_wrong_password_returns_401(pool: PgPool) {
         .json(&serde_json::json!({
             "email": email,
             "password": "definitely-not-the-password",
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -1179,6 +1198,7 @@ async fn login_rate_limit_triggers_429(pool: PgPool) {
     let bad = serde_json::json!({
         "email": email,
         "password": "wrong-password",
+        "tenant_slug": "default",
     });
 
     // First 5 attempts: 401 (within quota).
@@ -1338,11 +1358,17 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
     );
 }
 
-/// PMS-138 backward compat: clients that omit `tenant_id` continue to
-/// land in the default tenant, so single-tenant deployments and any
-/// existing SPA that has not yet been updated keep working.
+/// PMS-728 AC1: rejects a credential presented with NO tenant identifier
+/// (neither `tenant_id` nor `tenant_slug`). Supersedes the pre-PMS-728
+/// backward-compat behavior where an omitted hint fell back to the
+/// default tenant - that fallback let a bare email/password reach the
+/// default tenant's admin bootstrap by accident, and every tenant-local
+/// login must now name the tenant it targets. The response shape is the
+/// same 401 the endpoint returns for a wrong password, so the endpoint
+/// does not distinguish "no tenant hint" from "bad credentials" to an
+/// unauthenticated caller.
 #[sqlx::test]
-async fn login_omitting_tenant_id_falls_back_to_default(pool: PgPool) {
+async fn login_omitting_tenant_hint_401s(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
 
@@ -1355,17 +1381,11 @@ async fn login_omitting_tenant_id_falls_back_to_default(pool: PgPool) {
         }))
         .send()
         .await
-        .expect("send login (no tenant_id)");
+        .expect("send login (no tenant hint)");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::OK,
-        "login must succeed when tenant_id is omitted (default-tenant fallback)"
-    );
-    let body: serde_json::Value = resp.json().await.expect("login body");
-    assert_eq!(
-        body["user"]["tenant_id"].as_str(),
-        Some(common::DEFAULT_TENANT_ID.to_string().as_str()),
-        "omitted tenant_id must resolve to the default tenant"
+        reqwest::StatusCode::UNAUTHORIZED,
+        "login without tenant_id or tenant_slug must 401 (PMS-728: no more default-tenant fallback)"
     );
 }
 
@@ -1951,7 +1971,7 @@ async fn reset_password_changes_password_and_revokes_sessions(pool: PgPool) {
     let old_login = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }))
         .send()
         .await
         .expect("send old-password login");
@@ -2299,7 +2319,7 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
     let old = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }))
         .send()
         .await
         .expect("send old-password login");
