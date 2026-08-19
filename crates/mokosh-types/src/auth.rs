@@ -263,6 +263,16 @@ pub struct CurrentUser {
     /// `None` keeps old responses / fixtures deserialising cleanly.
     #[serde(default)]
     pub own_company_id: Option<Uuid>,
+    /// PMS-791 / MAPPS-462: the owning tenant's `kind` column, one of
+    /// `"org"` or `"personal"`. Threaded onto the session bootstrap so
+    /// the SPA can gate org-only features (Teams nav, invitation flows)
+    /// without a second round-trip. `#[serde(default)]` keeps the wire
+    /// backward-compatible: an older server that omits the field
+    /// deserialises to `""`, and the SPA's `is_org_tenant()` helper
+    /// defaults to `true` on empty (safe: the server-side authorization
+    /// still gates the actual endpoints).
+    #[serde(default)]
+    pub tenant_kind: String,
 }
 
 impl CurrentUser {
@@ -342,6 +352,11 @@ pub struct User {
     /// user-load queries. See [`CurrentUser::own_company_id`].
     #[serde(default)]
     pub own_company_id: Option<Uuid>,
+    /// PMS-791 / MAPPS-462: the owning tenant's `kind` column, populated by
+    /// the same correlated-subquery pattern as `own_company_id` above. See
+    /// [`CurrentUser::tenant_kind`].
+    #[serde(default)]
+    pub tenant_kind: String,
 }
 
 impl User {
@@ -361,6 +376,7 @@ impl User {
             theme_base_mode: self.theme_base_mode.clone(),
             theme_accent_id: self.theme_accent_id.clone(),
             own_company_id: self.own_company_id,
+            tenant_kind: self.tenant_kind.clone(),
         }
     }
 }

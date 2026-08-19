@@ -1235,7 +1235,8 @@ impl AuthService {
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
+                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
             FROM users
             WHERE tenant_id = $1 AND email = $2
             "#,
@@ -2245,7 +2246,8 @@ impl AuthService {
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
+                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
             FROM users
             WHERE {data_where}
             ORDER BY {order_by}
@@ -2388,7 +2390,8 @@ impl AuthService {
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, password_changed_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
+                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
             FROM users
             -- PMS-591: a tombstoned user (deleted via the Bunyip
             -- account_deleted webhook) reads as NotFound so every
@@ -2672,7 +2675,8 @@ impl AuthService {
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
+                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
             FROM users
             WHERE tenant_id = $1 AND email = $2
             "#,
@@ -3129,6 +3133,12 @@ struct UserRow {
     // subquery against `tenants` in each user-load query (tenant-scoped, not a
     // `users` column).
     own_company_id: Option<Uuid>,
+    // PMS-791 / MAPPS-462: the owning tenant's `kind` column, pulled in by
+    // the same correlated-subquery pattern. `#[sqlx(default)]` so the JIT
+    // placement path in middleware (which constructs a UserRow from claims,
+    // not a live SELECT) does not have to know about this column.
+    #[sqlx(default)]
+    tenant_kind: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -3165,6 +3175,7 @@ impl From<UserRow> for User {
             password_changed_at: row.password_changed_at,
             profile_completed_at: row.profile_completed_at,
             own_company_id: row.own_company_id,
+            tenant_kind: row.tenant_kind.unwrap_or_default(),
         }
     }
 }

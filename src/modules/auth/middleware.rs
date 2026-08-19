@@ -1001,6 +1001,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: String::new(),
         }
     }
 

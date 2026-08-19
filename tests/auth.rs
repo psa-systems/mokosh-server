@@ -29,6 +29,86 @@ use mokosh_server::utils::error::AppError;
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
 
+/// PMS-791 / MAPPS-462: /auth/me carries `tenant_kind` from the tenants
+/// row so the SPA can gate org-only features without a second round-trip.
+/// Default tenant seeded by migration 002 is `kind='org'`; separately-seeded
+/// tenants with `kind='personal'` also round-trip correctly.
+#[sqlx::test]
+async fn current_user_carries_tenant_kind_org(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let me: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me")
+        .json()
+        .await
+        .expect("/me json");
+    assert_eq!(
+        me["tenant_kind"].as_str(),
+        Some("org"),
+        "seeded default tenant is kind='org'"
+    );
+}
+
+#[sqlx::test]
+async fn current_user_carries_tenant_kind_personal(pool: PgPool) {
+    // Seed a personal tenant + a user in it so /me returns "personal".
+    let personal_owner = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind, personal_owner_id) \
+         VALUES ($1, 'Personal', 'personal-mapps462', 'active', 'personal', $2)",
+    )
+    .bind(tenant_id)
+    .bind(personal_owner)
+    .execute(&pool)
+    .await
+    .expect("seed personal tenant");
+    let (_user_id, email, password) =
+        common::seed_user(&pool, tenant_id, "personal-user@example.com", "admin").await;
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "personal-mapps462",
+        }))
+        .send()
+        .await
+        .expect("send login");
+    assert!(resp.status().is_success(), "login should succeed");
+    let body: serde_json::Value = resp.json().await.expect("login json");
+    let token = body["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+
+    let me: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me")
+        .json()
+        .await
+        .expect("/me json");
+    assert_eq!(
+        me["tenant_kind"].as_str(),
+        Some("personal"),
+        "seeded personal tenant is kind='personal'"
+    );
+}
+
 #[sqlx::test]
 async fn login_then_me_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
