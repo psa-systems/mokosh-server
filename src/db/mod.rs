@@ -10,3 +10,8 @@ pub use pool::{Database, TenantTransaction};
 // `main` before `Database::new` and migrations.
 #[cfg(feature = "server")]
 pub mod provision;
+
+// MAPPS-475 (MAPPS-474 phase 1): read helpers over `identities` and
+// `tenant_memberships`. Not wired into any handler yet; phase 2 consumes them.
+#[cfg(feature = "server")]
+pub mod identity;
