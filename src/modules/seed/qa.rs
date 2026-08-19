@@ -1273,6 +1273,9 @@ fn qa_appointment_specs(
                 timezone: "UTC".to_string(),
                 location: Some("Client site".to_string()),
                 recurrence_rule: None,
+                // PMS-791 phase 3: QA seed leaves team_id empty; QA
+                // tenants have no teams provisioned yet.
+                team_id: None,
             }
         })
         .collect()

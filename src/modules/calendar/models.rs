@@ -68,6 +68,11 @@ pub struct CreateAppointmentRequest {
     /// materialised as rows. A `DTSTART` line is NOT expected here - the
     /// series is anchored on this appointment's `start_time`.
     pub recurrence_rule: Option<String>,
+    /// PMS-791 phase 3 / MAPPS-464: optional team routing. `appointments.team_id`
+    /// column has existed since migration 008 but was unused until this ticket.
+    /// Nullable; personal tenants leave it empty.
+    #[serde(default)]
+    pub team_id: Option<Uuid>,
 }
 
 fn default_other() -> String {
@@ -98,6 +103,13 @@ pub struct UpdateAppointmentRequest {
     pub timezone: Option<String>,
     pub status: Option<String>,
     pub location: Option<String>,
+    /// PMS-791 phase 3 / MAPPS-464: team reassign; `None` = unchanged.
+    /// Explicit null on the wire (`Option<Option<Uuid>>` shape via
+    /// `#[serde(default, deserialize_with = ...)]`) would let a caller
+    /// clear the team; not offered in phase 3 to keep the shape simple.
+    /// Follow-up if a customer asks.
+    #[serde(default)]
+    pub team_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]

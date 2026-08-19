@@ -15,8 +15,9 @@
 
 mod common;
 
-use common::{boot, login, seed_admin};
+use common::{boot, login, seed_admin, seed_team, seed_tenant_with_admin};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Book a one-off appointment, then assert the bounded range query
 /// (`GET /api/v1/appointments?from&to`) returns it unchanged with no
@@ -503,4 +504,139 @@ async fn dispatch_view_aggregates_the_range(pool: PgPool) {
     );
     assert_eq!(tos[0]["status"].as_str(), Some("approved"));
     assert_eq!(tos[0]["id"].as_str(), Some(approved_to_id));
+}
+
+// ============================================================================
+// PMS-791 phase 3 / MAPPS-464: appointments carry team_id
+// ============================================================================
+
+/// PMS-791 phase 3: an appointment created with `team_id` set persists the
+/// column; readback + list response both surface it. Pre-phase-3 this
+/// column existed (migration 008) but no writer populated it.
+#[sqlx::test]
+async fn create_appointment_with_team_id_persists(pool: PgPool) {
+    let (admin_id, email, password) = seed_admin(&pool).await;
+    let team_id = seed_team(&pool, common::DEFAULT_TENANT_ID, "Field Techs", Some(admin_id)).await;
+    let app = boot(pool.clone()).await;
+    let token = login(&app, &email, &password).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/appointments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Team-routed visit",
+            "assigned_to_id": admin_id,
+            "start_time": "2026-03-02T09:00:00Z",
+            "end_time": "2026-03-02T10:00:00Z",
+            "team_id": team_id,
+        }))
+        .send()
+        .await
+        .expect("send create")
+        .json()
+        .await
+        .expect("create json");
+    assert_eq!(
+        created["team_id"].as_str(),
+        Some(team_id.to_string().as_str()),
+        "created appointment carries team_id"
+    );
+
+    let stored: Option<Uuid> =
+        sqlx::query_scalar("SELECT team_id FROM appointments WHERE id = $1::uuid")
+            .bind(created["id"].as_str().unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("read team_id back from db");
+    assert_eq!(
+        stored,
+        Some(team_id),
+        "team_id persisted on the appointments row"
+    );
+}
+
+/// PMS-791 phase 3 (F1 mirror): an appointment created with a `team_id`
+/// belonging to another tenant is rejected 400, mirroring the ticket-side
+/// PMS-406 pattern. The `validate_fk_opt(tenant_id, "teams", ...)` guard
+/// in CalendarService::create_appointment is what catches it.
+#[sqlx::test]
+async fn create_appointment_with_wrong_tenant_team_id_returns_400(pool: PgPool) {
+    let (admin_id, email, password) = seed_admin(&pool).await;
+    // Team lives in a DIFFERENT tenant.
+    let (tenant_b, _uid, _e, _p) =
+        seed_tenant_with_admin(&pool, "wrong-tenant-appt-team").await;
+    let stranger_team = seed_team(&pool, tenant_b, "Foreign Team", None).await;
+    let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/appointments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Should not persist",
+            "assigned_to_id": admin_id,
+            "start_time": "2026-03-02T09:00:00Z",
+            "end_time": "2026-03-02T10:00:00Z",
+            "team_id": stranger_team,
+        }))
+        .send()
+        .await
+        .expect("send create");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "cross-tenant team_id must be rejected"
+    );
+}
+
+/// PMS-791 phase 3: an update carrying `team_id` reassigns the
+/// appointment to the new team. COALESCE semantics: omitting the field
+/// leaves the stored team unchanged; sending a value overwrites.
+#[sqlx::test]
+async fn update_appointment_with_team_id_reassigns(pool: PgPool) {
+    let (admin_id, email, password) = seed_admin(&pool).await;
+    let team_a = seed_team(&pool, common::DEFAULT_TENANT_ID, "Alpha team", None).await;
+    let team_b = seed_team(&pool, common::DEFAULT_TENANT_ID, "Bravo team", None).await;
+    let app = boot(pool.clone()).await;
+    let token = login(&app, &email, &password).await;
+
+    // Create with team A.
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/appointments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Reassign me",
+            "assigned_to_id": admin_id,
+            "start_time": "2026-03-02T09:00:00Z",
+            "end_time": "2026-03-02T10:00:00Z",
+            "team_id": team_a,
+        }))
+        .send()
+        .await
+        .expect("create")
+        .json()
+        .await
+        .unwrap();
+    let appt_id = created["id"].as_str().unwrap();
+
+    // Reassign to team B.
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/appointments/{appt_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "team_id": team_b }))
+        .send()
+        .await
+        .expect("update");
+    assert!(resp.status().is_success(), "update must succeed");
+
+    let stored: Uuid = sqlx::query_scalar("SELECT team_id FROM appointments WHERE id = $1::uuid")
+        .bind(appt_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read team_id after update");
+    assert_eq!(stored, team_b, "team_id reassigned to team B");
 }
