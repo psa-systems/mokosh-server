@@ -129,12 +129,17 @@ async fn invited_user_lands_in_inviting_tenant_as_admin(pool: PgPool) {
     assert_eq!(still_pending, 0, "invite accepted on placement");
 }
 
+/// MAPPS-458 (PMS-728 slice 2): a Bunyip-authenticated identity with no
+/// existing `users` row and no pending invitation is REJECTED. Bunyip is
+/// no longer an onboarding surface: fresh users arrive via the explicit
+/// invitations flow. Supersedes the pre-MAPPS-458
+/// `uninvited_user_gets_their_own_personal_tenant` behavior.
 #[sqlx::test]
-async fn uninvited_user_gets_their_own_personal_tenant(pool: PgPool) {
+async fn uninvited_bunyip_user_without_invite_is_rejected(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
     let sub = Uuid::new_v4();
-    place_bunyip_user(
+    let state = place_bunyip_user(
         &auth,
         Some(&tenants),
         Some(&invitations),
@@ -145,33 +150,35 @@ async fn uninvited_user_gets_their_own_personal_tenant(pool: PgPool) {
         None,
         &claims(sub, None),
     )
-    .await
-    .expect("placed");
+    .await;
 
-    let (tenant, _role) = user_tenant_role(&pool, sub).await;
-    assert_ne!(
-        tenant,
-        common::DEFAULT_TENANT_ID,
-        "self-signup user is not put in the shared default tenant"
+    assert!(
+        state.is_none(),
+        "uninvited non-platform-admin must be rejected, not silently provisioned"
     );
-    let (kind, owner): (String, Option<Uuid>) =
-        sqlx::query_as("SELECT kind, personal_owner_id FROM tenants WHERE id = $1")
-            .bind(tenant)
-            .fetch_one(&pool)
-            .await
-            .expect("tenant");
-    assert_eq!(kind, "personal");
-    assert_eq!(owner, Some(sub), "the personal tenant is owned by the user");
+
+    // No user row exists.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
+        .bind(sub)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        count, 0,
+        "no `users` row is inserted for a rejected placement"
+    );
 }
 
+/// MAPPS-458: two uninvited (non-platform-admin) Bunyip users both get
+/// rejected. Neither gets a personal tenant. Supersedes the pre-MAPPS-458
+/// `two_uninvited_users_are_isolated_in_distinct_tenants` behavior.
 #[sqlx::test]
-async fn two_uninvited_users_are_isolated_in_distinct_tenants(pool: PgPool) {
+async fn two_uninvited_bunyip_users_are_both_rejected(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    for (sub, em) in [(a, "a@example.com"), (b, "b@example.com")] {
-        place_bunyip_user(
+    for em in ["a@example.com", "b@example.com"] {
+        let sub = Uuid::new_v4();
+        let state = place_bunyip_user(
             &auth,
             Some(&tenants),
             Some(&invitations),
@@ -182,16 +189,9 @@ async fn two_uninvited_users_are_isolated_in_distinct_tenants(pool: PgPool) {
             None,
             &claims(sub, None),
         )
-        .await
-        .expect("placed");
+        .await;
+        assert!(state.is_none(), "uninvited user {em} must be rejected");
     }
-
-    let (ta, _) = user_tenant_role(&pool, a).await;
-    let (tb, _) = user_tenant_role(&pool, b).await;
-    assert_ne!(
-        ta, tb,
-        "two self-signup users land in separate tenants - no shared data"
-    );
 }
 
 #[sqlx::test]
@@ -306,10 +306,12 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
         .await
         .expect("invite");
 
-    // Same email, but unverified -> the invite is ignored; the user self-signs
-    // up into their own personal tenant instead of joining the org.
+    // Same email, but unverified -> the invite is ignored. Pre-MAPPS-458
+    // the user then self-signed up into their own personal tenant; post
+    // MAPPS-458 the invite is ignored AND JIT provisioning is off, so
+    // placement returns None. The invite must remain pending either way.
     let sub = Uuid::new_v4();
-    place_bunyip_user(
+    let state = place_bunyip_user(
         &auth,
         Some(&tenants),
         Some(&invitations),
@@ -320,14 +322,18 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
         None,
         &claims(sub, None),
     )
-    .await
-    .expect("placed");
-
-    let (tenant, _role) = user_tenant_role(&pool, sub).await;
-    assert_ne!(
-        tenant, org,
-        "unverified email must not join the inviting tenant"
+    .await;
+    assert!(
+        state.is_none(),
+        "unverified email cannot consume the invite AND cannot self-signup (MAPPS-458)"
     );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
+        .bind(sub)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "no user row is written for a rejected placement");
 
     let still_pending: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM tenant_invitations WHERE tenant_id = $1 AND status = 'pending'",
@@ -508,7 +514,25 @@ async fn bootstrap_admin_verified_email_still_gets_super_admin(pool: PgPool) {
 /// the user land directly on the dashboard.
 #[sqlx::test]
 async fn name_claims_stamp_profile_completed_at(pool: PgPool) {
+    // MAPPS-458: brand-new bunyip user needs an invitation to be placed
+    // (JIT personal-tenant provisioning was retired). Seed one so the
+    // placement path exercises the intended profile-completion logic.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("named@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
 
     let sub = Uuid::new_v4();
     place_bunyip_user(
@@ -546,7 +570,25 @@ async fn name_claims_stamp_profile_completed_at(pool: PgPool) {
 /// fallback for that user.
 #[sqlx::test]
 async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
+    // MAPPS-458: seed an invitation so placement succeeds; the point of
+    // this test is the name-claims -> profile-completed-at bookkeeping,
+    // not the pre-458 self-signup path.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("anon@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
 
     let sub = Uuid::new_v4();
     place_bunyip_user(
@@ -582,7 +624,24 @@ async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
 /// back. `POST /auth/me/complete-onboarding` is what lets the screen finish.
 #[sqlx::test]
 async fn complete_onboarding_stamps_the_profile_once(pool: PgPool) {
+    // MAPPS-458: seed an invitation so placement succeeds; this test's
+    // point is `mark_profile_completed`, not the pre-458 self-signup.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("nameless@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
 
     let sub = Uuid::new_v4();
     place_bunyip_user(
@@ -635,7 +694,25 @@ async fn complete_onboarding_stamps_the_profile_once(pool: PgPool) {
 /// bunyip lands in `users.first_name` / `last_name` on the next placement.
 #[sqlx::test]
 async fn name_claims_refresh_on_every_login(pool: PgPool) {
+    // MAPPS-458: seed an invitation so the first placement succeeds;
+    // the subsequent calls see the user as already-placed and exercise
+    // the refresh branch.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("renamed@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
 
     let sub = Uuid::new_v4();
     let place = |first: Option<&str>, last: Option<&str>| {
@@ -734,7 +811,23 @@ async fn upsert_on_conflict_overwrites_names_only_from_non_empty_hints(pool: PgP
 /// the cached values intact rather than blanking the columns.
 #[sqlx::test]
 async fn absent_or_empty_name_claims_leave_cached_names_intact(pool: PgPool) {
+    // MAPPS-458: seed an invitation so the first placement succeeds.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("keeper@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
 
     let sub = Uuid::new_v4();
     let place = |first: Option<&str>, last: Option<&str>| {
@@ -807,7 +900,25 @@ async fn userinfo_is_skipped_for_an_existing_placed_user(pool: PgPool) {
     // The perf fix: an already-provisioned user in their own tenant with no
     // pending invite is resolved locally, so the per-request userinfo hop is
     // skipped.
+    // MAPPS-458: seed an invitation so the first placement succeeds
+    // (JIT self-signup was retired).
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("placed@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
+
     let sub = Uuid::new_v4();
     place_bunyip_user(
         &auth,
@@ -833,8 +944,26 @@ async fn userinfo_is_skipped_for_an_existing_placed_user(pool: PgPool) {
 async fn userinfo_is_fetched_when_a_pending_invite_matches(pool: PgPool) {
     // Invites still work: an existing user with a pending invite for their
     // verified email goes through the full (userinfo) path so it is honored.
+    // MAPPS-458: seed a first invitation so the initial placement lands the
+    // user in an org, then add a NEW pending invite to a different tenant to
+    // exercise the userinfo-needed guard.
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let seed_org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("seed org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(seed_org),
+            admin_id,
+            &invite("invitee@example.com", "manager"),
+            &AuditCtx::system(seed_org),
+        )
+        .await
+        .expect("seed invite");
+
     let sub = Uuid::new_v4();
     place_bunyip_user(
         &auth,
@@ -875,7 +1004,24 @@ async fn existing_user_resolves_with_no_userinfo(pool: PgPool) {
     // The fast path end to end: once provisioned, a user is resolved by
     // place_bunyip_user with NO email/name (the values the middleware passes when
     // it skips userinfo), staying in their tenant and keeping their cached name.
+    // MAPPS-458: seed an invitation so the first placement succeeds.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("fastpath@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
+
     let sub = Uuid::new_v4();
     place_bunyip_user(
         &auth,

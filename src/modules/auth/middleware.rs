@@ -673,6 +673,32 @@ pub async fn place_bunyip_user(
         _ => None,
     };
 
+    // MAPPS-458 (PMS-728 slice 2): Bunyip is no longer an onboarding
+    // surface. A `sub` that has no existing `users` row AND no pending
+    // invitation for the presented email is rejected here; the request
+    // returns 401 upstream when `place_bunyip_user` yields `None`.
+    // Users arrive via the explicit invitations flow, not silent JIT
+    // creation. `placement.is_some()` covers every already-provisioned
+    // user (including the stuck-in-default backfill, which is a tenant
+    // rehome, not a fresh user creation).
+    //
+    // Carve-out for the platform admin (`bunyip_role = "admin"`): this
+    // is the root/owner of the Mokosh instance in the bunyip model
+    // (PMS-728 proposed approach: "the root/owner user keeps a
+    // Bunyip-backed login"). They bootstrap the first tenant, so they
+    // must be able to sign in on a fresh instance without a
+    // pre-existing invitation - matches the `bootstrap_admin_*`
+    // regression pins in `tests/bunyip_login.rs`.
+    let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
+    if placement.is_none() && invite.is_none() && !is_platform_admin {
+        tracing::info!(
+            sub = %sub,
+            email = email.as_deref().unwrap_or("<absent>"),
+            "bunyip-authenticated identity has no local placement and no pending invitation; rejecting per MAPPS-458"
+        );
+        return None;
+    }
+
     // PMS-245: a non-admin user still parked in the shared default tenant (dumped
     // there by the pre-PMS-244 funnel) is treated like a fresh user - moved to
     // their own personal tenant - so nobody stays stuck sharing it.
