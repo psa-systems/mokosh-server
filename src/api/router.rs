@@ -46,6 +46,7 @@ use crate::modules::search::{search_routes, SearchService};
 use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
+use crate::modules::teams::{me_teams_routes, teams_routes, TeamsService};
 use crate::modules::tenants::{public_tenant_routes, tenant_routes, TenantService};
 use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
@@ -338,6 +339,13 @@ pub fn create_api_router(
         "/tenants",
         tenant_routes(tenant_service, settings_service.clone()),
     );
+    // PMS-791 / MAPPS-461: teams CRUD + membership. Two mounts so the
+    // "my teams" endpoint sits under /me alongside future me-scoped
+    // routes rather than crowding /teams.
+    #[cfg(feature = "multi-tenant")]
+    let api_v1 = api_v1
+        .nest("/teams", teams_routes(TeamsService::new(db.clone())))
+        .nest("/me", me_teams_routes(TeamsService::new(db.clone())));
     let api_v1 = api_v1
         // Contact management. The canonical company endpoints live
         // under `/api/v1/contacts/companies/...` (one router for

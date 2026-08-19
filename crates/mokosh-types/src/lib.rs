@@ -22,6 +22,7 @@ pub mod auth;
 pub mod contacts;
 pub mod datetime;
 pub mod mileage_tracking;
+pub mod teams;
 pub mod tenants;
 pub mod tickets;
 pub mod time_tracking;

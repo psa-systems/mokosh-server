@@ -30,6 +30,7 @@ pub mod search;
 pub mod seed;
 pub mod settings;
 pub mod sla;
+pub mod teams;
 pub mod tenants;
 pub mod ticket_templates;
 pub mod tickets;

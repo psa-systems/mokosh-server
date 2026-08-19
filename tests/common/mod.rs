@@ -498,3 +498,70 @@ pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
         .expect("login response has access_token")
         .to_string()
 }
+
+/// PMS-791 / MAPPS-461: seed a team owned by the given tenant. Returns the
+/// team id. `manager_id` is optional; when set, the caller has typically
+/// just `seed_user`-ed that user in the same tenant.
+#[allow(dead_code)]
+pub async fn seed_team(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    name: &str,
+    manager_id: Option<Uuid>,
+) -> Uuid {
+    let team_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO teams (id, tenant_id, name, manager_id, color, is_active)
+        VALUES ($1, $2, $3, $4, '#6366F1', TRUE)
+        "#,
+    )
+    .bind(team_id)
+    .bind(tenant_id)
+    .bind(name)
+    .bind(manager_id)
+    .execute(pool)
+    .await
+    .expect("seed_team");
+    team_id
+}
+
+/// PMS-791 / MAPPS-461: add a user to a team with the given role
+/// (`"leader"` or `"member"`). Bypass the production service so tests
+/// can set up invalid states on purpose (e.g. wrong-tenant user_id).
+#[allow(dead_code)]
+pub async fn seed_team_member(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    team_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO team_members (tenant_id, team_id, user_id, role, joined_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(team_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("seed_team_member");
+}
+
+/// PMS-791 / MAPPS-461: shorthand for the common test setup — an admin
+/// (via `seed_admin`) + a team + the admin as leader. Returns
+/// `(admin_id, admin_email, admin_password, team_id)`.
+#[allow(dead_code)]
+pub async fn seed_admin_and_team(
+    pool: &PgPool,
+    team_name: &str,
+) -> (Uuid, String, String, Uuid) {
+    let (admin_id, email, password) = seed_admin(pool).await;
+    let team_id = seed_team(pool, DEFAULT_TENANT_ID, team_name, Some(admin_id)).await;
+    seed_team_member(pool, DEFAULT_TENANT_ID, team_id, admin_id, "leader").await;
+    (admin_id, email, password, team_id)
+}
