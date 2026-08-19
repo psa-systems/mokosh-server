@@ -904,6 +904,51 @@ impl AuthService {
         Ok(user)
     }
 
+    /// MAPPS-459 (PMS-728 slice 3): upsert the per-tenant Bunyip
+    /// entitlement row consulted by [`ensure_tenant_active`]. Called
+    /// from the webhook path (or any future integration surface) with
+    /// the Bunyip-supplied membership status. `unknown` is legal here
+    /// so a "we lost contact, do not know" event can explicitly clear
+    /// a prior state without inventing a new value.
+    ///
+    /// Runs on the migrator pool because the write is a cross-tenant
+    /// integration write with no session GUC; the table is RLS-exempt
+    /// for the same reason (auth reads on the pre-session path).
+    pub async fn set_tenant_entitlement(
+        &self,
+        tenant_id: Uuid,
+        status: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> AppResult<()> {
+        if !matches!(status, "active" | "suspended" | "unknown") {
+            return Err(AppError::validation_field(
+                "status",
+                "must be one of: active, suspended, unknown",
+            ));
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO tenant_membership_entitlements
+                (tenant_id, status, checked_at, expires_at, reason, created_at, updated_at)
+            VALUES ($1, $2, NOW(), $3, $4, NOW(), NOW())
+            ON CONFLICT (tenant_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                checked_at = NOW(),
+                expires_at = EXCLUDED.expires_at,
+                reason = EXCLUDED.reason,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(status)
+        .bind(expires_at)
+        .bind(reason)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
+    }
+
     /// PMS-698: the shared "is this principal still usable" gate. Both auth
     /// paths run it - the legacy HS256 branch via
     /// [`Self::ensure_user_and_tenant_active`] and the bunyip RS branch via
@@ -926,11 +971,39 @@ impl AuthService {
             .fetch_optional(self.db.pool())
             .await?;
         match status.as_deref() {
-            Some("active") => Ok(()),
-            _ => Err(AppError::Forbidden(
-                "This organization is not active".to_string(),
-            )),
+            Some("active") => {}
+            _ => {
+                return Err(AppError::Forbidden(
+                    "This organization is not active".to_string(),
+                ));
+            }
         }
+
+        // MAPPS-459 (PMS-728 slice 3): consult the per-tenant Bunyip
+        // entitlement. `unknown` (the seed state, or a tenant with no
+        // integration wired yet) passes through so a fresh instance is
+        // never locked out. `suspended` OR an expired entitlement
+        // rejects with the same "not active" copy so the endpoint does
+        // not distinguish billing vs. operator lifecycle to a caller.
+        // The row lives on `tenant_membership_entitlements`
+        // (migration 125), RLS-exempt like `tenants`.
+        let entitlement: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+            "SELECT status, expires_at FROM tenant_membership_entitlements WHERE tenant_id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some((entitlement_status, expires_at)) = entitlement {
+            let now = chrono::Utc::now();
+            let expired = expires_at.is_some_and(|t| t < now);
+            if entitlement_status == "suspended" || expired {
+                return Err(AppError::Forbidden(
+                    "This organization is not active".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Authenticate (or auto-provision) a user from a Google OAuth

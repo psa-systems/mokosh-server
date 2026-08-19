@@ -1518,6 +1518,169 @@ async fn update_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
     .expect("self-rename is idempotent");
 }
 
+/// MAPPS-459 (PMS-728 slice 3): entitlement absent = pass-through. A fresh
+/// tenant with no `tenant_membership_entitlements` row consults nothing (no
+/// integration wired), so `ensure_principal_usable` succeeds.
+#[sqlx::test]
+async fn ensure_principal_usable_passes_when_no_entitlement_row(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect("no entitlement row = pass-through");
+}
+
+/// MAPPS-459: entitlement status = `active` passes. Regression pin so a future
+/// change to the entitlement writer does not accidentally block active tenants.
+#[sqlx::test]
+async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", None, None)
+        .await
+        .expect("write entitlement");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect("active entitlement = pass");
+}
+
+/// MAPPS-459: entitlement status = `suspended` rejects with the same "not
+/// active" copy the operator-side `tenants.status = 'suspended'` path returns,
+/// so a caller cannot distinguish billing suspension from operator suspension.
+#[sqlx::test]
+async fn ensure_principal_usable_rejects_when_entitlement_suspended(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    auth.set_tenant_entitlement(
+        common::DEFAULT_TENANT_ID,
+        "suspended",
+        None,
+        Some("payment_failed"),
+    )
+    .await
+    .expect("write entitlement");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    let err = auth
+        .ensure_principal_usable(&user)
+        .await
+        .expect_err("suspended entitlement must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not active"),
+        "reject uses the same wording as operator suspension: {msg}"
+    );
+}
+
+/// MAPPS-459: entitlement `active` but `expires_at < NOW()` rejects. Bunyip
+/// may hand us an active state that has since lapsed and there is no reason to
+/// wait for the next webhook to catch up.
+#[sqlx::test]
+async fn ensure_principal_usable_rejects_when_entitlement_expired(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", Some(past), None)
+        .await
+        .expect("write entitlement");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect_err("expired entitlement must reject");
+}
+
+/// MAPPS-459: upsert semantics - a later write replaces the prior state, so a
+/// suspended tenant that becomes active again on the next webhook is
+/// pass-through immediately.
+#[sqlx::test]
+async fn set_tenant_entitlement_upserts_on_repeat_writes(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "suspended", None, None)
+        .await
+        .expect("write suspended");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect_err("suspended rejects");
+
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", None, None)
+        .await
+        .expect("write active");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect("re-activation lifts the reject");
+
+    // Exactly one row per tenant post-upsert.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tenant_membership_entitlements WHERE tenant_id = $1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 1, "one row per tenant, not one row per write");
+}
+
+/// MAPPS-459: an unknown status string is rejected at the write API so a
+/// misconfigured caller cannot smuggle a novel state into the enum column
+/// (the CHECK constraint would catch it too; the service-level guard just
+/// yields a clean 400 instead of a raw sqlx violation).
+#[sqlx::test]
+async fn set_tenant_entitlement_rejects_unknown_status(pool: PgPool) {
+    let auth = AuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-secret".into(),
+        vec![],
+    );
+    let err = auth
+        .set_tenant_entitlement(common::DEFAULT_TENANT_ID, "not-a-status", None, None)
+        .await
+        .expect_err("unknown status must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("status") || msg.contains("active"),
+        "err mentions the invalid field: {msg}"
+    );
+}
+
 /// Migration 104: the seeded ticket-note copy names the organisation. The keys
 /// are supplied by `TicketsService::send_note_email`; an unresolved one would
 /// reach the client as literal braces, so template and context are asserted
