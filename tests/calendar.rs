@@ -640,3 +640,58 @@ async fn update_appointment_with_team_id_reassigns(pool: PgPool) {
         .expect("read team_id after update");
     assert_eq!(stored, team_b, "team_id reassigned to team B");
 }
+
+/// PMS-791 phase 4 / MAPPS-465: list appointments filtered by team_id.
+/// Only rows whose team_id matches are returned; NULL-team rows are
+/// excluded when the filter is set.
+#[sqlx::test]
+async fn list_appointments_filtered_by_team_id(pool: PgPool) {
+    let (admin_id, email, password) = seed_admin(&pool).await;
+    let team_a = seed_team(&pool, common::DEFAULT_TENANT_ID, "Filter A", None).await;
+    let team_b = seed_team(&pool, common::DEFAULT_TENANT_ID, "Filter B", None).await;
+    let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
+
+    for (title, team) in [("A-visit", Some(team_a)), ("B-visit", Some(team_b)), ("no-team", None)] {
+        let body = serde_json::json!({
+            "title": title,
+            "assigned_to_id": admin_id,
+            "start_time": "2026-04-01T09:00:00Z",
+            "end_time": "2026-04-01T10:00:00Z",
+            "team_id": team,
+        });
+        let resp = app
+            .client
+            .post(app.url("/api/v1/appointments"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("create");
+        assert!(resp.status().is_success(), "seed {title}");
+    }
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/appointments?team_id={team_a}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list")
+        .json()
+        .await
+        .expect("list json");
+    let data = list["data"].as_array().expect("data array");
+    assert!(
+        data.iter().any(|a| a["title"].as_str() == Some("A-visit")),
+        "team A appointment must appear: {data:?}"
+    );
+    assert!(
+        !data.iter().any(|a| a["title"].as_str() == Some("B-visit")),
+        "team B appointment must NOT appear: {data:?}"
+    );
+    assert!(
+        !data.iter().any(|a| a["title"].as_str() == Some("no-team")),
+        "null-team appointment must NOT appear when a specific team is filtered: {data:?}"
+    );
+}

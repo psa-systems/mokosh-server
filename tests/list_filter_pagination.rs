@@ -147,6 +147,8 @@ async fn appointments_list_handles_every_filter_combination(pool: PgPool) {
             appointment_type: Some("meeting".to_string()),
             from: Some(from),
             to: Some(to),
+            team_id: None,
+            my_teams: None,
         },
     ];
     for (i, filter) in combos.iter().enumerate() {

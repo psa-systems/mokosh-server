@@ -182,6 +182,14 @@ impl CalendarService {
             conditions.push(format!("start_time <= ${idx}"));
             idx += 1;
         }
+        // PMS-791 phase 4 / MAPPS-465: exact-team filter. The my_teams
+        // convenience scope is on the DTO but its expansion needs a
+        // caller_id thread-through that the calendar routes do not
+        // currently plumb; documented as follow-up on MAPPS-465.
+        if filter.team_id.is_some() {
+            conditions.push(format!("team_id = ${idx}"));
+            idx += 1;
+        }
         let where_clause = conditions.join(" AND ");
         let limit_placeholder = idx;
         let offset_placeholder = idx + 1;
@@ -189,7 +197,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE {where_clause}
                ORDER BY start_time
@@ -267,7 +275,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE {where_clause}
                ORDER BY start_time"#
@@ -293,7 +301,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE {rwhere}
                ORDER BY start_time"#
@@ -535,7 +543,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -1572,6 +1580,10 @@ impl ReminderRow {
             location: None,
             recurrence_rule: self.recurrence_rule.clone(),
             recurrence_parent_id: None,
+            // PMS-791 phase 3: expander constructs a placeholder response
+            // for range-expansion output; team_id has no meaning here
+            // (an expanded occurrence isn't a real row).
+            team_id: None,
             created_at: self.start_time,
             updated_at: self.start_time,
         }
@@ -1599,6 +1611,9 @@ struct AppointmentRow {
     location: Option<String>,
     recurrence_rule: Option<String>,
     recurrence_parent_id: Option<Uuid>,
+    // PMS-791 phase 3 / MAPPS-464: nullable team routing.
+    #[sqlx(default)]
+    team_id: Option<Uuid>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -1625,6 +1640,7 @@ impl From<AppointmentRow> for AppointmentResponse {
             location: r.location,
             recurrence_rule: r.recurrence_rule,
             recurrence_parent_id: r.recurrence_parent_id,
+            team_id: r.team_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
