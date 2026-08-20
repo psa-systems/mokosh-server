@@ -255,10 +255,20 @@ carries an ordered list of typed phone numbers (`contact_phones`:
 `phone_type` in `mobile`/`work`/`home`/`fax`/`other`, `number`,
 `extension`, `is_primary`, `sort_order`) and links to any number of
 companies (`contact_companies`: `company_id`, per-link `title`,
-`is_primary`, `UNIQUE (contact_id, company_id)`). Both are tenant-scoped
-with their own `tenant_isolation` RLS policy and a partial unique index
-enforcing one primary per contact
+`is_primary`, `sort_order`, `UNIQUE (contact_id, company_id)`). Both are
+tenant-scoped with their own `tenant_isolation` RLS policy and a partial
+unique index enforcing one primary per contact
 ([`108_contact_phones_and_companies.sql`](../migrations/108_contact_phones_and_companies.sql)).
+
+A contact's links are ordered by `(created_at, sort_order)`, and that
+order is what "removing the primary promotes the OLDEST remaining link"
+means. `created_at` alone is not enough: it defaults to `NOW()`, the
+transaction timestamp, so every link written by one call shares a value
+and the tiebreak fell through to a random `uuid_generate_v4()`
+([`109_contact_company_link_order.sql`](../migrations/109_contact_company_link_order.sql),
+PMS-815). `write_contact_companies` sets `sort_order` from the request
+position on INSERT only, so a link that survives a rewrite keeps the
+position it was created with.
 
 The child tables are authoritative. `contacts.phone`, `.mobile`, `.fax`
 and `.company_id` stay on the table as **maintained mirrors**, recomputed

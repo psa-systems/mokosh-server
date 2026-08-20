@@ -1561,6 +1561,16 @@ async fn update_contact(
     resp.json().await.expect("update contact JSON")
 }
 
+/// The company ids of a contact payload's `companies`, in the order returned.
+fn link_order(contact: &serde_json::Value) -> Vec<String> {
+    contact["companies"]
+        .as_array()
+        .expect("companies")
+        .iter()
+        .map(|l| l["company_id"].as_str().expect("company_id").to_string())
+        .collect()
+}
+
 /// Contact ids returned by `GET /contacts?company_id=`.
 async fn contact_ids_for_company_filter(
     app: &common::TestApp,
@@ -1843,6 +1853,14 @@ async fn removing_links_repromotes_and_recomputes(pool: PgPool) {
     .await;
     let contact_id = created["id"].as_str().expect("id").to_string();
     assert_eq!(created["company_id"].as_str(), Some(a.as_str()));
+    // Links written by one call share a `created_at` (NOW() is the transaction
+    // timestamp), so the list order has to come from the write position, not
+    // from a random uuid tiebreak (PMS-815).
+    assert_eq!(
+        link_order(&created),
+        vec![a.clone(), b.clone(), c.clone()],
+        "the primary leads, then the links in the order they were written"
+    );
 
     // Drop the primary (A) and hand back B and C with NO primary flagged. B is
     // the oldest survivor, so it is promoted and the mirror follows.
@@ -1876,6 +1894,11 @@ async fn removing_links_repromotes_and_recomputes(pool: PgPool) {
         "the oldest remaining link is promoted, not the first in the request"
     );
     assert_eq!(updated["company_id"].as_str(), Some(b.as_str()));
+    assert_eq!(
+        link_order(&updated),
+        vec![b.clone(), c.clone()],
+        "the surviving links keep their original order, promoted one first"
+    );
     // A no longer sees the contact.
     assert!(contact_ids_for_company_filter(&app, &token, &a)
         .await
