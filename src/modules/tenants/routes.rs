@@ -17,12 +17,12 @@ use super::{
     UpdateTenantAdminRequest, UpdateTenantRequest,
 };
 use crate::modules::auth::{
-    AuthService, RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole,
+    AuthService, RequireAuth, RequireAuthState, RequireSuperAdmin, TenantId, TenantScoped, UserRole,
 };
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
-use mokosh_types::auth::{LoginResponse, SelfServeTenantRequest};
+use mokosh_types::auth::{AdditionalTenantRequest, LoginResponse, SelfServeTenantRequest};
 
 #[derive(Clone)]
 pub struct TenantRouterState {
@@ -66,6 +66,14 @@ pub fn tenant_routes(
         // `needs_setup` login branch and returns a full `LoginResponse`
         // scoped to the freshly created tenant.
         .route("/self-serve", post(self_serve_tenant))
+        // MAPPS-494 (MAPPS-474 phase 5): authenticated identity creates
+        // an ADDITIONAL organization. Bearer required; the caller
+        // becomes admin in the new tenant. Distinct from `self-serve`
+        // (which is for the zero-membership `needs_setup` login branch
+        // and returns a full session) because an authenticated caller
+        // already has a session and can pick when to switch to the new
+        // tenant via `/auth/switch-tenant/:id`.
+        .route("/additional", post(create_additional_tenant))
         // PMS-751: the caller's OWN tenant, addressed without an id.
         //
         // Declared before the `{tenant_id}` routes for readability only; axum
@@ -228,6 +236,53 @@ async fn self_serve_tenant(
         .mint_session_for_membership(_tenant.id, &email, ip_address, user_agent)
         .await?;
     Ok(Json(response))
+}
+
+/// MAPPS-494 (MAPPS-474 phase 5): authenticated identity creates an
+/// additional organization. The caller becomes admin in the fresh
+/// tenant. Returns the Tenant DTO; the caller separately POSTs to
+/// `/auth/switch-tenant/:id` to move their session into it.
+///
+/// Unlike `self_serve_tenant`, this handler REQUIRES a bearer session
+/// (`RequireAuthState`) and does NOT return a fresh session. The client
+/// keeps its existing session and just refetches memberships +
+/// optionally switches when ready.
+async fn create_additional_tenant(
+    State(state): State<TenantRouterState>,
+    RequireAuthState(auth_state): RequireAuthState,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<AdditionalTenantRequest>,
+) -> AppResult<Json<TenantResponse>> {
+    request.validate()?;
+
+    let identity_id = auth_state.identity_id.ok_or(AppError::Unauthorized)?;
+
+    // Load the identity row for first/last name + password_hash. Same
+    // shape as `self_serve_tenant`: users row in the new tenant must
+    // mirror the identity plane so login stays coherent.
+    let pool = state.auth_service.db().migrator_pool();
+    let identity = crate::db::identity::IdentityRepo::find_by_id(pool, identity_id)
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .ok_or(AppError::Unauthorized)?;
+    if identity.status != "active" {
+        return Err(AppError::Unauthorized);
+    }
+
+    let (tenant, _admin_id) = state
+        .tenant_service
+        .create_tenant_for_identity(
+            &identity.email,
+            &identity.first_name,
+            &identity.last_name,
+            identity.password_hash.as_deref(),
+            &request.tenant_name,
+            request.tenant_slug.as_deref(),
+            &ctx,
+        )
+        .await?;
+
+    Ok(Json(tenant.into()))
 }
 
 /// Get tenant by ID

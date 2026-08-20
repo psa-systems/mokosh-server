@@ -550,6 +550,22 @@ pub struct SelfServeTenantRequest {
     pub tenant_slug: Option<String>,
 }
 
+/// MAPPS-494 (MAPPS-474 phase 5): request body for
+/// `POST /api/v1/tenants/additional`. Called by the in-app "Create new
+/// organization" switcher item when the caller is already authenticated;
+/// no identity_token needed because a bearer session is required.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct AdditionalTenantRequest {
+    /// Display name for the new organization.
+    #[validate(length(min = 1, max = 100, message = "Name must be 1-100 characters"))]
+    pub tenant_name: String,
+    /// URL-safe slug for the tenant's client portal. Optional: server
+    /// derives one from the name when omitted.
+    #[serde(default)]
+    #[validate(length(max = 64, message = "Slug must be 64 characters or fewer"))]
+    pub tenant_slug: Option<String>,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Deserialize)]
 pub struct RefreshTokenRequest {

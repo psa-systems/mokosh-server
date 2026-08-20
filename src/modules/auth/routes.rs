@@ -95,6 +95,11 @@ pub fn auth_routes(
         // login by trading the short-lived identity_token + a chosen
         // tenant_id for a full scoped session.
         .route("/select-tenant", post(select_tenant))
+        // MAPPS-494 (MAPPS-474 phase 5): switch the current session to
+        // another tenant the identity holds a membership in. Bearer
+        // required; the switch re-mints access + refresh tokens with the
+        // new tid + mid so subsequent requests scope to the picked tenant.
+        .route("/switch-tenant/{tenant_id}", post(switch_tenant))
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
@@ -282,6 +287,55 @@ async fn select_tenant(
             ip_address,
             user_agent,
         )
+        .await?;
+    Ok(Json(response).into_response())
+}
+
+/// MAPPS-494 (MAPPS-474 phase 5): switch the caller's active session to
+/// a different tenant they hold a membership in. Verifies membership
+/// from the pre-populated `AuthState.memberships` (phase-2 enrich pass),
+/// then delegates to the shared `mint_session_for_membership` primitive.
+///
+/// Returns the same `LoginResponse` shape as the login handler so the
+/// client's install_session path handles the response unchanged.
+async fn switch_tenant(
+    State(state): State<AuthRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RequireAuthState(auth_state): RequireAuthState,
+    axum::extract::Path(target_tenant_id): axum::extract::Path<Uuid>,
+) -> Result<Response, AppError> {
+    // Verify the caller holds an ACTIVE membership in the target tenant.
+    // Reading from AuthState instead of re-querying the DB: the enrich
+    // pass in `auth_middleware` already populated `memberships` for us.
+    let has_membership = auth_state
+        .memberships
+        .iter()
+        .any(|m| m.tenant_id == target_tenant_id && m.status == "active");
+    if !has_membership {
+        return Err(AppError::NotFound(
+            "No active membership in the requested tenant".to_string(),
+        ));
+    }
+
+    let caller = auth_state.user.as_ref().ok_or(AppError::Unauthorized)?;
+
+    let ip_address = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            &headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let response = state
+        .auth_service
+        .mint_session_for_membership(target_tenant_id, &caller.email, ip_address, user_agent)
         .await?;
     Ok(Json(response).into_response())
 }
