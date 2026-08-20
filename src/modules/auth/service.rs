@@ -3180,17 +3180,34 @@ impl AuthService {
                 Some(code) => {
                     // Same base32-decode + +/-1 step tolerance the
                     // tenant-hint path uses (see MFA branch above).
-                    // Phase-3 note: the per-user PMS-502 anti-replay
-                    // watermark is per (tenant, user) and cannot run
-                    // here (no tenant scoped yet). Follow-up: extend
-                    // the watermark to the identity level.
+                    // MAPPS-497 item 4 (PMS-502 identity extension):
+                    // burn the accepted step on the identity plane so
+                    // a captured code cannot be replayed against this
+                    // path within its ~60s window. Compare-and-set on
+                    // `identities.mfa_last_totp_step`; 0 rows
+                    // affected == replay.
                     let secret_b32 = identity.mfa_secret.as_deref().ok_or_else(|| {
                         AppError::Internal("MFA enabled without secret".to_string())
                     })?;
                     let secret = crate::utils::totp::base32_decode(secret_b32).map_err(|_| {
                         AppError::Internal("stored MFA secret is corrupt".to_string())
                     })?;
-                    if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+                    let step = match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
+                        Some(step) => step,
+                        None => return Err(AppError::Unauthorized),
+                    };
+                    let advanced = crate::db::identity::IdentityRepo::record_identity_mfa_success(
+                        pool,
+                        identity.id,
+                        step,
+                    )
+                    .await
+                    .map_err(|_| AppError::Unauthorized)?;
+                    if !advanced {
+                        // Replay of an already-spent step. Fail closed;
+                        // the caller sees the same 401 a wrong code
+                        // yields, so timing does not leak "replay vs
+                        // wrong code" to an attacker.
                         return Err(AppError::Unauthorized);
                     }
                 }
@@ -3220,8 +3237,29 @@ impl AuthService {
                 })
             }
             1 => {
+                // MAPPS-497 item 5 (PMS-658 identity-first extension):
+                // resolve the user + run the approval gate BEFORE
+                // session mint. The tenant-hint `login` path runs the
+                // same gate at the same spot; identity-first now
+                // matches for the single-membership (auto-scope) case.
                 let tenant_id = memberships[0].tenant_id;
-                self.mint_session_for_membership(tenant_id, &identity.email, ip_address, user_agent)
+                let user = self
+                    .find_user_by_email_for_tenant(tenant_id, &identity.email)
+                    .await?;
+                self.ensure_principal_usable(&user).await?;
+                if let Some(response) = self
+                    .check_login_approval(
+                        &user,
+                        request.device_id.as_deref(),
+                        request.approval_code.as_deref(),
+                        ip_address.as_deref(),
+                        user_agent.as_deref(),
+                    )
+                    .await?
+                {
+                    return Ok(response);
+                }
+                self.mint_session_for_user(&user, ip_address, user_agent)
                     .await
             }
             _ => {
@@ -3259,12 +3297,26 @@ impl AuthService {
     ) -> AppResult<LoginResponse> {
         let user = self.find_user_by_email_for_tenant(tenant_id, email).await?;
         self.ensure_principal_usable(&user).await?;
+        self.mint_session_for_user(&user, ip_address, user_agent)
+            .await
+    }
 
+    /// MAPPS-497 item 5: session-mint tail extracted from
+    /// `mint_session_for_membership` so the PMS-658 approval gate can
+    /// run BETWEEN principal-check and session-mint on the identity-
+    /// first branch. Callers that have already resolved a user and run
+    /// `ensure_principal_usable` invoke this directly.
+    pub(crate) async fn mint_session_for_user(
+        &self,
+        user: &User,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
         let session_id = self
             .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
             .await?;
         let (access_token, refresh_token, expires_at) =
-            self.generate_tokens(&user, session_id).await?;
+            self.generate_tokens(user, session_id).await?;
         self.update_last_login(user.tenant_id, user.id).await?;
 
         Ok(LoginResponse {
@@ -3279,6 +3331,60 @@ impl AuthService {
             identity_token: None,
             memberships: None,
         })
+    }
+
+    /// MAPPS-497 item 5 (PMS-658 identity-first extension): apply the
+    /// suspicious-login approval gate on any code path that has already
+    /// resolved a `User`. Returns:
+    /// - `Ok(None)` when the gate is disabled, the login is not
+    ///   suspicious, OR the emailed approval code was supplied and
+    ///   verified. Caller continues with session mint.
+    /// - `Ok(Some(response))` when suspicious + no code was supplied.
+    ///   The response carries `approval_required: true` + empty tokens
+    ///   (same shape the tenant-hint `login` path emits); the caller
+    ///   propagates it up so the SPA prompts for the code.
+    ///
+    /// Wired into `authenticate_identity_first` for the auto-scope
+    /// branch (single-membership case). The multi-membership picker
+    /// branch defers the gate to a follow-up ticket (would require
+    /// adding `approval_code` + `device_id` to `SelectTenantRequest`).
+    async fn check_login_approval(
+        &self,
+        user: &User,
+        device_id: Option<&str>,
+        approval_code: Option<&str>,
+        ip: Option<&str>,
+        ua: Option<&str>,
+    ) -> AppResult<Option<LoginResponse>> {
+        if !self.login_approval_enabled {
+            return Ok(None);
+        }
+        let assessment = self.assess_login(user, ip, device_id).await?;
+        if !assessment.suspicious {
+            return Ok(None);
+        }
+        match approval_code.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(code) => {
+                self.verify_login_approval(user.tenant_id, user.id, code)
+                    .await?;
+                Ok(None)
+            }
+            None => {
+                self.issue_login_approval(user, &assessment, ip, ua).await?;
+                Ok(Some(LoginResponse {
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: Utc::now(),
+                    user: None,
+                    mfa_required: false,
+                    approval_required: true,
+                    needs_selection: false,
+                    needs_setup: false,
+                    identity_token: None,
+                    memberships: None,
+                }))
+            }
+        }
     }
 
     /// MAPPS-492: complete a `needs_selection` login. Consumes an

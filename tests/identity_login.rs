@@ -185,6 +185,78 @@ async fn email_only_login_with_wrong_password_returns_401(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
+/// MAPPS-497 item 4 (PMS-502 identity extension): a TOTP step, once
+/// accepted by the identity-first branch, cannot be replayed against
+/// the same identity within its ~60s window. The second POST with the
+/// same code must 401, matching how the tenant-hint MFA branch has
+/// enforced anti-replay since PMS-502.
+#[sqlx::test]
+async fn identity_first_mfa_burns_totp_step(pool: PgPool) {
+    // Seed a fresh identity with MFA enabled and a known secret so we
+    // can compute a valid TOTP code deterministically via the same
+    // helpers the server uses.
+    let secret_bytes = [0x11u8; 20];
+    let secret_b32 = mokosh_server::utils::totp::base32_encode(&secret_bytes);
+    let identity_id = uuid::Uuid::new_v4();
+    let email = "mfa-replay@example.com";
+    let password = "test-password-12345";
+    let hash = mokosh_server::utils::crypto::hash_password(password).expect("hash pw");
+    sqlx::query(
+        "INSERT INTO identities \
+         (id, email, password_hash, first_name, last_name, status, email_verified_at, \
+          mfa_enabled, mfa_secret) \
+         VALUES ($1, $2, $3, 'First', 'Last', 'active', NOW(), TRUE, $4)",
+    )
+    .bind(identity_id)
+    .bind(email)
+    .bind(&hash)
+    .bind(&secret_b32)
+    .execute(&pool)
+    .await
+    .expect("insert identity");
+    // Attach the identity to the default tenant so the login auto-scopes.
+    let user_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at, mfa_enabled, mfa_secret) \
+         VALUES ($1, $2, $3, $4, 'First', 'Last', 'technician', 'active', NOW(), TRUE, $5)",
+    )
+    .bind(user_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(email)
+    .bind(&hash)
+    .bind(&secret_b32)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+    let app = common::boot(pool).await;
+
+    let code = mokosh_server::utils::totp::code_at(&secret_bytes, chrono::Utc::now());
+
+    // First attempt with the code: 2xx (auto-scoped session).
+    let resp1 = post_login(
+        &app,
+        serde_json::json!({ "email": email, "password": password, "mfa_code": code }),
+    )
+    .await;
+    assert!(
+        resp1.status().is_success(),
+        "first MFA attempt should succeed, got {}",
+        resp1.status()
+    );
+
+    // Second attempt with the SAME code: must 401 (replay).
+    let resp2 = post_login(
+        &app,
+        serde_json::json!({ "email": email, "password": password, "mfa_code": code }),
+    )
+    .await;
+    assert_eq!(
+        resp2.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "replay of the same TOTP code must be rejected"
+    );
+}
+
 #[sqlx::test]
 async fn select_tenant_with_valid_identity_token_returns_session(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;

@@ -34,6 +34,13 @@ pub struct IdentityRow {
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// MAPPS-497 item 4 (PMS-502 identity extension): the highest TOTP
+    /// step this identity has burned via the identity-first login path.
+    /// Non-null with default 0 so a fresh identity accepts any positive
+    /// step. Written by `IdentityRepo::record_identity_mfa_success` as a
+    /// compare-and-set; a subsequent same-step attempt is a replay.
+    #[sqlx(default)]
+    pub mfa_last_totp_step: i64,
 }
 
 pub struct IdentityRepo;
@@ -48,7 +55,7 @@ impl IdentityRepo {
             SELECT id, email, password_hash, first_name, last_name, phone, mobile,
                    avatar_url, timezone, locale, email_verified_at, last_login_at,
                    mfa_enabled, mfa_secret, notification_preferences, settings,
-                   status, created_at, updated_at
+                   status, created_at, updated_at, mfa_last_totp_step
             FROM identities
             WHERE lower(email) = lower($1)
             "#,
@@ -64,7 +71,7 @@ impl IdentityRepo {
             SELECT id, email, password_hash, first_name, last_name, phone, mobile,
                    avatar_url, timezone, locale, email_verified_at, last_login_at,
                    mfa_enabled, mfa_secret, notification_preferences, settings,
-                   status, created_at, updated_at
+                   status, created_at, updated_at, mfa_last_totp_step
             FROM identities
             WHERE id = $1
             "#,
@@ -202,5 +209,31 @@ impl IdentityRepo {
             .bind(email)
             .fetch_optional(pool)
             .await
+    }
+
+    /// MAPPS-497 item 4 (PMS-502 identity extension): burn the
+    /// just-accepted TOTP step on the identity plane. Compare-and-set:
+    /// only advances the watermark when the new step is strictly
+    /// greater than the last one. Returns `true` on advance, `false`
+    /// on replay (0 rows affected). Called from
+    /// `authenticate_identity_first` on TOTP success; the caller must
+    /// fail closed on `false`.
+    pub async fn record_identity_mfa_success(
+        pool: &PgPool,
+        identity_id: Uuid,
+        used_step: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE identities
+            SET mfa_last_totp_step = $1, updated_at = NOW()
+            WHERE id = $2 AND mfa_last_totp_step < $1
+            "#,
+        )
+        .bind(used_step)
+        .bind(identity_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
