@@ -116,6 +116,77 @@ fn validate_website(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Normalize a website for storage (PMS-805): a user who types
+/// `DentalArtsPractice.com` gets `https://dentalartspractice.com`, so no caller
+/// has to supply the scheme. A value that already carries ANY `scheme:` prefix
+/// is returned untouched, which is what keeps [`validate_website`] the
+/// authority: `javascript:alert(1)` reaches it unprefixed and is still
+/// rejected. Returns `None` for blank input.
+///
+/// Public because the website probe (`/companies/website-probe`) must normalize
+/// its query input by exactly this rule rather than a second copy of it.
+pub fn normalize_website(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Anything already carrying a scheme, and anything that is not shaped like
+    // a host, is handed to `validate_website` exactly as typed. That is what
+    // keeps `javascript:alert(1)`, `ftp://x` and `not a url` rejected: prefixing
+    // them would manufacture a URL the validator then has to accept.
+    if has_scheme_prefix(trimmed) || !looks_like_host(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    // Host names are case-insensitive, so `DentalArtsPractice.com` stores as
+    // `https://dentalartspractice.com`. Only the authority is folded; a path is
+    // case-sensitive and survives as typed.
+    let authority_end = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
+    let (authority, rest) = trimmed.split_at(authority_end);
+    Some(format!("https://{}{rest}", authority.to_ascii_lowercase()))
+}
+
+/// True when `value` starts with a URL scheme (`name:`). The candidate must be
+/// ASCII-alphanumeric (plus `+`/`-`) and start with a letter, so `example.com:8080`
+/// reads as a host and port (dot) and gets the scheme prefix, while `javascript:`,
+/// `data:` and `ftp:` read as schemes and pass through to the validator.
+fn has_scheme_prefix(value: &str) -> bool {
+    let Some((candidate, _)) = value.split_once(':') else {
+        return false;
+    };
+    candidate
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-')
+}
+
+/// True when a scheme-less value could be a host: no whitespace or control
+/// characters anywhere, and an authority carrying at least one dot between two
+/// non-empty labels. `example.com` and `www.example.co.uk/about` qualify;
+/// `not-a-valid-url`, `not a url` and `.com` do not.
+fn looks_like_host(value: &str) -> bool {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let authority = &value[..value.find(['/', '?', '#']).unwrap_or(value.len())];
+    let host = authority.split(':').next().unwrap_or(authority);
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() >= 2 && labels.iter().all(|l| !l.is_empty())
+}
+
+/// Deserialize an optional website field, adding a missing scheme and mapping a
+/// blank value to `None` (PMS-805). Pairs with `#[validate(custom = ...)]` on
+/// the same field, exactly as [`de_phone_opt`] pairs with `validate_phone_e164`.
+fn de_website_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|s| normalize_website(&s)))
+}
+
 /// Normalize a phone number for storage (PMS-325): keep a single leading `+`
 /// and drop common formatting characters (spaces, dashes, parentheses, dots),
 /// so `+1 (415) 555-1234` becomes `+14155551234`. Returns the digits-only
@@ -414,6 +485,7 @@ pub struct CreateCompanyRequest {
     pub status: CompanyStatus,
     #[validate(custom(function = "validate_text_no_nul"))]
     pub industry: Option<String>,
+    #[serde(default, deserialize_with = "de_website_opt")]
     #[validate(length(max = 255), custom(function = "validate_website"))]
     pub website: Option<String>,
     #[serde(default, deserialize_with = "de_phone_opt")]
@@ -457,6 +529,7 @@ pub struct UpdateCompanyRequest {
     pub status: Option<CompanyStatus>,
     #[validate(custom(function = "validate_text_no_nul"))]
     pub industry: Option<String>,
+    #[serde(default, deserialize_with = "de_website_opt")]
     #[validate(length(max = 255), custom(function = "validate_website"))]
     pub website: Option<String>,
     #[serde(default, deserialize_with = "de_phone_opt")]
@@ -1114,10 +1187,11 @@ mod tests {
 
     // PMS-351 acceptance criteria: the exact strings the external reviewer
     // entered on the New Company form must be rejected, and a scheme-bearing
-    // https URL accepted.
+    // https URL accepted. PMS-805 moved `example.com` out of this list: a bare
+    // host is now normalized to `https://example.com` before validation.
     #[test]
     fn website_acceptance_cases() {
-        for bad in ["not-a-valid-url", "example.com", "ftp://example.com"] {
+        for bad in ["not-a-valid-url", "ftp://example.com"] {
             assert!(
                 create_req(serde_json::json!({ "website": bad }))
                     .validate()
@@ -1158,6 +1232,77 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "website": "javascript:alert(1)" }))
                 .expect("request deserializes");
         assert!(req.validate().is_err());
+    }
+
+    // ---- PMS-805: the website normalizing deserializer ----
+
+    /// A scheme-less host gains `https://` and is lower-cased, which is the
+    /// reporter's case: typing `DentalArtsPractice.com` now saves.
+    #[test]
+    fn bare_host_website_gains_https() {
+        let req = create_req(serde_json::json!({ "website": "DentalArtsPractice.com" }));
+        assert_eq!(
+            req.website.as_deref(),
+            Some("https://dentalartspractice.com")
+        );
+        assert!(req.validate().is_ok());
+    }
+
+    /// An existing scheme is authoritative and survives byte-for-byte, in every
+    /// case combination, path and all.
+    #[test]
+    fn existing_scheme_website_is_untouched() {
+        for value in [
+            "https://example.com",
+            "http://example.com",
+            "HTTPS://Example.com/About",
+            "HtTp://Example.com",
+            "https://example.com/Path/With/Case",
+        ] {
+            let req = create_req(serde_json::json!({ "website": value }));
+            assert_eq!(req.website.as_deref(), Some(value), "{value} was rewritten");
+            assert!(req.validate().is_ok(), "{value} should validate");
+        }
+    }
+
+    /// Blank and whitespace-only values become `None`, not `Some("")`.
+    #[test]
+    fn blank_website_becomes_none() {
+        for value in ["", "   ", "\t\n"] {
+            let req = create_req(serde_json::json!({ "website": value }));
+            assert_eq!(req.website, None, "{value:?} should deserialize to None");
+            assert!(req.validate().is_ok());
+        }
+    }
+
+    /// The normalizer never manufactures a URL out of a dangerous or
+    /// nonsensical value: it reaches `validate_website` unprefixed and is still
+    /// rejected exactly as before.
+    #[test]
+    fn dangerous_and_nonsense_websites_reach_the_validator_unprefixed() {
+        for value in [
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "vbscript:msgbox(1)",
+            "ftp://example.com",
+            "not-a-valid-url",
+            "not a url",
+        ] {
+            let req = create_req(serde_json::json!({ "website": value }));
+            assert_eq!(req.website.as_deref(), Some(value), "{value} was rewritten");
+            assert!(req.validate().is_err(), "{value} should be rejected");
+        }
+    }
+
+    /// The update path carries the same deserializer, not just the same
+    /// validator.
+    #[test]
+    fn update_request_normalizes_bare_host() {
+        let req: UpdateCompanyRequest =
+            serde_json::from_value(serde_json::json!({ "website": " Example.COM/About " }))
+                .expect("request deserializes");
+        assert_eq!(req.website.as_deref(), Some("https://example.com/About"));
+        assert!(req.validate().is_ok());
     }
 
     // ---- PMS-325: phone / timezone / country / postal validation ----
