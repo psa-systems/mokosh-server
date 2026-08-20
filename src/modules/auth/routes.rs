@@ -51,12 +51,6 @@ pub struct AuthRouterState {
     /// Checked inline in the `forgot_password` handler for the same reason as
     /// login (the email lives in the request body).
     pub forgot_password_limiter: Arc<rate_limit::AuthRateLimiter>,
-    /// MAPPS-473 (PMS-728 followup): host-based agent-tenant derivation.
-    /// When configured (`AGENT_HOST_SUFFIX` non-empty), the login
-    /// handler pulls the tenant slug from the browser Host header so no
-    /// operator has to type it. Empty config disables the feature and
-    /// the existing "type your slug" form is the fallback.
-    pub agent_host_config: super::host_tenant::AgentHostConfig,
 }
 
 /// Create the auth router
@@ -66,10 +60,6 @@ pub fn auth_routes(
     client_origin: String,
     jwt_secret: String,
     cookie_secure: bool,
-    // MAPPS-473: caller-supplied so integration tests can override
-    // without touching the process env, matching the shape
-    // `create_api_router` uses for `portal_host_config`.
-    agent_host_config: super::host_tenant::AgentHostConfig,
 ) -> Router {
     let state = AuthRouterState {
         auth_service: Arc::new(auth_service),
@@ -83,7 +73,6 @@ pub fn auth_routes(
         // 3/min per email - enough for a fumbling user, caps reset-email
         // bombing of a known address (PMS-680).
         forgot_password_limiter: rate_limit::AuthRateLimiter::new(10, 3),
-        agent_host_config,
     };
 
     Router::new()
@@ -165,42 +154,9 @@ async fn login(
     State(state): State<AuthRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(mut request): Json<LoginRequest>,
+    Json(request): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
     request.validate()?;
-
-    // MAPPS-473: derive tenant_slug from the browser Host when the
-    // request body omits it AND the deploy has AGENT_HOST_SUFFIX
-    // configured. This lets an operator navigate to
-    // `{slug}.msp.<apex>` and sign in with just email + password —
-    // no slug typing. Prefer X-Forwarded-Host (SPA sends it when a
-    // dev proxy rewrites Host), fall back to the request Host header.
-    // Feature off / no match leaves the request as-is; PMS-728's
-    // fail-closed 401 kicks in downstream if the caller still has no
-    // identifier.
-    if request.tenant_id.is_none()
-        && request
-            .tenant_slug
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        && state.agent_host_config.is_enabled()
-    {
-        let host_hint = headers
-            .get("X-Forwarded-Host")
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| {
-                headers
-                    .get(axum::http::header::HOST)
-                    .and_then(|v| v.to_str().ok())
-            });
-        if let Some(host) = host_hint {
-            if let Some(slug) = state.agent_host_config.extract_slug(host) {
-                request.tenant_slug = Some(slug);
-            }
-        }
-    }
 
     if let Err(retry_after) = state.login_limiter.check(addr.ip(), &request.email) {
         return Ok(rate_limited_response(

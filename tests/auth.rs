@@ -575,7 +575,9 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
     let resp = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }))
+        .json(
+            &serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }),
+        )
         .send()
         .await
         .expect("send login without mfa");
@@ -2055,7 +2057,9 @@ async fn reset_password_changes_password_and_revokes_sessions(pool: PgPool) {
     let old_login = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }))
+        .json(
+            &serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }),
+        )
         .send()
         .await
         .expect("send old-password login");
@@ -2403,7 +2407,9 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
     let old = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }))
+        .json(
+            &serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }),
+        )
         .send()
         .await
         .expect("send old-password login");
@@ -2415,108 +2421,10 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
     let _new_token = common::login(&app, &email, new_password).await;
 }
 
-// ============================================================================
-// MAPPS-473 (PMS-728 followup): host-based agent-tenant derivation
-// ============================================================================
-
-/// MAPPS-473: an admin navigates to `{slug}.msp.<apex>`, submits email +
-/// password with no tenant hint in the body. Server derives the slug
-/// from the Host header (or X-Forwarded-Host) and authenticates. No
-/// operator ever types a slug.
-#[sqlx::test]
-async fn login_derives_tenant_slug_from_agent_host(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot_with_agent_host(
-        pool,
-        mokosh_server::modules::auth::AgentHostConfig::from_suffix(".msp.test"),
-    )
-    .await;
-
-    // Body carries no tenant_slug and no tenant_id; the header does the work.
-    let resp = app
-        .client
-        .post(app.url("/api/v1/auth/login"))
-        .header("X-Forwarded-Host", "default.msp.test")
-        .json(&serde_json::json!({ "email": email, "password": password }))
-        .send()
-        .await
-        .expect("send host-derived login");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::OK,
-        "host-derived login must succeed"
-    );
-    let body: serde_json::Value = resp.json().await.expect("login body");
-    assert!(
-        !body["access_token"].as_str().unwrap_or("").is_empty(),
-        "access_token populated"
-    );
-}
-
-/// MAPPS-473: an explicit `tenant_slug` in the body wins over the
-/// host-derived slug. Guards against a proxy that lies about the Host
-/// header silently overriding an operator's typed slug.
-#[sqlx::test]
-async fn login_body_slug_wins_over_agent_host(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot_with_agent_host(
-        pool,
-        mokosh_server::modules::auth::AgentHostConfig::from_suffix(".msp.test"),
-    )
-    .await;
-
-    // Body claims a nonexistent tenant. Host says "default". Body wins;
-    // the unknown slug fails closed with 401 (fail-closed via
-    // resolve_tenant_slug), never leaks-through as the default tenant.
-    let resp = app
-        .client
-        .post(app.url("/api/v1/auth/login"))
-        .header("X-Forwarded-Host", "default.msp.test")
-        .json(&serde_json::json!({
-            "email": email,
-            "password": password,
-            "tenant_slug": "nope-does-not-exist",
-        }))
-        .send()
-        .await
-        .expect("send login with conflicting body + host");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "explicit body slug wins; unknown slug must 401"
-    );
-}
-
-/// MAPPS-473 (SUPERSEDED by MAPPS-492 phase 3): a login body with no
-/// tenant hint AND a Host that does NOT end with the configured
-/// suffix (bare apex, or a portal host) used to 401. Under phase 3,
-/// this case now enters the identity-first branch and auto-scopes
-/// when the identity holds exactly one membership. The MAPPS-473
-/// host-derivation shortcut is still exercised when the Host DOES
-/// match (see the sibling test that pins that shape).
-#[sqlx::test]
-async fn login_without_hint_or_matching_host_falls_through_to_identity_first(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot_with_agent_host(
-        pool,
-        mokosh_server::modules::auth::AgentHostConfig::from_suffix(".msp.test"),
-    )
-    .await;
-
-    let resp = app
-        .client
-        .post(app.url("/api/v1/auth/login"))
-        // Bare apex - no leftmost label to extract.
-        .header("X-Forwarded-Host", "msp.test")
-        .json(&serde_json::json!({ "email": email, "password": password }))
-        .send()
-        .await
-        .expect("send no-slug + bare-apex login");
-    assert!(
-        resp.status().is_success(),
-        "expected 2xx identity-first auto-scope; got {}",
-        resp.status()
-    );
-    let body: serde_json::Value = resp.json().await.expect("login json");
-    assert!(!body["access_token"].as_str().unwrap().is_empty());
-}
+// MAPPS-495 (MAPPS-474 phase 6): the MAPPS-473 host-based agent-tenant
+// derivation was retired. The three tests that used to live here
+// (`login_derives_tenant_slug_from_agent_host`,
+// `login_body_slug_wins_over_agent_host`,
+// `login_without_hint_or_matching_host_falls_through_to_identity_first`)
+// are removed with the code; phase 3 (MAPPS-492) delivered identity-first
+// login which supersedes the whole host-derivation approach.

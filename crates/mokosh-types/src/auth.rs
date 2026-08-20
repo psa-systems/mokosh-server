@@ -806,6 +806,14 @@ pub struct UserResponse {
     /// See [`CurrentUser::own_company_id`].
     #[serde(default)]
     pub own_company_id: Option<Uuid>,
+    /// MAPPS-495 (MAPPS-476 fix): the owning tenant's `kind` ('org' or
+    /// 'personal'). Serialised on `/auth/me` so the SPA can gate
+    /// org-only features (Teams nav, invitation-to-team flow) without a
+    /// second round-trip. Was added to [`CurrentUser`] in PMS-791 phase
+    /// 1.5 (MAPPS-462) but never propagated onto `UserResponse`, which
+    /// is what `/auth/me` actually returns; that oversight was MAPPS-476.
+    #[serde(default)]
+    pub tenant_kind: String,
 }
 
 impl From<User> for UserResponse {
@@ -831,6 +839,7 @@ impl From<User> for UserResponse {
             created_at: user.created_at,
             profile_completed: user.profile_completed_at.is_some(),
             own_company_id: user.own_company_id,
+            tenant_kind: user.tenant_kind,
         }
     }
 }
