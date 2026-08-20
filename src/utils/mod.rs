@@ -7,6 +7,9 @@ pub mod email;
 pub mod error;
 pub mod geoip;
 pub mod html;
+// Shared IP classification (PMS-805): one `is_non_public_ip`, used by the
+// login-location check and by the website probe's SSRF guard.
+pub mod net;
 pub mod pagination;
 #[cfg(feature = "server")]
 pub mod security_headers;

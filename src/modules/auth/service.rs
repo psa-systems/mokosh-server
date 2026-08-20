@@ -34,6 +34,7 @@ use crate::utils::email::{salutation, LogMailer, Mailer};
 #[cfg(feature = "server")]
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::geoip::GeoIpService;
+use crate::utils::net::is_non_public_ip;
 use std::net::IpAddr;
 
 #[cfg(feature = "server")]
@@ -199,7 +200,7 @@ impl AuthService {
         // Private / loopback / link-local / unspecified addresses never map to a
         // public country and only show up behind a proxy or in dev; skip them so
         // they cannot spuriously "change country".
-        if Self::is_non_public_ip(&parsed) {
+        if is_non_public_ip(&parsed) {
             return;
         }
         let Some(country) = geoip.country_code(parsed) else {
@@ -307,7 +308,7 @@ impl AuthService {
     fn resolve_login_country(&self, ip: Option<&str>) -> Option<String> {
         let geoip = self.geoip.as_ref()?;
         let parsed = ip.and_then(|s| s.parse::<IpAddr>().ok())?;
-        if Self::is_non_public_ip(&parsed) {
+        if is_non_public_ip(&parsed) {
             return None;
         }
         geoip.country_code(parsed)
@@ -565,28 +566,6 @@ impl AuthService {
             }
             tx.commit().await?;
             Err(AppError::Unauthorized)
-        }
-    }
-
-    /// True for addresses that can never map to a public country: loopback,
-    /// RFC1918 / unique-local, link-local, unspecified, broadcast. PMS-657 skips
-    /// these so a request arriving without a real client IP does not register as
-    /// a country change.
-    fn is_non_public_ip(ip: &IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => {
-                v4.is_private()
-                    || v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local()
-                    || v6.is_unicast_link_local()
-            }
         }
     }
 
@@ -3644,35 +3623,6 @@ mod tests {
         );
     }
 
-    // PMS-657: only genuinely public client IPs may drive a country-change
-    // alert; loopback / RFC1918 / link-local / unspecified must be ignored.
-    #[test]
-    fn non_public_ip_detection() {
-        let non_public = [
-            "127.0.0.1",
-            "10.1.2.3",
-            "192.168.1.1",
-            "172.16.0.1",
-            "169.254.10.10",
-            "0.0.0.0",
-            "::1",
-            "::",
-            "fd00::1",
-            "fe80::1",
-        ];
-        for ip in non_public {
-            assert!(
-                AuthService::is_non_public_ip(&ip.parse().unwrap()),
-                "{ip} should be treated as non-public"
-            );
-        }
-
-        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"];
-        for ip in public {
-            assert!(
-                !AuthService::is_non_public_ip(&ip.parse().unwrap()),
-                "{ip} should be treated as public"
-            );
-        }
-    }
+    // PMS-657's non-public-IP coverage moved with the predicate itself in
+    // PMS-805: see `crate::utils::net::tests::non_public_ip_detection`.
 }

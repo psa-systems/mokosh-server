@@ -1286,3 +1286,202 @@ async fn create_company_row(pool: &PgPool, name: &str, company_type: &str) -> St
     .expect("insert company row");
     id.to_string()
 }
+
+// ============================================================================
+// PMS-805: a scheme-less website is normalized on the way in, and the website
+// probe endpoint is reachable, guarded and input-validated.
+// ============================================================================
+
+/// The reporter's case: typing `DentalArtsPractice.com` into the website field
+/// must save, and must persist with the scheme the product wants. The
+/// dangerous-scheme rejection that MAPPS-149 added must survive the change.
+#[sqlx::test]
+async fn company_website_accepts_a_bare_domain(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Dental Arts Practice",
+            "website": "DentalArtsPractice.com",
+        }))
+        .send()
+        .await
+        .expect("send create company");
+    assert!(
+        resp.status().is_success(),
+        "a bare domain should save, got {}",
+        resp.status()
+    );
+    let created: serde_json::Value = resp.json().await.expect("create JSON");
+    assert_eq!(
+        created["website"].as_str(),
+        Some("https://dentalartspractice.com")
+    );
+
+    // Independent GET: the normalized value is what reached Postgres, not just
+    // what the create response echoed.
+    let company_id = created["id"].as_str().expect("created company has an id");
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get company")
+        .json()
+        .await
+        .expect("get JSON");
+    assert_eq!(
+        got["website"].as_str(),
+        Some("https://dentalartspractice.com")
+    );
+
+    // The normalizer never manufactures a URL out of a dangerous scheme.
+    let rejected = app
+        .client
+        .post(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "XSS Co",
+            "website": "javascript:alert(1)",
+        }))
+        .send()
+        .await
+        .expect("send create company");
+    assert_eq!(
+        rejected.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "javascript: must still be a 422"
+    );
+
+    // Same rule on the update path.
+    let updated: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "website": "Example.COM/About" }))
+        .send()
+        .await
+        .expect("send update company")
+        .json()
+        .await
+        .expect("update JSON");
+    assert_eq!(
+        updated["website"].as_str(),
+        Some("https://example.com/About")
+    );
+}
+
+/// The probe endpoint is authenticated, resolves ahead of `/companies/{id}`,
+/// and refuses to connect to anything off the public internet. A loopback
+/// target must come back as a successful probe reporting `blocked_host`, which
+/// is what proves the SSRF guard is wired into the live route.
+#[sqlx::test]
+async fn website_probe_blocks_non_public_hosts(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Unauthenticated callers never reach the probe at all.
+    let anon = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe?url=example.com"))
+        .send()
+        .await
+        .expect("send anonymous probe");
+    assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // The static segment wins over `/companies/{company_id}`: an unparseable
+    // UUID would otherwise 4xx from the path extractor, never reaching here.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe?url=http://127.0.0.1"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send loopback probe");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "an unreachable verdict is a successful probe, not an error"
+    );
+    let body: serde_json::Value = resp.json().await.expect("probe JSON");
+    assert_eq!(body["reachable"], serde_json::json!(false));
+    assert_eq!(
+        body["unreachable_reason"],
+        serde_json::json!("blocked_host")
+    );
+    assert_eq!(body["canonical_url"], serde_json::Value::Null);
+    assert_eq!(body["www_change"], serde_json::json!("none"));
+    assert_eq!(body["input"], serde_json::json!("http://127.0.0.1"));
+
+    // An RFC1918 literal is refused by the same guard.
+    let private: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe?url=http://10.1.2.3"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send private probe")
+        .json()
+        .await
+        .expect("probe JSON");
+    assert_eq!(
+        private["unreachable_reason"],
+        serde_json::json!("blocked_host")
+    );
+}
+
+/// Input that cannot be a website at all is a 400, never a silently
+/// "unreachable" 200: a form has to tell "that is not a URL" apart from "your
+/// site is down".
+#[sqlx::test]
+async fn website_probe_rejects_impossible_input(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for bad in [
+        "javascript:alert(1)",
+        "data:text/html,<script>",
+        "ftp://example.com",
+        "http://user:pass@example.com",
+        "https://example.com:8080",
+        "exa mple.com",
+        "",
+    ] {
+        let resp = app
+            .client
+            .get(app.url("/api/v1/contacts/companies/website-probe"))
+            .query(&[("url", bad)])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("send probe");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{bad:?} should be a 400, got {}",
+            resp.status()
+        );
+    }
+
+    // A missing `url` parameter fails at the extractor, not inside the probe.
+    let missing = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send probe with no url");
+    assert!(
+        missing.status().is_client_error(),
+        "a missing url should be a 4xx, got {}",
+        missing.status()
+    );
+}

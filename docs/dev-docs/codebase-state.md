@@ -210,10 +210,13 @@ Tracked as **F3** - the highest-impact server fix.
 
 Files: [`routes.rs`](../src/modules/contacts/routes.rs) (299),
 [`service.rs`](../src/modules/contacts/service.rs) (845),
-[`models.rs`](../src/modules/contacts/models.rs) (630).
+[`models.rs`](../src/modules/contacts/models.rs) (630),
+[`website_probe.rs`](../src/modules/contacts/website_probe.rs).
 
-**Endpoints:** 16 total. The router exposes companies, contacts, and
-sites all under `/api/v1/contacts/...`. The empty
+**Endpoints:** the table below is the list, as registered in
+[`contact_routes`](../src/modules/contacts/routes.rs). The router
+exposes companies, contacts, sites and the company-industry lookup all
+under `/api/v1/contacts/...`. The empty
 `.nest("/companies", Router::new())` declared at
 [`router.rs:45`](../src/api/router.rs#L45) is dead - it matches
 nothing, so `/api/v1/companies` returns 404 instead of an alias. See
@@ -222,13 +225,30 @@ nothing, so `/api/v1/companies` returns 404 instead of an alias. See
 | Path | Method |
 | --- | --- |
 | `/api/v1/contacts/companies` | GET / POST |
+| `/api/v1/contacts/companies/website-probe` | GET |
 | `/api/v1/contacts/companies/:company_id` | GET / PUT / DELETE |
 | `/api/v1/contacts/companies/:company_id/contacts` | GET |
 | `/api/v1/contacts/companies/:company_id/sites` | GET |
 | `/api/v1/contacts/contacts` | GET / POST |
+| `/api/v1/contacts/contacts/field-values` | GET |
 | `/api/v1/contacts/contacts/:contact_id` | GET / PUT / DELETE |
+| `/api/v1/contacts/company-industries` | GET / POST |
+| `/api/v1/contacts/company-industries/:id` | PUT / DELETE |
 | `/api/v1/contacts/sites` | POST |
 | `/api/v1/contacts/sites/:site_id` | GET / PUT / DELETE |
+
+`GET /companies/website-probe?url=<value>` (PMS-805) resolves a website
+on demand and reports whether https answers, whether http answers,
+whether http redirects to https, whether the host gains or loses a
+`www` prefix, and the final canonical URL. It is a static segment, so
+it resolves ahead of `/companies/{company_id}`. It reads and writes no
+tenant data; the tenant is the rate-limit key only. Both the reachable
+and the unreachable verdict are 200s, because determining that a site
+does not answer is a successful probe; input that cannot be a website
+at all is a 400. `is_non_public_ip`
+([`utils/net.rs`](../src/utils/net.rs)) gates every resolved address
+before the first connect and again for every redirect hop, which is
+what stops the endpoint being an SSRF primitive.
 
 **Defect: `update_site` is a silent no-op.**
 [`routes.rs:273-288`](../src/modules/contacts/routes.rs#L273) accepts
