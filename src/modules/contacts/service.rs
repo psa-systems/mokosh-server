@@ -985,6 +985,12 @@ impl ContactService {
     ///    unflagged rewrite does not silently reshuffle the primary;
     /// 3. else the first entry in the list, which is the create case (nothing
     ///    pre-existed) and the "promote the first entry" rule.
+    ///
+    /// "Oldest" is `(created_at, sort_order)`, not `created_at` alone: NOW() is
+    /// the transaction timestamp, so every link written by one call shares one
+    /// `created_at` and only `sort_order` separates them (PMS-815). It is set
+    /// on INSERT and left alone on conflict, so a surviving link keeps its
+    /// original position.
     async fn write_contact_companies(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -994,7 +1000,8 @@ impl ContactService {
     ) -> AppResult<()> {
         let existing_order: Vec<Uuid> = sqlx::query_scalar(
             "SELECT company_id FROM contact_companies \
-             WHERE tenant_id = $1 AND contact_id = $2 ORDER BY created_at, id",
+             WHERE tenant_id = $1 AND contact_id = $2 \
+             ORDER BY created_at, sort_order, id",
         )
         .bind(tenant_id)
         .bind(contact_id)
@@ -1024,11 +1031,12 @@ impl ContactService {
         .execute(&mut *conn)
         .await?;
 
-        for link in links {
+        for (position, link) in links.iter().enumerate() {
             sqlx::query(
                 r#"
-                INSERT INTO contact_companies (tenant_id, contact_id, company_id, title, is_primary)
-                VALUES ($1, $2, $3, $4, FALSE)
+                INSERT INTO contact_companies
+                    (tenant_id, contact_id, company_id, title, is_primary, sort_order)
+                VALUES ($1, $2, $3, $4, FALSE, $5)
                 ON CONFLICT (contact_id, company_id) DO UPDATE
                     SET title = EXCLUDED.title,
                         updated_at = NOW()
@@ -1038,6 +1046,7 @@ impl ContactService {
             .bind(contact_id)
             .bind(link.company_id)
             .bind(&link.title)
+            .bind(position as i32)
             .execute(&mut *conn)
             .await?;
         }
@@ -1153,7 +1162,7 @@ impl ContactService {
             FROM contact_companies l
             LEFT JOIN companies co ON co.id = l.company_id AND co.tenant_id = l.tenant_id
             WHERE l.tenant_id = $1 AND l.contact_id = ANY($2)
-            ORDER BY l.contact_id, l.is_primary DESC, l.created_at
+            ORDER BY l.contact_id, l.is_primary DESC, l.created_at, l.sort_order, l.id
             "#,
         )
         .bind(tenant_id)
