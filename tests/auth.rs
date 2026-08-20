@@ -2421,6 +2421,129 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
     let _new_token = common::login(&app, &email, new_password).await;
 }
 
+/// MAPPS-499 (MAPPS-496 stage 2a): change_password writes the new
+/// hash to `identities.password_hash`; the MAPPS-498 back-mirror
+/// propagates it to users.password_hash so the legacy read path in
+/// UserRow still sees the new value.
+#[sqlx::test]
+async fn change_password_writes_identity_and_mirrors_to_users(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let new_password = "changed-password-mapps499";
+    let resp = app
+        .client
+        .put(app.url("/api/v1/auth/me/password"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "current_password": password,
+            "new_password": new_password,
+            "confirm_password": new_password,
+        }))
+        .send()
+        .await
+        .expect("send change-password");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let identity_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM identities WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read identity hash");
+    let users_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read users hash");
+    assert!(identity_hash.is_some(), "identity hash written");
+    assert_eq!(
+        identity_hash, users_hash,
+        "bidir trigger mirrors identity hash back to users"
+    );
+    // The new password authenticates.
+    let _new_token = common::login(&app, &email, new_password).await;
+}
+
+/// MAPPS-499: an identity with memberships in two tenants gets a
+/// single change_password; both users.password_hash rows update via
+/// the back-mirror.
+#[sqlx::test]
+async fn change_password_propagates_to_every_membership_users_row(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    // Second tenant with the same identity as an additional membership.
+    let tenant_b = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, kind, status) \
+         VALUES ($1, 'Beta', 'beta-mapps499', 'org', 'active')",
+    )
+    .bind(tenant_b)
+    .execute(&pool)
+    .await
+    .expect("seed second tenant");
+    let hash = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let user_b_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'First', 'Last', 'admin', 'active', NOW())",
+    )
+    .bind(user_b_id)
+    .bind(tenant_b)
+    .bind(&email)
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .expect("seed second users row");
+
+    let app = common::boot(pool).await;
+    // Log in via the tenant-hint path so we get a session on the
+    // default tenant regardless of the picker branch.
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "default",
+        }))
+        .send()
+        .await
+        .expect("send login");
+    let body: serde_json::Value = resp.json().await.expect("json");
+    let token = body["access_token"].as_str().unwrap().to_string();
+
+    let new_password = "propagated-password-mapps499";
+    let resp = app
+        .client
+        .put(app.url("/api/v1/auth/me/password"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "current_password": password,
+            "new_password": new_password,
+            "confirm_password": new_password,
+        }))
+        .send()
+        .await
+        .expect("send change-password");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let both_hashes: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT password_hash FROM users WHERE lower(email) = lower($1) ORDER BY id",
+    )
+    .bind(&email)
+    .fetch_all(&app.pool)
+    .await
+    .expect("read both users hashes");
+    assert_eq!(both_hashes.len(), 2);
+    assert_eq!(
+        both_hashes[0], both_hashes[1],
+        "both users rows carry the new hash"
+    );
+    let _ = admin_id; // silence unused
+}
+
 // MAPPS-495 (MAPPS-474 phase 6): the MAPPS-473 host-based agent-tenant
 // derivation was retired. The three tests that used to live here
 // (`login_derives_tenant_slug_from_agent_host`,

@@ -1548,15 +1548,17 @@ impl AuthService {
             ));
         }
 
-        // Get current password hash
+        // Get current password hash + email (need the email to
+        // resolve the identity row for the MAPPS-499 write).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let current_hash: String =
-            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND tenant_id = $2")
-                .bind(user_id)
-                .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| AppError::NotFound("User".to_string()))?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT password_hash, email FROM users WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (current_hash, email) = row.ok_or_else(|| AppError::NotFound("User".to_string()))?;
 
         // Verify current password
         if !verify_password(&request.current_password, &current_hash)? {
@@ -1569,12 +1571,28 @@ impl AuthService {
         // Hash and update new password
         let new_hash = hash_password(&request.new_password)?;
 
+        // MAPPS-499 (MAPPS-496 stage 2a): identities is now the source
+        // of truth for password_hash. The bidir trigger from
+        // migration 130 (MAPPS-498) mirrors this write back to every
+        // matching users.password_hash so legacy readers still see
+        // the new value. `password_changed_at` is users-only (PMS-681
+        // access-token revocation gate) and stays on the users
+        // UPDATE below. Both writes share the same tenant-scoped tx;
+        // identities is RLS-exempt so its UPDATE runs cleanly under
+        // any tenant GUC.
         sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW(), \
-             password_changed_at = NOW() \
-             WHERE id = $2 AND tenant_id = $3",
+            "UPDATE identities SET password_hash = $1, updated_at = NOW() \
+             WHERE lower(email) = lower($2)",
         )
         .bind(&new_hash)
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE users SET password_changed_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
         .bind(user_id)
         .bind(tenant_id)
         .execute(&mut *tx)
