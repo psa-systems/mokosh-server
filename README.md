@@ -2,6 +2,20 @@
 
 Professional Services Automation (PSA) platform for MSPs. REST API server built on Axum + SQLx + PostgreSQL. Secrets are sourced from a self-hosted Infisical instance.
 
+<!--
+BUNYIP-587 records the shared Bunyip-to-Mokosh walkthrough GIF. When it lands,
+commit a copy at docs/assets/mokosh-walkthrough.gif (a cross-repo relative path
+to the Bunyip copy does not render on the mirrors, and hot-linking the raw asset
+URL is fragile) and replace this comment with:
+![Mokosh walkthrough](docs/assets/mokosh-walkthrough.gif)
+-->
+
+## Try it
+
+Live staging: **<https://msp.a8n.systems>**. Sign in through the platform and click through the product; the walkthrough starts in Bunyip and moves into Mokosh.
+
+> Staging shows features **in development**, not a polished demo. State is **wiped on every deploy** - accounts and data are throwaway. Do not reuse a real password.
+
 ## Architecture
 
 - **HTTP**: Axum 0.8 (Tokio runtime) with Tower middleware (CORS, tracing, gzip, request limits, request-id).
