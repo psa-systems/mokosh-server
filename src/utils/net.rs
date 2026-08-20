@@ -37,6 +37,41 @@ pub fn is_non_public_ip(ip: &IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    /// PMS-805 lifted this predicate here precisely so a second copy could not
+    /// drift from the first. A prose note would not have held, so the "exactly
+    /// one definition" half of that is enforced here: re-adding a private
+    /// `is_non_public_ip` to any module fails this test.
+    #[test]
+    fn exactly_one_definition_in_the_crate() {
+        // Assembled at runtime so this test's own source does not match it.
+        let needle = format!("fn {}", "is_non_public_ip");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut definitions = Vec::new();
+        let mut pending = vec![src.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read source directory") {
+                let path = entry.expect("read directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let source = std::fs::read_to_string(&path).expect("read source file");
+                    if source.contains(&needle) {
+                        definitions.push(path);
+                    }
+                }
+            }
+        }
+        // `read_dir` order is filesystem-dependent; sort so a failure names the
+        // same list every run.
+        definitions.sort();
+        assert_eq!(
+            definitions,
+            vec![src.join("utils").join("net.rs")],
+            "is_non_public_ip must have exactly one definition, in utils/net.rs; \
+             call it, do not copy it"
+        );
+    }
+
     #[test]
     fn non_public_ip_detection() {
         let non_public = [
