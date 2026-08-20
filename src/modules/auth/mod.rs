@@ -29,10 +29,10 @@ pub mod tenant;
 #[cfg(feature = "server")]
 pub use middleware::{
     AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,
-    RequireAdminUser, RequireAssets, RequireAuth, RequireBilling, RequireCalendar,
-    RequireContracts, RequireFinance, RequireKnowledgeBase, RequireManager, RequireModuleEnabled,
-    RequireProjects, RequireReports, RequireRmm, RequireRole, RequireSuperAdmin,
-    RequireTimeTracking, RoleRequirement, SuperAdminRoles, TenantScope,
+    RequireAdminUser, RequireAssets, RequireAuth, RequireAuthState, RequireBilling,
+    RequireCalendar, RequireContracts, RequireFinance, RequireKnowledgeBase, RequireManager,
+    RequireModuleEnabled, RequireProjects, RequireReports, RequireRmm, RequireRole,
+    RequireSuperAdmin, RequireTimeTracking, RoleRequirement, SuperAdminRoles, TenantScope,
 };
 pub use models::*;
 #[cfg(feature = "server")]
@@ -49,7 +49,7 @@ pub use service::{MOKOSH_JWT_AUDIENCE, MOKOSH_JWT_ISSUER};
 // PMS-743: tenant naming derives a personal tenant's display name from the
 // same email-to-name logic the JIT user insert uses, rather than growing a
 // second copy of the UUID / placeholder rejection rules.
+pub use host_tenant::AgentHostConfig;
 #[cfg(feature = "server")]
 pub(crate) use service::{synthetic_name_from_email, SYNTHETIC_NAME_FALLBACK};
 pub use tenant::{TenantId, TenantScoped};
-pub use host_tenant::AgentHostConfig;

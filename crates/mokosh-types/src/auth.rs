@@ -156,6 +156,23 @@ impl std::fmt::Display for AuthRequired {
 
 impl std::error::Error for AuthRequired {}
 
+/// MAPPS-491 (MAPPS-474 phase 2): one active seat an identity holds in a tenant.
+///
+/// Returned by `GET /api/v1/auth/memberships` and populated on `AuthState`
+/// so extractors can inspect the caller's full membership set without a
+/// second round-trip. Client redefines the same shape locally in
+/// `mokosh-clients/src/hooks/auth.rs` until phase 3 consolidates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembershipView {
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    pub tenant_slug: String,
+    pub tenant_kind: String,
+    pub role: String,
+    pub status: String,
+    pub is_active: bool,
+}
+
 /// Current authenticated user state
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthState {
@@ -173,6 +190,23 @@ pub struct AuthState {
     /// still deserializes a pre-348 payload.
     #[serde(default)]
     pub deleted: bool,
+    /// MAPPS-491 (phase 2): identities.id for the authenticated caller,
+    /// resolved from the loaded user's email at middleware time. Distinct
+    /// from `user.id` (per-tenant projection) when an email is shared
+    /// across tenants (backfill collapsed both users rows to one identity).
+    /// `#[serde(default)]` keeps legacy wire shape compatible.
+    #[serde(default)]
+    pub identity_id: Option<Uuid>,
+    /// MAPPS-491 (phase 2): tenant_memberships.id the current session
+    /// is scoped to. Sourced from `JwtClaims.mid` when present, otherwise
+    /// resolved from `(identity_id, tenant_id)`. Phase 5 uses this to
+    /// power the switcher; phase 3 does not depend on it.
+    #[serde(default)]
+    pub active_membership_id: Option<Uuid>,
+    /// MAPPS-491 (phase 2): every active membership the identity holds.
+    /// Powers `GET /api/v1/auth/memberships` and phase 3's tenant picker.
+    #[serde(default)]
+    pub memberships: Vec<MembershipView>,
 }
 
 impl AuthState {
@@ -183,6 +217,9 @@ impl AuthState {
             user: Some(user),
             tenant_id: Some(tenant_id),
             deleted: false,
+            identity_id: None,
+            active_membership_id: None,
+            memberships: Vec::new(),
         }
     }
 
@@ -197,6 +234,9 @@ impl AuthState {
             user: None,
             tenant_id: None,
             deleted: true,
+            identity_id: None,
+            active_membership_id: None,
+            memberships: Vec::new(),
         }
     }
 
@@ -814,6 +854,13 @@ pub struct JwtClaims {
     pub typ: String,
     /// Session ID
     pub sid: Uuid,
+    /// MAPPS-491 (MAPPS-474 phase 2): active `tenant_memberships.id`
+    /// for the session's tenant scope. Optional so legacy tokens
+    /// minted before phase 2 still decode (`serde(default)` returns
+    /// `None`); on verify the middleware falls back to a repo lookup
+    /// by `(identity_id, tenant_id)` when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid: Option<Uuid>,
 }
 
 #[cfg(test)]

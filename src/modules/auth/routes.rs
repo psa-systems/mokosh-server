@@ -20,9 +20,10 @@ use super::{
     MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse,
     ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
-use crate::modules::auth::middleware::{RequireAuth, RequireManager};
+use crate::modules::auth::middleware::{RequireAuth, RequireAuthState, RequireManager};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
+use mokosh_types::auth::MembershipView;
 
 /// Application state for auth routes
 #[derive(Clone)]
@@ -100,6 +101,10 @@ pub fn auth_routes(
         // Protected routes
         .route("/me", get(get_current_user))
         .route("/me", put(update_current_user))
+        // MAPPS-491 (MAPPS-474 phase 2): every active membership the
+        // authenticated identity holds. Populated by the middleware so
+        // the handler is a projection over `AuthState.memberships`.
+        .route("/memberships", get(list_my_memberships))
         // PMS-752: let the onboarding screen finish. See the handler.
         .route("/me/complete-onboarding", post(complete_onboarding))
         .route("/me/password", put(change_password))
@@ -165,13 +170,22 @@ async fn login(
     // fail-closed 401 kicks in downstream if the caller still has no
     // identifier.
     if request.tenant_id.is_none()
-        && request.tenant_slug.as_deref().unwrap_or("").trim().is_empty()
+        && request
+            .tenant_slug
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
         && state.agent_host_config.is_enabled()
     {
         let host_hint = headers
             .get("X-Forwarded-Host")
             .and_then(|v| v.to_str().ok())
-            .or_else(|| headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()));
+            .or_else(|| {
+                headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+            });
         if let Some(host) = host_hint {
             if let Some(slug) = state.agent_host_config.extract_slug(host) {
                 request.tenant_slug = Some(slug);
@@ -325,6 +339,17 @@ async fn get_current_user(
         .get_user_by_id(user.tenant_id, user.id)
         .await?;
     Ok(Json(full_user.into()))
+}
+
+/// MAPPS-491 (MAPPS-474 phase 2): every active membership the caller
+/// holds. Populated by the middleware, so this is a projection over
+/// `AuthState.memberships`; no query runs in the handler. Client's
+/// `use_memberships_loader` (mokosh-clients/src/hooks/auth.rs:299)
+/// calls this endpoint on login and on switcher open.
+async fn list_my_memberships(
+    RequireAuthState(state): RequireAuthState,
+) -> AppResult<Json<Vec<MembershipView>>> {
+    Ok(Json(state.memberships))
 }
 
 /// Update current user endpoint

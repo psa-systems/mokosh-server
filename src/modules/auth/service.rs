@@ -822,7 +822,8 @@ impl AuthService {
             .await?;
 
         // Generate tokens
-        let (access_token, refresh_token, expires_at) = self.generate_tokens(&user, session_id)?;
+        let (access_token, refresh_token, expires_at) =
+            self.generate_tokens(&user, session_id).await?;
 
         // Update last login
         self.update_last_login(user.tenant_id, user.id).await?;
@@ -1143,7 +1144,8 @@ impl AuthService {
         let session_id = self
             .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
             .await?;
-        let (access_token, refresh_token, expires_at) = self.generate_tokens(&user, session_id)?;
+        let (access_token, refresh_token, expires_at) =
+            self.generate_tokens(&user, session_id).await?;
         self.update_last_login(user.tenant_id, user.id).await?;
         self.check_login_location(&user, loc_ip.as_deref(), loc_ua.as_deref())
             .await;
@@ -1279,7 +1281,7 @@ impl AuthService {
 
         // Generate new tokens
         let (access_token, new_refresh_token, expires_at) =
-            self.generate_tokens(&user, claims.sid)?;
+            self.generate_tokens(&user, claims.sid).await?;
 
         // Update session activity
         self.update_session_activity(claims.tid, claims.sid).await?;
@@ -2971,7 +2973,7 @@ impl AuthService {
     }
 
     /// Generate access and refresh tokens
-    fn generate_tokens(
+    async fn generate_tokens(
         &self,
         user: &User,
         session_id: Uuid,
@@ -2985,6 +2987,20 @@ impl AuthService {
         // refresh-TTL window has rotated every live legacy token.
         let iss = MOKOSH_JWT_ISSUER.to_string();
         let aud = MOKOSH_JWT_AUDIENCE.to_string();
+
+        // MAPPS-491 (phase 2): mint carries the active `tenant_memberships.id`.
+        // `None` is tolerated (bootstrap paths may run before the identity
+        // plane is populated); verify falls back to a repo lookup so a
+        // missing `mid` never fails a request.
+        let mid = crate::db::identity::MembershipRepo::find_id_by_email_and_tenant(
+            self.db.migrator_pool(),
+            &user.email,
+            user.tenant_id,
+        )
+        .await
+        .ok()
+        .flatten();
+
         let access_claims = JwtClaims {
             sub: user.id,
             tid: user.tenant_id,
@@ -2997,6 +3013,7 @@ impl AuthService {
             aud: aud.clone(),
             typ: "access".to_string(),
             sid: session_id,
+            mid,
         };
 
         let refresh_claims = JwtClaims {
@@ -3011,6 +3028,7 @@ impl AuthService {
             aud,
             typ: "refresh".to_string(),
             sid: session_id,
+            mid,
         };
 
         let encoding_key = EncodingKey::from_secret(self.jwt_secret.as_bytes());

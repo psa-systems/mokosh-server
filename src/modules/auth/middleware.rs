@@ -65,6 +65,53 @@ impl AuthMiddleware {
     }
 }
 
+/// MAPPS-491 (MAPPS-474 phase 2): fill `identity_id`,
+/// `active_membership_id`, and `memberships` on an authenticated
+/// `AuthState`. Safe no-op when the state is unauthenticated or the
+/// tenant is missing. `mid_hint` comes from the JWT (`JwtClaims.mid`);
+/// when absent, the membership id is resolved from
+/// `(email, tenant_id)`. Runs on the migrator pool because both
+/// identity-plane tables are RLS-exempt.
+async fn enrich_auth_state_with_identity(
+    auth_service: &AuthService,
+    state: AuthState,
+    mid_hint: Option<uuid::Uuid>,
+) -> AuthState {
+    let (Some(user), Some(tenant_id)) = (state.user.as_ref(), state.tenant_id) else {
+        return state;
+    };
+    let pool = auth_service.db().migrator_pool();
+    let identity_id = crate::db::identity::IdentityRepo::find_id_by_email(pool, &user.email)
+        .await
+        .ok()
+        .flatten();
+    let active_membership_id = match mid_hint {
+        Some(mid) => Some(mid),
+        None => crate::db::identity::MembershipRepo::find_id_by_email_and_tenant(
+            pool,
+            &user.email,
+            tenant_id,
+        )
+        .await
+        .ok()
+        .flatten(),
+    };
+    let memberships = match identity_id {
+        Some(id) => {
+            crate::db::identity::MembershipRepo::list_views_for_identity(pool, id, Some(tenant_id))
+                .await
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    AuthState {
+        identity_id,
+        active_membership_id,
+        memberships,
+        ..state
+    }
+}
+
 /// Extract auth state from request
 pub async fn auth_middleware(
     State(auth_middleware): State<AuthMiddleware>,
@@ -83,6 +130,11 @@ pub async fn auth_middleware(
     // instead of the generic 401. Distinguishes "your bunyip account was
     // deleted" from "your session expired / please refresh" at the SPA.
     let mut candidate_sub: Option<uuid::Uuid> = None;
+    // MAPPS-491: hint the enrich pass with `mid` from the legacy JWT when
+    // present. Bunyip tokens never carry it (bunyip does not know about
+    // memberships) so the hint stays None on that path and the enrich
+    // pass falls back to an (email, tenant_id) lookup.
+    let mut mid_hint: Option<uuid::Uuid> = None;
     let auth_state = match bearer(&request) {
         Some(token) => {
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
@@ -129,6 +181,10 @@ pub async fn auth_middleware(
                         if candidate_sub.is_none() {
                             candidate_sub = Some(claims.sub);
                         }
+                        // MAPPS-491: pull `mid` off the JWT for the enrich
+                        // pass below. `None` (legacy token) triggers the
+                        // fallback lookup by (email, tenant_id).
+                        mid_hint = claims.mid;
                         match auth_middleware
                             .auth_service
                             .ensure_user_and_tenant_active(claims.tid, claims.sub, claims.iat)
@@ -168,6 +224,12 @@ pub async fn auth_middleware(
     } else {
         auth_state
     };
+
+    // MAPPS-491 (MAPPS-474 phase 2): backfill identity + membership fields
+    // on the authenticated state so extractors and `GET /auth/memberships`
+    // can read them without a second round-trip. No-op when unauthenticated.
+    let auth_state =
+        enrich_auth_state_with_identity(&auth_middleware.auth_service, auth_state, mid_hint).await;
 
     // Insert auth state into request extensions
     request.extensions_mut().insert(auth_state);
@@ -217,6 +279,36 @@ where
             .unwrap_or_default();
 
         Ok(RequireAuth(user_or_auth_error(&auth_state)?))
+    }
+}
+
+/// MAPPS-491 (MAPPS-474 phase 2): extractor that surfaces the FULL
+/// authenticated `AuthState` (identity_id, active_membership_id,
+/// memberships, plus the user + tenant). Handlers that need the
+/// membership set — currently `GET /auth/memberships` — reach for this
+/// instead of `RequireAuth`, which only exposes `CurrentUser`.
+#[derive(Clone)]
+pub struct RequireAuthState(pub AuthState);
+
+impl<S> axum::extract::FromRequestParts<S> for RequireAuthState
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_state = parts
+            .extensions
+            .get::<AuthState>()
+            .cloned()
+            .unwrap_or_default();
+        // Reuse the RequireAuth gate: if the state isn't authenticated
+        // (or is tombstoned), map to the same 401 / 410.
+        user_or_auth_error(&auth_state)?;
+        Ok(RequireAuthState(auth_state))
     }
 }
 

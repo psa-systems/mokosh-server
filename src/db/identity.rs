@@ -130,4 +130,77 @@ impl MembershipRepo {
         .fetch_optional(pool)
         .await
     }
+
+    /// MAPPS-491: resolve `tenant_memberships.id` from an email + tenant
+    /// pair. Used as the fallback for legacy tokens minted before phase 2
+    /// (no `mid` claim) and in `generate_tokens` at mint time.
+    pub async fn find_id_by_email_and_tenant(
+        pool: &PgPool,
+        email: &str,
+        tenant_id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT tm.id
+            FROM tenant_memberships tm
+            JOIN identities i ON i.id = tm.identity_id
+            WHERE lower(i.email) = lower($1) AND tm.tenant_id = $2
+            "#,
+        )
+        .bind(email)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await
+    }
+
+    /// MAPPS-491: list every active membership for an identity joined
+    /// against `tenants` so callers get a wire-ready `MembershipView`
+    /// (tenant name/slug/kind included) in one round trip. Ordered by
+    /// `joined_at` so the phase-3 picker leads with the identity's
+    /// longest-standing tenant.
+    pub async fn list_views_for_identity(
+        pool: &PgPool,
+        identity_id: Uuid,
+        active_tenant_id: Option<Uuid>,
+    ) -> Result<Vec<mokosh_types::auth::MembershipView>, sqlx::Error> {
+        let rows: Vec<(Uuid, String, String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status
+            FROM tenant_memberships tm
+            JOIN tenants t ON t.id = tm.tenant_id
+            WHERE tm.identity_id = $1 AND tm.status = 'active'
+            ORDER BY tm.joined_at ASC
+            "#,
+        )
+        .bind(identity_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(tenant_id, name, slug, kind, role, status)| mokosh_types::auth::MembershipView {
+                    is_active: Some(tenant_id) == active_tenant_id,
+                    tenant_id,
+                    tenant_name: name,
+                    tenant_slug: slug,
+                    tenant_kind: kind,
+                    role,
+                    status,
+                },
+            )
+            .collect())
+    }
+}
+
+impl IdentityRepo {
+    /// MAPPS-491: resolve `identities.id` from an email. Convenience
+    /// used by the middleware to enrich `AuthState` with `identity_id`
+    /// when only the user row is in scope.
+    pub async fn find_id_by_email(pool: &PgPool, email: &str) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(r#"SELECT id FROM identities WHERE lower(email) = lower($1)"#)
+            .bind(email)
+            .fetch_optional(pool)
+            .await
+    }
 }
