@@ -81,7 +81,7 @@ impl DispatcherWorker {
         let rows = sqlx::query(
             r#"
             SELECT id, tenant_id, user_id, channel_type, recipient,
-                   subject, body, body_html, attempt_count
+                   subject, body, body_html, attempt_count, created_at
             FROM notifications
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
@@ -106,6 +106,7 @@ impl DispatcherWorker {
             let body: String = row.try_get("body")?;
             let body_html: Option<String> = row.try_get("body_html")?;
             let attempt: i32 = row.try_get("attempt_count")?;
+            let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
 
             let new_attempt = attempt + 1;
             let send_result = self
@@ -134,6 +135,10 @@ impl DispatcherWorker {
                     .execute(&mut *tx)
                     .await?;
                     stats.sent += 1;
+                    // PMS-788: make the enqueue-to-sent handoff visible so an
+                    // operator can tell app-side latency from downstream delivery.
+                    let latency_ms = (chrono::Utc::now() - created_at).num_milliseconds();
+                    tracing::info!(%id, channel = %channel, latency_ms, "notification sent");
                 }
                 Err(DeliveryError::Permanent(msg)) => {
                     sqlx::query(

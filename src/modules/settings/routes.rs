@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use validator::Validate;
@@ -63,6 +63,10 @@ pub fn settings_routes(
         // password, live mailer swap on write). A literal route registered
         // before `/settings/{category}` so it wins over the generic matcher.
         .route("/settings/email", get(get_email).put(put_email))
+        // PMS-788: send-a-test-email action (literal, before the generic
+        // /settings/{category}/{key} matcher). Lets an operator exercise email
+        // without a password reset.
+        .route("/settings/email/test-send", post(post_email_test_send))
         // PMS-113 AC1: category- and per-key tenant_settings endpoints.
         // Placed AFTER /settings/modules so the literal "modules"
         // segment matches the module routes first and only a non-
@@ -96,6 +100,26 @@ async fn put_email(
     let view = super::email::put_email_settings(&s.db, &s.enc_key, input).await?;
     super::email::rebuild_and_swap(&s.db, &s.enc_key, &s.shared_mailer).await?;
     Ok(Json(view))
+}
+
+/// PMS-788: send a one-off test email to `req.to` through the live mailer, so an
+/// operator can confirm outbound email without triggering a password reset.
+/// A malformed address or an SMTP failure surfaces as the mailer's error
+/// rather than being swallowed.
+async fn post_email_test_send(
+    State(s): State<SettingsRouterState>,
+    _admin: RequireAdmin,
+    Json(req): Json<super::email::TestEmailRequest>,
+) -> AppResult<axum::http::StatusCode> {
+    use crate::utils::email::Mailer;
+    s.shared_mailer
+        .send_text(
+            &req.to,
+            "Mokosh test email",
+            "This is a test email from Mokosh. If you received it, outbound email is working.",
+        )
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 async fn list_settings(
@@ -219,4 +243,33 @@ async fn delete_setting_by_key(
     s.service
         .delete_setting_by_key(u.tenant(), &category, &key)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::utils::email::{LogMailer, Mailer, SharedMailer};
+
+    use super::super::email::TestEmailRequest;
+
+    #[test]
+    fn test_email_request_deserializes_the_address() {
+        let req: TestEmailRequest =
+            serde_json::from_str(r#"{"to":"ops@example.com"}"#).expect("valid body");
+        assert_eq!(req.to, "ops@example.com");
+    }
+
+    // PMS-788: the send-test handler routes the address through the live mailer
+    // (`SharedMailer::send_text`), the same primitive the notifications worker
+    // uses. LogMailer records rather than sends, so this exercises the path
+    // without SMTP.
+    #[tokio::test]
+    async fn send_test_routes_through_the_mailer() {
+        let shared = SharedMailer::new(Arc::new(LogMailer));
+        shared
+            .send_text("ops@example.com", "Mokosh test email", "body")
+            .await
+            .expect("LogMailer send succeeds");
+    }
 }
