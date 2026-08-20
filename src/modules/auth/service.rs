@@ -1959,14 +1959,16 @@ impl AuthService {
         let secret = crate::utils::totp::generate_secret();
         let secret_b32 = crate::utils::totp::base32_encode(&secret);
 
+        // MAPPS-501 (MAPPS-496 stage 2c): identities is now the source
+        // of truth for mfa_secret; MAPPS-498 mirror back-propagates to
+        // every users.mfa_secret this identity backs.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
-             WHERE id = $2 AND tenant_id = $3",
+            "UPDATE identities SET mfa_secret = $1, updated_at = NOW() \
+             WHERE lower(email) = lower($2)",
         )
         .bind(&secret_b32)
-        .bind(user_id)
-        .bind(tenant_id)
+        .bind(&user.email)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -2011,16 +2013,23 @@ impl AuthService {
             .map(|c| recovery_code_hex_hash(c))
             .collect();
 
+        // MAPPS-501 (MAPPS-496 stage 2c): flip mfa_enabled + reset
+        // watermark on identities (source of truth); recovery-code
+        // hashes remain a users-only column (added by migration 029,
+        // not mirrored to identities).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            r#"
-            UPDATE users
-               SET mfa_enabled = TRUE,
-                   mfa_recovery_codes_hashes = $1,
-                   updated_at = NOW()
-             WHERE id = $2
-               AND tenant_id = $3
-            "#,
+            "UPDATE identities SET mfa_enabled = TRUE, \
+                                   mfa_last_totp_step = 0, \
+                                   updated_at = NOW() \
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(&user.email)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE users SET mfa_recovery_codes_hashes = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&hashes)
         .bind(user_id)
@@ -2051,17 +2060,24 @@ impl AuthService {
             return Err(AppError::Unauthorized);
         }
 
+        // MAPPS-501 (MAPPS-496 stage 2c): clear mfa_enabled + mfa_secret
+        // + watermark on identities (source of truth); clear recovery
+        // hashes on users (users-only column). Both writes share the
+        // same tx.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            r#"
-            UPDATE users
-               SET mfa_enabled = FALSE,
-                   mfa_secret = NULL,
-                   mfa_recovery_codes_hashes = '{}',
-                   updated_at = NOW()
-             WHERE id = $1
-               AND tenant_id = $2
-            "#,
+            "UPDATE identities SET mfa_enabled = FALSE, \
+                                   mfa_secret = NULL, \
+                                   mfa_last_totp_step = 0, \
+                                   updated_at = NOW() \
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(&user.email)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE users SET mfa_recovery_codes_hashes = '{}', updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
         )
         .bind(user_id)
         .bind(tenant_id)

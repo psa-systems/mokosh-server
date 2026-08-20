@@ -2421,6 +2421,135 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
     let _new_token = common::login(&app, &email, new_password).await;
 }
 
+/// MAPPS-501 (MAPPS-496 stage 2c): start_mfa_enrollment + enable_mfa
+/// write to `identities.mfa_secret` + `identities.mfa_enabled`; the
+/// MAPPS-498 back-mirror propagates both to `users`. Recovery-code
+/// hashes stay users-only (added by migration 029, never mirrored).
+#[sqlx::test]
+async fn mfa_enable_writes_to_identity_plane(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send mfa setup")
+        .json()
+        .await
+        .expect("mfa setup JSON");
+    let secret_b32 = setup["secret"].as_str().expect("secret").to_string();
+    let secret = mokosh_server::utils::totp::base32_decode(&secret_b32).expect("decode secret");
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .expect("send mfa enable");
+    assert!(resp.status().is_success());
+
+    // Identity plane is authoritative for mfa_enabled + mfa_secret.
+    let (id_enabled, id_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM identities WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read identity mfa");
+    assert!(id_enabled, "identity.mfa_enabled TRUE");
+    assert_eq!(
+        id_secret.as_deref(),
+        Some(secret_b32.as_str()),
+        "identity.mfa_secret matches setup"
+    );
+
+    // Users row mirrors via MAPPS-498.
+    let (u_enabled, u_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read users mfa");
+    assert!(u_enabled);
+    assert_eq!(u_secret, id_secret);
+
+    // Recovery hashes are users-only.
+    let recovery_hashes: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(mfa_recovery_codes_hashes) FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_all(&app.pool)
+            .await
+            .expect("read recovery hashes");
+    assert_eq!(recovery_hashes.len(), 10, "10 recovery hashes stored");
+}
+
+/// MAPPS-501: disable_mfa clears mfa_enabled + mfa_secret + watermark
+/// on identities; clears recovery hashes on users. Bidir mirror
+/// keeps users.mfa_* in sync.
+#[sqlx::test]
+async fn mfa_disable_clears_identity_plane(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Enroll and enable first.
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("setup")
+        .json()
+        .await
+        .expect("json");
+    let secret = mokosh_server::utils::totp::base32_decode(setup["secret"].as_str().unwrap())
+        .expect("decode");
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    app.client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .expect("enable");
+
+    // Disable requires current password.
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/disable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "password": password }))
+        .send()
+        .await
+        .expect("send disable");
+    assert!(resp.status().is_success());
+
+    let (id_enabled, id_secret, id_step): (bool, Option<String>, i64) = sqlx::query_as(
+        "SELECT mfa_enabled, mfa_secret, mfa_last_totp_step FROM identities WHERE id = $1",
+    )
+    .bind(admin_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("read identity");
+    assert!(!id_enabled, "identity.mfa_enabled cleared");
+    assert!(id_secret.is_none(), "identity.mfa_secret NULL");
+    assert_eq!(id_step, 0, "identity.mfa_last_totp_step reset");
+
+    let hashes: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(mfa_recovery_codes_hashes) FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_all(&app.pool)
+            .await
+            .expect("read hashes");
+    assert!(hashes.is_empty(), "recovery hashes cleared on users");
+}
+
 /// MAPPS-499 (MAPPS-496 stage 2a): change_password writes the new
 /// hash to `identities.password_hash`; the MAPPS-498 back-mirror
 /// propagates it to users.password_hash so the legacy read path in
