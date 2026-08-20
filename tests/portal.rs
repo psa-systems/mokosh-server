@@ -765,3 +765,111 @@ async fn portal_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
         );
     }
 }
+
+// PMS-806: a contact may now link to several companies, but portal scoping is
+// deliberately UNCHANGED by that PR: a portal session still resolves the
+// contact's PRIMARY company only. Broadening it is a security decision tracked
+// in PMS-807. This test pins the narrow scope so that decision cannot be made
+// by accident.
+#[sqlx::test]
+async fn portal_session_for_a_two_company_contact_sees_only_the_primary_company(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let primary = seed_company(&pool, "Primary Co").await;
+    let secondary = seed_company(&pool, "Secondary Co").await;
+    let contact = seed_portal_contact(&pool, primary, "dual@dual.example").await;
+
+    // Link the same contact to BOTH companies, primary first.
+    for (company, is_primary) in [(primary, true), (secondary, false)] {
+        sqlx::query(
+            "INSERT INTO contact_companies (tenant_id, contact_id, company_id, is_primary) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(contact)
+        .bind(company)
+        .bind(is_primary)
+        .execute(&pool)
+        .await
+        .expect("link contact to company");
+    }
+
+    // A ticket sitting on the SECONDARY company. The portal must not surface it.
+    let secondary_ticket =
+        seed_ticket_for_company(&pool, secondary, admin_id, "Secondary work").await;
+    let primary_ticket = seed_ticket_for_company(&pool, primary, admin_id, "Primary work").await;
+
+    let app = common::boot(pool).await;
+    let login: serde_json::Value = portal_login(&app, "dual@dual.example", PORTAL_PASSWORD)
+        .await
+        .json()
+        .await
+        .expect("portal login JSON");
+    assert_eq!(
+        login["contact"]["company_id"].as_str(),
+        Some(primary.to_string().as_str()),
+        "the session resolves the PRIMARY company, not the link set"
+    );
+    let token = login["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/portal/tickets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list portal tickets")
+        .json()
+        .await
+        .expect("portal ticket list JSON");
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .filter_map(|t| t["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&primary_ticket.to_string().as_str()),
+        "the primary company's ticket is visible: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&secondary_ticket.to_string().as_str()),
+        "the second company's ticket must NOT be visible until PMS-807 decides: {ids:?}"
+    );
+}
+
+/// Seed a minimal ticket under `company_id`, reusing the tenant's first status,
+/// priority and queue. Returns its id.
+async fn seed_ticket_for_company(
+    pool: &PgPool,
+    company_id: Uuid,
+    created_by: Uuid,
+    title: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO tickets (
+            id, tenant_id, ticket_number, title, company_id,
+            status_id, priority_id, queue_id, source, created_by_id
+        )
+        SELECT $1, $2, $3, $4, $5,
+               (SELECT id FROM ticket_statuses WHERE tenant_id = $2 ORDER BY sort_order LIMIT 1),
+               (SELECT id FROM ticket_priorities WHERE tenant_id = $2 ORDER BY sort_order LIMIT 1),
+               (SELECT id FROM ticket_queues WHERE tenant_id = $2 ORDER BY name LIMIT 1),
+               'portal', $6
+        "#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(format!("TKT-{}", &id.to_string()[..8]))
+    .bind(title)
+    .bind(company_id)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .expect("seed ticket");
+    id
+}

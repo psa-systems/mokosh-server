@@ -78,17 +78,82 @@ fn validate_company_link_exclusive(
     Ok(())
 }
 
+/// PMS-806: the multi-company list obeys the same exclusion as the single FK.
+/// A non-empty `companies` array alongside a non-empty freeform `company_name`
+/// is rejected, exactly as `company_id` plus `company_name` is.
+fn validate_companies_name_exclusive(
+    companies: &Option<Vec<ContactCompanyLinkInput>>,
+    company_name: &Option<String>,
+) -> Result<(), ValidationError> {
+    let has_links = companies.as_ref().is_some_and(|l| !l.is_empty());
+    let has_freeform = company_name.as_deref().is_some_and(|s| !s.is_empty());
+    if has_links && has_freeform {
+        return Err(ValidationError::new("companies_and_name_both_set"));
+    }
+    Ok(())
+}
+
+/// PMS-806: at most one entry in a child list may carry `is_primary`. A list
+/// with none flagged is fine (the service promotes the first entry); two is a
+/// contradiction the caller has to resolve, so it is a 422.
+fn validate_single_primary<T>(
+    entries: &Option<Vec<T>>,
+    is_primary: impl Fn(&T) -> bool,
+    code: &'static str,
+) -> Result<(), ValidationError> {
+    let Some(entries) = entries else {
+        return Ok(());
+    };
+    if entries.iter().filter(|e| is_primary(e)).count() > 1 {
+        return Err(ValidationError::new(code));
+    }
+    Ok(())
+}
+
+/// PMS-806: reject a `companies` list that names the same company twice. The
+/// `UNIQUE (contact_id, company_id)` constraint would otherwise reject it at
+/// the DB layer, which surfaces as a 500 instead of a field error.
+fn validate_companies_distinct(
+    companies: &Option<Vec<ContactCompanyLinkInput>>,
+) -> Result<(), ValidationError> {
+    let Some(links) = companies else {
+        return Ok(());
+    };
+    let mut seen = std::collections::HashSet::with_capacity(links.len());
+    if links.iter().any(|l| !seen.insert(l.company_id)) {
+        return Err(ValidationError::new("duplicate_company_link"));
+    }
+    Ok(())
+}
+
+/// The child-list rules shared by the create and update paths (PMS-806).
+fn validate_child_lists(
+    phones: &Option<Vec<ContactPhoneInput>>,
+    companies: &Option<Vec<ContactCompanyLinkInput>>,
+    company_name: &Option<String>,
+) -> Result<(), ValidationError> {
+    validate_companies_name_exclusive(companies, company_name)?;
+    validate_single_primary(phones, |p| p.is_primary, "multiple_primary_phones")?;
+    validate_single_primary(companies, |c| c.is_primary, "multiple_primary_companies")?;
+    validate_companies_distinct(companies)
+}
+
 /// Struct-level guard for `CreateContactRequest` (PMS-402): a contact may link
-/// a CRM `company_id` OR carry a freeform `company_name`, never both.
+/// a CRM `company_id` OR carry a freeform `company_name`, never both. PMS-806
+/// extends the same rule to the `companies` list and adds the primary-flag and
+/// duplicate-link checks.
 fn validate_create_company_link(req: &CreateContactRequest) -> Result<(), ValidationError> {
-    validate_company_link_exclusive(req.company_id, &req.company_name)
+    validate_company_link_exclusive(req.company_id, &req.company_name)?;
+    validate_child_lists(&req.phones, &req.companies, &req.company_name)
 }
 
 /// Struct-level guard for `UpdateContactRequest` (PMS-402): same mutual
 /// exclusion as create. Setting a `company_id` while also passing a non-empty
-/// `company_name` in the same request is rejected.
+/// `company_name` in the same request is rejected. PMS-806 adds the same
+/// child-list rules as the create path.
 fn validate_update_company_link(req: &UpdateContactRequest) -> Result<(), ValidationError> {
-    validate_company_link_exclusive(req.company_id, &req.company_name)
+    validate_company_link_exclusive(req.company_id, &req.company_name)?;
+    validate_child_lists(&req.phones, &req.companies, &req.company_name)
 }
 
 /// Validate a website as an http(s) URL. An empty string is treated as "no
@@ -703,6 +768,95 @@ impl ContactStatus {
     }
 }
 
+/// Phone-number classification for a `contact_phones` row (PMS-806). Mirrors
+/// the table's CHECK constraint one-for-one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PhoneType {
+    Mobile,
+    Work,
+    Home,
+    Fax,
+    #[default]
+    Other,
+}
+
+impl PhoneType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "mobile" => Some(Self::Mobile),
+            "work" => Some(Self::Work),
+            "home" => Some(Self::Home),
+            "fax" => Some(Self::Fax),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mobile => "mobile",
+            Self::Work => "work",
+            Self::Home => "home",
+            Self::Fax => "fax",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One typed phone number belonging to a contact (PMS-806). The ordered list
+/// on `Contact` is authoritative; `contacts.phone` / `mobile` / `fax` are
+/// mirrors recomputed from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactPhone {
+    pub id: Uuid,
+    pub phone_type: PhoneType,
+    pub number: String,
+    pub extension: Option<String>,
+    pub is_primary: bool,
+    pub sort_order: i32,
+}
+
+/// One link between a contact and a CRM company (PMS-806). The list on
+/// `Contact` is authoritative; `contacts.company_id` mirrors the primary link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactCompanyLink {
+    pub company_id: Uuid,
+    #[serde(default)]
+    pub company_name: Option<String>,
+    /// Role at THIS company; `contacts.title` stays the person's default.
+    pub title: Option<String>,
+    pub is_primary: bool,
+}
+
+/// Request-side phone entry (PMS-806). `number` carries the same
+/// [`de_phone_opt`] normalization and `validate_phone_e164` rule as
+/// `contacts.phone`, so an invalid entry fails at `phones[i].number` and names
+/// the offending entry in the 422.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactPhoneInput {
+    #[serde(default)]
+    pub phone_type: PhoneType,
+    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[validate(required, custom(function = "validate_phone_e164"))]
+    pub number: Option<String>,
+    #[validate(length(max = 20), custom(function = "validate_text_no_nul"))]
+    pub extension: Option<String>,
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+/// Request-side company link (PMS-806). The array order is the link order; the
+/// service promotes the first entry when none is flagged primary.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactCompanyLinkInput {
+    pub company_id: Uuid,
+    #[validate(length(max = 100), custom(function = "validate_text_no_nul"))]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
 /// Contact database model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
@@ -738,6 +892,14 @@ pub struct Contact {
     pub notes: Option<String>,
     pub avatar_url: Option<String>,
     pub status: ContactStatus,
+    /// PMS-806: the authoritative ordered phone list. `phone` / `mobile` /
+    /// `fax` above are mirrors recomputed from it on every write.
+    #[serde(default)]
+    pub phones: Vec<ContactPhone>,
+    /// PMS-806: every company this contact is linked to. `company_id` above
+    /// mirrors the primary link (`None` when there are no links).
+    #[serde(default)]
+    pub companies: Vec<ContactCompanyLink>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -792,6 +954,18 @@ pub struct CreateContactRequest {
     /// Create portal access for this contact
     #[serde(default)]
     pub create_portal_access: bool,
+    /// PMS-806: the authoritative typed phone list. Absent (`None`) keeps the
+    /// pre-PMS-806 behaviour exactly: the scalar `phone` / `mobile` / `fax`
+    /// drive the write and the service materializes the matching child rows.
+    /// Present: the scalars in the same request are ignored and recomputed.
+    #[serde(default)]
+    #[validate(nested)]
+    pub phones: Option<Vec<ContactPhoneInput>>,
+    /// PMS-806: the authoritative company-link list. Absent keeps the
+    /// single-`company_id` behaviour; `[]` means no links at all.
+    #[serde(default)]
+    #[validate(nested)]
+    pub companies: Option<Vec<ContactCompanyLinkInput>>,
 }
 
 /// Update contact request
@@ -836,6 +1010,20 @@ pub struct UpdateContactRequest {
     /// `/portal/set-password` link (PMS-136). Setting `false` revokes
     /// access (PMS-17 flag transition). `None` leaves the flag untouched.
     pub is_portal_user: Option<bool>,
+    /// PMS-806: replaces the contact's phone list wholesale when present. When
+    /// absent, a request that sets any of the scalar `phone` / `mobile` / `fax`
+    /// fields rebuilds the list from the resulting scalars; a request that
+    /// touches none of them leaves the list alone.
+    #[serde(default)]
+    #[validate(nested)]
+    pub phones: Option<Vec<ContactPhoneInput>>,
+    /// PMS-806: replaces the contact's company links wholesale when present
+    /// (`[]` unlinks every company). When absent, setting `company_id` keeps
+    /// the pre-PMS-806 single-company semantics and makes that company the
+    /// contact's only link.
+    #[serde(default)]
+    #[validate(nested)]
+    pub companies: Option<Vec<ContactCompanyLinkInput>>,
 }
 
 /// Contact summary (for embedding in other responses)
@@ -883,6 +1071,10 @@ pub struct ContactResponse {
     pub tags: Vec<String>,
     pub avatar_url: Option<String>,
     pub status: ContactStatus,
+    /// PMS-806: the full typed phone list and every company link, alongside
+    /// the `phone` / `mobile` / `company_id` mirrors above.
+    pub phones: Vec<ContactPhone>,
+    pub companies: Vec<ContactCompanyLink>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -907,6 +1099,8 @@ impl From<Contact> for ContactResponse {
             tags: c.tags,
             avatar_url: c.avatar_url,
             status: c.status,
+            phones: c.phones,
+            companies: c.companies,
             created_at: c.created_at,
         }
     }
@@ -1510,5 +1704,169 @@ mod tests {
         }))
         .expect("update deserializes");
         assert!(req.validate().is_err());
+    }
+
+    // ========================================================================
+    // PMS-806: typed phone list + multiple company links
+    // ========================================================================
+
+    #[test]
+    fn phone_type_round_trips_through_serde() {
+        for (variant, wire) in [
+            (PhoneType::Mobile, "mobile"),
+            (PhoneType::Work, "work"),
+            (PhoneType::Home, "home"),
+            (PhoneType::Fax, "fax"),
+            (PhoneType::Other, "other"),
+        ] {
+            let json = serde_json::to_string(&variant).expect("serializes");
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: PhoneType = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, variant);
+            // The DB round-trip (CHECK constraint values) uses the same strings.
+            assert_eq!(variant.as_str(), wire);
+            assert_eq!(PhoneType::from_str(wire), Some(variant));
+        }
+        assert_eq!(PhoneType::from_str("pager"), None);
+        assert_eq!(PhoneType::default(), PhoneType::Other);
+    }
+
+    #[test]
+    fn phone_list_entries_are_normalized_and_validated() {
+        let req = contact_req(serde_json::json!({
+            "phones": [
+                { "phone_type": "work", "number": "+1 (415) 555-1234", "is_primary": true },
+                { "phone_type": "mobile", "number": "+14155559999" },
+            ],
+        }));
+        assert!(req.validate().is_ok());
+        let phones = req.phones.as_ref().expect("phones present");
+        assert_eq!(phones[0].number.as_deref(), Some("+14155551234"));
+        assert_eq!(phones[0].phone_type, PhoneType::Work);
+        assert_eq!(phones[1].phone_type, PhoneType::Mobile);
+    }
+
+    #[test]
+    fn invalid_phone_entry_names_the_offending_entry() {
+        let req = contact_req(serde_json::json!({
+            "phones": [
+                { "phone_type": "work", "number": "+14155551234" },
+                { "phone_type": "home", "number": "not-a-phone" },
+            ],
+        }));
+        let errors = req.validate().expect_err("bad entry must be rejected");
+        // validator keys list errors by index, so the 422 identifies entry 1.
+        let rendered = format!("{errors:?}");
+        assert!(
+            rendered.contains("phones") && rendered.contains('1'),
+            "error should name the phones list and the failing index: {rendered}"
+        );
+    }
+
+    #[test]
+    fn phone_entry_without_a_number_is_rejected() {
+        // A blank number normalizes to None, which the `required` rule catches
+        // rather than silently storing an empty string.
+        let req = contact_req(serde_json::json!({
+            "phones": [{ "phone_type": "work", "number": "   " }],
+        }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn two_primary_phones_are_rejected() {
+        let req = contact_req(serde_json::json!({
+            "phones": [
+                { "phone_type": "work", "number": "+14155551234", "is_primary": true },
+                { "phone_type": "home", "number": "+14155555678", "is_primary": true },
+            ],
+        }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn no_primary_phone_is_accepted() {
+        // The service promotes the first entry rather than erroring.
+        let req = contact_req(serde_json::json!({
+            "phones": [{ "phone_type": "work", "number": "+14155551234" }],
+        }));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn two_primary_companies_are_rejected() {
+        let req = contact_req_raw(serde_json::json!({
+            "companies": [
+                { "company_id": "11111111-1111-1111-1111-111111111111", "is_primary": true },
+                { "company_id": "22222222-2222-2222-2222-222222222222", "is_primary": true },
+            ],
+        }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_company_link_is_rejected() {
+        let req = contact_req_raw(serde_json::json!({
+            "companies": [
+                { "company_id": "11111111-1111-1111-1111-111111111111" },
+                { "company_id": "11111111-1111-1111-1111-111111111111" },
+            ],
+        }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn companies_list_with_freeform_name_is_rejected() {
+        let req = contact_req_raw(serde_json::json!({
+            "company_name": "Acme Plumbing",
+            "companies": [{ "company_id": "11111111-1111-1111-1111-111111111111" }],
+        }));
+        assert!(
+            req.validate().is_err(),
+            "a non-empty companies list plus a freeform company_name must be rejected"
+        );
+    }
+
+    #[test]
+    fn empty_companies_list_with_freeform_name_is_valid() {
+        // `companies: []` means "no links", which does not collide with a
+        // freeform label.
+        let req = contact_req_raw(serde_json::json!({
+            "company_name": "Acme Plumbing",
+            "companies": [],
+        }));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn update_applies_the_same_child_list_rules() {
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "companies": [
+                { "company_id": "11111111-1111-1111-1111-111111111111", "is_primary": true },
+                { "company_id": "22222222-2222-2222-2222-222222222222", "is_primary": true },
+            ],
+        }))
+        .expect("update deserializes");
+        assert!(req.validate().is_err());
+
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "phones": [{ "phone_type": "mobile", "number": "+1 415 555 1234" }],
+        }))
+        .expect("update deserializes");
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            req.phones.as_ref().expect("phones")[0].number.as_deref(),
+            Some("+14155551234")
+        );
+    }
+
+    #[test]
+    fn contact_requests_without_child_lists_stay_absent() {
+        // The compatibility contract: an existing-shaped request leaves both
+        // lists `None`, which the service reads as "derive from the scalars".
+        let req = contact_req(serde_json::json!({ "phone": "+14155551234" }));
+        assert!(req.phones.is_none());
+        assert!(req.companies.is_none());
+        assert!(req.validate().is_ok());
     }
 }

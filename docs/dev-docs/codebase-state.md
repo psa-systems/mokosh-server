@@ -250,6 +250,43 @@ at all is a 400. `is_non_public_ip`
 before the first connect and again for every redirect hop, which is
 what stops the endpoint being an SSRF primitive.
 
+**Contact child collections and the mirror rule (PMS-806).** A contact
+carries an ordered list of typed phone numbers (`contact_phones`:
+`phone_type` in `mobile`/`work`/`home`/`fax`/`other`, `number`,
+`extension`, `is_primary`, `sort_order`) and links to any number of
+companies (`contact_companies`: `company_id`, per-link `title`,
+`is_primary`, `UNIQUE (contact_id, company_id)`). Both are tenant-scoped
+with their own `tenant_isolation` RLS policy and a partial unique index
+enforcing one primary per contact
+([`108_contact_phones_and_companies.sql`](../migrations/108_contact_phones_and_companies.sql)).
+
+The child tables are authoritative. `contacts.phone`, `.mobile`, `.fax`
+and `.company_id` stay on the table as **maintained mirrors**, recomputed
+from the child rows by
+[`recompute_contact_mirrors`](../src/modules/contacts/service.rs) inside
+the same transaction as every create and update - the single writer of
+those four columns. The rule: `phone` = the primary entry's number,
+`mobile` = the first `mobile`-type entry, `fax` = the first `fax`-type
+entry, `company_id` = the primary link (NULL with no links). This is a
+deliberate denormalization that keeps every pre-PMS-806 query, index,
+seed fixture, portal lookup and the current SPA working while the SPA
+catches up (MAPPS-481).
+
+`CreateContactRequest` / `UpdateContactRequest` take optional `phones`
+and `companies` arrays. Absent, the scalar fields drive the write and the
+service materializes the matching child rows; present, they are
+authoritative and the scalars in the same request are recomputed from
+them. Reads that answer "which contacts belong to company X"
+(`list_contacts`'s `company_id` filter, `get_company_contacts`, the
+company list's `contact_count`) go through `contact_companies`, so a
+contact is found through ANY of its links and counted once per company.
+`phones` and `companies` are hydrated with one batched query each per
+page, pinned by
+[`contact_hydration_query_budget.rs`](../tests/contact_hydration_query_budget.rs).
+
+Portal scoping is deliberately NOT broadened: a portal session still
+resolves the contact's primary company only (PMS-807).
+
 **Defect: `update_site` is a silent no-op.**
 [`routes.rs:273-288`](../src/modules/contacts/routes.rs#L273) accepts
 the request body, validates it, then calls `get_site` and returns
@@ -263,7 +300,8 @@ as **F4**.
 - [`service.rs:332`](../src/modules/contacts/service.rs#L332) -
   `create_contact` ignores `create_portal_access: true`.
 
-**Schema touched:** `companies`, `contacts`, `sites`.
+**Schema touched:** `companies`, `contacts`, `contact_phones`,
+`contact_companies`, `sites`.
 
 #### `tenants` (~810 LOC)
 
