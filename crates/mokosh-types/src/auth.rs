@@ -530,6 +530,26 @@ pub struct SelectTenantRequest {
     pub tenant_id: Uuid,
 }
 
+/// MAPPS-493 (MAPPS-474 phase 4): request body for
+/// `POST /api/v1/tenants/self-serve`. Called by the SPA `needs_setup`
+/// panel to trade an identity_token for a new organization + a full
+/// session scoped to it.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct SelfServeTenantRequest {
+    /// The short-lived JWT returned in `LoginResponse.identity_token`
+    /// when the identity-first login branch resolved to `needs_setup`.
+    #[validate(length(min = 1, message = "identity_token is required"))]
+    pub identity_token: String,
+    /// Display name for the new organization.
+    #[validate(length(min = 1, max = 100, message = "Name must be 1-100 characters"))]
+    pub tenant_name: String,
+    /// URL-safe slug for the tenant's client portal. Optional: server
+    /// derives one from the name when omitted.
+    #[serde(default)]
+    #[validate(length(max = 64, message = "Slug must be 64 characters or fewer"))]
+    pub tenant_slug: Option<String>,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Deserialize)]
 pub struct RefreshTokenRequest {

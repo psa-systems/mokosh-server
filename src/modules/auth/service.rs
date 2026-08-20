@@ -3242,13 +3242,15 @@ impl AuthService {
         }
     }
 
-    /// MAPPS-492: internal helper. Given an identity/email that has just
+    /// MAPPS-492: helper. Given an identity/email that has just
     /// authenticated and a specific tenant_id it holds a membership in,
     /// resolve the users row, run the principal gate, create a session,
     /// mint tokens, and return the scoped `LoginResponse`. Shared by the
-    /// auto-scope branch of `authenticate_identity_first` and by
-    /// `select_tenant_for_identity`.
-    async fn mint_session_for_membership(
+    /// auto-scope branch of `authenticate_identity_first`, by
+    /// `select_tenant_for_identity`, and (phase 4, MAPPS-493) by the
+    /// `/tenants/self-serve` handler which needs to mint a session for
+    /// the freshly-created admin of a self-serve tenant.
+    pub(crate) async fn mint_session_for_membership(
         &self,
         tenant_id: Uuid,
         email: &str,

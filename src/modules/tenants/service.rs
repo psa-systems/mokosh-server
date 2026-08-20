@@ -346,6 +346,156 @@ impl TenantService {
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
     }
 
+    /// MAPPS-493 (MAPPS-474 phase 4): create a tenant on behalf of an
+    /// already-authenticated identity. Unlike `create_tenant` (which is
+    /// the super-admin "provision a tenant for someone else" flow), the
+    /// caller here IS the admin: the admin user row lands with
+    /// `status='active'` and the identity's own `password_hash`, so no
+    /// welcome email + no `password_reset_token` are minted.
+    ///
+    /// Returns `(Tenant, admin_user_id)` so the caller can immediately
+    /// mint a session for the fresh admin.
+    ///
+    /// Shares uniqueness, cap enforcement, sequence seeding, default
+    /// config copy, and own-company provisioning with `create_tenant`
+    /// by opening the same transaction shape; the divergence is in the
+    /// admin-user INSERT (status + password_hash) and the absence of the
+    /// welcome-email dispatch.
+    #[tracing::instrument(skip_all)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_tenant_for_identity(
+        &self,
+        email: &str,
+        first_name: &str,
+        last_name: &str,
+        password_hash: Option<&str>,
+        tenant_name: &str,
+        tenant_slug: Option<&str>,
+        ctx: &AuditCtx,
+    ) -> AppResult<(Tenant, Uuid)> {
+        let tenant_id = Uuid::new_v4();
+        let admin_id = Uuid::new_v4();
+
+        // Slug: caller-provided if non-empty, else slugified from name.
+        // slugify() may collapse to empty on all-non-alphanumeric input;
+        // reject with a validation-shaped error so the caller can retry.
+        let raw_slug = tenant_slug
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(tenant_name);
+        let slug = slugify(raw_slug);
+        if slug.is_empty() {
+            return Err(AppError::BadRequest(
+                "Tenant name has no URL-safe characters; provide an explicit slug".to_string(),
+            ));
+        }
+
+        // Uniqueness + cap probes on the RLS-exempt migrator pool
+        // (mirrors create_tenant).
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants WHERE slug = $1)")
+                .bind(&slug)
+                .fetch_one(self.db.migrator_pool())
+                .await?;
+        if exists {
+            return Err(AppError::conflict("A tenant with this slug already exists"));
+        }
+        if let Some(cap) = self.max_tenants {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+                .fetch_one(self.db.migrator_pool())
+                .await?;
+            if (count as usize) >= cap {
+                return Err(AppError::conflict(format!(
+                    "Tenant creation cap reached ({cap}); contact your operator to raise MOKOSH_MAX_TENANTS."
+                )));
+            }
+        }
+        let name_taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tenants \
+             WHERE LOWER(name) = LOWER($1) AND personal_owner_id IS NULL)",
+        )
+        .bind(tenant_name)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if name_taken {
+            return Err(AppError::conflict("A tenant with this name already exists"));
+        }
+
+        let trial_ends_at = Utc::now() + Duration::days(14);
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO tenants (id, name, slug, status, kind, subscription_status, trial_ends_at, branding)
+            VALUES ($1, $2, $3, 'active', 'org', 'trialing', $4, '{}'::jsonb)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(tenant_name)
+        .bind(&slug)
+        .bind(trial_ends_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("INSERT INTO ticket_sequences (tenant_id, last_number) VALUES ($1, 0)")
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO invoice_sequences (tenant_id, last_number, prefix) VALUES ($1, 0, 'INV-')",
+        )
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Admin user row for the identity. Phase-1 trigger creates the
+        // matching `tenant_memberships` row (role='admin') and, if no
+        // identity exists for this email yet, mirrors the users row into
+        // `identities`. For the self-serve happy path an identity
+        // already exists (the caller just authenticated with it), so
+        // only the membership row lands.
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'admin', 'active', NOW())
+            "#,
+        )
+        .bind(admin_id)
+        .bind(tenant_id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(first_name)
+        .bind(last_name)
+        .execute(&mut *tx)
+        .await?;
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tenants t WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        audit_write(
+            &mut *tx,
+            TenantId::from_trusted(tenant_id),
+            ctx,
+            AuditAction::Create,
+            "tenants",
+            Some(tenant_id),
+            None,
+            after,
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        self.copy_default_config(tenant_id).await?;
+        self.ensure_own_company(tenant_id).await?;
+
+        let tenant = self.get_tenant(TenantId::from_trusted(tenant_id)).await?;
+        Ok((tenant, admin_id))
+    }
+
     /// Emit an `auth.welcome` message with a `/reset-password/{token}` link
     /// for the freshly created tenant's admin.
     ///
@@ -536,11 +686,7 @@ impl TenantService {
     /// 5. Mint + dispatch via [`mint_and_send_welcome`], same helper the
     ///    create path uses.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn resend_admin_welcome(
-        &self,
-        tenant_id: TenantId,
-        ctx: &AuditCtx,
-    ) -> AppResult<()> {
+    pub async fn resend_admin_welcome(&self, tenant_id: TenantId, ctx: &AuditCtx) -> AppResult<()> {
         // Cross-tenant super-admin read against the RLS-protected `users`
         // table: run under the tenant GUC so the SELECT sees the row.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -552,8 +698,7 @@ impl TenantService {
         .bind(*tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((admin_id, admin_email, admin_first_name, admin_last_name, status)) = admin
-        else {
+        let Some((admin_id, admin_email, admin_first_name, admin_last_name, status)) = admin else {
             return Err(AppError::not_found("No admin user found for this tenant"));
         };
         if status != "pending" {
@@ -846,9 +991,7 @@ impl TenantService {
             .fetch_one(self.db.migrator_pool())
             .await?;
             if collision {
-                return Err(AppError::conflict(
-                    "A tenant with this name already exists",
-                ));
+                return Err(AppError::conflict("A tenant with this name already exists"));
             }
         }
 
@@ -876,9 +1019,7 @@ impl TenantService {
             .fetch_one(self.db.migrator_pool())
             .await?;
             if collision {
-                return Err(AppError::conflict(
-                    "A tenant with this slug already exists",
-                ));
+                return Err(AppError::conflict("A tenant with this slug already exists"));
             }
             Some(candidate)
         } else {
@@ -1051,9 +1192,8 @@ impl TenantService {
         request: &UpdateTenantAdminRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TenantAdminInfo> {
-        let has_any_change = request.email.is_some()
-            || request.first_name.is_some()
-            || request.last_name.is_some();
+        let has_any_change =
+            request.email.is_some() || request.first_name.is_some() || request.last_name.is_some();
         if !has_any_change && !request.resend_welcome {
             return Err(AppError::validation_field(
                 "email",
@@ -1109,7 +1249,13 @@ impl TenantService {
                  WHERE id = $1",
             )
             .bind(admin_id)
-            .bind(request.email.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .bind(
+                request
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
             .bind(
                 request
                     .first_name

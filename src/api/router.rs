@@ -330,7 +330,11 @@ pub fn create_api_router(
         .nest(
             "/auth",
             auth_routes(
-                auth_service,
+                // MAPPS-493 (phase 4): share the AuthService Arc with
+                // tenant_routes so `/tenants/self-serve` can decode
+                // identity_tokens minted by /auth/login. AuthService
+                // derives Clone, so this is a cheap Arc bump.
+                auth_service.clone(),
                 google_oauth,
                 client_origin.clone(),
                 jwt_secret.clone(),
@@ -345,7 +349,11 @@ pub fn create_api_router(
     #[cfg(feature = "multi-tenant")]
     let api_v1 = api_v1.nest(
         "/tenants",
-        tenant_routes(tenant_service, settings_service.clone()),
+        tenant_routes(
+            tenant_service,
+            settings_service.clone(),
+            std::sync::Arc::new(auth_service),
+        ),
     );
     // PMS-791 / MAPPS-461: teams CRUD + membership. Two mounts so the
     // "my teams" endpoint sits under /me alongside future me-scoped

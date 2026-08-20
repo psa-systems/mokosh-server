@@ -16,10 +16,13 @@ use super::{
     CreateTenantRequest, TenantAdminInfo, TenantResponse, TenantService, TenantUsage,
     UpdateTenantAdminRequest, UpdateTenantRequest,
 };
-use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole};
+use crate::modules::auth::{
+    AuthService, RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole,
+};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
+use mokosh_types::auth::{LoginResponse, SelfServeTenantRequest};
 
 #[derive(Clone)]
 pub struct TenantRouterState {
@@ -32,6 +35,12 @@ pub struct TenantRouterState {
     // own router state; we Arc it here too so the clone is cheap and
     // the two routers share the same instance.
     pub settings_service: Arc<SettingsService>,
+    /// MAPPS-493 (MAPPS-474 phase 4): needed by the `/tenants/self-serve`
+    /// handler so it can decode an identity_token (from the phase-3
+    /// `needs_setup` login branch) and mint a full session for the
+    /// admin of the freshly created tenant. Shared with the auth
+    /// router via the same `Arc<AuthService>` created in `api/router.rs`.
+    pub auth_service: Arc<AuthService>,
 }
 
 /// Create the tenant management router. `settings_service` is threaded
@@ -40,16 +49,23 @@ pub struct TenantRouterState {
 pub fn tenant_routes(
     tenant_service: TenantService,
     settings_service: Arc<SettingsService>,
+    auth_service: Arc<AuthService>,
 ) -> Router {
     let state = TenantRouterState {
         tenant_service: Arc::new(tenant_service),
         logos: Arc::new(TenantLogoStore::new(TenantLogoConfig::from_env())),
         settings_service,
+        auth_service,
     };
 
     Router::new()
         .route("/", get(list_tenants))
         .route("/", post(create_tenant))
+        // MAPPS-493 (MAPPS-474 phase 4): PUBLIC (no RequireAuth); the
+        // handler decodes an identity_token from the phase-3
+        // `needs_setup` login branch and returns a full `LoginResponse`
+        // scoped to the freshly created tenant.
+        .route("/self-serve", post(self_serve_tenant))
         // PMS-751: the caller's OWN tenant, addressed without an id.
         //
         // Declared before the `{tenant_id}` routes for readability only; axum
@@ -125,6 +141,93 @@ async fn create_tenant(
     let tenant = state.tenant_service.create_tenant(&request, &ctx).await?;
 
     Ok(Json(tenant.into()))
+}
+
+/// MAPPS-493 (MAPPS-474 phase 4): trade an identity_token (from the
+/// phase-3 `needs_setup` login branch) for a new organization + a full
+/// session scoped to it. PUBLIC route (no bearer required); the
+/// identity_token in the body IS the authentication.
+///
+/// Refuses when the caller already holds at least one active membership
+/// (they should use the in-app "Create org" button instead — that lands
+/// in phase 5 as part of the switcher work).
+async fn self_serve_tenant(
+    State(state): State<TenantRouterState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<SelfServeTenantRequest>,
+) -> AppResult<Json<LoginResponse>> {
+    request.validate()?;
+
+    // 1. Authenticate via identity_token. Wrong typ / expired -> 401.
+    let (identity_id, email) = state
+        .auth_service
+        .decode_identity_token(&request.identity_token)?;
+
+    // 2. Load the identity row for the name fields + password hash.
+    //    The trigger from phase 1 uses the identity's password_hash to
+    //    keep the new users row in sync with what the identity plane
+    //    already believes.
+    let pool = state.auth_service.db().migrator_pool();
+    let identity = crate::db::identity::IdentityRepo::find_by_id(pool, identity_id)
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .ok_or(AppError::Unauthorized)?;
+    if identity.status != "active" {
+        return Err(AppError::Unauthorized);
+    }
+
+    // 3. Refuse when the identity already holds active memberships. Guards
+    //    against replaying a needs_setup identity_token after the identity
+    //    has been placed. Phase 5 will add an in-app "Create org" button
+    //    for authenticated identities that goes through a different route.
+    let existing = crate::db::identity::MembershipRepo::list_active_for_identity(pool, identity_id)
+        .await
+        .map_err(|_| AppError::Unauthorized)?;
+    if !existing.is_empty() {
+        return Err(AppError::conflict(
+            "You already belong to an organization. Sign in and use the in-app Create button instead.",
+        ));
+    }
+
+    // 4. Create the tenant + admin users row. Phase-1 trigger drops the
+    //    matching `tenant_memberships` row so the identity is admin in
+    //    the new tenant immediately.
+    let (_tenant, _admin_id) = state
+        .tenant_service
+        .create_tenant_for_identity(
+            &identity.email,
+            &identity.first_name,
+            &identity.last_name,
+            identity.password_hash.as_deref(),
+            &request.tenant_name,
+            request.tenant_slug.as_deref(),
+            &ctx,
+        )
+        .await?;
+
+    // 5. Mint a full session for the fresh admin. Client-side
+    //    `install_session` handles the wire response identically to
+    //    the auto-scope login branch, so the SPA lands directly on
+    //    the dashboard scoped to the new tenant.
+    let ip_address = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            &headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let response = state
+        .auth_service
+        .mint_session_for_membership(_tenant.id, &email, ip_address, user_agent)
+        .await?;
+    Ok(Json(response))
 }
 
 /// Get tenant by ID
