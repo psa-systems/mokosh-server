@@ -37,10 +37,7 @@ pub fn teams_routes(teams_service: TeamsService) -> Router {
             "/{team_id}",
             get(get_team).put(update_team).delete(soft_delete_team),
         )
-        .route(
-            "/{team_id}/members",
-            get(list_members).post(add_member),
-        )
+        .route("/{team_id}/members", get(list_members).post(add_member))
         .route(
             "/{team_id}/members/{user_id}",
             put(update_member_role).delete(remove_member),
@@ -75,7 +72,11 @@ pub struct ListTeamsQuery {
 
 impl ListTeamsQuery {
     fn to_filters(&self) -> TeamListFilters {
-        let active_raw = self.active.as_deref().unwrap_or("true").to_ascii_lowercase();
+        let active_raw = self
+            .active
+            .as_deref()
+            .unwrap_or("true")
+            .to_ascii_lowercase();
         let (include_inactive, only_inactive) = match active_raw.as_str() {
             "all" => (true, false),
             "false" | "0" | "no" => (false, true),
@@ -146,10 +147,7 @@ async fn get_team(
             .await?;
         Ok(Json(serde_json::to_value(bundle).unwrap()).into_response())
     } else {
-        let team = state
-            .teams_service
-            .get_team(user.tenant(), team_id)
-            .await?;
+        let team = state.teams_service.get_team(user.tenant(), team_id).await?;
         Ok(Json(serde_json::to_value(team).unwrap()).into_response())
     }
 }

@@ -516,7 +516,13 @@ async fn dispatch_view_aggregates_the_range(pool: PgPool) {
 #[sqlx::test]
 async fn create_appointment_with_team_id_persists(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
-    let team_id = seed_team(&pool, common::DEFAULT_TENANT_ID, "Field Techs", Some(admin_id)).await;
+    let team_id = seed_team(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "Field Techs",
+        Some(admin_id),
+    )
+    .await;
     let app = boot(pool.clone()).await;
     let token = login(&app, &email, &password).await;
 
@@ -564,8 +570,7 @@ async fn create_appointment_with_team_id_persists(pool: PgPool) {
 async fn create_appointment_with_wrong_tenant_team_id_returns_400(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     // Team lives in a DIFFERENT tenant.
-    let (tenant_b, _uid, _e, _p) =
-        seed_tenant_with_admin(&pool, "wrong-tenant-appt-team").await;
+    let (tenant_b, _uid, _e, _p) = seed_tenant_with_admin(&pool, "wrong-tenant-appt-team").await;
     let stranger_team = seed_team(&pool, tenant_b, "Foreign Team", None).await;
     let app = boot(pool).await;
     let token = login(&app, &email, &password).await;
@@ -652,7 +657,11 @@ async fn list_appointments_filtered_by_team_id(pool: PgPool) {
     let app = boot(pool).await;
     let token = login(&app, &email, &password).await;
 
-    for (title, team) in [("A-visit", Some(team_a)), ("B-visit", Some(team_b)), ("no-team", None)] {
+    for (title, team) in [
+        ("A-visit", Some(team_a)),
+        ("B-visit", Some(team_b)),
+        ("no-team", None),
+    ] {
         let body = serde_json::json!({
             "title": title,
             "assigned_to_id": admin_id,

@@ -1331,10 +1331,7 @@ async fn create_tenant_enforces_max_tenants_cap(pool: PgPool) {
         .await
         .expect_err("second create should be rejected at cap");
     let msg = format!("{err:?}");
-    assert!(
-        msg.contains("cap reached"),
-        "err must name the cap: {msg}"
-    );
+    assert!(msg.contains("cap reached"), "err must name the cap: {msg}");
 
     // Row-count guard: the rejected create must not have partially inserted.
     let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")

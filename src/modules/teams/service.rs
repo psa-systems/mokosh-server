@@ -115,9 +115,11 @@ impl TeamsService {
             validate_hex_color(color)?;
         }
         if let Some(mgr_id) = request.manager_id {
-            self.assert_user_in_tenant(*tenant_id, mgr_id, "manager_id").await?;
+            self.assert_user_in_tenant(*tenant_id, mgr_id, "manager_id")
+                .await?;
         }
-        self.assert_name_unique(*tenant_id, &request.name, None).await?;
+        self.assert_name_unique(*tenant_id, &request.name, None)
+            .await?;
 
         let team_id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -172,7 +174,8 @@ impl TeamsService {
             validate_hex_color(color)?;
         }
         if let Some(mgr_id) = request.manager_id {
-            self.assert_user_in_tenant(*tenant_id, mgr_id, "manager_id").await?;
+            self.assert_user_in_tenant(*tenant_id, mgr_id, "manager_id")
+                .await?;
         }
         if let Some(new_name) = request.name.as_deref() {
             self.assert_name_unique(*tenant_id, new_name, Some(team_id))
@@ -210,13 +213,12 @@ impl TeamsService {
         query.push_str(" WHERE tenant_id = $1 AND id = $2");
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let before: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(*tenant_id)
-        .bind(team_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2")
+                .bind(*tenant_id)
+                .bind(team_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         if before.is_none() {
             return Err(AppError::NotFound("Team".to_string()));
         }
@@ -239,13 +241,12 @@ impl TeamsService {
         }
         q.execute(&mut *tx).await?;
 
-        let after: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(*tenant_id)
-        .bind(team_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2")
+                .bind(*tenant_id)
+                .bind(team_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         audit_write(
             &mut *tx,
             tenant_id,
@@ -273,13 +274,12 @@ impl TeamsService {
         ctx: &AuditCtx,
     ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let before: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(*tenant_id)
-        .bind(team_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2")
+                .bind(*tenant_id)
+                .bind(team_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         if before.is_none() {
             return Err(AppError::NotFound("Team".to_string()));
         }
@@ -293,13 +293,12 @@ impl TeamsService {
         .execute(&mut *tx)
         .await?;
 
-        let after: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(*tenant_id)
-        .bind(team_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM teams t WHERE tenant_id = $1 AND id = $2")
+                .bind(*tenant_id)
+                .bind(team_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         audit_write(
             &mut *tx,
             tenant_id,
