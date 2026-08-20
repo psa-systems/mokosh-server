@@ -1496,13 +1496,32 @@ impl AuthService {
         // Update password. PMS-681: stamp `password_changed_at` so the auth
         // middleware rejects every access token issued before now (the `logout_all`
         // below only revokes refresh sessions).
+        //
+        // MAPPS-502 (MAPPS-496 stage 2d): identities is source of truth
+        // for password_hash (same shape as MAPPS-499 change_password);
+        // the MAPPS-498 bidir mirror keeps every matching users row
+        // current. `password_changed_at` is users-only (PMS-681
+        // revocation gate) and stays on the users UPDATE below.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let email: Option<String> =
+            sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND tenant_id = $2")
+                .bind(user_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let email = email.ok_or_else(|| AppError::NotFound("User".to_string()))?;
         sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW(), \
-             password_changed_at = NOW() \
-             WHERE id = $2 AND tenant_id = $3",
+            "UPDATE identities SET password_hash = $1, updated_at = NOW() \
+             WHERE lower(email) = lower($2)",
         )
         .bind(&new_hash)
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE users SET password_changed_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
         .bind(user_id)
         .bind(tenant_id)
         .execute(&mut *tx)
