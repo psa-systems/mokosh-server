@@ -15,3 +15,9 @@ pub mod provision;
 // `tenant_memberships`. Not wired into any handler yet; phase 2 consumes them.
 #[cfg(feature = "server")]
 pub mod identity;
+
+// MAPPS-513 (MAPPS-474 stage A follow-up): read + write helpers for
+// `platform_admins`. Distinct credential store for the platform
+// super-admin persona (see migrations 131 + 132).
+#[cfg(feature = "server")]
+pub mod platform_admin;

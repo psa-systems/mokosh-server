@@ -20,6 +20,7 @@ pub mod ip_enrich;
 pub mod knowledge_base;
 pub mod mileage_tracking;
 pub mod notifications;
+pub mod platform;
 pub mod portal;
 pub mod projects;
 pub mod quotes;

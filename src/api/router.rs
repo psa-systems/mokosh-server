@@ -36,6 +36,7 @@ use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
+use crate::modules::platform::{platform_routes, PlatformAdminService};
 use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::quotes::{quotes_routes, QuotesService};
@@ -334,6 +335,20 @@ pub fn create_api_router(
                 cookie_secure,
             ),
         )
+        // MAPPS-513: platform super-admin routes. Distinct credential
+        // store (`platform_admins`) and distinct JWT typ so the
+        // super-admin persona is isolated from the tenant identity
+        // model. `RequirePlatformAdmin` extractor reads the platform
+        // service from request extensions; layer(Extension(...)) below
+        // makes the service reachable from the extractor.
+        .nest(
+            "/platform",
+            platform_routes(PlatformAdminService::new(db.clone(), jwt_secret.clone())),
+        )
+        .layer(axum::Extension(Arc::new(PlatformAdminService::new(
+            db.clone(),
+            jwt_secret.clone(),
+        ))))
         // Tenant management. Only mounted in multi-tenant builds: in a
         // single-tenant deployment there is exactly one tenant and the
         // CRUD endpoints would be a foot-gun. PMS-24.
