@@ -205,3 +205,7 @@ justfile         Task runner.
 ## License
 
 Proprietary. See `Cargo.toml`.
+
+## Development happens on Forgejo
+
+The development home for this repository is <https://dev.a8n.run/psa-systems/mokosh-server>. The [GitHub](https://github.com/psa-systems/mokosh-server) and [Codeberg](https://codeberg.org/psa-systems/mokosh-server) copies are read-only mirrors that exist for visibility only: issues and pull requests are disabled there, and no community support runs on the mirrors. File issues and open pull requests on Forgejo.
