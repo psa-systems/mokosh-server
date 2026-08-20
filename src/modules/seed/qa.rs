@@ -849,6 +849,10 @@ fn qa_contacts_for(company_id: Uuid, idx: usize) -> Vec<CreateContactRequest> {
                 tags: vec![QA_TAG.to_string()],
                 notes: None,
                 create_portal_access: false,
+                // PMS-806: the scalars above materialize the child rows, so the
+                // QA set exercises the compatibility path.
+                phones: None,
+                companies: None,
             }
         })
         .collect()
