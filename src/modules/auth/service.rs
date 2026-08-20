@@ -2973,13 +2973,33 @@ impl AuthService {
     }
 
     /// Update user's last login timestamp. PMS-4 AC6.
+    ///
+    /// MAPPS-500 (MAPPS-496 stage 2b): identities is now the source of
+    /// truth for `last_login_at`; the MAPPS-498 back-mirror propagates
+    /// the timestamp to every users row this identity backs across all
+    /// tenants they hold a membership in. `tenant_id + user_id` is
+    /// still consulted first to resolve the email, so a stray
+    /// cross-tenant `user_id` returns no email and the write is
+    /// silently a no-op (matches the pre-500 shape which was a
+    /// 0-rows-affected users UPDATE for the same case).
     async fn update_last_login(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query("UPDATE users SET last_login_at = NOW() WHERE id = $1 AND tenant_id = $2")
-            .bind(user_id)
-            .bind(tenant_id)
-            .execute(&mut *tx)
-            .await?;
+        let email: Option<String> =
+            sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND tenant_id = $2")
+                .bind(user_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(email) = email else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE identities SET last_login_at = NOW(), updated_at = NOW() \
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
 
         Ok(())

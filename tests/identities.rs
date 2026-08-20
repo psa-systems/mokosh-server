@@ -283,6 +283,94 @@ async fn mirror_does_not_recurse(pool: PgPool) {
     assert_eq!(identity_mobile.as_deref(), Some("+15550002222"));
 }
 
+/// MAPPS-500 (MAPPS-496 stage 2b): a successful login writes
+/// `identities.last_login_at`; the MAPPS-498 mirror propagates it
+/// back to `users.last_login_at` for every membership.
+#[sqlx::test]
+async fn login_stamps_last_login_at_on_identity(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let _token = common::login(&app, &email, &password).await;
+
+    let identity_ts: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_login_at FROM identities WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read identity ts");
+    let users_ts: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_login_at FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read users ts");
+    assert!(identity_ts.is_some(), "identity last_login_at stamped");
+    assert_eq!(
+        identity_ts, users_ts,
+        "mirror keeps users last_login_at in sync"
+    );
+}
+
+/// MAPPS-500: a login through ONE tenant updates last_login_at on
+/// EVERY users row the identity backs (multi-membership fan-out via
+/// the MAPPS-498 mirror).
+#[sqlx::test]
+async fn last_login_stamp_fans_out_across_memberships(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    // Second membership for the same identity in another tenant.
+    // Manually insert so the password_hash matches the seeded admin's
+    // real hash (otherwise the users -> identity trigger from
+    // migration 128 would clobber the identity's password_hash with
+    // this row's bogus 'hash' literal, and the MAPPS-498 back-mirror
+    // would then propagate that bogus hash BACK to every users row -
+    // breaking the login step below).
+    let tenant_b = insert_tenant(&pool, "Beta Co", "beta-500").await;
+    let real_hash = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let user_b_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'First', 'Last', 'admin', 'active', NOW())",
+    )
+    .bind(user_b_id)
+    .bind(tenant_b)
+    .bind(&email)
+    .bind(&real_hash)
+    .execute(&pool)
+    .await
+    .expect("insert second users row with real hash");
+
+    // Reset both users rows' last_login_at so the assertion is
+    // sensitive to the stamp fired by the login below (not to any
+    // seed_admin baseline).
+    sqlx::query("UPDATE users SET last_login_at = NULL WHERE lower(email) = lower($1)")
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .expect("clear last_login_at");
+    sqlx::query("UPDATE identities SET last_login_at = NULL WHERE lower(email) = lower($1)")
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .expect("clear identity last_login_at");
+
+    let app = common::boot(pool).await;
+    let _token = common::login(&app, &email, &password).await;
+
+    let stamps: Vec<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+        "SELECT last_login_at FROM users WHERE lower(email) = lower($1) ORDER BY id",
+    )
+    .bind(&email)
+    .fetch_all(&app.pool)
+    .await
+    .expect("read stamps");
+    assert_eq!(stamps.len(), 2);
+    assert!(
+        stamps.iter().all(|s| s.is_some()),
+        "both users rows get stamped"
+    );
+    let _ = user_b_id;
+}
+
 #[sqlx::test]
 async fn deleting_tenant_removes_memberships_but_not_identity(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Zeta Co", "zeta").await;
