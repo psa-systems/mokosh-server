@@ -201,6 +201,88 @@ async fn update_users_password_hash_propagates_to_identity(pool: PgPool) {
     assert_eq!(identity.password_hash.as_deref(), Some("new-hash"));
 }
 
+/// MAPPS-498 (MAPPS-496 stage 1): UPDATE identities.<per-human>
+/// propagates back to users. Pins the identity_sync_to_users trigger
+/// installed in migration 130.
+#[sqlx::test]
+async fn update_identity_propagates_to_users(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    sqlx::query("UPDATE identities SET mobile = '+15550001111' WHERE id = $1")
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("update identity mobile");
+    let mobile: Option<String> = sqlx::query_scalar("SELECT mobile FROM users WHERE id = $1")
+        .bind(admin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read users.mobile");
+    assert_eq!(mobile.as_deref(), Some("+15550001111"));
+}
+
+/// MAPPS-498: an identity holding memberships in TWO tenants gets
+/// updated once; both users rows reflect the change. Pins the
+/// multi-membership fan-out shape of the back-mirror.
+#[sqlx::test]
+async fn update_identity_propagates_to_every_membership_users_row(pool: PgPool) {
+    // Seed identity with one users row in the default tenant.
+    let (_admin_id, email, _password) = common::seed_admin(&pool).await;
+    let tenant_b = insert_tenant(&pool, "Beta Co", "beta-497").await;
+    let user_b_id = insert_user(&pool, tenant_b, &email, "admin", "active").await;
+
+    // Resolve the identity id.
+    let identity = IdentityRepo::find_by_email(&pool, &email)
+        .await
+        .expect("find")
+        .expect("exists");
+
+    sqlx::query("UPDATE identities SET first_name = 'Renamed' WHERE id = $1")
+        .bind(identity.id)
+        .execute(&pool)
+        .await
+        .expect("update identity first_name");
+
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT first_name FROM users WHERE lower(email) = lower($1) ORDER BY id",
+    )
+    .bind(&email)
+    .fetch_all(&pool)
+    .await
+    .expect("read users first_names");
+    assert_eq!(names.len(), 2);
+    assert!(names.iter().all(|n| n == "Renamed"));
+    // Sanity: the second users row we inserted is one of them.
+    let user_b_name: String = sqlx::query_scalar("SELECT first_name FROM users WHERE id = $1")
+        .bind(user_b_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read user_b first_name");
+    assert_eq!(user_b_name, "Renamed");
+}
+
+/// MAPPS-498: a plain UPDATE on users still round-trips via the
+/// users -> identity mirror WITHOUT the identity -> users mirror
+/// re-firing (would cause infinite recursion). The pg_trigger_depth()
+/// guard on sync_identity_to_users breaks the cycle.
+#[sqlx::test]
+async fn mirror_does_not_recurse(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    // A plain UPDATE. If the mirrors cycle, sqlx errors on stack
+    // overflow / recursion depth.
+    sqlx::query("UPDATE users SET mobile = '+15550002222' WHERE id = $1")
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("update users mobile without recursion");
+    let identity_mobile: Option<String> =
+        sqlx::query_scalar("SELECT mobile FROM identities WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read identity mobile");
+    assert_eq!(identity_mobile.as_deref(), Some("+15550002222"));
+}
+
 #[sqlx::test]
 async fn deleting_tenant_removes_memberships_but_not_identity(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Zeta Co", "zeta").await;
