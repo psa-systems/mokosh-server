@@ -487,6 +487,47 @@ pub struct LoginResponse {
     /// login with `approval_code` to complete it.
     #[serde(default)]
     pub approval_required: bool,
+    /// MAPPS-492 (MAPPS-474 phase 3): the identity authenticated but
+    /// holds MORE THAN ONE active membership. Client renders the tenant
+    /// picker, then POSTs `/auth/select-tenant` with `identity_token` +
+    /// the chosen `tenant_id` to complete the login. Tokens are empty
+    /// and `user` is None on this branch, mirroring the mfa/approval
+    /// shape. Emitted on every response so the client sees an explicit
+    /// boolean rather than `undefined`; the field is new but adding a
+    /// key with a `false` default is backward-compatible.
+    #[serde(default)]
+    pub needs_selection: bool,
+    /// MAPPS-492 (phase 3): the identity authenticated but holds ZERO
+    /// active memberships. Client routes to the "create your
+    /// organization" landing (phase 4 wires the self-serve create-org
+    /// form). Tokens are empty and `user` is None on this branch too.
+    #[serde(default)]
+    pub needs_setup: bool,
+    /// MAPPS-492 (phase 3): short-lived JWT (typ="identity", 5 min TTL)
+    /// scoped to the identity only. Present ONLY on `needs_selection`
+    /// and `needs_setup` branches. Unusable as a bearer for the
+    /// general API; `auth_middleware` accepts only `typ="access"`.
+    /// Client stores it in-memory, submits it to
+    /// `/auth/select-tenant` or `/tenants` (phase 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_token: Option<String>,
+    /// MAPPS-492 (phase 3): the identity's active memberships when
+    /// `needs_selection` is true. Empty on every other branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memberships: Option<Vec<MembershipView>>,
+}
+
+/// MAPPS-492 (MAPPS-474 phase 3): request body for
+/// `POST /api/v1/auth/select-tenant`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct SelectTenantRequest {
+    /// The short-lived JWT returned in `LoginResponse.identity_token`
+    /// when the identity-first login branch resolved to
+    /// `needs_selection`.
+    #[validate(length(min = 1, message = "identity_token is required"))]
+    pub identity_token: String,
+    /// The tenant the caller picked from their membership list.
+    pub tenant_id: Uuid,
 }
 
 /// Refresh token request

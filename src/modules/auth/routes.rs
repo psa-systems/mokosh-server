@@ -91,6 +91,10 @@ pub fn auth_routes(
         // of the handler (see `login` below) so the limiter can key on
         // `(ip, email)` not just `ip`.
         .route("/login", post(login))
+        // MAPPS-492 (MAPPS-474 phase 3): completes a `needs_selection`
+        // login by trading the short-lived identity_token + a chosen
+        // tenant_id for a full scoped session.
+        .route("/select-tenant", post(select_tenant))
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
@@ -215,11 +219,70 @@ async fn login(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // MAPPS-492 (MAPPS-474 phase 3): identity-first branch. When the
+    // caller still has NO tenant hint after the MAPPS-473 host
+    // derivation ran, drop into the email-only login flow: the server
+    // resolves the identity by email + password, then either
+    // auto-scopes (single membership), returns a picker
+    // (`needs_selection`), or returns setup (`needs_setup`). Callers
+    // that DO supply a tenant hint (existing tests, MAPPS-473
+    // auto-resolved hosts, dev slug typing) keep taking the
+    // tenant-scoped `AuthService::login` path unchanged.
+    let has_tenant_hint = request.tenant_id.is_some()
+        || !request
+            .tenant_slug
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty();
+    let response = if has_tenant_hint {
+        state
+            .auth_service
+            .login(&request, ip_address, user_agent)
+            .await?
+    } else {
+        state
+            .auth_service
+            .authenticate_identity_first(&request, ip_address, user_agent)
+            .await?
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// MAPPS-492 (MAPPS-474 phase 3): finish a `needs_selection` login.
+/// Consumes an identity token minted by the login handler above and
+/// returns a full scoped session for the caller-chosen tenant.
+async fn select_tenant(
+    State(state): State<AuthRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<mokosh_types::auth::SelectTenantRequest>,
+) -> Result<Response, AppError> {
+    request.validate()?;
+
+    let ip_address = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            &headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let response = state
         .auth_service
-        .login(&request, ip_address, user_agent)
+        .select_tenant_for_identity(
+            &request.identity_token,
+            request.tenant_id,
+            ip_address,
+            user_agent,
+        )
         .await?;
-
     Ok(Json(response).into_response())
 }
 

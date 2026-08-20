@@ -1438,17 +1438,17 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
     );
 }
 
-/// PMS-728 AC1: rejects a credential presented with NO tenant identifier
-/// (neither `tenant_id` nor `tenant_slug`). Supersedes the pre-PMS-728
-/// backward-compat behavior where an omitted hint fell back to the
-/// default tenant - that fallback let a bare email/password reach the
-/// default tenant's admin bootstrap by accident, and every tenant-local
-/// login must now name the tenant it targets. The response shape is the
-/// same 401 the endpoint returns for a wrong password, so the endpoint
-/// does not distinguish "no tenant hint" from "bad credentials" to an
-/// unauthenticated caller.
+/// PMS-728 AC1 (SUPERSEDED by MAPPS-492 phase 3): a credential
+/// presented with NO tenant identifier used to 401. Under phase 3, the
+/// server enters the identity-first branch: it resolves the identity
+/// by email + password, enumerates active memberships, and auto-scopes
+/// when the identity holds exactly one. This test now pins the new
+/// contract: a valid email/password with no tenant hint AND a single
+/// membership succeeds and returns a full scoped session. The
+/// zero-membership and multi-membership branches are covered in
+/// `tests/identity_login.rs`.
 #[sqlx::test]
-async fn login_omitting_tenant_hint_401s(pool: PgPool) {
+async fn login_omitting_tenant_hint_autoscopes_when_identity_has_one_membership(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
 
@@ -1462,11 +1462,15 @@ async fn login_omitting_tenant_hint_401s(pool: PgPool) {
         .send()
         .await
         .expect("send login (no tenant hint)");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "login without tenant_id or tenant_slug must 401 (PMS-728: no more default-tenant fallback)"
+    assert!(
+        resp.status().is_success(),
+        "expected 2xx auto-scope; got {}",
+        resp.status()
     );
+    let body: serde_json::Value = resp.json().await.expect("login json");
+    assert!(!body["access_token"].as_str().unwrap().is_empty());
+    assert_eq!(body["needs_selection"], false);
+    assert_eq!(body["needs_setup"], false);
 }
 
 /// PMS-138 wrong-hint pin: a hint that names a tenant where the email
@@ -2483,11 +2487,15 @@ async fn login_body_slug_wins_over_agent_host(pool: PgPool) {
     );
 }
 
-/// MAPPS-473: a login body with no tenant hint AND a Host that does
-/// NOT end with the configured suffix (bare apex, or a portal host)
-/// still 401s. Preserves PMS-728 phase 1's fail-closed posture.
+/// MAPPS-473 (SUPERSEDED by MAPPS-492 phase 3): a login body with no
+/// tenant hint AND a Host that does NOT end with the configured
+/// suffix (bare apex, or a portal host) used to 401. Under phase 3,
+/// this case now enters the identity-first branch and auto-scopes
+/// when the identity holds exactly one membership. The MAPPS-473
+/// host-derivation shortcut is still exercised when the Host DOES
+/// match (see the sibling test that pins that shape).
 #[sqlx::test]
-async fn login_without_hint_or_matching_host_still_401s(pool: PgPool) {
+async fn login_without_hint_or_matching_host_falls_through_to_identity_first(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot_with_agent_host(
         pool,
@@ -2498,15 +2506,17 @@ async fn login_without_hint_or_matching_host_still_401s(pool: PgPool) {
     let resp = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        // Bare apex — no leftmost label to extract.
+        // Bare apex - no leftmost label to extract.
         .header("X-Forwarded-Host", "msp.test")
         .json(&serde_json::json!({ "email": email, "password": password }))
         .send()
         .await
         .expect("send no-slug + bare-apex login");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "no slug + no matching host must 401 (PMS-728 fail-closed)"
+    assert!(
+        resp.status().is_success(),
+        "expected 2xx identity-first auto-scope; got {}",
+        resp.status()
     );
+    let body: serde_json::Value = resp.json().await.expect("login json");
+    assert!(!body["access_token"].as_str().unwrap().is_empty());
 }

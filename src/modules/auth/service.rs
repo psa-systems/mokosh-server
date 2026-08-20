@@ -767,6 +767,10 @@ impl AuthService {
                     user: None,
                     mfa_required: true,
                     approval_required: false,
+                    needs_selection: false,
+                    needs_setup: false,
+                    identity_token: None,
+                    memberships: None,
                 });
             }
         }
@@ -801,6 +805,10 @@ impl AuthService {
                             user: None,
                             mfa_required: false,
                             approval_required: true,
+                            needs_selection: false,
+                            needs_setup: false,
+                            identity_token: None,
+                            memberships: None,
                         });
                     }
                 }
@@ -862,6 +870,10 @@ impl AuthService {
             user: Some(user.to_current_user()),
             mfa_required: false,
             approval_required: false,
+            needs_selection: false,
+            needs_setup: false,
+            identity_token: None,
+            memberships: None,
         })
     }
 
@@ -1133,6 +1145,10 @@ impl AuthService {
                 user: None,
                 mfa_required: true,
                 approval_required: false,
+                needs_selection: false,
+                needs_setup: false,
+                identity_token: None,
+                memberships: None,
             });
         }
 
@@ -1157,6 +1173,10 @@ impl AuthService {
             user: Some(user.to_current_user()),
             mfa_required: false,
             approval_required: false,
+            needs_selection: false,
+            needs_setup: false,
+            identity_token: None,
+            memberships: None,
         })
     }
 
@@ -3037,6 +3057,262 @@ impl AuthService {
         let refresh_token = encode(&Header::default(), &refresh_claims, &encoding_key)?;
 
         Ok((access_token, refresh_token, access_expires))
+    }
+
+    // ========================================================================
+    // MAPPS-492 (MAPPS-474 phase 3): identity-first login primitives.
+    // ========================================================================
+
+    /// Mint a short-lived (5 min) identity token used to bridge the login
+    /// picker step. `typ="identity"` so `auth_middleware` (which only
+    /// accepts `typ="access"`) never treats it as a general-purpose
+    /// bearer. Carries `sub=identity_id` and `email` only; `tid` is
+    /// `Uuid::nil()` (no tenant is scoped yet); `role`/`sid`/`mid`
+    /// are placeholders.
+    pub fn mint_identity_token(&self, identity_id: Uuid, email: &str) -> AppResult<String> {
+        let now = Utc::now();
+        let claims = JwtClaims {
+            sub: identity_id,
+            tid: Uuid::nil(),
+            email: email.to_string(),
+            role: UserRole::Technician,
+            iat: now.timestamp(),
+            nbf: now.timestamp(),
+            exp: (now + Duration::minutes(5)).timestamp(),
+            iss: MOKOSH_JWT_ISSUER.to_string(),
+            aud: MOKOSH_JWT_AUDIENCE.to_string(),
+            typ: "identity".to_string(),
+            sid: Uuid::nil(),
+            mid: None,
+        };
+        let encoding_key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        Ok(encode(&Header::default(), &claims, &encoding_key)?)
+    }
+
+    /// Verify an identity token and return `(identity_id, email)`.
+    /// Enforces `typ == "identity"` and standard exp validation. Wrong
+    /// type or expired -> `AppError::Unauthorized`. Mirrors the
+    /// `decode_token` validation shape: audience pinning is deferred
+    /// (MAPPS-334 follow-up), 30s leeway matches the bunyip RS verifier.
+    pub fn decode_identity_token(&self, token: &str) -> AppResult<(Uuid, String)> {
+        let decoding_key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.validate_aud = false;
+        validation.leeway = 30;
+        let claims = decode::<JwtClaims>(token, &decoding_key, &validation)
+            .map_err(|_| AppError::Unauthorized)?
+            .claims;
+        if claims.typ != "identity" {
+            return Err(AppError::Unauthorized);
+        }
+        Ok((claims.sub, claims.email))
+    }
+
+    /// Identity-first login (MAPPS-492 phase 3). Called when the login
+    /// request has no tenant hint. Verifies (email, password) against
+    /// `identities`, runs the identity-level MFA gate, enumerates active
+    /// memberships, and branches:
+    ///
+    /// - 1 membership: mints a full session for that tenant and returns
+    ///   a scoped `LoginResponse` (single membership auto-scope).
+    /// - N > 1: returns a `needs_selection` response with the
+    ///   `identity_token` + membership list. Client re-POSTs to
+    ///   `/auth/select-tenant` to finish.
+    /// - 0: returns a `needs_setup` response with the `identity_token`.
+    ///   Phase 4 wires the "create your organization" flow that
+    ///   redeems it.
+    ///
+    /// Login-approval (PMS-658) is intentionally NOT applied on this
+    /// branch in phase 3; the follow-up plan tracks integration. The
+    /// tenant-hint `login()` path keeps its existing approval gate.
+    pub async fn authenticate_identity_first(
+        &self,
+        request: &LoginRequest,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        // 1. Resolve identity by email. Unauthorized rather than 404 so
+        //    email enumeration is no easier than the tenant-hint path.
+        let pool = self.db.migrator_pool();
+        let identity = crate::db::identity::IdentityRepo::find_by_email(pool, &request.email)
+            .await
+            .map_err(|_| AppError::Unauthorized)?
+            .ok_or(AppError::Unauthorized)?;
+
+        // 2. Password check against the identity plane. Bunyip-only
+        //    identities have no hash -> Unauthorized (this path is
+        //    password-only, bunyip callers go through the bunyip
+        //    verifier in the middleware).
+        let hash = identity
+            .password_hash
+            .as_deref()
+            .ok_or(AppError::Unauthorized)?;
+        if !verify_password(&request.password, hash)? {
+            return Err(AppError::Unauthorized);
+        }
+
+        // 3. MFA at the identity level. Mirrors the tenant-hint branch's
+        //    contract: no code -> `mfa_required` shape (empty tokens,
+        //    user=None). Verification uses the identity's mfa_secret,
+        //    which the phase-1 trigger keeps in sync with users.mfa_secret.
+        if identity.mfa_enabled {
+            let code = request
+                .mfa_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match code {
+                None => {
+                    return Ok(LoginResponse {
+                        access_token: String::new(),
+                        refresh_token: String::new(),
+                        expires_at: Utc::now(),
+                        user: None,
+                        mfa_required: true,
+                        approval_required: false,
+                        needs_selection: false,
+                        needs_setup: false,
+                        identity_token: None,
+                        memberships: None,
+                    });
+                }
+                Some(code) => {
+                    // Same base32-decode + +/-1 step tolerance the
+                    // tenant-hint path uses (see MFA branch above).
+                    // Phase-3 note: the per-user PMS-502 anti-replay
+                    // watermark is per (tenant, user) and cannot run
+                    // here (no tenant scoped yet). Follow-up: extend
+                    // the watermark to the identity level.
+                    let secret_b32 = identity.mfa_secret.as_deref().ok_or_else(|| {
+                        AppError::Internal("MFA enabled without secret".to_string())
+                    })?;
+                    let secret = crate::utils::totp::base32_decode(secret_b32).map_err(|_| {
+                        AppError::Internal("stored MFA secret is corrupt".to_string())
+                    })?;
+                    if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+                        return Err(AppError::Unauthorized);
+                    }
+                }
+            }
+        }
+
+        // 4. Enumerate active memberships across all tenants.
+        let memberships =
+            crate::db::identity::MembershipRepo::list_views_for_identity(pool, identity.id, None)
+                .await
+                .map_err(|_| AppError::Unauthorized)?;
+
+        match memberships.len() {
+            0 => {
+                let identity_token = self.mint_identity_token(identity.id, &identity.email)?;
+                Ok(LoginResponse {
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: Utc::now(),
+                    user: None,
+                    mfa_required: false,
+                    approval_required: false,
+                    needs_selection: false,
+                    needs_setup: true,
+                    identity_token: Some(identity_token),
+                    memberships: None,
+                })
+            }
+            1 => {
+                let tenant_id = memberships[0].tenant_id;
+                self.mint_session_for_membership(tenant_id, &identity.email, ip_address, user_agent)
+                    .await
+            }
+            _ => {
+                let identity_token = self.mint_identity_token(identity.id, &identity.email)?;
+                Ok(LoginResponse {
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: Utc::now(),
+                    user: None,
+                    mfa_required: false,
+                    approval_required: false,
+                    needs_selection: true,
+                    needs_setup: false,
+                    identity_token: Some(identity_token),
+                    memberships: Some(memberships),
+                })
+            }
+        }
+    }
+
+    /// MAPPS-492: internal helper. Given an identity/email that has just
+    /// authenticated and a specific tenant_id it holds a membership in,
+    /// resolve the users row, run the principal gate, create a session,
+    /// mint tokens, and return the scoped `LoginResponse`. Shared by the
+    /// auto-scope branch of `authenticate_identity_first` and by
+    /// `select_tenant_for_identity`.
+    async fn mint_session_for_membership(
+        &self,
+        tenant_id: Uuid,
+        email: &str,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        let user = self.find_user_by_email_for_tenant(tenant_id, email).await?;
+        self.ensure_principal_usable(&user).await?;
+
+        let session_id = self
+            .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
+            .await?;
+        let (access_token, refresh_token, expires_at) =
+            self.generate_tokens(&user, session_id).await?;
+        self.update_last_login(user.tenant_id, user.id).await?;
+
+        Ok(LoginResponse {
+            access_token,
+            refresh_token,
+            expires_at,
+            user: Some(user.to_current_user()),
+            mfa_required: false,
+            approval_required: false,
+            needs_selection: false,
+            needs_setup: false,
+            identity_token: None,
+            memberships: None,
+        })
+    }
+
+    /// MAPPS-492: complete a `needs_selection` login. Consumes an
+    /// identity token minted by `authenticate_identity_first`, verifies
+    /// the caller has a membership in the chosen tenant, and returns a
+    /// full scoped session.
+    ///
+    /// Errors:
+    /// - `Unauthorized` on token decode failure, wrong `typ`, or expiry.
+    /// - `NotFound` when the identity holds no active membership in
+    ///   `tenant_id`.
+    pub async fn select_tenant_for_identity(
+        &self,
+        identity_token: &str,
+        tenant_id: Uuid,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        let (identity_id, email) = self.decode_identity_token(identity_token)?;
+        // Reject when the identity holds no active membership in the
+        // requested tenant. Consulted via the shared repo helper so the
+        // (identity, tenant) status filter stays in one place.
+        let membership = crate::db::identity::MembershipRepo::find(
+            self.db.migrator_pool(),
+            identity_id,
+            tenant_id,
+        )
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .ok_or_else(|| AppError::NotFound("Membership not found for this tenant".to_string()))?;
+        if membership.status != "active" {
+            return Err(AppError::NotFound("Membership is not active".to_string()));
+        }
+
+        self.mint_session_for_membership(tenant_id, &email, ip_address, user_agent)
+            .await
     }
 
     /// Get all active sessions for a user. PMS-260: scoped to the caller's
