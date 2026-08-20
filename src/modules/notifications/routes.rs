@@ -61,6 +61,8 @@ pub fn notifications_routes(service: NotificationsService) -> Router {
         // PMS-92 dispatcher (manual trigger; the real worker calls
         // NotificationsService::dispatch directly)
         .route("/notifications/dispatch", post(dispatch_event))
+        // PMS-808 preview: render what dispatch would send, send nothing
+        .route("/notifications/preview", post(preview_event))
         .with_state(state)
 }
 
@@ -260,6 +262,25 @@ async fn delete_rule(
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_rule(u.tenant(), id).await
+}
+
+/// PMS-808: what would this event mail, for this context? Nothing is
+/// queued, minted or sent, so this sits behind the module's read-side
+/// `RequireAuth` rather than the admin gate the write paths use: it
+/// exposes the caller's own tenant's templates and rule recipients,
+/// which `GET /notification-templates` and `GET /notification-rules`
+/// already return to any authenticated user.
+async fn preview_event(
+    State(s): State<NotificationsRouterState>,
+    RequireAuth(u): RequireAuth,
+    Json(req): Json<DispatchNotificationRequest>,
+) -> AppResult<Json<Vec<NotificationPreviewResponse>>> {
+    req.validate()?;
+    Ok(Json(
+        s.service
+            .preview(u.tenant(), &req.event_type, &req.context)
+            .await?,
+    ))
 }
 
 async fn dispatch_event(

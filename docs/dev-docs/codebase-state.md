@@ -348,7 +348,7 @@ against an existing schema.
 | `calendar` | `appointments`, `user_availability`, `time_off`, `on_call_schedules` | `/calendar`, `/dispatch` |
 | `contracts` | `contracts`, `contract_items`, `contract_hour_balances`, `rate_cards`, `rate_card_items` | `/contracts`, `/contracts/new`, `/contracts/:id` |
 | `knowledge_base` | `kb_categories`, `kb_articles`, `kb_article_versions` | `/kb`, `/kb/articles`, `/portal/kb` |
-| `notifications` | `notification_channels`, `notification_templates`, `user_notification_preferences`, `notifications`, `notification_rules` | notification bell + `/settings/notifications` |
+| `notifications` | `notification_channels`, `notification_templates`, `user_notification_preferences`, `notifications`, `notification_rules` | notification bell + `/settings/notifications`; PMS-808 preview: `POST /api/v1/notifications/preview` renders what `dispatch` would send for an `(event_type, context)` and queues/sends nothing (drives the MAPPS-482 preview affordance) |
 | `portal` | (uses `contacts` for portal identity) | all `/portal/*` (7 routes) |
 | `projects` | `projects`, `project_phases`, `task_statuses`, `tasks`, `task_dependencies` | `/projects`, `/projects/new`, `/projects/:id`, `/projects/:id/tasks` |
 | `reports` | (aggregate over many tables) | `/reports`, `/reports/:report_type` |
