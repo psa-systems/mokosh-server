@@ -8,13 +8,15 @@
 //! request at all.
 //!
 //! SSRF is the whole risk surface here: an authenticated user names a host and
-//! the server connects to it. The mitigation is [`crate::utils::net::is_non_public_ip`]
-//! applied to every resolved address BEFORE the connect, and again for every
-//! redirect hop, plus a port allowlist of 80/443, a 5-hop cap, a 5s per-scheme
-//! timeout, and never reading a response body. The residual is stated rather
-//! than hidden: a DNS rebinding attack that changes the answer between the
-//! check and the connect is not covered without an IP-pinned connector. What it
-//! could yield even then is a status code and a final URL.
+//! the server connects to it. The mitigation is
+//! [`crate::utils::net::guard_outbound_url`] applied BEFORE the connect and
+//! again for every redirect hop (PMS-809 promoted that gate out of this module
+//! so the automation webhook and the RMM provider share it), plus a port
+//! allowlist of 80/443, a 5-hop cap, a 5s per-scheme timeout, and never reading
+//! a response body. The residual is stated rather than hidden: a DNS rebinding
+//! attack that changes the answer between the check and the connect is not
+//! covered without an IP-pinned connector. What it could yield even then is a
+//! status code and a final URL.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -25,7 +27,10 @@ use serde::Serialize;
 use url::Url;
 
 use crate::utils::error::AppError;
-use crate::utils::net::is_non_public_ip;
+use crate::utils::net::{
+    guard_outbound_url, private_target_allowlist, HostResolver, SystemResolver, UrlGuardError,
+    WEB_PORTS,
+};
 
 /// Redirect hops followed before the probe gives up.
 const MAX_HOPS: usize = 5;
@@ -37,9 +42,9 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// blur must not re-hit the origin each time.
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// Ports the probe will ever connect on. Anything else is rejected at input
-/// (400) or refused at a redirect hop (`blocked_host`).
-const ALLOWED_PORTS: [u16; 2] = [80, 443];
+/// Ports the probe will ever connect on ([`WEB_PORTS`]). Anything else is
+/// rejected at input (400) or refused at a redirect hop (`blocked_host`).
+const ALLOWED_PORTS: [u16; 2] = WEB_PORTS;
 
 // ============================================================================
 // WIRE TYPES
@@ -144,13 +149,10 @@ impl FetchError {
 }
 
 /// The network, injected. Splitting it out is what lets every classification
-/// rule below be unit tested without an outbound request.
+/// rule below be unit tested without an outbound request. Resolution comes from
+/// [`HostResolver`], the same trait the shared guard screens through.
 #[async_trait]
-pub trait WebsiteFetcher: Send + Sync {
-    /// Resolve a host to its addresses. The error is the DNS failure itself; it
-    /// is logged by the caller before becoming `unreachable_reason: "dns"`.
-    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String>;
-
+pub trait WebsiteFetcher: HostResolver {
     /// Issue ONE request and return its status plus `Location`. Implementations
     /// must not follow redirects (the probe follows them itself so it can
     /// re-check every hop) and must not read the body.
@@ -401,49 +403,32 @@ async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &s
     Outcome::Failed(UnreachableReason::Refused)
 }
 
-/// The SSRF gate, applied before the first connect and again for every hop:
-/// http(s) only, port 80/443 only, and no resolved address that is off the
-/// public internet.
+/// The shared SSRF gate, applied before the first connect and again for every
+/// hop, with its refusal mapped onto the coarse wire reason. A resolution
+/// failure is `dns`; everything else the guard rejects is `blocked_host`.
 async fn guard_url<F: WebsiteFetcher + ?Sized>(
     fetcher: &F,
     url: &Url,
 ) -> Result<(), UnreachableReason> {
-    if !matches!(url.scheme(), "http" | "https") {
-        tracing::warn!(url = %url, "website probe refused a non-http(s) hop");
-        return Err(UnreachableReason::BlockedHost);
-    }
-    let port = url.port_or_known_default().unwrap_or(0);
-    if !ALLOWED_PORTS.contains(&port) {
-        tracing::warn!(url = %url, port, "website probe refused a hop on a disallowed port");
-        return Err(UnreachableReason::BlockedHost);
-    }
-    let Some(host) = url.host_str().filter(|h| !h.is_empty()) else {
-        tracing::warn!(url = %url, "website probe refused a hop with no host");
-        return Err(UnreachableReason::BlockedHost);
-    };
-
-    let addresses = match fetcher.resolve(host, port).await {
-        Ok(a) => a,
+    match guard_outbound_url(
+        fetcher,
+        url,
+        Some(&ALLOWED_PORTS),
+        private_target_allowlist(),
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
         Err(e) => {
-            tracing::warn!(host, error = %e, "website probe could not resolve host");
-            return Err(UnreachableReason::Dns);
+            // Logged with the real cause before it is flattened, so a refused
+            // probe is never an unexplained `blocked_host`.
+            tracing::warn!(url = %url, error = %e, "website probe refused a hop");
+            Err(match e {
+                UrlGuardError::Dns(_) => UnreachableReason::Dns,
+                _ => UnreachableReason::BlockedHost,
+            })
         }
-    };
-    if addresses.is_empty() {
-        tracing::warn!(host, "website probe resolved host to no addresses");
-        return Err(UnreachableReason::Dns);
     }
-    // ANY non-public answer blocks: a name resolving to both a public and a
-    // private address is exactly the shape an SSRF attempt takes.
-    if let Some(blocked) = addresses.iter().find(|ip| is_non_public_ip(ip)) {
-        tracing::warn!(
-            host,
-            address = %blocked,
-            "website probe refused a host resolving off the public internet"
-        );
-        return Err(UnreachableReason::BlockedHost);
-    }
-    Ok(())
 }
 
 // ============================================================================
@@ -471,19 +456,14 @@ impl ReqwestFetcher {
 }
 
 #[async_trait]
-impl WebsiteFetcher for ReqwestFetcher {
+impl HostResolver for ReqwestFetcher {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
-        // A bracketed IPv6 literal reaches us with the brackets stripped by
-        // `Url::host_str`, so it parses directly and needs no resolver.
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![ip]);
-        }
-        let addresses = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(addresses.map(|a| a.ip()).collect())
+        SystemResolver.resolve(host, port).await
     }
+}
 
+#[async_trait]
+impl WebsiteFetcher for ReqwestFetcher {
     async fn head_or_get(&self, url: &Url) -> Result<HopResponse, FetchError> {
         let head = self.send(reqwest::Method::HEAD, url).await?;
         // Some origins answer HEAD with "not allowed" and serve the same
@@ -873,14 +853,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl WebsiteFetcher for FakeFetcher {
+    impl HostResolver for FakeFetcher {
         async fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
             self.addresses
                 .get(host)
                 .cloned()
                 .unwrap_or_else(|| Err(format!("no scripted answer for {host}")))
         }
+    }
 
+    #[async_trait]
+    impl WebsiteFetcher for FakeFetcher {
         async fn head_or_get(&self, url: &Url) -> Result<HopResponse, FetchError> {
             self.requested
                 .lock()
