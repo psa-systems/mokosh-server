@@ -139,14 +139,63 @@ async fn tickets_status(app: &common::TestApp, token: &str) -> reqwest::StatusCo
 /// AC3: after `POST /tenants/{id}/suspend` a previously working bunyip bearer
 /// gets a non-2xx on `GET /api/v1/tickets`. The legacy bearer for the same
 /// tenant is asserted alongside it so the two paths are pinned together.
+///
+/// MAPPS-519 note: this test used to seed its principal via
+/// `common::seed_admin`, which parks a `users.role='super_admin'` row in
+/// `DEFAULT_TENANT_ID`. Pre-519 the bunyip `admin` claim promoted to
+/// `SuperAdmin`, `is_stuck_in_default` exempted `super_admin`, and both
+/// bearers stayed pinned to DEFAULT so suspending DEFAULT rejected both.
+/// Post-519 the claim mints tenant `Admin`, which then gets re-homed off
+/// the shared default tenant into a personal one on the next bunyip
+/// placement, so suspending DEFAULT is no longer enough. The fixture
+/// switches to `common::seed_tenant_with_admin`, which puts the caller
+/// in a purpose-built non-default tenant from the start; re-home never
+/// fires (the caller is already in a real tenant), both bearers stay
+/// pinned to that tenant, and suspending that tenant rejects both.
+/// Platform-admin credentials for `/platform/login` still come from
+/// `common::seed_admin`'s `platform_admins` seed.
 #[sqlx::test]
 async fn suspended_tenant_rejects_both_auth_paths(pool: PgPool) {
-    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    // Platform-plane admin: exists in `platform_admins` so
+    // `platform_login` returns a valid bearer for `/suspend`.
+    let (_pa_id, pa_email, pa_password) = common::seed_admin(&pool).await;
+
+    // Tenant-plane principal: a `users` row in a fresh non-default
+    // tenant so the bunyip re-home never fires and both bearers stay
+    // pinned to the same tenant across the test.
+    let (tenant_id, admin_id, email, password) =
+        common::seed_tenant_with_admin(&pool, "mapps-519-suspend-probe").await;
+
     let op = StubOp::spawn(admin_id, &email).await;
     let app = common::boot_with_bunyip(pool.clone(), op.verifier()).await;
 
     let bunyip = op.mint(admin_id, "admin");
-    let legacy = common::login(&app, &email, &password).await;
+    // MAPPS-519: the seeded tenant is not the default one, so
+    // `common::login` (which hardcodes `tenant_slug="default"`) 401s.
+    // POST `/auth/login` with the seeded slug directly.
+    let legacy = {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/auth/login"))
+            .json(&serde_json::json!({
+                "email": email,
+                "password": password,
+                "tenant_slug": "mapps-519-suspend-probe",
+            }))
+            .send()
+            .await
+            .expect("send /auth/login request");
+        assert!(
+            resp.status().is_success(),
+            "legacy login for the seeded tenant admin expected 2xx, got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("/auth/login JSON body");
+        body["access_token"]
+            .as_str()
+            .expect("login response has access_token")
+            .to_string()
+    };
 
     assert!(
         tickets_status(&app, &bunyip).await.is_success(),
@@ -157,18 +206,14 @@ async fn suspended_tenant_rejects_both_auth_paths(pool: PgPool) {
         "legacy bearer works before the suspension"
     );
 
-    // MAPPS-518: /tenants/{id}/suspend is now gated on `RequirePlatformAdmin`
+    // MAPPS-518: /tenants/{id}/suspend is gated on `RequirePlatformAdmin`
     // (the bunyip bearer's tenant scope no longer grants it). Use the
     // platform-plane bearer minted by `seed_admin` + `/platform/login` to
-    // drive the suspension; the assertions above/below still target the two
-    // tenant-plane bearers.
-    let platform = common::platform_login(&app, &email, &password).await;
+    // drive the suspension of the seeded tenant.
+    let platform = common::platform_login(&app, &pa_email, &pa_password).await;
     let resp = app
         .client
-        .post(app.url(&format!(
-            "/api/v1/tenants/{}/suspend",
-            common::DEFAULT_TENANT_ID
-        )))
+        .post(app.url(&format!("/api/v1/tenants/{}/suspend", tenant_id)))
         .bearer_auth(&platform)
         .send()
         .await

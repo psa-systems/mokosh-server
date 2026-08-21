@@ -420,16 +420,26 @@ async fn placement_seeds_off_psa_target_tenant_so_tickets_create(pool: PgPool) {
     );
 }
 
-/// PMS-676: the first/bootstrap admin must be able to log in and operate with
-/// FULL admin rights on a fresh instance even when email is unconfigured and
-/// the address can therefore never be verified. Production authenticates the
-/// bootstrap admin through bunyip-as-OP: the platform-admin claim
-/// (`bunyip_role = "admin"`) maps to mokosh `super_admin` in `place_bunyip_user`,
-/// and that path does NOT gate login on `email_verified`. Here `email_verified
-/// = false` stands in for the "SMTP unconfigured, email can never be verified"
-/// state: the admin still authenticates and still lands as `super_admin`.
+/// PMS-676 (revised for MAPPS-519): the first/bootstrap admin must still be
+/// able to log in and operate with FULL admin rights on a fresh instance
+/// even when email is unconfigured and the address can therefore never be
+/// verified. Production authenticates the bootstrap admin through
+/// bunyip-as-OP; that path does NOT gate login on `email_verified`.
+/// Here `email_verified = false` stands in for the "SMTP unconfigured,
+/// email can never be verified" state.
+///
+/// MAPPS-519 (MAPPS-518 stage B follow-up): the bunyip `admin` claim used
+/// to promote the placement to `UserRole::SuperAdmin` on the tenant plane.
+/// That mint path was the last remaining source of `users.role='super_admin'`
+/// in production, and it silently reopened the shared-identity data surface
+/// migration 133 closed. It now flattens to tenant `Admin`. The bootstrap
+/// admin still authenticates + still owns their own tenant; the mokosh
+/// platform super-admin persona (cross-tenant privilege) moved to
+/// `platform_admins` + `/platform/login` in MAPPS-513 / MAPPS-518 and is
+/// bootstrapped from `ADMIN_EMAIL` / `ADMIN_PASSWORD` (see
+/// `auth::bootstrap`), not from a bunyip claim.
 #[sqlx::test]
-async fn bootstrap_admin_unverified_email_still_gets_super_admin(pool: PgPool) {
+async fn bootstrap_admin_unverified_email_still_authenticates(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
     let sub = Uuid::new_v4();
@@ -443,7 +453,9 @@ async fn bootstrap_admin_unverified_email_still_gets_super_admin(pool: PgPool) {
         false,
         None,
         None,
-        // Platform-admin claim -> the bootstrap admin.
+        // Platform-admin claim (bunyip-side). Post-MAPPS-519 this no longer
+        // promotes on the mokosh tenant plane; the bootstrap admin still
+        // authenticates and owns their own tenant.
         &claims(sub, Some("admin")),
     )
     .await;
@@ -454,27 +466,36 @@ async fn bootstrap_admin_unverified_email_still_gets_super_admin(pool: PgPool) {
         .expect("authenticated state carries the current user");
     assert_eq!(
         user.role,
-        UserRole::SuperAdmin,
-        "the platform-admin claim grants super_admin regardless of email verification"
+        UserRole::Admin,
+        "MAPPS-519: the bunyip admin claim mints tenant Admin, not \
+         SuperAdmin - platform super-admin lives in platform_admins now"
     );
     assert!(
-        state.has_role(UserRole::SuperAdmin),
-        "bootstrap admin has super_admin access on a fresh, email-unconfigured instance"
+        state.has_role(UserRole::Admin),
+        "bootstrap admin has tenant-admin access on a fresh, \
+         email-unconfigured instance"
     );
 
     let (_tenant, role) = user_tenant_role(&pool, sub).await;
     assert_eq!(
-        role, "super_admin",
-        "the persisted row is super_admin, so admin access survives the next request"
+        role, "admin",
+        "the persisted row is admin, so tenant-admin access survives the \
+         next request; MAPPS-519 blocks the users.role='super_admin' mint \
+         path so this row cannot regress on a re-login"
     );
 }
 
-/// PMS-676 companion: once email IS configured (address verified), the same
-/// bootstrap-admin login still yields `super_admin` - i.e. turning email on does
-/// not regress or downgrade the bootstrap admin. `email_verified = true` stands
-/// in for the "SMTP configured, email verified" state.
+/// PMS-676 companion (revised for MAPPS-519): once email IS configured
+/// (address verified), the same bootstrap-admin login still lands as
+/// tenant `Admin`. `email_verified = true` stands in for the "SMTP
+/// configured, email verified" state. Turning email on must not regress
+/// or downgrade the bootstrap admin's tenant-admin role.
+///
+/// Pairs with `bootstrap_admin_unverified_email_still_authenticates`
+/// above; both were pinned at `SuperAdmin` pre-MAPPS-519 and flipped
+/// together when the bunyip `admin` promotion was retired.
 #[sqlx::test]
-async fn bootstrap_admin_verified_email_still_gets_super_admin(pool: PgPool) {
+async fn bootstrap_admin_verified_email_still_authenticates(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
     let sub = Uuid::new_v4();
@@ -498,12 +519,13 @@ async fn bootstrap_admin_verified_email_still_gets_super_admin(pool: PgPool) {
         .expect("authenticated state carries the current user");
     assert_eq!(
         user.role,
-        UserRole::SuperAdmin,
-        "enabling email must not downgrade the bootstrap admin"
+        UserRole::Admin,
+        "MAPPS-519: enabling email must not change what role the bunyip \
+         admin claim mints (tenant Admin, not SuperAdmin)"
     );
 
     let (_tenant, role) = user_tenant_role(&pool, sub).await;
-    assert_eq!(role, "super_admin");
+    assert_eq!(role, "admin");
 }
 
 /// MAPPS-329: Bunyip-onboarded users (BUNYIP-206 guarantees first + last name
@@ -1113,27 +1135,50 @@ async fn inactive_user_is_not_placed(pool: PgPool) {
 
 /// PMS-698 AC2: a placement whose resolved tenant is not `active` is rejected,
 /// so a tenant suspension stops data access on the bunyip path too.
+///
+/// MAPPS-519 note: pre-MAPPS-519 this test used `common::seed_admin`,
+/// which parks a `users.role='super_admin'` row in `DEFAULT_TENANT_ID`;
+/// the old `is_stuck_in_default` exemption for `super_admin` meant the
+/// placement stayed pinned to DEFAULT and suspending DEFAULT rejected
+/// the next call. Post-519 the bunyip `admin` claim mints tenant `Admin`
+/// (not `SuperAdmin`), and `Admin` in the default tenant IS re-homed to
+/// a personal tenant on the next placement, so suspending DEFAULT would
+/// let the second placement re-home out and succeed. The test uses a
+/// fresh sub with no seeded row so the first placement JITs the user
+/// into a personal tenant of their own; we read that tenant and suspend
+/// it, and the second placement then hits AC2's rejection cleanly.
 #[sqlx::test]
 async fn suspended_tenant_is_not_placed(pool: PgPool) {
-    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
+    let sub = Uuid::new_v4();
 
     let placed = place_bunyip_user(
         &auth,
         Some(&tenants),
         Some(&invitations),
-        admin_id,
-        Some("test-admin@example.com".to_string()),
+        sub,
+        Some("suspended-tenant-probe@example.com".to_string()),
         true,
         None,
         None,
-        &claims(admin_id, Some("admin")),
+        &claims(sub, Some("admin")),
     )
     .await;
     assert!(placed.is_some(), "active tenant places normally");
 
+    // MAPPS-519: read the personal tenant the JIT placement provisioned
+    // and suspend that so the AC2 rejection has something real to gate
+    // on (not the shared default tenant, which the re-home would leave
+    // for a personal one on the second call).
+    let (landed_tenant, _role) = user_tenant_role(&pool, sub).await;
+    assert_ne!(
+        landed_tenant,
+        common::DEFAULT_TENANT_ID,
+        "MAPPS-519 sanity: a bunyip admin with no seeded row must JIT \
+         into a personal tenant, not the shared default"
+    );
     sqlx::query("UPDATE tenants SET status = 'suspended' WHERE id = $1")
-        .bind(common::DEFAULT_TENANT_ID)
+        .bind(landed_tenant)
         .execute(&pool)
         .await
         .expect("suspend tenant");
@@ -1142,12 +1187,12 @@ async fn suspended_tenant_is_not_placed(pool: PgPool) {
         &auth,
         Some(&tenants),
         Some(&invitations),
-        admin_id,
-        Some("test-admin@example.com".to_string()),
+        sub,
+        Some("suspended-tenant-probe@example.com".to_string()),
         true,
         None,
         None,
-        &claims(admin_id, Some("admin")),
+        &claims(sub, Some("admin")),
     )
     .await;
     assert!(

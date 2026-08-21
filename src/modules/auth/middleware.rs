@@ -1021,12 +1021,28 @@ pub async fn place_bunyip_user(
 
 /// Translate Bunyip's system role (the `bunyip_role` claim) into mokosh's
 /// effective role on the Bunyip RS path (PMS-172, revised for the
-/// single-tenancy posture in PMS-447).
+/// single-tenancy posture in PMS-447 and again for the MAPPS-513 /
+/// MAPPS-518 auth-plane split).
 ///
 /// After PMS-447 each Mokosh tenant has exactly one user (the owner), so a
-/// signed-in Bunyip user IS the admin of their own world by construction:
-/// - `admin`      -> mokosh `super_admin` (platform-level, cross-tenant; the
-///   only role that is genuinely Bunyip-exclusive).
+/// signed-in Bunyip user IS the admin of their own world by construction.
+///
+/// MAPPS-519 (MAPPS-518 stage B follow-up): the mokosh platform
+/// super-admin persona lives in `platform_admins`, not in a `users` row.
+/// Migration 133 deletes every existing `users.role='super_admin'` row,
+/// and every previously-`RequireSuperAdmin` handler is now gated on
+/// `RequirePlatformAdmin` (a `/platform/login` bearer). This mapping
+/// used to promote a bunyip `admin` to `UserRole::SuperAdmin` on the
+/// tenant plane, which would silently re-create a super_admin `users`
+/// row on the next bunyip JIT — reopening the shared-identity data
+/// surface that migration 133 just closed if that bunyip admin shared
+/// an email with an existing tenant admin. The mapping now flattens to
+/// `Admin`: being a bunyip admin still owns the tenant, but no longer
+/// implicitly carries mokosh-platform privilege. Platform-plane
+/// privilege comes only from a `platform_admins` row.
+///
+/// - `admin`      -> mokosh `admin` (single-tenancy floor; owner of the
+///   caller's own tenant, nothing more). See the MAPPS-519 note above.
 /// - `subscriber` -> mokosh `admin` (single-tenancy floor). A stale local
 ///   `super_admin` clamps down to `admin`; anything lower than `admin`
 ///   (Technician, Manager, etc.) upgrades up to `admin`.
@@ -1039,11 +1055,16 @@ pub async fn place_bunyip_user(
 fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> UserRole {
     match bunyip_role {
         None => local,
-        Some("admin") => UserRole::SuperAdmin,
+        // MAPPS-519: `admin` no longer promotes to `SuperAdmin`.
+        // Every branch below returns `UserRole::Admin`; the regression
+        // test at the bottom of this module pins that invariant so a
+        // future accidental flip fails a unit test rather than
+        // silently reopening the identity-share surface.
         Some(_) => {
-            // PMS-447: subscriber (or unknown future role) -> tenant admin.
-            // super_admin is Bunyip-exclusive, so a stale local super_admin
-            // clamps down to admin; anything else rises to admin.
+            // PMS-447: bunyip `admin` / `subscriber` / any unknown role
+            // -> tenant admin. A stale local `super_admin` clamps down
+            // to `admin`; anything lower than `admin` (Technician,
+            // Manager, etc.) upgrades up to `admin`.
             UserRole::Admin
         }
     }
@@ -1171,8 +1192,17 @@ mod tests {
     }
 
     #[test]
-    fn bunyip_admin_maps_to_super_admin() {
-        // A Bunyip admin is the top mokosh role regardless of the local row.
+    fn bunyip_admin_maps_to_tenant_admin() {
+        // MAPPS-519 (MAPPS-518 stage B follow-up): a Bunyip `admin` used
+        // to promote to `UserRole::SuperAdmin`, which - combined with
+        // the MAPPS-498 users<->identities mirror - re-created a
+        // super_admin `users` row on every bunyip JIT and reopened the
+        // shared-identity data surface migration 133 closed. The
+        // mapping now flattens to tenant `Admin`: the bunyip admin
+        // still owns their tenant (PMS-447 single-tenancy floor), but
+        // no longer implicitly carries mokosh-platform privilege.
+        // Platform-plane privilege comes only from a `platform_admins`
+        // row + `/platform/login`.
         for local in [
             UserRole::Technician,
             UserRole::Manager,
@@ -1181,8 +1211,47 @@ mod tests {
         ] {
             assert_eq!(
                 effective_role_from_bunyip(Some("admin"), local),
-                UserRole::SuperAdmin
+                UserRole::Admin,
+                "bunyip admin must not mint a super_admin users row \
+                 (regression from MAPPS-519)"
             );
+        }
+    }
+
+    #[test]
+    fn no_bunyip_role_ever_mints_super_admin() {
+        // MAPPS-519 belt-and-braces regression: for the full cross of
+        // known bunyip claims x known local roles, no branch of
+        // `effective_role_from_bunyip` may return `SuperAdmin`. A
+        // future accidental flip (a new bunyip role, a copy-paste of
+        // the old mapping) is caught by this test rather than
+        // silently reopening the shared-identity data surface in
+        // production.
+        //
+        // The `None` branch is deliberately excluded here because it
+        // preserves the local row verbatim for back-compat with the
+        // legacy HS256 / standalone paths; a caller with an existing
+        // `local = SuperAdmin` still needs to see it come back
+        // unchanged there. Migration 133 already deletes those rows
+        // in prod, so no live caller exercises that combination.
+        for claim in ["admin", "subscriber", "owner", "member", "guest", ""] {
+            for local in [
+                UserRole::Technician,
+                UserRole::Dispatcher,
+                UserRole::Sales,
+                UserRole::Finance,
+                UserRole::Manager,
+                UserRole::Admin,
+                UserRole::SuperAdmin,
+            ] {
+                let effective = effective_role_from_bunyip(Some(claim), local);
+                assert_ne!(
+                    effective,
+                    UserRole::SuperAdmin,
+                    "bunyip_role={claim:?} local={local:?} must not \
+                     promote to SuperAdmin (regression from MAPPS-519)"
+                );
+            }
         }
     }
 
