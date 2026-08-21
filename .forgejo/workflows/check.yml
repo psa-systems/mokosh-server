@@ -117,6 +117,16 @@ jobs:
         run: |
           nu scripts/check-oci-publish-tags.nu
 
+      - name: Workspace dependency table
+        # PMS-785: `[workspace.dependencies]` only reaches the build graph
+        # through `{ workspace = true }`. An entry nobody inherits states a
+        # version and a feature set the build never uses (`tower-http` pinned
+        # two features there while the root package pinned six), and
+        # `cargo machete` cannot see it - it reads each package's own tables.
+        shell: nu {0}
+        run: |
+          nu scripts/check-workspace-deps.nu
+
       - name: Check formatting
         run: cargo fmt --all --check
 
