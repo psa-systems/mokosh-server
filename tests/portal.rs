@@ -162,10 +162,21 @@ async fn seed_kb_article(
 /// `POST /api/v1/portal/auth/login` -> raw response so the caller can
 /// assert on the status of both success and failure paths.
 async fn portal_login(app: &common::TestApp, email: &str, password: &str) -> reqwest::Response {
+    portal_login_in(app, "default", email, password).await
+}
+
+/// `portal_login` against an explicit tenant slug, for the PMS-820 tests that
+/// hold the same address in two different portals.
+async fn portal_login_in(
+    app: &common::TestApp,
+    tenant_slug: &str,
+    email: &str,
+    password: &str,
+) -> reqwest::Response {
     app.client
         .post(app.url("/api/v1/portal/auth/login"))
         .json(&serde_json::json!({
-            "tenant_slug": "default",
+            "tenant_slug": tenant_slug,
             "email": email,
             "password": password,
         }))
@@ -913,5 +924,600 @@ async fn portal_login_rejects_a_contact_whose_company_was_deleted(pool: PgPool) 
         reqwest::StatusCode::UNAUTHORIZED,
         "a company-less portal contact is rejected explicitly, not with a decode 500 \
          (body: {body})"
+    );
+}
+
+// ============================================================================
+// PMS-820: the portal has its own password-reset path, and it can only ever
+// touch the portal identity it was started from.
+// ============================================================================
+
+/// Seed a second tenant (a second portal) and return its id. The
+/// `auth.password_reset` template + rule are copied from the default tenant
+/// exactly as `TenantService::create` copies them, so the reset mail this
+/// tenant queues carries a real rendered link.
+async fn seed_portal_tenant(pool: &PgPool, slug: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) VALUES ($1, $2, $3, 'active', 'org')",
+    )
+    .bind(id)
+    .bind(slug)
+    .bind(slug)
+    .execute(pool)
+    .await
+    .expect("seed tenant");
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_templates
+            (tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+        SELECT $1, name, event_type, channel_type, subject, body_text, body_html, is_active
+        FROM notification_templates
+        WHERE tenant_id = $2 AND event_type = 'auth.password_reset'
+        "#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(pool)
+    .await
+    .expect("copy reset template");
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (tenant_id, name, event_type, channels, recipients, template_id, is_active)
+        SELECT $1, r.name, r.event_type, r.channels, r.recipients, nt.id, r.is_active
+        FROM notification_rules r
+        JOIN notification_templates ot
+          ON ot.id = r.template_id AND ot.tenant_id = $2
+        JOIN notification_templates nt
+          ON nt.tenant_id = $1
+         AND nt.event_type = ot.event_type
+         AND nt.channel_type = ot.channel_type
+        WHERE r.tenant_id = $2 AND r.event_type = 'auth.password_reset'
+        "#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(pool)
+    .await
+    .expect("copy reset rule");
+
+    id
+}
+
+/// `seed_company` / `seed_portal_contact` under a caller-chosen tenant, so one
+/// test can stand up the same address in two portals.
+async fn seed_company_in(pool: &PgPool, tenant_id: Uuid, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(tenant_id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed company");
+    id
+}
+
+async fn seed_portal_contact_in(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    email: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash =
+        mokosh_server::utils::crypto::hash_password(PORTAL_PASSWORD).expect("hash portal password");
+    sqlx::query(
+        r#"
+        INSERT INTO contacts (
+            id, tenant_id, company_id, first_name, last_name, email,
+            is_portal_user, portal_password_hash
+        )
+        VALUES ($1, $2, $3, 'Portal', 'Contact', $4, TRUE, $5)
+        "#,
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(company_id)
+    .bind(email)
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .expect("seed portal contact");
+    id
+}
+
+/// `POST /api/v1/portal/auth/forgot-password`.
+async fn portal_forgot(app: &common::TestApp, tenant_slug: &str, email: &str) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/portal/auth/forgot-password"))
+        .json(&serde_json::json!({ "tenant_slug": tenant_slug, "email": email }))
+        .send()
+        .await
+        .expect("send portal forgot-password")
+}
+
+/// `POST /api/v1/portal/auth/reset-password`.
+async fn portal_reset(app: &common::TestApp, token: &str, password: &str) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/portal/auth/reset-password"))
+        .json(&serde_json::json!({ "token": token, "password": password }))
+        .send()
+        .await
+        .expect("send portal reset-password")
+}
+
+/// Pull the reset token out of the one queued notification for `recipient`
+/// under `tenant_id` whose body contains `marker`. The token is only ever in
+/// the emailed link, so this is how a test gets hold of the real thing rather
+/// than a hand-seeded stand-in. `marker` separates the portal link
+/// (`/portal/reset-password?token=`) from the platform one
+/// (`/reset-password/`) when both were sent to the same address.
+async fn queued_reset_token(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    recipient: &str,
+    marker: &str,
+) -> String {
+    let bodies: Vec<String> = sqlx::query_scalar(
+        "SELECT body FROM notifications WHERE tenant_id = $1 AND recipient = $2 \
+         ORDER BY created_at",
+    )
+    .bind(tenant_id)
+    .bind(recipient)
+    .fetch_all(pool)
+    .await
+    .expect("read queued notifications");
+
+    let mut tokens: Vec<String> = bodies
+        .iter()
+        .filter_map(|body| body.split_once(marker))
+        .map(|(_, rest)| {
+            rest.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        tokens.len(),
+        1,
+        "expected exactly one queued '{marker}' link for {recipient} in tenant {tenant_id}, \
+         got {tokens:?} from {bodies:?}"
+    );
+    tokens.remove(0)
+}
+
+/// Snapshot of the credential columns a reset must not disturb.
+async fn user_credential(pool: &PgPool, user_id: Uuid) -> (Option<String>, String) {
+    sqlx::query_as(
+        "SELECT password_hash, (updated_at::text || '|' || COALESCE(password_changed_at::text, '')) \
+         FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("read users credential")
+}
+
+async fn contact_credential(pool: &PgPool, contact_id: Uuid) -> (Option<String>, String) {
+    sqlx::query_as("SELECT portal_password_hash, updated_at::text FROM contacts WHERE id = $1")
+        .bind(contact_id)
+        .fetch_one(pool)
+        .await
+        .expect("read contact credential")
+}
+
+async fn setup_token_count(pool: &PgPool, contact_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM portal_setup_tokens WHERE contact_id = $1")
+        .bind(contact_id)
+        .fetch_one(pool)
+        .await
+        .expect("count portal setup tokens")
+}
+
+// AC2 + AC3 + AC4: one address is a platform user AND a portal contact of two
+// different portals. Each identity resets independently and the other two
+// credentials keep authenticating unchanged. The `users` row is asserted byte
+// for byte across both portal resets (AC3), and both `contacts` rows across the
+// platform reset (AC4).
+#[sqlx::test]
+async fn portal_and_platform_resets_never_touch_each_other(pool: PgPool) {
+    const SHARED: &str = "shared@acme.example";
+    const NEW_A: &str = "new-portal-a-pw-12345";
+    const NEW_B: &str = "new-portal-b-pw-12345";
+    const NEW_PLATFORM: &str = "new-platform-pw-12345";
+
+    // Platform identity: a `users` row in the default tenant.
+    let (user_id, _, platform_pw) =
+        common::seed_user(&pool, common::DEFAULT_TENANT_ID, SHARED, "technician").await;
+    // Portal identity A: a `contacts` row in the default tenant's portal.
+    let company_a = seed_company(&pool, "Acme Co").await;
+    let contact_a = seed_portal_contact(&pool, company_a, SHARED).await;
+    // Portal identity B: a `contacts` row in a second tenant's portal.
+    let tenant_b = seed_portal_tenant(&pool, "beta").await;
+    let company_b = seed_company_in(&pool, tenant_b, "Beta Ltd").await;
+    let contact_b = seed_portal_contact_in(&pool, tenant_b, company_b, SHARED).await;
+
+    let app = common::boot(pool.clone()).await;
+
+    let user_before = user_credential(&pool, user_id).await;
+    let contact_b_before = contact_credential(&pool, contact_b).await;
+
+    // ---- Reset portal identity A, in the default tenant's portal. ----
+    let resp = portal_forgot(&app, "default", SHARED).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "forgot-password 200"
+    );
+    let token_a = queued_reset_token(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        SHARED,
+        "/portal/reset-password?token=",
+    )
+    .await;
+    assert!(
+        token_a.starts_with(&format!("{contact_a}.")),
+        "the portal token is bound to portal contact A, not to the users row: {token_a}"
+    );
+    let resp = portal_reset(&app, &token_a, NEW_A).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "portal reset-password returns 204"
+    );
+
+    // AC3: the platform account is untouched, byte for byte.
+    assert_eq!(
+        user_credential(&pool, user_id).await,
+        user_before,
+        "a portal reset writes nothing to the users row"
+    );
+    // The other portal identity is untouched too.
+    assert_eq!(
+        contact_credential(&pool, contact_b).await,
+        contact_b_before,
+        "resetting portal A leaves portal B's credential alone"
+    );
+
+    // The three credentials each authenticate to their own identity.
+    let old = portal_login(&app, SHARED, PORTAL_PASSWORD).await;
+    assert_eq!(
+        old.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "portal A's old password stops working"
+    );
+    assert!(
+        portal_login(&app, SHARED, NEW_A)
+            .await
+            .status()
+            .is_success(),
+        "portal A signs in with its new password"
+    );
+    assert!(
+        portal_login_in(&app, "beta", SHARED, PORTAL_PASSWORD)
+            .await
+            .status()
+            .is_success(),
+        "portal B still signs in with its original password"
+    );
+    assert!(
+        app.client
+            .post(app.url("/api/v1/auth/login"))
+            .json(&serde_json::json!({ "email": SHARED, "password": platform_pw }))
+            .send()
+            .await
+            .expect("platform login")
+            .status()
+            .is_success(),
+        "the platform account still signs in with its original password"
+    );
+
+    // ---- Reset portal identity B, in the second tenant's portal. ----
+    // Re-snapshot: the platform logins above legitimately stamp
+    // `users.last_login_at` / `updated_at`, so the "untouched" comparison has
+    // to bracket the reset itself and nothing else.
+    let user_before = user_credential(&pool, user_id).await;
+    let contact_a_after_reset = contact_credential(&pool, contact_a).await;
+    let resp = portal_forgot(&app, "beta", SHARED).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "forgot-password 200"
+    );
+    let token_b =
+        queued_reset_token(&pool, tenant_b, SHARED, "/portal/reset-password?token=").await;
+    assert!(
+        token_b.starts_with(&format!("{contact_b}.")),
+        "the second portal's token is bound to its own contact: {token_b}"
+    );
+    assert_eq!(
+        portal_reset(&app, &token_b, NEW_B).await.status(),
+        reqwest::StatusCode::NO_CONTENT,
+    );
+
+    assert_eq!(
+        user_credential(&pool, user_id).await,
+        user_before,
+        "the second portal's reset writes nothing to the users row either"
+    );
+    assert_eq!(
+        contact_credential(&pool, contact_a).await,
+        contact_a_after_reset,
+        "resetting portal B leaves portal A's just-changed credential alone"
+    );
+    assert!(
+        portal_login(&app, SHARED, NEW_A)
+            .await
+            .status()
+            .is_success(),
+        "portal A keeps its new password"
+    );
+    assert!(
+        portal_login_in(&app, "beta", SHARED, NEW_B)
+            .await
+            .status()
+            .is_success(),
+        "portal B signs in with its new password"
+    );
+
+    // ---- Reset the platform account. ----
+    let contact_a_before_platform = contact_credential(&pool, contact_a).await;
+    let contact_b_before_platform = contact_credential(&pool, contact_b).await;
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/forgot-password"))
+        .json(&serde_json::json!({ "email": SHARED }))
+        .send()
+        .await
+        .expect("platform forgot-password");
+    assert!(resp.status().is_success(), "platform forgot-password 2xx");
+    let platform_token =
+        queued_reset_token(&pool, common::DEFAULT_TENANT_ID, SHARED, "/reset-password/").await;
+    assert!(
+        platform_token.starts_with(&format!("{user_id}.")),
+        "the platform token is bound to the users row: {platform_token}"
+    );
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": platform_token,
+            "new_password": NEW_PLATFORM,
+            "confirm_password": NEW_PLATFORM,
+        }))
+        .send()
+        .await
+        .expect("platform reset-password");
+    assert!(resp.status().is_success(), "platform reset-password 2xx");
+
+    // AC4: neither portal identity's credential moved.
+    assert_eq!(
+        contact_credential(&pool, contact_a).await,
+        contact_a_before_platform,
+        "a platform reset never writes contacts.portal_password_hash"
+    );
+    assert_eq!(
+        contact_credential(&pool, contact_b).await,
+        contact_b_before_platform,
+        "a platform reset never writes the other portal's portal_password_hash"
+    );
+    assert!(
+        portal_login(&app, SHARED, NEW_A)
+            .await
+            .status()
+            .is_success(),
+        "portal A survives the platform reset"
+    );
+    assert!(
+        portal_login_in(&app, "beta", SHARED, NEW_B)
+            .await
+            .status()
+            .is_success(),
+        "portal B survives the platform reset"
+    );
+    assert!(
+        app.client
+            .post(app.url("/api/v1/auth/login"))
+            .json(&serde_json::json!({ "email": SHARED, "password": NEW_PLATFORM }))
+            .send()
+            .await
+            .expect("platform login")
+            .status()
+            .is_success(),
+        "the platform account signs in with its new password"
+    );
+}
+
+// AC1 + AC5: the portal resolves the identity from `contacts` in its own scope
+// only. An address that is a platform user but not a portal contact, an address
+// nobody holds, and a contact without portal access all get the same 200 and no
+// token - and the platform `users` row is not touched on the way past.
+#[sqlx::test]
+async fn portal_forgot_password_does_not_enumerate_or_reach_users(pool: PgPool) {
+    let (admin_id, admin_email, _) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let known = seed_portal_contact(&pool, company, "known@acme.example").await;
+    // Portal access never granted: in the address book, not a portal identity.
+    let no_access = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name, email) \
+         VALUES ($1, $2, $3, 'No', 'Access', 'no-access@acme.example')",
+    )
+    .bind(no_access)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .execute(&pool)
+    .await
+    .expect("seed non-portal contact");
+
+    let app = common::boot(pool.clone()).await;
+    let user_before = user_credential(&pool, admin_id).await;
+
+    let known_resp = portal_forgot(&app, "default", "known@acme.example").await;
+    let known_status = known_resp.status();
+    let known_body = known_resp.text().await.expect("known body");
+
+    for (label, email) in [
+        ("a platform-only address", admin_email.as_str()),
+        ("an address nobody holds", "nobody@acme.example"),
+        ("a contact without portal access", "no-access@acme.example"),
+    ] {
+        let resp = portal_forgot(&app, "default", email).await;
+        let status = resp.status();
+        let body = resp.text().await.expect("unknown body");
+        assert_eq!(status, known_status, "{label} answers like a known address");
+        assert_eq!(body, known_body, "{label} answers the same body");
+    }
+
+    assert_eq!(
+        setup_token_count(&pool, known).await,
+        1,
+        "the known portal contact got exactly one token"
+    );
+    assert_eq!(
+        setup_token_count(&pool, no_access).await,
+        0,
+        "a contact without portal access is never handed a token (it would grant access)"
+    );
+    assert_eq!(
+        user_credential(&pool, admin_id).await,
+        user_before,
+        "a portal reset request never writes the users row it shares an address with"
+    );
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE recipient = $1")
+        .bind(&admin_email)
+        .fetch_one(&pool)
+        .await
+        .expect("count notifications");
+    assert_eq!(
+        queued, 0,
+        "no reset mail is queued for the platform-only address"
+    );
+}
+
+// AC6: both new endpoints are rate limited, per IP and per account. The account
+// quota is 3/min, so the fourth request from the same (IP, account) is 429 with
+// a Retry-After header.
+#[sqlx::test]
+async fn portal_reset_endpoints_are_rate_limited(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    let contact = seed_portal_contact(&pool, company, "limited@acme.example").await;
+    let app = common::boot(pool.clone()).await;
+
+    for attempt in 1..=3 {
+        let resp = portal_forgot(&app, "default", "limited@acme.example").await;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "forgot-password attempt {attempt} is under quota"
+        );
+    }
+    let over = portal_forgot(&app, "default", "limited@acme.example").await;
+    assert_eq!(
+        over.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the fourth forgot-password in a minute is throttled"
+    );
+    assert!(
+        over.headers().contains_key("retry-after"),
+        "the 429 carries Retry-After"
+    );
+    // A different portal account on the same IP still has quota: the throttle
+    // above was the per-account bucket, not a blanket block.
+    assert_eq!(
+        portal_forgot(&app, "default", "other@acme.example")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "another address on the same IP is unaffected by the account bucket"
+    );
+
+    // reset-password keys its account bucket on the contact the token names.
+    let bogus = format!("{contact}.not-the-real-secret");
+    for attempt in 1..=3 {
+        assert_eq!(
+            portal_reset(&app, &bogus, "whatever-password-1")
+                .await
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "reset attempt {attempt} is under quota and rejected on its merits"
+        );
+    }
+    let over = portal_reset(&app, &bogus, "whatever-password-1").await;
+    assert_eq!(
+        over.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the fourth reset attempt against the same contact is throttled"
+    );
+    assert!(
+        over.headers().contains_key("retry-after"),
+        "the 429 carries Retry-After"
+    );
+}
+
+// AC7: a portal reset token is single use and expires, and a replay returns the
+// 410 the setup flow already returns for a replay.
+#[sqlx::test]
+async fn portal_reset_token_is_single_use_and_expires(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    let contact = seed_portal_contact(&pool, company, "once@acme.example").await;
+    let app = common::boot(pool.clone()).await;
+
+    assert_eq!(
+        portal_forgot(&app, "default", "once@acme.example")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+    );
+    let token = queued_reset_token(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "once@acme.example",
+        "/portal/reset-password?token=",
+    )
+    .await;
+
+    assert_eq!(
+        portal_reset(&app, &token, "first-new-password-1")
+            .await
+            .status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "the minted token redeems once"
+    );
+    assert_eq!(
+        portal_reset(&app, &token, "second-new-password-1")
+            .await
+            .status(),
+        reqwest::StatusCode::GONE,
+        "replaying a redeemed reset token returns 410, exactly as the setup flow does"
+    );
+    assert!(
+        portal_login(&app, "once@acme.example", "first-new-password-1")
+            .await
+            .status()
+            .is_success(),
+        "the replay did not overwrite the password the first redemption set"
+    );
+
+    // An expired token is a 400, indistinguishable from an unknown one.
+    let expired = seed_setup_token(
+        &pool,
+        contact,
+        "expired-reset-secret-abcdefghijk",
+        chrono::Utc::now() - chrono::Duration::hours(1),
+    )
+    .await;
+    assert_eq!(
+        portal_reset(&app, &expired, "third-new-password-1")
+            .await
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an expired reset token returns 400"
     );
 }

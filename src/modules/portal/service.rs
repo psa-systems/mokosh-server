@@ -10,18 +10,33 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::utils::crypto::{hash_password, verify_password};
+use crate::modules::auth::TenantId;
+use crate::modules::notifications::NotificationsService;
+use crate::utils::crypto::{generate_token, hash_password, verify_password};
 use crate::utils::error::{AppError, AppResult};
 
 use super::models::*;
 
+/// Lifetime of a portal self-service reset token (PMS-820). Shorter than
+/// the 72h agent-minted setup link: the customer asked for this one
+/// seconds ago and is waiting on it.
+const PORTAL_RESET_TOKEN_TTL_HOURS: i64 = 24;
+
 /// Portal-side counterpart to `AuthService`. Stateless except for the
-/// JWT signing secret and the database handle.
+/// JWT signing secret, the database handle and (PMS-820) the delivery
+/// wiring the self-service reset mail needs.
 #[derive(Clone)]
 pub struct PortalAuthService {
     db: Database,
     jwt_secret: String,
     access_token_ttl: Duration,
+    /// SPA origin the emailed `/portal/reset-password?token=...` link is
+    /// built from. Empty when the service was built without delivery.
+    app_url: String,
+    /// Dispatcher the reset mail is queued through. `None` in fixtures
+    /// built with [`PortalAuthService::new`]; the token is still persisted
+    /// and the miss is logged.
+    notifications: Option<NotificationsService>,
 }
 
 impl PortalAuthService {
@@ -30,6 +45,24 @@ impl PortalAuthService {
             db,
             jwt_secret,
             access_token_ttl: Duration::hours(8),
+            app_url: String::new(),
+            notifications: None,
+        }
+    }
+
+    /// PMS-820: same service with the reset-mail delivery wiring. `app_url`
+    /// is the SPA origin (the base of the `/portal/reset-password` page),
+    /// matching what `ContactService` uses for the setup link.
+    pub fn with_delivery(
+        db: Database,
+        jwt_secret: String,
+        app_url: String,
+        notifications: NotificationsService,
+    ) -> Self {
+        Self {
+            app_url,
+            notifications: Some(notifications),
+            ..Self::new(db, jwt_secret)
         }
     }
 
@@ -249,6 +282,162 @@ impl PortalAuthService {
         Ok(data.claims)
     }
 
+    /// PMS-820: start a portal self-service password reset.
+    ///
+    /// Resolves the identity inside the portal's own scope only - a
+    /// `contacts` row under the tenant named by `tenant_slug`, exactly the
+    /// resolution [`login`](Self::login) does - so it can never reach a
+    /// `users` row, whatever platform account shares the address. Only a
+    /// contact that already HAS portal access gets a token: minting for a
+    /// contact whose `is_portal_user` is false would let anyone in the
+    /// tenant's address book grant themselves a portal login.
+    ///
+    /// Always returns `Ok(())`. An unknown address gets the same body, the
+    /// same status and (via the dummy Argon2 hash below) the same cost as a
+    /// known one, so the endpoint does not enumerate customers.
+    ///
+    /// A duplicated address inside one tenant mints one token per matching
+    /// portal contact: `contacts.email` is only indexed, not unique, and
+    /// `login` picks whichever row the planner returns first, so minting for
+    /// exactly one of them could hand out a link for the identity the
+    /// customer cannot sign into.
+    #[tracing::instrument(skip_all)]
+    pub async fn request_password_reset(&self, tenant_slug: &str, email: &str) -> AppResult<()> {
+        // SAFETY (PMS-285): pre-auth, the same `(tenant_slug, email)` lookup
+        // `login` runs and for the same reason - there is no session yet, so no
+        // `app.current_tenant` GUC to set, and `contacts` is RLS-covered so the
+        // app pool would fail this read closed.
+        let contacts: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+            r#"
+                SELECT c.id, c.tenant_id, c.email, c.first_name
+                FROM contacts c
+                INNER JOIN tenants t ON c.tenant_id = t.id
+                WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
+                  AND c.is_portal_user = TRUE
+                ORDER BY c.created_at
+                "#,
+        )
+        .bind(tenant_slug)
+        .bind(email)
+        .fetch_all(self.db.migrator_pool())
+        .await?;
+
+        if contacts.is_empty() {
+            // Spend one Argon2 hash anyway so an unknown address costs the same
+            // wall-clock as a known one; without it the response time answers
+            // the question the flat 200 refuses to.
+            hash_password(&generate_token(64))?;
+            tracing::info!(
+                tenant_slug,
+                "portal password reset requested for an address with no portal contact; \
+                 responding 200 without minting a token",
+            );
+            return Ok(());
+        }
+
+        for (contact_id, tenant_id, contact_email, first_name) in contacts {
+            let secret = generate_token(64);
+            let token_hash = hash_password(&secret)?;
+            let token = format!("{contact_id}.{secret}");
+            let expires_at = Utc::now() + Duration::hours(PORTAL_RESET_TOKEN_TTL_HOURS);
+
+            // Same table and same token shape as the agent-minted setup link
+            // (PMS-136), so the portal has one contact-bound token to redeem
+            // and one replay contract rather than two.
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                r#"
+                INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .bind(&token_hash)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+
+            self.send_reset_email(tenant_id, contact_id, &contact_email, &first_name, &token)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Queue the portal reset mail through the `auth.password_reset`
+    /// dispatch (PMS-820). Best effort: the token row is already committed,
+    /// so a delivery failure is logged and the customer can ask again rather
+    /// than rolling the mint back.
+    async fn send_reset_email(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        email: &str,
+        first_name: &str,
+        token: &str,
+    ) {
+        let reset_link = format!(
+            "{}/portal/reset-password?token={}",
+            self.app_url.trim_end_matches('/'),
+            token,
+        );
+        let Some(notify) = self.notifications.as_ref() else {
+            tracing::warn!(
+                contact_id = %contact_id,
+                "no notifications dispatcher wired; portal reset token persisted but no message queued",
+            );
+            return;
+        };
+        let context = serde_json::json!({
+            // No `recipient_user_id`: the recipient is a contact, so the fanout
+            // is by address only and never resolves a `users` row.
+            "recipient_email": email,
+            "salutation": crate::utils::email::salutation(first_name),
+            "display_name": first_name,
+            "reset_link": reset_link,
+        });
+        // SAFETY (PMS-261): `tenant_id` is read off the contact row this reset
+        // resolved, not from caller input; `dispatch` re-derives the RLS GUC per
+        // query via `begin_with_tenant`.
+        match notify
+            .dispatch(
+                TenantId::from_trusted(tenant_id),
+                "auth.password_reset",
+                &context,
+            )
+            .await
+        {
+            // A zero fanout is a delivered-nothing outcome, not a success: the
+            // tenant has no active `auth.password_reset` rule, so the customer
+            // is waiting on a mail that will never arrive.
+            Ok(0) => tracing::warn!(
+                contact_id = %contact_id,
+                "portal reset token persisted but the tenant has no active auth.password_reset \
+                 rule, so no message was queued",
+            ),
+            Ok(fanout) => {
+                tracing::info!(contact_id = %contact_id, fanout, "portal password reset queued")
+            }
+            Err(e) => tracing::warn!(
+                contact_id = %contact_id,
+                error = ?e,
+                "portal reset email dispatch failed; token persisted but link unreachable",
+            ),
+        }
+    }
+
+    /// Redeem a portal reset token and set the contact's password
+    /// (PMS-820). Deliberately the same redemption as
+    /// [`setup_password`](Self::setup_password): one contact-bound token
+    /// shape in this module means one single-use rule, one expiry rule and
+    /// one replay status (410) for both ways a customer arrives here.
+    #[tracing::instrument(skip_all)]
+    pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
+        self.setup_password(token, new_password).await
+    }
+
     /// Redeem a single-use portal setup token and set the contact's
     /// password (PMS-136). The token is `{contact_id}.{secret}`; only the
     /// Argon2 hash of the secret is stored (`portal_setup_tokens`), so the
@@ -371,6 +560,14 @@ impl PortalAuthService {
         .await?;
         Ok(())
     }
+}
+
+/// The contact a portal token is bound to, or `None` for a malformed one.
+/// PMS-820: the reset route rate-limits per (IP, contact) and the contact
+/// is only knowable from the token, so the handler needs this before the
+/// service ever touches the database.
+pub fn token_contact_id(token: &str) -> Option<Uuid> {
+    parse_contact_bound_token(token).map(|(contact_id, _)| contact_id)
 }
 
 /// Split a portal setup token `{contact_id}.{secret}` into its parts.

@@ -96,6 +96,12 @@ Remaining auth-adjacent workspace crate:
 google-oauth-flow        Reusable Google OAuth popup/code-exchange client (used by legacy /auth/google routes)
 ```
 
+### Portal credentials are a third, fully separate plane (PMS-820)
+
+A portal identity is a `contacts` row (`portal_password_hash`, `is_portal_user`); a platform identity is a `users` row. One email address can legitimately hold one platform account and a portal identity in several tenants at once, so the portal owns its whole credential lifecycle: `POST /api/v1/portal/auth/{login,setup-password,forgot-password,reset-password}` resolve the identity from `contacts` inside the tenant named by `tenant_slug` and never read or write `users`. `/api/v1/auth/forgot-password` is the platform path and resolves against `users` only; an address that is portal-only finds no user there and gets the same silent 200 as any unknown address. Do NOT point the portal at the platform reset endpoints: one credential path serving two identity kinds is the PMS-820 defect, where a customer resetting their portal password reset a staff login instead.
+
+Portal reset tokens reuse the PMS-136 `portal_setup_tokens` row and its `{contact_id}.{secret}` shape (Argon2-hashed, single use, 24h), so redeeming a self-service reset link and redeeming an agent-minted setup link share one replay contract: 204, then 410 on replay, 400 on expired/unknown. Both new endpoints are rate limited by `AuthRateLimiter` (10/min per IP, 3/min per account) exactly as PMS-680 did for the platform path; forgot-password keys the account bucket on `(tenant_slug, email)` because `contacts.email` is only unique within a tenant, and reset-password keys it on the contact id in the token. The mail is queued through the existing `auth.password_reset` template (already copied to every new tenant by `TenantService::create`), so no new template is seeded.
+
 ### Routing model
 
 `create_api_router` (`src/api/router.rs`) builds:
