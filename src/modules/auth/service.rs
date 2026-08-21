@@ -1181,10 +1181,18 @@ impl AuthService {
     }
 
     /// Auto-provision a user from a verified Google identity. FAIL-CLOSED:
-    /// only exact emails in `self.super_admin_emails` may auto-provision (as
-    /// super_admin, to bootstrap administrators). Any other unrecognized
-    /// Google identity is rejected - real users must be invited rather than
-    /// silently dropped into the default tenant.
+    /// only exact emails in `self.super_admin_emails` may auto-provision.
+    /// Any other unrecognized Google identity is rejected - real users
+    /// must be invited rather than silently dropped into the default
+    /// tenant.
+    ///
+    /// MAPPS-518: the allowlisted Google identity now lands as a tenant
+    /// `admin`, not `super_admin`. The platform super-admin persona
+    /// lives in `platform_admins` and is bootstrapped via
+    /// `ADMIN_EMAIL` / `ADMIN_PASSWORD` (see `auth::bootstrap`); the
+    /// Google auto-provision flow can no longer mint platform-level
+    /// privilege. The environment variable name (`super_admin_emails`)
+    /// is unchanged for backwards-compat.
     async fn provision_user_from_google(
         &self,
         google: &google_oauth_flow::GoogleUserInfo,
@@ -1194,7 +1202,7 @@ impl AuthService {
                 "No account is provisioned for this Google identity. Ask an administrator for an invite.".to_string(),
             ));
         }
-        let role = "super_admin";
+        let role = "admin";
 
         let user_id = Uuid::new_v4();
         // Bootstrap super-admins land in the default tenant seeded by

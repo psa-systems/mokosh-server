@@ -17,8 +17,68 @@ use super::{
     UpdateTenantAdminRequest, UpdateTenantRequest,
 };
 use crate::modules::auth::{
-    AuthService, RequireAuth, RequireAuthState, RequireSuperAdmin, TenantId, TenantScoped, UserRole,
+    AuthService, CurrentUser, RequireAuth, RequireAuthState, TenantId, TenantScoped,
 };
+use crate::modules::platform::RequirePlatformAdmin;
+
+/// MAPPS-518: extractor that lets a tenant `users` caller AND a
+/// `/platform/login` bearer through the same handler. The former
+/// `role='super_admin'` cross-tenant bypass is retired, but the
+/// cross-tenant admin surface it enabled (viewing / editing an
+/// arbitrary tenant from the console) is preserved via the
+/// platform-plane bearer. Handlers that used to check
+/// `user.role == UserRole::SuperAdmin || user.tenant_id == tenant_id`
+/// now consume `TenantOrPlatformCaller` and call one of its
+/// `require_*` helpers instead.
+pub enum TenantOrPlatformCaller {
+    Platform,
+    Tenant(CurrentUser),
+}
+
+impl<S> axum::extract::FromRequestParts<S> for TenantOrPlatformCaller
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        if RequirePlatformAdmin::from_request_parts(parts, state)
+            .await
+            .is_ok()
+        {
+            return Ok(TenantOrPlatformCaller::Platform);
+        }
+        let RequireAuth(user) = RequireAuth::from_request_parts(parts, state).await?;
+        Ok(TenantOrPlatformCaller::Tenant(user))
+    }
+}
+
+impl TenantOrPlatformCaller {
+    /// Read-side gate: platform admin can read any tenant; a tenant
+    /// caller can read only their own.
+    fn require_read_access(&self, tenant_id: Uuid) -> AppResult<()> {
+        match self {
+            TenantOrPlatformCaller::Platform => Ok(()),
+            TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id => Ok(()),
+            _ => Err(AppError::Forbidden("Access denied".to_string())),
+        }
+    }
+
+    /// Write-side gate: platform admin can write any tenant; a tenant
+    /// caller must be the admin of their own tenant.
+    fn require_admin_write_access(&self, tenant_id: Uuid) -> AppResult<()> {
+        match self {
+            TenantOrPlatformCaller::Platform => Ok(()),
+            TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id && u.role.is_admin() => {
+                Ok(())
+            }
+            _ => Err(AppError::Forbidden("Access denied".to_string())),
+        }
+    }
+}
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -123,7 +183,7 @@ pub fn tenant_routes(
 /// List all tenants (super admin only)
 async fn list_tenants(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TenantResponse>>> {
     let (tenants, total) = state.tenant_service.list_tenants(&pagination).await?;
@@ -140,7 +200,7 @@ async fn list_tenants(
 /// Create a new tenant (super admin only)
 async fn create_tenant(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
@@ -285,22 +345,17 @@ async fn create_additional_tenant(
     Ok(Json(tenant.into()))
 }
 
-/// Get tenant by ID
+/// Get tenant by ID. MAPPS-518: platform admin OR same-tenant caller.
 async fn get_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<Json<TenantResponse>> {
-    // Super admin can view any tenant, others can only view their own
-    if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
+    caller.require_read_access(tenant_id)?;
 
-    // SAFETY (PMS-261): this super-admin surface deliberately addresses an
-    // arbitrary path `tenant_id`, not the caller's own claim. The role guard
-    // above is the gate (super-admin, or same-tenant), so `from_trusted` is
-    // sound: a non-super-admin can only reach this with `tenant_id ==
-    // user.tenant_id`.
+    // SAFETY (PMS-261 + MAPPS-518): allowed via same-tenant guard OR
+    // platform admin; the arbitrary path `tenant_id` is sound to
+    // bridge because the check above pins it.
     let tenant = state
         .tenant_service
         .get_tenant(TenantId::from_trusted(tenant_id))
@@ -513,21 +568,17 @@ async fn update_current_tenant(
 /// Update tenant
 async fn update_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     ctx: crate::modules::audit::AuditCtx,
     Path(tenant_id): Path<Uuid>,
     Json(request): Json<UpdateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
-    // Super admin can update any tenant, admins can update their own
-    if user.role != UserRole::SuperAdmin && !(user.tenant_id == tenant_id && user.role.is_admin()) {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
+    // MAPPS-518: platform admin OR same-tenant admin.
+    caller.require_admin_write_access(tenant_id)?;
 
     request.validate()?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
-    // the role guard above; the arbitrary path `tenant_id` is sound to bridge
-    // via `from_trusted` only because of that guard.
+    // SAFETY (PMS-261 + MAPPS-518): admin-scoped by the guard above.
     let tenant = state
         .tenant_service
         .update_tenant(TenantId::from_trusted(tenant_id), &request, &ctx)
@@ -539,7 +590,7 @@ async fn update_tenant(
 /// Suspend tenant (super admin only)
 async fn suspend_tenant(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
     // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
@@ -557,7 +608,7 @@ async fn suspend_tenant(
 /// MAPPS-450: read the tenant admin's `users` row (super admin only).
 async fn get_tenant_admin(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<Json<TenantAdminInfo>> {
     // SAFETY (PMS-261): super-admin-only path; the arbitrary `tenant_id`
@@ -572,7 +623,7 @@ async fn get_tenant_admin(
 /// MAPPS-450: super-admin edits the tenant admin's email + name pair.
 async fn update_tenant_admin(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     ctx: crate::modules::audit::AuditCtx,
     Path(tenant_id): Path<Uuid>,
     Json(request): Json<UpdateTenantAdminRequest>,
@@ -591,7 +642,7 @@ async fn update_tenant_admin(
 /// MAPPS-448: re-issue the tenant admin's welcome email (super admin only).
 async fn resend_admin_welcome(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     ctx: crate::modules::audit::AuditCtx,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -609,7 +660,7 @@ async fn resend_admin_welcome(
 /// Activate tenant (super admin only)
 async fn activate_tenant(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
     // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
@@ -623,19 +674,17 @@ async fn activate_tenant(
     Ok(())
 }
 
-/// Get tenant usage statistics
+/// Get tenant usage statistics. MAPPS-518: platform admin OR
+/// same-tenant caller.
 async fn get_tenant_usage(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<Json<TenantUsage>> {
-    // Super admin can view any tenant, admins can view their own
-    if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
+    caller.require_read_access(tenant_id)?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
-    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
+    // SAFETY (PMS-261 + MAPPS-518): allowed via same-tenant guard OR
+    // platform admin; `from_trusted` sound.
     let usage = state
         .tenant_service
         .get_tenant_usage(TenantId::from_trusted(tenant_id))
@@ -653,15 +702,14 @@ async fn get_tenant_usage(
 /// implicitly to the caller's own tenant.
 async fn get_module_config(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     Path((tenant_id, module)): Path<(Uuid, String)>,
 ) -> AppResult<Json<ModuleConfigResponse>> {
-    if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
+    // MAPPS-518: platform admin OR same-tenant caller.
+    caller.require_read_access(tenant_id)?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
-    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
+    // SAFETY (PMS-261 + MAPPS-518): allowed via same-tenant guard OR
+    // platform admin; `from_trusted` sound.
     let config = state
         .settings_service
         .get_module_config(TenantId::from_trusted(tenant_id), &module)
@@ -674,16 +722,14 @@ async fn get_module_config(
 /// delegates to the canonical `SettingsService`.
 async fn update_module_config(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     Path((tenant_id, module)): Path<(Uuid, String)>,
     Json(request): Json<UpsertModuleConfigRequest>,
 ) -> AppResult<Json<ModuleConfigResponse>> {
-    if user.role != UserRole::SuperAdmin && !(user.tenant_id == tenant_id && user.role.is_admin()) {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
+    // MAPPS-518: platform admin OR same-tenant admin.
+    caller.require_admin_write_access(tenant_id)?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
-    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
+    // SAFETY (PMS-261 + MAPPS-518): admin-scoped by the guard above.
     let config = state
         .settings_service
         .upsert_module_config(TenantId::from_trusted(tenant_id), &module, &request)

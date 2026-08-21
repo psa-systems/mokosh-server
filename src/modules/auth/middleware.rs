@@ -1060,6 +1060,14 @@ fn default_bunyip_tenant_id() -> uuid::Uuid {
 /// default landing tenant into their own personal tenant. True only for a user
 /// currently in `default_tenant`, with no pending invite, who is not a platform
 /// `super_admin` (those legitimately belong to the infra/default tenant).
+///
+/// MAPPS-518: post stage B the platform super-admin persona lives in
+/// `platform_admins`, not `users`, so no `users.role = 'super_admin'`
+/// row is produced by any production code path (bootstrap + Google
+/// auto-provision both switched away). The check is retained for the
+/// integration-test fixtures that still seed a role='super_admin' row
+/// in the default tenant (`common::seed_admin`) to keep those tests
+/// stable; it is a no-op in production.
 fn is_stuck_in_default(
     current: Option<uuid::Uuid>,
     default_tenant: uuid::Uuid,

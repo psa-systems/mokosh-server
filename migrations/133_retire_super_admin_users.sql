@@ -1,0 +1,31 @@
+-- MAPPS-518 (MAPPS-513 stage B): delete every `users` row with
+-- `role = 'super_admin'`. The platform super-admin persona now lives
+-- exclusively in `platform_admins` (see migration 131 + 132 which
+-- create the table and backfill from these very rows).
+--
+-- Consequence: super-admin no longer has an `identities` row derived
+-- from a `users` row, so tenant admin password resets writing
+-- `identities.password_hash` (via MAPPS-499 change_password /
+-- MAPPS-502 reset_password) no longer propagate through MAPPS-498's
+-- mirror to the super-admin's users row (because there is no such
+-- users row to mirror to). This is the fix for the "resend welcome
+-- email on tenant Test also reset my super-admin password" bug.
+--
+-- The `identities` table is not touched: any identity still
+-- referenced by another users row (e.g. a tenant admin sharing the
+-- email) survives. Truly orphaned identity rows (no users row
+-- anywhere) can be reaped by a later maintenance sweep if operators
+-- accumulate them; harmless to leave in place.
+--
+-- After this migration:
+-- - `bootstrap.rs` creates a `platform_admins` row on first-run
+--   super-admin bootstrap (not a users row with role='super_admin').
+-- - Every handler previously gated on `RequireSuperAdmin` (the
+--   users-role extractor) now requires a platform bearer via
+--   `RequirePlatformAdmin` (see modules/platform/routes.rs).
+-- - The `role = 'super_admin'` value stays in the `users.role` CHECK
+--   constraint for schema-level backwards compat with any deployed
+--   database that had super_admin rows; nothing writes it any more.
+--   A future ticket may drop the enum variant + the CHECK entry.
+
+DELETE FROM users WHERE role = 'super_admin';

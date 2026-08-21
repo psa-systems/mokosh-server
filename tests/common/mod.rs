@@ -335,6 +335,23 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     .await
     .expect("insert seeded admin");
 
+    // MAPPS-518 (MAPPS-513 stage B): also seed a `platform_admins` row
+    // for the same email + password so tests that hit endpoints gated
+    // by `RequirePlatformAdmin` (post stage B: list/create/suspend/
+    // activate/resend_welcome tenants, get/update tenant admin) can
+    // call `common::platform_login` to get a platform bearer. Older
+    // tests that just use `common::login` still work; the users row
+    // is unchanged.
+    sqlx::query(
+        "INSERT INTO platform_admins (email, password_hash, first_name, last_name, status) \
+         VALUES ($1, $2, 'Test', 'Admin', 'active') ON CONFLICT DO NOTHING",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(pool)
+    .await
+    .expect("insert seeded platform admin");
+
     (user_id, email, password)
 }
 
@@ -496,6 +513,34 @@ pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
     body["access_token"]
         .as_str()
         .expect("login response has access_token")
+        .to_string()
+}
+
+/// MAPPS-518 (MAPPS-513 stage B): drive `POST /api/v1/platform/login`
+/// and return the platform bearer. `seed_admin` seeds a matching
+/// `platform_admins` row so this works with the same email/password
+/// pair. Use this for tests that hit endpoints gated by
+/// `RequirePlatformAdmin` (list_tenants, create_tenant,
+/// suspend_tenant, activate_tenant, resend_admin_welcome,
+/// get_tenant_admin, update_tenant_admin).
+#[allow(dead_code)]
+pub async fn platform_login(app: &TestApp, email: &str, password: &str) -> String {
+    let resp = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .expect("send /platform/login request");
+    assert!(
+        resp.status().is_success(),
+        "platform login expected 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("/platform/login JSON body");
+    body["access_token"]
+        .as_str()
+        .expect("platform login response has access_token")
         .to_string()
 }
 

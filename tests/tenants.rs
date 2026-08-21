@@ -263,7 +263,11 @@ async fn create_tenant_emails_admin_setup_link(pool: PgPool) {
 async fn list_tenants_returns_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
-    let token = common::login(&app, &email, &password).await;
+    // MAPPS-518: /api/v1/tenants is gated on `RequirePlatformAdmin`, so use
+    // the platform-plane bearer minted by `/platform/login` (which
+    // `seed_admin` also seeds a row for). A tenant `AuthContext` bearer
+    // now returns 401 here.
+    let token = common::platform_login(&app, &email, &password).await;
 
     let resp = app
         .client
@@ -275,7 +279,7 @@ async fn list_tenants_returns_default(pool: PgPool) {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
-        "list tenants should succeed for a super_admin"
+        "list tenants should succeed for a platform admin"
     );
 
     let body: serde_json::Value = resp.json().await.expect("tenants list JSON");
@@ -287,17 +291,21 @@ async fn list_tenants_returns_default(pool: PgPool) {
     assert_eq!(default["slug"].as_str(), Some("default"));
 }
 
-// PMS-260: `tenants::list_tenants` runs no SQL tenant filter (listing every
-// tenant is its whole job); the only thing standing between a tenant-scoped
-// caller and the full list is the route's SuperAdmin guard. Pin that guard: a
-// non-super-admin must get 403, never the global tenant list.
+// PMS-260 + MAPPS-518: `tenants::list_tenants` runs no SQL tenant filter
+// (listing every tenant is its whole job); the only thing standing between a
+// tenant-scoped caller and the full list is the route's
+// `RequirePlatformAdmin` guard (previously `RequireSuperAdmin`, before
+// MAPPS-518 retired the role-based bypass). Pin that guard: a tenant
+// bearer must get 401 (no platform admin identity in the token), never
+// the global tenant list.
 #[sqlx::test]
 async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
     let (_admin_id, _admin_email, _admin_password) = common::seed_admin(&pool).await;
     // A second tenant exists, so an unscoped leak would be observable.
     let (_tenant_b_id, _b_uid, _b_email, _b_password) =
         common::seed_tenant_with_admin(&pool, "pms260-list-b").await;
-    // A tenant-A admin (role `admin`, NOT super_admin).
+    // A tenant-A admin (role `admin`) with only a tenant bearer, no
+    // platform_admins row.
     let (_tech_id, tech_email, tech_password) = common::seed_user(
         &pool,
         common::DEFAULT_TENANT_ID,
@@ -315,11 +323,11 @@ async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
         .bearer_auth(&token)
         .send()
         .await
-        .expect("send list tenants as non-super-admin");
+        .expect("send list tenants as tenant-scoped caller");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::FORBIDDEN,
-        "a non-super-admin must not be able to list all tenants"
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a tenant bearer must not pass the platform-admin gate"
     );
 }
 

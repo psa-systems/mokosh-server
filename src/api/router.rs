@@ -339,16 +339,15 @@ pub fn create_api_router(
         // store (`platform_admins`) and distinct JWT typ so the
         // super-admin persona is isolated from the tenant identity
         // model. `RequirePlatformAdmin` extractor reads the platform
-        // service from request extensions; layer(Extension(...)) below
-        // makes the service reachable from the extractor.
+        // service from request extensions; the extension layer that
+        // makes it reachable is attached at the very end of the
+        // api_v1 build (alongside `settings_service`) so every route
+        // (including the MAPPS-518 platform-admin-gated tenant
+        // endpoints) can resolve it.
         .nest(
             "/platform",
             platform_routes(PlatformAdminService::new(db.clone(), jwt_secret.clone())),
         )
-        .layer(axum::Extension(Arc::new(PlatformAdminService::new(
-            db.clone(),
-            jwt_secret.clone(),
-        ))))
         // Tenant management. Only mounted in multi-tenant builds: in a
         // single-tenant deployment there is exactly one tenant and the
         // CRUD endpoints would be a foot-gun. PMS-24.
@@ -510,6 +509,16 @@ pub fn create_api_router(
         // `parts.extensions.get::<Arc<SettingsService>>()` and short-
         // circuits with 404 when the gated module is disabled.
         .layer(axum::Extension(settings_service))
+        // MAPPS-513 / MAPPS-518: make `PlatformAdminService` reachable
+        // from the `RequirePlatformAdmin` extractor via request
+        // extensions. Attached at the outermost layer so every
+        // /api/v1 route (including the platform-admin-gated tenant
+        // endpoints from MAPPS-518) can resolve it, not just the
+        // /platform sub-tree.
+        .layer(axum::Extension(Arc::new(PlatformAdminService::new(
+            db.clone(),
+            jwt_secret.clone(),
+        ))))
         // PMS-298: outermost layer so every 4xx (including extractor
         // rejections such as a JSON body that fails to deserialize) is
         // returned as the standard `{error:{code,message}}` envelope instead

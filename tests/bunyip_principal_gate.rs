@@ -157,13 +157,19 @@ async fn suspended_tenant_rejects_both_auth_paths(pool: PgPool) {
         "legacy bearer works before the suspension"
     );
 
+    // MAPPS-518: /tenants/{id}/suspend is now gated on `RequirePlatformAdmin`
+    // (the bunyip bearer's tenant scope no longer grants it). Use the
+    // platform-plane bearer minted by `seed_admin` + `/platform/login` to
+    // drive the suspension; the assertions above/below still target the two
+    // tenant-plane bearers.
+    let platform = common::platform_login(&app, &email, &password).await;
     let resp = app
         .client
         .post(app.url(&format!(
             "/api/v1/tenants/{}/suspend",
             common::DEFAULT_TENANT_ID
         )))
-        .bearer_auth(&bunyip)
+        .bearer_auth(&platform)
         .send()
         .await
         .expect("POST /tenants/{id}/suspend");

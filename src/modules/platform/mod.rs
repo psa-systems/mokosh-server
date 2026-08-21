@@ -9,6 +9,6 @@ pub mod routes;
 pub mod service;
 
 #[cfg(feature = "server")]
-pub use routes::platform_routes;
+pub use routes::{platform_routes, RequirePlatformAdmin};
 #[cfg(feature = "server")]
 pub use service::PlatformAdminService;
