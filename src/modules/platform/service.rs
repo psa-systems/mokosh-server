@@ -82,12 +82,107 @@ impl PlatformAdminService {
         // Best-effort last_login stamp; failure does not block the login.
         let _ = PlatformAdminRepo::update_last_login(pool, admin.id).await;
 
+        // MAPPS-520 walkthrough: ensure the platform admin also has a
+        // tenant admin users row in the default tenant. Without this,
+        // a pure platform admin (fresh install; or an operator whose
+        // super_admin users row was deleted by migration 133) can
+        // sign in on the platform plane but sees "You need an admin
+        // role" on every tenant-scoped admin surface (Invitations,
+        // Audit Log, Settings, ...). The chained /auth/login the
+        // client fires after platform login only succeeds if a
+        // users row exists to authenticate against; this heal
+        // creates one on the fly.
+        //
+        // Idempotent: skipped when any users row already exists for
+        // this email (any tenant), so a real tenant admin at the
+        // same email is not overwritten and repeated platform
+        // logins are a no-op after the first.
+        //
+        // The MAPPS-518 credential isolation is preserved: the
+        // MAPPS-498 mirror still cannot touch `platform_admins`, so
+        // a subsequent tenant-side password reset only writes
+        // `users.password_hash` (and via the mirror,
+        // `identities.password_hash`); the platform password stays
+        // exactly as-is. The tenant row's password can diverge
+        // from the platform password over time; the client's
+        // chained login will still succeed for whichever password
+        // it holds at the moment of login.
+        let _ = self.ensure_tenant_admin_row(&admin).await;
+
         let (access_token, expires_at) = self.mint_token(&admin)?;
         Ok(PlatformLoginResponse {
             access_token,
             expires_at,
             admin: profile_of(&admin),
         })
+    }
+
+    /// MAPPS-520: idempotent heal that ensures a `users` row exists
+    /// for the platform admin so the tenant-plane surfaces work
+    /// end-to-end without a manual "create your first tenant" step.
+    /// Best-effort - a failure is logged and swallowed, never
+    /// propagated back to `authenticate` (a hiccup here must not
+    /// block a login that has already verified valid credentials).
+    async fn ensure_tenant_admin_row(&self, admin: &PlatformAdminRow) -> AppResult<()> {
+        let pool = self.db.migrator_pool();
+        // Any live users row at this email is enough - do not clobber
+        // a real tenant admin at the same email.
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users \
+             WHERE lower(email) = lower($1) AND deleted_at IS NULL \
+             LIMIT 1",
+        )
+        .bind(&admin.email)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, admin_id = %admin.id, "MAPPS-520 ensure_tenant_admin_row: users lookup failed; skipping heal");
+            AppError::Internal("users lookup failed".to_string())
+        })?;
+
+        if existing.is_some() {
+            return Ok(());
+        }
+
+        let default_tenant = Uuid::from_u128(1);
+        let password_hash = admin.password_hash.as_deref().unwrap_or("");
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO users (
+                id, tenant_id, email, password_hash,
+                first_name, last_name, role, status,
+                email_verified_at, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'admin', 'active', NOW(), NOW(), NOW())
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(admin.id)
+        .bind(default_tenant)
+        .bind(&admin.email)
+        .bind(password_hash)
+        .bind(&admin.first_name)
+        .bind(&admin.last_name)
+        .execute(pool)
+        .await;
+
+        if let Err(e) = insert_result {
+            tracing::warn!(
+                error = %e,
+                admin_id = %admin.id,
+                email = %admin.email,
+                "MAPPS-520 ensure_tenant_admin_row: users insert failed; the platform login itself still succeeded"
+            );
+        } else {
+            tracing::info!(
+                admin_id = %admin.id,
+                email = %admin.email,
+                tenant_id = %default_tenant,
+                "MAPPS-520 ensure_tenant_admin_row: provisioned tenant admin users row for platform admin"
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn change_password(
