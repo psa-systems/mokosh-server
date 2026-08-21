@@ -107,6 +107,16 @@ jobs:
         run: |
           nu scripts/check-oci-build-cache.nu
 
+      - name: OCI publish tags
+        # PMS-733: `:latest` publishes from main only; a feature branch publishes
+        # its own tag and only if oci-build/get-tags.nu allow-lists it. The push
+        # filter, the ref guard and the tag resolver must agree, and they drift
+        # silently - a branch in the filter but not the resolver would resolve
+        # `latest` and overwrite the tag production tracks.
+        shell: nu {0}
+        run: |
+          nu scripts/check-oci-publish-tags.nu
+
       - name: Check formatting
         run: cargo fmt --all --check
 
