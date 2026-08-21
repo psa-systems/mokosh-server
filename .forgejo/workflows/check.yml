@@ -11,6 +11,13 @@ on:
   push:
     branches:
       - main
+      # PMS-825: mokosh-client-login publishes its own image tag (PMS-733) and
+      # is long-lived, so no pull_request into main ever covers it. Without this
+      # entry staging pulls an image whose commit never ran fmt/clippy/tests.
+      # It goes away with the branch tag under PMS-824. Keep in sync with
+      # BRANCH_ALLOW_LIST in oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu
+      # fails the build if a publishing branch is missing here.
+      - mokosh-client-login
   pull_request:
     branches:
       - main
