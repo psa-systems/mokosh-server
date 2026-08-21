@@ -56,16 +56,25 @@ def check-workflow [] {
 
 # Every publish decision the workflow can reach, asserted on the resolver.
 def check-resolver [] {
-    let branch = ($BRANCH_ALLOW_LIST | first)
-    let cases = [
+    let base_cases = [
         [what, args, tag];
         ["a version tag push publishes the version only" { mode: "release", ref_name: "v1.2.3" } "v1.2.3"]
         ["a main push publishes latest only" { mode: "latest", ref_name: "main" } "latest"]
-        ["an allow-listed branch push publishes its branch tag only" { mode: "branch", ref_name: $branch } $branch]
         ["a manual run off main resolves the latest train" { mode: "dry-run", ref_name: "main" } "latest"]
         ["a manual run with simulate_tag resolves the release train" { mode: "dry-run", ref_name: "main", simulate_tag: "v9.9.9" } "v9.9.9"]
-        ["a manual run off an allow-listed branch resolves that branch, never latest" { mode: "dry-run", ref_name: $branch } $branch]
     ]
+    # The allow-list is empty whenever no branch is being staged, which is the
+    # steady state; only add the branch cases when there is a branch to assert.
+    let cases = if ($BRANCH_ALLOW_LIST | is-empty) {
+        $base_cases
+    } else {
+        let branch = ($BRANCH_ALLOW_LIST | first)
+        $base_cases ++ [
+            [what, args, tag];
+            ["an allow-listed branch push publishes its branch tag only" { mode: "branch", ref_name: $branch } $branch]
+            ["a manual run off an allow-listed branch resolves that branch, never latest" { mode: "dry-run", ref_name: $branch } $branch]
+        ]
+    }
 
     mut errors = []
     for case in $cases {
@@ -103,7 +112,12 @@ def main [] {
     let errors = ((check-workflow) ++ (check-resolver))
 
     if ($errors | is-empty) {
-        print $"OCI publish tags OK: :latest from main only, branch tags for ($BRANCH_ALLOW_LIST | str join ', ')"
+        let allowed = if ($BRANCH_ALLOW_LIST | is-empty) {
+            "no branch allow-listed"
+        } else {
+            $"branch tags for ($BRANCH_ALLOW_LIST | str join ', ')"
+        }
+        print $"OCI publish tags OK: :latest from main only, ($allowed)"
     } else {
         print --stderr "ERROR: OCI publish-tag rule violated (PMS-733)."
         print --stderr "`:latest` publishes from main only, and a branch publishes only if oci-build/get-tags.nu allow-lists it."
