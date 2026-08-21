@@ -14,6 +14,33 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// Parse and screen a stored `api_url` before the reachability probe connects
+/// to it (PMS-809). The error string is what the endpoint reports back, so a
+/// refused target reads as unreachable-with-a-reason rather than a bare false.
+async fn screened_target(api_url: &str, connection_id: Uuid) -> Result<url::Url, String> {
+    let target =
+        url::Url::parse(api_url).map_err(|e| format!("api_url is not a valid URL: {e}"))?;
+    match crate::utils::net::guard_outbound_url(
+        &crate::utils::net::SystemResolver,
+        &target,
+        None,
+        crate::utils::net::private_target_allowlist(),
+    )
+    .await
+    {
+        Ok(()) => Ok(target),
+        Err(e) => {
+            tracing::warn!(
+                %connection_id, blocked = %e,
+                "RMM connection test refused: api_url is not on the public internet",
+            );
+            Err(format!(
+                "api_url refused: {e}. Set OUTBOUND_PRIVATE_ALLOWLIST if this target is deliberately private."
+            ))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RmmService {
     db: Database,
@@ -256,14 +283,23 @@ impl RmmService {
         let _api_key = crate::utils::crypto::decrypt(&key_enc, &self.encryption_key)?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            // A followed redirect would connect to an address the guard below
+            // never screened, so the hop is reported instead of taken.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| AppError::Internal(format!("http client: {e}")))?;
-        let result = client
-            .head(&url)
-            .send()
-            .await
-            .map(|r| r.status().as_u16())
-            .map_err(|e| e.to_string());
+        // PMS-809: `api_url` is tenant-editable, so this probe is screened
+        // exactly like the provider's requests. A refusal is `reachable: false`
+        // carrying the cause, never a silent success.
+        let result = match screened_target(&url, id).await {
+            Ok(target) => client
+                .head(target)
+                .send()
+                .await
+                .map(|r| r.status().as_u16())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
         let summary = match result {
             Ok(status) => serde_json::json!({"reachable": true, "status": status}),
             Err(e) => serde_json::json!({"reachable": false, "error": e}),

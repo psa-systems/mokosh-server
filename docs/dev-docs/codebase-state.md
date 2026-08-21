@@ -245,10 +245,28 @@ it resolves ahead of `/companies/{company_id}`. It reads and writes no
 tenant data; the tenant is the rate-limit key only. Both the reachable
 and the unreachable verdict are 200s, because determining that a site
 does not answer is a successful probe; input that cannot be a website
-at all is a 400. `is_non_public_ip`
+at all is a 400. `guard_outbound_url`
 ([`utils/net.rs`](../src/utils/net.rs)) gates every resolved address
 before the first connect and again for every redirect hop, which is
 what stops the endpoint being an SSRF primitive.
+
+**The same gate everywhere a URL is not hardcoded (PMS-809).** The probe
+was not the only outbound fetch of a caller-supplied URL, so
+`guard_outbound_url` is shared by three callers: the probe (ports pinned
+to 80/443), the ticket-automation `webhook` action
+([`tickets/automation.rs`](../src/modules/tickets/automation.rs), which
+now follows redirects itself so each hop is re-screened, and logs a
+refusal with the rule id and the blocked address), and
+`TacticalRmmProvider`
+([`rmm/provider.rs`](../src/modules/rmm/provider.rs), which screens its
+tenant-configured `api_url` before every request, refuses with an
+`AppError::Configuration` that reaches `rmm_connections.last_error`, and
+does not follow redirects). A second copy of the predicate or the resolve
+loop fails `utils::net`'s `exactly_one_definition_in_the_crate` test.
+`OUTBOUND_PRIVATE_ALLOWLIST` (hostnames, IPs, or CIDRs) is the operator
+escape hatch for an on-premise integration; fetches whose URL comes from
+operator env (Infisical, Stripe, the `OIDC_ISSUER` JWKS, the version
+check) are deliberately out of scope.
 
 **Contact child collections and the mirror rule (PMS-806).** A contact
 carries an ordered list of typed phone numbers (`contact_phones`:
