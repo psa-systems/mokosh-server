@@ -469,7 +469,16 @@ pub fn create_api_router(
     // Build portal API routes. Portal identity is the contacts row,
     // so this surface runs its own auth middleware (mounted inside
     // `portal_routes`) and never sees `AuthMiddleware` / `AuthState`.
-    let portal_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
+    // PMS-820: the portal owns its own password reset, so the service holds
+    // the dispatcher the reset mail is queued through and the SPA origin the
+    // `/portal/reset-password` link is built from (a mokosh-apps route, so
+    // the SPA origin and not the apex - MAPPS-425).
+    let portal_service = PortalAuthService::with_delivery(
+        db.clone(),
+        jwt_secret.clone(),
+        spa_base_url.clone(),
+        notifications_service.clone(),
+    );
     // PMS-483: `portal_attachment_routes` needs its own clone of the
     // service so it can build the same `portal_auth_middleware` layer
     // independently (the layer is per-Router in axum, not inherited

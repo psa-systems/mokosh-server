@@ -20,11 +20,13 @@ use validator::Validate;
 
 use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
-use super::service::PortalAuthService;
+use super::service::{token_contact_id, PortalAuthService};
 use super::{
-    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact, PortalLoginRequest,
+    CreatePortalTicketNoteRequest, CreatePortalTicketRequest, CurrentContact,
+    PortalForgotPasswordRequest, PortalLoginRequest, PortalResetPasswordRequest,
     PortalSetupPasswordRequest,
 };
+use crate::modules::auth::rate_limit::AuthRateLimiter;
 use crate::modules::billing::{BillingService, InvoiceFilter, InvoiceResponse, PayInvoiceResponse};
 use crate::modules::knowledge_base::{KbArticleResponse, KbService};
 use crate::modules::quotes::{
@@ -51,6 +53,16 @@ pub struct PortalRouterState {
     /// `login_limiter` so a burst of decisions cannot lock a contact out of
     /// logging back in.
     pub decision_limiter: Arc<PortalDecisionLimiter>,
+    /// PMS-820: throttles `/auth/forgot-password`, per IP and per
+    /// `(tenant_slug, email)`. Its own instance with its own buckets, so a
+    /// reset request never consumes login quota (and vice versa) - the same
+    /// per-endpoint split PMS-680 made on the platform side.
+    pub forgot_password_limiter: Arc<AuthRateLimiter>,
+    /// PMS-820: throttles `/auth/reset-password`, per IP and per contact.
+    /// The account bucket keys on the contact id carried in the token
+    /// because that body has no email in it; a malformed token keys on the
+    /// IP bucket alone.
+    pub reset_password_limiter: Arc<AuthRateLimiter>,
     /// PMS-711: SPA origin the invoice "Pay Now" success / cancel return URLs
     /// are built from (the base of the portal invoice pages).
     pub portal_origin: String,
@@ -75,6 +87,11 @@ pub fn portal_routes(
         quotes: Arc::new(quotes),
         login_limiter: PortalLoginLimiter::new(),
         decision_limiter: PortalDecisionLimiter::new(),
+        // PMS-820, matching the platform forgot-password numbers (PMS-680):
+        // 10/min per IP, 3/min per account - enough for a fumbling customer,
+        // and it caps reset-mail bombing of a known address.
+        forgot_password_limiter: AuthRateLimiter::new(10, 3),
+        reset_password_limiter: AuthRateLimiter::new(10, 3),
         portal_origin,
     };
     let mw = PortalAuthMiddleware::new(service);
@@ -86,6 +103,13 @@ pub fn portal_routes(
         // (PMS-136). No auth: the customer is not yet a logged-in contact;
         // the single-use token IS the credential proving they own the link.
         .route("/auth/setup-password", post(setup_password))
+        // Public: portal-scoped self-service password reset (PMS-820). The
+        // portal's own path, resolving the identity from `contacts` inside
+        // the requested tenant; the platform `/auth/forgot-password` route
+        // resolves against `users` and the two can never cross, however many
+        // identities one email address holds.
+        .route("/auth/forgot-password", post(forgot_password))
+        .route("/auth/reset-password", post(reset_password))
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
         .route("/auth/me", get(me))
@@ -170,6 +194,75 @@ async fn setup_password(
         .setup_password(&request.token, &request.password)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-820: start a portal password reset. Always answers 200 with an empty
+/// body, whether or not the address belongs to a portal contact, so the
+/// endpoint cannot be used to enumerate a tenant's customers. Rate-limited
+/// inline (like login) because the email lives in the request body.
+async fn forgot_password(
+    State(state): State<PortalRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<PortalForgotPasswordRequest>,
+) -> Result<Response, AppError> {
+    request.validate()?;
+
+    // Key the account bucket on `(tenant_slug, email)`, not the bare email:
+    // two tenants can legitimately host the same customer address and must
+    // not share one quota.
+    if let Err(retry_after) = state.forgot_password_limiter.check(
+        addr.ip(),
+        &account_key(&request.tenant_slug, &request.email),
+    ) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many password reset requests, please try again later",
+        ));
+    }
+
+    state
+        .service
+        .request_password_reset(&request.tenant_slug, &request.email)
+        .await?;
+    Ok(StatusCode::OK.into_response())
+}
+
+/// PMS-820: redeem a portal reset token and set the contact's password.
+/// Same status contract as `setup_password` (204 / 410 on replay / 400 on
+/// an expired, unknown or malformed token) because it is the same
+/// contact-bound single-use token.
+async fn reset_password(
+    State(state): State<PortalRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<PortalResetPasswordRequest>,
+) -> Result<Response, AppError> {
+    request.validate()?;
+
+    // The body carries no email, so the account bucket keys on the contact
+    // the token names. A malformed token has no contact to key on and rides
+    // the per-IP bucket alone.
+    let account = token_contact_id(&request.token)
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    if let Err(retry_after) = state.reset_password_limiter.check(addr.ip(), &account) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many password reset attempts, please try again later",
+        ));
+    }
+
+    state
+        .service
+        .reset_password(&request.token, &request.password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Normalised `(tenant_slug, email)` rate-limit bucket key. A NUL byte
+/// separates the halves so `("ab", "c")` and `("a", "bc")` never collide;
+/// `AuthRateLimiter` trims and lowercases what it is handed.
+fn account_key(tenant_slug: &str, email: &str) -> String {
+    format!("{}\u{0}{}", tenant_slug.trim(), email.trim())
 }
 
 async fn list_invoices(
