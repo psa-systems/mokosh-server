@@ -13,12 +13,18 @@
 # single source of truth and this check fails the build when the workflow drifts
 # from it. It also exercises the resolver itself, since every publish decision
 # is made there.
+#
+# A fourth place has to agree since PMS-825: check.yml's push filter. An
+# allow-listed branch is long-lived and has no pull request into main, so
+# without that entry its commits publish an image that never ran fmt, clippy or
+# the tests.
 
 use ../oci-build/get-tags.nu
 use ../oci-build/get-tags.nu BRANCH_ALLOW_LIST
 
 const WORKFLOW = ".forgejo/workflows/build-oci-image.yml"
 const JOB = "build-and-push"
+const CHECK_WORKFLOW = ".forgejo/workflows/check.yml"
 
 # The `:latest` half of the ref guard, byte for byte. This issue adds a publish
 # path; it does not relax the existing one, so the original expression must
@@ -49,6 +55,24 @@ def check-workflow [] {
     )
     if $guard_branches != $allowed {
         $errors = ($errors | append $"($WORKFLOW): the ($JOB) ref guard admits branches ($guard_branches | str join ', '); the allow-list says ($allowed | str join ', ')")
+    }
+
+    $errors
+}
+
+# PMS-825: every commit that can publish an image has had the check suite run
+# against it. Containment, not equality: check.yml running on an extra branch
+# costs a CI minute, while a publishing branch missing from it ships unchecked.
+def check-gate [] {
+    let branches = (open $CHECK_WORKFLOW | get on.push.branches)
+    mut errors = []
+
+    if "main" not-in $branches {
+        $errors = ($errors | append $"($CHECK_WORKFLOW): push trigger must include `main`, found ($branches | str join ', ')")
+    }
+    let missing = ($BRANCH_ALLOW_LIST | where {|b| $b not-in $branches })
+    if ($missing | is-not-empty) {
+        $errors = ($errors | append $"($CHECK_WORKFLOW): publishing branches ($missing | str join ', ') are missing from the push trigger, so their commits publish an image the check suite never ran on")
     }
 
     $errors
@@ -109,7 +133,7 @@ def check-resolver [] {
 }
 
 def main [] {
-    let errors = ((check-workflow) ++ (check-resolver))
+    let errors = ((check-workflow) ++ (check-gate) ++ (check-resolver))
 
     if ($errors | is-empty) {
         let allowed = if ($BRANCH_ALLOW_LIST | is-empty) {
@@ -121,6 +145,7 @@ def main [] {
     } else {
         print --stderr "ERROR: OCI publish-tag rule violated (PMS-733)."
         print --stderr "`:latest` publishes from main only, and a branch publishes only if oci-build/get-tags.nu allow-lists it."
+        print --stderr "An allow-listed branch must also run the check gate (PMS-825), or it publishes an unchecked image."
         for e in $errors { print --stderr $"  ($e)" }
         exit 1
     }
