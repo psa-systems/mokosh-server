@@ -15,37 +15,17 @@ edition = "2021"
 license = "Proprietary"
 authors = ["Mokosh Server Team"]
 
+# Only crates a member actually inherits with `{ workspace = true }` belong here
+# (PMS-785): an entry nobody inherits pins a version and a feature set the build
+# never uses. `scripts/check-workspace-deps.nu` fails the build if that drifts.
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "2"
 async-trait = "0.1"
-tracing = "0.1"
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "ipnetwork"] }
-axum = { version = "0.8", features = ["macros"] }
-axum-extra = { version = "0.10", features = ["cookie", "cookie-private", "typed-header"] }
-tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-tokio = { version = "1", features = ["full"] }
-jsonwebtoken = "9"
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
-argon2 = "0.5"
-aes-gcm = "0.10"
-sha2 = "0.10"
-rand = "0.9"
-rand_core = "0.6"
-base64 = "0.22"
-url = { version = "2", features = ["serde"] }
-governor = "0.8"
-moka = { version = "0.12", features = ["future"] }
-zeroize = { version = "1", features = ["derive"] }
 secrecy = { version = "0.10", features = ["serde"] }
-constant_time_eq = "0.3"
-anyhow = "1"
 ipnetwork = "0.20"
-bytes = "1"
 # `pool` is NOT a lettre default; opt in so LettreMailer reuses TCP
 # connections across sends. `native-tls` over rustls because some SMTP
 # relays' cert chains historically failed verification under rustls.
@@ -96,14 +76,14 @@ tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = "0.1"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # UUID
-uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
+uuid = { workspace = true }
 
 # Date/Time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true }
 # IANA timezone database for chrono (business-hours-aware SLA clock,
 # PMS-106). 0.9 tracks chrono 0.4.
 chrono-tz = "0.9"

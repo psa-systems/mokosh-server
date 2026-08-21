@@ -46,7 +46,7 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
@@ -87,6 +87,13 @@ check-oci-cache:
 [group: 'check']
 check-oci-publish-tags:
     nu scripts/check-oci-publish-tags.nu
+
+# Keep [workspace.dependencies] describing what the workspace shares (PMS-785).
+# Fails if an entry is inherited by no member, or if a member re-pins a crate
+# the workspace table already pins.
+[group: 'check']
+check-workspace-deps:
+    nu scripts/check-workspace-deps.nu
 
 # Check compilation
 [group: 'check']
