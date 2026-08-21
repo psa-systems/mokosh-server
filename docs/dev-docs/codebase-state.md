@@ -297,6 +297,30 @@ page, pinned by
 Portal scoping is deliberately NOT broadened: a portal session still
 resolves the contact's primary company only (PMS-807).
 
+**Deleting a company unlinks its contacts (PMS-812).**
+`contacts.company_id` is `ON DELETE SET NULL`
+([`110_contacts_company_id_set_null.sql`](../migrations/110_contacts_company_id_set_null.sql)),
+not the `ON DELETE CASCADE` it was created with in 004. `delete_company`
+is the primary path: inside the same transaction as the company DELETE it
+removes that company's `contact_companies` rows, promotes the oldest
+remaining link on any contact that just lost its primary (the same rule
+`write_contact_companies` applies), and recomputes the mirrors. The FK
+action is the backstop for a direct SQL delete or a mirror that outlives
+its link row.
+
+A **company-less contact** - `company_id` NULL with no `contact_companies`
+rows - is a first-class state, valid since PMS-402 (which made the column
+nullable for the freeform `company_name` case). It reads back normally
+from `GET /contacts/contacts/{id}` and stays in the contacts list; it just
+appears under no company, so `GET /companies/{id}/contacts`, the
+`company_id` list filter and `contact_count` never surface it. Every read
+of `contacts.company_id` must therefore decode it as `Option<Uuid>`:
+`PortalService::login` rejects a company-less contact with a logged 401
+(there is nothing to scope a portal session to, since every portal read
+takes `CurrentContact.company_id`), and email-intake's
+`resolve_or_create_contact` falls back to the tenant's
+`email_intake/default_company_id` setting.
+
 **Defect: `update_site` is a silent no-op.**
 [`routes.rs:273-288`](../src/modules/contacts/routes.rs#L273) accepts
 the request body, validates it, then calls `get_site` and returns

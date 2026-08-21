@@ -873,3 +873,45 @@ async fn seed_ticket_for_company(
     .expect("seed ticket");
     id
 }
+
+/// PMS-812: deleting a company unlinks its contacts instead of deleting them,
+/// so a portal contact can end up with `company_id IS NULL`. Every portal read
+/// is company-scoped, so there is no session to issue - but the rejection has
+/// to be an explicit 401, not the 500 the old non-null `Uuid` decode produced.
+#[sqlx::test]
+async fn portal_login_rejects_a_contact_whose_company_was_deleted(pool: PgPool) {
+    let company = seed_company(&pool, "Doomed Co").await;
+    let contact = seed_portal_contact(&pool, company, "orphan@doomed.example").await;
+
+    sqlx::query("DELETE FROM companies WHERE id = $1")
+        .bind(company)
+        .execute(&pool)
+        .await
+        .expect("delete the contact's only company");
+
+    // The contact survives the delete with a NULL company_id (migration 110's
+    // ON DELETE SET NULL). Under the old CASCADE the row was gone, and the 401
+    // below would have proved nothing.
+    let company_id: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT company_id FROM contacts WHERE id = $1")
+            .bind(contact)
+            .fetch_optional(&pool)
+            .await
+            .expect("read the contact back");
+    assert_eq!(
+        company_id,
+        Some(None),
+        "the portal contact survives with no company"
+    );
+
+    let app = common::boot(pool).await;
+    let resp = portal_login(&app, "orphan@doomed.example", PORTAL_PASSWORD).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a company-less portal contact is rejected explicitly, not with a decode 500 \
+         (body: {body})"
+    );
+}

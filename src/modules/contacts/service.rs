@@ -777,6 +777,54 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // PMS-812: unlink this company's contacts, never delete them. Runs
+        // BEFORE the company DELETE so `recompute_contact_mirrors` - the single
+        // writer of `contacts.company_id` (PMS-806) - leaves no mirror pointing
+        // at the row that is about to go. The `ON DELETE SET NULL` action added
+        // in migration 110 is only the backstop for a direct SQL delete.
+        let unlinked: Vec<Uuid> = sqlx::query_scalar(
+            "DELETE FROM contact_companies WHERE tenant_id = $1 AND company_id = $2 \
+             RETURNING contact_id",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !unlinked.is_empty() {
+            // Same promotion rule as `write_contact_companies`: a contact that
+            // just lost its primary gets its OLDEST remaining link, ordered by
+            // `(created_at, sort_order, id)` (PMS-815). `DISTINCT ON` picks one
+            // row per contact and the `NOT EXISTS` skips contacts that still
+            // have a primary, so the partial unique index cannot collide.
+            sqlx::query(
+                r#"
+                UPDATE contact_companies l
+                SET is_primary = TRUE, updated_at = NOW()
+                FROM (
+                    SELECT DISTINCT ON (contact_id) id, contact_id
+                    FROM contact_companies
+                    WHERE tenant_id = $1 AND contact_id = ANY($2)
+                    ORDER BY contact_id, created_at, sort_order, id
+                ) oldest
+                WHERE l.id = oldest.id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM contact_companies p
+                      WHERE p.contact_id = oldest.contact_id AND p.is_primary
+                  )
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(&unlinked)
+            .execute(&mut *tx)
+            .await?;
+
+            for contact_id in &unlinked {
+                self.recompute_contact_mirrors(&mut tx, tenant_id, *contact_id)
+                    .await?;
+            }
+        }
+
         // The explicit ticket guard above only covers one of the many tables
         // that foreign-key `companies` (contracts, invoices, payments,
         // projects, assets, time entries, appointments, sub-companies, ...).

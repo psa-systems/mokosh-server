@@ -41,10 +41,14 @@ impl PortalAuthService {
     #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip_all)]
     pub async fn login(&self, request: &PortalLoginRequest) -> AppResult<PortalLoginResponse> {
+        // `c.company_id` is `Option<Uuid>`: PMS-402 made it nullable and PMS-812
+        // makes deleting a company null it out rather than delete the contact.
+        // Decoding it as a bare `Uuid` turned that row into a decode error, so a
+        // customer whose company was deleted got a 500 from the login endpoint.
         let row: Option<(
             Uuid,
             Uuid,
-            Uuid,
+            Option<Uuid>,
             String,
             String,
             String,
@@ -113,6 +117,22 @@ impl PortalAuthService {
             self.register_failed_login(id).await?;
             return Err(AppError::Unauthorized);
         }
+
+        // PMS-812: every portal read is scoped by `CurrentContact.company_id`
+        // (tickets, invoices, quotes, KB articles), so a contact with no company
+        // has nothing to scope a session to. Reject explicitly, and log it: the
+        // password was correct, so this is a real customer locked out by an
+        // agent deleting their company, and a bare 401 gives the operator no way
+        // to find that out.
+        let Some(company_id) = company_id else {
+            tracing::warn!(
+                contact_id = %id,
+                tenant_id = %tenant_id,
+                "portal login rejected: contact has no company (its company was \
+                 deleted or never set); re-link the contact to a company",
+            );
+            return Err(AppError::Unauthorized);
+        };
 
         // SAFETY (PMS-285): companion write to the portal login above, same
         // separate `contacts`-identity plane with portal isolation deferred.
