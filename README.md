@@ -128,6 +128,7 @@ just check-oci-cache        # fail if the OCI build leaves the type=gha runner c
 just check-oci-publish-tags # fail if the publish tags drift from oci-build/get-tags.nu (PMS-733)
 just check-workspace-deps   # fail if [workspace.dependencies] and its members disagree (PMS-785)
 just check-unused-deps      # cargo-machete: fail on a dependency with no call site (PMS-780)
+just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836)
 
 # Format, test, build
 just fmt                    # cargo fmt --all

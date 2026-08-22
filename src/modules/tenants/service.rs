@@ -23,12 +23,22 @@ use super::models::*;
 /// `Uuid::from_u128(1)` (== `00000000-0000-0000-0000-000000000001`), the same
 /// constant `auth::bootstrap` uses. A malformed env value is a configuration
 /// error, not a panic.
+///
+/// PMS-836: an empty value reads as unset, like every other optional var here.
+/// `compose.dev.yml` enumerates the environment, so a forwarded-but-unset key
+/// arrives as `""`; without this it would fail tenant provisioning outright.
 fn seed_source_tenant_id() -> AppResult<Uuid> {
-    match std::env::var("MOKOSH_SEED_TENANT_ID") {
-        Ok(raw) => Uuid::parse_str(raw.trim()).map_err(|e| {
+    parse_seed_source_tenant_id(std::env::var("MOKOSH_SEED_TENANT_ID").ok().as_deref())
+}
+
+/// The pure parse, split out so it is unit-testable without process env
+/// (same shape as `seed::service::seed_enabled_for`).
+fn parse_seed_source_tenant_id(raw: Option<&str>) -> AppResult<Uuid> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) => Uuid::parse_str(value).map_err(|e| {
             AppError::Configuration(format!("MOKOSH_SEED_TENANT_ID is not a valid UUID: {e}"))
         }),
-        Err(_) => Ok(Uuid::from_u128(1)),
+        None => Ok(Uuid::from_u128(1)),
     }
 }
 
@@ -1217,6 +1227,24 @@ impl From<TenantRow> for Tenant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PMS-836: compose.dev.yml forwards this key with an empty default, so
+    // "set but empty" has to mean the same as unset.
+    #[test]
+    fn an_empty_seed_tenant_id_falls_back_to_the_migration_seed() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_seed_source_tenant_id(raw).unwrap(),
+                Uuid::from_u128(1),
+                "{raw:?} must read as unset"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_seed_tenant_id_is_a_configuration_error() {
+        assert!(parse_seed_source_tenant_id(Some("not-a-uuid")).is_err());
+    }
 
     #[test]
     fn a_real_given_name_wins() {
