@@ -31,7 +31,7 @@ fn services(
 ) {
     let db = Database::from_pool(pool.clone());
     (
-        Arc::new(AuthService::new(db.clone(), "test-secret".into(), vec![])),
+        Arc::new(AuthService::new(db.clone(), "test-secret".into())),
         Arc::new(TenantService::new(db.clone())),
         Arc::new(InvitationsService::new(db)),
     )

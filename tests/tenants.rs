@@ -40,11 +40,7 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
         .await
         .expect("provision target tenant");
 
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
 
     // First org-claimed login: the user moves out of the default tenant.
     let moved = auth

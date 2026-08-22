@@ -271,22 +271,12 @@ services:
       OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
       OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
 
-      # Google OAuth login. Consumed by the google-oauth-flow workspace
-      # crate (Config::from_env()). The two secrets are required; the
-      # redirect URI defaults to the dev localhost callback.
-      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:?GOOGLE_OAUTH_CLIENT_ID missing - paste the dev OAuth client id into .env}
-      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:?GOOGLE_OAUTH_CLIENT_SECRET missing - paste the dev OAuth client secret into .env}
-      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:4301/api/v1/auth/google/callback}
-
-      # The exact origin the callback HTML postMessages tokens to.
-      # Must equal the browser-visible client origin byte-for-byte.
+      # Browser-visible origin of the client that talks to this API. Must
+      # equal it byte-for-byte: it is the CORS_ORIGIN default and the base
+      # for emailed reset/invite links. PMS-837 removed the Google OAuth
+      # client id/secret/redirect keys and the super-admin email allowlist
+      # along with the Google sign-in routes.
       CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:4301}
-
-      # Comma-separated, lowercased exact-email allowlist. A first-time
-      # Google sign-in whose email exactly matches an entry is
-      # auto-provisioned as role 'super_admin'; others are rejected.
-      # Existing users are never re-roled. Empty by default (fail-closed).
-      OAUTH_SUPER_ADMIN_EMAILS: ${OAUTH_SUPER_ADMIN_EMAILS:-}
 
       # First-run admin bootstrap (DEV ONLY). Ignored once any user exists.
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}

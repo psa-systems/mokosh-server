@@ -844,7 +844,6 @@ fn auth_service(pool: &PgPool) -> Arc<AuthService> {
     Arc::new(AuthService::new(
         Database::from_pool(pool.clone()),
         "test-secret".into(),
-        vec![],
     ))
 }
 
@@ -1534,11 +1533,7 @@ async fn get_user_sessions_is_tenant_scoped(pool: PgPool) {
         insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
     let _session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
 
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let (sessions, total) = auth
         .get_user_sessions(
             common::DEFAULT_TENANT_ID,
@@ -1569,11 +1564,7 @@ async fn logout_all_is_tenant_scoped(pool: PgPool) {
     insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
     let session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
 
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     auth.logout_all(common::DEFAULT_TENANT_ID, user_id)
         .await
         .expect("logout_all");

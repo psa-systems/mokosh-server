@@ -2,23 +2,21 @@
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
-use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    google_login, rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest,
-    CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest,
-    ListUsersFilter, LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest,
-    MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse,
-    ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
+    rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest, CreateApiKeyRequest,
+    CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest, ListUsersFilter, LoginRequest,
+    MfaDisableRequest, MfaEnableRequest, MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest,
+    RefreshTokenResponse, ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::{RequireAuth, RequireManager};
 use crate::utils::error::{rate_limited_response, AppError, AppResult};
@@ -28,16 +26,6 @@ use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 #[derive(Clone)]
 pub struct AuthRouterState {
     pub auth_service: Arc<AuthService>,
-    pub google_oauth: Arc<google_oauth_flow::Client>,
-    /// Origin where the SPA is served. Used as the `postMessage` target
-    /// origin in the popup-closing HTML.
-    pub client_origin: String,
-    /// JWT secret used to HMAC-sign the OAuth state cookie. Same key as
-    /// the access/refresh token signer.
-    pub jwt_secret: String,
-    /// Whether to set the `Secure` flag on the OAuth state cookie.
-    /// `false` over plain HTTP localhost in dev; `true` in prod.
-    pub cookie_secure: bool,
     /// Layered (per-IP + per-email) login rate limiter (PMS-4 AC2 / F2).
     /// Lives for the lifetime of the router so quota state survives
     /// across requests. The check happens inline at the top of the
@@ -53,19 +41,9 @@ pub struct AuthRouterState {
 }
 
 /// Create the auth router
-pub fn auth_routes(
-    auth_service: AuthService,
-    google_oauth: Arc<google_oauth_flow::Client>,
-    client_origin: String,
-    jwt_secret: String,
-    cookie_secure: bool,
-) -> Router {
+pub fn auth_routes(auth_service: AuthService) -> Router {
     let state = AuthRouterState {
         auth_service: Arc::new(auth_service),
-        google_oauth,
-        client_origin,
-        jwt_secret,
-        cookie_secure,
         // Login: 20/min per IP (NAT'd offices), 5/min per email (account cap).
         login_limiter: rate_limit::AuthRateLimiter::new(20, 5),
         // Forgot-password: rarer than login, so tighter. 10/min per IP,
@@ -83,9 +61,8 @@ pub fn auth_routes(
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
         .route("/reset-password", post(reset_password))
-        // Google OAuth
-        .route("/google", get(google_authorize))
-        .route("/google/callback", get(google_callback))
+        // PMS-837: no `/google` mounts. The popup sign-in flow was retired as
+        // unconsumed; see the module doc in `mod.rs`.
         // Protected routes
         .route("/me", get(get_current_user))
         .route("/me", put(update_current_user))
@@ -608,134 +585,45 @@ async fn update_user(
     Ok(Json(updated.into()))
 }
 
-// ---------------------------------------------------------------------------
-// Google OAuth handlers
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use axum::body::Body;
+    use sqlx::postgres::PgPool;
+    use tower::ServiceExt;
 
-#[derive(Debug, Deserialize)]
-struct GoogleCallbackQuery {
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
-}
+    /// PMS-837: the Google OAuth popup surface was retired as unconsumed. This
+    /// is the mechanical guard: re-mounting either route turns these 404s into
+    /// 200/500 and fails here, so the surface cannot come back unnoticed.
+    ///
+    /// Routing a miss never touches the database, so the lazy pool is never
+    /// connected.
+    #[tokio::test]
+    async fn google_oauth_routes_stay_unmounted() {
+        let pool = PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool builds without connecting");
+        let router = auth_routes(AuthService::new(
+            Database::from_pool(pool),
+            "test-secret".to_string(),
+        ));
 
-/// Step 1 of the OAuth flow: redirect the browser to Google's consent
-/// page. Sets a short-lived signed cookie carrying the CSRF state and
-/// PKCE verifier so the callback can verify them.
-async fn google_authorize(State(state): State<AuthRouterState>) -> Result<Response, AppError> {
-    let (url, auth_state) = state
-        .google_oauth
-        .build_authorize_url()
-        .map_err(|e| AppError::internal(format!("OAuth setup failed: {e}")))?;
-
-    let cookie = google_login::encode_state_cookie(
-        &auth_state,
-        state.jwt_secret.as_bytes(),
-        state.cookie_secure,
-    )
-    .map_err(|e| AppError::internal(format!("OAuth state cookie failed: {e}")))?;
-
-    let cookie_value = HeaderValue::from_str(&cookie)
-        .map_err(|e| AppError::internal(format!("invalid cookie header: {e}")))?;
-
-    let mut response = Redirect::to(url.as_str()).into_response();
-    response.headers_mut().append(SET_COOKIE, cookie_value);
-    Ok(response)
-}
-
-/// Step 2: Google redirects the browser back here with `?code&state`.
-/// Verify the state cookie, exchange the code for userinfo, find or
-/// auto-provision the user, then return an HTML page that posts the
-/// JWT response to `window.opener` and closes itself.
-async fn google_callback(
-    State(state): State<AuthRouterState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(query): Query<GoogleCallbackQuery>,
-) -> Response {
-    let outcome = run_google_callback(&state, &addr, &headers, &query).await;
-    let (payload, set_cookies): (serde_json::Value, Vec<String>) = match outcome {
-        Ok(login_response) => (
-            serde_json::json!({ "ok": true, "data": login_response }),
-            vec![google_login::clear_state_cookie()],
-        ),
-        Err(message) => (
-            serde_json::json!({ "ok": false, "error": message }),
-            vec![google_login::clear_state_cookie()],
-        ),
-    };
-
-    let mut response = google_login::callback_response(&payload, &state.client_origin);
-    for cookie in set_cookies {
-        if let Ok(v) = HeaderValue::from_str(&cookie) {
-            response.headers_mut().append(SET_COOKIE, v);
+        for uri in ["/google", "/google/callback"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must stay unmounted (PMS-837)"
+            );
         }
     }
-    response
-}
-
-/// Inner helper for `google_callback` that returns a flat `Result` so
-/// errors can be turned into the popup-closing HTML payload uniformly.
-async fn run_google_callback(
-    state: &AuthRouterState,
-    addr: &SocketAddr,
-    headers: &HeaderMap,
-    query: &GoogleCallbackQuery,
-) -> Result<LoginResponse, String> {
-    if let Some(err) = &query.error {
-        let detail = query
-            .error_description
-            .clone()
-            .unwrap_or_else(|| err.clone());
-        return Err(format!("Google rejected the sign-in: {detail}"));
-    }
-
-    let code = query
-        .code
-        .as_deref()
-        .ok_or_else(|| "missing `code` in callback".to_string())?;
-    let received_state = query
-        .state
-        .as_deref()
-        .ok_or_else(|| "missing `state` in callback".to_string())?;
-
-    let cookie_header = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| "missing state cookie".to_string())?;
-    let cookie_value = google_login::read_state_cookie(cookie_header)
-        .ok_or_else(|| "missing state cookie".to_string())?;
-    let auth_state = google_login::decode_state_cookie(&cookie_value, state.jwt_secret.as_bytes())
-        .map_err(|e| format!("invalid state cookie: {e}"))?;
-
-    if auth_state.csrf_token != received_state {
-        return Err("state mismatch (possible CSRF)".to_string());
-    }
-
-    let userinfo = state
-        .google_oauth
-        .exchange_code(code, &auth_state.pkce_verifier)
-        .await
-        .map_err(|e| format!("Google token exchange failed: {e}"))?;
-
-    // PMS-587: real client IP from the forwarded header behind Traefik.
-    let ip = Some(
-        crate::utils::client_ip::extract_client_ip(
-            addr.ip(),
-            headers,
-            crate::utils::client_ip::trusted_proxies(),
-        )
-        .to_string(),
-    );
-    let user_agent = headers
-        .get("User-Agent")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    state
-        .auth_service
-        .login_with_google(userinfo, ip, user_agent)
-        .await
-        .map_err(|e| e.to_string())
 }

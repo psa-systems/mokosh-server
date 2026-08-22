@@ -18,18 +18,16 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 # real sources below.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/build-metadata/Cargo.toml ./crates/build-metadata/
-COPY crates/google-oauth-flow/Cargo.toml ./crates/google-oauth-flow/
 COPY crates/mokosh-types/Cargo.toml ./crates/mokosh-types/
-RUN mkdir -p src/bin crates/build-metadata/src crates/google-oauth-flow/src crates/mokosh-types/src \
+RUN mkdir -p src/bin crates/build-metadata/src crates/mokosh-types/src \
     && echo 'fn main() {}' > build.rs \
     && echo 'fn main() {}' > src/main.rs \
     && echo 'fn main() {}' > src/bin/mokosh-bootstrap.rs \
     && touch src/lib.rs \
              crates/build-metadata/src/lib.rs \
-             crates/google-oauth-flow/src/lib.rs \
              crates/mokosh-types/src/lib.rs
 
-# `cargo clean` drops the four stub-built workspace crates and keeps every
+# `cargo clean` drops the three stub-built workspace crates and keeps every
 # dependency artifact. It is deterministic where relying on mtimes is not: COPY
 # preserves the build context's timestamps, which are older than this layer, so
 # without the clean cargo would call the stubs fresh and the image would ship a
@@ -38,7 +36,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bins \
     && cargo clean --release --package mokosh-server \
                              --package mokosh-types \
-                             --package google-oauth-flow \
                              --package build-metadata
 
 # Build-time version metadata. The `.git` directory is intentionally not

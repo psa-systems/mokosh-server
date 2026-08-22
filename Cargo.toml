@@ -2,11 +2,9 @@
 resolver = "2"
 members = [
     ".",
-    # main added this crate for the Google OAuth popup flow.
-    "crates/google-oauth-flow",
     # Shared DTOs between mokosh-server and mokosh-clients (PMS-129).
     "crates/mokosh-types",
-    # Shared build-script logic for the root build.rs and google-oauth-flow (PMS-198).
+    # Shared build-script logic for the root build.rs (PMS-198).
     "crates/build-metadata",
 ]
 
@@ -162,12 +160,6 @@ rrule = "0.14"
 
 # URL
 url = "2"
-
-# Cookies (for the Google OAuth state cookie)
-cookie = "0.18"
-
-# Reusable Google OAuth helper (workspace member)
-google-oauth-flow = { path = "crates/google-oauth-flow" }
 
 # Shared DTOs (workspace member). The `models.rs` for each shared
 # module (auth, contacts, tenants, tickets, time_tracking) re-exports

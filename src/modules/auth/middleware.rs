@@ -1073,8 +1073,8 @@ async fn place_bunyip_caller(
         None => match auth_service.get_user_by_id(target, sub).await {
             Ok(user) => user,
             Err(_) => {
-                // Persist the IdP-supplied email on the JIT insert ONLY when the
-                // IdP reports it verified, matching the Google path.
+                // Persist the IdP-supplied email on the JIT insert ONLY when
+                // the IdP reports it verified.
                 // `upsert_user_from_oidc` (MAPPS-335) now binds
                 // `email_verified_at` to the actual `email_verified` flag, so
                 // an unverified address lands with NULL instead of NOW();

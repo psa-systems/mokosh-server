@@ -14,6 +14,10 @@ handling, and admin/entitlement (role) assignment.
   `bunyip_webhook.rs` (292), `google_login.rs` (141), `rate_limit.rs` (77),
   plus `src/utils/totp.rs` (222), `src/utils/recovery.rs` (86), and the role
   model in `crates/mokosh-types/src/auth.rs`.
+- Since this audit ran, PMS-837 deleted `google_login.rs` and the two
+  `/api/v1/auth/google*` routes entirely (unconsumed surface). F2 below is
+  therefore historical: the file it hardened no longer exists. Everything else
+  in this report still refers to live code.
 
 ## Overall posture
 

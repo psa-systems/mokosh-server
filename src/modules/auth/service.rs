@@ -48,11 +48,6 @@ pub struct AuthService {
     jwt_secret: String,
     access_token_ttl: Duration,
     refresh_token_ttl: Duration,
-    /// Lowercased exact email addresses allowed to auto-provision a
-    /// super_admin account on first Google sign-in. Any other unrecognized
-    /// Google identity is rejected (fail-closed) rather than auto-created in
-    /// the default tenant. Existing users are never re-roled.
-    super_admin_emails: Vec<String>,
     /// Outbound transactional email. Defaults to `LogMailer` so unit
     /// constructions that do not need real SMTP keep working. Kept as
     /// a fallback for builds that do not wire a `NotificationsService`
@@ -93,11 +88,10 @@ struct LoginAssessment {
 #[cfg(feature = "server")]
 impl AuthService {
     /// Create a new auth service.
-    pub fn new(db: Database, jwt_secret: String, super_admin_emails: Vec<String>) -> Self {
+    pub fn new(db: Database, jwt_secret: String) -> Self {
         Self::with_mailer(
             db,
             jwt_secret,
-            super_admin_emails,
             Arc::new(LogMailer),
             "http://localhost:4301".to_string(),
         )
@@ -116,7 +110,6 @@ impl AuthService {
     pub fn with_mailer(
         db: Database,
         jwt_secret: String,
-        super_admin_emails: Vec<String>,
         mailer: Arc<dyn Mailer>,
         frontend_base_url: String,
     ) -> Self {
@@ -125,7 +118,6 @@ impl AuthService {
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
-            super_admin_emails,
             mailer,
             notifications: None,
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
@@ -145,7 +137,6 @@ impl AuthService {
     pub fn with_dispatcher(
         db: Database,
         jwt_secret: String,
-        super_admin_emails: Vec<String>,
         mailer: Arc<dyn Mailer>,
         frontend_base_url: String,
         notifications: NotificationsService,
@@ -155,7 +146,6 @@ impl AuthService {
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
-            super_admin_emails,
             mailer,
             notifications: Some(notifications),
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
@@ -830,7 +820,7 @@ impl AuthService {
 
     /// Reject access when the owning tenant is not active (suspended or
     /// cancelled). Threaded into every session-minting path (password login,
-    /// Google login, refresh) so a tenant suspension takes effect immediately
+    /// refresh) so a tenant suspension takes effect immediately
     /// instead of lingering until token expiry.
     /// MAPPS-337: cheap public guard the auth middleware can run after
     /// decoding a legacy HS256 access token. Loads the user, asserts
@@ -895,247 +885,6 @@ impl AuthService {
                 "This organization is not active".to_string(),
             )),
         }
-    }
-
-    /// Authenticate (or auto-provision) a user from a Google OAuth
-    /// userinfo response. The caller is responsible for verifying the
-    /// CSRF state and exchanging the authorization code via the
-    /// `google-oauth-flow` crate before calling this.
-    #[tracing::instrument(skip_all)]
-    pub async fn login_with_google(
-        &self,
-        google: google_oauth_flow::GoogleUserInfo,
-        ip_address: Option<String>,
-        user_agent: Option<String>,
-    ) -> AppResult<LoginResponse> {
-        // Reject if Google did not confirm the email is verified.
-        if google.email_verified != Some(true) {
-            return Err(AppError::Forbidden(
-                "Google did not report this email as verified".to_string(),
-            ));
-        }
-
-        // 1. Look up an existing identity by (provider, subject).
-        // SAFETY (PMS-258/PMS-285): this is a pre-auth, cross-tenant lookup - it
-        // runs before the user is placed in a tenant, so it cannot set
-        // `app.current_tenant`. user_oauth_identities now has FORCE RLS, so once
-        // the app connection moves to a NOBYPASSRLS role (PMS-285) this query and
-        // the last_used_at UPDATE below must run on the privileged (BYPASSRLS)
-        // pool. The tenant-scoped unique key keeps it to at most one row per
-        // tenant; a single human maps to one personal tenant, so it stays unique
-        // in practice.
-        let linked_user_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT user_id FROM user_oauth_identities \
-             WHERE provider = 'google' AND subject = $1",
-        )
-        .bind(&google.sub)
-        .fetch_optional(self.db.migrator_pool())
-        .await?;
-
-        let user = if let Some(user_id) = linked_user_id {
-            sqlx::query(
-                "UPDATE user_oauth_identities SET last_used_at = NOW() \
-                 WHERE provider = 'google' AND subject = $1",
-            )
-            .bind(&google.sub)
-            .execute(self.db.migrator_pool())
-            .await?;
-            // Resolve the tenant from the linked row so the scoped
-            // get_user_by_id lookup has the boundary it needs. The
-            // OAuth callback path is the only place where we hold a
-            // user_id without already knowing the tenant.
-            // SAFETY (PMS-285): still pre-auth - this resolves which tenant the
-            // Google-linked user lives in before any session/GUC exists. Reads
-            // RLS-covered `users` by id on the migrator pool; the subsequent
-            // `get_user_by_id` re-reads under that tenant's GUC.
-            let tenant_id: Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
-                .bind(user_id)
-                .fetch_optional(self.db.migrator_pool())
-                .await?
-                .ok_or_else(|| AppError::NotFound("User".to_string()))?;
-            self.get_user_by_id(tenant_id, user_id).await?
-        } else {
-            // 2. No identity row yet - find or create the user by email.
-            // PMS-138: Google OAuth callback carries no SPA-provided
-            // tenant hint (the OAuth state cookie does not encode one),
-            // so the JIT-link lookup falls back to the default tenant.
-            // Multi-tenant Google login is a separate story; it would
-            // require baking tenant_id into the OAuth state at popup
-            // open time and verifying it in the callback.
-            let google_jit_tenant_id = Self::resolve_tenant_for_login(None);
-            match self
-                .find_user_by_email_for_tenant_optional(google_jit_tenant_id, &google.email)
-                .await?
-            {
-                Some(existing) => {
-                    // Only auto-link to an existing local account whose own
-                    // email is verified. Otherwise someone who registered a
-                    // password account under another person's email could
-                    // capture that person's Google sign-in.
-                    if existing.email_verified_at.is_none() {
-                        return Err(AppError::Forbidden(
-                            "An account with this email exists but is not verified. Sign in with your password first to link Google.".to_string(),
-                        ));
-                    }
-                    // Link new identity to existing user; do NOT change role.
-                    // Runs inside the existing user's tenant so the row carries
-                    // the tenant scope (PMS-258) and satisfies the WITH CHECK
-                    // policy even under a NOBYPASSRLS connection.
-                    let mut tx = self.db.begin_with_tenant(existing.tenant_id).await?;
-                    sqlx::query(
-                        "INSERT INTO user_oauth_identities \
-                         (user_id, tenant_id, provider, subject, email) \
-                         VALUES ($1, $2, 'google', $3, $4)",
-                    )
-                    .bind(existing.id)
-                    .bind(existing.tenant_id)
-                    .bind(&google.sub)
-                    .bind(&google.email)
-                    .execute(&mut *tx)
-                    .await?;
-                    tx.commit().await?;
-                    existing
-                }
-                None => self.provision_user_from_google(&google).await?,
-            }
-        };
-
-        // 3. Reject inactive users and suspended/cancelled tenants.
-        if user.status != UserStatus::Active {
-            return Err(AppError::Forbidden("Account is not active".to_string()));
-        }
-        self.ensure_tenant_active(user.tenant_id).await?;
-
-        // 3b. Enforce MFA exactly like the password `login()` path. A
-        // verified Google identity is NOT a substitute for the user's
-        // locally-enabled second factor; minting tokens here without it
-        // would silently bypass MFA for any account that links Google.
-        // The Google callback carries no MFA code, so signal
-        // `mfa_required` (with empty tokens) and let the SPA complete the
-        // second factor, mirroring `login()`'s no-code branch.
-        if user.mfa_enabled {
-            return Ok(LoginResponse {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expires_at: Utc::now(),
-                // Omit the user profile until the second factor is satisfied,
-                // mirroring the password `login()` mfa_required branch.
-                user: None,
-                mfa_required: true,
-                approval_required: false,
-            });
-        }
-
-        // 4. Issue session + tokens identically to the password flow.
-        // PMS-657: keep the client IP + UA for the login-location check below,
-        // since create_session consumes the owned values.
-        let loc_ip = ip_address.clone();
-        let loc_ua = user_agent.clone();
-        let session_id = self
-            .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
-            .await?;
-        let (access_token, refresh_token, expires_at) = self.generate_tokens(&user, session_id)?;
-        self.update_last_login(user.tenant_id, user.id).await?;
-        self.check_login_location(&user, loc_ip.as_deref(), loc_ua.as_deref())
-            .await;
-
-        Ok(LoginResponse {
-            access_token,
-            refresh_token,
-            expires_at,
-            user: Some(user.to_current_user()),
-            mfa_required: false,
-            approval_required: false,
-        })
-    }
-
-    /// Auto-provision a user from a verified Google identity. FAIL-CLOSED:
-    /// only exact emails in `self.super_admin_emails` may auto-provision (as
-    /// super_admin, to bootstrap administrators). Any other unrecognized
-    /// Google identity is rejected - real users must be invited rather than
-    /// silently dropped into the default tenant.
-    async fn provision_user_from_google(
-        &self,
-        google: &google_oauth_flow::GoogleUserInfo,
-    ) -> AppResult<User> {
-        if !is_allowlisted_email(&self.super_admin_emails, &google.email) {
-            return Err(AppError::Forbidden(
-                "No account is provisioned for this Google identity. Ask an administrator for an invite.".to_string(),
-            ));
-        }
-        let role = "super_admin";
-
-        let user_id = Uuid::new_v4();
-        // Bootstrap super-admins land in the default tenant seeded by
-        // migrations/002_seed_data.sql. Everyone else is invited into a
-        // specific tenant via the invite flow, not this path.
-        let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001")
-            .expect("default tenant UUID is valid");
-
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO users (
-                id, tenant_id, email, password_hash, first_name, last_name,
-                role, status, email_verified_at
-            )
-            VALUES ($1, $2, $3, NULL, $4, $5, $6, 'active', NOW())
-            "#,
-        )
-        .bind(user_id)
-        .bind(tenant_id)
-        .bind(&google.email)
-        .bind(google.given_name.clone().unwrap_or_default())
-        .bind(google.family_name.clone().unwrap_or_default())
-        .bind(role)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO user_oauth_identities \
-             (user_id, tenant_id, provider, subject, email) \
-             VALUES ($1, $2, 'google', $3, $4)",
-        )
-        .bind(user_id)
-        .bind(tenant_id)
-        .bind(&google.sub)
-        .bind(&google.email)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-
-        self.get_user_by_id(tenant_id, user_id).await
-    }
-
-    /// Look up a user by `(tenant_id, email)`; returns `Ok(None)`
-    /// instead of `Err(Unauthorized)` when no row matches.
-    /// Tenant-bound sibling of `find_user_by_email_for_tenant` for
-    /// the Google JIT-link path. PMS-138.
-    async fn find_user_by_email_for_tenant_optional(
-        &self,
-        tenant_id: Uuid,
-        email: &str,
-    ) -> AppResult<Option<User>> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row = sqlx::query_as::<_, UserRow>(
-            r#"
-            SELECT id, tenant_id, email, password_hash, first_name, last_name,
-                   phone, mobile, title, avatar_url, timezone, locale,
-                   date_format_string, theme_base_mode, theme_accent_id, role,
-                   status, email_verified_at, last_login_at, last_login_country,
-                   login_location_alerts, mfa_enabled,
-                   mfa_secret, notification_preferences, settings,
-                   created_at, updated_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
-            FROM users
-            WHERE tenant_id = $1 AND email = $2
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(email)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(row.map(Into::into))
     }
 
     /// Refresh access token
@@ -3296,15 +3045,6 @@ fn recovery_code_hex_hash(code: &str) -> String {
     out
 }
 
-/// Case-insensitive exact-match against an email allowlist. Allowlist entries
-/// are expected already lowercased (config parsing lowercases them); the
-/// candidate is lowercased here for safety.
-#[cfg(feature = "server")]
-fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
-    let email = email.to_ascii_lowercase();
-    allowlist.iter().any(|e| e == &email)
-}
-
 /// Domain of the JIT placeholder address (`{sub}@unresolved.invalid`) stored
 /// when bunyip has not yet verified the user's email. `.invalid` is reserved by
 /// RFC 2606 and never resolves, so mail addressed to it is guaranteed to bounce.
@@ -3528,17 +3268,6 @@ mod tests {
         assert!(
             hits.is_empty(),
             "a stale-read attempt counter is back: {hits:?}"
-        );
-    }
-
-    #[test]
-    fn allowlist_matches_case_insensitively() {
-        let allow = vec!["admin@niceguyit.biz".to_string()];
-        assert!(is_allowlisted_email(&allow, "Admin@NiceGuyIT.biz"));
-        assert!(!is_allowlisted_email(&allow, "other@niceguyit.biz"));
-        assert!(
-            !is_allowlisted_email(&[], "admin@niceguyit.biz"),
-            "empty allowlist matches nothing"
         );
     }
 

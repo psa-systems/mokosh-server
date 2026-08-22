@@ -52,7 +52,6 @@ You do not hand-author any env file. `just dev` runs the `ensure-env` recipe fir
 
 Third-party credentials stay as placeholders in `.env.example` and are carried into `.env` unchanged, because they cannot be generated:
 
-- `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` ship as `dev-placeholder...` values so the server boots; `/api/v1/auth/google/*` returns 500 at request time until you paste real credentials from the Google console. Legacy email/password auth works fine without them.
 - `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET` / `INFISICAL_PROJECT_ID` are empty until the one-time Infisical bootstrap (step 5) fills them in `.env`.
 
 You do not need to touch anything before booting: `just dev` in step 4 generates a working `.env` on its own.
@@ -167,9 +166,6 @@ just dev --detach
 
 **Port collisions on shared hosts**
 Defaults: API `4302`, Postgres `5433`, Infisical UI `28002`, Mailpit UI `8025`, SMTP `1025`. Change `MOKOSH_PORT` / `MOKOSH_PG_HOST_PORT` in `.env` after `just dev` generates it (Infisical/Mailpit ports are pinned in `compose.dev.yml`).
-
-**`Failed to read GOOGLE_OAUTH_* env`**
-Server panics at startup if the three `GOOGLE_OAUTH_*` vars are empty. Placeholder strings are fine for dev; only real Google credentials make the OAuth routes functional.
 
 **Server compile takes forever**
 First build hits every crate in the workspace cold. Watch `docker logs --follow dev-mokosh-server-long`. Subsequent boots reuse `dev-mokosh-server-target-long` and are about 30 seconds.
