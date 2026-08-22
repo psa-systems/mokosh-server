@@ -15,7 +15,6 @@ use super::models::{
     CreateFormDefinitionRequest, CreateFormFieldRequest, FieldType, FormDefinitionResponse,
     FormFieldResponse, FormRule, FormSubmissionResponse, UpdateFormDefinitionRequest,
 };
-use super::validation::validate_submission;
 use crate::db::{Database, TenantTransaction};
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult, FieldError};
@@ -387,81 +386,10 @@ impl FormsService {
         self.get(tenant_id, id).await
     }
 
-    /// Delete a definition. Submissions hold an `ON DELETE RESTRICT` FK, so a
-    /// definition that has ever been submitted cannot be deleted; retire it
-    /// with `is_active = false` instead. That is reported as a 409 rather
-    /// than a raw database error.
-    pub async fn delete(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let submitted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM form_submissions WHERE tenant_id = $1 AND form_definition_id = $2",
-        )
-        .bind(tenant_id)
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if submitted > 0 {
-            return Err(AppError::Conflict(format!(
-                "This form has {submitted} submission(s) and cannot be deleted; set is_active to false to retire it."
-            )));
-        }
-        let affected = sqlx::query("DELETE FROM form_definitions WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
-        if affected == 0 {
-            return Err(AppError::NotFound("Form definition".to_string()));
-        }
-        Ok(())
-    }
-
-    /// Validate a payload against a definition and store it.
-    ///
-    /// A retired (`is_active = false`) definition refuses new submissions:
-    /// retiring is how an operator stops collecting, so accepting one anyway
-    /// would make the flag decorative.
-    pub async fn submit(
-        &self,
-        tenant_id: TenantId,
-        definition_id: Uuid,
-        payload: &serde_json::Value,
-        submitted_by_contact_id: Option<Uuid>,
-    ) -> AppResult<FormSubmissionResponse> {
-        let definition = self.get(tenant_id, definition_id).await?;
-        if !definition.is_active {
-            return Err(AppError::Conflict(
-                "This form has been retired and is no longer accepting submissions.".to_string(),
-            ));
-        }
-
-        let normalised = validate_submission(
-            &definition.fields,
-            &definition.rules,
-            payload,
-            Utc::now().date_naive(),
-        )?;
-
-        let id = Uuid::new_v4();
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row = sqlx::query_as::<_, SubmissionRow>(
-            "INSERT INTO form_submissions \
-               (id, tenant_id, form_definition_id, payload, submitted_by_contact_id) \
-             VALUES ($1, $2, $3, $4, $5) \
-             RETURNING id, form_definition_id, payload, submitted_by_contact_id, ticket_id, created_at",
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(definition_id)
-        .bind(serde_json::Value::Object(normalised))
-        .bind(submitted_by_contact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(row.into())
-    }
+    // PMS-840: no `delete` and no agent-side `submit`. Their routes were
+    // retired as unconsumed, `is_active` is how an operator stops collecting,
+    // and `submit_via_request_link` is now the only writer of
+    // `form_submissions`.
 
     pub async fn list_submissions(
         &self,
