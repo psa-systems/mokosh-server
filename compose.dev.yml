@@ -32,19 +32,20 @@
 # https://${USER}-mokosh-api.a8n.run to the container's $MOKOSH_PORT (see the
 # server's `labels` below).
 #
-# MOKOSH_HOST_BIND_IP is still discovered by `just dev` for the server's
-# BASE_URL. It is deliberately NOT used to publish any host port: postgres and
-# mailpit publish on loopback only (PMS-496), so host-side tooling (sqlx-cli,
-# the mail UI) reaches them via localhost while the LAN/internet cannot.
+# MOKOSH_HOST_BIND_IP is still discovered and written to .env by `just dev`, but
+# nothing in this file consumes it. It is deliberately NOT used to publish any
+# host port: postgres and mailpit publish on loopback only (PMS-496), so
+# host-side tooling (sqlx-cli, the mail UI) reaches them via localhost while the
+# LAN/internet cannot, and the server is reachable through Traefik alone.
 # Discover the host IP with:
 #   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
 #
 # The Mokosh application database runs inside this stack as the
 # `postgres` service (separate from `infisical-postgres`, which is for
 # Infisical only). Server reaches it via in-network DNS at
-# `postgres:5432`. The container is also published to the host so
-# host-side tools (sqlx-cli via `just migrate-run`) can connect via
-# `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT}` (default 5433 to
+# `postgres:5432`. The container is also published to the host on
+# loopback so host-side tools (sqlx-cli via `just migrate-run`) can
+# connect via `127.0.0.1:${MOKOSH_PG_HOST_PORT}` (default 5433 to
 # avoid clashing with any host-side postgres on 5432).
 #
 # This file contains no hardcoded values. Every environment variable is
@@ -206,7 +207,10 @@ services:
       HOST: 0.0.0.0
       PORT: ${MOKOSH_PORT:?MOKOSH_PORT missing - run `just dev` (which generates .env from .env.example)}
       ENVIRONMENT: development
-      BASE_URL: http://${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}
+      # The server's own public base URL. Traefik is the sole ingress and this
+      # service publishes no host port, so the only address that reaches it is
+      # the routed hostname below (same value as OIDC_AUDIENCE).
+      BASE_URL: https://${USER}-mokosh-api.a8n.run
 
       # Reach the in-stack postgres by service-DNS name. PMS-285: the split
       # roles activate RLS at runtime. DATABASE_URL connects as the privileged
