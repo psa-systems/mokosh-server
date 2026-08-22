@@ -46,7 +46,13 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes
+
+# Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
+# README.md or docs/quickstart.md names a recipe the justfile does not define.
+[group: 'check']
+check-doc-recipes:
+    nu scripts/check-doc-recipes.nu
 
 # Keep .env.example and compose.dev.yml in step with what the code reads
 # (PMS-836). Fails if a variable the code reads has no .env.example key or no

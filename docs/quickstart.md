@@ -92,7 +92,7 @@ This creates the admin user, project, machine identity, and writes `INFISICAL_PR
 Restart so the server picks up the new credentials:
 
 ```nu
-just dev-down
+just down
 just dev --detach
 ```
 
@@ -127,8 +127,7 @@ Service URLs:
 
 ```nu
 just dev --detach            # boot or rebuild
-just dev-down                # stop, keep volumes
-just down                    # stop both LAN-IP and SSO stacks, remove orphans
+just down                    # stop, keep volumes
 just dev-clean               # stop + drop volumes + remove .env (leaves .env.infisical; next `just dev` regenerates .env)
 
 just check                   # cargo check + clippy + fmt --check + repo guards (run before pushing)
@@ -160,7 +159,7 @@ You ran `docker compose` directly instead of through `just dev`. The justfile wr
 The recipe uses `sys net | where name =~ 'eth0|br0'`. If your interface is different, edit `.env` after `just dev` writes it:
 ```nu
 open .env | lines | where not ($it | str starts-with 'MOKOSH_HOST_BIND_IP=') | append 'MOKOSH_HOST_BIND_IP=127.0.0.1' | str join "\n" | save --force .env
-just dev-down
+just down
 just dev --detach
 ```
 
@@ -181,4 +180,4 @@ just dev-clean        # stop + drop app volumes + remove .env
 
 Most of the ~30 route groups have real handlers (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, and more). The only endpoint still returning HTTP 501 is the PDF format of the report-export route (CSV is implemented). The database schema is still ahead of the handler layer in places. Before adding a feature module, read [`codebase-state.md`](dev-docs/codebase-state.md) for per-module status, open TODOs (`F1..F14`), and known shallow-DTO traps.
 
-Authentication (PMS-295): mokosh no longer runs its own OIDC IdP. The `crates/mokosh-auth*` subsystem and its `MOKOSH_AUTH_*` env vars were removed; bunyip is the sole OP. Two independent paths run in parallel: the bunyip-as-OP Resource-Server path (mokosh verifies bunyip-issued Bearer tokens against bunyip's JWKS, configured by `OIDC_ISSUER` / `OIDC_AUDIENCE`), which the SPA and E2E suite use, and the legacy HS256 email/password cookie auth used by the original PSA endpoints. A bare dev `.env` with no OIDC vars still boots and serves the legacy path. As of PMS-511 `just dev` is the single Traefik-routed stack (per-developer `https://${USER}-mokosh-api.a8n.run`); the former separate `just dev-sso` overlay is gone.
+Authentication (PMS-295): mokosh no longer runs its own OIDC IdP. The `crates/mokosh-auth*` subsystem and its `MOKOSH_AUTH_*` env vars were removed; bunyip is the sole OP. Two independent paths run in parallel: the bunyip-as-OP Resource-Server path (mokosh verifies bunyip-issued Bearer tokens against bunyip's JWKS, configured by `OIDC_ISSUER` / `OIDC_AUDIENCE`), which the SPA and E2E suite use, and the legacy HS256 email/password cookie auth used by the original PSA endpoints. A bare dev `.env` with no OIDC vars still boots and serves the legacy path. As of PMS-511 `just dev` is the single Traefik-routed stack (per-developer `https://${USER}-mokosh-api.a8n.run`); the former separate `dev-sso` overlay recipe is gone.

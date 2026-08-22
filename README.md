@@ -130,6 +130,7 @@ just check-oci-publish-tags # fail if the publish tags drift from oci-build/get-
 just check-workspace-deps   # fail if [workspace.dependencies] and its members disagree (PMS-785)
 just check-unused-deps      # cargo-machete: fail on a dependency with no call site (PMS-780)
 just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836)
+just check-doc-recipes      # fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843)
 
 # Format, test, build
 just fmt                    # cargo fmt --all
