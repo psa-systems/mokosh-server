@@ -66,6 +66,7 @@ check: check-compile check-clippy check-fmt check-migrations check-migration-imm
 
 # Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
 # README.md or docs/quickstart.md names a recipe the justfile does not define.
+[doc("Fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843).")]
 [group: 'check']
 check-doc-recipes:
     nu scripts/check-doc-recipes.nu
@@ -74,6 +75,7 @@ check-doc-recipes:
 # (PMS-836). Fails if a variable the code reads has no .env.example key or no
 # compose.dev.yml server line (so it cannot be set in dev at all), or if
 # .env.example declares a key nothing consumes.
+[doc("Fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836).")]
 [group: 'check']
 check-env-example:
     nu scripts/check-env-example.nu
@@ -105,6 +107,7 @@ check-pool-safety:
 
 # Keep transactional email body copy in notification_templates, not in Rust
 # (PMS-700). Fails if a `Mailer` helper re-adds a seeded template's wording.
+[doc("Fail if a `Mailer` helper duplicates a seeded template's copy (PMS-700).")]
 [group: 'check']
 check-mail-copy:
     nu scripts/check-no-duplicate-mail-copy.nu
@@ -112,6 +115,7 @@ check-mail-copy:
 # Keep every 429 coming from the one shared builder (PMS-773). Fails if a route
 # file constructs a TOO_MANY_REQUESTS response itself, or if a handler computes
 # a retry delay and discards it.
+[doc("Fail if a 429 response is built outside the shared builder (PMS-773).")]
 [group: 'check']
 check-rate-limit-helper:
     nu scripts/check-rate-limit-helper.nu
@@ -119,6 +123,7 @@ check-rate-limit-helper:
 # Keep CI jobs on the right runner label (PMS-719). Fails if a compiling job
 # requests the base label, if a workflow installs a C toolchain at run time,
 # or if a runs-on carries no comment justifying its label.
+[doc("Fail if a CI job requests the wrong runner label (PMS-719).")]
 [group: 'check']
 check-runner-labels:
     nu scripts/check-runner-labels.nu
@@ -126,6 +131,7 @@ check-runner-labels:
 # Keep the OCI build on the type=gha runner cache (PMS-720, GOV-20). Fails if a
 # buildx workflow drops the docker-container driver or the runtime-env step, or
 # if the retired inline / registry :buildcache backends come back.
+[doc("Fail if the OCI build leaves the type=gha runner cache (PMS-720).")]
 [group: 'check']
 check-oci-cache:
     nu scripts/check-oci-build-cache.nu
@@ -133,6 +139,7 @@ check-oci-cache:
 # Keep `:latest` publishable from main only, and branch builds on the allow-list
 # in oci-build/get-tags.nu (PMS-733). Fails if the workflow's push filter or ref
 # guard drifts from that list, or if the tag resolver stops honouring it.
+[doc("Fail if the publish tags drift from oci-build/get-tags.nu (PMS-733).")]
 [group: 'check']
 check-oci-publish-tags:
     nu scripts/check-oci-publish-tags.nu
@@ -140,6 +147,7 @@ check-oci-publish-tags:
 # Keep [workspace.dependencies] describing what the workspace shares (PMS-785).
 # Fails if an entry is inherited by no member, or if a member re-pins a crate
 # the workspace table already pins.
+[doc("Fail if [workspace.dependencies] and its members disagree (PMS-785).")]
 [group: 'check']
 check-workspace-deps:
     nu scripts/check-workspace-deps.nu
@@ -147,6 +155,7 @@ check-workspace-deps:
 # Fail loud on a dependency declared in Cargo.toml with no call site (PMS-780).
 # `pulldown-cmark` and `minijinja` sat there unused, compiled on every cold
 # build. Install once: `cargo install --locked cargo-machete`.
+[doc("Fail on a dependency declared in Cargo.toml with no call site (PMS-780).")]
 [group: 'check']
 check-unused-deps:
     #!/usr/bin/env nu
@@ -206,12 +215,14 @@ test-integration: ensure-env
 # Postgres-backed setup as `test-integration`, including its superuser
 # DATABASE_URL override (see the note there for why `mokosh_migrator` cannot
 # run a `#[sqlx::test]` suite).
+[doc("Run the demo-critical subset of the integration suite: seed_demo plus data_transfer (PMS-677).")]
 [group: 'test']
 verify-demo: ensure-env
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --test seed_demo --test data_transfer -- --test-threads=4'
 
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
+[doc("Run the Playwright E2E suite against staging or $E2E_BASE_URL; trailing args go to `playwright test` (PMS-140).")]
 [group: 'test']
 test-e2e *args:
     cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test {{args}}
@@ -453,6 +464,7 @@ dev-clean-all: dev-clean
 
 # Create a release: bump major (vx.0.0), minor (v0.x.0), or hotfix (v0.0.x), push the branch, and open the PR via fj.
 # After the PR merges, the create-release workflow creates the tag and release automatically.
+[doc("Bump the version (major|minor|hotfix), push the release branch, and open the release PR.")]
 [group: 'release']
 create-release bump: ensure-env
     #!/usr/bin/env nu
