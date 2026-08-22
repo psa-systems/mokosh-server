@@ -635,3 +635,112 @@ async fn replacing_the_field_set_cannot_strand_an_existing_rule(pool: PgPool) {
         "dropping the field and its rule together is a legitimate edit"
     );
 }
+
+/// PMS-841: the 200-character cap on `contact_info` is the server's, so it has
+/// to answer the same way on both of the server's own write paths. Before this,
+/// create refused an over-length line and update stored it, which made the cap
+/// a suggestion for anyone who edited an existing form.
+#[sqlx::test]
+async fn an_over_length_contact_line_is_refused_on_create_and_on_update(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let too_long = "x".repeat(201);
+
+    // Create: the same value, refused.
+    let mut body = departure_form();
+    body["slug"] = json!("departure-overlong");
+    body["contact_info"] = json!(too_long);
+    let resp = app
+        .client
+        .post(app.url("/api/v1/forms"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send create with an over-length contact line");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "create must refuse a contact line over 200 characters"
+    );
+    let created_err: serde_json::Value = resp.json().await.expect("create error JSON");
+    assert!(
+        field_codes(&created_err)
+            .iter()
+            .any(|(f, c)| f == "contact_info" && c == "length"),
+        "the create refusal must name contact_info, got {:?}",
+        field_codes(&created_err)
+    );
+
+    // A form that exists, with a contact line inside the cap.
+    let mut ok_body = departure_form();
+    ok_body["contact_info"] = json!("support@example.com");
+    let form = create_form(&app, &token, ok_body).await;
+    let form_id = form["id"].as_str().expect("form id").to_string();
+    assert_eq!(form["contact_info"].as_str(), Some("support@example.com"));
+
+    // Update: the same value, refused the same way.
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({ "contact_info": too_long }))
+        .send()
+        .await
+        .expect("send patch with an over-length contact line");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "update must refuse what create refuses"
+    );
+    let updated_err: serde_json::Value = resp.json().await.expect("update error JSON");
+    assert!(
+        field_codes(&updated_err)
+            .iter()
+            .any(|(f, c)| f == "contact_info" && c == "length"),
+        "the update refusal must name contact_info, got {:?}",
+        field_codes(&updated_err)
+    );
+
+    // Exactly 200 is inside the cap on the update path.
+    let at_cap = "y".repeat(200);
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({ "contact_info": at_cap }))
+        .send()
+        .await
+        .expect("send patch at the cap");
+    assert!(
+        resp.status().is_success(),
+        "200 characters is inside the cap, got {}",
+        resp.status()
+    );
+    let at_cap_body: serde_json::Value = resp.json().await.expect("patch JSON");
+    assert_eq!(at_cap_body["contact_info"].as_str(), Some(at_cap.as_str()));
+
+    // An explicit null still clears: `length` passes on an absent inner value,
+    // so the double-option clear semantics survive the new attribute.
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({ "contact_info": serde_json::Value::Null }))
+        .send()
+        .await
+        .expect("send patch clearing the contact line");
+    assert!(
+        resp.status().is_success(),
+        "clearing the contact line must stay legal, got {}",
+        resp.status()
+    );
+    let cleared: serde_json::Value = resp.json().await.expect("cleared JSON");
+    assert!(
+        cleared["contact_info"].is_null(),
+        "null must clear the stored contact line, got {:?}",
+        cleared["contact_info"]
+    );
+}

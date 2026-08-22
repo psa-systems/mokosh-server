@@ -192,6 +192,9 @@ pub struct UpdateFormDefinitionRequest {
     pub description: Option<Option<String>>,
     /// PMS-748. Double-optioned like `description`, so a form's contact line
     /// can be cleared as well as changed.
+    /// PMS-841: the same 200-character cap the create path carries. `length`
+    /// recurses through both `Option`s, so a null still clears.
+    #[validate(length(max = 200))]
     #[serde(default, deserialize_with = "double_option")]
     pub contact_info: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
