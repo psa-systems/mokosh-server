@@ -37,9 +37,9 @@ const ALLOWED_MIME: &[(&str, &str)] = &[
     ("image/gif", "gif"),
 ];
 
-/// Default cap when `TENANT_LOGO_MAX_BYTES` is unset. Two orders of magnitude
-/// under the 25 MiB attachment cap on purpose: this one is embedded in every
-/// email a client receives, so it is a size that has to stay polite.
+/// Default cap when `TENANT_LOGO_MAX_BYTES` is unset. 1 MiB, a twenty-fifth of
+/// the 25 MiB attachment cap, on purpose: this one is embedded in every email a
+/// client receives, so it is a size that has to stay polite.
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// PMS-783 (F10): the box a rendered logo occupies, in CSS pixels. One pair of
