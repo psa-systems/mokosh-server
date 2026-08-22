@@ -153,3 +153,70 @@ pub struct PortalJwtClaims {
     /// agent tokens minted by `AuthService`.
     pub typ: String,
 }
+
+/// What `portal_auth_middleware` needs from the `contacts` row on every
+/// request, in one read.
+///
+/// The names are not minted into the JWT (PII minimisation, PMS-195), so the
+/// middleware was already loading this row; MAPPS-532's revocation cutoff
+/// rides along in the same query rather than adding a second round trip.
+#[derive(Debug, Clone)]
+pub struct PortalContactSnapshot {
+    pub first_name: String,
+    pub last_name: String,
+    /// MAPPS-532: reject a token minted before this instant. `None` (the
+    /// column's default, and every row that predates the migration) means the
+    /// contact has never signed out, so nothing is revoked.
+    pub tokens_valid_from: Option<DateTime<Utc>>,
+}
+
+impl PortalContactSnapshot {
+    /// Whether a token issued at `token_iat` (seconds since the epoch) has
+    /// been revoked by a sign-out.
+    ///
+    /// Strictly `<`, matching `AuthService::ensure_user_and_tenant_active`:
+    /// `iat` has one-second resolution, so a contact who signs out and
+    /// straight back in inside the same second must keep the token they just
+    /// received.
+    pub fn revokes(&self, token_iat: i64) -> bool {
+        match self.tokens_valid_from {
+            Some(cutoff) => token_iat < cutoff.timestamp(),
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(cutoff: Option<DateTime<Utc>>) -> PortalContactSnapshot {
+        PortalContactSnapshot {
+            first_name: "Portal".to_string(),
+            last_name: "Contact".to_string(),
+            tokens_valid_from: cutoff,
+        }
+    }
+
+    /// MAPPS-532: a contact who has never signed out revokes nothing, so the
+    /// column being NULL on every pre-migration row cannot lock anyone out.
+    #[test]
+    fn no_cutoff_revokes_nothing() {
+        assert!(!snapshot(None).revokes(0));
+        assert!(!snapshot(None).revokes(i64::MAX));
+    }
+
+    /// The boundary is the whole design. `iat` is stamped in whole seconds, so
+    /// a contact who signs out and immediately back in gets a token whose
+    /// `iat` equals the cutoff; treating that as revoked would sign them out
+    /// of the session they just created.
+    #[test]
+    fn a_token_minted_in_the_same_second_as_the_sign_out_survives() {
+        let cutoff = DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
+        let snap = snapshot(Some(cutoff));
+
+        assert!(snap.revokes(1_699_999_999), "issued before the sign-out");
+        assert!(!snap.revokes(1_700_000_000), "issued in the same second");
+        assert!(!snap.revokes(1_700_000_001), "issued after the sign-out");
+    }
+}
