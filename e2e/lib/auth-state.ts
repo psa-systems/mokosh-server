@@ -6,8 +6,8 @@
 // - `token.txt`: the bunyip-issued access_token captured during SPA login.
 //   The `api` project's request fixture (`lib/fixtures.ts`) injects it as
 //   `Authorization: Bearer`. We cannot reuse Playwright's `storageState`
-//   for this because the mokosh-clients SPA keeps the token in WASM
-//   memory (`mokosh-clients/src/hooks/fetch.rs:189`), not in cookies or
+//   for this because the mokosh-apps SPA keeps the token in WASM
+//   memory (`mokosh-apps/src/hooks/fetch.rs:189`), not in cookies or
 //   localStorage, so cookie replay does not authenticate the API context.
 //   Direct `POST /api/v1/auth/login` is also not an option: the OP
 //   advertises only authorization_code + refresh_token grants, and SPA

@@ -42,7 +42,7 @@ import { loginViaSpa } from '../lib/login';
 //     local `users` table; SPA accounts that signed up through the bunyip
 //     hub live elsewhere and return 401 there.
 //   - The SPA's bearer token lives in WASM thread-local memory
-//     (mokosh-clients/src/hooks/fetch.rs:189), so page.evaluate() cannot
+//     (mokosh-apps/src/hooks/fetch.rs:189), so page.evaluate() cannot
 //     read it.
 // Intercepting the OIDC handshake is the only path that reuses the real
 // auth flow without registering a new OIDC client or maintaining a

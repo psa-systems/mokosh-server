@@ -5,7 +5,7 @@ content here is derived from a 2026-05-06 codebase audit; treat it
 as a living snapshot and update it alongside the code changes that
 invalidate any of its claims. The same audit produced matching
 documentation in
-[`mokosh-clients/dev-docs/`](../../mokosh-clients/dev-docs/).
+[`mokosh-apps/dev-docs/`](../../mokosh-apps/dev-docs/).
 
 ## Contents
 

@@ -39,8 +39,8 @@ gate (that is PMS-141).
 only place the projects are enumerated in prose, so a config change has a single
 document to update; this README deliberately does not repeat it.
 
-**Harness shape.** Two independent auth paths because the mokosh-clients SPA
-keeps its bearer token in WASM memory (`mokosh-clients/src/hooks/fetch.rs`),
+**Harness shape.** Two independent auth paths because the mokosh-apps SPA
+keeps its bearer token in WASM memory (`mokosh-apps/src/hooks/fetch.rs`),
 which Playwright's `storageState` cannot replay; and direct
 `POST /api/v1/auth/login` does not work either (the OP advertises only
 `authorization_code` + `refresh_token`, and SPA-signed-up accounts do not

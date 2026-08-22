@@ -22,7 +22,7 @@
 #
 # This stack contains the Mokosh API server plus its secrets-management
 # infrastructure (Infisical + its Postgres + Valkey, behind the `infisical`
-# profile). The Mokosh client apps run separately (see ../mokosh-clients) and
+# profile). The Mokosh client apps run separately (see ../mokosh-apps) and
 # reach the API through Traefik at https://${USER}-mokosh-api.a8n.run.
 #
 # The Mokosh API server runs as the `server` service, reachable inside the
