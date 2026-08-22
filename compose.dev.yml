@@ -292,6 +292,66 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
 
+      # PMS-836: this map enumerates the container's environment, so a variable
+      # the code reads but that has no line here CANNOT be set from .env - the
+      # operator edits .env, sees no error, and the feature stays off. Every
+      # remaining variable the server process reads is therefore listed below,
+      # each defaulting to the fallback the code already applies when unset, so
+      # an untouched .env behaves exactly as before. scripts/check-env-example.nu
+      # fails `just check` if a new read is added without a line here.
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+
+      # MAPPS-425 / PMS-748 / MAPPS-429: the emailed-link and email-branding
+      # trio. SPA_BASE_URL falls back to CLIENT_ORIGIN, so it only needs setting
+      # on a stack where the SPA is not the login origin; PUBLIC_API_BASE_URL is
+      # what makes the tenant logo in a request-form email an absolute src, and
+      # unset means the mail carries no logo at all.
+      SPA_BASE_URL: ${SPA_BASE_URL:-}
+      ABUSE_CONTACT_EMAIL: ${ABUSE_CONTACT_EMAIL:-}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
+
+      # PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
+      # Empty falls back to the built-in dev value, which only development /
+      # dev / test accept (resolve_secret, PMS-499).
+      BUNYIP_WEBHOOK_SECRET: ${BUNYIP_WEBHOOK_SECRET:-}
+
+      # PMS-587 / PMS-809: empty means "use the built-in default" for the
+      # trusted-proxy ranges, and "exempt nothing" for the outbound SSRF guard.
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
+      OUTBOUND_PRIVATE_ALLOWLIST: ${OUTBOUND_PRIVATE_ALLOWLIST:-}
+
+      # PMS-657 / BUNYIP-475 / PMS-658: login-location enrichment and the
+      # notify-and-approve gate. All three are off when empty.
+      IP2LOCATION_DB_PATH: ${IP2LOCATION_DB_PATH:-}
+      IP2PROXY_DB_PATH: ${IP2PROXY_DB_PATH:-}
+      LOGIN_APPROVAL_ENABLED: ${LOGIN_APPROVAL_ENABLED:-}
+
+      # Upload root, shared by ticket attachments and tenant logos (which live
+      # in a `tenant-logos/` subdirectory of it). Defaulted to the `attachments`
+      # named volume below rather than the code's CWD-relative `./attachments`,
+      # so an uploaded logo survives `just dev` rebuilding the image.
+      ATTACHMENT_DIR: ${ATTACHMENT_DIR:-/data/attachments}
+      ATTACHMENT_MAX_BYTES: ${ATTACHMENT_MAX_BYTES:-}
+      TENANT_LOGO_MAX_BYTES: ${TENANT_LOGO_MAX_BYTES:-}
+
+      # RS verifier knobs beyond the issuer/audience pair above; empty keeps the
+      # built-in 600s JWKS cache and 30s clock leeway. OIDC_DEFAULT_TENANT_ID is
+      # the shared landing tenant bunyip users JIT into (PMS-239).
+      OIDC_JWKS_CACHE_TTL_SECS: ${OIDC_JWKS_CACHE_TTL_SECS:-}
+      OIDC_LEEWAY_SECONDS: ${OIDC_LEEWAY_SECONDS:-}
+      OIDC_DEFAULT_TENANT_ID: ${OIDC_DEFAULT_TENANT_ID:-}
+
+      # Stripe REST base, overridable so a test can point checkout at a stub;
+      # empty uses https://api.stripe.com.
+      STRIPE_API_BASE: ${STRIPE_API_BASE:-}
+
+      # PMS-710 demo-data gate, the template tenant its rows are copied from,
+      # and the upstream version probe. All three are off/default when empty.
+      MOKOSH_DEMO_SEED: ${MOKOSH_DEMO_SEED:-}
+      MOKOSH_SEED_TENANT_ID: ${MOKOSH_SEED_TENANT_ID:-}
+      MOKOSH_UPDATE_CHECK_URL: ${MOKOSH_UPDATE_CHECK_URL:-}
+
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:
       - private
@@ -343,6 +403,11 @@ services:
       # Postgres-backed run stays in `just test-integration`).
       - ./tests:/app/tests
       - server-target:/app/target
+      # PMS-836: uploads (ticket attachments and tenant logos) land under
+      # ATTACHMENT_DIR. Without this they live in the container filesystem and
+      # a rebuild loses them, so a dev tenant's logo disappears on the next
+      # `just dev`. Mount point must match the ATTACHMENT_DIR default above.
+      - attachments:/data/attachments
     depends_on:
       postgres:
         condition: service_healthy
@@ -364,6 +429,8 @@ volumes:
     name: dev-mokosh-postgres-data-${USER:?USER missing - run via just dev}
   server-target:
     name: dev-mokosh-server-target-${USER:?USER missing - run via just dev}
+  attachments:
+    name: dev-mokosh-attachments-${USER:?USER missing - run via just dev}
 
 networks:
   private:

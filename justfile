@@ -46,7 +46,15 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example
+
+# Keep .env.example and compose.dev.yml in step with what the code reads
+# (PMS-836). Fails if a variable the code reads has no .env.example key or no
+# compose.dev.yml server line (so it cannot be set in dev at all), or if
+# .env.example declares a key nothing consumes.
+[group: 'check']
+check-env-example:
+    nu scripts/check-env-example.nu
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
@@ -349,7 +357,7 @@ migrate-create name:
 
 # -- Cleanup ------------------------------------------------------------------
 
-# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target, uploaded attachments/logos), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
 [group: 'cleanup']
 dev-clean: ensure-env
     #!/usr/bin/env nu
@@ -359,6 +367,8 @@ dev-clean: ensure-env
         $"dev-mokosh-postgres-data-($suffix)"
         $"dev-mokosh-infisical-postgres-data-($suffix)"
         $"dev-mokosh-server-target-($suffix)"
+        # PMS-836: uploads (ticket attachments + tenant logos under ATTACHMENT_DIR).
+        $"dev-mokosh-attachments-($suffix)"
     ]
     let existing = docker volume ls --quiet | lines
     for vol in $vols {
