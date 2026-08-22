@@ -31,7 +31,7 @@ mokosh's E2E auth is split because the PSA API and the bunyip OP are authenticat
 
 Why not just `POST /api/v1/auth/login` and skip the browser entirely? Three independent reasons (`tests/global.setup.ts`):
 
-- The OP (`crates/mokosh-auth-oidc/src/discovery.rs`) advertises only `authorization_code` + `refresh_token`. No `client_credentials`, no password grant, so a service-to-service token mint does not exist.
+- mokosh hosts no OP and no token endpoint (PMS-295 removed the `crates/mokosh-auth*` subsystem), so there is nothing in this repo to mint a token from. bunyip is the OP, and the suite holds no client credentials for a service-to-service grant against it.
 - Legacy `POST /api/v1/auth/login` works only against rows in mokosh's local `users` table; SPA accounts that signed up through the bunyip hub live elsewhere and 401 there.
 - The SPA keeps its bearer in WASM thread-local memory (`mokosh-clients/src/hooks/fetch.rs`), so `page.evaluate()` / `storageState` cannot read it.
 

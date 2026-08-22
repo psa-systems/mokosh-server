@@ -1,47 +1,49 @@
-# Architecture seams: duplicated subsystems and their canonical owners
+# Architecture seams: parallel subsystems and their canonical owners
 
-Parallel development left `mokosh-server` with two of several things in a single binary. PMS-198 converged the cheap-to-merge seams (error type, super-admin extractor, `build.rs`, settings upsert, worker lifecycle, RMM filter) in code, and recorded an explicit owner / decision for the seams that are too large or too risky to merge in one change. This document is that record. Read it before touching auth, billing, the `tenants`/`users` tables, or the subscription columns so you modify the canonical side, not the parallel one.
+`mokosh-server` has several places where two subsystems could plausibly own the same job. This file is the record of which one wins, so a change lands on the canonical side instead of the parallel one. Read it before touching auth, the portal, billing, or the `tenants` / `users` tables.
 
-This file is the home for "two of these exist, here is which one wins". When you collapse a seam, strike its row here and move the note into the relevant module.
+PMS-198 merged the cheap duplications in code (one `AppError` in `src/utils/error.rs`, one `RequireSuperAdmin` extractor in `src/modules/auth/middleware.rs`, one root `build.rs`, one settings upsert, one worker lifecycle, one RMM filter) and recorded the rest here. PMS-295 then deleted the `crates/mokosh-auth*` subsystem outright, which collapsed three of the four seams this file used to describe; "Retired seams" at the end says what became of them.
 
-## Dual auth surfaces
+When you collapse a seam, delete its section here and move whatever is still true into the module it belongs to.
 
-Two authentication systems coexist; both are intentional today.
+## Three identity planes
 
-| Surface | Code | Routes | Identity / token | Session store |
+Three credential systems coexist and all three are intentional. They share extractors and error shapes, never identities.
+
+| Plane | Code | Routes | Credential | Server-side state |
 | --- | --- | --- | --- | --- |
-| Legacy PSA auth | `src/modules/auth/` | `/api/v1/auth/*` | HS256 JWT in cookie, Argon2 passwords | `public.user_sessions` |
-| SSO / OIDC IdP | `crates/mokosh-auth*` | `/v1/auth/*` and the OIDC endpoints | EdDSA `at+jwt` access tokens | `mokosh_auth.*` (sessions, refresh, codes) |
+| Platform, bunyip-as-OP | `src/modules/auth/oidc_rs.rs`, wired by `AuthMiddleware::with_bunyip` in `src/api/router.rs` | every `/api/v1/*` route that takes `RequireAuth` and friends | bunyip-issued RFC 9068 `at+jwt` Bearer, verified against bunyip's JWKS (`OIDC_ISSUER` + `OIDC_AUDIENCE`) | none in mokosh; bunyip owns the session. `place_bunyip_user` JIT-provisions a local `public.users` shadow row |
+| Platform, legacy password | `src/modules/auth/service.rs` + `middleware.rs` | `/api/v1/auth/*` | HS256 JWT in a cookie, Argon2 password, TOTP (`src/utils/totp.rs`) and recovery codes (`src/utils/recovery.rs`) | `public.user_sessions`, plus the credential columns on `public.users` |
+| Customer portal | `src/modules/portal/` | `/api/v1/portal/*` | HS256 Bearer JWT tagged `typ = "portal_access"`, minted from a `contacts` row (`is_portal_user`, `portal_password_hash`, `migrations/004_contacts.sql`) | none for the session; setup and reset links live in `portal_setup_tokens` |
 
-**Shared contract.** The single point where the two meet is `AuthMiddleware` in `src/modules/auth/middleware.rs`: `main.rs` passes the SSO key set into `AuthMiddleware::with_at_jwt(...)`, so the one middleware accepts *either* a legacy HS256 cookie *or* an SSO-issued `at+jwt` and populates the same `AuthState`. Everything downstream (the `RequireAuth` / `RequireRole` / `RequireSuperAdmin` extractors) is token-agnostic by design.
+**Shared contract.** `auth_middleware` (`src/modules/auth/middleware.rs`) is the single point where the two platform planes meet: it accepts either a bunyip `at+jwt` or a legacy cookie and populates the same `AuthState`, so every downstream extractor (`RequireAuth`, `RequireRole`, `RequireAdmin`, `RequireSuperAdmin`, `RequireModuleEnabled`, ...) is credential-agnostic. Both platform planes then run the same `AuthService::ensure_principal_usable` gate (PMS-698), so a deactivated user or a suspended tenant is refused on the next request whichever credential it carried. The portal plane has its own `portal_auth_middleware` and never produces an `AuthState`.
 
-**Ownership rule.** New first-party login / token-issuance work belongs in the SSO subsystem (`crates/mokosh-auth*`); the legacy `src/modules/auth/` surface is in maintenance mode and exists for the original PSA endpoints plus the shared middleware and extractors. Do **not** add a new token format or a third session table. If a change touches "how a request is authenticated", it changes `AuthMiddleware`; if it touches "how a token is minted", it changes `mokosh-auth-oidc`. The legacy flow still owns TOTP verification only because it reuses the `mokosh-auth-crypto` primitive directly (see `CLAUDE.md` "Auth: two systems coexist").
+**Ownership rule.** mokosh mints no platform access token. bunyip is the sole OP since PMS-295 and this repo hosts no `/oauth2/*` surface, so new first-party login or token-issuance work belongs in bunyip, not here. What mokosh still owns is two credential lifecycles, and they are separate on purpose:
 
-## Dual billing subsystems
+- The legacy password path (`src/modules/auth/service.rs`) is in maintenance mode and exists for the original PSA endpoints. Fix its bugs; do not build new identity features on it, and do not add a third platform token format or a second platform session table.
+- The portal path (`src/modules/portal/service.rs`) owns its whole credential lifecycle: login, setup-password, forgot-password, reset-password. A portal identity is a `contacts` row, so one email address can hold a platform account and a portal identity in several tenants at once. Never point a portal user at `/api/v1/auth/*`: that is the PMS-820 defect, where a customer resetting a portal password reset a staff login instead.
 
-Two unrelated subsystems share the word "billing". They are different domains and must not be merged.
+Where a change lands: "how is this request authenticated" is `AuthMiddleware`; "how is a bunyip token validated" is `oidc_rs.rs`; "how does a portal customer sign in" is `src/modules/portal/`.
 
-| Subsystem | Code | Model | Domain |
-| --- | --- | --- | --- |
-| SaaS subscription billing | `crates/mokosh-auth-http` (`BillingRepository`, `BillingTier`) | tiers / subscriptions for the platform itself | "what does this tenant pay **us**" |
-| MSP invoicing | `src/modules/billing/` (`BillingService`, `Invoice`) | invoices, recurring contract runs, payment-gateway configs | "what does the MSP bill **its own customers**" |
+## "Billing" means two unrelated domains
 
-**Ownership rule.** They share only a name, never a type or a table. A change about platform subscription tiers goes to the auth-http crate; a change about MSP-customer invoices, recurring invoicing, or gateway secrets goes to `src/modules/billing/`. When in doubt, the prefix tells you: `BillingTier`/`BillingRepository` = SaaS, `BillingService`/`Invoice`/`RecurringInvoicingWorker` = MSP. Do not introduce a shared `billing` module that tries to host both.
+Two things in this repo answer to the word "billing". They are different domains and must not be merged.
 
-## Subscription state in two schemas (decision recorded)
+| Subsystem | Code | Domain |
+| --- | --- | --- |
+| MSP invoicing | `src/modules/billing/` (`BillingService`, `Invoice`, `RecurringInvoicingWorker`, `stripe_webhook.rs`) | what the MSP bills **its own customers** |
+| Platform subscription state | `public.tenants.subscription_plan` / `subscription_status` / `trial_ends_at` (`migrations/002_tenants.sql:24`) | what a tenant would pay **us** |
 
-Subscription state lives in two places with no foreign key or sync:
+**Ownership rule.** They share a word, never a type and never a table. Invoices, recurring contract runs, payment-gateway configs and the per-tenant Stripe webhook receiver (`/api/v1/stripe/webhooks/{tenant_id}`, PMS-711) are MSP-side and live in `src/modules/billing/`. Nothing else in the tree implements platform subscription billing: the repository that did (`BillingRepository` / `BillingTier` in `crates/mokosh-auth-http`) left with PMS-295.
 
-- `public.tenants.subscription_plan` / `subscription_status` / `trial_ends_at` (`migrations/002_tenants.sql`).
-- `mokosh_auth.subscriptions` (the SSO subsystem's own table).
+**The three `tenants.subscription_*` columns are inert.** `TenantService::create` writes them once at tenant creation (`src/modules/tenants/service.rs:175`, with a 14-day `trial_ends_at`) and the read DTOs echo them back; nothing in `src/` reads them for a decision. They are display fields with no ongoing writer and no subscription system behind them, so do not gate access, module enablement or billing logic on them. Tenant-level access control is `tenants.status` plus `ensure_principal_usable`; feature access is `RequireModuleEnabled` over `module_config`.
 
-**Decision (PMS-198): `mokosh_auth.subscriptions` is the canonical source of subscription truth; the `public.tenants.subscription_*` columns are a denormalized read cache, not an independent writer.** No cross-schema foreign key is added: a hard FK from `public.tenants` into `mokosh_auth` couples the PSA schema to the optional SSO subsystem (SSO mounts only when its env vars are present), and would block tenant creation when SSO is disabled. Instead the columns stay nullable and advisory. Until a sync path exists, treat the `public.tenants.subscription_*` columns as best-effort display only: never gate access or billing logic on them; read `mokosh_auth.subscriptions` for any decision. A follow-up issue owns writing the one-way `mokosh_auth.subscriptions` -> `public.tenants` projection (a trigger or a small reconciler on the Scheduler); this note records the canonical-store choice so that work does not re-litigate it.
+## Retired seams
 
-## Dual users tables (decision recorded)
+Recorded so a reader does not go hunting for a subsystem that was deleted, and so the next audit does not re-derive it.
 
-Two user tables are both written today, with different security postures:
-
-- `public.users` (`migrations/003_auth.sql`): legacy PSA users, `mfa_secret` stored as **plaintext** `VARCHAR(100)`.
-- `mokosh_auth.users` + `mokosh_auth.user_totp`: SSO users, TOTP secret stored under **AES-256-GCM**.
-
-**Decision (PMS-198): `mokosh_auth.users` is the canonical user store going forward; `public.users` is retained only for the legacy PSA endpoints and is frozen for new identity features.** The two are NOT merged in this change: collapsing them touches every PSA service method (each takes a `tenant_id` and joins `public.users`) and the live RLS policies, which is too large and too risky for one PR. The immediate security divergence (plaintext `public.users.mfa_secret`) is tracked as its own follow-up: either migrate legacy MFA enrolment onto `mokosh_auth.user_totp` or encrypt the column in place; no new code may read or write `public.users.mfa_secret` in plaintext. Recording the canonical store here is the prerequisite the issue called out ("decide the canonical store first") before the migration is scheduled.
+- **SSO / OIDC IdP (`crates/mokosh-auth*`).** Removed by PMS-295. mokosh no longer runs an OP, holds no signing key and exposes no `/oauth2/*` endpoints; the `MOKOSH_AUTH_*` env vars are gone. The TOTP and recovery-code primitives the legacy path borrowed from `mokosh-auth-crypto` were relocated into `src/utils/totp.rs` and `src/utils/recovery.rs`.
+- **SaaS subscription billing (`crates/mokosh-auth-http`).** Left in the same removal; the billing section above covers what remains.
+- **The `mokosh_auth.*` schema.** Its `subscriptions`, `users` and `user_totp` tables were created by the removed subsystem's own migrations, never by `migrations/` in this repo, so no mokosh database has that schema today. The PMS-198 decisions naming `mokosh_auth.subscriptions` the canonical subscription store and `mokosh_auth.users` the canonical user store are void: `public.tenants` and `public.users` are the only stores there are.
+- **Dual users tables.** Collapsed to `public.users` by the above. One divergence the old entry flagged is still real and is now tracked as PMS-871: `users.mfa_secret` (`migrations/003_auth.sql:25`) holds the TOTP shared secret in plaintext, written at `src/modules/auth/service.rs:1569`.
+- **Google OAuth popup sign-in.** Removed by PMS-837 along with the `google-oauth-flow` crate; the `google_oauth_routes_stay_unmounted` test in `src/modules/auth/routes.rs` fails if either mount comes back. The `user_oauth_identities` table stays because migrations are immutable.
