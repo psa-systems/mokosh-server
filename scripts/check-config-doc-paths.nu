@@ -29,7 +29,10 @@ def referenced-paths [file: string] {
     | enumerate
     | each {|row|
         $row.item
-        | parse --regex '(?:^|[^A-Za-z0-9._/-])(?<path>docs/[A-Za-z0-9._/-]+)'
+        # The leading boundary keeps a longer path's tail (`crates/docs/x`) from
+        # matching as a repo-root reference; `./docs/x` is the same reference
+        # and is accepted explicitly rather than silently skipped.
+        | parse --regex '(?:^|[^A-Za-z0-9._/-])(?<path>(?:\./)?docs/[A-Za-z0-9._/-]+)'
         | each {|m| {file: $file, line: ($row.index + 1), path: (strip-trailing $m.path)} }
     }
     | flatten
