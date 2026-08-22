@@ -44,19 +44,20 @@ Positives confirmed during this pass:
 ## Findings
 
 Severity is CVSS-flavored qualitative. "Fixed here" = addressed in the PMS-625
-branch; "Follow-up issue" = should be filed as its own tracked YouTrack issue
-(this audit runner cannot create issues; file from this table).
+branch; `Tracked (KEY)` = carried by that YouTrack issue, which is where its
+state lives. Every deferred finding below names its issue; read the state off
+the issue, not off this table.
 
 | # | Severity | Area | Finding | Disposition |
 |---|----------|------|---------|-------------|
 | F1 | High | Admin/role assignment | `PUT /api/v1/auth/users/{id}` (`update_user`) checked only `is_admin()`, not the PMS-503 `can_grant` ceiling. A tenant `admin` could set any user's role - including their own via `PUT /users/{self}` (not the role-sanitizing `/me`) - to `super_admin`, a platform-level cross-tenant account. Asymmetric with `create_user`, which already gates it. | **Fixed here** |
 | F2 | High | OAuth callback | `google_login::callback_html` embeds `serde_json::to_string(payload)` into an inline `<script>`; the code comment claimed serde_json HTML-escapes `<>&` (it does not). The OAuth error branch reflects the fully attacker-controlled `error_description` query param into `payload.error`, so `GET /auth/google/callback?error=x&error_description=</script><script>...` is a reflected XSS on the API origin. A Google `given_name` reaches the success payload the same way. | **Fixed here** |
-| F3 | Medium | Session revocation | The legacy HS256 access-token path in `auth_middleware` never checks `claims.sid` against `user_sessions` (only `refresh_token` does). After `logout()` / `logout_all()` (the latter is what `reset_password` calls to "invalidate all sessions"), an outstanding **access** token still authenticates until it expires (up to 1h). Bounded by the 1h access TTL, and only affects the legacy path. | **Follow-up issue** |
-| F4 | Medium | Password change | `change_password` updates the hash but does **not** revoke other sessions, unlike `reset_password` (which calls `logout_all`). A user changing their password because they suspect compromise leaves other sessions and refresh tokens live. Behavioral/UX decision (keep-current-session vs revoke-all). | **Follow-up issue** |
+| F3 | Medium | Session revocation | The legacy HS256 access-token path in `auth_middleware` never checks `claims.sid` against `user_sessions` (only `refresh_token` does). After `logout()` / `logout_all()` (the latter is what `reset_password` calls to "invalidate all sessions"), an outstanding **access** token still authenticates until it expires (up to 1h). Bounded by the 1h access TTL, and only affects the legacy path. The password half of this is PMS-681's `iat`-vs-`password_changed_at` cutoff; PMS-880 covers what a sign-out leaves behind. | Tracked (PMS-880) |
+| F4 | Medium | Password change | As audited, `change_password` updated the hash but did **not** revoke other sessions, unlike `reset_password` (which calls `logout_all`). A user changing their password because they suspect compromise left other sessions and refresh tokens live. Behavioral/UX decision (keep-current-session vs revoke-all). | Tracked (PMS-681) |
 | F5 | Low | 2FA lockout | As audited, `login` returned `Unauthorized` for a failed **recovery code** without calling `register_failed_mfa`, so only failed TOTP codes armed the PMS-502 second-factor lockout. Recovery-code guessing was still bounded by the 5/min-per-email login limiter and 80-bit entropy, so brute force was infeasible, but the lockout coverage was asymmetric. | Tracked (PMS-694) |
-| F6 | Low | Re-auth rate limiting | The password re-auth in `change_password` and `disable_mfa` is not rate-limited (the login limiter only guards `/login`). An attacker holding a stolen session could brute-force the current password to disable MFA / change the password without any per-account throttle. | **Follow-up issue** |
+| F6 | Low | Re-auth rate limiting | The password re-auth in `change_password` and `disable_mfa` is not rate-limited (the login limiter only guards `/login`). An attacker holding a stolen session could brute-force the current password to disable MFA / change the password without any per-account throttle. | Tracked (PMS-881) |
 | F7 | Info | Legacy JWT | `decode_token` deliberately does not yet pin `iss`/`aud` (mint side stamps them; strict flip deferred). Already tracked by **MAPPS-334**; no new issue - complete that ticket after the rolling refresh-TTL window rotates every live legacy token. | Tracked (MAPPS-334) |
-| F8 | Info | Webhook replay | The `account_deleted` webhook has no timestamp/nonce window; a captured valid delivery can be replayed. Harmless today because the tombstone is idempotent, but any future non-idempotent event added to the same endpoint pattern would be exposed. | **Follow-up issue** (only if the endpoint gains non-idempotent events) |
+| F8 | Info | Webhook replay | The `account_deleted` webhook has no timestamp/nonce window; a captured valid delivery can be replayed. Harmless today because the tombstone is idempotent, but any future non-idempotent event added to the same endpoint pattern would be exposed. | Tracked (PMS-882), which holds the "close this before the endpoint gains a non-idempotent event" precondition |
 
 ## Fixes applied on this branch
 
@@ -86,15 +87,17 @@ corrected. Unit tests:
 `callback_html_neutralizes_script_breakout`,
 `escape_json_for_script_is_reversible_json`.
 
-## Follow-up issues to file
+## Where each deferred finding went
 
-Each of F3, F4, F6, and (conditionally) F8 should become its own YouTrack
-issue linked to PMS-625 (`is required for` / `relates to`). F5 is tracked by
-PMS-694. Suggested titles:
+Every row that was not fixed on the PMS-625 branch has an owning issue. This
+list is the index; the issues carry the detail and the state.
 
-- F3: "Legacy HS256 access token not validated against user_sessions; logout /
-  reset-password leaves access tokens live up to 1h"
-- F4: "change_password does not revoke other sessions (reset_password does)"
-- F6: "Rate-limit password re-auth on change_password and disable_mfa"
-- F8: "Add replay/timestamp window to the Bunyip webhook receiver before adding
-  any non-idempotent event"
+- F3 -> PMS-880 (the sign-out half) and PMS-681 (the password-change half).
+- F4 -> PMS-681, the same mechanism.
+- F5 -> PMS-694.
+- F6 -> PMS-881.
+- F7 -> MAPPS-334.
+- F8 -> PMS-882.
+
+PMS-880, PMS-881 and PMS-882 were filed by PMS-857, which swept this document
+for follow-up claims that named no issue.
