@@ -222,10 +222,14 @@ verify-demo: ensure-env
 
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
+# bun, not npm: e2e/ has a bun.lock and no package-lock.json, so `npm ci` fails
+# outright, and e2e.yml installs with bun too (PMS-852). All three browsers, not
+# just chromium: the `setup` project runs on Firefox and there is a `webkit`
+# project, so a chromium-only install dies before the first assertion.
 [doc("Run the Playwright E2E suite against staging or $E2E_BASE_URL; trailing args go to `playwright test` (PMS-140).")]
 [group: 'test']
 test-e2e *args:
-    cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test {{args}}
+    cd e2e && bun install --frozen-lockfile && bun x playwright install chromium firefox webkit && bun x playwright test {{args}}
 
 # Build release binaries
 [group: 'build']

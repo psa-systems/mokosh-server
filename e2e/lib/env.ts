@@ -49,15 +49,15 @@ function deriveApiBase(spaUrl: string): string | null {
 const spaBaseURL = required('E2E_BASE_URL');
 const derivedApi = deriveApiBase(spaBaseURL);
 const apiBaseURL = optional('E2E_API_BASE_URL') ?? derivedApi ?? spaBaseURL;
-// The OIDC OP (provider) is a separate host from mokosh-server on
-// bunyip-as-OP deploys: SPA + mokosh PSA live under `msp.<tld>`, but the
-// OP runs under the apex `api.<tld>` (no `msp.` prefix). When unset, fall
-// back to apiBaseURL so a mokosh-as-OP deploy still works.
+// The OIDC OP (provider) is bunyip, on a separate host from mokosh-server:
+// SPA + mokosh PSA live under `msp.<tld>`, but the OP runs under the apex
+// `api.<tld>` (no `msp.` prefix). When unset, fall back to apiBaseURL - a
+// legacy default that points at mokosh, which serves no `/oauth2/*`.
 const opBaseURL = optional('E2E_OP_BASE_URL') ?? apiBaseURL;
 
 export const env = {
-  // Where a human browser hits the SPA (login form, dashboard). The auth-ui
-  // project navigates here.
+  // Where a human browser hits the SPA (login form, dashboard). The browser
+  // projects (`setup`, `chromium`, `firefox`, `webkit`) navigate here.
   baseURL: spaBaseURL,
   // Where the mokosh PSA JSON API lives. The api project and teardown hit
   // this host for `/api/v1/*`. Defaults to prepending `api.` to
@@ -67,9 +67,9 @@ export const env = {
   // `opBaseURL` below, which can be a different host on bunyip-as-OP deploys.
   apiBaseURL,
   // Where the OIDC OP (authorize / token / userinfo / discovery) lives.
-  // On bunyip-as-OP deploys this is a different host from apiBaseURL
-  // (e.g. `api.<tld>` rather than `api.msp.<tld>`); on
-  // mokosh-as-OP it defaults to apiBaseURL.
+  // bunyip is the OP, on a different host from apiBaseURL (`api.<tld>`
+  // rather than `api.msp.<tld>`), so set E2E_OP_BASE_URL; the apiBaseURL
+  // fallback is a legacy default that points at mokosh.
   opBaseURL,
   get email() {
     return required('E2E_EMAIL');
