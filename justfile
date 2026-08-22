@@ -191,7 +191,7 @@ check-docker:
 # random value for every self-owned secret so a generic password never lands in
 # .env (PMS-490). Only the create path generates; an existing .env is left
 # untouched, so the recipe stays idempotent as a dependency of other recipes.
-# Third-party credentials (Google, Stripe, Twilio, Slack, Infisical client) stay
+# Third-party credentials (Stripe, Twilio, Slack, Infisical client) stay
 # empty placeholders because they cannot be generated. Passwords that get
 # interpolated into postgres:// URLs are hex (URL-safe alphanumeric); the URL
 # lines are rebuilt from the same generated values so host-side tools (sqlx-cli)

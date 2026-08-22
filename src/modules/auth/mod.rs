@@ -1,6 +1,23 @@
 //! Authentication and Authorization Module
 //!
 //! Handles user authentication, session management, and authorization.
+//!
+//! # Retired: Google OAuth (PMS-837)
+//!
+//! The `/google` and `/google/callback` mounts under `/api/v1/auth` (the
+//! popup + `postMessage` sign-in flow, its `google_login` glue module, the
+//! `google-oauth-flow` workspace crate, `AuthService::login_with_google`, and
+//! the Google client id/secret/redirect-uri and super-admin-allowlist env
+//! vars) were removed.
+//! No client ever called them: three parity audits between 2026-07-30 and
+//! 2026-08-14 found the routes unconsumed, and `mokosh-apps` still has no
+//! reference to them. The absence is deliberate, not an oversight: an auth
+//! entry point nothing exercises is one nobody reviews when this middleware
+//! changes. `google_oauth_routes_stay_unmounted` in `routes.rs` fails if
+//! either mount comes back.
+//!
+//! The `user_oauth_identities` table stays (migrations are immutable, and it
+//! is the natural home for any future federated identity).
 
 #[cfg(feature = "server")]
 pub mod bootstrap;
@@ -8,8 +25,6 @@ pub mod bootstrap;
 // the JWT auth chain in `create_api_router`.
 #[cfg(feature = "server")]
 pub mod bunyip_webhook;
-#[cfg(feature = "server")]
-pub mod google_login;
 #[cfg(feature = "server")]
 pub mod middleware;
 mod models;

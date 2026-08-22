@@ -18,7 +18,7 @@ on:
     paths:
       - "src/**"
       # Workspace crates also produce compiled output; without this
-      # glob, edits limited to e.g. crates/google-oauth-flow/src/...
+      # glob, edits limited to e.g. crates/mokosh-types/src/...
       # never re-publish :latest.
       - "crates/**"
       - "migrations/**"

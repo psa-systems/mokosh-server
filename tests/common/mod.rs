@@ -266,16 +266,6 @@ async fn boot_with_db(
         )
         .try_init();
 
-    // Stub Google OAuth client - tests never drive the Google flow.
-    let google_oauth = Arc::new(
-        google_oauth_flow::Client::new(google_oauth_flow::Config {
-            client_id: "test-client".into(),
-            client_secret: "test-secret".into(),
-            redirect_uri: "http://localhost/callback".into(),
-        })
-        .expect("build stub google_oauth client"),
-    );
-
     // create_api_router now takes the swappable handle (PMS-638); wrap the
     // test LogMailer so the signature matches. Tests never swap it.
     let mailer = Arc::new(SharedMailer::new(Arc::new(LogMailer)));
@@ -284,14 +274,11 @@ async fn boot_with_db(
     let router = create_api_router(
         db,
         "test-jwt-secret-that-is-clearly-not-for-prod".into(),
-        google_oauth,
         "http://localhost".into(),
         // MAPPS-425 spa_base_url: deliberately different from client_origin so
         // a test asserting an emailed link's host cannot pass by accident.
         "http://spa.localhost".into(),
         vec!["http://localhost".into()],
-        Vec::new(),
-        false,  // cookie_secure: irrelevant for bearer-token tests
         bunyip, // bunyip RS verifier: None unless the suite booted via `boot_with_bunyip`
         mailer,
         encryption_key,

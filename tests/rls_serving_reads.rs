@@ -81,7 +81,7 @@ async fn is_user_tombstoned_true_for_a_soft_deleted_user(pool: PgPool) {
     // exactly like boot_rls, but drive the service directly.
     let app_pool = common::build_app_role_pool(&pool).await;
     let db = Database::from_pools(app_pool, pool.clone());
-    let auth = Arc::new(AuthService::new(db, "test-secret".into(), vec![]));
+    let auth = Arc::new(AuthService::new(db, "test-secret".into()));
 
     // Active user: not tombstoned.
     assert!(

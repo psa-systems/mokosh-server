@@ -63,15 +63,12 @@ use crate::version_check::version_check;
 pub fn create_api_router(
     db: Database,
     jwt_secret: String,
-    google_oauth: Arc<google_oauth_flow::Client>,
     client_origin: String,
     // MAPPS-425: base for emailed links to pages that exist only in the
     // mokosh-apps SPA. Distinct from `client_origin`, which is the apex on
     // every deployed environment because bunyip-web hosts login there.
     spa_base_url: String,
     cors_origins: Vec<String>,
-    super_admin_emails: Vec<String>,
-    cookie_secure: bool,
     bunyip_verifier: Option<crate::modules::auth::oidc_rs::Verifier>,
     // PMS-638: the live, swappable mailer handle. Upcast to `Arc<dyn Mailer>`
     // for the services below; the concrete handle is threaded into
@@ -124,14 +121,12 @@ pub fn create_api_router(
     let auth_service = AuthService::with_dispatcher(
         db.clone(),
         jwt_secret.clone(),
-        super_admin_emails,
         mailer.clone(),
         // MAPPS-425: stays on `client_origin` deliberately. This is the base
         // for `/reset-password/{token}`, and bunyip-web at the apex owns the
         // canonical reset page; mokosh-apps' route only redirects there. Same
-        // for the invitation link, the OAuth postMessage origin and the
-        // not-a-frontend fallback below. Only links to pages that exist ONLY
-        // in mokosh-apps take `spa_base_url`.
+        // for the invitation link and the not-a-frontend fallback below. Only
+        // links to pages that exist ONLY in mokosh-apps take `spa_base_url`.
         client_origin.clone(),
         notifications_service.clone(),
     )
@@ -297,16 +292,7 @@ pub fn create_api_router(
         // available. Disabled (no outbound request) when the env var is unset.
         .route("/version/check", get(version_check))
         // Auth routes
-        .nest(
-            "/auth",
-            auth_routes(
-                auth_service,
-                google_oauth,
-                client_origin.clone(),
-                jwt_secret.clone(),
-                cookie_secure,
-            ),
-        )
+        .nest("/auth", auth_routes(auth_service))
         // Tenant management. Only mounted in multi-tenant builds: in a
         // single-tenant deployment there is exactly one tenant and the
         // CRUD endpoints would be a foot-gun. PMS-24.

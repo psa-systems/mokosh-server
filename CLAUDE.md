@@ -72,7 +72,7 @@ src/
   utils/                error, email (Mailer trait + SmtpMailer/LogMailer), crypto, validation, pagination
   version.rs            VersionInfo (build-time git hash/describe via build.rs)
 
-crates/                 Workspace members: google-oauth-flow, mokosh-types, build-metadata
+crates/                 Workspace members: mokosh-types, build-metadata
 migrations/             SQLx migrations, embedded at compile time via sqlx::migrate!
 oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
@@ -92,11 +92,7 @@ Both paths run the same principal gate (PMS-698): `AuthService::ensure_principal
 
 **History (PMS-291 / PMS-292 / PMS-289)**: mokosh-auth was a configured-but-unused second IdP (`crates/mokosh-auth*`). PMS-289 made a misconfigured mokosh-auth a fatal boot error, which took staging+prod down (PMS-292 restored service by provisioning keys - interim path B). PMS-295 is the path-A follow-up: tear mokosh-auth out so `MOKOSH_AUTH_*` env, the `crates/mokosh-auth*` workspace members, and the `mokosh-server-secrets` volume all go away. The server boots fine with no `MOKOSH_AUTH_*` env present.
 
-Remaining auth-adjacent workspace crate:
-
-```
-google-oauth-flow        Reusable Google OAuth popup/code-exchange client (used by legacy /auth/google routes)
-```
+PMS-837 removed the last auth-adjacent workspace crate: `google-oauth-flow` and the `/api/v1/auth/google` + `/api/v1/auth/google/callback` popup routes it served went away with the `GOOGLE_OAUTH_*` and `OAUTH_SUPER_ADMIN_EMAILS` env vars. No client ever called them (three parity audits between 2026-07-30 and 2026-08-14 found the routes unconsumed, and mokosh-apps still has no reference). `google_oauth_routes_stay_unmounted` in `src/modules/auth/routes.rs` is the guard that fails if either mount returns; the `user_oauth_identities` table stays, because migrations are immutable.
 
 ### Portal credentials are a third, fully separate plane (PMS-820)
 
@@ -142,7 +138,7 @@ Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 imple
 - Email backend selection: `MailerConfig::from_env().build()` returns `SmtpMailer` if `SMTP_HOST` is set, `LogMailer` otherwise. `SMTP_USERNAME` without `SMTP_PASSWORD` is a hard error at startup (fail-loud, not silent degrade).
 - `ENCRYPTION_KEY` must parse as 32 bytes (raw or 64 hex chars) via `utils::crypto::parse_encryption_key`. Used for AES-256-GCM at-rest encryption of per-tenant secrets (e.g. payment-gateway configs).
 - `CORS_ORIGIN` is comma-separated; required to be a valid header value or startup panics. Defaults to `[CLIENT_ORIGIN]`.
-- `LOGIN_APPROVAL_ENABLED` (PMS-658) turns on the suspicious-login notify-and-approve gate; off by default because it can withhold a login, so it is opt-in per deployment for a staged rollout. When on and a password login clears password/MFA but comes from a new country (needs `IP2LOCATION_DB_PATH`) or a new device (client-supplied `device_id` in the login body), the session/tokens are withheld and a single-use 6-digit code is emailed; the client re-POSTs `/auth/login` with `approval_code` to finish (mirrors the `mfa_required` flow). Off = the PMS-657 alert-only behaviour. Gates password login in v1 (Google and portal are follow-ups); tables `login_approvals` + `user_login_devices`.
+- `LOGIN_APPROVAL_ENABLED` (PMS-658) turns on the suspicious-login notify-and-approve gate; off by default because it can withhold a login, so it is opt-in per deployment for a staged rollout. When on and a password login clears password/MFA but comes from a new country (needs `IP2LOCATION_DB_PATH`) or a new device (client-supplied `device_id` in the login body), the session/tokens are withheld and a single-use 6-digit code is emailed; the client re-POSTs `/auth/login` with `approval_code` to finish (mirrors the `mfa_required` flow). Off = the PMS-657 alert-only behaviour. Gates password login in v1 (the portal path is a follow-up); tables `login_approvals` + `user_login_devices`.
 - Outbound-URL screening (PMS-805, PMS-809): every outbound fetch whose URL comes from a request or from tenant-editable configuration runs through `utils::net::guard_outbound_url`, which resolves the host and refuses any address `is_non_public_ip` rejects, before the first connect and again on every redirect hop. Three callers: the company website probe (`modules/contacts/website_probe.rs`, ports pinned to 80/443), the ticket-automation `webhook` action (`modules/tickets/automation.rs`, refusal logged with the rule id and the blocked address), and `TacticalRmmProvider` (`modules/rmm/provider.rs`, refusal is an `AppError::Configuration` surfaced in `rmm_connections.last_error`; redirects are not followed). Do not copy the predicate or the resolve loop: a second definition of either fails `utils::net`'s `exactly_one_definition_in_the_crate` test. `OUTBOUND_PRIVATE_ALLOWLIST` is the operator escape hatch (comma-separated hostnames, IPs, or CIDRs) for a self-hosted integration that really does live on a private network; unset means no exemption. Fetches whose URL comes from operator env are deliberately NOT screened (`INFISICAL_ADDRESS`, the Stripe API base, the `OIDC_ISSUER` JWKS, the fixed upstream version check).
 - Docker resource naming: every service/volume/network is prefixed with the app name; dev resources get an extra `dev-` prefix. Sub-service data stores sort adjacent to their parent (`dev-backup-infisical-postgres`, not `dev-backup-postgres-infisical`).
 - Dev stack binds to a private LAN IP (br0/eth0), not 127.0.0.1, so sibling containers on the host can reach the API while the public internet cannot.
