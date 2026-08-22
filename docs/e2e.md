@@ -10,7 +10,7 @@ Key consequence: the suite asserts against whatever the target environment is cu
 
 ## Architecture: the project model
 
-The suite shares ONE E2E account and ONE tenant, and login is rate-limited to **5 requests per minute per email** (`src/modules/auth/routes.rs`, the layered per-IP + per-email `LoginLimiter`). So the Playwright projects are serialised (`workers: 1`, `fullyParallel: false`) and logins are spent sparingly: the `setup` project logs in exactly once and every API spec reuses the captured credential.
+The suite shares ONE E2E account and ONE tenant, and login is rate-limited to **5 requests per minute per email** (`src/modules/auth/routes.rs`, the layered per-IP + per-email `AuthRateLimiter` from `src/modules/auth/rate_limit.rs`). So the Playwright projects are serialised (`workers: 1`, `fullyParallel: false`) and logins are spent sparingly: the `setup` project logs in exactly once and every API spec reuses the captured credential.
 
 | Project | Tests | Auth | Notes |
 | --- | --- | --- | --- |

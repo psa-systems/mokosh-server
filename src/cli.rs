@@ -3,7 +3,8 @@
 //! Three operator features used to live only in the standalone
 //! `mokosh-bootstrap` binary (`src/bin/mokosh-bootstrap.rs`). PMS-494 folded them
 //! into the main binary, so they are now reachable as `mokosh-server <subcommand>`
-//! (the standalone binary still exists and now carries only `bootstrap-infisical`):
+//! (the standalone binary still exists and dispatches its own subcommand set,
+//! which overlaps this one without matching it: see `print_help` there):
 //!
 //! - `bootstrap-infisical`        - first-run setup of a fresh Infisical
 //!   instance (core logic in [`crate::infisical::run_dev_bootstrap`]).
