@@ -130,7 +130,7 @@ Per-feature files under `migrations/` (split from the original `001_initial_sche
 
 ### Module status
 
-Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 implemented modules (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, `saved_reports`, `workflows`, `time_tracking`, and more); the old `stub_routes()` 501 placeholder mechanism is gone. The only endpoint still returning HTTP 501 is the PDF format of the report-export route (`src/modules/reports/routes.rs`); CSV is implemented. The schema is still ahead of the handler layer in places. Before adding a new module, read `docs/dev-docs/codebase-state.md` for the per-module status, open TODOs (`F1..F14`), and known shallow-DTO traps in tickets.
+Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 implemented modules (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, `saved_reports`, `workflows`, `time_tracking`, and more); the old `stub_routes()` 501 placeholder mechanism is gone. The report-export route (`src/modules/reports/routes.rs`) implements CSV only and rejects every other `format`, `pdf` included, with 400 and not 501: `format` is an enumerated query parameter, so a value outside the implemented set is an out-of-range request rather than a server-side gap (PMS-854; adding PDF is tracked in PMS-876). The schema is still ahead of the handler layer in places. Before adding a new module, read `docs/dev-docs/codebase-state.md` for the per-module status, open TODOs (`F1..F14`), and known shallow-DTO traps in tickets.
 
 ## Conventions specific to this repo
 

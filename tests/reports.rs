@@ -342,6 +342,31 @@ async fn reports_registry_and_aggregates(pool: PgPool) {
     assert!(!body.trim().is_empty(), "csv export returns content");
 }
 
+// PMS-854: an unsupported export format is a 400, never a 501. The docs
+// claimed 501 for three months while the handler returned 400, so pin the
+// status a client branches on rather than leaving it to a comment.
+#[sqlx::test]
+async fn unsupported_export_format_is_400_not_501(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    for format in ["pdf", "PDF", "xlsx"] {
+        let res = app
+            .client
+            .get(app.url(&format!("/api/v1/reports/tickets/export?format={format}")))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("export request");
+        assert_eq!(
+            res.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "format={format} must be 400"
+        );
+    }
+}
+
 // AC5: a report is tenant-scoped - another tenant's invoices never appear
 // in this tenant's billing report.
 #[sqlx::test]
