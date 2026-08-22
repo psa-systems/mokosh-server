@@ -284,11 +284,11 @@ fn default_csv() -> String {
     "csv".into()
 }
 
-/// Generic export. `:report` selects which report to serialise; today
-/// only `csv` is implemented. `pdf` returns 501 with a Retry-After-ish
-/// note pointing at the PMS-99 follow-up that wires `printpdf`; we
-/// don't pull a wkhtmltopdf binary just for a hint that the format is
-/// coming.
+/// Generic export. `:report` selects which report to serialise; `csv` is the
+/// only implemented format. Every other value, `pdf` included, is a 400 and
+/// not a 501: one branch serves them all, so an unsupported `format` is an
+/// out-of-range query parameter, not a server-side gap (PMS-854). Adding PDF
+/// is tracked in PMS-876.
 async fn export_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,

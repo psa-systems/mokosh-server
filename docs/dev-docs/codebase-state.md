@@ -27,10 +27,20 @@ alongside source changes.
 > calendar, contracts, quotes, assets, rmm, sla, saved_reports,
 > workflows, time_tracking, dashboards, email_intake, approvals,
 > settings, audit, data_transfer, and more) and the 501 placeholder
-> router is gone. The sole remaining HTTP 501 is the PDF format
-> of the report-export route (`reports/routes.rs`); CSV is
-> implemented. The "At a glance" and "Placeholder modules" tables
+> router is gone. The "At a glance" and "Placeholder modules" tables
 > below are kept for history but no longer reflect the handler layer.
+
+> **Update 2026-08-22 (export-format status, PMS-854).** An earlier
+> revision of this file said the PDF format of the report-export
+> route was the sole remaining HTTP 501. It never returned 501:
+> `export_report` in `reports/routes.rs` rejects every format other
+> than `csv` with `AppError::BadRequest`, a 400. That is the intended
+> contract, because one branch serves every unsupported value and
+> `format` is an enumerated query parameter, so a value outside the
+> implemented set is an out-of-range request rather than a
+> server-side gap. Adding PDF is tracked in PMS-876. The remaining
+> 501 references below all describe the retired placeholder router
+> and are historical.
 
 ## At a glance
 
@@ -42,7 +52,7 @@ alongside source changes.
 | Module placeholders | **0** (the 501 placeholder router is gone) |
 | Route groups under `/api/v1` | **~30 + `/health`** |
 | Route groups returning real data | **most** |
-| Route groups returning HTTP 501 | **1 format** (PDF report export in [`reports/routes.rs`](../src/modules/reports/routes.rs); CSV works) |
+| Report export formats | **CSV** ([`reports/routes.rs`](../src/modules/reports/routes.rs)); any other `format`, `pdf` included, is a 400 (see the 2026-08-22 correction) |
 | Schema tables in [`migrations/001_initial_schema.sql`](../migrations/001_initial_schema.sql) | **71** |
 | Tests | **0** |
 | TODOs in source | **11** |
