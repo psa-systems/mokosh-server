@@ -31,14 +31,113 @@ struct ParamSpec {
     required: bool,
 }
 
+const fn date(name: &'static str) -> ParamSpec {
+    ParamSpec {
+        name,
+        kind: "date",
+        required: false,
+    }
+}
+
+/// Which report a descriptor names. `export_report` matches this
+/// exhaustively, so a registry entry with no export decision fails to
+/// compile instead of 404ing at run time (PMS-839).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReportKind {
+    Dashboard,
+    Tickets,
+    Time,
+    RequestTypes,
+    Billing,
+    Custom,
+    Projects,
+    Clients,
+}
+
 /// A discoverable report type and its parameter schema (PMS-93 AC1).
 #[derive(Serialize)]
 struct ReportDescriptor {
+    /// Not on the wire: it selects the export arm, not something a client
+    /// reads. The JSON stays `key` / `name` / `description` / `parameters`.
+    #[serde(skip)]
+    kind: ReportKind,
     key: &'static str,
     name: &'static str,
     description: &'static str,
-    parameters: Vec<ParamSpec>,
+    parameters: &'static [ParamSpec],
 }
+
+/// The one list of reports (PMS-839). `GET /reports` serves it verbatim and
+/// `GET /reports/{key}/export` resolves its path segment through it, so the
+/// registry, the export switch and the 404 all read from the same array.
+const REPORTS: &[ReportDescriptor] = &[
+    ReportDescriptor {
+        kind: ReportKind::Dashboard,
+        key: "dashboard",
+        name: "Operations Dashboard",
+        description:
+            "Open tickets by priority, SLA at-risk / breached, and the 30-day ticket trend.",
+        parameters: &[],
+    },
+    ReportDescriptor {
+        kind: ReportKind::Tickets,
+        key: "tickets",
+        name: "Ticket Volume & SLA",
+        description:
+            "Tickets opened by status, total closed, and opened-by-assignee for a date range.",
+        parameters: &[date("from"), date("to")],
+    },
+    ReportDescriptor {
+        kind: ReportKind::Time,
+        key: "time",
+        name: "Technician Utilization",
+        description: "Logged minutes by user and by work type for a date range.",
+        parameters: &[date("from"), date("to")],
+    },
+    ReportDescriptor {
+        kind: ReportKind::Billing,
+        key: "billing",
+        name: "Revenue & A/R Aging",
+        description: "Invoiced / paid / outstanding totals and A/R aging buckets. Finance only.",
+        parameters: &[ParamSpec {
+            name: "company_id",
+            kind: "uuid",
+            required: false,
+        }],
+    },
+    ReportDescriptor {
+        kind: ReportKind::RequestTypes,
+        key: "request-types",
+        name: "Request Type Durations",
+        description:
+            "How long each client-request type actually takes, measured from the time tracked against the tickets those requests produced.",
+        parameters: &[date("from"), date("to")],
+    },
+    ReportDescriptor {
+        kind: ReportKind::Custom,
+        key: "custom",
+        name: "Custom Report Builder",
+        description:
+            "Build a report from a whitelisted catalog of sources, dimensions, and measures. Discover the catalog at GET /reports/custom/schema and run via POST /reports/custom. This is the only report key GET /reports/{key}/export cannot serve: the spec travels in a POST body, which a GET export cannot carry, so ask POST /reports/custom for CSV with \"format\": \"csv\" instead. Every other key in this registry exports.",
+        parameters: &[],
+    },
+    ReportDescriptor {
+        kind: ReportKind::Projects,
+        key: "projects",
+        name: "Project Delivery",
+        description:
+            "Projects by status, budget vs actual hours / amount, task completion, and overdue projects.",
+        parameters: &[],
+    },
+    ReportDescriptor {
+        kind: ReportKind::Clients,
+        key: "clients",
+        name: "Clients & Assets",
+        description:
+            "Company counts, asset inventory by type and status, warranties expiring soon, and contract renewals.",
+        parameters: &[],
+    },
+];
 
 pub fn reports_routes(service: ReportsService) -> Router {
     let state = ReportsRouterState {
@@ -70,73 +169,8 @@ struct DateRange {
 /// client can discover what it can run (PMS-93 AC1).
 async fn list_reports(
     RequireReports { .. }: RequireReports,
-) -> AppResult<Json<Vec<ReportDescriptor>>> {
-    let date = |name, required| ParamSpec {
-        name,
-        kind: "date",
-        required,
-    };
-    Ok(Json(vec![
-        ReportDescriptor {
-            key: "dashboard",
-            name: "Operations Dashboard",
-            description:
-                "Open tickets by priority, SLA at-risk / breached, and the 30-day ticket trend.",
-            parameters: vec![],
-        },
-        ReportDescriptor {
-            key: "tickets",
-            name: "Ticket Volume & SLA",
-            description:
-                "Tickets opened by status, total closed, and opened-by-assignee for a date range.",
-            parameters: vec![date("from", false), date("to", false)],
-        },
-        ReportDescriptor {
-            key: "time",
-            name: "Technician Utilization",
-            description: "Logged minutes by user and by work type for a date range.",
-            parameters: vec![date("from", false), date("to", false)],
-        },
-        ReportDescriptor {
-            key: "billing",
-            name: "Revenue & A/R Aging",
-            description:
-                "Invoiced / paid / outstanding totals and A/R aging buckets. Finance only.",
-            parameters: vec![ParamSpec {
-                name: "company_id",
-                kind: "uuid",
-                required: false,
-            }],
-        },
-        ReportDescriptor {
-            key: "request-types",
-            name: "Request Type Durations",
-            description:
-                "How long each client-request type actually takes, measured from the time tracked against the tickets those requests produced.",
-            parameters: vec![date("from", false), date("to", false)],
-        },
-        ReportDescriptor {
-            key: "custom",
-            name: "Custom Report Builder",
-            description:
-                "Build a report from a whitelisted catalog of sources, dimensions, and measures. Discover the catalog at GET /reports/custom/schema and run via POST /reports/custom. This is the only report key GET /reports/{key}/export cannot serve: the spec travels in a POST body, which a GET export cannot carry, so ask POST /reports/custom for CSV with \"format\": \"csv\" instead. Every other key in this registry exports.",
-            parameters: vec![],
-        },
-        ReportDescriptor {
-            key: "projects",
-            name: "Project Delivery",
-            description:
-                "Projects by status, budget vs actual hours / amount, task completion, and overdue projects.",
-            parameters: vec![],
-        },
-        ReportDescriptor {
-            key: "clients",
-            name: "Clients & Assets",
-            description:
-                "Company counts, asset inventory by type and status, warranties expiring soon, and contract renewals.",
-            parameters: vec![],
-        },
-    ]))
+) -> AppResult<Json<&'static [ReportDescriptor]>> {
+    Ok(Json(REPORTS))
 }
 
 /// PMS-406: `team_id` scopes the dashboard aggregates to a single team so
@@ -267,20 +301,34 @@ async fn export_report(
             q.format
         )));
     }
-    let csv = match report.as_str() {
-        "dashboard" => csv_for_dashboard(
+    // The registry resolves the path segment, so `GET /reports` and this
+    // export serve exactly the same set of keys (PMS-839). Plain `{report}`,
+    // not `{report:?}`: Debug quoted the name inside the sentence, so the 404
+    // read `report "widgets" not found` (PMS-775).
+    let Some(descriptor) = REPORTS.iter().find(|r| r.key == report) else {
+        return Err(AppError::NotFound(format!("Report {report}")));
+    };
+    let csv = match descriptor.kind {
+        ReportKind::Dashboard => csv_for_dashboard(
             &s.service
                 .dashboard(u.tenant(), q.team_id, &u.timezone)
                 .await?,
         ),
-        "tickets" => csv_for_tickets(&s.service.tickets(u.tenant(), q.from, q.to).await?),
-        "time" => csv_for_time(&s.service.time(u.tenant(), q.from, q.to).await?),
-        "request-types" => csv_for_request_types(
+        ReportKind::Tickets => csv_for_tickets(&s.service.tickets(u.tenant(), q.from, q.to).await?),
+        ReportKind::Time => csv_for_time(&s.service.time(u.tenant(), q.from, q.to).await?),
+        ReportKind::RequestTypes => csv_for_request_types(
             &s.service
                 .request_type_durations(u.tenant(), q.from, q.to)
                 .await?,
         ),
-        "billing" => {
+        // The one registered key a GET export cannot serve: the spec travels
+        // in a POST body. Say so rather than 404ing a report that exists.
+        ReportKind::Custom => {
+            return Err(AppError::BadRequest(
+                "The custom report cannot be exported through GET /reports/custom/export: its spec travels in a request body. POST /reports/custom with \"format\": \"csv\" instead.".to_string(),
+            ))
+        }
+        ReportKind::Billing => {
             // The billing export carries the same revenue / A/R figures as
             // GET /reports/billing, so it enforces the same finance gate
             // rather than letting any reports-enabled role read it (PMS-350:
@@ -292,8 +340,8 @@ async fn export_report(
             }
             csv_for_billing(&s.service.billing(u.tenant(), q.company_id).await?)
         }
-        "projects" => csv_for_projects(&s.service.projects(u.tenant()).await?),
-        "clients" => {
+        ReportKind::Projects => csv_for_projects(&s.service.projects(u.tenant()).await?),
+        ReportKind::Clients => {
             // The clients export is Client Profitability (invoiced / paid /
             // outstanding), the same financial data as GET /reports/clients,
             // so it enforces the same finance gate as the billing export above
@@ -305,9 +353,6 @@ async fn export_report(
             }
             csv_for_clients(&s.service.clients(u.tenant()).await?)
         }
-        // Plain `{other}`, not `{other:?}`: Debug quoted the name inside the
-        // sentence, so the 404 read `report "widgets" not found` (PMS-775).
-        other => return Err(AppError::NotFound(format!("Report {other}"))),
     };
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
@@ -453,4 +498,53 @@ async fn request_types_report(
             .request_type_durations(u.tenant(), q.from, q.to)
             .await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PMS-839: the exhaustive match in `export_report` only gates a new
+    /// registry entry if that entry needs a new `ReportKind`. Reusing a
+    /// variant would slip an entry past the compiler and silently export
+    /// another report's data under it.
+    #[test]
+    fn every_descriptor_has_its_own_key_and_kind() {
+        for (i, r) in REPORTS.iter().enumerate() {
+            for other in &REPORTS[i + 1..] {
+                assert_ne!(r.key, other.key, "two registry entries share a key");
+                assert_ne!(
+                    r.kind, other.kind,
+                    "{} and {} share a ReportKind, so one of them never reached \
+                     the export match as itself",
+                    r.key, other.key
+                );
+            }
+        }
+    }
+
+    /// The wire shape predates the array and clients read it, so `kind` must
+    /// stay off it: the descriptor serialises as key / name / description /
+    /// parameters and nothing else.
+    #[test]
+    fn the_registry_wire_shape_is_unchanged() {
+        let json = serde_json::to_value(REPORTS).expect("serialise the registry");
+        let entries = json.as_array().expect("the registry is a JSON array");
+        assert_eq!(entries.len(), REPORTS.len());
+        for entry in entries {
+            // serde_json orders an object's keys alphabetically, so compare
+            // against the sorted field set rather than declaration order.
+            let fields: Vec<&str> = entry
+                .as_object()
+                .expect("a descriptor is a JSON object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                fields,
+                ["description", "key", "name", "parameters"],
+                "descriptor {entry}"
+            );
+        }
+    }
 }
