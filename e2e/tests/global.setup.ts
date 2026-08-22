@@ -35,8 +35,8 @@ import { loginViaSpa } from '../lib/login';
 // next run captures via the bearer header normally.
 //
 // Why network sniff and not POST /api/v1/auth/login directly?
-//   - mokosh hosts no OP and no token endpoint (PMS-295 removed the
-//     crates/mokosh-auth* subsystem); bunyip is the OP and this suite has
+//   - mokosh hosts no OP and no token endpoint (PMS-295 removed the OP
+//     subsystem it used to ship); bunyip is the OP and this suite has
 //     no client credentials for a service-to-service grant against it.
 //   - Legacy POST /api/v1/auth/login only works against rows in mokosh's
 //     local `users` table; SPA accounts that signed up through the bunyip

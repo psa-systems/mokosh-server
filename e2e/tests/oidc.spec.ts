@@ -44,8 +44,8 @@ test.describe('OIDC token flow', () => {
       response_type: 'code',
       client_id: env.oidcClientId,
       redirect_uri: env.oidcRedirectUri,
-      // offline_access is required by the OP to mint a refresh_token (the
-      // last leg of this test). See crates/mokosh-auth-oidc/.
+      // offline_access is required by bunyip (the OP) to mint a refresh_token
+      // (the last leg of this test).
       scope: 'openid profile email offline_access',
       state,
       nonce,
