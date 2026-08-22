@@ -35,9 +35,9 @@ import { loginViaSpa } from '../lib/login';
 // next run captures via the bearer header normally.
 //
 // Why network sniff and not POST /api/v1/auth/login directly?
-//   - The OP (crates/mokosh-auth-oidc/src/discovery.rs:47) only advertises
-//     `authorization_code` + `refresh_token`. No client_credentials, no
-//     password grant - so a service-to-service token mint is not available.
+//   - mokosh hosts no OP and no token endpoint (PMS-295 removed the
+//     crates/mokosh-auth* subsystem); bunyip is the OP and this suite has
+//     no client credentials for a service-to-service grant against it.
 //   - Legacy POST /api/v1/auth/login only works against rows in mokosh's
 //     local `users` table; SPA accounts that signed up through the bunyip
 //     hub live elsewhere and return 401 there.
