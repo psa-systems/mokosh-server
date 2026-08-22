@@ -1,8 +1,36 @@
-# Codebase state - mokosh-server
+# Codebase state - mokosh-server (2026-05-06 snapshot, frozen)
 
-A practical reference for what's actually implemented in this repo.
-Derived from a 2026-05-06 audit and intended to be kept current
-alongside source changes.
+**Snapshot date: 2026-05-06. Frozen on 2026-08-22 (PMS-849). Not
+maintained, and not a description of the current tree.**
+
+This file is the record of the 2026-05-06 audit plus the dated
+corrections appended to it since. Read it as history. Every count, LOC
+figure, line number and "today the code does X" claim below was
+measured on 2026-05-06 unless a dated note says otherwise, and most of
+them are now wrong: roughly 30 modules, a Postgres-backed integration
+suite, RLS and rate limiting all shipped after the audit. Three doc
+audits in a row (2026-08-08, 2026-08-10, 2026-08-15) found this file
+stale while it still called itself current, which is why it now
+carries its date instead of a promise.
+
+Do not append to it. Confirm any claim here against the tree before
+acting on it.
+
+For current state, read in this order:
+
+1. [`src/api/router.rs`](../../src/api/router.rs) for what is actually
+   mounted, and the "Routing model" section of the repo
+   [`CLAUDE.md`](../../CLAUDE.md) for what authenticates a request to
+   each top-level nest (including the unauthenticated
+   `/api/v1/public/*` subtree, the portal router and the two webhook
+   receivers, none of which existed at this snapshot).
+2. [`architecture-seams.md`](architecture-seams.md) for the
+   subsystems that deliberately coexist and which side is canonical.
+3. The tree itself for any count (see [Counts](#counts) below).
+
+What stays useful here is the vocabulary: the `F1..F14` fix ids and
+the numbered [cross-cutting issues](#cross-cutting-issues), which
+source comments and YouTrack issues cite by number.
 
 > **Update 2026-06-03 (Service Desk slice).** The metrics and
 > per-module table below predate substantial work and are stale in
@@ -27,8 +55,10 @@ alongside source changes.
 > calendar, contracts, quotes, assets, rmm, sla, saved_reports,
 > workflows, time_tracking, dashboards, email_intake, approvals,
 > settings, audit, data_transfer, and more) and the 501 placeholder
-> router is gone. The "At a glance" and "Placeholder modules" tables
-> below are kept for history but no longer reflect the handler layer.
+> router is gone. The "Placeholder modules" table below is kept for
+> history but no longer reflects the handler layer. (The "At a glance"
+> metrics table this note also named was deleted when the file was
+> frozen; see [Counts](#counts).)
 
 > **Update 2026-08-22 (export-format status, PMS-854).** An earlier
 > revision of this file said the PDF format of the report-export
@@ -42,24 +72,28 @@ alongside source changes.
 > 501 references below all describe the retired placeholder router
 > and are historical.
 
-## At a glance
+## Counts
 
-| Metric | Value |
-| --- | --- |
-| Total Rust LOC under [`src/`](../src/) (excluding modules) | ~3,000 |
-| LOC under [`src/modules/`](../src/modules/) | ~6,950 |
-| Modules implemented | **most** (~30 nested/merged in [`api/router.rs`](../src/api/router.rs); see the 2026-07-24 correction) |
-| Module placeholders | **0** (the 501 placeholder router is gone) |
-| Route groups under `/api/v1` | **~30 + `/health`** |
-| Route groups returning real data | **most** |
-| Report export formats | **CSV** ([`reports/routes.rs`](../src/modules/reports/routes.rs)); any other `format`, `pdf` included, is a 400 (see the 2026-08-22 correction) |
-| Schema tables in [`migrations/001_initial_schema.sql`](../migrations/001_initial_schema.sql) | **71** |
-| Tests | **0** |
-| TODOs in source | **11** |
+The 2026-05-06 metrics table stood here and has been removed. Every
+row of it was a number derivable from the tree in one command, and
+every one of them drifted: it was still claiming `Tests | 0` against a
+`tests/` directory that has held a Postgres-backed integration suite
+for months, and counting schema tables inside the monolithic initial
+migration that PMS-128 split into per-feature files. A frozen document
+cannot carry live counts, so derive them:
 
-The schema is far ahead of the handler layer. Most "missing" features
-already have tables waiting in the initial migration; the gap is
-service + route code, not data modeling.
+```nu
+ls migrations/*.sql | length                    # migrations
+ls tests/*.rs | length                          # integration test files
+ls src/modules/ | where type == dir | length    # feature modules
+rg --count-matches '\.nest\(|\.merge\(' src/api/router.rs   # mounts
+```
+
+The reading the table was there to support does still hold in places:
+the schema runs ahead of the handler layer, so a "missing" feature
+often has its tables waiting and needs service plus route code rather
+than data modeling. Which features those are is not recorded here
+accurately any more.
 
 ## Architecture
 
@@ -440,7 +474,7 @@ the router mapped each to a placeholder handler that returned
 these, so adding a real module is mostly handler + service work
 against an existing schema.
 
-| Module | Schema tables in [`001_initial_schema.sql`](../migrations/001_initial_schema.sql) | Client UI surface affected |
+| Module | Schema tables (in the 2026-05-06 monolith, since split into [`migrations/`](../../migrations/) by PMS-128) | Client UI surface affected |
 | --- | --- | --- |
 | `assets` | `asset_types`, `assets`, `asset_relationships`, `configuration_items`, `credential_vault`, `asset_audit_log` | `/assets`, `/assets/new`, `/assets/:id` |
 | `audit` | `audit_log` | none direct |
@@ -478,8 +512,11 @@ the infrastructure or shared-helper layer.
    impact server defect.
 2. **Portal endpoints all return 501.** [`router.rs:90-99`](../src/api/router.rs#L90).
    The client portal renders pages that cannot ever fetch data.
-3. **No tests.** No `tests/` dir, no `*test*.rs` files, no
-   integration coverage for any route group.
+3. **No tests.** ~~No `tests/` dir, no `*test*.rs` files, no
+   integration coverage for any route group.~~ **Resolved (F10).**
+   [`tests/`](../../tests/) is a Postgres-backed integration suite run by
+   `just test-integration`; derive its size from the tree rather than
+   from a number in a doc (see [Counts](#counts)).
 4. **Tracing is structural, not semantic.** `TraceLayer` is wired
    globally; `RUST_LOG` is honored. Service methods do not open
    named spans, so request-scoped diagnostics through the body of a
@@ -532,11 +569,12 @@ the infrastructure or shared-helper layer.
    and `Update*Request` types are validated. `*Filter` query types
    (`TicketFilter`, `CompanyFilter`, `ContactFilter`) are not.
    Tracked as **F9**.
-10. **Single 1688-line initial migration.** Adding any feature
-    module on the server side will need to touch
-    [`001_initial_schema.sql`](../migrations/001_initial_schema.sql)
-    plus the seed file. Pre-prod is the cheapest moment to split it
-    per feature. Tracked as **F14**.
+10. **Single 1688-line initial migration.** ~~Adding any feature
+    module on the server side will need to touch the monolithic
+    initial migration plus the seed file. Pre-prod is the cheapest
+    moment to split it per feature.~~ **Resolved (F14, PMS-128):** the
+    monolith is gone and [`migrations/`](../../migrations/) holds
+    per-feature files, each immutable once applied.
 11. **Companies route alias is dead.**
     [`router.rs:45`](../src/api/router.rs#L45) declares
     `.nest("/companies", Router::new())` with the comment "Alias

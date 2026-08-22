@@ -83,7 +83,7 @@ oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
 compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
 .forgejo/workflows/     CI (Forgejo)
-docs/                   Contributor/user docs; docs/dev-docs/ = internal notes (codebase-state.md = module/route catalog)
+docs/                   Contributor/user docs; docs/dev-docs/ = internal notes (codebase-state.md = frozen 2026-05-06 route catalog)
 ```
 
 ### Auth: two independent mechanisms (PMS-295)
@@ -122,7 +122,7 @@ Portal sessions are stateless, so revocation is a cutoff, not a delete (MAPPS-53
 
 ### Multi-tenancy
 
-No middleware-level tenant scoping. Every service method takes `tenant_id: Uuid` explicitly. Forgetting to thread `user.tenant_id` becomes a cross-tenant data leak. See `docs/dev-docs/codebase-state.md` cross-cutting issue #8.
+No middleware-level tenant scoping: every service method takes the scope explicitly. Since PMS-139 that scope is a `TenantId` newtype (`src/modules/auth/tenant.rs`) whose in-crate constructor is `pub(crate)` and is reached only through `CurrentUser::tenant()`, so a handler that forgets to thread the caller's tenant no longer compiles instead of leaking across tenants. The deliberate escape hatch is `TenantId::from_trusted`, for the paths where the scope genuinely is not a `CurrentUser` claim: the Stripe and RMM webhook receivers, super-admin `tenants` handlers addressing a path tenant, portal contact sessions, the seeders, and the cross-tenant workers (`calendar/worker.rs`, `sla/worker.rs`, the billing sweep). Cross-cutting issue #8 in `docs/dev-docs/codebase-state.md` records the rollout.
 
 ### Migrations
 
@@ -132,7 +132,7 @@ Per-feature files under `migrations/` (split from the original `001_initial_sche
 
 ### Module status
 
-Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 implemented modules (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, `saved_reports`, `workflows`, `time_tracking`, and more); the old `stub_routes()` 501 placeholder mechanism is gone. The report-export route (`src/modules/reports/routes.rs`) implements CSV only and rejects every other `format`, `pdf` included, with 400 and not 501: `format` is an enumerated query parameter, so a value outside the implemented set is an out-of-range request rather than a server-side gap (PMS-854; adding PDF is tracked in PMS-876). The schema is still ahead of the handler layer in places. Before adding a new module, read `docs/dev-docs/codebase-state.md` for the per-module status, open TODOs (`F1..F14`), and known shallow-DTO traps in tickets.
+Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 implemented modules (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, `saved_reports`, `workflows`, `time_tracking`, and more); the old `stub_routes()` 501 placeholder mechanism is gone. The report-export route (`src/modules/reports/routes.rs`) implements CSV only and rejects every other `format`, `pdf` included, with 400 and not 501: `format` is an enumerated query parameter, so a value outside the implemented set is an out-of-range request rather than a server-side gap (PMS-854; adding PDF is tracked in PMS-876). The schema is still ahead of the handler layer in places. `docs/dev-docs/codebase-state.md` is a frozen 2026-05-06 snapshot (PMS-849), not a current per-module status: read it for the `F1..F14` fix ids, the numbered cross-cutting issues that source comments cite, and the shallow-DTO traps in tickets, and read `src/api/router.rs` plus the "Routing model" section above for what is actually mounted. Do not append to it; a new route group is recorded in the "Routing model" list.
 
 ## Conventions specific to this repo
 
