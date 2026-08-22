@@ -1,10 +1,15 @@
 ---
 
-# The Postgres-backed integration suite lives in
-# a separate workflow (integration.yml) so this gate stays fast and the local
-# `just pre-commit` hook can mirror it one-to-one (PMS-267).
-# Validate code on every push and pull request by running 'just check'
-# Mirrors the local `just check` + `just test` recipes (which use ./dev/cargo).
+# Fast, database-free gate on every push and pull request. The Postgres-backed
+# integration suite lives in a separate workflow (integration.yml) so this one
+# stays fast (PMS-267).
+#
+# The steps below are spelled out rather than delegated to `just`, so they drift
+# from the local recipes silently. `just check` covers every step here except
+# the two cargo test ones, and `just pre-commit` covers those plus fmt / clippy
+# / compile; running both locally covers this workflow. Keep the three in step
+# and record any deliberate difference in docs/dev-docs/local-vs-ci-checks.md
+# (PMS-851).
 name: Check
 
 on:

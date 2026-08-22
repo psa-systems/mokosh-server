@@ -130,7 +130,8 @@ just dev --detach            # boot or rebuild
 just down                    # stop, keep volumes
 just dev-clean               # stop + drop volumes + remove .env (leaves .env.infisical; next `just dev` regenerates .env)
 
-just check                   # cargo check + clippy + fmt --check + repo guards (run before pushing)
+just check                   # every check.yml step except its cargo test steps (run before pushing)
+just pre-commit              # the cargo test steps `just check` leaves out, plus fmt/clippy/compile
 just test                    # cargo test workspace-wide
 just fmt                     # cargo fmt --all
 just migrate-run             # sqlx migrate run against $DATABASE_URL (host)

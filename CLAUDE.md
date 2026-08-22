@@ -15,10 +15,12 @@ All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0
 
 ```
 just                       # list recipes
-just check                 # cargo check + clippy + fmt --check + repo guards (run before pushing)
+just check                 # every check.yml step except its cargo test steps (run before pushing)
 just check-compile         # cargo check --all-targets
-just check-clippy          # cargo clippy --all-targets
+just check-clippy          # cargo clippy --all-targets -- -D warnings (same as check.yml)
 just check-fmt             # cargo fmt --all --check
+just check-migration-immutability # fail if a migration already on main is modified or deleted
+just check-pool-safety     # fail if a serving `.pool()` call lacks its `// SAFETY (PMS-285` note
 just check-workspace-deps  # [workspace.dependencies] matches what members inherit
 just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just check-env-example     # every var the code reads has a .env.example key and a compose.dev.yml line
@@ -27,13 +29,15 @@ just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
 just install-hooks         # install the git pre-commit hook -> runs `just pre-commit`
-just pre-commit            # fast, DB-free fmt/clippy/compile/unit/doc checks (mirrors CI check.yml)
+just pre-commit            # check.yml's cargo steps only: fmt/clippy/compile/unit/doc, in the dev container
 just build                 # cargo build --release --bins
 just migrate-run           # sqlx migrate run against $DATABASE_URL
 just migrate-create <name> # new migration in migrations/
-just check-docker          # validate OCI image builder stage
+just check-docker          # validate OCI image builder stage (NOT part of `just check`)
 just build-docker          # build production OCI image (oci-build/Dockerfile)
 ```
+
+`just check` and `just pre-commit` are complements: together they cover every step of `.forgejo/workflows/check.yml`, and neither covers it alone. `docs/dev-docs/local-vs-ci-checks.md` maps the workflow onto the recipes step by step and states why `check-docker`, `test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella recipe (PMS-851). Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-commit`) and the row in that file.
 
 Single test: `cargo test -p <crate> <test_name>` (workspace), e.g. `cargo test -p mokosh-server utils::totp::tests::rfc6238_vector`.
 

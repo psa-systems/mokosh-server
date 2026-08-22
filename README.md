@@ -105,7 +105,7 @@ Every recipe `just --list` prints is listed here; run `just --list` for the grou
 # General
 just                        # the `default` recipe: list every recipe
 just install-hooks          # install the git pre-commit hook (once per fresh clone) -> runs `just pre-commit`
-just pre-commit             # fast, database-free checks in the dev `server` container (mirrors CI check.yml)
+just pre-commit             # check.yml's cargo checks (fmt/clippy/compile/unit/doc) in the dev `server` container
 
 # Dev stack
 just dev [args]             # start the Traefik-routed dev stack (args go to `docker compose up`, e.g. --build --detach)
@@ -116,12 +116,14 @@ just dev-clean-all          # everything dev-clean does, plus remove this repo's
 just infisical-bootstrap    # one-time: drive Infisical first-run setup and fill INFISICAL_* in .env
 
 # Checks
-just check                  # umbrella: compile + clippy + fmt --check + every repo guard below
+just check                  # umbrella: every check.yml step except its cargo test steps (see below)
 just check-compile          # cargo check --all-targets
-just check-clippy           # cargo clippy --all-targets
+just check-clippy           # cargo clippy --all-targets -- -D warnings (same as check.yml)
 just check-fmt              # cargo fmt --all --check
-just check-docker           # build the OCI image's builder stage only (validation)
+just check-docker           # build the OCI image's builder stage only (validation; NOT in `just check`)
 just check-migrations       # fail if two migrations share a numeric prefix (PMS-198)
+just check-migration-immutability # fail if a migration already on main is modified or deleted (DEV-395)
+just check-pool-safety      # fail if a serving `.pool()` call lacks its `// SAFETY (PMS-285` note (PMS-692)
 just check-mail-copy        # fail if a `Mailer` helper duplicates a seeded template's copy (PMS-700)
 just check-rate-limit-helper # fail if a 429 response is built outside the shared builder (PMS-773)
 just check-runner-labels    # fail if a CI job requests the wrong runner label (PMS-719)
@@ -148,6 +150,12 @@ just migrate-create <name>  # create a new migration file
 # Release
 just create-release <bump>  # bump version (major|minor|hotfix), push release branch, print PR link
 ```
+
+`just check` plus `just pre-commit` together cover every step of
+`.forgejo/workflows/check.yml`; neither covers it alone.
+[`docs/dev-docs/local-vs-ci-checks.md`](docs/dev-docs/local-vs-ci-checks.md)
+maps the workflow onto the recipes step by step and states why `check-docker`,
+`test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella.
 
 ## First-run admin bootstrap
 

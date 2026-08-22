@@ -20,13 +20,17 @@ install-hooks:
     ^chmod +x $hook
     print $"Wrote ($hook) -> just pre-commit"
 
-# Mirrors check.yml one-to-one so a green hook means a green Check run. The
-# `--all-targets` clippy/check steps compile the tests/*.rs integration binaries
-# too (PMS-640 mounts ./tests into the `server` service), so a harness-breaking
-# signature change fails here rather than only in CI. The Postgres-backed suite
-# is still NOT run here (compile-only); use `just test-integration` (mirrors
-# integration.yml) to actually run it. PMS-267.
-# Run the fast, database-free checks inside the dev compose `server` container.
+# The cargo half of check.yml (fmt, clippy, compile, unit tests, doc tests) run
+# in the dev compose `server` container. It does NOT run check.yml's repo guard
+# scripts; `just check` runs those, so the two together cover check.yml and
+# neither covers it alone (PMS-851; full mapping in
+# docs/dev-docs/local-vs-ci-checks.md). The `--all-targets` clippy/check steps
+# compile the tests/*.rs integration binaries too (PMS-640 mounts ./tests into
+# the `server` service), so a harness-breaking signature change fails here
+# rather than only in CI. The Postgres-backed suite is still NOT run here
+# (compile-only); use `just test-integration` (mirrors integration.yml) to
+# actually run it. PMS-267.
+[doc("Run check.yml's fast, database-free cargo checks inside the dev compose `server` container.")]
 [group: 'hooks']
 pre-commit: ensure-env
     #!/usr/bin/env nu
@@ -44,9 +48,21 @@ pre-commit: ensure-env
 
 # -- Checks ----------------------------------------------------------------------
 
-# Umbrella check: build + clippy + fmt + docker builder stage.
+# Every check.yml step except its two cargo test steps: all twelve repo guard
+# steps plus compile, clippy and fmt. `just pre-commit` runs the unit and doc
+# tests, so the two recipes together cover check.yml and neither covers it alone
+# (PMS-851; per-step mapping in docs/dev-docs/local-vs-ci-checks.md).
+#
+# Deliberately NOT here, and why:
+# - `check-docker` builds an OCI builder stage (minutes, needs a Docker builder
+#   and the crates.io network), and no check.yml step builds an image either;
+#   build-oci-image.yml owns that. Run it by hand before touching
+#   oci-build/Dockerfile.
+# - `test-integration` needs a Postgres container, which is why PMS-267 split it
+#   into integration.yml. Run it by hand before touching the tests/*.rs suite.
+[doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes
 
 # Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
 # README.md or docs/quickstart.md names a recipe the justfile does not define.
@@ -64,9 +80,28 @@ check-env-example:
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
+[doc("Fail if two migrations share a numeric prefix (PMS-198).")]
 [group: 'check']
 check-migrations:
     nu scripts/check-migration-prefixes.nu
+
+# Enforce migration immutability (DEV-395). sqlx re-verifies applied-migration
+# checksums on boot, so editing one stops every deployed database. Needs
+# origin/main fetched with history (check.yml clones with fetch-depth: 0); run
+# `git fetch origin main` first on a shallow clone.
+[doc("Fail if a migration already on main is modified, renamed, or deleted (DEV-395).")]
+[group: 'check']
+check-migration-immutability:
+    nu scripts/check-migration-immutability.nu
+
+# Keep request-serving queries off the bare app pool (PMS-692). A `.pool()` call
+# hits the NOBYPASSRLS pool and fail-closes RLS-covered rows to zero, so it is
+# legitimate only on an RLS-exempt table or a pre-auth path, with an adjacent
+# `// SAFETY (PMS-285` note saying which.
+[doc("Fail if a serving `.pool()` call appears without its `// SAFETY (PMS-285` note (PMS-692).")]
+[group: 'check']
+check-pool-safety:
+    nu scripts/check-pool-safety.nu
 
 # Keep transactional email body copy in notification_templates, not in Rust
 # (PMS-700). Fails if a `Mailer` helper re-adds a seeded template's wording.
@@ -126,10 +161,12 @@ check-unused-deps:
 check-compile:
     cargo check --all-targets
 
-# Run clippy lints
+# Run clippy with check.yml's `-D warnings` (PMS-851). Without it a lint that
+# fails the Check job passed here, which is the drift this gate exists to catch.
+[doc("Run clippy over all targets with `-D warnings`, exactly as check.yml does.")]
 [group: 'check']
 check-clippy:
-    cargo clippy --all-targets
+    cargo clippy --all-targets -- -D warnings
 
 # Check formatting
 [group: 'check']
@@ -251,7 +288,7 @@ ensure-env:
     $"($rendered)\n" | save .env
     print "ensure-env: created .env with freshly generated self-owned secrets"
 
-# Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical — use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
+# Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical, use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
 [doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
 [group: 'dev']
 dev *args: ensure-env
