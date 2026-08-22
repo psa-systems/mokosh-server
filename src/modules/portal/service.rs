@@ -245,17 +245,21 @@ impl PortalAuthService {
         Ok(())
     }
 
-    /// Re-read a contact's display names from the `contacts` row. The
-    /// portal JWT omits names (PII minimisation), so the middleware
+    /// Re-read the per-request facts the middleware needs from the
+    /// `contacts` row: the display names, and MAPPS-532's revocation cutoff.
+    ///
+    /// The portal JWT omits names (PII minimisation), so the middleware
     /// hydrates `first_name` / `last_name` for `/me`-style handlers after
-    /// decoding the token (PMS-195). Scoped by `(tenant_id, id)`.
-    pub async fn contact_names(
+    /// decoding the token (PMS-195). The cutoff comes back in the same read
+    /// because the row is already being loaded. Scoped by `(tenant_id, id)`.
+    pub async fn contact_snapshot(
         &self,
         tenant_id: Uuid,
         contact_id: Uuid,
-    ) -> AppResult<Option<(String, String)>> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT first_name, last_name FROM contacts WHERE tenant_id = $1 AND id = $2",
+    ) -> AppResult<Option<PortalContactSnapshot>> {
+        let row: Option<(String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT first_name, last_name, portal_tokens_valid_from \
+             FROM contacts WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
         .bind(contact_id)
@@ -263,7 +267,40 @@ impl PortalAuthService {
         // so it does not fail closed on the NOBYPASSRLS serving connection.
         .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
-        Ok(row)
+        Ok(row.map(
+            |(first_name, last_name, tokens_valid_from)| PortalContactSnapshot {
+                first_name,
+                last_name,
+                tokens_valid_from,
+            },
+        ))
+    }
+
+    /// MAPPS-532: end every portal session this contact holds.
+    ///
+    /// The portal plane is stateless - `login` mints a JWT and writes no
+    /// session row, and `PortalJwtClaims` carries no session id - so there is
+    /// nothing to delete the way `AuthService::logout` deletes a
+    /// `user_sessions` row. Stamping the contact instead invalidates every
+    /// token issued before now, which is sign-out-everywhere: the right
+    /// default for a customer with one credential, no session manager and a
+    /// possibly shared machine.
+    #[tracing::instrument(skip(self))]
+    pub async fn logout(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<()> {
+        // The caller came through `RequirePortalAuth`, so the tenant is the
+        // verified `tid` claim: a tenant-scoped write on the RLS-covered
+        // `contacts` table, no migrator pool needed.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contacts SET portal_tokens_valid_from = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Decode + validate a portal JWT. Rejects anything that isn't
