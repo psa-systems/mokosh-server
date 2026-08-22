@@ -64,7 +64,7 @@ OIDC client registration recipes (`register-client`, etc.) were removed with mok
 src/
   main.rs               mokosh-server entrypoint: AppConfig::from_env, build router
   lib.rs                library crate root
-  api/router.rs         create_api_router: nests every module under /api/v1, wires middleware + CORS
+  api/router.rs         create_api_router: builds every /api/v1 nest (see "Routing model"), wires middleware + CORS
   bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown
   db/                   Database wrapper around sqlx::PgPool
   infisical/            Infisical HTTP client + first-run bootstrap
@@ -102,11 +102,14 @@ Portal reset tokens reuse the PMS-136 `portal_setup_tokens` row and its `{contac
 
 ### Routing model
 
-`create_api_router` (`src/api/router.rs`) builds:
+`create_api_router` (`src/api/router.rs`) builds these top-level nests, plus a fallback. Each one states what authenticates a request to it; keep this list in step with the `.nest(...)` calls at the end of `create_api_router`.
 
-- `/api/v1/*` PSA router. Every module exposes either `<name>_routes(service)` (nested under a prefix) or merges directly when it owns multiple top-level prefixes (e.g. `time_tracking_routes`, `projects_routes`, `calendar_routes`, `contracts_routes`, `billing_routes`, etc. all use `.merge`). `auth_middleware` runs globally and populates `AuthState`; route handlers opt in.
-- `/api/v1/portal/*` portal router with its OWN auth middleware (identity = `contacts` row, not `users`). Never sees `AuthState`.
-- Fallback for non-API paths: small HTML "not a frontend" page linking back to the SaaS shell.
+- `/api/v1/*` PSA router. Every module exposes either `<name>_routes(service)` (nested under a prefix) or merges directly when it owns multiple top-level prefixes (e.g. `time_tracking_routes`, `projects_routes`, `calendar_routes`, `contracts_routes`, `billing_routes`, etc. all use `.merge`). Authenticated by the session: `auth_middleware` runs globally and populates `AuthState`; route handlers opt in via `RequireAuth` / `RequireRole` / `RequireAdmin` / `RequireManager` / `RequireFinance`.
+- `/api/v1/public/*` UNAUTHENTICATED, by design. Nothing authenticates a request to this subtree: no session, no cookie, no bearer, no signature. Everything it serves is listed here. `GET` and `POST /api/v1/public/request-forms/{token}` (`src/modules/forms/public_routes.rs`), where the single-use magic-link token in the URL is the only identity and resolves its own tenant, throttled per client IP by `RequestFormLimiter`. `GET /api/v1/public/tenants/{tenant_id}/logo` (`src/modules/tenants/routes.rs`), which a recipient's mail client fetches straight out of a request-form email and can never authenticate; a tenant with no logo 404s identically to a tenant id that does not exist, and SVG is excluded from the allowed upload types (`src/modules/tenants/logo.rs`). A handler added here answers anyone on the internet: it needs its own throttle and must expose nothing that a tenant id or a leaked token alone should not unlock.
+- `/api/v1/portal/*` portal router with its OWN auth middleware (identity = `contacts` row, not `users`). Authenticated by a portal-tagged Bearer JWT that `portal_auth_middleware` decodes; handlers opt in via `RequirePortalAuth`, and the `/portal/auth/*` credential endpoints are reachable without one (they are rate limited by `AuthRateLimiter` instead). Never sees `AuthState`.
+- `/api/v1/bunyip/*` bunyip webhook receiver (`POST /webhooks/account-deleted`). Authenticated by the `X-Webhook-Signature` HMAC-SHA256 over the body, keyed by `BUNYIP_WEBHOOK_SECRET` (PMS-591), not by a session.
+- `/api/v1/stripe/*` Stripe webhook receiver (`POST /webhooks/{tenant_id}`). Authenticated by the `Stripe-Signature` HMAC over the raw body, keyed by that tenant's stored webhook signing secret (PMS-711), not by a session. The tenant id in the path selects which secret to verify against; it is not itself a credential.
+- Fallback for non-API paths: small HTML "not a frontend" page linking back to the SaaS shell. No authentication; it renders the same page for anyone.
 
 `#[cfg(feature = "multi-tenant")]` gates the `/tenants` CRUD routes; default features are `["multi-tenant", "server"]`. The `server` feature gates HTTP-only code so the library crate can be reused without Axum.
 
