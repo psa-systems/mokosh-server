@@ -5,7 +5,7 @@ content here is derived from a 2026-05-06 codebase audit; treat it
 as a living snapshot and update it alongside the code changes that
 invalidate any of its claims. The same audit produced matching
 documentation in
-[`mokosh-clients/dev-docs/`](../../mokosh-clients/dev-docs/).
+`mokosh-clients/dev-docs/`, in that repository.
 
 ## Contents
 
@@ -30,7 +30,7 @@ documentation in
 ## Conventions
 
 - File paths are relative to the repo root (e.g.
-  [`src/api/router.rs`](../src/api/router.rs)).
+  [`src/api/router.rs`](../../src/api/router.rs)).
 - "F1..F14" identifiers reference proposed fixes in
   [`codebase-state.md`](codebase-state.md#proposed-fixes).
 - Endpoint paths are full (`/api/v1/auth/login`) unless inside a

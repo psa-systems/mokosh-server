@@ -133,6 +133,7 @@ just check-workspace-deps   # fail if [workspace.dependencies] and its members d
 just check-unused-deps      # cargo-machete: fail on a dependency with no call site (PMS-780)
 just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836)
 just check-doc-recipes      # fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843)
+just check-doc-links        # fail if a relative Markdown link does not resolve to an existing path (PMS-850)
 
 # Format, test, build
 just fmt                    # cargo fmt --all

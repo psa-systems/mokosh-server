@@ -25,6 +25,7 @@ just check-workspace-deps  # [workspace.dependencies] matches what members inher
 just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just check-env-example     # every var the code reads has a .env.example key and a compose.dev.yml line
 just check-doc-recipes     # every `just <recipe>` in README.md / docs/quickstart.md exists in the justfile
+just check-doc-links       # every relative Markdown link resolves to a path that exists
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)

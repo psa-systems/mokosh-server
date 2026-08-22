@@ -30,6 +30,7 @@ one alone and you have not.
 | Workspace dependency table | `nu scripts/check-workspace-deps.nu` | `check-workspace-deps` | no |
 | Environment-variable parity | `nu scripts/check-env-example.nu` | `check-env-example` | no |
 | Documented just recipes | `nu scripts/check-doc-recipes.nu` | `check-doc-recipes` | no |
+| Markdown link targets | `nu scripts/check-doc-links.nu` | `check-doc-links` | no |
 | Unused dependencies | `cargo machete` | `check-unused-deps` | no |
 | Check formatting | `cargo fmt --all --check` | `check-fmt` | yes |
 | Clippy | `cargo clippy --all-targets -- -D warnings` | `check-clippy` | yes |
