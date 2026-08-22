@@ -2,8 +2,8 @@
 
 # Resolvable-path guard for the config files an operator reads (PMS-855).
 #
-# .env.example, compose.dev.yml and the justfile carried four comments pointing
-# at a `docs/mokosh-smtp/` directory that has never existed in this repo at any
+# .env.example and compose.dev.yml carried four comments pointing at a `docs/`
+# subdirectory of SMTP setup notes that has never existed in this repo at any
 # commit. Two of them are in .env.example, which `just ensure-env` mints into
 # .env in every clone, so the dead pointer reached every developer who set the
 # project up and told an operator configuring mail to go looking for nothing.
