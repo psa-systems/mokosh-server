@@ -90,6 +90,68 @@ pub async fn seed_company(pool: &PgPool) -> Uuid {
     id
 }
 
+/// Seed a ticket plus one internal note on it under the default tenant,
+/// reusing the seeded statuses / priorities / queues. Returns
+/// `(ticket_id, note_id)`.
+///
+/// Shared by the two attachment binaries (`ticket_note_attachments.rs` and
+/// `attachment_download_streaming.rs`, split apart in PMS-822) so the fixture
+/// cannot drift between them. `#[allow(dead_code)]` for the same per-binary
+/// reason as the other helpers.
+#[allow(dead_code)]
+pub async fn seed_ticket_and_note(pool: &PgPool, admin_id: Uuid, company_id: Uuid) -> (Uuid, Uuid) {
+    let status_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_statuses WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("status");
+    let priority_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("priority");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("queue");
+    let ticket_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO tickets
+           (id, tenant_id, ticket_number, title, status_id, priority_id,
+            queue_id, company_id, created_by_id)
+           VALUES ($1, $2, $3, 'Attachment ticket', $4, $5, $6, $7, $8)"#,
+    )
+    .bind(ticket_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(format!("T-{}", &ticket_id.to_string()[..8]))
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(admin_id)
+    .execute(pool)
+    .await
+    .expect("seed ticket");
+    let note_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO ticket_notes
+           (id, tenant_id, ticket_id, content, note_type, created_by_id)
+           VALUES ($1, $2, $3, 'parent note', 'internal', $4)"#,
+    )
+    .bind(note_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(ticket_id)
+    .bind(admin_id)
+    .execute(pool)
+    .await
+    .expect("seed note");
+    (ticket_id, note_id)
+}
+
 /// Parse a decimal string literal into a [`Decimal`] for test fixtures
 /// that bind money columns. Panics on malformed input (test-only).
 #[allow(dead_code)]

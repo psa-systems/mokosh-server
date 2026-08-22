@@ -6,56 +6,19 @@
 //!     ticket and an agent can download it; a sibling-company contact
 //!     gets 404 on the same paths (cross-company access deny).
 //!   - Server enforces ATTACHMENT_MAX_BYTES; oversize bodies 413.
-//!   - PMS-783: a download is cacheable, revalidates to 304, and streams
-//!     rather than buffering the blob.
+//!   - PMS-783: a download is cacheable and revalidates to 304. The companion
+//!     pin that the download STREAMS rather than buffering lives in
+//!     `tests/attachment_download_streaming.rs`: its allocation probe is
+//!     process-global and cannot share a binary with other cases (PMS-822).
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// PMS-783 F6: the largest single allocation this process has made since the
-/// counter was last reset.
-///
-/// Peak RSS cannot answer "did the server buffer the whole blob?" here: it is a
-/// monotonic high-water mark for a process that also runs the client and three
-/// other tests, so 25 MiB of slack hides the very allocation being looked for.
-/// The largest single allocation does answer it, because the old code path
-/// (`tokio::fs::read`) preallocates one `Vec` the size of the file, and a
-/// streamed body never asks for more than a chunk.
-static MAX_ALLOC: AtomicUsize = AtomicUsize::new(0);
-
-struct MaxAllocTracker;
-
-unsafe impl GlobalAlloc for MaxAllocTracker {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        MAX_ALLOC.fetch_max(layout.size(), Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        MAX_ALLOC.fetch_max(layout.size(), Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        MAX_ALLOC.fetch_max(new_size, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: MaxAllocTracker = MaxAllocTracker;
 
 /// Shared per-suite attachment dir + tight 1 KiB cap. Blob filenames
 /// are unique uuids so parallel tests do not collide.
@@ -64,59 +27,6 @@ fn install_test_attachment_env() -> PathBuf {
     std::env::set_var("ATTACHMENT_DIR", &dir);
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1024");
     dir
-}
-
-async fn seed_ticket_and_note(pool: &PgPool, admin_id: Uuid, company_id: Uuid) -> (Uuid, Uuid) {
-    let status_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM ticket_statuses WHERE tenant_id = $1 LIMIT 1")
-            .bind(common::DEFAULT_TENANT_ID)
-            .fetch_one(pool)
-            .await
-            .expect("status");
-    let priority_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
-            .bind(common::DEFAULT_TENANT_ID)
-            .fetch_one(pool)
-            .await
-            .expect("priority");
-    let queue_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
-            .bind(common::DEFAULT_TENANT_ID)
-            .fetch_one(pool)
-            .await
-            .expect("queue");
-    let ticket_id = Uuid::new_v4();
-    sqlx::query(
-        r#"INSERT INTO tickets
-           (id, tenant_id, ticket_number, title, status_id, priority_id,
-            queue_id, company_id, created_by_id)
-           VALUES ($1, $2, $3, 'Attachment ticket', $4, $5, $6, $7, $8)"#,
-    )
-    .bind(ticket_id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(format!("T-{}", &ticket_id.to_string()[..8]))
-    .bind(status_id)
-    .bind(priority_id)
-    .bind(queue_id)
-    .bind(company_id)
-    .bind(admin_id)
-    .execute(pool)
-    .await
-    .expect("seed ticket");
-    let note_id = Uuid::new_v4();
-    sqlx::query(
-        r#"INSERT INTO ticket_notes
-           (id, tenant_id, ticket_id, content, note_type, created_by_id)
-           VALUES ($1, $2, $3, 'parent note', 'internal', $4)"#,
-    )
-    .bind(note_id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(ticket_id)
-    .bind(admin_id)
-    .execute(pool)
-    .await
-    .expect("seed note");
-    (ticket_id, note_id)
 }
 
 /// Insert a uniquely-named company on the default tenant. The shared
@@ -192,7 +102,7 @@ async fn agent_upload_list_download_delete(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
-    let (ticket_id, note_id) = seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let (ticket_id, note_id) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &admin_email, &admin_pw).await;
 
@@ -266,7 +176,7 @@ async fn oversize_upload_returns_413(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
-    let (ticket_id, note_id) = seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let (ticket_id, note_id) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &admin_email, &admin_pw).await;
 
@@ -305,7 +215,7 @@ async fn a_portal_delete_does_not_read_the_blob(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, _admin_email, _admin_pw) = common::seed_admin(&pool).await;
     let company_id = seed_company_named(&pool, "Delete Co").await;
-    let (ticket_id, note_id) = seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let (ticket_id, note_id) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
     let (_contact_id, contact_email, contact_pw) = seed_contact(&pool, company_id).await;
     let app = common::boot(pool.clone()).await;
     let portal_token = portal_login(&app, &contact_email, &contact_pw).await;
@@ -365,7 +275,7 @@ async fn a_download_is_cacheable_and_revalidates_to_304(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
-    let (ticket_id, note_id) = seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let (ticket_id, note_id) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &admin_email, &admin_pw).await;
 
@@ -452,83 +362,13 @@ async fn a_download_is_cacheable_and_revalidates_to_304(pool: PgPool) {
     assert_eq!(changed.bytes().await.unwrap().as_ref(), &body[..]);
 }
 
-/// PMS-783 F6: ten concurrent 25 MiB downloads used to mean 250 MiB of
-/// transient heap. Seeds the blob and the row directly rather than uploading,
-/// because the suite-wide cap is 1 KiB and the upload path is not what is
-/// under test.
-#[sqlx::test]
-async fn a_large_download_never_allocates_the_whole_blob(pool: PgPool) {
-    const BLOB_BYTES: usize = 25 * 1024 * 1024;
-    /// Comfortably above any HTTP read buffer on either side of the socket and
-    /// far below the blob, so the assertion only fires on a buffered body.
-    const ALLOC_CEILING: usize = 4 * 1024 * 1024;
-
-    let dir = install_test_attachment_env();
-    let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
-    let company_id = common::seed_company(&pool).await;
-    let (ticket_id, note_id) = seed_ticket_and_note(&pool, admin_id, company_id).await;
-
-    let attachment_id = Uuid::new_v4();
-    let blob_path = dir.join(format!("big-{attachment_id}"));
-    tokio::fs::create_dir_all(&dir).await.expect("blob dir");
-    tokio::fs::write(&blob_path, vec![7u8; BLOB_BYTES])
-        .await
-        .expect("write blob");
-    sqlx::query(
-        r#"INSERT INTO ticket_attachments
-           (id, tenant_id, ticket_id, note_id, file_name, file_size, mime_type,
-            storage_path, uploaded_by_id)
-           VALUES ($1, $2, $3, $4, 'big.bin', $5, 'application/octet-stream', $6, $7)"#,
-    )
-    .bind(attachment_id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(ticket_id)
-    .bind(note_id)
-    .bind(BLOB_BYTES as i32)
-    .bind(blob_path.to_string_lossy().to_string())
-    .bind(admin_id)
-    .execute(&pool)
-    .await
-    .expect("seed attachment row");
-
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &admin_email, &admin_pw).await;
-
-    // Reset AFTER the fixture: writing the blob allocates it once, on purpose.
-    MAX_ALLOC.store(0, Ordering::Relaxed);
-    let mut resp = app
-        .client
-        .get(app.url(&format!(
-            "/api/v1/tickets/{ticket_id}/notes/{note_id}/attachments/{attachment_id}"
-        )))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("download");
-    assert!(resp.status().is_success());
-    assert_eq!(resp.headers()["content-length"], BLOB_BYTES.to_string());
-    // Consume chunk by chunk and drop each: a `bytes()` call would buffer the
-    // whole body client-side and measure the test, not the server.
-    let mut received = 0usize;
-    while let Some(chunk) = resp.chunk().await.expect("chunk") {
-        received += chunk.len();
-    }
-    let peak = MAX_ALLOC.load(Ordering::Relaxed);
-    assert_eq!(received, BLOB_BYTES, "the whole blob still arrives");
-    assert!(
-        peak < ALLOC_CEILING,
-        "serving a {BLOB_BYTES}-byte attachment allocated {peak} bytes in one \
-         block; the body must stream, not buffer"
-    );
-}
-
 #[sqlx::test]
 async fn portal_upload_visible_to_agent_blocked_for_sibling(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company_a = seed_company_named(&pool, "Acme Alpha").await;
     let company_b = seed_company_named(&pool, "Beta Industries").await;
-    let (ticket_id, note_id) = seed_ticket_and_note(&pool, admin_id, company_a).await;
+    let (ticket_id, note_id) = common::seed_ticket_and_note(&pool, admin_id, company_a).await;
     let (contact_a_id, contact_a_email, contact_a_pw) = seed_contact(&pool, company_a).await;
     let (_contact_b_id, contact_b_email, contact_b_pw) = seed_contact(&pool, company_b).await;
     let app = common::boot(pool.clone()).await;

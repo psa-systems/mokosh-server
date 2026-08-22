@@ -210,10 +210,13 @@ Tracked as **F3** - the highest-impact server fix.
 
 Files: [`routes.rs`](../src/modules/contacts/routes.rs) (299),
 [`service.rs`](../src/modules/contacts/service.rs) (845),
-[`models.rs`](../src/modules/contacts/models.rs) (630).
+[`models.rs`](../src/modules/contacts/models.rs) (630),
+[`website_probe.rs`](../src/modules/contacts/website_probe.rs).
 
-**Endpoints:** 16 total. The router exposes companies, contacts, and
-sites all under `/api/v1/contacts/...`. The empty
+**Endpoints:** the table below is the list, as registered in
+[`contact_routes`](../src/modules/contacts/routes.rs). The router
+exposes companies, contacts, sites and the company-industry lookup all
+under `/api/v1/contacts/...`. The empty
 `.nest("/companies", Router::new())` declared at
 [`router.rs:45`](../src/api/router.rs#L45) is dead - it matches
 nothing, so `/api/v1/companies` returns 404 instead of an alias. See
@@ -222,13 +225,119 @@ nothing, so `/api/v1/companies` returns 404 instead of an alias. See
 | Path | Method |
 | --- | --- |
 | `/api/v1/contacts/companies` | GET / POST |
+| `/api/v1/contacts/companies/website-probe` | GET |
 | `/api/v1/contacts/companies/:company_id` | GET / PUT / DELETE |
 | `/api/v1/contacts/companies/:company_id/contacts` | GET |
 | `/api/v1/contacts/companies/:company_id/sites` | GET |
 | `/api/v1/contacts/contacts` | GET / POST |
+| `/api/v1/contacts/contacts/field-values` | GET |
 | `/api/v1/contacts/contacts/:contact_id` | GET / PUT / DELETE |
+| `/api/v1/contacts/company-industries` | GET / POST |
+| `/api/v1/contacts/company-industries/:id` | PUT / DELETE |
 | `/api/v1/contacts/sites` | POST |
 | `/api/v1/contacts/sites/:site_id` | GET / PUT / DELETE |
+
+`GET /companies/website-probe?url=<value>` (PMS-805) resolves a website
+on demand and reports whether https answers, whether http answers,
+whether http redirects to https, whether the host gains or loses a
+`www` prefix, and the final canonical URL. It is a static segment, so
+it resolves ahead of `/companies/{company_id}`. It reads and writes no
+tenant data; the tenant is the rate-limit key only. Both the reachable
+and the unreachable verdict are 200s, because determining that a site
+does not answer is a successful probe; input that cannot be a website
+at all is a 400. `guard_outbound_url`
+([`utils/net.rs`](../src/utils/net.rs)) gates every resolved address
+before the first connect and again for every redirect hop, which is
+what stops the endpoint being an SSRF primitive.
+
+**The same gate everywhere a URL is not hardcoded (PMS-809).** The probe
+was not the only outbound fetch of a caller-supplied URL, so
+`guard_outbound_url` is shared by three callers: the probe (ports pinned
+to 80/443), the ticket-automation `webhook` action
+([`tickets/automation.rs`](../src/modules/tickets/automation.rs), which
+now follows redirects itself so each hop is re-screened, and logs a
+refusal with the rule id and the blocked address), and
+`TacticalRmmProvider`
+([`rmm/provider.rs`](../src/modules/rmm/provider.rs), which screens its
+tenant-configured `api_url` before every request, refuses with an
+`AppError::Configuration` that reaches `rmm_connections.last_error`, and
+does not follow redirects). A second copy of the predicate or the resolve
+loop fails `utils::net`'s `exactly_one_definition_in_the_crate` test.
+`OUTBOUND_PRIVATE_ALLOWLIST` (hostnames, IPs, or CIDRs) is the operator
+escape hatch for an on-premise integration; fetches whose URL comes from
+operator env (Infisical, Stripe, the `OIDC_ISSUER` JWKS, the version
+check) are deliberately out of scope.
+
+**Contact child collections and the mirror rule (PMS-806).** A contact
+carries an ordered list of typed phone numbers (`contact_phones`:
+`phone_type` in `mobile`/`work`/`home`/`fax`/`other`, `number`,
+`extension`, `is_primary`, `sort_order`) and links to any number of
+companies (`contact_companies`: `company_id`, per-link `title`,
+`is_primary`, `sort_order`, `UNIQUE (contact_id, company_id)`). Both are
+tenant-scoped with their own `tenant_isolation` RLS policy and a partial
+unique index enforcing one primary per contact
+([`108_contact_phones_and_companies.sql`](../migrations/108_contact_phones_and_companies.sql)).
+
+A contact's links are ordered by `(created_at, sort_order)`, and that
+order is what "removing the primary promotes the OLDEST remaining link"
+means. `created_at` alone is not enough: it defaults to `NOW()`, the
+transaction timestamp, so every link written by one call shares a value
+and the tiebreak fell through to a random `uuid_generate_v4()`
+([`109_contact_company_link_order.sql`](../migrations/109_contact_company_link_order.sql),
+PMS-815). `write_contact_companies` sets `sort_order` from the request
+position on INSERT only, so a link that survives a rewrite keeps the
+position it was created with.
+
+The child tables are authoritative. `contacts.phone`, `.mobile`, `.fax`
+and `.company_id` stay on the table as **maintained mirrors**, recomputed
+from the child rows by
+[`recompute_contact_mirrors`](../src/modules/contacts/service.rs) inside
+the same transaction as every create and update - the single writer of
+those four columns. The rule: `phone` = the primary entry's number,
+`mobile` = the first `mobile`-type entry, `fax` = the first `fax`-type
+entry, `company_id` = the primary link (NULL with no links). This is a
+deliberate denormalization that keeps every pre-PMS-806 query, index,
+seed fixture, portal lookup and the current SPA working while the SPA
+catches up (MAPPS-481).
+
+`CreateContactRequest` / `UpdateContactRequest` take optional `phones`
+and `companies` arrays. Absent, the scalar fields drive the write and the
+service materializes the matching child rows; present, they are
+authoritative and the scalars in the same request are recomputed from
+them. Reads that answer "which contacts belong to company X"
+(`list_contacts`'s `company_id` filter, `get_company_contacts`, the
+company list's `contact_count`) go through `contact_companies`, so a
+contact is found through ANY of its links and counted once per company.
+`phones` and `companies` are hydrated with one batched query each per
+page, pinned by
+[`contact_hydration_query_budget.rs`](../tests/contact_hydration_query_budget.rs).
+
+Portal scoping is deliberately NOT broadened: a portal session still
+resolves the contact's primary company only (PMS-807).
+
+**Deleting a company unlinks its contacts (PMS-812).**
+`contacts.company_id` is `ON DELETE SET NULL`
+([`110_contacts_company_id_set_null.sql`](../migrations/110_contacts_company_id_set_null.sql)),
+not the `ON DELETE CASCADE` it was created with in 004. `delete_company`
+is the primary path: inside the same transaction as the company DELETE it
+removes that company's `contact_companies` rows, promotes the oldest
+remaining link on any contact that just lost its primary (the same rule
+`write_contact_companies` applies), and recomputes the mirrors. The FK
+action is the backstop for a direct SQL delete or a mirror that outlives
+its link row.
+
+A **company-less contact** - `company_id` NULL with no `contact_companies`
+rows - is a first-class state, valid since PMS-402 (which made the column
+nullable for the freeform `company_name` case). It reads back normally
+from `GET /contacts/contacts/{id}` and stays in the contacts list; it just
+appears under no company, so `GET /companies/{id}/contacts`, the
+`company_id` list filter and `contact_count` never surface it. Every read
+of `contacts.company_id` must therefore decode it as `Option<Uuid>`:
+`PortalService::login` rejects a company-less contact with a logged 401
+(there is nothing to scope a portal session to, since every portal read
+takes `CurrentContact.company_id`), and email-intake's
+`resolve_or_create_contact` falls back to the tenant's
+`email_intake/default_company_id` setting.
 
 **Defect: `update_site` is a silent no-op.**
 [`routes.rs:273-288`](../src/modules/contacts/routes.rs#L273) accepts
@@ -243,7 +352,8 @@ as **F4**.
 - [`service.rs:332`](../src/modules/contacts/service.rs#L332) -
   `create_contact` ignores `create_portal_access: true`.
 
-**Schema touched:** `companies`, `contacts`, `sites`.
+**Schema touched:** `companies`, `contacts`, `contact_phones`,
+`contact_companies`, `sites`.
 
 #### `tenants` (~810 LOC)
 
@@ -328,7 +438,7 @@ against an existing schema.
 | `calendar` | `appointments`, `user_availability`, `time_off`, `on_call_schedules` | `/calendar`, `/dispatch` |
 | `contracts` | `contracts`, `contract_items`, `contract_hour_balances`, `rate_cards`, `rate_card_items` | `/contracts`, `/contracts/new`, `/contracts/:id` |
 | `knowledge_base` | `kb_categories`, `kb_articles`, `kb_article_versions` | `/kb`, `/kb/articles`, `/portal/kb` |
-| `notifications` | `notification_channels`, `notification_templates`, `user_notification_preferences`, `notifications`, `notification_rules` | notification bell + `/settings/notifications` |
+| `notifications` | `notification_channels`, `notification_templates`, `user_notification_preferences`, `notifications`, `notification_rules` | notification bell + `/settings/notifications`; PMS-808 preview: `POST /api/v1/notifications/preview` renders what `dispatch` would send for an `(event_type, context)` and queues/sends nothing (drives the MAPPS-482 preview affordance) |
 | `portal` | (uses `contacts` for portal identity) | all `/portal/*` (7 routes) |
 | `projects` | `projects`, `project_phases`, `task_statuses`, `tasks`, `task_dependencies` | `/projects`, `/projects/new`, `/projects/:id`, `/projects/:id/tasks` |
 | `reports` | (aggregate over many tables) | `/reports`, `/reports/:report_type` |

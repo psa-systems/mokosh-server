@@ -114,6 +114,27 @@ pub struct PortalSetupPasswordRequest {
     pub password: String,
 }
 
+/// `POST /api/v1/portal/auth/forgot-password` request body (PMS-820).
+/// `tenant_slug` is required for the same reason login requires it:
+/// `contacts.email` is only unique within a tenant, and the portal must
+/// resolve the identity inside its own tenant rather than against the
+/// platform's `users` table.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PortalForgotPasswordRequest {
+    #[validate(length(min = 1, max = 100, message = "tenant_slug is required"))]
+    pub tenant_slug: String,
+    #[validate(email(message = "Invalid email address"))]
+    pub email: String,
+}
+
+/// `POST /api/v1/portal/auth/reset-password` request body (PMS-820).
+/// Deliberately the same `{contact_id}.{secret}` token plus password as
+/// [`PortalSetupPasswordRequest`]: the portal has one contact-bound token
+/// shape, so redeeming a self-service reset link and redeeming an
+/// agent-minted setup link take the same body and answer with the same
+/// statuses.
+pub type PortalResetPasswordRequest = PortalSetupPasswordRequest;
+
 /// JWT claim shape for portal access tokens. Kept separate from the
 /// agent-side `JwtClaims` to avoid type drift if one side learns new
 /// fields.

@@ -1286,3 +1286,844 @@ async fn create_company_row(pool: &PgPool, name: &str, company_type: &str) -> St
     .expect("insert company row");
     id.to_string()
 }
+
+// ============================================================================
+// PMS-805: a scheme-less website is normalized on the way in, and the website
+// probe endpoint is reachable, guarded and input-validated.
+// ============================================================================
+
+/// The reporter's case: typing `DentalArtsPractice.com` into the website field
+/// must save, and must persist with the scheme the product wants. The
+/// dangerous-scheme rejection that MAPPS-149 added must survive the change.
+#[sqlx::test]
+async fn company_website_accepts_a_bare_domain(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Dental Arts Practice",
+            "website": "DentalArtsPractice.com",
+        }))
+        .send()
+        .await
+        .expect("send create company");
+    assert!(
+        resp.status().is_success(),
+        "a bare domain should save, got {}",
+        resp.status()
+    );
+    let created: serde_json::Value = resp.json().await.expect("create JSON");
+    assert_eq!(
+        created["website"].as_str(),
+        Some("https://dentalartspractice.com")
+    );
+
+    // Independent GET: the normalized value is what reached Postgres, not just
+    // what the create response echoed.
+    let company_id = created["id"].as_str().expect("created company has an id");
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get company")
+        .json()
+        .await
+        .expect("get JSON");
+    assert_eq!(
+        got["website"].as_str(),
+        Some("https://dentalartspractice.com")
+    );
+
+    // The normalizer never manufactures a URL out of a dangerous scheme.
+    let rejected = app
+        .client
+        .post(app.url("/api/v1/contacts/companies"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "XSS Co",
+            "website": "javascript:alert(1)",
+        }))
+        .send()
+        .await
+        .expect("send create company");
+    assert_eq!(
+        rejected.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "javascript: must still be a 422"
+    );
+
+    // Same rule on the update path.
+    let updated: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "website": "Example.COM/About" }))
+        .send()
+        .await
+        .expect("send update company")
+        .json()
+        .await
+        .expect("update JSON");
+    assert_eq!(
+        updated["website"].as_str(),
+        Some("https://example.com/About")
+    );
+}
+
+/// The probe endpoint is authenticated, resolves ahead of `/companies/{id}`,
+/// and refuses to connect to anything off the public internet. A loopback
+/// target must come back as a successful probe reporting `blocked_host`, which
+/// is what proves the SSRF guard is wired into the live route.
+#[sqlx::test]
+async fn website_probe_blocks_non_public_hosts(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Unauthenticated callers never reach the probe at all.
+    let anon = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe?url=example.com"))
+        .send()
+        .await
+        .expect("send anonymous probe");
+    assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // The static segment wins over `/companies/{company_id}`: an unparseable
+    // UUID would otherwise 4xx from the path extractor, never reaching here.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe?url=http://127.0.0.1"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send loopback probe");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "an unreachable verdict is a successful probe, not an error"
+    );
+    let body: serde_json::Value = resp.json().await.expect("probe JSON");
+    assert_eq!(body["reachable"], serde_json::json!(false));
+    assert_eq!(
+        body["unreachable_reason"],
+        serde_json::json!("blocked_host")
+    );
+    assert_eq!(body["canonical_url"], serde_json::Value::Null);
+    assert_eq!(body["www_change"], serde_json::json!("none"));
+    assert_eq!(body["input"], serde_json::json!("http://127.0.0.1"));
+
+    // An RFC1918 literal is refused by the same guard.
+    let private: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe?url=http://10.1.2.3"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send private probe")
+        .json()
+        .await
+        .expect("probe JSON");
+    assert_eq!(
+        private["unreachable_reason"],
+        serde_json::json!("blocked_host")
+    );
+}
+
+/// Input that cannot be a website at all is a 400, never a silently
+/// "unreachable" 200: a form has to tell "that is not a URL" apart from "your
+/// site is down".
+#[sqlx::test]
+async fn website_probe_rejects_impossible_input(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for bad in [
+        "javascript:alert(1)",
+        "data:text/html,<script>",
+        "ftp://example.com",
+        "http://user:pass@example.com",
+        "https://example.com:8080",
+        "exa mple.com",
+        "",
+    ] {
+        let resp = app
+            .client
+            .get(app.url("/api/v1/contacts/companies/website-probe"))
+            .query(&[("url", bad)])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("send probe");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{bad:?} should be a 400, got {}",
+            resp.status()
+        );
+    }
+
+    // A missing `url` parameter fails at the extractor, not inside the probe.
+    let missing = app
+        .client
+        .get(app.url("/api/v1/contacts/companies/website-probe"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send probe with no url");
+    assert!(
+        missing.status().is_client_error(),
+        "a missing url should be a 4xx, got {}",
+        missing.status()
+    );
+}
+
+// ============================================================================
+// PMS-806: typed phone list + links to multiple companies
+// ============================================================================
+
+/// Helper: create a contact through the API and return the response body.
+async fn create_contact(
+    app: &common::TestApp,
+    token: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send create contact");
+    assert!(
+        resp.status().is_success(),
+        "create contact should 2xx, got {}",
+        resp.status()
+    );
+    resp.json().await.expect("create contact JSON")
+}
+
+/// Helper: POST a contact and return the raw status, for the 422 cases.
+async fn post_contact_status(
+    app: &common::TestApp,
+    token: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send create contact")
+}
+
+async fn get_contact(app: &common::TestApp, token: &str, contact_id: &str) -> serde_json::Value {
+    app.client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send get contact")
+        .json()
+        .await
+        .expect("get contact JSON")
+}
+
+async fn update_contact(
+    app: &common::TestApp,
+    token: &str,
+    contact_id: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send update contact");
+    assert!(
+        resp.status().is_success(),
+        "update contact should 2xx, got {}",
+        resp.status()
+    );
+    resp.json().await.expect("update contact JSON")
+}
+
+/// The company ids of a contact payload's `companies`, in the order returned.
+fn link_order(contact: &serde_json::Value) -> Vec<String> {
+    contact["companies"]
+        .as_array()
+        .expect("companies")
+        .iter()
+        .map(|l| l["company_id"].as_str().expect("company_id").to_string())
+        .collect()
+}
+
+/// Contact ids returned by `GET /contacts?company_id=`.
+async fn contact_ids_for_company_filter(
+    app: &common::TestApp,
+    token: &str,
+    company_id: &str,
+) -> Vec<String> {
+    let body: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/contacts/contacts"))
+        .query(&[("company_id", company_id), ("per_page", "50")])
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send filtered contact list")
+        .json()
+        .await
+        .expect("filtered list JSON");
+    body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|c| c["id"].as_str().expect("id").to_string())
+        .collect()
+}
+
+/// Contact ids returned by `GET /companies/{id}/contacts`, plus the total.
+async fn company_contact_ids(
+    app: &common::TestApp,
+    token: &str,
+    company_id: &str,
+) -> (Vec<String>, i64) {
+    let body: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}/contacts")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send company contacts")
+        .json()
+        .await
+        .expect("company contacts JSON");
+    let ids = body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|c| c["id"].as_str().expect("id").to_string())
+        .collect();
+    let total = body["meta"]["total"]
+        .as_i64()
+        .expect("a total in the paginated envelope");
+    (ids, total)
+}
+
+/// `contact_count` as the company list reports it.
+async fn company_contact_count(app: &common::TestApp, token: &str, company_id: &str) -> i64 {
+    let body: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/contacts/companies"))
+        .query(&[("per_page", "50")])
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send company list")
+        .json()
+        .await
+        .expect("company list JSON");
+    body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .find(|c| c["id"].as_str() == Some(company_id))
+        .expect("company is in the list")["contact_count"]
+        .as_i64()
+        .expect("contact_count is populated")
+}
+
+/// AC: with `phones` / `companies` absent, an existing-shaped request creates
+/// exactly the same contact AND materializes the matching child rows.
+#[sqlx::test]
+async fn legacy_shaped_request_still_creates_the_same_contact_and_materializes_children(
+    pool: PgPool,
+) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    let created = create_contact(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Bob",
+            "last_name": "Johnson",
+            "phone": "+1 555 0100",
+            "mobile": "+1 555 0200",
+            "fax": "+1 555 0300",
+        }),
+    )
+    .await;
+
+    // The mirrors are byte-for-byte what the pre-PMS-806 request produced.
+    assert_eq!(created["phone"].as_str(), Some("+15550100"));
+    assert_eq!(created["mobile"].as_str(), Some("+15550200"));
+    assert_eq!(created["company_id"].as_str(), Some(company_id.as_str()));
+    assert_eq!(created["company_name"].as_str(), Some("Acme"));
+
+    // ... and the child rows now exist, derived from those scalars.
+    let phones = created["phones"].as_array().expect("phones array");
+    assert_eq!(phones.len(), 3, "one child row per populated scalar");
+    assert_eq!(phones[0]["phone_type"].as_str(), Some("work"));
+    assert_eq!(phones[0]["number"].as_str(), Some("+15550100"));
+    assert_eq!(phones[0]["is_primary"].as_bool(), Some(true));
+    assert_eq!(phones[1]["phone_type"].as_str(), Some("mobile"));
+    assert_eq!(phones[2]["phone_type"].as_str(), Some("fax"));
+    assert_eq!(phones[2]["number"].as_str(), Some("+15550300"));
+
+    let companies = created["companies"].as_array().expect("companies array");
+    assert_eq!(companies.len(), 1);
+    assert_eq!(
+        companies[0]["company_id"].as_str(),
+        Some(company_id.as_str())
+    );
+    assert_eq!(companies[0]["company_name"].as_str(), Some("Acme"));
+    assert_eq!(companies[0]["is_primary"].as_bool(), Some(true));
+
+    // A contact with only a mobile keeps `contacts.phone` NULL: the mirror
+    // rule must not promote the mobile into the primary slot.
+    let mobile_only = create_contact(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Mo",
+            "last_name": "Bile",
+            "mobile": "+1 555 0400",
+        }),
+    )
+    .await;
+    assert!(mobile_only["phone"].is_null(), "no work number, no mirror");
+    assert_eq!(mobile_only["mobile"].as_str(), Some("+15550400"));
+    assert_eq!(mobile_only["phones"].as_array().expect("phones").len(), 1);
+}
+
+/// AC: explicit lists are authoritative and the mirrors are recomputed from
+/// them, in the same transaction as the write.
+#[sqlx::test]
+async fn explicit_child_lists_drive_the_mirrors(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let acme = create_company(&app, &token, "Acme").await;
+    let globex = create_company(&app, &token, "Globex").await;
+
+    let created = create_contact(
+        &app,
+        &token,
+        serde_json::json!({
+            // The scalars below are deliberately contradictory: with the lists
+            // present they must be ignored and recomputed.
+            "phone": "+15559999999",
+            "first_name": "Cora",
+            "last_name": "Tractor",
+            "phones": [
+                { "phone_type": "work", "number": "+1 (415) 555-1234", "extension": "204" },
+                { "phone_type": "mobile", "number": "+14155559999" },
+                { "phone_type": "fax", "number": "+14155550000" },
+            ],
+            "companies": [
+                { "company_id": acme, "title": "Consultant" },
+                { "company_id": globex, "title": "IT Director", "is_primary": true },
+            ],
+        }),
+    )
+    .await;
+
+    // Mirrors: primary phone, first mobile, first fax, primary link.
+    assert_eq!(created["phone"].as_str(), Some("+14155551234"));
+    assert_eq!(created["mobile"].as_str(), Some("+14155559999"));
+    assert_eq!(created["company_id"].as_str(), Some(globex.as_str()));
+    assert_eq!(created["company_name"].as_str(), Some("Globex"));
+
+    let phones = created["phones"].as_array().expect("phones");
+    assert_eq!(phones.len(), 3);
+    assert_eq!(phones[0]["extension"].as_str(), Some("204"));
+    assert!(
+        phones[0]["is_primary"].as_bool() == Some(true),
+        "no entry flagged primary promotes the first"
+    );
+
+    let companies = created["companies"].as_array().expect("companies");
+    assert_eq!(companies.len(), 2);
+    let globex_link = companies
+        .iter()
+        .find(|l| l["company_id"].as_str() == Some(globex.as_str()))
+        .expect("globex link");
+    assert_eq!(globex_link["title"].as_str(), Some("IT Director"));
+    assert_eq!(globex_link["is_primary"].as_bool(), Some(true));
+
+    // The stored `fax` mirror comes back on a re-GET too.
+    let contact_id = created["id"].as_str().expect("id");
+    let refetched = get_contact(&app, &token, contact_id).await;
+    assert_eq!(refetched["phones"].as_array().expect("phones").len(), 3);
+    assert_eq!(
+        refetched["companies"].as_array().expect("companies").len(),
+        2
+    );
+}
+
+/// AC: filtering by company matches ANY link, and each company counts the
+/// contact exactly once.
+#[sqlx::test]
+async fn filtering_by_company_matches_any_link(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let a = create_company(&app, &token, "Alpha").await;
+    let b = create_company(&app, &token, "Beta").await;
+
+    let created = create_contact(
+        &app,
+        &token,
+        serde_json::json!({
+            "first_name": "Dana",
+            "last_name": "Dual",
+            "companies": [
+                { "company_id": a, "is_primary": true },
+                { "company_id": b },
+            ],
+        }),
+    )
+    .await;
+    let contact_id = created["id"].as_str().expect("id").to_string();
+
+    for company in [&a, &b] {
+        assert!(
+            contact_ids_for_company_filter(&app, &token, company)
+                .await
+                .contains(&contact_id),
+            "GET /contacts?company_id={company} must find the contact through its link"
+        );
+        let (ids, total) = company_contact_ids(&app, &token, company).await;
+        assert!(
+            ids.contains(&contact_id),
+            "get_company_contacts({company}) must find the contact"
+        );
+        assert_eq!(total, 1, "the {company} page total counts it once");
+        assert_eq!(
+            company_contact_count(&app, &token, company).await,
+            1,
+            "the {company} contact_count counts it exactly once"
+        );
+    }
+}
+
+/// AC: removing the primary link promotes the oldest remaining link and
+/// recomputes the mirrors; removing the last link nulls `contacts.company_id`.
+#[sqlx::test]
+async fn removing_links_repromotes_and_recomputes(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let a = create_company(&app, &token, "Alpha").await;
+    let b = create_company(&app, &token, "Beta").await;
+    let c = create_company(&app, &token, "Gamma").await;
+
+    let created = create_contact(
+        &app,
+        &token,
+        serde_json::json!({
+            "first_name": "Dana",
+            "last_name": "Dual",
+            "companies": [
+                { "company_id": a, "is_primary": true },
+                { "company_id": b },
+                { "company_id": c },
+            ],
+        }),
+    )
+    .await;
+    let contact_id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(created["company_id"].as_str(), Some(a.as_str()));
+    // Links written by one call share a `created_at` (NOW() is the transaction
+    // timestamp), so the list order has to come from the write position, not
+    // from a random uuid tiebreak (PMS-815).
+    assert_eq!(
+        link_order(&created),
+        vec![a.clone(), b.clone(), c.clone()],
+        "the primary leads, then the links in the order they were written"
+    );
+
+    // Drop the primary (A) and hand back B and C with NO primary flagged. B is
+    // the oldest survivor, so it is promoted and the mirror follows.
+    let updated = update_contact(
+        &app,
+        &token,
+        &contact_id,
+        serde_json::json!({
+            "companies": [
+                { "company_id": c },
+                { "company_id": b },
+            ],
+        }),
+    )
+    .await;
+    let links = updated["companies"].as_array().expect("companies");
+    assert_eq!(links.len(), 2, "A is unlinked");
+    assert!(
+        links
+            .iter()
+            .all(|l| l["company_id"].as_str() != Some(a.as_str())),
+        "the removed link is gone: {links:#?}"
+    );
+    let primary = links
+        .iter()
+        .find(|l| l["is_primary"].as_bool() == Some(true))
+        .expect("a primary link survives");
+    assert_eq!(
+        primary["company_id"].as_str(),
+        Some(b.as_str()),
+        "the oldest remaining link is promoted, not the first in the request"
+    );
+    assert_eq!(updated["company_id"].as_str(), Some(b.as_str()));
+    assert_eq!(
+        link_order(&updated),
+        vec![b.clone(), c.clone()],
+        "the surviving links keep their original order, promoted one first"
+    );
+    // A no longer sees the contact.
+    assert!(contact_ids_for_company_filter(&app, &token, &a)
+        .await
+        .is_empty());
+
+    // Removing the last link nulls the mirror.
+    let cleared = update_contact(
+        &app,
+        &token,
+        &contact_id,
+        serde_json::json!({ "companies": [] }),
+    )
+    .await;
+    assert!(cleared["companies"]
+        .as_array()
+        .expect("companies")
+        .is_empty());
+    assert!(
+        cleared["company_id"].is_null(),
+        "no links means contacts.company_id is NULL"
+    );
+    assert!(cleared["company_name"].is_null());
+}
+
+/// AC: an invalid phone entry is a 422 that names the failing entry; two
+/// primaries in either list is a 422; a `companies` list plus a freeform
+/// `company_name` is a 422; a foreign `company_id` in the list is rejected
+/// before any row is written.
+#[sqlx::test]
+async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let a = create_company(&app, &token, "Alpha").await;
+    let b = create_company(&app, &token, "Beta").await;
+
+    // Invalid phone entry -> 422 naming `phones[1].number`.
+    let resp = post_contact_status(
+        &app,
+        &token,
+        serde_json::json!({
+            "first_name": "Bad",
+            "last_name": "Phone",
+            "phones": [
+                { "phone_type": "work", "number": "+14155551234" },
+                { "phone_type": "home", "number": "not-a-phone" },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    let fields: Vec<&str> = body["error"]["errors"]
+        .as_array()
+        .expect("field errors")
+        .iter()
+        .filter_map(|e| e["field"].as_str())
+        .collect();
+    assert!(
+        fields.contains(&"phones[1].number"),
+        "the 422 must identify the failing entry, got {fields:?}"
+    );
+
+    // Two primaries, phones.
+    assert_eq!(
+        post_contact_status(
+            &app,
+            &token,
+            serde_json::json!({
+                "first_name": "Two",
+                "last_name": "Primaries",
+                "phones": [
+                    { "phone_type": "work", "number": "+14155551234", "is_primary": true },
+                    { "phone_type": "home", "number": "+14155555678", "is_primary": true },
+                ],
+            }),
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    // Two primaries, companies.
+    assert_eq!(
+        post_contact_status(
+            &app,
+            &token,
+            serde_json::json!({
+                "first_name": "Two",
+                "last_name": "Companies",
+                "companies": [
+                    { "company_id": a, "is_primary": true },
+                    { "company_id": b, "is_primary": true },
+                ],
+            }),
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    // A non-empty companies list plus a freeform company_name.
+    assert_eq!(
+        post_contact_status(
+            &app,
+            &token,
+            serde_json::json!({
+                "first_name": "Both",
+                "last_name": "Ways",
+                "company_name": "Acme Plumbing",
+                "companies": [{ "company_id": a }],
+            }),
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    // A company_id that does not exist in this tenant is rejected, and nothing
+    // is written.
+    let foreign = uuid::Uuid::new_v4();
+    let resp = post_contact_status(
+        &app,
+        &token,
+        serde_json::json!({
+            "first_name": "Foreign",
+            "last_name": "Link",
+            "companies": [{ "company_id": a }, { "company_id": foreign }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an unknown company in the list must be rejected"
+    );
+    assert!(
+        !contact_ids_for_company_filter(&app, &token, &a)
+            .await
+            .iter()
+            .any(|_| true),
+        "the rejected create must not have linked anything to Alpha"
+    );
+}
+
+/// AC: a non-empty list with no `is_primary` promotes the first entry rather
+/// than erroring, on both the create and the update path.
+#[sqlx::test]
+async fn a_list_with_no_primary_promotes_the_first_entry(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let a = create_company(&app, &token, "Alpha").await;
+    let b = create_company(&app, &token, "Beta").await;
+
+    let created = create_contact(
+        &app,
+        &token,
+        serde_json::json!({
+            "first_name": "No",
+            "last_name": "Primary",
+            "phones": [
+                { "phone_type": "home", "number": "+14155551234" },
+                { "phone_type": "mobile", "number": "+14155559999" },
+            ],
+            "companies": [{ "company_id": a }, { "company_id": b }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        created["phones"].as_array().expect("phones")[0]["is_primary"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(created["phone"].as_str(), Some("+14155551234"));
+    assert_eq!(created["company_id"].as_str(), Some(a.as_str()));
+
+    // Update with a fresh, unflagged list: the first entry wins again.
+    let contact_id = created["id"].as_str().expect("id");
+    let updated = update_contact(
+        &app,
+        &token,
+        contact_id,
+        serde_json::json!({
+            "phones": [{ "phone_type": "work", "number": "+14155550000" }],
+        }),
+    )
+    .await;
+    assert_eq!(updated["phone"].as_str(), Some("+14155550000"));
+    assert_eq!(updated["phones"].as_array().expect("phones").len(), 1);
+}
+
+/// AC: an update that touches only the scalar phone fields still rebuilds the
+/// child rows, so the two representations never diverge.
+#[sqlx::test]
+async fn a_scalar_only_update_keeps_the_child_rows_in_step(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    let created = create_contact(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Sca",
+            "last_name": "Lar",
+            "phone": "+15550100",
+        }),
+    )
+    .await;
+    let contact_id = created["id"].as_str().expect("id");
+
+    let updated = update_contact(
+        &app,
+        &token,
+        contact_id,
+        serde_json::json!({ "mobile": "+1 555 0200" }),
+    )
+    .await;
+    assert_eq!(updated["phone"].as_str(), Some("+15550100"));
+    assert_eq!(updated["mobile"].as_str(), Some("+15550200"));
+    let phones = updated["phones"].as_array().expect("phones");
+    assert_eq!(phones.len(), 2, "the mobile joined the list: {phones:#?}");
+    assert_eq!(phones[0]["phone_type"].as_str(), Some("work"));
+    assert_eq!(phones[1]["phone_type"].as_str(), Some("mobile"));
+    assert_eq!(phones[1]["number"].as_str(), Some("+15550200"));
+}

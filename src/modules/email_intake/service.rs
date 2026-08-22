@@ -308,7 +308,14 @@ impl EmailIntakeService {
         // lookup, the default-company setting read, and the auto-create INSERT
         // all run under one tenant-GUC transaction.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let existing: Option<(Uuid, Uuid)> = sqlx::query_as(
+        // `contacts.company_id` is nullable (PMS-402) and deleting a company
+        // now nulls it instead of deleting the contact (PMS-812), so decoding
+        // it as a bare `Uuid` turned a company-less sender into a decode error
+        // and a 500. A ticket still needs a company, so a company-less sender
+        // falls through to the same `email_intake/default_company_id` setting
+        // the auto-create path uses; with that unset the caller's explicit 400
+        // fires instead.
+        let existing: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
             "SELECT id, company_id FROM contacts \
              WHERE tenant_id = $1 AND lower(email) = $2 LIMIT 1",
         )
@@ -316,8 +323,8 @@ impl EmailIntakeService {
         .bind(&from)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some(pair) = existing {
-            return Ok(Some(pair));
+        if let Some((contact_id, Some(company_id))) = existing {
+            return Ok(Some((contact_id, company_id)));
         }
         let default_company =
             crate::modules::settings::read_email_intake_default_company(&mut tx, tenant_id.get())
@@ -325,6 +332,14 @@ impl EmailIntakeService {
         let Some(company_id) = default_company else {
             return Ok(None);
         };
+        if let Some((contact_id, None)) = existing {
+            tracing::warn!(
+                %contact_id,
+                %company_id,
+                "email-intake sender has no company; using the tenant default company",
+            );
+            return Ok(Some((contact_id, company_id)));
+        }
         let (first, last) = split_display_name(req.from_name.as_deref());
         let contact_id = Uuid::new_v4();
         sqlx::query(

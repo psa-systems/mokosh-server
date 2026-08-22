@@ -2,9 +2,11 @@
 
 use axum::{
     extract::{Path, Query, State},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
+use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
@@ -13,27 +15,45 @@ use super::{
     CompanyFilter, CompanyIndustryResponse, CompanyResponse, ContactFieldValuesQuery,
     ContactFilter, ContactResponse, ContactService, CreateCompanyRequest, CreateContactRequest,
     CreateSiteRequest, SiteResponse, UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
-    UpsertCompanyIndustryRequest,
+    UpsertCompanyIndustryRequest, WebsiteProbeLimiter, WebsiteProbeService,
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct ContactRouterState {
     pub contact_service: Arc<ContactService>,
+    /// PMS-805. `None` only when the probe's HTTP client could not be built,
+    /// which is logged at `error` here and surfaces as a 500 on the endpoint
+    /// rather than as a site that silently reports itself unreachable.
+    pub website_probe: Option<Arc<WebsiteProbeService>>,
+    pub website_probe_limiter: Arc<WebsiteProbeLimiter>,
 }
 
 /// Create the contact management router
 pub fn contact_routes(contact_service: ContactService) -> Router {
+    let website_probe = match WebsiteProbeService::live() {
+        Ok(service) => Some(service),
+        Err(e) => {
+            tracing::error!(error = %e, "website probe disabled: HTTP client could not be built");
+            None
+        }
+    };
     let state = ContactRouterState {
         contact_service: Arc::new(contact_service),
+        website_probe,
+        website_probe_limiter: WebsiteProbeLimiter::new(),
     };
 
     Router::new()
         // Companies
         .route("/companies", get(list_companies))
         .route("/companies", post(create_company))
+        // PMS-805: static segment, so it resolves ahead of the
+        // `{company_id}` routes below (same shape as
+        // `/contacts/field-values`).
+        .route("/companies/website-probe", get(probe_company_website))
         .route("/companies/{company_id}", get(get_company))
         .route("/companies/{company_id}", put(update_company))
         .route("/companies/{company_id}", delete(delete_company))
@@ -199,6 +219,45 @@ async fn get_company_sites(
         &pagination,
         total,
     )))
+}
+
+/// PMS-805: `GET /companies/website-probe?url=<value>`.
+#[derive(Debug, Deserialize)]
+pub struct WebsiteProbeQuery {
+    pub url: String,
+}
+
+/// Resolve a website and report what answered.
+///
+/// Reads and writes no tenant data; the tenant is used only as the rate-limit
+/// key. Both the reachable and the unreachable case are 200s, because
+/// determining that a site does not answer is a successful probe. Input that
+/// cannot be a website at all is a 400 instead, so the form can tell "you typed
+/// something that is not a URL" apart from "your site is down".
+async fn probe_company_website(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<WebsiteProbeQuery>,
+) -> Result<Response, AppError> {
+    if let Err(retry_after) = state.website_probe_limiter.check(*user.tenant()) {
+        tracing::warn!(
+            tenant_id = %user.tenant(),
+            retry_after,
+            "website probe rate limited"
+        );
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many website probes, please try again shortly",
+        ));
+    }
+
+    let Some(service) = state.website_probe.as_ref() else {
+        return Err(AppError::Configuration(
+            "The website probe is unavailable.".to_string(),
+        ));
+    };
+
+    Ok(Json(service.probe_input(&query.url).await?).into_response())
 }
 
 // ============================================================================

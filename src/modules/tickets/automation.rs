@@ -10,14 +10,37 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::modules::auth::TenantId;
+use url::Url;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::notifications::NotificationsService;
 use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::AppResult;
+use crate::utils::net::{
+    guard_outbound_url, private_target_allowlist, HostResolver, PrivateTargetAllowlist,
+    SystemResolver, UrlGuardError,
+};
 
 use super::models::*;
+
+/// Redirect hops the `webhook` action follows. Each one is re-screened, so a
+/// rule cannot reach a private address by way of a redirect either.
+const WEBHOOK_MAX_HOPS: usize = 5;
+
+/// Why a `webhook` action did not deliver. Every variant is logged; none is
+/// folded into a success (PMS-809).
+#[derive(Debug, thiserror::Error)]
+enum WebhookError {
+    /// The SSRF guard refused the target. Carries the resolved address it
+    /// refused, so the log names it.
+    #[error("{0}")]
+    Refused(#[from] UrlGuardError),
+    #[error("{0}")]
+    Transport(String),
+    #[error("more than {0} redirects")]
+    TooManyRedirects(usize),
+}
 
 /// Automation engine for processing ticket automation rules
 #[derive(Clone)]
@@ -25,6 +48,9 @@ pub struct AutomationEngine {
     db: Database,
     mailer: Arc<dyn Mailer>,
     http: reqwest::Client,
+    /// Resolver the `webhook` action screens through. A field rather than a
+    /// call so a test can script DNS without touching the network.
+    resolver: Arc<dyn HostResolver>,
     /// When `Some`, the `send_notification` action dispatches through
     /// the notifications queue (template + worker delivery) instead of
     /// hitting the mailer directly. None preserves the legacy inline
@@ -64,12 +90,16 @@ impl AutomationEngine {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent("mokosh-server/automation")
+            // The webhook action follows redirects itself so it can re-run the
+            // SSRF guard on every hop; reqwest must not do it underneath.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client builds with default config");
         Self {
             db,
             mailer,
             http,
+            resolver: Arc::new(SystemResolver),
             notifications,
         }
     }
@@ -353,10 +383,23 @@ impl AutomationEngine {
                     // the rule chain.
                     let Some(url) = action.params.get("url").and_then(|v| v.as_str()) else {
                         tracing::warn!(
-                            %ticket_id, rule = %rule.name,
+                            %ticket_id, rule_id = %rule.id, rule = %rule.name,
                             "webhook action missing 'url' param",
                         );
                         continue;
+                    };
+                    // Parsed here rather than handed to reqwest as a string:
+                    // the guard screens a `Url`, and an unusable value is a
+                    // named failure instead of a transport error later.
+                    let target = match Url::parse(url) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!(
+                                %ticket_id, rule_id = %rule.id, rule = %rule.name, error = %e,
+                                "webhook action has an unusable 'url' param",
+                            );
+                            continue;
+                        }
                     };
                     let method = action
                         .params
@@ -373,26 +416,34 @@ impl AutomationEngine {
                         })
                     });
 
-                    let request_builder = match method.as_str() {
-                        "GET" => self.http.get(url),
-                        "PUT" => self.http.put(url).json(&payload),
-                        "PATCH" => self.http.patch(url).json(&payload),
-                        "DELETE" => self.http.delete(url),
-                        _ => self.http.post(url).json(&payload),
-                    };
-                    match request_builder.send().await {
-                        Ok(resp) if resp.status().is_success() => {
+                    match send_guarded_webhook(
+                        &self.http,
+                        self.resolver.as_ref(),
+                        private_target_allowlist(),
+                        &target,
+                        &method,
+                        &payload,
+                    )
+                    .await
+                    {
+                        Ok(status) if status.is_success() => {
                             tracing::info!(
-                                %ticket_id, rule = %rule.name, status = %resp.status(),
+                                %ticket_id, rule_id = %rule.id, rule = %rule.name, status = %status,
                                 "automation webhook delivered",
                             );
                         }
-                        Ok(resp) => tracing::warn!(
-                            %ticket_id, rule = %rule.name, status = %resp.status(),
+                        Ok(status) => tracing::warn!(
+                            %ticket_id, rule_id = %rule.id, rule = %rule.name, status = %status,
                             "automation webhook returned non-2xx",
                         ),
+                        // PMS-809: a refused target is a failed action naming
+                        // the rule and the address, not a silent no-op.
+                        Err(WebhookError::Refused(guard)) => tracing::warn!(
+                            %ticket_id, rule_id = %rule.id, rule = %rule.name, blocked = %guard,
+                            "automation webhook refused: target is not on the public internet",
+                        ),
                         Err(e) => tracing::warn!(
-                            ?e, %ticket_id, rule = %rule.name,
+                            %ticket_id, rule_id = %rule.id, rule = %rule.name, error = %e,
                             "automation webhook send failed",
                         ),
                     }
@@ -415,6 +466,68 @@ impl AutomationEngine {
 
         Ok(())
     }
+}
+
+/// Send one webhook, screening the target before the first connect and again
+/// for every redirect hop (PMS-809).
+///
+/// A free function, not a method: it needs no `Database`, so the refusal path is
+/// unit testable without Postgres. The method is re-issued unchanged on a
+/// redirect - a webhook receiver that wants a different verb should publish the
+/// final URL.
+async fn send_guarded_webhook(
+    http: &reqwest::Client,
+    resolver: &dyn HostResolver,
+    allowlist: &PrivateTargetAllowlist,
+    target: &Url,
+    method: &str,
+    payload: &serde_json::Value,
+) -> Result<reqwest::StatusCode, WebhookError> {
+    let mut url = target.clone();
+    for _ in 0..=WEBHOOK_MAX_HOPS {
+        // A tenant integration may legitimately listen on its own port, so the
+        // port set is not pinned here; the resolved address is what is screened.
+        guard_outbound_url(resolver, &url, None, allowlist).await?;
+
+        let request = match method {
+            "GET" => http.get(url.clone()),
+            "PUT" => http.put(url.clone()).json(payload),
+            "PATCH" => http.patch(url.clone()).json(payload),
+            "DELETE" => http.delete(url.clone()),
+            _ => http.post(url.clone()).json(payload),
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(|e| WebhookError::Transport(e.to_string()))?;
+        let status = response.status();
+        if !status.is_redirection() {
+            return Ok(status);
+        }
+        let location = match response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .map(|v| v.to_str())
+        {
+            Some(Ok(value)) => Some(value.to_string()),
+            // A Location the transport cannot read as text is not silently a
+            // "no redirect": say so, then let the chain end here.
+            Some(Err(e)) => {
+                tracing::warn!(url = %url, error = %e, "automation webhook got an unreadable Location header");
+                None
+            }
+            None => None,
+        };
+        // A 3xx with no usable Location is where the chain ends; report the
+        // redirect itself rather than inventing a failure.
+        let Some(location) = location else {
+            return Ok(status);
+        };
+        url = url
+            .join(&location)
+            .map_err(|e| WebhookError::Transport(format!("unusable redirect target: {e}")))?;
+    }
+    Err(WebhookError::TooManyRedirects(WEBHOOK_MAX_HOPS))
 }
 
 #[derive(sqlx::FromRow)]
@@ -465,4 +578,109 @@ struct TicketDataRow {
     is_billable: bool,
     status_name: String,
     priority_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::net::IpAddr;
+
+    /// Scripted DNS. Every answer is declared by the test, and each case below
+    /// is refused by the guard BEFORE a connect, so no test opens a socket.
+    struct FakeResolver(Vec<IpAddr>);
+
+    #[async_trait]
+    impl HostResolver for FakeResolver {
+        async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn resolver(ip: &str) -> FakeResolver {
+        FakeResolver(vec![ip.parse().expect("test IP parses")])
+    }
+
+    async fn send(
+        resolver: &FakeResolver,
+        allowlist: &PrivateTargetAllowlist,
+        target: &str,
+    ) -> Result<reqwest::StatusCode, WebhookError> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            // Every case here is refused before the connect; the timeout is
+            // belt-and-braces so a future edit cannot hang the suite.
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client builds");
+        send_guarded_webhook(
+            &http,
+            resolver,
+            allowlist,
+            &Url::parse(target).expect("test URL parses"),
+            "POST",
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_a_loopback_target() {
+        let err = send(
+            &resolver("127.0.0.1"),
+            &PrivateTargetAllowlist::default(),
+            "http://hook.internal/notify",
+        )
+        .await
+        .expect_err("a loopback webhook target is refused");
+        assert!(
+            matches!(&err, WebhookError::Refused(UrlGuardError::Blocked(ip)) if ip.to_string() == "127.0.0.1"),
+            "expected a refusal naming the address, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_an_rfc1918_target() {
+        let err = send(
+            &resolver("10.1.2.3"),
+            &PrivateTargetAllowlist::default(),
+            "http://hook.internal:9000/notify",
+        )
+        .await
+        .expect_err("an RFC1918 webhook target is refused");
+        assert!(
+            matches!(&err, WebhookError::Refused(UrlGuardError::Blocked(ip)) if ip.to_string() == "10.1.2.3"),
+            "expected a refusal naming the address, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_a_non_http_scheme() {
+        let err = send(
+            &resolver("93.184.216.34"),
+            &PrivateTargetAllowlist::default(),
+            "ftp://hooks.example.com/notify",
+        )
+        .await
+        .expect_err("a non-http(s) webhook target is refused");
+        assert!(
+            matches!(&err, WebhookError::Refused(UrlGuardError::Scheme(s)) if s == "ftp"),
+            "expected a scheme refusal, got {err:?}"
+        );
+    }
+
+    /// The allowlist reaches this path too: the same private target the tests
+    /// above refuse passes the screen once an operator names its network. The
+    /// assertion stops at the guard rather than calling `send_guarded_webhook`,
+    /// because a target that PASSES would then connect, and no test here opens a
+    /// socket. `utils::net` covers the allow decision itself.
+    #[tokio::test]
+    async fn webhook_screen_honours_the_operator_allowlist() {
+        let target = Url::parse("http://hook.internal:9000/notify").expect("test URL parses");
+        let allowlist = PrivateTargetAllowlist::parse("10.0.0.0/8");
+        assert_eq!(
+            guard_outbound_url(&resolver("10.1.2.3"), &target, None, &allowlist).await,
+            Ok(())
+        );
+    }
 }

@@ -11,11 +11,17 @@
 //!
 //! See PMS-103 for the AC list.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use url::Url;
 use uuid::Uuid;
 
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::net::{
+    guard_outbound_url, private_target_allowlist, HostResolver, SystemResolver,
+};
 
 /// One device as returned by a provider. Field names mirror the
 /// `rmm_device_mappings` + `assets` columns the worker writes; provider
@@ -94,9 +100,17 @@ pub fn build_provider(provider: &str, cfg: ProviderConfig) -> Box<dyn RmmProvide
 /// the agent list, `/alerts/` returns active alerts. Tactical's JSON
 /// shape is documented above; this implementation only reads the
 /// fields the PSA actually surfaces.
+///
+/// `api_url` is tenant-editable integration configuration, so every request
+/// screens it through [`guard_outbound_url`] first (PMS-809): without that, a
+/// tenant admin could point the integration at `127.0.0.1` or a cloud metadata
+/// endpoint and have the server connect from inside the network. An
+/// on-premise RMM that really does live on a private network is what
+/// `OUTBOUND_PRIVATE_ALLOWLIST` is for.
 pub struct TacticalRmmProvider {
     cfg: ProviderConfig,
     http: reqwest::Client,
+    resolver: Arc<dyn HostResolver>,
 }
 
 impl TacticalRmmProvider {
@@ -104,32 +118,91 @@ impl TacticalRmmProvider {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("mokosh-server/rmm")
+            // Redirects are not followed: a followed hop would connect to an
+            // address the guard above never screened. A redirecting api_url is
+            // reported as the configuration error it is.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client builds with default config");
-        Self { cfg, http }
+        Self {
+            cfg,
+            http,
+            resolver: Arc::new(SystemResolver),
+        }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!(
+    /// Build the URL for `path` and screen it before the caller connects. The
+    /// error is a `Configuration` failure the integration UI shows in
+    /// `rmm_connections.last_error`, never a silent success.
+    async fn guarded_url(&self, path: &str) -> AppResult<Url> {
+        let raw = format!(
             "{}/{}",
             self.cfg.api_url.trim_end_matches('/'),
             path.trim_start_matches('/'),
+        );
+        let url = Url::parse(&raw).map_err(|e| {
+            tracing::warn!(
+                connection_id = %self.cfg.connection_id, error = %e,
+                "RMM connection has an unusable api_url",
+            );
+            AppError::Configuration(format!("RMM api_url is not a valid URL: {e}"))
+        })?;
+        guard_outbound_url(
+            self.resolver.as_ref(),
+            &url,
+            // A self-hosted RMM legitimately listens on its own port, so the
+            // port set is not pinned; the resolved address is what is screened.
+            None,
+            private_target_allowlist(),
         )
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                connection_id = %self.cfg.connection_id, blocked = %e,
+                "RMM connection refused: api_url is not on the public internet",
+            );
+            AppError::Configuration(format!(
+                "RMM api_url refused: {e}. Set OUTBOUND_PRIVATE_ALLOWLIST if this target is deliberately private."
+            ))
+        })?;
+        Ok(url)
+    }
+
+    /// Fold a response into a hard failure unless it is a real 2xx. A 3xx is
+    /// called out separately because the client does not follow redirects.
+    fn check_status(
+        &self,
+        response: reqwest::Response,
+        what: &str,
+    ) -> AppResult<reqwest::Response> {
+        if response.status().is_redirection() {
+            tracing::warn!(
+                connection_id = %self.cfg.connection_id, status = %response.status(),
+                "RMM connection redirected; api_url must name the final URL",
+            );
+            return Err(AppError::Configuration(format!(
+                "tactical_rmm {what} redirected ({}); point api_url at the final URL, redirects are not followed",
+                response.status(),
+            )));
+        }
+        response
+            .error_for_status()
+            .map_err(|e| AppError::Internal(format!("tactical_rmm {what} status: {e}")))
     }
 }
 
 #[async_trait]
 impl RmmProvider for TacticalRmmProvider {
     async fn list_devices(&self) -> AppResult<Vec<ProviderDevice>> {
+        let url = self.guarded_url("agents/").await?;
         let resp = self
             .http
-            .get(self.url("agents/"))
+            .get(url)
             .header("Authorization", format!("Token {}", self.cfg.api_key))
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("tactical_rmm agents: {e}")))?
-            .error_for_status()
-            .map_err(|e| AppError::Internal(format!("tactical_rmm agents status: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("tactical_rmm agents: {e}")))?;
+        let resp = self.check_status(resp, "agents")?;
         let agents: Vec<serde_json::Value> = resp
             .json()
             .await
@@ -138,15 +211,15 @@ impl RmmProvider for TacticalRmmProvider {
     }
 
     async fn list_alerts(&self, _since: DateTime<Utc>) -> AppResult<Vec<ProviderAlert>> {
+        let url = self.guarded_url("alerts/").await?;
         let resp = self
             .http
-            .get(self.url("alerts/"))
+            .get(url)
             .header("Authorization", format!("Token {}", self.cfg.api_key))
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("tactical_rmm alerts: {e}")))?
-            .error_for_status()
-            .map_err(|e| AppError::Internal(format!("tactical_rmm alerts status: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("tactical_rmm alerts: {e}")))?;
+        let resp = self.check_status(resp, "alerts")?;
         let alerts: Vec<serde_json::Value> = resp
             .json()
             .await
@@ -155,15 +228,15 @@ impl RmmProvider for TacticalRmmProvider {
     }
 
     async fn ping(&self) -> AppResult<()> {
-        self.http
-            .head(self.url("core/version/"))
+        let url = self.guarded_url("core/version/").await?;
+        let resp = self
+            .http
+            .head(url)
             .header("Authorization", format!("Token {}", self.cfg.api_key))
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("tactical_rmm ping: {e}")))?
-            .error_for_status()
-            .map(|_| ())
-            .map_err(|e| AppError::Internal(format!("tactical_rmm ping status: {e}")))
+            .map_err(|e| AppError::Internal(format!("tactical_rmm ping: {e}")))?;
+        self.check_status(resp, "ping").map(|_| ())
     }
 }
 
@@ -298,6 +371,57 @@ mod tests {
         let res = p.list_devices().await;
         let err = res.unwrap_err();
         assert!(format!("{err:?}").contains("datto"));
+    }
+
+    /// PMS-809. The api_url is an IP literal, so `SystemResolver` answers from
+    /// the string with no DNS query, and the guard refuses before any connect:
+    /// no test here touches the network.
+    #[tokio::test]
+    async fn tactical_provider_refuses_a_private_api_url() {
+        for api_url in [
+            "http://127.0.0.1:8000",
+            "http://10.1.2.3",
+            "https://192.168.1.50:8443/api",
+            "http://[::1]:8000",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let provider = TacticalRmmProvider::new(ProviderConfig {
+                connection_id: Uuid::nil(),
+                api_url: api_url.into(),
+                api_key: "k".into(),
+                api_secret: None,
+            });
+            for outcome in [
+                provider.ping().await.map(|_| ()),
+                provider.list_devices().await.map(|_| ()),
+                provider.list_alerts(Utc::now()).await.map(|_| ()),
+            ] {
+                let err = outcome.expect_err("a private api_url is refused");
+                assert!(
+                    matches!(err, AppError::Configuration(_)),
+                    "{api_url} should be a configuration error, got {err:?}"
+                );
+                assert!(
+                    format!("{err}").contains("OUTBOUND_PRIVATE_ALLOWLIST"),
+                    "{api_url} refusal must name the operator escape hatch: {err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tactical_provider_rejects_an_unusable_api_url() {
+        let provider = TacticalRmmProvider::new(ProviderConfig {
+            connection_id: Uuid::nil(),
+            api_url: "not a url".into(),
+            api_key: "k".into(),
+            api_secret: None,
+        });
+        let err = provider
+            .ping()
+            .await
+            .expect_err("an unparseable api_url fails");
+        assert!(matches!(err, AppError::Configuration(_)), "got {err:?}");
     }
 
     #[test]

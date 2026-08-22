@@ -599,6 +599,10 @@ fn showcase_contact(company_id: Uuid, idx: usize) -> CreateContactRequest {
         tags: vec![SHOWCASE_TAG.to_string()],
         notes: None,
         create_portal_access: false,
+        // PMS-806: the scalars above materialize the child rows, so the
+        // showcase set exercises the compatibility path.
+        phones: None,
+        companies: None,
     }
 }
 

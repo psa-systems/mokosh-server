@@ -2,6 +2,20 @@
 
 Professional Services Automation (PSA) platform for MSPs. REST API server built on Axum + SQLx + PostgreSQL. Secrets are sourced from a self-hosted Infisical instance.
 
+<!--
+BUNYIP-587 records the shared Bunyip-to-Mokosh walkthrough GIF. When it lands,
+commit a copy at docs/assets/mokosh-walkthrough.gif (a cross-repo relative path
+to the Bunyip copy does not render on the mirrors, and hot-linking the raw asset
+URL is fragile) and replace this comment with:
+![Mokosh walkthrough](docs/assets/mokosh-walkthrough.gif)
+-->
+
+## Try it
+
+Live staging: **<https://msp.a8n.systems>**. Sign in through the platform and click through the product; the walkthrough starts in Bunyip and moves into Mokosh.
+
+> Staging shows features **in development**, not a polished demo. State is **wiped on every deploy** - accounts and data are throwaway. Do not reuse a real password.
+
 ## Architecture
 
 - **HTTP**: Axum 0.8 (Tokio runtime) with Tower middleware (CORS, tracing, brotli/gzip compression, request limits, request-id).
@@ -192,3 +206,7 @@ justfile         Task runner.
 ## License
 
 Proprietary. See `Cargo.toml`.
+
+## Development happens on Forgejo
+
+The development home for this repository is <https://dev.a8n.run/psa-systems/mokosh-server>. The [GitHub](https://github.com/psa-systems/mokosh-server) and [Codeberg](https://codeberg.org/psa-systems/mokosh-server) copies are read-only mirrors that exist for visibility only: issues and pull requests are disabled there, and no community support runs on the mirrors. File issues and open pull requests on Forgejo.

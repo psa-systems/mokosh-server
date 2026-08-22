@@ -1152,7 +1152,11 @@ async fn place_bunyip_caller(
             .await
         {
             Ok(refreshed) => user = refreshed,
-            Err(e) => tracing::warn!(error = %e, sub = %sub, "profile name refresh failed"),
+            // PMS-787: best-effort cosmetic name sync. A failure leaves the
+            // request unaffected (the user keeps its stored name), and a real DB
+            // fault surfaces loudly on the login's own queries, so this is a
+            // debug diagnostic rather than a warn on every successful login.
+            Err(e) => tracing::debug!(error = %e, sub = %sub, "profile name refresh failed"),
         }
     }
 

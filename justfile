@@ -46,7 +46,7 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-unused-deps
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
@@ -80,6 +80,20 @@ check-runner-labels:
 [group: 'check']
 check-oci-cache:
     nu scripts/check-oci-build-cache.nu
+
+# Keep `:latest` publishable from main only, and branch builds on the allow-list
+# in oci-build/get-tags.nu (PMS-733). Fails if the workflow's push filter or ref
+# guard drifts from that list, or if the tag resolver stops honouring it.
+[group: 'check']
+check-oci-publish-tags:
+    nu scripts/check-oci-publish-tags.nu
+
+# Keep [workspace.dependencies] describing what the workspace shares (PMS-785).
+# Fails if an entry is inherited by no member, or if a member re-pins a crate
+# the workspace table already pins.
+[group: 'check']
+check-workspace-deps:
+    nu scripts/check-workspace-deps.nu
 
 # Fail loud on a dependency declared in Cargo.toml with no call site (PMS-780).
 # `pulldown-cmark` and `minijinja` sat there unused, compiled on every cold
