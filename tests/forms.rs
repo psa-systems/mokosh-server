@@ -7,7 +7,13 @@
 //! behaviour of the validator itself is unit-tested in
 //! `src/modules/forms/validation.rs`; this file pins the wiring, the
 //! persisted result, and the surfaces the unit tests cannot reach (auth
-//! gating, retirement, deletion).
+//! gating, retirement).
+//!
+//! PMS-840 retired the authenticated `POST /forms/{id}/submissions` as
+//! unconsumed, so every submission here goes through the PMS-730 magic link,
+//! which is now the only writer of `form_submissions`. That makes these tests
+//! a little longer (a submission needs a company and an issued link) and
+//! makes them exercise the path a real client actually takes.
 //!
 //! RLS coverage for `form_definitions`, `form_fields` and `form_submissions`
 //! is asserted generically by `tests/rls_coverage.rs`, which fails any
@@ -17,6 +23,7 @@ mod common;
 
 use serde_json::json;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// The MACD departure form from the PMS-731 field-list review, trimmed to the
 /// fields that carry a distinct rule. `forward_to` is the conditional case:
@@ -101,16 +108,68 @@ async fn create_form(
     serde_json::from_str(&text).expect("create form JSON")
 }
 
-async fn submit(
+/// Issue a client a magic link and recover its token out of the queued email,
+/// the way the recipient does. The token is never returned by the API.
+async fn issue_link(
     app: &common::TestApp,
     token: &str,
+    pool: &PgPool,
     form_id: &str,
+    company_id: Uuid,
+) -> String {
+    let resp = app
+        .client
+        .post(app.url("/api/v1/form-request-links"))
+        .bearer_auth(token)
+        .json(&json!({
+            "form_definition_id": form_id,
+            "company_id": company_id,
+            "recipient_email": "client@example.com"
+        }))
+        .send()
+        .await
+        .expect("send issue link");
+    let status = resp.status();
+    let text = resp.text().await.expect("issue link body");
+    assert!(
+        status.is_success(),
+        "issue link should 2xx, got {status} body={text}"
+    );
+
+    // Match on the link body rather than taking the newest notification
+    // outright: a successful submission creates a ticket, which queues
+    // notifications of its own.
+    let body_text: String = sqlx::query_scalar(
+        "SELECT body FROM notifications \
+         WHERE tenant_id = $1 AND body LIKE '%/request-forms/%' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(pool)
+    .await
+    .expect("a request-link email was queued");
+
+    body_text
+        .split("/request-forms/")
+        .nth(1)
+        .expect("the queued email carries the link")
+        .split_whitespace()
+        .next()
+        .expect("the link has a token")
+        .to_string()
+}
+
+/// Submit `payload` behind an issued link. A rejected submission leaves the
+/// link live, so one link carries as many invalid attempts as a test needs; a
+/// successful one burns it and the next submission needs a fresh link.
+async fn submit(
+    app: &common::TestApp,
+    link_token: &str,
     payload: serde_json::Value,
 ) -> (reqwest::StatusCode, serde_json::Value) {
     let resp = app
         .client
-        .post(app.url(&format!("/api/v1/forms/{form_id}/submissions")))
-        .bearer_auth(token)
+        .post(app.url(&format!("/api/v1/public/request-forms/{link_token}")))
         .json(&json!({ "payload": payload }))
         .send()
         .await
@@ -118,6 +177,26 @@ async fn submit(
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.expect("submission JSON");
     (status, body)
+}
+
+/// The submissions of one definition, read back through the surface an agent
+/// uses (`GET /forms/{id}/submissions`).
+async fn list_submissions(
+    app: &common::TestApp,
+    token: &str,
+    form_id: &str,
+) -> Vec<serde_json::Value> {
+    let body: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/forms/{form_id}/submissions")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send list submissions")
+        .json()
+        .await
+        .expect("submissions JSON");
+    body.as_array().expect("submissions[]").clone()
 }
 
 /// Collect `{field: code}` pairs from a 422 body so assertions read as the
@@ -197,15 +276,17 @@ async fn definition_round_trips_with_its_ordered_field_set(pool: PgPool) {
 #[sqlx::test]
 async fn a_submission_is_rejected_with_every_field_error_at_once(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
     let form = create_form(&app, &token, departure_form()).await;
-    let form_id = form["id"].as_str().expect("form id");
+    let form_id = form["id"].as_str().expect("form id").to_string();
+    let link = issue_link(&app, &token, &pool, &form_id, company_id).await;
 
     // Empty payload: all three required fields must be reported together,
     // not one at a time.
-    let (status, body) = submit(&app, &token, form_id, json!({})).await;
+    let (status, body) = submit(&app, &link, json!({})).await;
     assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         field_codes(&body),
@@ -219,8 +300,7 @@ async fn a_submission_is_rejected_with_every_field_error_at_once(pool: PgPool) {
     // One payload exercising several distinct rules at once.
     let (status, body) = submit(
         &app,
-        &token,
-        form_id,
+        &link,
         json!({
             "employee_name": "Dana Reyes",
             "last_working_day": "1999-01-01",
@@ -244,8 +324,7 @@ async fn a_submission_is_rejected_with_every_field_error_at_once(pool: PgPool) {
     // The conditional rule: forwarding without an address is the one error.
     let (status, body) = submit(
         &app,
-        &token,
-        form_id,
+        &link,
         json!({
             "employee_name": "Dana Reyes",
             "last_working_day": "2099-01-01",
@@ -260,19 +339,8 @@ async fn a_submission_is_rejected_with_every_field_error_at_once(pool: PgPool) {
     );
 
     // Nothing was stored by any of the rejected attempts.
-    let listed: serde_json::Value = app
-        .client
-        .get(app.url(&format!("/api/v1/forms/{form_id}/submissions")))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("send list submissions")
-        .json()
-        .await
-        .expect("submissions JSON");
-    assert_eq!(
-        listed.as_array().map(|a| a.len()),
-        Some(0),
+    assert!(
+        list_submissions(&app, &token, &form_id).await.is_empty(),
         "a rejected submission must not persist"
     );
 }
@@ -280,16 +348,17 @@ async fn a_submission_is_rejected_with_every_field_error_at_once(pool: PgPool) {
 #[sqlx::test]
 async fn a_valid_submission_is_stored_normalised(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
     let form = create_form(&app, &token, departure_form()).await;
-    let form_id = form["id"].as_str().expect("form id");
+    let form_id = form["id"].as_str().expect("form id").to_string();
+    let link = issue_link(&app, &token, &pool, &form_id, company_id).await;
 
     let (status, body) = submit(
         &app,
-        &token,
-        form_id,
+        &link,
         json!({
             "employee_name": "  Dana Reyes  ",
             "last_working_day": "2099-06-01",
@@ -304,7 +373,14 @@ async fn a_valid_submission_is_stored_normalised(pool: PgPool) {
         "valid submission should 2xx, got {status} body={body}"
     );
 
-    let payload = &body["payload"];
+    // Read back through `GET /forms/{id}/submissions`, the surface PMS-840
+    // kept: what a client answered has to be legible after the fact, not only
+    // in the ticket description it was rendered into once.
+    let listed = list_submissions(&app, &token, &form_id).await;
+    assert_eq!(listed.len(), 1);
+    let stored = &listed[0];
+
+    let payload = &stored["payload"];
     assert_eq!(
         payload["employee_name"].as_str(),
         Some("Dana Reyes"),
@@ -316,21 +392,9 @@ async fn a_valid_submission_is_stored_normalised(pool: PgPool) {
         "an optional field answered with whitespace is omitted, not stored blank"
     );
     assert!(
-        body["ticket_id"].is_null(),
-        "turning a submission into a ticket is PMS-730, not this issue"
+        !stored["ticket_id"].is_null(),
+        "the magic-link path links the stored submission to the ticket it created (PMS-730)"
     );
-
-    let listed: serde_json::Value = app
-        .client
-        .get(app.url(&format!("/api/v1/forms/{form_id}/submissions")))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("send list submissions")
-        .json()
-        .await
-        .expect("submissions JSON");
-    assert_eq!(listed.as_array().map(|a| a.len()), Some(1));
 }
 
 #[sqlx::test]
@@ -378,6 +442,7 @@ async fn a_definition_is_rejected_when_its_field_set_cannot_work(pool: PgPool) {
 #[sqlx::test]
 async fn a_boolean_conditioned_rule_fires_and_is_bounded_at_authoring_time(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
@@ -411,10 +476,11 @@ async fn a_boolean_conditioned_rule_fires_and_is_bounded_at_authoring_time(pool:
     });
 
     let form = create_form(&app, &token, definition.clone()).await;
-    let form_id = form["id"].as_str().expect("form id");
+    let form_id = form["id"].as_str().expect("form id").to_string();
+    let link = issue_link(&app, &token, &pool, &form_id, company_id).await;
 
     // Condition holds and the dependent field is absent -> 422 naming it.
-    let (status, body) = submit(&app, &token, form_id, json!({"keep_mailbox": true})).await;
+    let (status, body) = submit(&app, &link, json!({"keep_mailbox": true})).await;
     assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         field_codes(&body),
@@ -422,8 +488,9 @@ async fn a_boolean_conditioned_rule_fires_and_is_bounded_at_authoring_time(pool:
         "a boolean condition must make the rule fire server-side"
     );
 
-    // Condition does not hold -> the dependent field stays optional.
-    let (status, body) = submit(&app, &token, form_id, json!({"keep_mailbox": false})).await;
+    // Condition does not hold -> the dependent field stays optional. The
+    // rejected attempt above left the link live, so it still works here.
+    let (status, body) = submit(&app, &link, json!({"keep_mailbox": false})).await;
     assert!(
         status.is_success(),
         "no address is needed when the mailbox is not kept, got {status} body={body}"
@@ -451,37 +518,31 @@ async fn a_boolean_conditioned_rule_fires_and_is_bounded_at_authoring_time(pool:
     );
 }
 
+/// PMS-840 removed `DELETE /forms/{id}`, so `is_active` is the whole
+/// retirement story and this pins both halves of it: a link already in a
+/// client's inbox stops working, and no new link can be sent.
 #[sqlx::test]
-async fn a_retired_form_refuses_submissions_and_a_submitted_form_refuses_deletion(pool: PgPool) {
+async fn a_retired_form_refuses_submissions_and_refuses_new_links(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
     let form = create_form(&app, &token, departure_form()).await;
     let form_id = form["id"].as_str().expect("form id").to_string();
 
+    // Two links up front: the second is the one already in a client's inbox
+    // when the form is retired, and a link cannot be issued after that point.
+    let spent = issue_link(&app, &token, &pool, &form_id, company_id).await;
+    let in_flight = issue_link(&app, &token, &pool, &form_id, company_id).await;
+
     let valid = json!({
         "employee_name": "Dana Reyes",
         "last_working_day": "2099-06-01",
         "mailbox_handling": "convert to shared"
     });
-    let (status, _) = submit(&app, &token, &form_id, valid.clone()).await;
-    assert!(status.is_success());
-
-    // A form with submissions cannot be deleted: the submission is a record
-    // of something a client asked for. Retiring is the supported path.
-    let del = app
-        .client
-        .delete(app.url(&format!("/api/v1/forms/{form_id}")))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("send delete");
-    assert_eq!(
-        del.status(),
-        reqwest::StatusCode::CONFLICT,
-        "deleting a submitted form must 409 rather than cascade"
-    );
+    let (status, body) = submit(&app, &spent, valid.clone()).await;
+    assert!(status.is_success(), "got {status} body={body}");
 
     // Retire it, and new submissions stop.
     let patched = app
@@ -494,16 +555,43 @@ async fn a_retired_form_refuses_submissions_and_a_submitted_form_refuses_deletio
         .expect("send retire");
     assert!(patched.status().is_success());
 
-    let (status, _) = submit(&app, &token, &form_id, valid).await;
+    let (status, _) = submit(&app, &in_flight, valid).await;
     assert_eq!(
         status,
         reqwest::StatusCode::CONFLICT,
         "a retired form must stop collecting, or the flag is decorative"
     );
+
+    let refused = app
+        .client
+        .post(app.url("/api/v1/form-request-links"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "form_definition_id": form_id,
+            "company_id": company_id,
+            "recipient_email": "client@example.com"
+        }))
+        .send()
+        .await
+        .expect("send issue link for a retired form");
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a link issued for a retired form would die on arrival"
+    );
+
+    // The submission taken before retirement is still readable: retiring
+    // stops collection, it does not erase what a client asked for. That is
+    // the property the removed hard delete would have broken.
+    assert_eq!(
+        list_submissions(&app, &token, &form_id).await.len(),
+        1,
+        "retiring must keep existing submissions"
+    );
 }
 
 #[sqlx::test]
-async fn authoring_is_admin_gated_but_submitting_is_not(pool: PgPool) {
+async fn authoring_is_admin_gated_but_sending_a_link_is_not(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
         &pool,
@@ -512,6 +600,7 @@ async fn authoring_is_admin_gated_but_submitting_is_not(pool: PgPool) {
         "technician",
     )
     .await;
+    let company_id = common::seed_company(&pool).await;
     let app = common::boot(pool.clone()).await;
     let admin_token = common::login(&app, &admin_email, &admin_password).await;
     let tech_token = common::login(&app, &tech_email, &tech_password).await;
@@ -537,22 +626,37 @@ async fn authoring_is_admin_gated_but_submitting_is_not(pool: PgPool) {
         "authoring a definition is tenant-wide config and stays admin-only"
     );
 
-    // Reading and submitting are open to any authenticated agent: filling a
-    // request on a client's behalf is a normal path.
-    let (status, _) = submit(
-        &app,
-        &tech_token,
-        &form_id,
-        json!({
-            "employee_name": "Dana Reyes",
-            "last_working_day": "2099-06-01",
-            "mailbox_handling": "convert to shared"
-        }),
-    )
-    .await;
+    // Reading a definition and emailing a client its link are open to any
+    // authenticated agent: sending a request out is ordinary account work.
+    let read = app
+        .client
+        .get(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("send get as technician");
     assert!(
-        status.is_success(),
-        "an authenticated agent must be able to submit, got {status}"
+        read.status().is_success(),
+        "an authenticated agent must be able to read a definition, got {}",
+        read.status()
+    );
+
+    let sent = app
+        .client
+        .post(app.url("/api/v1/form-request-links"))
+        .bearer_auth(&tech_token)
+        .json(&json!({
+            "form_definition_id": form_id,
+            "company_id": company_id,
+            "recipient_email": "client@example.com"
+        }))
+        .send()
+        .await
+        .expect("send issue link as technician");
+    assert!(
+        sent.status().is_success(),
+        "an authenticated agent must be able to issue a request link, got {}",
+        sent.status()
     );
 }
 
