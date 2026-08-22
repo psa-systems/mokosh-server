@@ -134,6 +134,16 @@ jobs:
         run: |
           nu scripts/check-workspace-deps.nu
 
+      - name: Unused dependencies
+        # PMS-780: `pulldown-cmark` and `minijinja` were declared with no call
+        # site and compiled on every cold build. The manifest is clean now, so
+        # this gate is blocking rather than advisory: a dependency with no use
+        # fails the PR instead of waiting for the next audit. `cargo install`
+        # is a no-op when rust-cache restores the binary.
+        run: |
+          cargo install --locked cargo-machete
+          cargo machete
+
       - name: Check formatting
         run: cargo fmt --all --check
 

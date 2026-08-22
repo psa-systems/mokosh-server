@@ -46,7 +46,7 @@ pre-commit: ensure-env
 
 # Umbrella check: build + clippy + fmt + docker builder stage.
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps
+check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
@@ -94,6 +94,18 @@ check-oci-publish-tags:
 [group: 'check']
 check-workspace-deps:
     nu scripts/check-workspace-deps.nu
+
+# Fail loud on a dependency declared in Cargo.toml with no call site (PMS-780).
+# `pulldown-cmark` and `minijinja` sat there unused, compiled on every cold
+# build. Install once: `cargo install --locked cargo-machete`.
+[group: 'check']
+check-unused-deps:
+    #!/usr/bin/env nu
+    if (which cargo-machete | is-empty) {
+        print --stderr "cargo-machete not installed: cargo install --locked cargo-machete"
+        exit 1
+    }
+    cargo machete
 
 # Check compilation
 [group: 'check']

@@ -18,7 +18,7 @@ Live staging: **<https://msp.a8n.systems>**. Sign in through the platform and cl
 
 ## Architecture
 
-- **HTTP**: Axum 0.8 (Tokio runtime) with Tower middleware (CORS, tracing, gzip, request limits, request-id).
+- **HTTP**: Axum 0.8 (Tokio runtime) with Tower middleware (CORS, tracing, brotli/gzip compression, request limits, request-id).
 - **Database**: PostgreSQL 18 via SQLx (compile-time-checked migrations).
 - **Secrets**: Infisical (Universal Auth machine identity) reached over HTTP.
 - **Email**: Lettre (SMTP).
@@ -93,10 +93,11 @@ just dev [args]            # bring up the dev stack (passes args to `docker comp
 just dev-down              # stop the dev stack (volumes preserved)
 just dev-clean             # stop and remove volumes; remove .env (preserves .env.infisical)
 just infisical-bootstrap   # one-time: drives Infisical first-run setup and rewrites .env
-just check                 # cargo check + clippy + fmt --check
+just check                 # cargo check + clippy + fmt --check + repo guards
 just check-clippy
 just check-compile
 just check-fmt
+just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just fmt
 just test
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)

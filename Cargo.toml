@@ -61,7 +61,10 @@ path = "src/lib.rs"
 # Axum HTTP server
 axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "limit", "request-id"] }
+# PMS-780: `compression-br` alongside `compression-gzip` so the global
+# `CompressionLayer` can answer `Accept-Encoding: br`; without the feature it
+# silently negotiates gzip instead.
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br", "limit", "request-id"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal"] }
@@ -140,17 +143,11 @@ ip2location = "0.6"
 # Rate limiting
 governor = "0.8"
 
-# Caching
+# Caching (tenants::service seeded-tenant cache)
 moka = { version = "0.12", features = ["future"] }
 
 # Decimal
 rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
-
-# Markdown
-pulldown-cmark = "0.12"
-
-# Templates
-minijinja = "2"
 
 # Regex
 regex = "1"

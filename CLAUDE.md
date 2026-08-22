@@ -11,15 +11,16 @@ Mokosh Server: PSA (Professional Services Automation) REST API for MSPs. Rust + 
 
 ## Common commands
 
-All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust stable, `sqlx-cli` for migrations.
+All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust stable, `sqlx-cli` for migrations, `cargo-machete` for the unused-dependency gate (`cargo install --locked cargo-machete`).
 
 ```
 just                       # list recipes
-just check                 # cargo check + clippy + fmt --check (run before pushing)
+just check                 # cargo check + clippy + fmt --check + repo guards (run before pushing)
 just check-compile         # cargo check --all-targets
 just check-clippy          # cargo clippy --all-targets
 just check-fmt             # cargo fmt --all --check
 just check-workspace-deps  # [workspace.dependencies] matches what members inherit
+just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
@@ -133,6 +134,7 @@ Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 imple
 - OCI build cache (PMS-720, GOV-20): `build-oci-image.yml` builds on a `docker-container` buildx driver and caches to the runner's built-in Actions cache server (`cache_from type=gha`, `cache_to type=gha,mode=max,ignore-error=true`), with `crazy-max/ghaction-github-runtime@v3` re-exporting `ACTIONS_CACHE_URL` / `ACTIONS_RUNTIME_TOKEN` so a raw `docker buildx build` can reach it. The retired `type=inline` and `type=registry` `:buildcache` backends are banned. `scripts/check-oci-build-cache.nu` (in `just check` and `check.yml`) enforces this; because `ignore-error=true` makes a dead cache go green silently, read freshness from the build log's `importing cache manifest from gha` line, not the exit code.
 - Image publish tags (PMS-733): the publish train comes from the trigger, not `git describe`. A `v*` tag push publishes `:vX.Y.Z` only, a `main` push publishes `:latest` only, and a push to a branch on `BRANCH_ALLOW_LIST` in `oci-build/get-tags.nu` publishes that branch's own tag only (the branch name with `/` replaced by `-`), so staging can run a feature branch without `:latest` moving. A branch off that list publishes nothing: it is filtered out by `on.push.branches`, rejected by the job's ref guard, and would fail loud in `get-tags.nu` rather than fall back to `:latest`. To publish from a new branch, add it to the const AND to both places in `build-oci-image.yml`; `scripts/check-oci-publish-tags.nu` (in `just check` and `check.yml`) fails the build if the three disagree.
 - Workspace dependency table (PMS-785): `[workspace.dependencies]` in the root `Cargo.toml` lists only crates a member actually inherits with `<crate> = { workspace = true }`, because that is the only way an entry reaches the build graph. An entry nobody inherits pins a version and a feature set the build never uses (`tower-http` pinned `["cors", "trace"]` there while the root package independently pinned a six-feature superset), and a member that re-pins a crate the table already covers reopens the same ambiguity. `scripts/check-workspace-deps.nu` (in `just check` and `check.yml`) fails on either shape; `cargo machete` cannot, because it only reads each package's own `[dependencies]` / `[dev-dependencies]` / `[build-dependencies]`. To share a new crate, add the workspace entry and the member's `{ workspace = true }` line in the same change.
+- Unused dependencies (PMS-780): `cargo machete` runs in `just check` and `check.yml` as a blocking gate, so a crate declared in `Cargo.toml` with no call site fails the PR. `pulldown-cmark` and `minijinja` had been compiled on every cold build for nothing. Response compression is brotli-then-gzip: `CompressionLayer::new()` offers only the algorithms whose `tower-http` cargo features are compiled in, so `compression-br` must stay in the feature list (guarded by the negotiation tests in `src/api/router.rs`).
 - Releases: `just create-release <major|minor|hotfix>` bumps `Cargo.toml`, pushes a `release/v<X.Y.Z>` branch, opens the PR. CI tags + publishes on merge.
 - Email backend selection: `MailerConfig::from_env().build()` returns `SmtpMailer` if `SMTP_HOST` is set, `LogMailer` otherwise. `SMTP_USERNAME` without `SMTP_PASSWORD` is a hard error at startup (fail-loud, not silent degrade).
 - `ENCRYPTION_KEY` must parse as 32 bytes (raw or 64 hex chars) via `utils::crypto::parse_encryption_key`. Used for AES-256-GCM at-rest encryption of per-tenant secrets (e.g. payment-gateway configs).
