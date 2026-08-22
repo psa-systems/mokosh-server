@@ -15,8 +15,8 @@
 //! - `mokosh_migrator` (`LOGIN BYPASSRLS`) owns the schema and runs DDL /
 //!   migrations / bootstrap. It is also granted `CREATE ON DATABASE` so the
 //!   migrations can self-install the (trusted) `uuid-ossp` / `pg_trgm` /
-//!   `citext` / `pgcrypto` extensions and create the `mokosh_auth` schema -
-//!   the grant the old `provision-roles` step omitted.
+//!   `citext` / `pgcrypto` extensions (`migrations/002_tenants.sql`) - the
+//!   grant the old `provision-roles` step omitted.
 //! - `mokosh_app` (`LOGIN NOSUPERUSER NOBYPASSRLS`) is the request-serving
 //!   role. It is granted connect/usage/DML on the current objects plus
 //!   `ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator` so objects created by
@@ -117,8 +117,8 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
         // The migrator owns/creates schema objects.
         "GRANT ALL ON SCHEMA public TO mokosh_migrator".to_string(),
         // CREATE on the database lets the migrator self-install the trusted
-        // extensions (CREATE EXTENSION) and create the mokosh_auth schema. The
-        // old provision-roles step omitted this, so the migrator could not.
+        // extensions (CREATE EXTENSION). The old provision-roles step omitted
+        // this, so the migrator could not.
         format!("GRANT CREATE ON DATABASE {db} TO mokosh_migrator"),
         // The app role: connect + use the schema, read/write existing objects.
         format!("GRANT CONNECT ON DATABASE {db} TO mokosh_app"),

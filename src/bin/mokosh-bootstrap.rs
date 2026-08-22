@@ -1,9 +1,10 @@
 //! `mokosh-bootstrap` CLI.
 //!
-//! Currently exposes a single subcommand, `bootstrap-infisical`, which drives
-//! the first-run setup of a fresh Infisical instance and writes the resulting
-//! Universal Auth credentials into `.env` so the dev stack picks them up on
-//! the next restart.
+//! One-shot operator utility: first-run setup of a fresh Infisical instance
+//! (`bootstrap-infisical`, which writes the resulting Universal Auth
+//! credentials into `.env` so the dev stack picks them up on the next
+//! restart) plus the dataset and backfill chores. `print_help` below is the
+//! authoritative list of subcommands; do not restate a count here.
 //!
 //! The CLI reads everything it needs from environment variables (typically
 //! sourced from a gitignored `.env.infisical` file by the `just
