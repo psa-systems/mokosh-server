@@ -92,6 +92,7 @@ The dev host is a VPS on the public internet, and several developers share it. T
 | `JWT_SECRET`, `ENCRYPTION_KEY` | `.env` | API server secrets, generated per clone on first `.env` creation; provision them explicitly for any non-local environment. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | `.env` | Optional first-run admin bootstrap. Dev only; see "First-run admin bootstrap" below. |
 | `INFISICAL_*` | `.env` | Infisical server config (bootstrap inputs) and Universal Auth client credentials (filled by `mokosh-bootstrap`). |
+| `ATTACHMENT_DIR` | `.env` | Upload root for ticket attachments and tenant logos. The dev stack points it at `/data/attachments` on the `dev-mokosh-attachments-${USER}` volume so an upload survives a rebuild; deployed environments want an absolute path on a mounted volume. |
 | `RUST_LOG` | `.env` | Tracing subscriber filter. |
 
 `compose.dev.yml` references every value via `${VAR}` substitution and contains no hardcoded secrets. Required vars use `${VAR:?...}` so compose fails loudly with a helpful message when a value is missing.

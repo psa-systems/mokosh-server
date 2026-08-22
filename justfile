@@ -357,7 +357,7 @@ migrate-create name:
 
 # -- Cleanup ------------------------------------------------------------------
 
-# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target, uploaded attachments/logos), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
 [group: 'cleanup']
 dev-clean: ensure-env
     #!/usr/bin/env nu
@@ -367,6 +367,8 @@ dev-clean: ensure-env
         $"dev-mokosh-postgres-data-($suffix)"
         $"dev-mokosh-infisical-postgres-data-($suffix)"
         $"dev-mokosh-server-target-($suffix)"
+        # PMS-836: uploads (ticket attachments + tenant logos under ATTACHMENT_DIR).
+        $"dev-mokosh-attachments-($suffix)"
     ]
     let existing = docker volume ls --quiet | lines
     for vol in $vols {
