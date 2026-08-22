@@ -4,8 +4,13 @@ Authoritative working doc for PMS-255. It exists because the epic is too broad t
 execute as one task: this doc carries the ground-truth schema inventory, the chosen
 model, the table classification, and the decomposition into runner-sized child issues.
 
-Derived from a live read of `migrations/*.sql` and `src/` on 2026-06-12. Keep it
-current as the child issues land.
+Derived from a live read of `migrations/*.sql` and `src/` on 2026-06-12, and re-read
+against the working tree on 2026-08-22 (PMS-847), which corrected the enforcement
+section: RLS is fail-closed, and the coverage invariant is tested with an empty
+allowlist. Keep it current as the child issues land.
+
+Citations name a file and a symbol rather than a line number, because the line numbers
+in the 2026-06-12 draft had all moved by the time anyone followed them.
 
 ## Decisions (resolved with the product owner)
 
@@ -13,9 +18,9 @@ current as the child issues land.
    own `tenants` row with `kind='personal'` (`TenantService::ensure_personal_tenant`,
    called from `place_bunyip_user`, `src/modules/auth/middleware.rs`). The existing
    `tenant_id` boundary becomes the per-user boundary; the existing `TenantId` newtype
-   and the `024` RLS policy do the work once enforcement is real and nobody normal shares
-   the default tenant. Future `kind='org'` tenants plus a teams/ACL layer add collaboration
-   on top, later, without reworking the isolation primitive.
+   and the RLS policy (`024`, rewritten fail-closed by `038`) do the work, provided nobody
+   normal shares the default tenant. Future `kind='org'` tenants plus a teams/ACL layer add
+   collaboration on top, later, without reworking the isolation primitive.
 2. Collaboration (assignment, dispatch, manager approval, account/project managers) is
    intentionally out of scope and temporarily precluded. This is accepted, not a blocker.
    Isolation and data integrity are the absolute highest priority.
@@ -29,39 +34,98 @@ current as the child issues land.
 
 ## Current state (what already exists)
 
-- **Provisioning is largely built.** `place_bunyip_user` (`src/modules/auth/middleware.rs:506`)
+- **Provisioning is largely built.** `place_bunyip_user` (`src/modules/auth/middleware.rs`)
   provisions a personal tenant for new users via `TenantService::ensure_personal_tenant(sub)`,
   and the PMS-243/245 backfill (`is_stuck_in_default`, `rehome_user_between_tenants`) moves
-  non-admin users off the shared default tenant `Uuid::from_u128(1)` into their own. Gap:
-  prove no normal user can remain in the default tenant, and that `OIDC_DEFAULT_TENANT_ID`
-  is not a shared landing zone.
-- **Enforcement is NOT real.** RLS (`migrations/024_triggers_and_rls.sql:55-61`) is fail-open:
-  the policy reduces to `tenant_id = tenant_id` when `app.current_tenant` is unset. The GUC is
-  set only inside `Database::begin_with_tenant` (`src/db/pool.rs:90`), which most read paths
-  bypass in favour of a hand-written `WHERE tenant_id = $1`. The policy is `USING`-only, so it
-  has no `WITH CHECK` and does not constrain INSERT/UPDATE.
+  non-admin users off the shared default tenant `Uuid::from_u128(1)` into their own.
+  `tests/bunyip_login.rs` pins the three cases: a self-signup user is not placed in the shared
+  default tenant, a non-admin already parked there is backfilled out, and a platform
+  `super_admin` legitimately stays (the default tenant is infra-only, PMS-262).
+- **Enforcement is fail-closed.** `migrations/038_rls_fail_closed.sql` (PMS-257) replaced the
+  fail-open `024` policy on every `tenant_id` table with
+
+  ```sql
+  USING      (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+  ```
+
+  and ran `ENABLE` plus `FORCE ROW LEVEL SECURITY` so the table owner is not exempt either.
+  With the GUC unset or empty, the comparison is `NULL` rather than true, so a read returns
+  zero rows and a write is rejected (SQLSTATE `42501`). `WITH CHECK` is what stops an INSERT
+  or UPDATE placing a row in another tenant, which the `USING`-only `024` policy could not do.
+
+  The GUC is set transaction-locally by `Database::begin_with_tenant` (`src/db/pool.rs`), via
+  `set_config('app.current_tenant', $1, true)`.
+- **The role split is what makes the policy bite (PMS-285).** `Database` holds two pools
+  (`src/db/pool.rs`): `app_pool` connects as `mokosh_app` (`NOSUPERUSER NOBYPASSRLS`) and
+  serves every request, so a serving query that skips `begin_with_tenant` fail-closes to zero
+  rows instead of leaking; `migrator_pool` connects as `mokosh_migrator` (`BYPASSRLS`) and is
+  reserved for migrations, bootstrap, the cross-tenant workers and the pre-auth paths, each
+  carrying a `// SAFETY (PMS-285` note at the call site. `scripts/check-pool-safety.nu`
+  (wired into `just check`) fails a PR that adds a bare `.pool()` serving call without one.
+  In dev and CI without the role split both pools are the same connection, and a superuser or
+  `BYPASSRLS` role bypasses RLS unconditionally: role posture, not the policy, is what decides
+  whether the backstop is live. `docs/postgres-security.md` covers the role provisioning.
+- **Coverage of the invariant is tested, with an empty allowlist.**
+  `tests/rls_coverage.rs` (PMS-683) introspects the fully-migrated schema and lists every
+  `public` table that has a `tenant_id` column but is missing RLS enabled, RLS forced, or a
+  `tenant_isolation` policy. Its `ALLOWED_WITHOUT_RLS` allowlist is now
+  `const ALLOWED_WITHOUT_RLS: &[&str] = &[];` - empty.
+
+  What the empty allowlist guarantees, and the reason it is the useful fact for anyone adding
+  a table: **a new table with a `tenant_id` column whose migration does not enable, force and
+  attach the `tenant_isolation` policy fails `every_tenant_table_has_rls_or_is_allowlisted`
+  outright.** There is no entry left to hide behind. Copy the three statements from an
+  existing migration (`105_form_definition_drafts.sql` is the shortest current example) into
+  the new one. The test's second assertion runs the other way: an allowlisted table that has
+  since gained RLS must be deleted from the list, so the list cannot rot back into cover.
+- **Behaviour is tested too, not just schema shape.** `tests/rls_isolation.rs` and
+  `tests/tenantless_table_rls.rs` drive the policies through a purpose-created
+  `NOSUPERUSER NOBYPASSRLS` role (`#[sqlx::test]` itself connects as the superuser, which
+  bypasses RLS), and `tests/rls_serving_reads.rs` pins the opposite failure: a serving read
+  that reaches the app role must still return its own tenant's rows rather than fail-closing
+  to an empty 200. `tests/per_user_isolation.rs` and `tests/worker_tenant_isolation.rs` cover
+  the request path and the background workers.
 - **Type-safe tenant threading is done (PMS-139).** Service methods take `TenantId`, only
   constructible from an authenticated claim via `CurrentUser::tenant()`.
 
-## Schema inventory (76 tables, live from migrations 2026-06-12)
+## Schema inventory (76 tables, snapshot of migrations at 2026-06-12)
 
-`tenant_id` = has the column (so the `024` RLS loop attaches to it). `user cols` = direct
+This is a dated snapshot, not a live list: migrations have added tenant tables since. The
+authoritative inventory is the query in `tests/rls_coverage.rs`, which reads the migrated
+schema itself; read that rather than trusting the counts below.
+
+`tenant_id` = has the column (so the `024`/`038` RLS loops attach to it). `user cols` = direct
 user-ownership columns. `class` is the handling; the editable-lookup split is confirmed by
 PMS-259 (see below).
 
 Classes: `business` (user-created records), `lookup` (user-editable config, isolated + seeded
 per user), `auth` (identity/session), `seq` (per-tenant counters).
 
-### Tables WITHOUT tenant_id (6) - must be fixed (PMS-255.3)
+### Tables WITHOUT tenant_id (6) - covered by migration 041 (PMS-258)
 
-| table | pk | user cols | issue |
+The `024`/`038` loops select `WHERE column_name = 'tenant_id'`, so these six were skipped.
+`migrations/041_rls_cover_tenantless_tables.sql` covers the five that are not the root table.
+
+| table | pk | user cols | how it is isolated |
 | --- | --- | --- | --- |
-| `tenants` | id | (personal_owner_id) | root table, by design; no change |
-| `user_oauth_identities` | id | user_id | CRITICAL: unique `(provider, subject)` collides across tenants; must include tenant/user scope |
-| `kb_article_versions` | id | edited_by_id | add tenant_id or parent-join RLS (parent `kb_articles`) |
-| `invoice_lines` | id | - | add tenant_id or parent-join RLS (parent `invoices`) |
-| `rate_card_items` | id | - | add tenant_id or parent-join RLS (parent `rate_cards`) |
-| `sla_targets` | id | - | add tenant_id or parent-join RLS (parent `sla_policies`) |
+| `tenants` | id | (personal_owner_id) | root table, by design; no policy |
+| `user_oauth_identities` | id | user_id | gained a denormalized `tenant_id` plus a tenant-scoped unique key, replacing the global `(provider, subject)` that collided across tenants; standard direct policy |
+| `kb_article_versions` | id | edited_by_id | fail-closed parent-join policy (`EXISTS` over `kb_articles.tenant_id`) |
+| `invoice_lines` | id | - | fail-closed parent-join policy (parent `invoices`) |
+| `rate_card_items` | id | - | fail-closed parent-join policy (parent `rate_cards`) |
+| `sla_targets` | id | - | fail-closed parent-join policy (parent `sla_policies`) |
+
+The parent-join form was chosen over a denormalized column: no backfill, and no `NOT NULL`
+column to keep populated on every INSERT, so no drift risk. `tests/tenantless_table_rls.rs`
+pins both properties (per-tenant uniqueness on `user_oauth_identities`, and the parent-join
+policy fail-closing on `kb_article_versions`).
+
+**Known gap:** a table in this shape is invisible to `tests/rls_coverage.rs`, whose sweep
+requires a `tenant_id` column, and `tenantless_table_rls.rs` names two tables rather than
+sweeping. `quote_lines` (migration `092`) was added after `041` in exactly this shape and has
+no policy at all. Closing that, and extending the sweep so the next one cannot slip through,
+is tracked in PMS-874.
 
 ### Tables WITH tenant_id (70)
 
@@ -94,37 +158,61 @@ auth: `users`, `user_sessions` (user_id), `api_keys` (user_id), `password_reset_
 (user_id), `tenant_invitations` (invited_by, accepted_by), `teams` (manager_id), `team_members`
 (user_id).
 
-## Decomposition (child issues of PMS-255)
+## Decomposition (child issues of PMS-255) and where each piece landed
 
-Ordered by dependency. Each is a runner-sized PR.
+The nine steps below were the original dependency-ordered breakdown, each a runner-sized PR.
+Each now names the artifact that carries it, so a reader can go read the code rather than the
+plan. Status belongs in YouTrack, not here; follow the issue ids.
 
-1. **GUC plumbing - route every PSA service query through `begin_with_tenant`.** Replace raw
-   `self.pool` / `db.pool().begin()` paths so every read and write sets `app.current_tenant`.
-   Prerequisite for fail-closed. Modules: all 20 under `src/modules/`.
-2. **Flip RLS fail-closed + add `WITH CHECK` + `BYPASSRLS` migration role.** New migration that
-   rewrites the `024` policy so an unset GUC yields zero rows and writes are constrained.
-   Depends on (1).
-3. **Cover the 6 no-`tenant_id` tables** (table above); fix `user_oauth_identities` unique
-   constraint.
-4. **Per-user lookup seeding + system-shared class (PMS-259).** Seed `lookup` tables into each
-   personal tenant at provisioning; introduce the read-only system-shared class. Detailed in
+1. **GUC plumbing - route every PSA service query through `begin_with_tenant`.**
+   `Database::begin_with_tenant` (`src/db/pool.rs`) opens the transaction and sets
+   `app.current_tenant`. `scripts/check-pool-safety.nu` is the standing gate: a serving
+   `.pool()` call needs an adjacent `// SAFETY (PMS-285` note saying why it legitimately
+   skips the GUC. PMS-256 / PMS-285 / PMS-692 lineage.
+2. **Flip RLS fail-closed + add `WITH CHECK` + `BYPASSRLS` migration role.**
+   `migrations/038_rls_fail_closed.sql` (PMS-257) for the policy;
+   `migrations/094_rls_quotes_backstop.sql` and `095_rls_deferred_tables.sql` (PMS-683) for
+   the tables added after the `038` loop ran. The role split is `Database`'s two pools, and
+   the roles themselves are a deployment step (`docs/postgres-security.md`), because roles are
+   cluster-global and a migration cannot safely create them.
+3. **Cover the 6 no-`tenant_id` tables.** `migrations/041_rls_cover_tenantless_tables.sql`
+   (PMS-258); see the table above, including the `quote_lines` gap tracked in PMS-874.
+4. **Per-user lookup seeding + system-shared class (PMS-259).** `TenantService::copy_default_config`
+   (`src/modules/tenants/service.rs`) and `migrations/039_system_shared_class.sql`. Detailed in
    the two sections below.
-5. **Fix known cross-tenant leak points.** `auth::get_user_sessions` (`service.rs:1715`,
-   user_id-only), `auth::logout_all` (`service.rs:535`), `auth::find_user_placement`
-   reachability (`service.rs:1413`), `invitations::newest_pending_for` exposure
-   (`service.rs:152`), `tenants::list_tenants` guard (`service.rs:242`), `reports::dashboard`
-   aggregates.
-6. **Audit background workers + `from_trusted` escape hatches.** calendar reminder, SLA sweep,
-   billing recurring, RMM ingest webhook, notification dispatcher, portal bridges
-   (`portal/routes.rs:102,127,158,178,194`).
-7. **Remove/redefine the `single-tenant` cargo feature + default-tenant landing audit.**
-   `main.rs:94-116`, `db/tenant.rs:45-56`; prove no normal user lands in `Uuid::from_u128(1)`.
+5. **Fix known cross-tenant leak points (PMS-260).** `AuthService::get_user_sessions` and
+   `AuthService::logout_all` take a `tenant_id` and run under the GUC.
+   `AuthService::find_user_placement` still reads `users` across tenants by design (it resolves
+   which tenant a `sub` belongs to, before any session exists) and runs on the migrator pool;
+   `routes_do_not_reach_global_login_helpers` in `tests/auth.rs` pins that no `routes.rs`
+   reaches it. `InvitationsService::newest_pending_for` is the other deliberate pre-auth
+   cross-tenant bridge, on the migrator pool and pinned by the same test.
+   `TenantService::list_tenants` enumerates the RLS-exempt `tenants` root on the migrator pool
+   and is gated on `super_admin` at the route. All three carry their `// SAFETY (PMS-285` note.
+6. **Audit background workers + `from_trusted` escape hatches (PMS-261).** The workers
+   enumerate tenants on the migrator pool, then bridge each unit of work through
+   `TenantId::from_trusted`; `src/modules/audit/context.rs` documents that seam.
+   `tests/worker_tenant_isolation.rs` pins that a worker's per-tenant unit of work neither
+   reads nor writes another tenant's rows.
+7. **Remove/redefine the `single-tenant` cargo feature + default-tenant landing audit.** The
+   feature is gone (PMS-262): `Cargo.toml` declares only `multi-tenant` and `server`, and
+   `AppConfig::is_multi_tenant` (`src/main.rs`) returns `true` unconditionally. The default
+   tenant id is resolved in two places, neither of them under `src/db/` (which holds only
+   `mod.rs`, `pool.rs` and `provision.rs`): `parse_seed_source_tenant_id` in
+   `src/modules/tenants/service.rs` reads `MOKOSH_SEED_TENANT_ID` and falls back to
+   `Uuid::from_u128(1)`, and
+   `default_bunyip_tenant_id` in `src/modules/auth/middleware.rs` reads
+   `OIDC_DEFAULT_TENANT_ID` with the same fallback. `is_stuck_in_default` next to it is what
+   moves a normal user off that tenant.
 8. **Backfill migration + verification query** for existing co-mingled default-tenant rows.
    Resolved: no production data exists (the DB is wiped before go-live), so the backfill is a
    no-op; `migrations/040_backfill_comingled_default_tenant.sql` records that and asserts the
    zero-co-mingling invariant fail-loud. See the resolved decision below.
-9. **Per-user isolation integration test suite.** Two users in two personal tenants; assert
-   every module denies cross-user read AND write; aggregates scoped; RLS fail-closed regression.
+9. **Per-user isolation integration test suite (PMS-264).** `tests/per_user_isolation.rs`:
+   two users in two personal tenants, driven through the real HTTP API, asserting cross-user
+   read and write denial per module. The DB-engine face of the same guarantee (a write whose
+   `tenant_id` differs from the GUC is rejected with SQLSTATE `42501`) is in
+   `tests/rls_isolation.rs`.
 
 ## Editable-lookup seeding (PMS-259)
 
@@ -188,10 +276,14 @@ mechanism is a no-op for current data.
 Mechanism:
 
 1. **Sentinel**: `tenant_id IS NULL` means "global / system-shared".
-2. **Read (RLS)**: the `tenant_isolation` policy on every `tenant_id` table is recreated with
+2. **Read (RLS)**: `039`'s loop recreated the `tenant_isolation` policy as
    `tenant_id IS NULL OR tenant_id = <current-tenant match>`, so a global row is visible to
-   every tenant. (PMS-257 owns flipping the tenant match fail-closed and adding WITH CHECK; the
-   `IS NULL` read clause is owned here.)
+   every tenant. (PMS-257 owns the fail-closed tenant match and the WITH CHECK; the `IS NULL`
+   read clause is owned here.) That loop covered the tables that existed when `039` ran.
+   Tables added since (`094`, `095`, `105`, and every new-table migration, which copies the
+   plain `038` block) carry no `IS NULL` disjunct, and `mokosh_enable_system_shared` does not
+   add one, so opting one of them in today would store global rows that no tenant can read.
+   Inert while nothing opts in; tracked in PMS-875.
 3. **Write guard (DB)**: trigger function `mokosh_guard_system_shared_row()` rejects any
    INSERT / UPDATE / DELETE touching a `tenant_id IS NULL` row unless the session sets
    `app.allow_system_writes = 'on'` (reserved for the migration / super-admin role). Raises
@@ -220,8 +312,13 @@ strict per-user isolation for everything editable.
   sidesteps the unsafe one-shot path: personal tenants are provisioned lazily on login
   (PMS-243/245), so a bulk SQL backfill would have no tenant to resolve most owners to.
 - **Portal identity (PMS-255.6).** Portal runs on a `contacts`-row identity (`CurrentContact`,
-  company-scoped), a separate plane from `users`. Proposed default: keep portal company-scoped for
-  now and revisit with the orgs work; do not force per-user isolation on portal contacts. Confirm.
+  company-scoped), a separate plane from `users`, with its own `portal_auth_middleware` and
+  `RequirePortalAuth` extractor (`src/modules/portal/middleware.rs`) and its own credential
+  lifecycle under `/api/v1/portal/auth/*` (PMS-820). Per-user isolation is deliberately NOT
+  applied to portal contacts: the plane stays company-scoped and is revisited with the orgs
+  work. `PortalService::login` is a pre-auth `(tenant_slug, email)` resolve on the migrator
+  pool with the `// SAFETY (PMS-285` note pointing back at this section; keep the two in step
+  if the decision changes.
 - ~~**Lookup classification.**~~ Resolved by PMS-259: see "Borderline tables (confirmed
   classification)" above. `business_hours` is editable-lookup; `payment_gateway_configs` and
   `email_mailboxes` are business.
