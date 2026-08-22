@@ -1521,3 +1521,85 @@ async fn portal_reset_token_is_single_use_and_expires(pool: PgPool) {
         "an expired reset token returns 400"
     );
 }
+
+/// MAPPS-532: portal sign-out ends the session it is called with.
+///
+/// The portal plane mints stateless JWTs - no session row, no session id in
+/// the claims - so before this the endpoint did not exist and the SPA's
+/// Logout button revoked nothing: the token stayed good for its full 8-hour
+/// TTL. `POST /portal/auth/logout` stamps a cutoff on the contact, which
+/// invalidates every token that contact holds, not just the one presenting
+/// it. That is the deliberate behaviour, and this test pins it by signing out
+/// on one "device" and checking the other one is out too.
+#[sqlx::test]
+async fn portal_logout_revokes_every_token_the_contact_holds(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    seed_portal_contact(&pool, company, "customer@acme.example").await;
+    let app = common::boot(pool).await;
+
+    let laptop = portal_token(&app, "customer@acme.example").await;
+    let phone = portal_token(&app, "customer@acme.example").await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/portal/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send portal /auth/me")
+                .status()
+        }
+    };
+
+    assert_eq!(me(laptop.clone()).await, reqwest::StatusCode::OK);
+    assert_eq!(me(phone.clone()).await, reqwest::StatusCode::OK);
+
+    // The cutoff is compared against the token's `iat`, which has one-second
+    // resolution, and the comparison is strictly `<` so that signing straight
+    // back in works. Cross the second boundary so the tokens above are
+    // genuinely older than the sign-out rather than equal to it.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let signed_out = app
+        .client
+        .post(app.url("/api/v1/portal/auth/logout"))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("send portal logout");
+    assert_eq!(signed_out.status(), reqwest::StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        me(laptop).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the token the sign-out was made with must stop working"
+    );
+    assert_eq!(
+        me(phone).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a portal sign-out ends every session that contact holds"
+    );
+
+    // Signing back in is unaffected: the cutoff only looks backwards.
+    let fresh = portal_token(&app, "customer@acme.example").await;
+    assert_eq!(me(fresh).await, reqwest::StatusCode::OK);
+}
+
+/// MAPPS-532: the sign-out route is on the authenticated side of the portal
+/// router. Without a bearer there is no contact to revoke, and answering
+/// anything but 401 would let an anonymous caller name one.
+#[sqlx::test]
+async fn portal_logout_requires_a_portal_bearer(pool: PgPool) {
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/portal/auth/logout"))
+        .send()
+        .await
+        .expect("send unauthenticated portal logout");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}

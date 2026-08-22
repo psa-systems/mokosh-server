@@ -113,6 +113,9 @@ pub fn portal_routes(
         // Protected: profile + ticket creation. List + get arrive in
         // subsequent commits in this story.
         .route("/auth/me", get(me))
+        // Protected: end the caller's portal sessions (MAPPS-532). Needs the
+        // bearer it is revoking, so it sits on the authenticated side.
+        .route("/auth/logout", post(logout))
         .route("/tickets", get(list_tickets).post(create_ticket))
         .route("/tickets/{ticket_id}", get(get_ticket))
         // PMS-449: portal ticket comments. GET lists `note_type='public'`
@@ -179,6 +182,25 @@ async fn login(
 
 async fn me(RequirePortalAuth(contact): RequirePortalAuth) -> AppResult<Json<CurrentContact>> {
     Ok(Json(contact))
+}
+
+/// MAPPS-532: portal sign-out. Answers 204.
+///
+/// Not a mirror of the agent `logout`, which deletes the `user_sessions` row
+/// its bearer names: a portal token names no session, so this stamps a cutoff
+/// on the contact and every token issued before now stops decoding into a
+/// session. That makes it sign-out-everywhere rather than sign-out-this-tab -
+/// see `PortalAuthService::logout`.
+///
+/// Deliberately unthrottled: the caller has already presented a valid portal
+/// bearer, and the write it triggers only ever revokes that caller's own
+/// sessions.
+async fn logout(
+    State(state): State<PortalRouterState>,
+    RequirePortalAuth(contact): RequirePortalAuth,
+) -> AppResult<StatusCode> {
+    state.service.logout(contact.tenant_id, contact.id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Redeem a setup token and set the contact's portal password (PMS-136).

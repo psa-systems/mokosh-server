@@ -45,29 +45,54 @@ pub async fn portal_auth_middleware(
     let auth_state = match bearer(&request) {
         Some(token) => match state.service.decode_token(token) {
             Ok(claims) => {
-                outcome = BearerOutcome::Accepted;
                 // Names are not minted into the JWT (PII minimisation), so
-                // hydrate them from the contacts row (PMS-195). A missing
-                // row or read error degrades to empty names rather than
-                // failing the request. PMS-769: log the read error before
-                // substituting, so a DB fault is not indistinguishable from a
-                // contact who genuinely has no name on file.
-                let names = match state.service.contact_names(claims.tid, claims.sub).await {
-                    Ok(names) => names,
-                    Err(e) => {
-                        tracing::warn!(error = %e, contact = %claims.sub, "portal contact name lookup failed; falling back to empty names");
-                        None
+                // hydrate them from the contacts row (PMS-195). MAPPS-532: the
+                // same read carries the sign-out cutoff, because the portal
+                // plane has no session row to delete and revocation is
+                // therefore a property of this row.
+                match state.service.contact_snapshot(claims.tid, claims.sub).await {
+                    // MAPPS-532: signed out. The token decodes and has not
+                    // expired, but it predates the contact's last sign-out, so
+                    // it is exactly as good as a forged one.
+                    Ok(Some(snapshot)) if snapshot.revokes(claims.iat) => {
+                        outcome = BearerOutcome::Rejected;
+                        tracing::debug!(
+                            contact = %claims.sub,
+                            "portal bearer rejected: predates the contact's sign-out"
+                        );
+                        PortalAuthState::default()
                     }
-                };
-                let (first_name, last_name) = names.unwrap_or_default();
-                PortalAuthState::authenticated(CurrentContact {
-                    id: claims.sub,
-                    tenant_id: claims.tid,
-                    company_id: claims.cid,
-                    email: claims.email,
-                    first_name,
-                    last_name,
-                })
+                    Ok(snapshot) => {
+                        outcome = BearerOutcome::Accepted;
+                        // A missing row still degrades to empty names rather
+                        // than failing the request, as it did before.
+                        let (first_name, last_name) = snapshot
+                            .map(|s| (s.first_name, s.last_name))
+                            .unwrap_or_default();
+                        PortalAuthState::authenticated(CurrentContact {
+                            id: claims.sub,
+                            tenant_id: claims.tid,
+                            company_id: claims.cid,
+                            email: claims.email,
+                            first_name,
+                            last_name,
+                        })
+                    }
+                    // MAPPS-532: this read used to degrade to empty names and
+                    // let the request through. It now decides whether the
+                    // token has been revoked, and a revocation check that
+                    // fails open is not a revocation check - so a read error
+                    // is a 401. The cost is bounded: every portal handler
+                    // reads the database anyway, so a database this broken
+                    // serves nothing either way.
+                    // PMS-769: log the cause, so a DB fault is not
+                    // indistinguishable from a rejected credential.
+                    Err(e) => {
+                        outcome = BearerOutcome::Rejected;
+                        tracing::warn!(error = %e, contact = %claims.sub, "portal contact lookup failed; rejecting the bearer");
+                        PortalAuthState::default()
+                    }
+                }
             }
             // PMS-769: log the cause rather than discarding it, so a portal
             // 401 leaves server-side evidence. `debug`: an expired or
