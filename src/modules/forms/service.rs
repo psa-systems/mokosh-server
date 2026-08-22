@@ -318,19 +318,27 @@ impl FormsService {
             check_field_set(fields)?;
         }
         if req.fields.is_some() || req.rules.is_some() {
-            let names: Vec<(String, Option<Vec<String>>)> = match &req.fields {
+            let known: Vec<RuleField> = match &req.fields {
                 Some(fields) => fields
                     .iter()
-                    .map(|f| (f.name.clone(), f.options.clone()))
+                    .map(|f| RuleField {
+                        name: f.name.clone(),
+                        field_type: f.field_type,
+                        options: f.options.clone(),
+                    })
                     .collect(),
                 None => existing
                     .fields
                     .iter()
-                    .map(|f| (f.name.clone(), f.options.clone()))
+                    .map(|f| RuleField {
+                        name: f.name.clone(),
+                        field_type: f.field_type,
+                        options: f.options.clone(),
+                    })
                     .collect(),
             };
             let rules = req.rules.as_deref().unwrap_or(&existing.rules);
-            check_rules_against_names(rules, &names)?;
+            check_rules_against_fields(rules, &known)?;
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -585,21 +593,32 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
     }
 }
 
+/// The parts of a field the rule checker needs. The type matters as much as
+/// the name: it is what bounds the values `equals` can usefully be compared
+/// against (PMS-842).
+struct RuleField {
+    name: String,
+    field_type: FieldType,
+    options: Option<Vec<String>>,
+}
+
 fn check_rules(rules: &[FormRule], fields: &[CreateFormFieldRequest]) -> AppResult<()> {
-    let names: Vec<(String, Option<Vec<String>>)> = fields
+    let known: Vec<RuleField> = fields
         .iter()
-        .map(|f| (f.name.clone(), f.options.clone()))
+        .map(|f| RuleField {
+            name: f.name.clone(),
+            field_type: f.field_type,
+            options: f.options.clone(),
+        })
         .collect();
-    check_rules_against_names(rules, &names)
+    check_rules_against_fields(rules, &known)
 }
 
 /// A rule that names a field the form does not have can never fire, so it is
 /// a typo rather than a feature. Rejecting it here means the interpreter
-/// never has to explain a silently-inert rule to a confused author.
-fn check_rules_against_names(
-    rules: &[FormRule],
-    names: &[(String, Option<Vec<String>>)],
-) -> AppResult<()> {
+/// never has to explain a silently-inert rule to a confused author. The same
+/// reasoning covers an `equals` outside the condition field's value domain.
+fn check_rules_against_fields(rules: &[FormRule], known: &[RuleField]) -> AppResult<()> {
     let mut errors = Vec::new();
     for (i, rule) in rules.iter().enumerate() {
         let FormRule::RequiredIf {
@@ -607,32 +626,28 @@ fn check_rules_against_names(
             when_field,
             equals,
         } = rule;
-        if !names.iter().any(|(n, _)| n == field) {
+        if !known.iter().any(|f| &f.name == field) {
             errors.push(FieldError::new(
                 format!("rules[{i}].field"),
                 format!("Rule targets unknown field `{field}`"),
                 "unknown_field",
             ));
         }
-        match names.iter().find(|(n, _)| n == when_field) {
+        match known.iter().find(|f| &f.name == when_field) {
             None => errors.push(FieldError::new(
                 format!("rules[{i}].when_field"),
                 format!("Rule reads unknown field `{when_field}`"),
                 "unknown_field",
             )),
-            // When the condition reads a select, `equals` must be one of its
-            // options or the rule can never fire.
-            Some((_, Some(options))) if !options.iter().any(|o| o == equals) => {
-                errors.push(FieldError::new(
-                    format!("rules[{i}].equals"),
-                    format!(
-                        "`{equals}` is not an option of `{when_field}` (one of: {})",
-                        options.join(", ")
-                    ),
-                    "option",
-                ));
+            Some(condition) => {
+                if let Some(message) = equals_outside_domain(condition, equals) {
+                    errors.push(FieldError::new(
+                        format!("rules[{i}].equals"),
+                        message,
+                        "option",
+                    ));
+                }
             }
-            Some(_) => {}
         }
     }
     if errors.is_empty() {
@@ -642,5 +657,114 @@ fn check_rules_against_names(
             "one or more fields are invalid",
             errors,
         ))
+    }
+}
+
+/// The reason `equals` can never match an answer to `condition`, if any.
+///
+/// A select is bounded by its option set and a boolean by `true`/`false`; the
+/// free-text types accept anything, so nothing there is refusable. A select
+/// carrying no option set is left to `check_field_set`, which rejects it on
+/// its own terms rather than as a rule error.
+fn equals_outside_domain(condition: &RuleField, equals: &str) -> Option<String> {
+    match condition.field_type {
+        FieldType::Select => {
+            let options = condition.options.as_ref()?;
+            if options.iter().any(|o| o == equals) {
+                return None;
+            }
+            Some(format!(
+                "`{equals}` is not an option of `{}` (one of: {})",
+                condition.name,
+                options.join(", ")
+            ))
+        }
+        FieldType::Boolean => (equals != "true" && equals != "false").then(|| {
+            format!(
+                "`{equals}` is not a value of `{}` (one of: true, false)",
+                condition.name
+            )
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known(name: &str, field_type: FieldType, options: Option<Vec<String>>) -> RuleField {
+        RuleField {
+            name: name.to_string(),
+            field_type,
+            options,
+        }
+    }
+
+    fn errors_of(err: &AppError) -> Vec<(String, String)> {
+        match err {
+            AppError::Validation { errors, .. } => errors
+                .iter()
+                .map(|e| (e.field.clone(), e.code.clone()))
+                .collect(),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    fn rule(field: &str, when_field: &str, equals: &str) -> FormRule {
+        FormRule::RequiredIf {
+            field: field.to_string(),
+            when_field: when_field.to_string(),
+            equals: equals.to_string(),
+        }
+    }
+
+    /// PMS-842: a boolean condition only ever answers `true` or `false`, so an
+    /// `equals` outside that pair is a rule that can never fire and is refused
+    /// at authoring time rather than stored inert.
+    #[test]
+    fn a_boolean_condition_bounds_equals_to_true_or_false() {
+        let fields = vec![
+            known("keep_mailbox", FieldType::Boolean, None),
+            known("forward_to", FieldType::Email, None),
+        ];
+
+        for accepted in ["true", "false"] {
+            check_rules_against_fields(&[rule("forward_to", "keep_mailbox", accepted)], &fields)
+                .unwrap_or_else(|e| panic!("`{accepted}` must be authorable, got {e:?}"));
+        }
+
+        let err = check_rules_against_fields(&[rule("forward_to", "keep_mailbox", "yes")], &fields)
+            .expect_err("`yes` can never equal a JSON boolean");
+        assert_eq!(
+            errors_of(&err),
+            vec![("rules[0].equals".to_string(), "option".to_string())]
+        );
+    }
+
+    /// The select check keeps working, and the free-text types stay unbounded.
+    #[test]
+    fn a_select_condition_still_bounds_equals_and_text_does_not() {
+        let fields = vec![
+            known(
+                "handling",
+                FieldType::Select,
+                Some(vec!["forward".into(), "delete".into()]),
+            ),
+            known("employee_name", FieldType::Text, None),
+            known("forward_to", FieldType::Email, None),
+        ];
+
+        check_rules_against_fields(&[rule("forward_to", "handling", "forward")], &fields)
+            .expect("an on-menu option is authorable");
+        let err = check_rules_against_fields(&[rule("forward_to", "handling", "shred")], &fields)
+            .expect_err("off-menu option");
+        assert_eq!(
+            errors_of(&err),
+            vec![("rules[0].equals".to_string(), "option".to_string())]
+        );
+
+        check_rules_against_fields(&[rule("forward_to", "employee_name", "Dana")], &fields)
+            .expect("a text condition accepts any comparison value");
     }
 }

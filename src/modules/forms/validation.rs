@@ -142,15 +142,24 @@ fn required_by_rule(
             field: target,
             when_field,
             equals,
-        } => {
-            target == &field.name
-                && object
-                    .get(when_field)
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.trim() == equals)
-                    .unwrap_or(false)
-        }
+        } => target == &field.name && condition_matches(object.get(when_field), equals),
     })
+}
+
+/// Whether a condition value equals the rule's `equals` string.
+///
+/// `equals` is authored as text whatever the condition field's type, so the
+/// answer is compared by its JSON rendering: reading it with `as_str` alone
+/// made a `true` answer on a boolean field yield `None` and the rule never
+/// fire, while the SPA (which holds every answer as a string) did fire it.
+/// PMS-842.
+fn condition_matches(value: Option<&Value>, equals: &str) -> bool {
+    match value {
+        Some(Value::String(s)) => s.trim() == equals,
+        Some(Value::Bool(b)) => b.to_string() == equals,
+        Some(Value::Number(n)) => n.to_string() == equals,
+        _ => false,
+    }
 }
 
 /// Type and rule checks for a value already known to be present.
@@ -507,6 +516,55 @@ mod tests {
         )
         .expect_err("an optional field that IS answered must still be valid");
         assert_eq!(codes(&err), vec!["email"]);
+    }
+
+    /// PMS-842: the condition field can be a checkbox. `equals` is authored as
+    /// text whatever the type, so `"true"` must match a JSON `true`, which is
+    /// what the SPA already does and what the server used to miss.
+    #[test]
+    fn required_if_fires_on_a_boolean_condition_field() {
+        let fields = vec![
+            field("keep_mailbox", FieldType::Boolean, true),
+            field("forward_to", FieldType::Email, false),
+        ];
+        let rules = vec![FormRule::RequiredIf {
+            field: "forward_to".into(),
+            when_field: "keep_mailbox".into(),
+            equals: "true".into(),
+        }];
+
+        let err = validate_submission(
+            &fields,
+            &rules,
+            &serde_json::json!({"keep_mailbox": true}),
+            today(),
+        )
+        .expect_err("keeping the mailbox without an address");
+        assert_eq!(codes(&err), vec!["required"]);
+        assert_eq!(fields_of(&err), vec!["forward_to"]);
+
+        validate_submission(
+            &fields,
+            &rules,
+            &serde_json::json!({"keep_mailbox": false}),
+            today(),
+        )
+        .expect("no address needed when the mailbox is not kept");
+
+        // The `false` side of the same rule is symmetric.
+        let negated = vec![FormRule::RequiredIf {
+            field: "forward_to".into(),
+            when_field: "keep_mailbox".into(),
+            equals: "false".into(),
+        }];
+        let err = validate_submission(
+            &fields,
+            &negated,
+            &serde_json::json!({"keep_mailbox": false}),
+            today(),
+        )
+        .expect_err("the rule must fire on false too");
+        assert_eq!(fields_of(&err), vec!["forward_to"]);
     }
 
     #[test]

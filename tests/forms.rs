@@ -370,6 +370,87 @@ async fn a_definition_is_rejected_when_its_field_set_cannot_work(pool: PgPool) {
     );
 }
 
+/// PMS-842: a `required_if` whose condition is a checkbox must fire on the
+/// server, not only in the SPA. `equals` is authored as text whatever the
+/// condition field's type, so `"true"` has to match a JSON `true` answer, and
+/// an `equals` outside `true`/`false` has to be refused at authoring time
+/// rather than stored as a rule that can never fire.
+#[sqlx::test]
+async fn a_boolean_conditioned_rule_fires_and_is_bounded_at_authoring_time(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let definition = json!({
+        "name": "Mailbox",
+        "slug": "mailbox",
+        "fields": [
+            {
+                "name": "keep_mailbox",
+                "label": "Keep the mailbox",
+                "field_type": "boolean",
+                "is_required": true,
+                "sort_order": 1
+            },
+            {
+                "name": "forward_to",
+                "label": "Forward to",
+                "field_type": "email",
+                "is_required": false,
+                "sort_order": 2
+            }
+        ],
+        "rules": [
+            {
+                "kind": "required_if",
+                "field": "forward_to",
+                "when_field": "keep_mailbox",
+                "equals": "true"
+            }
+        ]
+    });
+
+    let form = create_form(&app, &token, definition.clone()).await;
+    let form_id = form["id"].as_str().expect("form id");
+
+    // Condition holds and the dependent field is absent -> 422 naming it.
+    let (status, body) = submit(&app, &token, form_id, json!({"keep_mailbox": true})).await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        field_codes(&body),
+        vec![("forward_to".to_string(), "required".to_string())],
+        "a boolean condition must make the rule fire server-side"
+    );
+
+    // Condition does not hold -> the dependent field stays optional.
+    let (status, body) = submit(&app, &token, form_id, json!({"keep_mailbox": false})).await;
+    assert!(
+        status.is_success(),
+        "no address is needed when the mailbox is not kept, got {status} body={body}"
+    );
+
+    // An `equals` a boolean can never take is an author error.
+    let mut broken = definition;
+    broken["name"] = json!("Mailbox yes");
+    broken["slug"] = json!("mailbox-yes");
+    broken["rules"][0]["equals"] = json!("yes");
+    let resp = app
+        .client
+        .post(app.url("/api/v1/forms"))
+        .bearer_auth(&token)
+        .json(&broken)
+        .send()
+        .await
+        .expect("send create with an unsatisfiable rule");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    assert_eq!(
+        field_codes(&body),
+        vec![("rules[0].equals".to_string(), "option".to_string())],
+        "a rule that can never fire must be refused, not stored inert"
+    );
+}
+
 #[sqlx::test]
 async fn a_retired_form_refuses_submissions_and_a_submitted_form_refuses_deletion(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
