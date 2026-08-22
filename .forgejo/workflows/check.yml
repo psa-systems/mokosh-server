@@ -158,6 +158,16 @@ jobs:
         run: |
           nu scripts/check-doc-recipes.nu
 
+      - name: Config doc paths
+        # PMS-855: four comments in .env.example and compose.dev.yml pointed at
+        # a docs/mokosh-smtp/ directory that has never existed in this repo.
+        # .env.example is minted into .env in every clone, so the dead pointer
+        # reached every developer configuring mail. Fails when a config comment
+        # names a docs/ path that is not on disk.
+        shell: nu {0}
+        run: |
+          nu scripts/check-config-doc-paths.nu
+
       - name: Unused dependencies
         # PMS-780: `pulldown-cmark` and `minijinja` were declared with no call
         # site and compiled on every cold build. The manifest is clean now, so

@@ -176,8 +176,8 @@ services:
   # Mailpit captures every outgoing email locally. mokosh-server points
   # SMTP_HOST=mailpit in the dev env (see the server service below); the
   # web UI is at http://localhost:8025. State is intentionally
-  # ephemeral - no volume mount, restart clears the inbox. See
-  # docs/mokosh-smtp/01-dev-mailcatcher.md.
+  # ephemeral - no volume mount, restart clears the inbox. MP_DELIVER is
+  # false, so nothing leaves the box whatever SMTP_FROM says.
   mailpit:
     container_name: dev-mokosh-mailpit-${USER:?USER missing - run via just dev}
     image: axllent/mailpit:v1.27
@@ -235,7 +235,7 @@ services:
       # alongside this one; messages land in http://localhost:8025.
       # Production deploys override these via secrets; setting
       # SMTP_HOST empty drops back to LogMailer (links go to docker
-      # logs). See docs/mokosh-smtp/03-config-and-bootstrap.md.
+      # logs). The .env.example block above these keys is the reference.
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
