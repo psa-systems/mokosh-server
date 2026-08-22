@@ -26,8 +26,8 @@ alongside source changes.
 > now nests/merges ~30 implemented modules (billing, projects,
 > calendar, contracts, quotes, assets, rmm, sla, saved_reports,
 > workflows, time_tracking, dashboards, email_intake, approvals,
-> settings, audit, data_transfer, and more) and the `stub_routes()`
-> 501 mechanism is gone. The sole remaining HTTP 501 is the PDF format
+> settings, audit, data_transfer, and more) and the 501 placeholder
+> router is gone. The sole remaining HTTP 501 is the PDF format
 > of the report-export route (`reports/routes.rs`); CSV is
 > implemented. The "At a glance" and "Placeholder modules" tables
 > below are kept for history but no longer reflect the handler layer.
@@ -39,7 +39,7 @@ alongside source changes.
 | Total Rust LOC under [`src/`](../src/) (excluding modules) | ~3,000 |
 | LOC under [`src/modules/`](../src/modules/) | ~6,950 |
 | Modules implemented | **most** (~30 nested/merged in [`api/router.rs`](../src/api/router.rs); see the 2026-07-24 correction) |
-| Module placeholders | **0** (the `stub_routes()` mechanism is gone) |
+| Module placeholders | **0** (the 501 placeholder router is gone) |
 | Route groups under `/api/v1` | **~30 + `/health`** |
 | Route groups returning real data | **most** |
 | Route groups returning HTTP 501 | **1 format** (PDF report export in [`reports/routes.rs`](../src/modules/reports/routes.rs); CSV works) |
@@ -421,11 +421,11 @@ inserts into `companies`, `contacts`, `tickets`.
 > modules below (assets, audit, billing, calendar, contracts,
 > knowledge_base, notifications, portal, projects, reports, rmm,
 > settings, sla, time_tracking) now have real handlers merged in
-> `api/router.rs`, and the `stub_routes()` 501 mechanism no longer
-> exists. Retained to document the original schema-to-handler mapping.
+> `api/router.rs`, and the 501 placeholder router no longer exists.
+> Retained to document the original schema-to-handler mapping.
 
-Each is a single-line `mod.rs` (`//! <name> module placeholder`) and
-the router maps each to `stub_routes()` which returns
+Each was a single-line `mod.rs` (`//! <name> module placeholder`) and
+the router mapped each to a placeholder handler that returned
 `HTTP 501 Not implemented yet`. Schema tables exist for every one of
 these, so adding a real module is mostly handler + service work
 against an existing schema.
@@ -451,6 +451,15 @@ against an existing schema.
 implementations.
 
 ## Cross-cutting issues
+
+> **Historical (2026-05-06 audit).** This list and the `F1..F14`
+> fix list below are the findings of the 2026-05-06 audit, retained
+> for the reasoning behind each fix. Several no longer hold: item 2
+> in particular, because `/api/v1/portal/*` is a real router with
+> its own contact-scoped auth middleware today. Read a claim here as
+> a record of what was true on 2026-05-06, not as current state, and
+> confirm it against the tree before acting on it. Rebuilding or
+> freezing this catalog is tracked in PMS-849.
 
 These appear across implemented modules and are best fixed once at
 the infrastructure or shared-helper layer.
@@ -533,14 +542,18 @@ the infrastructure or shared-helper layer.
     Each `mod.rs` uses `#[cfg(feature = "server")]` to omit handler
     and service code from the WASM build. Currently in lock-step;
     vulnerable to silent drift the moment one side is edited
-    without porting. See
-    [`client-server-integration.md`](client-server-integration.md#dto-sharing).
+    without porting.
 
 ## Proposed fixes
 
+> **Historical (2026-05-06 audit).** Covered by the note under
+> [Cross-cutting issues](#cross-cutting-issues): these are the
+> 2026-05-06 proposals, and several have shipped since. F6 and F12
+> below, and the `## Priority` table that ranks them, describe a 501
+> placeholder router that no longer exists.
+
 Concrete, scoped patches. IDs are referenced from per-module
-sections above and from
-[`client-server-integration.md`](client-server-integration.md).
+sections above.
 
 ### F1. `auth/routes.rs::list_users` - implement instead of returning empty
 
@@ -745,6 +758,12 @@ adds its own migration without touching others.
 
 ## Verifying the API locally
 
+> **Does not run as written.** The snippet below addresses the API
+> through a host port the dev stack no longer publishes and logs in
+> as an account no migration creates. Rewriting it against the
+> Traefik-routed stack is tracked in PMS-873; until then follow
+> [`quickstart.md`](../quickstart.md).
+
 When the dev stack is up (see [README.md](../README.md) -
 "Quick start"):
 
@@ -766,16 +785,11 @@ http get --headers $auth http://($env.MOKOSH_HOST_BIND_IP):($env.MOKOSH_PORT)/ap
 http get --headers $auth http://($env.MOKOSH_HOST_BIND_IP):($env.MOKOSH_PORT)/api/v1/tickets
 http get --headers $auth http://($env.MOKOSH_HOST_BIND_IP):($env.MOKOSH_PORT)/api/v1/contacts/companies
 http get --headers $auth http://($env.MOKOSH_HOST_BIND_IP):($env.MOKOSH_PORT)/api/v1/tenants
-
-# Confirm a stub group returns 501
-http get --headers $auth --full http://($env.MOKOSH_HOST_BIND_IP):($env.MOKOSH_PORT)/api/v1/invoices
 ```
 
-Three things this surfaces directly:
+Two things this surfaced at the 2026-05-06 audit:
 
 1. `tickets` list comes back with empty `status.name`,
    `priority.name`, `company_name` etc. (validates F3).
 2. `/api/v1/companies` (without the `/contacts/` prefix) returns 404
    (validates Cross-cutting #11).
-3. Every stub group returns 501 with the body `Not implemented yet`
-   (validates Cross-cutting #2).
