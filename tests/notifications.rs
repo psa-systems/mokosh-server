@@ -21,6 +21,12 @@
 //!     recipient name (PMS-774).
 //!   * `POST /notifications/preview` renders exactly what `dispatch` would
 //!     send, writes nothing, and stays inside the caller's tenant (PMS-808).
+//!   * A row left claimed (`status = 'sending'`) by a tick that died is
+//!     retried once its claim expires, and a live claim is left alone
+//!     (PMS-782). The rest of PMS-782 lives in
+//!     `tests/notification_dispatch_query_budget.rs` and
+//!     `tests/notification_worker_transactions.rs`, which each need a
+//!     process-global tracing subscriber.
 
 mod common;
 
@@ -965,5 +971,72 @@ async fn preview_cannot_read_another_tenants_templates(pool: PgPool) {
     assert!(
         other.is_empty(),
         "a tenant must not preview another tenant's templates, got {other:?}",
+    );
+}
+
+/// PMS-782: a tick claims its batch by flipping rows to `sending` with a
+/// bounded claim (`next_attempt_at = NOW() + the claim timeout`) and only then
+/// sends, so a worker that dies mid-tick leaves rows claimed. A later tick must
+/// pick those rows back up once the claim has expired, and must leave a claim
+/// that is still live alone.
+#[sqlx::test]
+async fn a_stale_claim_is_retried_and_a_live_one_is_left_alone(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+
+    let stale = Uuid::new_v4();
+    let live = Uuid::new_v4();
+    for (id, claim_offset) in [(stale, "-1 minute"), (live, "10 minutes")] {
+        sqlx::query(
+            r#"INSERT INTO notifications
+                   (id, tenant_id, user_id, channel_type, subject, body, status,
+                    attempt_count, next_attempt_at)
+               VALUES ($1, $2, $3, 'in_app', 'Crashed mid-tick', 'body', 'sending',
+                       1, NOW() + $4::interval)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(admin_id)
+        .bind(claim_offset)
+        .execute(&pool)
+        .await
+        .expect("seed claimed row");
+    }
+
+    let worker = DispatcherWorker::new(Database::from_pool(pool.clone()), Arc::new(LogMailer));
+    let stats = worker.run_tick(10).await.expect("worker tick");
+
+    assert_eq!(
+        stats.examined, 1,
+        "only the expired claim is due; the live one belongs to another tick",
+    );
+    assert_eq!(stats.sent, 1, "the reclaimed row must be delivered");
+
+    let (status, attempt): (Option<String>, i32) =
+        sqlx::query_as("SELECT status, attempt_count FROM notifications WHERE id = $1")
+            .bind(stale)
+            .fetch_one(&pool)
+            .await
+            .expect("re-fetch the stale row");
+    assert_eq!(
+        status.as_deref(),
+        Some("sent"),
+        "an expired claim must be retried, not stuck in 'sending'",
+    );
+    assert_eq!(
+        attempt, 2,
+        "the reclaiming tick counts as this row's second attempt",
+    );
+
+    let live_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM notifications WHERE id = $1")
+            .bind(live)
+            .fetch_one(&pool)
+            .await
+            .expect("re-fetch the live row");
+    assert_eq!(
+        live_status.as_deref(),
+        Some("sending"),
+        "a claim that has not expired must not be stolen",
     );
 }

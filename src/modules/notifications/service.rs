@@ -715,6 +715,16 @@ impl NotificationsService {
     /// A rule whose `template_id` is NULL, or whose template row is gone,
     /// is skipped with a `warn!` and contributes nothing to the returned
     /// fanout count (PMS-701).
+    ///
+    /// PMS-782: the whole call runs in ONE `begin_with_tenant` transaction
+    /// (rule lookup, template reads, preference reads and the inserts), and
+    /// each fan-out is written with one batched `INSERT ... SELECT ... FROM
+    /// UNNEST` per (rule, channel, recipient kind) instead of a transaction
+    /// per row. `dispatch` is awaited inline on request paths (a ticket note
+    /// add, a password reset), so the round trips were paid by the caller.
+    /// The rows are now atomic as a set: a mid-fan-out failure queues nothing
+    /// rather than half the recipients, which is the right semantic here
+    /// because retries live on the row, not on the dispatch.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch(
         &self,
@@ -722,7 +732,10 @@ impl NotificationsService {
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<u64> {
-        let messages = self.render_event(tenant_id, event_type, context).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let messages = self
+            .render_event(&mut tx, tenant_id, event_type, context)
+            .await?;
 
         let mut fanout = 0u64;
         for message in messages {
@@ -741,45 +754,45 @@ impl NotificationsService {
                 );
             }
 
-            for user_id in &message.user_ids {
-                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-                sqlx::query(
+            // One statement per recipient kind, whatever the recipient count.
+            if !message.user_ids.is_empty() {
+                fanout += sqlx::query(
                     r#"INSERT INTO notifications
                        (tenant_id, user_id, channel_type, template_id, subject, body, body_html, status)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
+                       SELECT $1, u, $2, $3, $4, $5, $6, 'pending'
+                       FROM UNNEST($7::uuid[]) AS u"#,
                 )
                 .bind(tenant_id)
-                .bind(user_id)
                 .bind(&message.channel)
                 .bind(message.template_id)
                 .bind(&message.subject)
                 .bind(&message.body_text)
                 .bind(&message.body_html)
+                .bind(&message.user_ids)
                 .execute(&mut *tx)
-                .await?;
-                tx.commit().await?;
-                fanout += 1;
+                .await?
+                .rows_affected();
             }
-            for addr in &message.emails {
-                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-                sqlx::query(
+            if !message.emails.is_empty() {
+                fanout += sqlx::query(
                     r#"INSERT INTO notifications
                        (tenant_id, channel_type, template_id, recipient, subject, body, body_html, status)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"#,
+                       SELECT $1, $2, $3, r, $4, $5, $6, 'pending'
+                       FROM UNNEST($7::text[]) AS r"#,
                 )
                 .bind(tenant_id)
                 .bind(&message.channel)
                 .bind(message.template_id)
-                .bind(addr)
                 .bind(&message.subject)
                 .bind(&message.body_text)
                 .bind(&message.body_html)
+                .bind(&message.emails)
                 .execute(&mut *tx)
-                .await?;
-                tx.commit().await?;
-                fanout += 1;
+                .await?
+                .rows_affected();
             }
         }
+        tx.commit().await?;
         Ok(fanout)
     }
 
@@ -800,7 +813,10 @@ impl NotificationsService {
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<Vec<NotificationPreviewResponse>> {
-        let messages = self.render_event(tenant_id, event_type, context).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let messages = self
+            .render_event(&mut tx, tenant_id, event_type, context)
+            .await?;
 
         // Recipients are shown as addresses, so a user-id fan-out reads the
         // same way as a standalone email one. The lookup is the same
@@ -811,7 +827,8 @@ impl NotificationsService {
             .iter()
             .flat_map(|m| m.user_ids.iter().copied())
             .collect();
-        let addresses = self.load_user_emails(tenant_id, &user_ids).await?;
+        let addresses = self.load_user_emails(&mut tx, tenant_id, &user_ids).await?;
+        tx.commit().await?;
 
         Ok(messages
             .into_iter()
@@ -846,24 +863,25 @@ impl NotificationsService {
     /// deliberately one function: a preview rendered by a second copy of
     /// this logic would drift from what actually gets sent, which is
     /// worse than having no preview at all. Nothing here writes.
+    ///
+    /// Reads run on the caller's connection (PMS-782) so the whole
+    /// dispatch, rule lookup through insert, is one transaction.
     async fn render_event(
         &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<Vec<RenderedNotification>> {
-        let rules = {
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            sqlx::query_as::<_, RuleRow>(
-                r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
-                   FROM notification_rules
-                   WHERE tenant_id = $1 AND event_type = $2 AND is_active = TRUE"#,
-            )
-            .bind(tenant_id)
-            .bind(event_type)
-            .fetch_all(&mut *tx)
-            .await?
-        };
+        let rules = sqlx::query_as::<_, RuleRow>(
+            r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
+               FROM notification_rules
+               WHERE tenant_id = $1 AND event_type = $2 AND is_active = TRUE"#,
+        )
+        .bind(tenant_id)
+        .bind(event_type)
+        .fetch_all(&mut *conn)
+        .await?;
 
         let ctx_user_id: Option<Uuid> = context
             .get("recipient_user_id")
@@ -886,13 +904,12 @@ impl NotificationsService {
             // own rule, so the row lives under this same tenant.
             let template = match rule.template_id {
                 Some(tid) => {
-                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                     sqlx::query_as::<_, TemplateRow>(
                         "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
                          FROM notification_templates WHERE id = $1",
                     )
                     .bind(tid)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(&mut *conn)
                     .await?
                 }
                 None => None,
@@ -949,38 +966,43 @@ impl NotificationsService {
             // instead of querying once per (channel, user) pair inside the
             // nested loop below (was N+1).
             let prefs = self
-                .load_user_preferences(tenant_id, &user_ids, event_type)
+                .load_user_preferences(&mut *conn, tenant_id, &user_ids, event_type)
                 .await?;
 
-            for channel in &rule.channels {
-                // A template with no subject (in_app rows need none) leaves
-                // the column NULL rather than inventing one.
-                let (subject, subject_unresolved) = match template.subject.as_deref() {
-                    Some(raw) => {
-                        let (rendered, unresolved) = render_template(raw, context);
-                        (Some(rendered), unresolved)
-                    }
-                    None => (None, Vec::new()),
-                };
-                let (body, body_unresolved) = render_template(&template.body_text, context);
-                // PMS-700: render the authored HTML alternative alongside the
-                // text and persist it on the row, so the worker sends one
-                // multipart message instead of re-resolving the template
-                // (which could have been edited after the row was queued).
-                let (body_html, html_unresolved) = match template.body_html.as_deref() {
-                    Some(raw) => {
-                        let (rendered, unresolved) = render_template(raw, context);
-                        (Some(rendered), unresolved)
-                    }
-                    None => (None, Vec::new()),
-                };
-                let mut unresolved = subject_unresolved;
-                for key in body_unresolved.into_iter().chain(html_unresolved) {
-                    if !unresolved.contains(&key) {
-                        unresolved.push(key);
-                    }
+            // PMS-782: rendered once per rule, not once per channel. The
+            // inputs (this rule's template, the caller's context) do not vary
+            // by channel, so every channel of a rule got a byte-identical
+            // substitution pass.
+            //
+            // A template with no subject (in_app rows need none) leaves the
+            // column NULL rather than inventing one.
+            let (subject, subject_unresolved) = match template.subject.as_deref() {
+                Some(raw) => {
+                    let (rendered, unresolved) = render_template(raw, context);
+                    (Some(rendered), unresolved)
                 }
+                None => (None, Vec::new()),
+            };
+            let (body, body_unresolved) = render_template(&template.body_text, context);
+            // PMS-700: render the authored HTML alternative alongside the
+            // text and persist it on the row, so the worker sends one
+            // multipart message instead of re-resolving the template
+            // (which could have been edited after the row was queued).
+            let (body_html, html_unresolved) = match template.body_html.as_deref() {
+                Some(raw) => {
+                    let (rendered, unresolved) = render_template(raw, context);
+                    (Some(rendered), unresolved)
+                }
+                None => (None, Vec::new()),
+            };
+            let mut unresolved = subject_unresolved;
+            for key in body_unresolved.into_iter().chain(html_unresolved) {
+                if !unresolved.contains(&key) {
+                    unresolved.push(key);
+                }
+            }
 
+            for channel in &rule.channels {
                 messages.push(RenderedNotification {
                     rule_name: rule.name.clone(),
                     template_id: template.id,
@@ -1000,10 +1022,10 @@ impl NotificationsService {
                     } else {
                         emails.clone()
                     },
-                    subject,
-                    body_text: body,
-                    body_html,
-                    unresolved,
+                    subject: subject.clone(),
+                    body_text: body.clone(),
+                    body_html: body_html.clone(),
+                    unresolved: unresolved.clone(),
                 });
             }
         }
@@ -1016,18 +1038,18 @@ impl NotificationsService {
     /// the worker would actually mail.
     async fn load_user_emails(
         &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         user_ids: &[Uuid],
     ) -> AppResult<HashMap<Uuid, String>> {
         if user_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(Uuid, String)> =
             sqlx::query_as("SELECT id, email FROM users WHERE tenant_id = $1 AND id = ANY($2)")
                 .bind(tenant_id)
                 .bind(user_ids)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut *conn)
                 .await?;
         Ok(rows.into_iter().collect())
     }
@@ -1038,6 +1060,7 @@ impl NotificationsService {
     /// [`accepts_channel`]).
     async fn load_user_preferences(
         &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         user_ids: &[Uuid],
         event_type: &str,
@@ -1045,7 +1068,6 @@ impl NotificationsService {
         if user_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(Uuid, Option<bool>, Vec<String>)> = sqlx::query_as(
             r#"SELECT user_id, is_enabled, channel_types
                FROM user_notification_preferences
@@ -1054,7 +1076,7 @@ impl NotificationsService {
         .bind(tenant_id)
         .bind(user_ids)
         .bind(event_type)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
         Ok(rows
             .into_iter()
@@ -1101,6 +1123,11 @@ fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) ->
     }
 }
 
+/// Tracing target of the per-render event emitted by
+/// [`render_template`]. Exported so a test can count renders without
+/// hardcoding a module path.
+pub const RENDER_TRACE_TARGET: &str = "mokosh::notifications::render";
+
 /// Minimal `{{key}}` substitution. Keys are resolved against the
 /// top-level fields of `context`; missing keys leave the placeholder
 /// untouched so an operator can see what was expected at delivery time.
@@ -1121,6 +1148,10 @@ fn require_template_id(request: &UpsertNotificationRuleRequest) -> AppResult<Uui
 }
 
 pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec<String>) {
+    // PMS-782: one trace event per substitution pass, so the render count of a
+    // dispatch is observable (it used to be one pass per channel of the same
+    // rule, rendering byte-identical output N times).
+    tracing::trace!(target: RENDER_TRACE_TARGET, bytes = input.len(), "rendering notification template");
     let mut out = String::with_capacity(input.len());
     let mut unresolved: Vec<String> = Vec::new();
     let mut rest = input;
