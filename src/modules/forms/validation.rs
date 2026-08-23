@@ -143,6 +143,12 @@ fn required_by_rule(
             when_field,
             equals,
         } => target == &field.name && condition_matches(object.get(when_field), equals),
+        // PMS-898: the read path is deliberately tolerant. A stored rule this
+        // build cannot name makes no field required here; it is not evidence
+        // that the submission is wrong, only that this binary is older than
+        // the rule. The write path refuses to create one in the first place,
+        // so reaching this arm means a definition written by a newer server.
+        FormRule::Unknown => false,
     })
 }
 

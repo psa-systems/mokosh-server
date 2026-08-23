@@ -61,6 +61,30 @@ fn validate_nonneg(
 /// Validate a money rate stored in a `DECIMAL(10, 2)` column (`default_rate`,
 /// `hourly_rate`): non-negative, at most 2 decimal places, magnitude `< 1e8`.
 /// A zero rate is allowed (free / non-billable work).
+/// A URL slug: lowercase alphanumerics in hyphen-separated groups, with no
+/// leading, trailing or doubled hyphen. Grammar `^[a-z0-9]+(-[a-z0-9]+)*$`.
+///
+/// PMS-898: moved here with the forms DTOs, which validate a definition's slug
+/// on the wire. Written by hand rather than with the `regex` the server's copy
+/// used, because this crate is compiled into the SPA's WASM bundle and a regex
+/// engine is a large thing to ship for one grammar this simple. The server's
+/// `utils::validation::validate_slug` now delegates here, so there is one
+/// definition rather than two that can disagree.
+pub fn validate_slug(slug: &str) -> Result<(), ValidationError> {
+    let ok = !slug.is_empty()
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && !slug.contains("--")
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(ValidationError::new("invalid_slug"))
+    }
+}
+
 pub fn validate_rate(value: &Decimal) -> Result<(), ValidationError> {
     validate_nonneg(
         value,
@@ -173,5 +197,31 @@ mod tests {
 
         assert!(validate_distance_miles(&dec("1000000")).is_err());
         assert!(validate_distance_miles(&dec("1.234")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pms898_slug_tests {
+    use super::validate_slug;
+
+    /// The grammar the regex this replaces enforced, case by case, so the
+    /// hand-written form cannot drift from `^[a-z0-9]+(-[a-z0-9]+)*$`.
+    #[test]
+    fn slug_grammar_matches_the_regex_it_replaces() {
+        for ok in ["a", "hello-world", "hello123", "a1-b2-c3", "9"] {
+            assert!(validate_slug(ok).is_ok(), "`{ok}` should be valid");
+        }
+        for bad in [
+            "",
+            "-leading",
+            "trailing-",
+            "double--hyphen",
+            "Upper",
+            "has space",
+            "under_score",
+            "-",
+        ] {
+            assert!(validate_slug(bad).is_err(), "`{bad}` should be rejected");
+        }
     }
 }

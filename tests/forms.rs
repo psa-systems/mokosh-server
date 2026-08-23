@@ -848,3 +848,71 @@ async fn an_over_length_contact_line_is_refused_on_create_and_on_update(pool: Pg
         cleared["contact_info"]
     );
 }
+
+/// PMS-898: a rule kind the server cannot name is refused on a write.
+///
+/// The shared `FormRule` gained a catch-all so the READ path stays tolerant: a
+/// client older than a rule kind renders the form and lets the server enforce
+/// it, rather than failing to deserialise the definition. That tolerance must
+/// not reach writes, or a definition would store a rule this server can never
+/// enforce, and the form would carry a constraint that exists only in the
+/// payload that created it.
+///
+/// The compiler is what made this unavoidable: `check_rules_against_fields`
+/// destructured `FormRule` irrefutably, so adding the catch-all broke the build
+/// until someone decided what an unnamed rule means on a write.
+#[sqlx::test]
+async fn a_rule_kind_the_server_cannot_name_is_refused(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let mut body = departure_form();
+    body["slug"] = json!("departure-unknown-rule");
+    body["rules"] = json!([
+        {
+            "kind": "required_if",
+            "field": "forward_to",
+            "when_field": "mailbox_handling",
+            "equals": "forward"
+        },
+        {
+            "kind": "invented_by_a_newer_server",
+            "field": "forward_to"
+        }
+    ]);
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/forms"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .expect("create definition with an unknown rule kind");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "an unnamed rule must not be storable"
+    );
+
+    let error: serde_json::Value = resp.json().await.expect("error JSON");
+    let errors = error["error"]["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the 422 carries field errors, got {error}"));
+    assert!(
+        errors.iter().any(|e| e["field"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("rules[")
+            && e["code"].as_str() == Some("unknown_rule_kind")),
+        "the rejection names which rule, got {error}"
+    );
+
+    // The known rule alone still creates, so the rejection is about the
+    // unnamed kind and not about rules in general.
+    let mut ok_body = departure_form();
+    ok_body["slug"] = json!("departure-known-rule-only");
+    let created = create_form(&app, &token, ok_body).await;
+    assert_eq!(created["rules"].as_array().map(|r| r.len()), Some(1));
+}
