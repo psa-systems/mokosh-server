@@ -27,6 +27,40 @@ impl ProjectsService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-894: tenant-wide project totals in one round trip.
+    ///
+    /// Two aggregates over the same table, kept in one transaction so the
+    /// counts and the sum describe the same instant - a client rendering them
+    /// side by side should not be able to show a budget that includes a
+    /// project the counts do not.
+    pub async fn project_summary(&self, tenant_id: TenantId) -> AppResult<ProjectSummaryResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM projects WHERE tenant_id = $1 GROUP BY status",
+        )
+        .bind(tenant_id.get())
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // COALESCE so an empty tenant sums to 0 rather than NULL. `Decimal`
+        // all the way out: the column is numeric, and rounding it through an
+        // f64 on the way to a client is how a budget total ends in .9999999.
+        let total: rust_decimal::Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(budget_amount), 0) FROM projects WHERE tenant_id = $1",
+        )
+        .bind(tenant_id.get())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(ProjectSummaryResponse {
+            counts_by_status: rows.into_iter().collect(),
+            total_budget: total.to_string(),
+        })
+    }
+
     pub async fn list_projects(
         &self,
         tenant_id: TenantId,
