@@ -711,6 +711,167 @@ async fn current_reads_and_renames_the_callers_own_tenant(pool: PgPool) {
     assert_eq!(stored, "Acme IT");
 }
 
+/// PMS-896: the organisation record round-trips through the surface the
+/// onboarding flow writes to, with and without the one optional field.
+///
+/// End to end rather than on the conversion alone: the point of the endpoint is
+/// that the record lands on the CALLER'S tenant with no id in the request, and
+/// that `GET /current` reads back what was submitted.
+#[sqlx::test]
+async fn the_organisation_record_persists_with_and_without_a_website(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let with_website = app
+        .client
+        .put(app.url("/api/v1/tenants/current/organization"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Contoso IT",
+            "contact_name": "Dana",
+            "phone": "555-0100",
+            "email": "help@contoso.example",
+            "website": "https://contoso.example",
+        }))
+        .send()
+        .await
+        .expect("send organisation submission");
+    assert_eq!(with_website.status(), reqwest::StatusCode::OK);
+
+    let (name, branding): (String, serde_json::Value) =
+        sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("the caller's own tenant row");
+    assert_eq!(name, "Contoso IT");
+    assert_eq!(branding["support_phone"], serde_json::json!("555-0100"));
+    assert_eq!(
+        branding["support_email"],
+        serde_json::json!("help@contoso.example")
+    );
+    assert_eq!(branding["support_contact_name"], serde_json::json!("Dana"));
+    assert_eq!(
+        branding["website"],
+        serde_json::json!("https://contoso.example")
+    );
+
+    // The same submission with the optional field omitted is accepted, and
+    // clears the website rather than leaving the old one behind: this is a
+    // whole-record submission, not a patch.
+    let without_website: serde_json::Value = app
+        .client
+        .put(app.url("/api/v1/tenants/current/organization"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Contoso IT",
+            "contact_name": "Dana",
+            "phone": "555-0100",
+            "email": "help@contoso.example",
+        }))
+        .send()
+        .await
+        .expect("send organisation submission")
+        .json()
+        .await
+        .expect("organisation JSON");
+    assert_eq!(
+        without_website["branding"]["website"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        without_website["branding"]["support_phone"],
+        serde_json::json!("555-0100")
+    );
+
+    // What the settings page reads back is what was submitted.
+    let read: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send read")
+        .json()
+        .await
+        .expect("current tenant JSON");
+    assert_eq!(read["name"], serde_json::json!("Contoso IT"));
+    assert_eq!(read["branding"]["website"], serde_json::Value::Null);
+    assert_eq!(
+        read["branding"]["support_email"],
+        serde_json::json!("help@contoso.example")
+    );
+}
+
+/// PMS-896: phone and email are required, so a submission missing either is
+/// refused and nothing is written. The generic `PUT /current` patch cannot say
+/// this (a logo upload sends two keys and no phone), which is why the
+/// organisation record has its own surface.
+#[sqlx::test]
+async fn an_organisation_submission_requires_a_phone_and_an_email(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for body in [
+        serde_json::json!({ "name": "Contoso IT", "email": "help@contoso.example" }),
+        serde_json::json!({ "name": "Contoso IT", "phone": "555-0100" }),
+        serde_json::json!({ "name": "Contoso IT", "phone": "555-0100", "email": "help@contoso.example", "website": "javascript:alert(1)" }),
+    ] {
+        let resp = app
+            .client
+            .put(app.url("/api/v1/tenants/current/organization"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("send organisation submission");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "expected a refusal for {body}"
+        );
+    }
+
+    let name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("tenant name");
+    assert_ne!(name, "Contoso IT", "a refused submission writes nothing");
+}
+
+/// PMS-896: the organisation surface carries the same admin gate as the rename
+/// it performs (PMS-751); a non-admin's onboarding does not reach it
+/// (MAPPS-524).
+#[sqlx::test]
+async fn a_non_admin_cannot_submit_the_organisation_record(pool: PgPool) {
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "pms896-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &tech_email, &tech_password).await;
+
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current/organization"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Renamed by a technician",
+            "phone": "555-0100",
+            "email": "help@contoso.example",
+        }))
+        .send()
+        .await
+        .expect("send organisation submission");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
 /// `current` is not a uuid, and must never be parsed as one: a static segment
 /// has to win over `/{tenant_id}` or the route would 400 on every call.
 #[sqlx::test]

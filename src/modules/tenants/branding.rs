@@ -8,13 +8,15 @@
 //! number that was a sentence, or a path pointing anywhere the public API base
 //! can be joined to went out over the MSP's own SMTP identity.
 //!
-//! One table, two callers: `PUT /api/v1/tenants/:id` merges a whole document
-//! ([`validate_branding_patch`], called from `TenantService::update_tenant`) and
+//! One table, three callers: `PUT /api/v1/tenants/:id` merges a whole document
+//! ([`validate_branding_patch`], called from `TenantService::update_tenant`),
 //! `PUT /api/v1/settings/{category}/{key}` writes one key at a time
 //! ([`validate_branding_value`], called from
-//! `settings::models::validate_setting_value`). They still write to different
-//! stores, which is the seam PMS-703 F18 names; what they no longer do is
-//! disagree about what a valid value is.
+//! `settings::models::validate_setting_value`), and PMS-896's
+//! `PUT /api/v1/tenants/current/organization` submits the organisation record
+//! whole ([`validate_branding_value_as`], called from `super::organization`).
+//! They still write to different stores, which is the seam PMS-703 F18 names;
+//! what they no longer do is disagree about what a valid value is.
 //!
 //! Ungated, unlike the rest of the tenant surface: the settings validator is
 //! not gated on `multi-tenant`, and a single-tenant build has branding too.
@@ -41,6 +43,9 @@ const MAX_PHONE: usize = 40;
 const MAX_EMAIL: usize = 254;
 const MAX_PATH: usize = 200;
 const MAX_DOMAIN: usize = 253;
+/// PMS-896: same cap as `companies.website`, so the organisation's own web
+/// address and a client's are bounded alike.
+const MAX_URL: usize = 255;
 
 /// Validate a whole `branding` PATCH document.
 ///
@@ -71,6 +76,16 @@ pub fn validate_branding_patch(patch: &Value) -> AppResult<()> {
 /// hang it on different request fields (`branding.{key}` for the tenants PATCH,
 /// `value` for the per-key settings write) and one table has to serve both.
 pub fn validate_branding_value(key: &str, value: &Value) -> Result<(), String> {
+    validate_branding_value_as(key, key, value)
+}
+
+/// PMS-896: the same table, reporting against a different field name.
+///
+/// The organisation submission (`super::organization`) calls its fields `phone`,
+/// `email` and `contact_name`, so a message naming `support_phone` would name a
+/// key that request does not have. `key` still selects the rule; `label` is
+/// what the message calls it.
+pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Result<(), String> {
     // PMS-758: an explicit null is how a merged document clears a key, and the
     // logo-delete route sends two of them.
     if value.is_null() {
@@ -81,62 +96,71 @@ pub fn validate_branding_value(key: &str, value: &Value) -> Result<(), String> {
         // accepted per PMS-703 F18 because the settings endpoint has written it
         // since PMS-113.
         "primary_color" | "secondary_color" | "accent_color" => {
-            let s = text(key, value, 7)?;
+            let s = text(label, value, 7)?;
             if is_hex_color(s) {
                 Ok(())
             } else {
-                Err(format!("`{key}` must be a hex colour like #0066cc"))
+                Err(format!("`{label}` must be a hex colour like #0066cc"))
             }
         }
         "support_email" => {
-            let s = text(key, value, MAX_EMAIL)?;
-            validate_email(s.trim()).map_err(|_| format!("`{key}` must be an email address"))
+            let s = text(label, value, MAX_EMAIL)?;
+            validate_email(s.trim()).map_err(|_| format!("`{label}` must be an email address"))
         }
         "support_phone" => {
-            let s = text(key, value, MAX_PHONE)?;
+            let s = text(label, value, MAX_PHONE)?;
             if s.chars().any(|c| c.is_ascii_digit()) {
                 Ok(())
             } else {
                 Err(format!(
-                    "`{key}` must be a phone number; it reads as \"on {{number}}\" in a client's email"
+                    "`{label}` must be a phone number; it reads as \"on {{number}}\" in a client's email"
                 ))
             }
         }
-        "support_contact_name" | "company_name" => text(key, value, MAX_NAME).map(|_| ()),
+        "support_contact_name" | "company_name" => text(label, value, MAX_NAME).map(|_| ()),
+        // PMS-896: the organisation's own web address. Held to the same rule as
+        // a company's (`mokosh_types::contacts::validate_website`) rather than a
+        // second copy of it: the SPA renders both as a link, so `javascript:`
+        // has to be as dead here as it is there.
+        "website" => {
+            let s = text(label, value, MAX_URL)?;
+            mokosh_types::contacts::validate_website(s.trim())
+                .map_err(|_| format!("`{label}` must be a web address like https://acme.example"))
+        }
         // `logo_url` is what the upload route writes and what the email
         // composer joins to the public API base. `favicon_url` has no reader
         // yet; holding it to the same prefix stops it becoming an arbitrary
         // URL before one arrives.
         "logo_url" | "favicon_url" => {
-            let s = text(key, value, MAX_PATH)?;
+            let s = text(label, value, MAX_PATH)?;
             if s.starts_with(PUBLIC_TENANT_PATH_PREFIX) {
                 Ok(())
             } else {
                 Err(format!(
-                    "`{key}` must be a public tenant path beginning `{PUBLIC_TENANT_PATH_PREFIX}`"
+                    "`{label}` must be a public tenant path beginning `{PUBLIC_TENANT_PATH_PREFIX}`"
                 ))
             }
         }
         // The content type the public logo route answers with, so it is the
         // same set the upload accepts.
         "logo_mime" => {
-            let s = text(key, value, 100)?;
+            let s = text(label, value, 100)?;
             check_mime(s).map(|_| ()).map_err(|_| {
-                format!("`{key}` must be an image type the logo route can serve (PNG, JPEG, WebP or GIF)")
+                format!("`{label}` must be an image type the logo route can serve (PNG, JPEG, WebP or GIF)")
             })
         }
         "portal_domain" => {
-            let s = text(key, value, MAX_DOMAIN)?;
+            let s = text(label, value, MAX_DOMAIN)?;
             if is_hostname(s.trim()) {
                 Ok(())
             } else {
                 Err(format!(
-                    "`{key}` must be a bare hostname like portal.acme.example"
+                    "`{label}` must be a bare hostname like portal.acme.example"
                 ))
             }
         }
         _ => Err(format!(
-            "`{key}` is not a branding key; the known keys are {}",
+            "`{label}` is not a branding key; the known keys are {}",
             KNOWN_KEYS.join(", ")
         )),
     }
@@ -156,6 +180,7 @@ const KNOWN_KEYS: &[&str] = &[
     "support_contact_name",
     "support_email",
     "support_phone",
+    "website",
 ];
 
 /// A string value that will be rendered: present, not blank, within its
@@ -255,6 +280,7 @@ mod tests {
             "support_email": "help@acme.example",
             "support_phone": "555-0100",
             "support_contact_name": "Dana",
+            "website": "https://acme.example",
             "portal_domain": "portal.acme.example",
         });
         assert!(patch(full.clone()).is_ok());
@@ -303,6 +329,33 @@ mod tests {
     fn a_logo_mime_is_one_the_public_route_can_serve() {
         assert!(patch(json!({ "logo_mime": "image/png" })).is_ok());
         assert!(patch(json!({ "logo_mime": "image/svg+xml" })).is_err());
+    }
+
+    /// PMS-896: the organisation website is a link a client clicks, so the
+    /// scheme allowlist that protects `companies.website` protects this too.
+    #[test]
+    fn a_website_is_an_http_url() {
+        assert!(patch(json!({ "website": "https://acme.example" })).is_ok());
+        assert!(patch(json!({ "website": "http://acme.example/support" })).is_ok());
+        assert!(patch(json!({ "website": "acme.example" })).is_err());
+        assert!(patch(json!({ "website": "javascript:alert(1)" })).is_err());
+        assert!(
+            patch(json!({ "website": null })).is_ok(),
+            "an organisation with no website submits an explicit null"
+        );
+    }
+
+    /// PMS-896: the organisation submission names its fields `phone` / `email`
+    /// / `website`, so the message it hands back must not name a branding key
+    /// the caller never sent.
+    #[test]
+    fn a_message_can_be_reported_against_the_callers_own_field_name() {
+        let err =
+            validate_branding_value_as("support_phone", "phone", &json!("call us")).unwrap_err();
+        assert!(err.contains("`phone`"), "unexpected: {err}");
+        assert!(!err.contains("support_phone"), "unexpected: {err}");
+        let err = validate_branding_value_as("support_email", "email", &json!("   ")).unwrap_err();
+        assert!(err.contains("`email`"), "unexpected: {err}");
     }
 
     #[test]
