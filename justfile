@@ -36,14 +36,14 @@ pre-commit: ensure-env
     #!/usr/bin/env nu
     print "\n[pre-commit] cargo fmt --all --check"
     ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo fmt --all --check
-    print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --all-targets -- -D warnings
-    print "\n[pre-commit] cargo check --all-targets"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --all-targets
+    print "\n[pre-commit] cargo clippy --workspace --all-targets -- -D warnings"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --workspace --all-targets -- -D warnings
+    print "\n[pre-commit] cargo check --workspace --all-targets"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --workspace --all-targets
     print "\n[pre-commit] unit tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --lib
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --lib
     print "\n[pre-commit] doc tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --doc
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --doc
     print "\n[pre-commit] all checks passed"
 
 # -- Checks ----------------------------------------------------------------------
@@ -168,14 +168,14 @@ check-unused-deps:
 # Check compilation
 [group: 'check']
 check-compile:
-    cargo check --all-targets
+    cargo check --workspace --all-targets
 
 # Run clippy with check.yml's `-D warnings` (PMS-851). Without it a lint that
 # fails the Check job passed here, which is the drift this gate exists to catch.
 [doc("Run clippy over all targets with `-D warnings`, exactly as check.yml does.")]
 [group: 'check']
 check-clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Check formatting
 [group: 'check']
@@ -190,7 +190,7 @@ fmt:
 # Run tests
 [group: 'test']
 test:
-    cargo test
+    cargo test --workspace
 
 # Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
 # this omits `--no-deps`, so the compose `postgres` dependency starts. PMS-267.
