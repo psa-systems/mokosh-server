@@ -2594,7 +2594,10 @@ SELECT
     t.asset_id, t.procedure_kb_article_id,
     t.sla_due_date, t.is_billable, t.billing_status,
     t.estimated_hours, t.actual_hours, t.tags,
-    t.closed_at, t.created_at, t.updated_at,
+    -- PMS-893: `resolved_at` stops the SLA clock, the same way the sweep
+    -- worker has always treated it. Without it here the badge contradicted
+    -- the alerts on every resolved-but-open ticket.
+    t.resolved_at, t.closed_at, t.created_at, t.updated_at,
     ts.id   AS status_id,
     ts.name AS status_name,
     ts.color AS status_color,
@@ -2747,6 +2750,7 @@ struct TicketResponseRow {
     estimated_hours: Option<rust_decimal::Decimal>,
     actual_hours: rust_decimal::Decimal,
     tags: Vec<String>,
+    resolved_at: Option<chrono::DateTime<Utc>>,
     closed_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
@@ -2772,8 +2776,16 @@ impl From<TicketResponseRow> for TicketResponse {
     fn from(r: TicketResponseRow) -> Self {
         // The joined row already carries everything `compute_sla_status`
         // needs, so reuse the shared helper instead of rebuilding a full
-        // Ticket just to call its method.
-        let sla_status = compute_sla_status(r.closed_at, r.sla_due_date);
+        // Ticket just to call its method. PMS-893: that now means all three
+        // conditions that stop the clock, including the two this mapping used
+        // to drop on the floor while the SLA sweep worker honoured them.
+        let sla_status = compute_sla_status(&SlaClock {
+            created_at: r.created_at,
+            sla_due_date: r.sla_due_date,
+            closed_at: r.closed_at,
+            resolved_at: r.resolved_at,
+            status_is_closed: r.status_is_closed.unwrap_or(false),
+        });
 
         TicketResponse {
             id: r.id,

@@ -36,14 +36,14 @@ pre-commit: ensure-env
     #!/usr/bin/env nu
     print "\n[pre-commit] cargo fmt --all --check"
     ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo fmt --all --check
-    print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --all-targets -- -D warnings
-    print "\n[pre-commit] cargo check --all-targets"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --all-targets
+    print "\n[pre-commit] cargo clippy --workspace --all-targets -- -D warnings"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --workspace --all-targets -- -D warnings
+    print "\n[pre-commit] cargo check --workspace --all-targets"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --workspace --all-targets
     print "\n[pre-commit] unit tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --lib
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --lib
     print "\n[pre-commit] doc tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --doc
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --doc
     print "\n[pre-commit] all checks passed"
 
 # -- Checks ----------------------------------------------------------------------
@@ -62,7 +62,7 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths
 
 # Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
 # README.md or docs/quickstart.md names a recipe the justfile does not define.
@@ -70,6 +70,14 @@ check: check-compile check-clippy check-fmt check-migrations check-migration-imm
 [group: 'check']
 check-doc-recipes:
     nu scripts/check-doc-recipes.nu
+
+# Keep config-comment `docs/` pointers resolving (PMS-855). .env.example is
+# minted into every clone's .env, so a dead pointer there reaches every
+# developer. Fails if one of the three config files names a missing path.
+[doc("Fail if .env.example, compose.dev.yml or the justfile names a docs/ path that does not exist (PMS-855).")]
+[group: 'check']
+check-config-doc-paths:
+    nu scripts/check-config-doc-paths.nu
 
 # Keep .env.example and compose.dev.yml in step with what the code reads
 # (PMS-836). Fails if a variable the code reads has no .env.example key or no
@@ -168,14 +176,14 @@ check-unused-deps:
 # Check compilation
 [group: 'check']
 check-compile:
-    cargo check --all-targets
+    cargo check --workspace --all-targets
 
 # Run clippy with check.yml's `-D warnings` (PMS-851). Without it a lint that
 # fails the Check job passed here, which is the drift this gate exists to catch.
 [doc("Run clippy over all targets with `-D warnings`, exactly as check.yml does.")]
 [group: 'check']
 check-clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Check formatting
 [group: 'check']
@@ -190,7 +198,7 @@ fmt:
 # Run tests
 [group: 'test']
 test:
-    cargo test
+    cargo test --workspace
 
 # Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
 # this omits `--no-deps`, so the compose `postgres` dependency starts. PMS-267.
