@@ -377,7 +377,7 @@ impl ContactService {
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
-        let order_by = pagination.order_by("name", &["name", "created_at", "updated_at"])?;
+        let order_by = pagination.order_by("name", mokosh_types::sort::COMPANIES)?;
 
         let query = format!(
             r#"
@@ -1514,10 +1514,7 @@ impl ContactService {
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
-        let order_by = pagination.order_by(
-            "last_name",
-            &["first_name", "last_name", "email", "created_at"],
-        )?;
+        let order_by = pagination.order_by("last_name", mokosh_types::sort::CONTACTS)?;
 
         let query = format!(
             r#"

@@ -286,10 +286,7 @@ impl QuotesService {
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
         // Bare column: `order_by` appends the direction itself.
-        let order_by = pagination.order_by(
-            "created_at",
-            &["created_at", "valid_until", "total", "title"],
-        )?;
+        let order_by = pagination.order_by("created_at", mokosh_types::sort::QUOTES)?;
         let query = format!(
             r#"
             SELECT {QUOTE_COLUMNS}
@@ -828,8 +825,7 @@ impl QuotesService {
     ) -> AppResult<(Vec<QuoteResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
-        let order_by =
-            pagination.order_by("created_at", &["created_at", "valid_until", "total"])?;
+        let order_by = pagination.order_by("created_at", mokosh_types::sort::QUOTE_REQUESTS)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, QuoteRow>(&format!(

@@ -425,10 +425,7 @@ impl TicketService {
             "NOT EXISTS (SELECT 1 FROM ticket_statuses s \
              WHERE s.id = t.status_id AND s.is_closed = TRUE)",
         );
-        let order_by = pagination.order_by(
-            "t.created_at",
-            &["created_at", "updated_at", "sla_due_date", "priority_id"],
-        )?;
+        let order_by = pagination.order_by("t.created_at", mokosh_types::sort::TICKETS_BARE)?;
 
         let query = format!(
             r#"
@@ -2377,19 +2374,7 @@ impl TicketService {
         // Priority sorts by `sort_order`, not by name or id: the rank is what
         // someone means by "sort by priority", and sorting by a UUID is
         // meaningless while sorting by name puts High above Urgent.
-        let order_by = pagination.order_by_mapped(
-            "t.created_at",
-            &[
-                ("created_at", "t.created_at"),
-                ("updated_at", "t.updated_at"),
-                ("sla_due_date", "t.sla_due_date"),
-                ("ticket_number", "t.ticket_number"),
-                ("company_name", "co.name"),
-                ("status", "ts.name"),
-                ("priority", "tp.sort_order"),
-                ("assigned_to_name", "au.first_name"),
-            ],
-        )?;
+        let order_by = pagination.order_by_mapped("t.created_at", TICKET_SORT_COLUMNS)?;
 
         let query = format!(
             "{select} WHERE {data_where} ORDER BY {order_by} LIMIT $2 OFFSET $3",
@@ -2806,6 +2791,26 @@ struct TicketResponseRow {
     created_by_name: String,
 }
 
+/// PMS-897: the public sort key each joined column answers to.
+///
+/// The keys are `mokosh_types::sort::TICKETS`, asserted by a test below - this
+/// is the one allow-list the compiler cannot pair for us, because the
+/// expressions must NOT be shared. `order_by_mapped` exists so a joined column
+/// can be sorted without the API ever naming it, and exporting these pairs
+/// would give that away.
+const TICKET_SORT_COLUMNS: &[(&str, &str)] = &[
+    ("created_at", "t.created_at"),
+    ("updated_at", "t.updated_at"),
+    ("sla_due_date", "t.sla_due_date"),
+    ("ticket_number", "t.ticket_number"),
+    ("company_name", "co.name"),
+    ("status", "ts.name"),
+    // The rank, not the id or the name: a UUID is meaningless to sort by, and
+    // the name puts High above Urgent.
+    ("priority", "tp.sort_order"),
+    ("assigned_to_name", "au.first_name"),
+];
+
 impl From<TicketResponseRow> for TicketResponse {
     fn from(r: TicketResponseRow) -> Self {
         // The joined row already carries everything `compute_sla_status`
@@ -3027,6 +3032,41 @@ impl From<TicketCategoryRow> for TicketCategoryResponse {
             description: row.description,
             is_active: row.is_active,
             sort_order: row.sort_order,
+        }
+    }
+}
+
+#[cfg(test)]
+mod pms897_tests {
+    use super::TICKET_SORT_COLUMNS;
+
+    /// PMS-897: the one allow-list pairing the compiler cannot check.
+    ///
+    /// Every other `order_by` call site takes `mokosh_types::sort::*` directly,
+    /// so a drift is a compile error. This site cannot: its entries pair a
+    /// public key with a SQL expression, and the expressions must never cross
+    /// the wire, so only the KEY half is shared. This test is what stands in
+    /// for the compiler - add a sortable column here without adding its key to
+    /// the crate and the client will never know it exists; remove one and the
+    /// client will offer a sort that 422s.
+    #[test]
+    fn the_mapped_keys_are_exactly_the_shared_list() {
+        let keys: Vec<&str> = TICKET_SORT_COLUMNS.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            keys,
+            mokosh_types::sort::TICKETS.to_vec(),
+            "the ticket sort keys must match mokosh_types::sort::TICKETS, in order"
+        );
+    }
+
+    /// And the expressions must stay on this side of the wire.
+    #[test]
+    fn no_sql_expression_leaked_into_the_shared_keys() {
+        for (key, expr) in TICKET_SORT_COLUMNS {
+            assert!(
+                !mokosh_types::sort::TICKETS.contains(expr) || key == expr,
+                "`{expr}` is a SQL expression and must not be an accepted wire key"
+            );
         }
     }
 }

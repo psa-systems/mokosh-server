@@ -390,10 +390,7 @@ impl BillingService {
         let count_where = count_conds.join(" AND ");
         // default_field must be a bare column (order_by appends the
         // direction); "invoice_date DESC" produced "... DESC DESC" -> 500.
-        let order_by = pagination.order_by(
-            "invoice_date",
-            &["invoice_date", "due_date", "total", "created_at"],
-        )?;
+        let order_by = pagination.order_by("invoice_date", mokosh_types::sort::INVOICES)?;
         let query = format!(
             r#"
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
@@ -2031,8 +2028,7 @@ impl BillingService {
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
         // Bare column only (order_by appends the direction).
-        let order_by =
-            pagination.order_by("payment_date", &["payment_date", "amount", "created_at"])?;
+        let order_by = pagination.order_by("payment_date", mokosh_types::sort::PAYMENTS)?;
         let query = format!(
             r#"
             SELECT id, tenant_id, invoice_id, company_id, payment_date, amount,

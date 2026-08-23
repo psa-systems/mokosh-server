@@ -1870,17 +1870,7 @@ impl AuthService {
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
 
-        let order_by = pagination.order_by(
-            "created_at",
-            &[
-                "email",
-                "first_name",
-                "last_name",
-                "role",
-                "status",
-                "created_at",
-            ],
-        )?;
+        let order_by = pagination.order_by("created_at", mokosh_types::sort::USERS)?;
 
         let data_query = format!(
             r#"
