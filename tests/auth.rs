@@ -2680,3 +2680,231 @@ async fn change_password_propagates_to_every_membership_users_row(pool: PgPool) 
 // `login_without_hint_or_matching_host_falls_through_to_identity_first`)
 // are removed with the code; phase 3 (MAPPS-492) delivered identity-first
 // login which supersedes the whole host-derivation approach.
+
+// MAPPS-548: creating a new client (tenant) with an admin email that
+// collides with an existing account MUST NOT overwrite the existing
+// account's password when the new client admin redeems their
+// welcome-email setup token.
+//
+// Fixture: three accounts, all at the same email `collide@example.com`:
+//   1. mokosh platform super-admin (`platform_admins` row + a `users`
+//      row from migration 132's backfill), password "PLATFORM-A".
+//   2. a tenant admin in an unrelated tenant "tenant-b" with password
+//      "TENANT-B".
+//   3. a fresh client-admin `users` row (status='pending',
+//      password_hash NULL) in a new tenant "client-c" - the state the
+//      MAPPS-448 `send_admin_welcome` path leaves the admin row in
+//      immediately after `create_tenant`.
+//
+// Action: redeem a MAPPS-548 setup-flow reset token for account 3 with
+// a fresh password "CLIENT-C".
+//
+// Post-conditions:
+//   - account 1 still authenticates via `/api/v1/platform/login` with
+//     "PLATFORM-A" (platform_admins is isolated from users<->identities
+//     by table shape; this survived MAPPS-518 already, verified here
+//     as a regression guard against re-introducing a mirror).
+//   - account 2 still authenticates via `/api/v1/auth/login` with
+//     "TENANT-B" + tenant_slug="tenant-b" (the identity plane's
+//     password_hash is unchanged, and the tenant-scoped login path
+//     resolves via users.password_hash for the specific tenant users
+//     row).
+//   - account 3 authenticates via `/api/v1/auth/login` with
+//     "CLIENT-C" + tenant_slug="client-c" (the setup wrote to this
+//     specific users row only, so tenant-scoped login sees the fresh
+//     hash).
+#[sqlx::test]
+async fn client_admin_setup_isolates_credentials_when_email_collides(pool: PgPool) {
+    let email = "collide@example.com".to_string();
+    let platform_pw = "PLATFORM-A-12345".to_string();
+    let tenant_b_pw = "TENANT-B-12345".to_string();
+    let client_c_pw = "CLIENT-C-12345".to_string();
+    let platform_hash =
+        mokosh_server::utils::crypto::hash_password(&platform_pw).expect("hash platform pw");
+    let tenant_b_hash =
+        mokosh_server::utils::crypto::hash_password(&tenant_b_pw).expect("hash tenant-b pw");
+
+    // Account 1: mokosh platform super-admin row + matching users row in
+    // DEFAULT_TENANT. Post MAPPS-132 backfill this is exactly what a
+    // real operator has after upgrading.
+    let platform_admin_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO platform_admins (id, email, password_hash, first_name, last_name, status, email_verified_at) \
+         VALUES ($1, $2, $3, 'Yousif', 'Shkara', 'active', NOW())",
+    )
+    .bind(platform_admin_id)
+    .bind(&email)
+    .bind(&platform_hash)
+    .execute(&pool)
+    .await
+    .expect("insert platform admin");
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'Yousif', 'Shkara', 'admin', 'active', NOW())",
+    )
+    .bind(platform_admin_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(&email)
+    .bind(&platform_hash)
+    .execute(&pool)
+    .await
+    .expect("insert platform admin tenant users row");
+
+    // Account 2: unrelated tenant "tenant-b" with a tenant admin at
+    // the same email + password "TENANT-B".
+    let tenant_b_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Tenant B', 'tenant-b', 'active', 'org')",
+    )
+    .bind(tenant_b_id)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b");
+    let tenant_b_admin_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'B', 'Admin', 'admin', 'active', NOW())",
+    )
+    .bind(tenant_b_admin_id)
+    .bind(tenant_b_id)
+    .bind(&email)
+    .bind(&tenant_b_hash)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b admin");
+
+    // Account 3: fresh client-admin users row (pending, password_hash
+    // NULL) in a new tenant "client-c". This mirrors the state
+    // `TenantService::create_tenant` -> `send_admin_welcome` leaves
+    // the row in right before the recipient clicks their setup link.
+    let client_c_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Client C', 'client-c', 'active', 'org')",
+    )
+    .bind(client_c_id)
+    .execute(&pool)
+    .await
+    .expect("insert client-c");
+    let client_c_admin_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, NULL, 'C', 'Admin', 'admin', 'pending', NOW())",
+    )
+    .bind(client_c_admin_id)
+    .bind(client_c_id)
+    .bind(&email)
+    .execute(&pool)
+    .await
+    .expect("insert client-c admin (pending, no password)");
+
+    let app = common::boot(pool.clone()).await;
+
+    // Craft a setup token for account 3, redeem it with password
+    // "CLIENT-C".
+    let setup_token = craft_reset_token(
+        &app.pool,
+        client_c_id,
+        client_c_admin_id,
+        Utc::now() + Duration::hours(1),
+    )
+    .await;
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": setup_token,
+            "new_password": client_c_pw,
+            "confirm_password": client_c_pw,
+        }))
+        .send()
+        .await
+        .expect("send setup reset-password");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "setup password redemption succeeds"
+    );
+
+    // Account 1: platform login with the ORIGINAL platform password
+    // must still succeed.
+    let platform_resp = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": platform_pw }))
+        .send()
+        .await
+        .expect("send platform login");
+    assert_eq!(
+        platform_resp.status(),
+        reqwest::StatusCode::OK,
+        "MAPPS-548: platform super-admin password must survive a colliding client-admin setup"
+    );
+
+    // Account 2: tenant-scoped login for tenant-b with the ORIGINAL
+    // tenant-b password must still succeed.
+    let tenant_b_resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": tenant_b_pw,
+            "tenant_slug": "tenant-b",
+        }))
+        .send()
+        .await
+        .expect("send tenant-b login");
+    assert_eq!(
+        tenant_b_resp.status(),
+        reqwest::StatusCode::OK,
+        "MAPPS-548: an unrelated tenant admin at the same email must keep their password"
+    );
+
+    // Account 3: tenant-scoped login for client-c with the NEW
+    // password must succeed - the setup wrote to this users row.
+    let client_c_resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": client_c_pw,
+            "tenant_slug": "client-c",
+        }))
+        .send()
+        .await
+        .expect("send client-c login");
+    assert_eq!(
+        client_c_resp.status(),
+        reqwest::StatusCode::OK,
+        "MAPPS-548: the new client admin must be able to sign in with their newly-set password"
+    );
+
+    // The tenant users row for account 1 must NOT have been changed
+    // by the setup write (this is the sanity check that the
+    // migration-134 short-circuit actually fired).
+    let account1_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND tenant_id = $2")
+            .bind(platform_admin_id)
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read account 1 users hash");
+    assert_eq!(
+        account1_hash.as_deref(),
+        Some(platform_hash.as_str()),
+        "MAPPS-548: platform admin's tenant users row must keep its original hash"
+    );
+    let account2_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND tenant_id = $2")
+            .bind(tenant_b_admin_id)
+            .bind(tenant_b_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read account 2 users hash");
+    assert_eq!(
+        account2_hash.as_deref(),
+        Some(tenant_b_hash.as_str()),
+        "MAPPS-548: tenant-b admin's users row must keep its original hash"
+    );
+}

@@ -1510,30 +1510,82 @@ impl AuthService {
         // the MAPPS-498 bidir mirror keeps every matching users row
         // current. `password_changed_at` is users-only (PMS-681
         // revocation gate) and stays on the users UPDATE below.
+        //
+        // MAPPS-548: the `password_reset_tokens` table is reused by the
+        // tenant-admin welcome-email flow (see
+        // `TenantService::send_admin_welcome`) as a first-time setup
+        // path, not just for existing users doing a forgot-password
+        // reset. Detect the setup path by the users row's
+        // `password_hash IS NULL` state at the moment of the reset
+        // (a real user reset always has a hash to overwrite); when
+        // it's a setup, flip the migration-134 session guard so the
+        // password write lands on THIS users row only. A pre-existing
+        // account at the same email (mokosh super-admin, another
+        // tenant's admin, another client's admin) keeps its
+        // credential untouched. Existing forgot-password path is
+        // unaffected: their users row has a hash, the flag stays
+        // unset, the identity mirror fires exactly as before.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let email: Option<String> =
-            sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND tenant_id = $2")
-                .bind(user_id)
-                .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let email = email.ok_or_else(|| AppError::NotFound("User".to_string()))?;
-        sqlx::query(
-            "UPDATE identities SET password_hash = $1, updated_at = NOW() \
-             WHERE lower(email) = lower($2)",
-        )
-        .bind(&new_hash)
-        .bind(&email)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE users SET password_changed_at = NOW(), updated_at = NOW() \
-             WHERE id = $1 AND tenant_id = $2",
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT email, password_hash FROM users WHERE id = $1 AND tenant_id = $2",
         )
         .bind(user_id)
         .bind(tenant_id)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        let (email, current_hash) = row.ok_or_else(|| AppError::NotFound("User".to_string()))?;
+        let is_first_time_setup = current_hash.is_none();
+        if is_first_time_setup {
+            // Use set_config('name', 'val', true) rather than a
+            // `SET LOCAL name = val` statement: same semantics
+            // (transaction-scoped), matches how
+            // `Database::begin_with_tenant` already sets
+            // `app.current_tenant`, and reliably runs on the
+            // transaction connection through the sqlx executor
+            // instead of opening a parser-level ambiguity around
+            // the reserved `SET LOCAL` form.
+            sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
+                .execute(&mut *tx)
+                .await?;
+            // Setup path writes only to the users row's password_hash.
+            // Skip the identities UPDATE entirely; the migration-134
+            // guard would short-circuit the trigger even if we did,
+            // but avoiding the UPDATE avoids clobbering identity data
+            // for an existing identity at the same email. Also flip
+            // `status` to `'active'` in the same write - the row was
+            // seeded as `'pending'` by `create_tenant`, and
+            // `ensure_principal_usable` refuses to authenticate a
+            // non-active users row, so the setup flow has to promote
+            // the row for the newly-set password to actually be
+            // usable at login time.
+            sqlx::query(
+                "UPDATE users SET password_hash = $1, status = 'active', \
+                 password_changed_at = NOW(), updated_at = NOW() \
+                 WHERE id = $2 AND tenant_id = $3",
+            )
+            .bind(&new_hash)
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE identities SET password_hash = $1, updated_at = NOW() \
+                 WHERE lower(email) = lower($2)",
+            )
+            .bind(&new_hash)
+            .bind(&email)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE users SET password_changed_at = NOW(), updated_at = NOW() \
+                 WHERE id = $1 AND tenant_id = $2",
+            )
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // Mark token as used
         sqlx::query(
