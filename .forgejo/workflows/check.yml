@@ -44,7 +44,9 @@ jobs:
           fetch-depth: 0
 
       - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
+        # nproc/2 cap: never claim more than half the host (see "Concurrency
+        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
+        # this repository).
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
       - name: Cache Rust build
