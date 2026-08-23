@@ -2366,9 +2366,29 @@ impl TicketService {
             count_where,
             binds,
         } = build_ticket_filter_sql(filter, caller_id, "ts.is_closed = FALSE");
-        let order_by = pagination.order_by(
+        // PMS-894: the SPA's ticket list sorts on ticket number, company,
+        // status, priority and assignee, and none of them were sortable here -
+        // `order_by` drops an unknown field and sorts by the default, so a
+        // client that started sending them would have got `created_at DESC`
+        // and a 200. Every expression below names an alias `TICKET_RESPONSE_SELECT`
+        // already establishes; the plain `order_by` cannot express them,
+        // because the name a client sends is not the SQL that sorts by it.
+        //
+        // Priority sorts by `sort_order`, not by name or id: the rank is what
+        // someone means by "sort by priority", and sorting by a UUID is
+        // meaningless while sorting by name puts High above Urgent.
+        let order_by = pagination.order_by_mapped(
             "t.created_at",
-            &["created_at", "updated_at", "sla_due_date", "priority_id"],
+            &[
+                ("created_at", "t.created_at"),
+                ("updated_at", "t.updated_at"),
+                ("sla_due_date", "t.sla_due_date"),
+                ("ticket_number", "t.ticket_number"),
+                ("company_name", "co.name"),
+                ("status", "ts.name"),
+                ("priority", "tp.sort_order"),
+                ("assigned_to_name", "au.first_name"),
+            ],
         );
 
         let query = format!(
@@ -2463,14 +2483,28 @@ fn build_ticket_filter_sql(
     let mut binds = Vec::new();
 
     if let Some(q) = &filter.q {
-        data_conds.push(format!(
-            "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-            idx = data_idx
-        ));
-        count_conds.push(format!(
-            "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-            idx = count_idx
-        ));
+        // PMS-894: the SPA searches company and assignee as well as title and
+        // number, so a search moved server-side without these silently finds
+        // less than the same box did in the browser.
+        //
+        // Correlated EXISTS rather than joins, for two reasons. This predicate
+        // is shared by the data query and by two count queries whose FROM
+        // clauses differ and carry no company or user join, and an INNER JOIN
+        // to `users` would drop every unassigned ticket from the result -
+        // turning a search into a filter nobody asked for. Both tables are
+        // RLS-covered and this runs inside the tenant transaction.
+        let text_match = |idx: u32| {
+            format!(
+                "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx} \
+                  OR EXISTS (SELECT 1 FROM companies c \
+                             WHERE c.id = t.company_id AND c.name ILIKE ${idx}) \
+                  OR EXISTS (SELECT 1 FROM users u \
+                             WHERE u.id = t.assigned_to_id \
+                               AND (u.first_name || ' ' || u.last_name) ILIKE ${idx}))"
+            )
+        };
+        data_conds.push(text_match(data_idx));
+        count_conds.push(text_match(count_idx));
         data_idx += 1;
         count_idx += 1;
         binds.push(TicketFilterBind::Text(format!("%{q}%")));

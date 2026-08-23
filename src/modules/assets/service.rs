@@ -188,8 +188,14 @@ impl AssetsService {
         // search; without this the picker's `?q=...` was silently
         // dropped, so the dropdown listed every asset regardless of
         // typed text.
+        // PMS-894: also match the serial number. The SPA's asset list searches
+        // both, so a search moved server-side on name alone loses the field an
+        // operator is most likely to paste in - the operator types a serial,
+        // gets nothing, and concludes the asset is not there.
         if filter.q.is_some() {
-            conditions.push(format!("a.name ILIKE ${idx}"));
+            conditions.push(format!(
+                "(a.name ILIKE ${idx} OR a.serial_number ILIKE ${idx})"
+            ));
             idx += 1;
         }
         let where_clause = conditions.join(" AND ");
