@@ -549,11 +549,24 @@ fn check_rules(rules: &[FormRule], fields: &[CreateFormFieldRequest]) -> AppResu
 fn check_rules_against_fields(rules: &[FormRule], known: &[RuleField]) -> AppResult<()> {
     let mut errors = Vec::new();
     for (i, rule) in rules.iter().enumerate() {
+        // PMS-898: refuse a rule kind this build cannot name. Storing one
+        // would persist a rule the server can never enforce, and the client
+        // would render a form whose constraints exist only in the payload that
+        // created it. The read path ignores an unknown rule instead; only
+        // writes are strict.
         let FormRule::RequiredIf {
             field,
             when_field,
             equals,
-        } = rule;
+        } = rule
+        else {
+            errors.push(FieldError::new(
+                format!("rules[{i}].kind"),
+                "Unknown rule kind".to_string(),
+                "unknown_rule_kind",
+            ));
+            continue;
+        };
         if !known.iter().any(|f| &f.name == field) {
             errors.push(FieldError::new(
                 format!("rules[{i}].field"),
