@@ -11,9 +11,6 @@ static EMAIL_REGEX: LazyLock<Regex> =
 
 static PHONE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\+?[1-9]\d{1,14}$").unwrap());
 
-static SLUG_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").unwrap());
-
 /// Validate an email address
 pub fn validate_email(email: &str) -> Result<(), ValidationError> {
     if EMAIL_REGEX.is_match(email) {
@@ -32,13 +29,14 @@ pub fn validate_phone(phone: &str) -> Result<(), ValidationError> {
     }
 }
 
-/// Validate a URL slug
+/// Validate a URL slug.
+///
+/// PMS-898: delegates to `mokosh_types::validation`, which owns the grammar
+/// now that the forms DTOs validate a slug on the wire. Kept as a wrapper so
+/// the server's existing call sites and `#[validate(custom(...))]` paths do not
+/// all have to move at once.
 pub fn validate_slug(slug: &str) -> Result<(), ValidationError> {
-    if SLUG_REGEX.is_match(slug) {
-        Ok(())
-    } else {
-        Err(ValidationError::new("invalid_slug"))
-    }
+    mokosh_types::validation::validate_slug(slug)
 }
 
 /// Validate password strength
