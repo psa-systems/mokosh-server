@@ -61,8 +61,9 @@ jobs:
         # is also too full to usefully restore a multi-GB cargo cache, so
         # failing first saves that download and leaves less on disk for
         # whatever runs next.
-        # PMS-740. `cargo test --tests` links 22 debug test binaries, each
-        # several hundred MB, several concurrently under CARGO_BUILD_JOBS.
+        # PMS-740. `cargo test --tests` links one debug binary per `tests/*.rs`
+        # suite, each several hundred MB, several concurrently under
+        # CARGO_BUILD_JOBS.
         # When the runner filesystem fills mid-write, `rust-lld` writes its
         # output through an mmap and takes SIGBUS, which surfaces as:
         #
@@ -75,9 +76,14 @@ jobs:
         #
         # 25G is chosen as roughly twice the peak this suite's link stage has
         # been observed to need. Raise it if the suite grows rather than
-        # lowering it after a near miss.
+        # lowering it after a near miss. How much the suite has grown is
+        # counted at run time and printed below rather than written into this
+        # comment: the hand-maintained literal that used to sit here read 22
+        # while the tree held 81 (PMS-858).
         run: |
+          suites=$(ls tests/*.rs | wc -l)
           avail_gb=$(df -P -BG . | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+          echo "Integration suites to link: ${suites} debug test binaries"
           echo "Free space on the workspace filesystem: ${avail_gb}G"
           df -h .
           if [ "${avail_gb}" -lt 25 ]; then
@@ -91,15 +97,19 @@ jobs:
           cache-on-failure: true
 
       - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
+        # nproc/2 cap: never claim more than half the host (see "Concurrency
+        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
+        # this repository).
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
 
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`
         # binaries) plus the lib unit tests, so new suites are picked up
-        # automatically instead of via a hand-maintained --test allowlist
-        # that silently dropped 13 of 22 suites from CI.
+        # automatically instead of via a hand-maintained --test allowlist,
+        # which at the time it was removed silently dropped 13 of the 22
+        # suites that then existed. That count is history, not a description
+        # of the tree; the suite count is printed by the disk-headroom step.
         #
         # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
         # Each test creates a per-test database AND holds the sqlx-test
