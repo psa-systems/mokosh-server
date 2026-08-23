@@ -494,6 +494,17 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
                 "duplicate",
             ));
         }
+        // PMS-898: refuse a field type this build cannot name. The catch-all
+        // exists so a READER older than a type still renders the form; storing
+        // one would leave a field this server cannot validate and a column
+        // value its CHECK constraint would reject anyway.
+        if f.field_type == FieldType::Unknown {
+            errors.push(FieldError::new(
+                format!("fields[{i}].field_type"),
+                format!("`{}` has an unknown field type", f.name),
+                "unknown_field_type",
+            ));
+        }
         if f.field_type == FieldType::Select && f.options.as_ref().is_none_or(|o| o.is_empty()) {
             errors.push(FieldError::new(
                 format!("fields[{i}].options"),

@@ -32,6 +32,19 @@ pub enum FieldType {
     Date,
     Select,
     Boolean,
+    /// PMS-898: a field type this build does not know.
+    ///
+    /// Same tolerant-read, strict-write split as [`FormRule::Unknown`], and for
+    /// a sharper reason: the public request form is rendered for a client with
+    /// no account, off an emailed link. Without this, a server that grows a
+    /// field type would make that whole page fail to deserialise rather than
+    /// render the unknown field as a text input and let the server judge the
+    /// answer. A blank page is the worst outcome available there.
+    ///
+    /// Refused on write, so a definition cannot store a type the server cannot
+    /// validate.
+    #[serde(other)]
+    Unknown,
 }
 
 impl FieldType {
@@ -55,6 +68,9 @@ impl FieldType {
             Self::Date => "date",
             Self::Select => "select",
             Self::Boolean => "boolean",
+            // Never authored: `from_str` cannot produce it and the write path
+            // refuses it. Spelled so the round trip is total.
+            Self::Unknown => "unknown",
         }
     }
 
