@@ -140,7 +140,9 @@ jobs:
       - name: Set up buildx builder
         # The `docker-container` driver is required for any cache export;
         # the default `docker` driver only carries inline metadata, which
-        # misses the dependency-build layer (governance CI.md, GOV-20).
+        # misses the dependency-build layer ("OCI build workflow" in CI.md of
+        # dev.a8n.run/niceguyit/governance, GOV-20; not a file in this
+        # repository).
         run: docker buildx create --name container-builder --driver docker-container --use
 
       - name: Export Actions runtime env for buildx gha cache
