@@ -837,9 +837,29 @@ impl AuthService {
         tenant_id: Uuid,
         user_id: Uuid,
         token_iat: i64,
+        session_id: Uuid,
     ) -> AppResult<User> {
         let user = self.get_user_by_id(tenant_id, user_id).await?;
         self.ensure_principal_usable(&user).await?;
+        // MAPPS-531: the session the token names must still exist.
+        //
+        // `logout` deletes the `user_sessions` row, which until now revoked
+        // only the REFRESH capability: nothing on the access path consulted
+        // that table, so a bearer minted just before sign-out kept
+        // authenticating every request for the rest of its hour. That is the
+        // residual half of the defect MAPPS-522 was filed to close, and it is
+        // the half that lets a signed-out bearer read tenant data.
+        //
+        // Keyed on `sid` rather than stamped on the user (the shape PMS-681
+        // used for password changes) because a stamp cannot distinguish
+        // sessions: signing out of one device would sign the user out of all
+        // of them. Refresh reuses the same `sid` rather than rotating it, so a
+        // long-lived session stays valid across refreshes.
+        if !self.session_is_live(tenant_id, session_id).await? {
+            return Err(AppError::Forbidden(
+                "Session has been signed out".to_string(),
+            ));
+        }
         // PMS-681: reject an access token minted before the user's last password
         // change (reset or self-service), so a stolen token dies the moment the
         // password changes instead of living out its TTL. Read straight off the
@@ -856,6 +876,29 @@ impl AuthService {
             }
         }
         Ok(user)
+    }
+
+    /// MAPPS-531: is the session behind an access token still live?
+    ///
+    /// `expires_at > NOW()` as well as existence, matching what
+    /// [`Self::get_session`] has always required of the refresh path. Session
+    /// lifetimes are 7 days (30 with "remember me") against a one-hour access
+    /// token, so this cannot expire a token early; it is the same row going
+    /// stale by the same clock.
+    ///
+    /// `user_sessions` is RLS-covered, so the read runs inside the tenant
+    /// transaction rather than on the bare pool, where it would fail closed to
+    /// "no session" and 403 every request.
+    pub async fn session_is_live(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<bool> {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM user_sessions \
+             WHERE id = $1 AND tenant_id = $2 AND expires_at > NOW())",
+        )
+        .bind(session_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *self.db.begin_with_tenant(tenant_id).await?)
+        .await?;
+        Ok(live)
     }
 
     /// PMS-698: the shared "is this principal still usable" gate. Both auth

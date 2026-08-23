@@ -2188,3 +2188,107 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
     );
     let _new_token = common::login(&app, &email, new_password).await;
 }
+
+/// MAPPS-531: signing out invalidates the access token, not only the refresh
+/// session.
+///
+/// `logout` deletes the `user_sessions` row, and until this change nothing on
+/// the access path consulted that table: the middleware decoded the JWT,
+/// checked the user and tenant were active, and let it through. So a bearer
+/// minted just before sign-out kept authenticating every `/api/v1/*` request
+/// for the rest of its hour - the residual half of the defect MAPPS-522 was
+/// filed to close, and the half that lets a signed-out bearer read tenant data.
+#[sqlx::test]
+async fn logout_invalidates_the_access_token_not_just_the_refresh_session(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    assert_eq!(me(token.clone()).await, reqwest::StatusCode::OK);
+
+    let signed_out = app
+        .client
+        .post(app.url("/api/v1/auth/logout"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send logout");
+    assert!(
+        signed_out.status().is_success(),
+        "logout expected 2xx, got {}",
+        signed_out.status()
+    );
+
+    assert_ne!(
+        me(token).await,
+        reqwest::StatusCode::OK,
+        "the access token must stop working the moment its session is signed out"
+    );
+}
+
+/// MAPPS-531: and it invalidates only THAT session.
+///
+/// This is why the fix keys on the token's `sid` rather than stamping the user
+/// row the way PMS-681 does for a password change: a stamp cannot tell two
+/// sessions apart, so signing out of one device would sign the user out
+/// everywhere. Signing out on a laptop must not sign the same person out on
+/// their phone.
+#[sqlx::test]
+async fn logout_leaves_the_users_other_sessions_alone(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    // Two independent logins for the same user: two `user_sessions` rows, two
+    // access tokens carrying different `sid` claims.
+    let laptop = common::login(&app, &email, &password).await;
+    let phone = common::login(&app, &email, &password).await;
+    assert_ne!(laptop, phone, "two logins must not hand back one token");
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    let signed_out = app
+        .client
+        .post(app.url("/api/v1/auth/logout"))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("send logout");
+    assert!(signed_out.status().is_success());
+
+    assert_ne!(
+        me(laptop).await,
+        reqwest::StatusCode::OK,
+        "the signed-out session is over"
+    );
+    assert_eq!(
+        me(phone).await,
+        reqwest::StatusCode::OK,
+        "the other session is untouched"
+    );
+}
