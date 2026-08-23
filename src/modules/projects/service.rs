@@ -94,6 +94,15 @@ impl ProjectsService {
         if filter.project_manager_id.is_some() {
             data_conds.push(format!("project_manager_id = ${data_idx}"));
             count_conds.push(format!("project_manager_id = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // PMS-895: name search. Last, so the placeholder numbering above is
+        // untouched; the binds below go in this same order, which is the
+        // invariant this whole parallel-clause dance exists to hold.
+        if filter.q.is_some() {
+            data_conds.push(format!("name ILIKE ${data_idx}"));
+            count_conds.push(format!("name ILIKE ${count_idx}"));
         }
         let where_clause = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
@@ -139,6 +148,11 @@ impl ProjectsService {
         if let Some(v) = filter.project_manager_id {
             q = q.bind(v);
             cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.q {
+            let pattern = format!("%{v}%");
+            q = q.bind(pattern.clone());
+            cq = cq.bind(pattern);
         }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q.fetch_all(&mut *tx).await?;

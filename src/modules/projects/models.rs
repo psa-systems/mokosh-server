@@ -193,6 +193,12 @@ pub struct ProjectFilter {
     #[validate(length(max = 100))]
     pub status: Option<String>,
     pub project_manager_id: Option<Uuid>,
+    /// PMS-895: free-text search on the project name, ILIKE-matched, mirroring
+    /// `CompanyFilter::q` and `AssetFilter::q`. Without it the SPA's project
+    /// list cannot page server-side: its search box would filter whichever
+    /// page happened to be loaded and present that as the whole answer.
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
