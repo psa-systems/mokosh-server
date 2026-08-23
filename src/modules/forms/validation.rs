@@ -195,6 +195,15 @@ fn validate_value(
                 ));
             }
         }
+        // PMS-898: a stored field type this build cannot name. It cannot have
+        // been authored here (the write path refuses it, and `from_str` cannot
+        // produce it), so reaching this arm means a definition written by a
+        // newer server. Accept the answer as a string and let that server's own
+        // validation be the authority, rather than rejecting a submission on
+        // the strength of not recognising the question.
+        FieldType::Unknown => {
+            as_string(field, value)?;
+        }
         FieldType::Date => {
             let s = as_string(field, value)?;
             let Ok(parsed) = NaiveDate::parse_from_str(s, DATE_FORMAT) else {
