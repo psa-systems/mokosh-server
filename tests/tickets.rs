@@ -1632,10 +1632,15 @@ async fn ticket_list_sorts_by_the_columns_the_client_offers(pool: PgPool) {
 
     // The guard the mapped allow-list exists for: the SQL expression is not
     // itself an accepted key, so a client cannot name a column.
-    let raw = sorted("co.name", "asc").await;
-    assert_eq!(
-        raw.len(),
-        2,
-        "an unaccepted sort key still returns the page"
-    );
+    // MAPPS-533 changed what that refusal looks like. PMS-894 asserted here
+    // that an unaccepted key "still returns the page", because `order_by`
+    // silently sorted by the default. It is now a 422 that says so.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/tickets?sort=co.name"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list tickets with a SQL expression as the sort key");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 }
