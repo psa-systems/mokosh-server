@@ -15,6 +15,7 @@ mod common;
 
 use serde_json::Value;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 #[sqlx::test]
 async fn seed_admin_is_backfilled_into_platform_admins(pool: PgPool) {
@@ -192,4 +193,141 @@ async fn platform_change_password_isolates_from_identity_plane(pool: PgPool) {
         .await
         .expect("relog");
     assert!(relog.status().is_success());
+}
+
+// MAPPS-550: platform login self-heals `platform_admins.password_hash`
+// from `identities.password_hash` when they drift. A stale platform
+// hash otherwise 401s the operator, the MAPPS-520 platform-first
+// chain falls through, and the platform bearer never lands - which
+// hides the sidebar "Clients" tab from the operator's walkthrough.
+//
+// Fixture: platform_admins row at password A + a matching identities
+// row at the same email with password B (drift). POST /platform/login
+// with B succeeds AND rewrites platform_admins.password_hash so a
+// subsequent login with A returns 401 (proves the heal actually
+// happened, not that both hashes are silently accepted forever).
+#[sqlx::test]
+async fn platform_login_heals_from_identity_when_platform_hash_drifted(pool: PgPool) {
+    let email = "drifted@example.com".to_string();
+    let password_a = "PLATFORM-STALE-A".to_string();
+    let password_b = "IDENTITY-CURRENT-B".to_string();
+    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a).expect("hash A");
+    let hash_b = mokosh_server::utils::crypto::hash_password(&password_b).expect("hash B");
+
+    let admin_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO platform_admins (id, email, password_hash, first_name, last_name, status, email_verified_at) \
+         VALUES ($1, $2, $3, 'Op', 'Drift', 'active', NOW())",
+    )
+    .bind(admin_id)
+    .bind(&email)
+    .bind(&hash_a)
+    .execute(&pool)
+    .await
+    .expect("insert stale platform_admin");
+
+    let identity_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identities (id, email, password_hash, first_name, last_name, status) \
+         VALUES ($1, $2, $3, 'Op', 'Drift', 'active')",
+    )
+    .bind(identity_id)
+    .bind(&email)
+    .bind(&hash_b)
+    .execute(&pool)
+    .await
+    .expect("insert current identity");
+
+    let app = common::boot(pool.clone()).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": password_b }))
+        .send()
+        .await
+        .expect("send login with identity password");
+    assert!(
+        resp.status().is_success(),
+        "MAPPS-550: identity password should heal the stale platform hash; got {}",
+        resp.status()
+    );
+
+    // The heal wrote the identity hash onto platform_admins.
+    // Verify by querying the row directly.
+    let stored: String =
+        sqlx::query_scalar("SELECT password_hash FROM platform_admins WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("re-read platform_admin");
+    assert_eq!(
+        stored, hash_b,
+        "MAPPS-550: heal writes the identity password hash onto platform_admins"
+    );
+
+    // Old platform password A no longer authenticates - the heal is
+    // a real overwrite, not a "accept both" trapdoor.
+    let stale = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": password_a }))
+        .send()
+        .await
+        .expect("send login with stale password");
+    assert_eq!(
+        stale.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "MAPPS-550: stale password must not authenticate post-heal"
+    );
+}
+
+// MAPPS-550: fresh install / no drift path is unchanged. A platform
+// admin at password A with no matching identities row still logs in
+// with A and gets 401 on any other password (no fallback loosening,
+// no crash on the missing-identity lookup).
+#[sqlx::test]
+async fn platform_login_no_identity_row_still_works(pool: PgPool) {
+    let email = "solo-platform@example.com".to_string();
+    let password_a = "SOLO-A-12345".to_string();
+    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a).expect("hash A");
+
+    let admin_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO platform_admins (id, email, password_hash, first_name, last_name, status, email_verified_at) \
+         VALUES ($1, $2, $3, 'Solo', 'Admin', 'active', NOW())",
+    )
+    .bind(admin_id)
+    .bind(&email)
+    .bind(&hash_a)
+    .execute(&pool)
+    .await
+    .expect("insert lonely platform_admin");
+
+    let app = common::boot(pool).await;
+
+    // Correct password still succeeds.
+    let ok = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": password_a }))
+        .send()
+        .await
+        .expect("send login");
+    assert!(
+        ok.status().is_success(),
+        "MAPPS-550: no-identity-row path must still authenticate on match; got {}",
+        ok.status()
+    );
+
+    // Wrong password still 401s (no false success from the missing-
+    // identity fallback path).
+    let bad = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": "wrong-password-000" }))
+        .send()
+        .await
+        .expect("send bad login");
+    assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
 }

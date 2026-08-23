@@ -76,7 +76,75 @@ impl PlatformAdminService {
             .as_deref()
             .ok_or(AppError::Unauthorized)?;
         if !verify_password(password, hash)? {
-            return Err(AppError::Unauthorized);
+            // MAPPS-550: one-way heal from the identity plane. The
+            // platform_admins.password_hash is deliberately isolated
+            // from the MAPPS-498 mirror (MAPPS-518 stage B), so a
+            // tenant-side password change (change_password /
+            // reset_password) never propagates to platform_admins.
+            // Over time the two hashes drift: the operator updates
+            // their tenant password, `identities.password_hash` +
+            // `users.password_hash` catch up via the mirror, but
+            // `platform_admins.password_hash` stays at whichever
+            // value was there at bootstrap / migration-132 backfill.
+            // Consequence: /platform/login 401s even though the
+            // operator IS the platform admin, the client's
+            // MAPPS-520 platform-first chain falls through, the
+            // platform bearer never lands, and the sidebar's Clients
+            // tab disappears from their walkthrough.
+            //
+            // The heal is opt-in per login attempt: when the supplied
+            // password does not match the platform hash, look up the
+            // identity at this email and try the identity's
+            // password_hash instead. On a match, the caller has
+            // proven they hold the CURRENT identity password;
+            // update platform_admins.password_hash to that value
+            // so the next login verifies on the hot path with no
+            // extra query. Deliberately ONE-WAY: a platform-side
+            // password change still does NOT propagate to
+            // identities, so the MAPPS-518 stage B invariant
+            // ("a tenant admin at the same email cannot clobber
+            // your platform password") stays intact.
+            //
+            // Best-effort UPDATE: a failed write logs and still
+            // returns success for the request (the caller already
+            // proved they hold the current identity password);
+            // subsequent logins retry the heal until the write
+            // lands.
+            let identity_hash: Option<String> = sqlx::query_scalar(
+                "SELECT password_hash FROM identities WHERE lower(email) = lower($1)",
+            )
+            .bind(&admin.email)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| AppError::Unauthorized)?
+            .flatten();
+            let Some(identity_hash) = identity_hash else {
+                return Err(AppError::Unauthorized);
+            };
+            if !verify_password(password, &identity_hash)? {
+                return Err(AppError::Unauthorized);
+            }
+            let heal_result = sqlx::query(
+                "UPDATE platform_admins SET password_hash = $1, updated_at = NOW() \
+                 WHERE id = $2",
+            )
+            .bind(&identity_hash)
+            .bind(admin.id)
+            .execute(pool)
+            .await;
+            if let Err(e) = heal_result {
+                tracing::warn!(
+                    error = %e,
+                    admin_id = %admin.id,
+                    "MAPPS-550: identity-hash heal of platform_admins.password_hash failed; login still succeeds this request"
+                );
+            } else {
+                tracing::info!(
+                    admin_id = %admin.id,
+                    email = %admin.email,
+                    "MAPPS-550: healed platform_admins.password_hash from identities after a drift"
+                );
+            }
         }
 
         // Best-effort last_login stamp; failure does not block the login.
