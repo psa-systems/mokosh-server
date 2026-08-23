@@ -32,10 +32,10 @@ one alone and you have not.
 | Documented just recipes | `nu scripts/check-doc-recipes.nu` | `check-doc-recipes` | no |
 | Unused dependencies | `cargo machete` | `check-unused-deps` | no |
 | Check formatting | `cargo fmt --all --check` | `check-fmt` | yes |
-| Clippy | `cargo clippy --all-targets -- -D warnings` | `check-clippy` | yes |
-| Compile check | `cargo check --all-targets` | `check-compile` | yes |
-| Unit tests | `cargo test --lib` | no | yes |
-| Doc tests | `cargo test --doc` | no | yes |
+| Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | `check-clippy` | yes |
+| Compile check | `cargo check --workspace --all-targets` | `check-compile` | yes |
+| Unit tests | `cargo test --workspace --lib` | no | yes |
+| Doc tests | `cargo test --workspace --doc` | no | yes |
 
 `check.yml`'s remaining steps (clone, `CARGO_BUILD_JOBS` cap, `rust-cache`) set
 the runner up and check nothing, so no recipe mirrors them.
