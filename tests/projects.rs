@@ -1579,3 +1579,94 @@ async fn project_oversized_budget_and_safe_company_id(pool: PgPool) {
         after_injection.status()
     );
 }
+
+/// PMS-894: tenant-wide project totals in one request.
+///
+/// The SPA's project list computed its Active / On hold / Completed cards and
+/// its budget sum from the rows it had fetched, so past the server's default
+/// page every card reported one page rather than the tenant. The counts alone
+/// were already answerable with `?status=X&per_page=1` and `meta.total`; a sum
+/// is the one a page cannot approximate from a page, which is why this endpoint
+/// exists.
+#[sqlx::test]
+async fn project_summary_totals_the_tenant_not_a_page(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let summary = || {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/projects/summary");
+        let token = token.clone();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("get project summary");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            resp.json::<serde_json::Value>()
+                .await
+                .expect("summary JSON")
+        }
+    };
+
+    // An empty tenant sums to 0, not null: COALESCE, so a client renders "0"
+    // rather than deciding what a missing total means.
+    let empty = summary().await;
+    assert_eq!(empty["total_budget"].as_str(), Some("0"));
+    assert!(empty["counts_by_status"]
+        .as_object()
+        .expect("counts object")
+        .is_empty());
+
+    for (name, status, budget) in [
+        ("Network Upgrade", "active", Some("10000.50")),
+        ("Office Move", "active", Some("2500.25")),
+        ("Archive Cleanup", "completed", Some("100")),
+        // No budget at all, which is the case that makes SUM return NULL if
+        // nothing accounts for it.
+        ("Unbudgeted Discovery", "active", None),
+    ] {
+        let mut body = serde_json::json!({
+            "name": name,
+            "company_id": company,
+            "status": status,
+        });
+        if let Some(budget) = budget {
+            body["budget_amount"] = serde_json::json!(budget);
+        }
+        let resp = post(&app, &token, "/api/v1/projects", body).await;
+        assert!(
+            resp.status().is_success(),
+            "create {name}: {}",
+            resp.status()
+        );
+    }
+
+    let s = summary().await;
+
+    // Counts are per status, and a status nobody holds is absent rather than
+    // zero: the set of statuses belongs to the data.
+    assert_eq!(s["counts_by_status"]["active"].as_i64(), Some(3));
+    assert_eq!(s["counts_by_status"]["completed"].as_i64(), Some(1));
+    assert!(s["counts_by_status"].get("on_hold").is_none());
+
+    // The sum is exact and carries its cents. A project with no budget
+    // contributes nothing rather than making the whole sum NULL, which is what
+    // SUM does without the COALESCE and the NULL-skipping it relies on.
+    assert_eq!(
+        s["total_budget"].as_str(),
+        Some("12600.75"),
+        "10000.50 + 2500.25 + 100, with the unbudgeted project skipped"
+    );
+
+    // And it is a string on the wire, like every other money field, so no
+    // client parses a budget through a float.
+    assert!(
+        s["total_budget"].is_string(),
+        "money crosses the wire as a string"
+    );
+}
