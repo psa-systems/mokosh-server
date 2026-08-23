@@ -31,6 +31,7 @@ one alone and you have not.
 | Environment-variable parity | `nu scripts/check-env-example.nu` | `check-env-example` | no |
 | Documented just recipes | `nu scripts/check-doc-recipes.nu` | `check-doc-recipes` | no |
 | Config doc paths | `nu scripts/check-config-doc-paths.nu` | `check-config-doc-paths` | no |
+| Markdown link targets | `nu scripts/check-doc-links.nu` | `check-doc-links` | no |
 | Unused dependencies | `cargo machete` | `check-unused-deps` | no |
 | Check formatting | `cargo fmt --all --check` | `check-fmt` | yes |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | `check-clippy` | yes |

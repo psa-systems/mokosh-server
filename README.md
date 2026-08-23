@@ -152,6 +152,7 @@ just check-unused-deps      # cargo-machete: fail on a dependency with no call s
 just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836)
 just check-doc-recipes      # fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843)
 just check-config-doc-paths # fail if a docs/ path in .env.example, compose.dev.yml or the justfile is missing (PMS-855)
+just check-doc-links        # fail if a relative Markdown link does not resolve to an existing path (PMS-850)
 
 # Format, test, build
 just fmt                    # cargo fmt --all

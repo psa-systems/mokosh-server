@@ -150,11 +150,11 @@ Notable layer details:
 
 #### `auth` (~1,700 LOC)
 
-Files: [`routes.rs`](../src/modules/auth/routes.rs) (302),
-[`service.rs`](../src/modules/auth/service.rs) (706),
-[`models.rs`](../src/modules/auth/models.rs) (627),
-[`middleware.rs`](../src/modules/auth/middleware.rs) (198),
-[`bootstrap.rs`](../src/modules/auth/bootstrap.rs) (123).
+Files: [`routes.rs`](../../src/modules/auth/routes.rs) (302),
+[`service.rs`](../../src/modules/auth/service.rs) (706),
+[`models.rs`](../../src/modules/auth/models.rs) (627),
+[`middleware.rs`](../../src/modules/auth/middleware.rs) (198),
+[`bootstrap.rs`](../../src/modules/auth/bootstrap.rs) (123).
 
 **Endpoints:** 14 total.
 
@@ -173,21 +173,21 @@ Files: [`routes.rs`](../src/modules/auth/routes.rs) (302),
 | `/api/v1/auth/users` | POST | admin | |
 | `/api/v1/auth/users/:user_id` | GET / PUT | admin | |
 
-Tech: Argon2 (via [`utils/crypto.rs`](../src/utils/crypto.rs)) for
+Tech: Argon2 (via [`utils/crypto.rs`](../../src/utils/crypto.rs)) for
 password hashing, JWT HS256 (via `jsonwebtoken`) for access + refresh
 tokens, sessions persisted in the `user_sessions` table.
 
 **Open TODOs:**
 
-- [`service.rs:81`](../src/modules/auth/service.rs#L81) - MFA TOTP
+- [`service.rs:81`](../../src/modules/auth/service.rs#L81) - MFA TOTP
   verify not implemented; users with `mfa_enabled = true` can be
   blocked from logging in entirely.
-- [`service.rs:196`](../src/modules/auth/service.rs#L196) - password
+- [`service.rs:196`](../../src/modules/auth/service.rs#L196) - password
   reset token is persisted but no email is sent. The user has no way
   to learn the token.
-- [`service.rs:345`](../src/modules/auth/service.rs#L345) - welcome
+- [`service.rs:345`](../../src/modules/auth/service.rs#L345) - welcome
   email for newly created users is not sent.
-- [`routes.rs:238`](../src/modules/auth/routes.rs#L238) - `list_users`
+- [`routes.rs:238`](../../src/modules/auth/routes.rs#L238) - `list_users`
   hard-codes an empty `PaginatedResponse`. The endpoint advertises
   listing but does not list. Tracked as **F1**.
 
@@ -196,10 +196,10 @@ but no handler), `password_reset_tokens`, `tenants` (read).
 
 #### `tickets` (~2,400 LOC)
 
-Files: [`routes.rs`](../src/modules/tickets/routes.rs) (401),
-[`service.rs`](../src/modules/tickets/service.rs) (888),
-[`models.rs`](../src/modules/tickets/models.rs) (733),
-[`automation.rs`](../src/modules/tickets/automation.rs) (315).
+Files: [`routes.rs`](../../src/modules/tickets/routes.rs) (401),
+[`service.rs`](../../src/modules/tickets/service.rs) (888),
+[`models.rs`](../../src/modules/tickets/models.rs) (733),
+[`automation.rs`](../../src/modules/tickets/automation.rs) (315).
 
 **Endpoints:** 11 total.
 
@@ -229,19 +229,19 @@ be joined from DB` for nine string fields:
 The endpoint returns `200 OK` but those fields come back empty. Any
 client that depends on them (which is most of them, since the client
 displays names not UUIDs) will render with blanks. See
-[`routes.rs:71-99,128-159,178-209,231-262,287-318`](../src/modules/tickets/routes.rs#L71).
+[`routes.rs:71-99,128-159,178-209,231-262,287-318`](../../src/modules/tickets/routes.rs#L71).
 Tracked as **F3** - the highest-impact server fix.
 
 **Open TODOs:**
 
-- [`service.rs:132`](../src/modules/tickets/service.rs#L132) -
+- [`service.rs:132`](../../src/modules/tickets/service.rs#L132) -
   `on_create` automation rules not invoked.
-- [`service.rs:409`](../src/modules/tickets/service.rs#L409) -
+- [`service.rs:409`](../../src/modules/tickets/service.rs#L409) -
   `on_update` automation rules not invoked.
-- [`service.rs:477`](../src/modules/tickets/service.rs#L477) -
+- [`service.rs:477`](../../src/modules/tickets/service.rs#L477) -
   `add_note` ignores `send_email: true`.
-- [`automation.rs:235`](../src/modules/tickets/automation.rs#L235),
-  [`automation.rs:243`](../src/modules/tickets/automation.rs#L243) -
+- [`automation.rs:235`](../../src/modules/tickets/automation.rs#L235),
+  [`automation.rs:243`](../../src/modules/tickets/automation.rs#L243) -
   notification + webhook dispatch from rules unwired (gated on the
   `notifications` placeholder module).
 
@@ -252,17 +252,17 @@ Tracked as **F3** - the highest-impact server fix.
 
 #### `contacts` (~1,800 LOC)
 
-Files: [`routes.rs`](../src/modules/contacts/routes.rs) (299),
-[`service.rs`](../src/modules/contacts/service.rs) (845),
-[`models.rs`](../src/modules/contacts/models.rs) (630),
-[`website_probe.rs`](../src/modules/contacts/website_probe.rs).
+Files: [`routes.rs`](../../src/modules/contacts/routes.rs) (299),
+[`service.rs`](../../src/modules/contacts/service.rs) (845),
+[`models.rs`](../../src/modules/contacts/models.rs) (630),
+[`website_probe.rs`](../../src/modules/contacts/website_probe.rs).
 
 **Endpoints:** the table below is the list, as registered in
-[`contact_routes`](../src/modules/contacts/routes.rs). The router
+[`contact_routes`](../../src/modules/contacts/routes.rs). The router
 exposes companies, contacts, sites and the company-industry lookup all
 under `/api/v1/contacts/...`. The empty
 `.nest("/companies", Router::new())` declared at
-[`router.rs:45`](../src/api/router.rs#L45) is dead - it matches
+[`router.rs:45`](../../src/api/router.rs#L45) is dead - it matches
 nothing, so `/api/v1/companies` returns 404 instead of an alias. See
 [Cross-cutting issues](#cross-cutting-issues) #11.
 
@@ -290,7 +290,7 @@ tenant data; the tenant is the rate-limit key only. Both the reachable
 and the unreachable verdict are 200s, because determining that a site
 does not answer is a successful probe; input that cannot be a website
 at all is a 400. `guard_outbound_url`
-([`utils/net.rs`](../src/utils/net.rs)) gates every resolved address
+([`utils/net.rs`](../../src/utils/net.rs)) gates every resolved address
 before the first connect and again for every redirect hop, which is
 what stops the endpoint being an SSRF primitive.
 
@@ -298,11 +298,11 @@ what stops the endpoint being an SSRF primitive.
 was not the only outbound fetch of a caller-supplied URL, so
 `guard_outbound_url` is shared by three callers: the probe (ports pinned
 to 80/443), the ticket-automation `webhook` action
-([`tickets/automation.rs`](../src/modules/tickets/automation.rs), which
+([`tickets/automation.rs`](../../src/modules/tickets/automation.rs), which
 now follows redirects itself so each hop is re-screened, and logs a
 refusal with the rule id and the blocked address), and
 `TacticalRmmProvider`
-([`rmm/provider.rs`](../src/modules/rmm/provider.rs), which screens its
+([`rmm/provider.rs`](../../src/modules/rmm/provider.rs), which screens its
 tenant-configured `api_url` before every request, refuses with an
 `AppError::Configuration` that reaches `rmm_connections.last_error`, and
 does not follow redirects). A second copy of the predicate or the resolve
@@ -320,14 +320,14 @@ companies (`contact_companies`: `company_id`, per-link `title`,
 `is_primary`, `sort_order`, `UNIQUE (contact_id, company_id)`). Both are
 tenant-scoped with their own `tenant_isolation` RLS policy and a partial
 unique index enforcing one primary per contact
-([`108_contact_phones_and_companies.sql`](../migrations/108_contact_phones_and_companies.sql)).
+([`108_contact_phones_and_companies.sql`](../../migrations/108_contact_phones_and_companies.sql)).
 
 A contact's links are ordered by `(created_at, sort_order)`, and that
 order is what "removing the primary promotes the OLDEST remaining link"
 means. `created_at` alone is not enough: it defaults to `NOW()`, the
 transaction timestamp, so every link written by one call shares a value
 and the tiebreak fell through to a random `uuid_generate_v4()`
-([`109_contact_company_link_order.sql`](../migrations/109_contact_company_link_order.sql),
+([`109_contact_company_link_order.sql`](../../migrations/109_contact_company_link_order.sql),
 PMS-815). `write_contact_companies` sets `sort_order` from the request
 position on INSERT only, so a link that survives a rewrite keeps the
 position it was created with.
@@ -335,7 +335,7 @@ position it was created with.
 The child tables are authoritative. `contacts.phone`, `.mobile`, `.fax`
 and `.company_id` stay on the table as **maintained mirrors**, recomputed
 from the child rows by
-[`recompute_contact_mirrors`](../src/modules/contacts/service.rs) inside
+[`recompute_contact_mirrors`](../../src/modules/contacts/service.rs) inside
 the same transaction as every create and update - the single writer of
 those four columns. The rule: `phone` = the primary entry's number,
 `mobile` = the first `mobile`-type entry, `fax` = the first `fax`-type
@@ -354,14 +354,14 @@ company list's `contact_count`) go through `contact_companies`, so a
 contact is found through ANY of its links and counted once per company.
 `phones` and `companies` are hydrated with one batched query each per
 page, pinned by
-[`contact_hydration_query_budget.rs`](../tests/contact_hydration_query_budget.rs).
+[`contact_hydration_query_budget.rs`](../../tests/contact_hydration_query_budget.rs).
 
 Portal scoping is deliberately NOT broadened: a portal session still
 resolves the contact's primary company only (PMS-807).
 
 **Deleting a company unlinks its contacts (PMS-812).**
 `contacts.company_id` is `ON DELETE SET NULL`
-([`110_contacts_company_id_set_null.sql`](../migrations/110_contacts_company_id_set_null.sql)),
+([`110_contacts_company_id_set_null.sql`](../../migrations/110_contacts_company_id_set_null.sql)),
 not the `ON DELETE CASCADE` it was created with in 004. `delete_company`
 is the primary path: inside the same transaction as the company DELETE it
 removes that company's `contact_companies` rows, promotes the oldest
@@ -384,16 +384,16 @@ takes `CurrentContact.company_id`), and email-intake's
 `email_intake/default_company_id` setting.
 
 **Defect: `update_site` is a silent no-op.**
-[`routes.rs:273-288`](../src/modules/contacts/routes.rs#L273) accepts
+[`routes.rs:273-288`](../../src/modules/contacts/routes.rs#L273) accepts
 the request body, validates it, then calls `get_site` and returns
 the unmodified record. A `200 OK` disguises a missed write. Tracked
 as **F4**.
 
 **Open TODOs:**
 
-- [`routes.rs:281`](../src/modules/contacts/routes.rs#L281) -
+- [`routes.rs:281`](../../src/modules/contacts/routes.rs#L281) -
   `update_site` does not actually update.
-- [`service.rs:332`](../src/modules/contacts/service.rs#L332) -
+- [`service.rs:332`](../../src/modules/contacts/service.rs#L332) -
   `create_contact` ignores `create_portal_access: true`.
 
 **Schema touched:** `companies`, `contacts`, `contact_phones`,
@@ -401,9 +401,9 @@ as **F4**.
 
 #### `tenants` (~810 LOC)
 
-Files: [`routes.rs`](../src/modules/tenants/routes.rs) (171),
-[`service.rs`](../src/modules/tenants/service.rs) (475),
-[`models.rs`](../src/modules/tenants/models.rs) (149).
+Files: [`routes.rs`](../../src/modules/tenants/routes.rs) (171),
+[`service.rs`](../../src/modules/tenants/service.rs) (475),
+[`models.rs`](../../src/modules/tenants/models.rs) (149).
 
 **Endpoints:** 7 total. All require auth; create / suspend /
 activate are super-admin only.
@@ -428,9 +428,9 @@ plus reads across `users`, `tickets`, etc. for usage.
 
 #### `seed` (PMS-157; one route via `data_transfer`, PMS-679)
 
-Files: [`service.rs`](../src/modules/seed/service.rs),
-[`middleware.rs`](../src/modules/seed/middleware.rs),
-[`data.rs`](../src/modules/seed/data.rs).
+Files: [`service.rs`](../../src/modules/seed/service.rs),
+[`middleware.rs`](../../src/modules/seed/middleware.rs),
+[`data.rs`](../../src/modules/seed/data.rs).
 
 First-visit demo-data seeding. A middleware (`seed_middleware`) runs
 inner of the auth middleware so `AuthState` is populated, and on the
@@ -510,7 +510,7 @@ the infrastructure or shared-helper layer.
 
 1. **Shallow ticket DTOs.** See `tickets` module above. Highest-
    impact server defect.
-2. **Portal endpoints all return 501.** [`router.rs:90-99`](../src/api/router.rs#L90).
+2. **Portal endpoints all return 501.** [`router.rs:90-99`](../../src/api/router.rs#L90).
    The client portal renders pages that cannot ever fetch data.
 3. **No tests.** ~~No `tests/` dir, no `*test*.rs` files, no
    integration coverage for any route group.~~ **Resolved (F10).**
@@ -522,16 +522,16 @@ the infrastructure or shared-helper layer.
    named spans, so request-scoped diagnostics through the body of a
    transaction are impossible.
 5. **No rate limit on `/auth/login`** (or anywhere). The `governor`
-   crate is in [`Cargo.toml:85`](../Cargo.toml#L85) but never
+   crate is in [`Cargo.toml:85`](../../Cargo.toml#L85) but never
    imported. Tracked as **F2**.
-6. **CORS = Any / Any / Any.** [`router.rs:108-113`](../src/api/router.rs#L108).
+6. **CORS = Any / Any / Any.** [`router.rs:108-113`](../../src/api/router.rs#L108).
    Dev-friendly. Must tighten before any non-local environment.
    Tracked as **F13**.
 7. **`utils/pagination.rs` exists but is bypassed.** `auth::list_users`
    constructs a `PaginatedResponse` of `vec![]`; `tenants` and
    `contacts` build inline pagination SQL.
 8. **Multi-tenancy: typed scoping rollout DONE (PMS-139).** A `TenantId`
-   newtype ([`auth/tenant.rs`](../src/modules/auth/tenant.rs)) whose only
+   newtype ([`auth/tenant.rs`](../../src/modules/auth/tenant.rs)) whose only
    in-crate constructor is `pub(crate)` and is reached solely via
    `CurrentUser::tenant()` (the `TenantScoped` trait), so a `TenantId` always
    traces back to an authenticated claim. Service methods that take
@@ -576,7 +576,7 @@ the infrastructure or shared-helper layer.
     monolith is gone and [`migrations/`](../../migrations/) holds
     per-feature files, each immutable once applied.
 11. **Companies route alias is dead.**
-    [`router.rs:45`](../src/api/router.rs#L45) declares
+    [`router.rs:45`](../../src/api/router.rs#L45) declares
     `.nest("/companies", Router::new())` with the comment "Alias
     handled by contact routes". The alias is empty: it matches
     nothing. `/api/v1/companies` returns 404, not the intended
@@ -584,9 +584,9 @@ the infrastructure or shared-helper layer.
     `/api/v1/contacts/companies`.
 12. **Cross-repo: client and server share DTOs by byte-identical
     copy-paste.** All `.rs` files in
-    [`src/modules/{auth,contacts,tenants,tickets}/`](../src/modules/)
+    [`src/modules/{auth,contacts,tenants,tickets}/`](../../src/modules/)
     diff cleanly to zero against
-    [`mokosh-apps/src/modules/...`](../../mokosh-apps/src/modules/).
+    `mokosh-apps/src/modules/...`, in that repository.
     Each `mod.rs` uses `#[cfg(feature = "server")]` to omit handler
     and service code from the WASM build. Currently in lock-step;
     vulnerable to silent drift the moment one side is edited
@@ -605,7 +605,7 @@ sections above.
 
 ### F1. `auth/routes.rs::list_users` - implement instead of returning empty
 
-Today ([`routes.rs:228-246`](../src/modules/auth/routes.rs#L228)):
+Today ([`routes.rs:228-246`](../../src/modules/auth/routes.rs#L228)):
 
 ```rust
 async fn list_users(...) -> AppResult<Json<PaginatedResponse<UserResponse>>> {
@@ -618,9 +618,9 @@ async fn list_users(...) -> AppResult<Json<PaginatedResponse<UserResponse>>> {
 ```
 
 Replace with a real query against `users` for `tenant_id =
-user.tenant_id`, paginated via [`utils/pagination.rs`](../src/utils/pagination.rs).
+user.tenant_id`, paginated via [`utils/pagination.rs`](../../src/utils/pagination.rs).
 Pattern already exists in
-[`tenant_service::list_tenants`](../src/modules/tenants/service.rs#L133).
+[`tenant_service::list_tenants`](../../src/modules/tenants/service.rs#L133).
 
 ### F2. Rate-limit `/api/v1/auth/login`
 
@@ -637,18 +637,18 @@ joined row. No `String::new()` placeholders remain. Original note kept
 below for history.
 
 Highest-impact fix. Patch
-[`tickets/service.rs::list_tickets`](../src/modules/tickets/service.rs#L194)
+[`tickets/service.rs::list_tickets`](../../src/modules/tickets/service.rs#L194)
 (and `get_ticket`, `update_ticket`, `assign_ticket`) so the SELECT
 joins `ticket_statuses`, `ticket_priorities`, `ticket_queues`,
 `ticket_types`, `ticket_categories`, `companies`, `contacts`, and
 `users` (assigned_to + created_by). Build `TicketResponse` from the
 joined row in the service, not the route handler. Today the route
 handler builds the DTO with `String::new()` for every joined name
-([`routes.rs:71-99,128-159,178-209,231-262,287-318`](../src/modules/tickets/routes.rs#L71)).
+([`routes.rs:71-99,128-159,178-209,231-262,287-318`](../../src/modules/tickets/routes.rs#L71)).
 
 ### F4. `contacts/routes.rs::update_site` - actually call update
 
-Today ([`routes.rs:273-288`](../src/modules/contacts/routes.rs#L273)):
+Today ([`routes.rs:273-288`](../../src/modules/contacts/routes.rs#L273)):
 
 ```rust
 async fn update_site(...) -> AppResult<Json<SiteResponse>> {
@@ -661,14 +661,14 @@ async fn update_site(...) -> AppResult<Json<SiteResponse>> {
 
 Add `update_site(&self, tenant_id, site_id, &UpdateSiteRequest) ->
 AppResult<Site>` to
-[`contact_service`](../src/modules/contacts/service.rs) (mirror
+[`contact_service`](../../src/modules/contacts/service.rs) (mirror
 `update_company` at
-[`service.rs:207`](../src/modules/contacts/service.rs#L207)), then
+[`service.rs:207`](../../src/modules/contacts/service.rs#L207)), then
 have the route call it.
 
 ### F5. Expose `tenant_service::{get,update}_module_config` over HTTP
 
-[`tenants/service.rs:283-460`](../src/modules/tenants/service.rs#L283)
+[`tenants/service.rs:283-460`](../../src/modules/tenants/service.rs#L283)
 defines module-config helpers that read/write `tenant_settings` and
 `module_config`. No route maps to them. Add:
 
@@ -679,7 +679,7 @@ This unblocks the client's `/settings/integrations` page.
 
 ### F6. Wire `/api/v1/portal/*` to a contact-scoped session
 
-Portal endpoints all 501 ([`router.rs:90-99`](../src/api/router.rs#L90)).
+Portal endpoints all 501 ([`router.rs:90-99`](../../src/api/router.rs#L90)).
 Portal users are `Contact` rows (the schema has
 `contacts.has_portal_access`), not `User` rows. Implement:
 
@@ -700,7 +700,7 @@ already ships rendered pages.
 ### F7. Stand up minimal read-only `/api/v1/invoices`
 
 Tables already exist. Create
-[`src/modules/billing/`](../src/modules/billing/) with at minimum:
+[`src/modules/billing/`](../../src/modules/billing/) with at minimum:
 
 - `GET /api/v1/invoices` (paginated, filter by `company_id`, `status`)
 - `GET /api/v1/invoices/:id`
@@ -747,9 +747,9 @@ used surfaces and the data is user-produced.
 
 ### F9. Add `validator::Validate` to `*Filter` query types
 
-`TicketFilter` ([`tickets/models.rs:446`](../src/modules/tickets/models.rs#L446)),
+`TicketFilter` ([`tickets/models.rs:446`](../../src/modules/tickets/models.rs#L446)),
 `CompanyFilter` and `ContactFilter`
-([`contacts/models.rs:613,623`](../src/modules/contacts/models.rs#L613))
+([`contacts/models.rs:613,623`](../../src/modules/contacts/models.rs#L613))
 are deserialized from the query string and passed to SQL as-is. Add
 `#[derive(Validate)]` plus length/regex constraints, then call
 `filter.validate()?` at the top of each list handler.
@@ -766,8 +766,8 @@ Postgres is cleanest, but the dev compose
 
 Once `notifications` becomes a real module, have the ticket service
 call `AutomationEngine::process_rules` on `on_create` and `on_update`
-([`tickets/service.rs:132,409`](../src/modules/tickets/service.rs#L132)
-and [`automation.rs:235,243`](../src/modules/tickets/automation.rs#L235)).
+([`tickets/service.rs:132,409`](../../src/modules/tickets/service.rs#L132)
+and [`automation.rs:235,243`](../../src/modules/tickets/automation.rs#L235)).
 Gated on F12.
 
 ### F12. Skeletons for the remaining placeholder modules
@@ -779,7 +779,7 @@ implemented yet").
 
 ### F13. Tighten CORS
 
-[`router.rs:108-113`](../src/api/router.rs#L108). Replace
+[`router.rs:108-113`](../../src/api/router.rs#L108). Replace
 `Any/Any/Any` with origins from `MOKOSH_ALLOWED_ORIGINS` env var,
 methods restricted to `GET/POST/PUT/DELETE`, and headers restricted
 to `Authorization`, `Content-Type`, `Accept`.
@@ -812,7 +812,7 @@ adds its own migration without touching others.
 > Traefik-routed stack is tracked in PMS-873; until then follow
 > [`quickstart.md`](../quickstart.md).
 
-When the dev stack is up (see [README.md](../README.md) -
+When the dev stack is up (see [README.md](../../README.md) -
 "Quick start"):
 
 ```nu

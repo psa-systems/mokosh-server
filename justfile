@@ -48,7 +48,7 @@ pre-commit: ensure-env
 
 # -- Checks ----------------------------------------------------------------------
 
-# Every check.yml step except its two cargo test steps: all twelve repo guard
+# Every check.yml step except its two cargo test steps: all thirteen repo guard
 # steps plus compile, clippy and fmt. `just pre-commit` runs the unit and doc
 # tests, so the two recipes together cover check.yml and neither covers it alone
 # (PMS-851; per-step mapping in docs/dev-docs/local-vs-ci-checks.md).
@@ -62,7 +62,15 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
+
+# Keep every relative Markdown link pointing at a file that exists (PMS-850).
+# The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
+# three doc audits reported the same set because a broken link fails silently.
+[doc("Fail if a relative Markdown link does not resolve to an existing path (PMS-850).")]
+[group: 'check']
+check-doc-links:
+    nu scripts/check-doc-links.nu
 
 # Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
 # README.md or docs/quickstart.md names a recipe the justfile does not define.
