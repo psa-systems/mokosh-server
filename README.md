@@ -34,6 +34,23 @@ Modules under `src/modules/` cover the typical PSA surface area: `tickets`, `con
 | `mokosh-server` | Long-running HTTP API (Axum). |
 | `mokosh-bootstrap` | One-shot CLI that performs first-run setup of a fresh Infisical instance and writes the resulting Universal Auth credentials into `.env`. |
 
+### Operator subcommands
+
+`mokosh-server` inspects `argv` before binding a port (PMS-494, `src/cli.rs`): when the first token is one of these it runs the task and exits instead of serving.
+
+| Subcommand | Purpose |
+| --- | --- |
+| `bootstrap-infisical` | First-run setup of a fresh Infisical instance. Driven by `just infisical-bootstrap`; see "Infisical bootstrap" below. |
+| `qa-seed` | Load the QA walkthrough dataset (PMS-331) into the tenant named by `--tenant <uuid>` or `MOKOSH_QA_TENANT_ID`. |
+| `qa-teardown` | Remove that dataset from the same tenant. |
+| `showcase-seed` | Create the richer showcase demo dataset (PMS-620) in the tenant named by `--tenant <uuid>` or `MOKOSH_SHOWCASE_TENANT_ID`. |
+| `showcase-refresh` | Tear the showcase dataset down and re-seed it in one step. |
+| `showcase-teardown` | Remove the showcase dataset. |
+
+Both seeds are fail-closed and write nothing unless the target tenant is explicitly marked: `settings.is_qa` for `qa-*`, `settings.is_showcase` for `showcase-*`. That is what keeps them off a production tenant. Each needs a privileged `DATABASE_URL`.
+
+`mokosh-bootstrap` dispatches its own overlapping set (`bootstrap-infisical`, `qa-seed`, `qa-teardown`, plus `normalize-company-industries`, PMS-602); it has no `showcase-*` subcommands. Run `mokosh-bootstrap` with no arguments for its help text.
+
 ## Prerequisites
 
 - Rust toolchain (matches `rust-toolchain.toml` if present, otherwise stable).
@@ -91,6 +108,7 @@ The dev host is a VPS on the public internet, and several developers share it. T
 | `MOKOSH_SERVER_INFISICAL_ADDRESS` | written to `.env` by `just dev-infisical` | In-network Infisical URL handed to the server as `INFISICAL_ADDRESS`. Empty on a plain `just dev`, which makes the readiness probe report Infisical as `skipped`. |
 | `JWT_SECRET`, `ENCRYPTION_KEY` | `.env` | API server secrets, generated per clone on first `.env` creation; provision them explicitly for any non-local environment. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | `.env` | Optional first-run admin bootstrap. Dev only; see "First-run admin bootstrap" below. |
+| `INFISICAL_URL` | `.env` | Host-side URL of the dev Infisical instance, read by the bootstrap CLI when `just infisical-bootstrap` runs it on the host. Default `http://localhost:28002`. Not the same key as `MOKOSH_SERVER_INFISICAL_ADDRESS` above, which is the in-network URL the server container gets. |
 | `INFISICAL_*` | `.env` | Infisical server config (bootstrap inputs) and Universal Auth client credentials (filled by `mokosh-bootstrap`). |
 | `ATTACHMENT_DIR` | `.env` | Upload root for ticket attachments and tenant logos. The dev stack points it at `/data/attachments` on the `dev-mokosh-attachments-${USER}` volume so an upload survives a rebuild; deployed environments want an absolute path on a mounted volume. |
 | `RUST_LOG` | `.env` | Tracing subscriber filter. |
@@ -133,6 +151,7 @@ just check-workspace-deps   # fail if [workspace.dependencies] and its members d
 just check-unused-deps      # cargo-machete: fail on a dependency with no call site (PMS-780)
 just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836)
 just check-doc-recipes      # fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843)
+just check-config-doc-paths # fail if a docs/ path in .env.example, compose.dev.yml or the justfile is missing (PMS-855)
 just check-doc-links        # fail if a relative Markdown link does not resolve to an existing path (PMS-850)
 
 # Format, test, build

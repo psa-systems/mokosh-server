@@ -39,7 +39,7 @@ Why not just `POST /api/v1/auth/login` and skip the browser entirely? Three inde
 
 - mokosh hosts no OP and no token endpoint (PMS-295 removed the OP subsystem it used to ship), so there is nothing in this repo to mint a token from. bunyip is the OP, and the suite holds no client credentials for a service-to-service grant against it.
 - Legacy `POST /api/v1/auth/login` works only against rows in mokosh's local `users` table; SPA accounts that signed up through the bunyip hub live elsewhere and 401 there.
-- The SPA keeps its bearer in WASM thread-local memory (`mokosh-clients/src/hooks/fetch.rs`), so `page.evaluate()` / `storageState` cannot read it.
+- The SPA keeps its bearer in WASM thread-local memory (`mokosh-apps/src/hooks/fetch.rs`), so `page.evaluate()` / `storageState` cannot read it.
 
 Intercepting the real SPA auth flow is the only path that reuses production auth without registering a new client or maintaining a parallel signup pipeline.
 

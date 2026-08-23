@@ -23,6 +23,11 @@
 # invisible to a plain `env::var` grep.
 const ENV_HELPERS = ["require_env" "required_env" "resolve_secret"]
 
+# Same idea, for helpers that take the env var NAME as their SECOND argument.
+# `parse_tenant_arg_env(args, "MOKOSH_SHOWCASE_TENANT_ID", "showcase")` is a
+# read, and the first-argument regex above could not see it (PMS-853).
+const ENV_HELPERS_ARG2 = ["parse_tenant_arg_env"]
+
 # Names in CODE that deliberately have no .env.example key.
 const CODE_NOT_IN_TEMPLATE = {
     CARGO_PKG_VERSION: "build-time, set by cargo itself"
@@ -32,7 +37,7 @@ const CODE_NOT_IN_TEMPLATE = {
     SOURCE_DATE_EPOCH: "build-time reproducible-build input, never a runtime setting"
     MOKOSH_ENV_FILE: "host-side mokosh-bootstrap CLI flag default, not server config"
     MOKOSH_QA_TENANT_ID: "host-side qa-seed / qa-teardown CLI argument fallback"
-    INFISICAL_URL: "host-side bootstrap CLI; lives in .env.infisical, not .env"
+    MOKOSH_SHOWCASE_TENANT_ID: "host-side showcase-seed / -refresh / -teardown CLI argument fallback"
     INFISICAL_ADMIN_EMAIL: "host-side bootstrap CLI; lives in .env.infisical"
     INFISICAL_ADMIN_PASSWORD: "host-side bootstrap CLI; lives in .env.infisical"
     INFISICAL_ADMIN_FIRST_NAME: "host-side bootstrap CLI; lives in .env.infisical"
@@ -40,8 +45,8 @@ const CODE_NOT_IN_TEMPLATE = {
     INFISICAL_IDENTITY_NAME: "host-side bootstrap CLI; lives in .env.infisical"
     INFISICAL_PROJECT_NAME: "host-side bootstrap CLI; lives in .env.infisical"
     INFISICAL_ADDRESS: "container-side name; .env carries it as MOKOSH_SERVER_INFISICAL_ADDRESS so the host-side and in-network URLs stay separate (PMS-707)"
-    OIDC_ISSUER: "dev value is derived from ${USER} in compose.dev.yml so it always matches the Traefik route; an operator-set .env value would not. Documenting an overridable key is tracked in PMS-853"
-    OIDC_AUDIENCE: "dev value is derived from ${USER} in compose.dev.yml so it always matches the Traefik route; an operator-set .env value would not. Documenting an overridable key is tracked in PMS-853"
+    OIDC_ISSUER: "dev value is derived from ${USER} in compose.dev.yml so it always matches the Traefik route; compose does not interpolate a .env override, so a key here would be inert. Both names and the reason are documented in the .env.example prose block above OIDC_DEFAULT_TENANT_ID (PMS-853)"
+    OIDC_AUDIENCE: "dev value is derived from ${USER} in compose.dev.yml so it always matches the Traefik route; compose does not interpolate a .env override, so a key here would be inert. Both names and the reason are documented in the .env.example prose block above OIDC_DEFAULT_TENANT_ID (PMS-853)"
 }
 
 # Names in CODE that deliberately have no compose.dev.yml server line.
@@ -53,6 +58,7 @@ const CODE_NOT_IN_COMPOSE = {
     SOURCE_DATE_EPOCH: "build-time reproducible-build input, never a runtime setting"
     MOKOSH_ENV_FILE: "host-side mokosh-bootstrap CLI flag default, not server config"
     MOKOSH_QA_TENANT_ID: "host-side qa-seed / qa-teardown CLI argument fallback"
+    MOKOSH_SHOWCASE_TENANT_ID: "host-side showcase-* CLI argument fallback"
     INFISICAL_URL: "host-side bootstrap CLI runs on the host, not in the server container"
     INFISICAL_ADMIN_EMAIL: "host-side bootstrap CLI runs on the host"
     INFISICAL_ADMIN_PASSWORD: "host-side bootstrap CLI runs on the host"
@@ -63,17 +69,14 @@ const CODE_NOT_IN_COMPOSE = {
 }
 
 # Keys in TEMPLATE that no Rust file and no compose.dev.yml interpolation reads.
-const TEMPLATE_UNREAD = {
-    TACTICAL_RMM_URL: "no reader; RMM credentials are per-tenant rows in rmm_connections. Removal tracked in PMS-853"
-    TACTICAL_RMM_API_KEY: "no reader; RMM credentials are per-tenant rows in rmm_connections. Removal tracked in PMS-853"
-    TWILIO_ACCOUNT_SID: "no reader; SMS is not wired up. Removal tracked in PMS-853"
-    TWILIO_AUTH_TOKEN: "no reader; SMS is not wired up. Removal tracked in PMS-853"
-    TWILIO_PHONE_NUMBER: "no reader; SMS is not wired up. Removal tracked in PMS-853"
-    SLACK_BOT_TOKEN: "no reader; the Slack integration is not wired up. Removal tracked in PMS-853"
-    SLACK_SIGNING_SECRET: "no reader; the Slack integration is not wired up. Removal tracked in PMS-853"
-    TEAMS_WEBHOOK_URL: "no reader; the Teams integration is not wired up. Removal tracked in PMS-853"
-    INFISICAL_BASE_URL: "dead key: the bootstrap CLI reads INFISICAL_URL. The rename is tracked in PMS-853"
-}
+#
+# PMS-853 emptied this: the eight integration credentials (TACTICAL_RMM_*,
+# TWILIO_*, SLACK_*, TEAMS_WEBHOOK_URL) were deleted from .env.example because
+# nothing reads them, and the dead host-side Infisical key was renamed onto
+# INFISICAL_URL, which the bootstrap CLI has always read. An entry belongs here
+# only when a key must stay in the template despite having no reader; there is
+# no such key today.
+const TEMPLATE_UNREAD = {}
 
 # Extract every env var name the Rust sources read.
 def code-reads [] {
@@ -85,6 +88,10 @@ def code-reads [] {
 
     let helper_regex = (
         ['(?:' ($ENV_HELPERS | str join '|') ')\(\s*"(?<name>[A-Z][A-Z0-9_]*)"'] | str join ''
+    )
+    let helper_arg2_regex = (
+        ['(?:' ($ENV_HELPERS_ARG2 | str join '|') ')\([^,()]*,\s*"(?<name>[A-Z][A-Z0-9_]*)"']
+        | str join ''
     )
 
     # One regex pass per pattern per FILE, not per line: `parse --regex` returns
@@ -102,6 +109,8 @@ def code-reads [] {
         ))
         # require_env("NAME") and friends
         $names = ($names | append ($text | parse --regex $helper_regex | get name))
+        # parse_tenant_arg_env(args, "NAME", label) and friends
+        $names = ($names | append ($text | parse --regex $helper_arg2_regex | get name))
         # const ALLOWLIST_VAR: &str = "NAME";  read as  env::var(ALLOWLIST_VAR)
         for row in ($text | parse --regex 'const\s+(?<ident>[A-Z][A-Z0-9_]*)\s*:\s*&[^=\n]*str\s*=\s*"(?<name>[A-Z][A-Z0-9_]*)"') {
             $const_names = ($const_names | insert $row.ident $row.name)

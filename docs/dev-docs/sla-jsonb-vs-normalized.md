@@ -38,9 +38,9 @@ Verified across the SLA module (`src/modules/sla/`):
 
 Normalization buys SQL-level queryability and constraints the application does not use, in exchange for a migration, a backfill, and rewrites of the read path (join/aggregate), the write path (multi-row), and the SPA editors. Net: cost outweighs benefit for a small, bounded, read-mostly structure that is always consumed whole.
 
-## Follow-up worth doing regardless (the one real gap)
+## Structure is enforced in Rust, not by the DB (PMS-604)
 
-The upsert requests validate only `name` length; `schedule` / `holidays` carry `#[serde(default)]` with no `#[validate(...)]`, so any JSON shape is accepted and stored. Malformed content is silently tolerated and skipped at read time by the `clock.rs` parser, which can quietly distort SLA math. This is a *validation* gap, not a *storage* gap: add Rust parse-and-reject on write (return 422 on a malformed schedule/holiday payload) instead of normalizing to get DB-level structure enforcement. Tracked as a separate ticket.
+Keeping JSONB gives up DB-level structure constraints, so the write path enforces them instead. `validate_business_schedule` and `validate_holiday_list` (`src/modules/sla/models.rs:134` and `:244`) hang off the upsert requests as `#[validate(custom(...))]`, so a malformed `schedule` or `holidays` payload is rejected with a 422 keyed onto that field rather than stored and then silently skipped at read time by the tolerant `clock.rs` parser. That was the one real gap this decision left open, and PMS-604 closed it as a *validation* change, not a *storage* one: normalizing was never the cheapest way to get structure enforced.
 
 ## Revisit if
 

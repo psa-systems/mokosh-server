@@ -160,6 +160,16 @@ jobs:
         run: |
           nu scripts/check-doc-recipes.nu
 
+      - name: Config doc paths
+        # PMS-855: four comments in .env.example and compose.dev.yml pointed at
+        # a docs/ subdirectory of SMTP notes that has never existed in this
+        # repo. .env.example is minted into .env in every clone, so the dead
+        # pointer reached every developer configuring mail. Fails when a config
+        # comment names a docs/ path that is not on disk.
+        shell: nu {0}
+        run: |
+          nu scripts/check-config-doc-paths.nu
+
       - name: Markdown link targets
         # PMS-850: the 2026-07-01 docs move relocated docs/dev-docs/ without
         # repointing its relative links, leaving 72 `](../...)` targets one
@@ -184,16 +194,22 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Compile check
-        run: cargo check --all-targets
+        # PMS-893: `--workspace`, because without it this checks the root
+        # package only. crates/mokosh-types' test target had not compiled since
+        # PMS-730 added a field its fixture never got, and no gate noticed.
+        run: cargo check --workspace --all-targets
 
       - name: Unit tests
-        run: cargo test --lib
+        # PMS-893: `--workspace` runs the shared crate's 83 tests, which had
+        # never executed anywhere. mokosh-types is the client/server wire
+        # contract; its tests are the ones that most need to run.
+        run: cargo test --workspace --lib
 
       - name: Doc tests
         # Runs the doctests, including the PMS-139 `compile_fail` guard that
         # pins "a raw Uuid cannot be passed where a TenantId is required".
         # `--lib` above does not execute doctests.
-        run: cargo test --doc
+        run: cargo test --workspace --doc

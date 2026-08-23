@@ -25,6 +25,7 @@ just check-workspace-deps  # [workspace.dependencies] matches what members inher
 just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just check-env-example     # every var the code reads has a .env.example key and a compose.dev.yml line
 just check-doc-recipes     # every `just <recipe>` in README.md / docs/quickstart.md exists in the justfile
+just check-config-doc-paths # every docs/ path named in .env.example / compose.dev.yml / justfile exists
 just check-doc-links       # every relative Markdown link resolves to a path that exists
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
@@ -58,7 +59,7 @@ OIDC client registration recipes (`register-client`, etc.) were removed with mok
 
 `just dev` rewrites `MOKOSH_HOST_BIND_IP` and `USER` in `.env` each run (`USER` names the per-developer containers, volumes, networks and the `${USER}-mokosh-api.a8n.run` route; the LAN IP, discovered from `sys net | where name =~ 'eth0|br0'`, is recorded but no longer consumed by `compose.dev.yml`, since PMS-496 moved the `postgres`/`mailpit` host publishes to loopback and the `server` is ingress-only via Traefik). First run generates `.env` from the committed `.env.example` (via the `ensure-env` recipe, a dependency of `just dev`), minting fresh random values for every self-owned secret (PMS-490: DB passwords, `JWT_SECRET`, `ENCRYPTION_KEY`, the Infisical secrets) and leaving third-party credentials as empty placeholders. It does not copy a file; an existing `.env` is left untouched, so the generation runs once per clone.
 
-`just dev-infisical` rewrites `MOKOSH_SERVER_INFISICAL_ADDRESS` in `.env` to `http://infisical:8080`, which compose passes to the `server` container as `INFISICAL_ADDRESS` (restart `server` to pick it up). It stays empty on a plain `just dev` so the readiness probe reports `checks.infisical == "skipped"` rather than 503ing against the profile-gated service (PMS-707). The separate plain `INFISICAL_BASE_URL` in `.env` is a different key: the host-side `http://localhost:28002` that `just infisical-bootstrap` uses.
+`just dev-infisical` rewrites `MOKOSH_SERVER_INFISICAL_ADDRESS` in `.env` to `http://infisical:8080`, which compose passes to the `server` container as `INFISICAL_ADDRESS` (restart `server` to pick it up). It stays empty on a plain `just dev` so the readiness probe reports `checks.infisical == "skipped"` rather than 503ing against the profile-gated service (PMS-707). The separate plain `INFISICAL_URL` in `.env` is a different key: the host-side `http://localhost:28002` that the bootstrap CLI reads when `just infisical-bootstrap` runs it. PMS-853 renamed that template key onto the name the CLI actually reads; the previous name was read by nothing.
 
 `just dev` requires the shared external `network-traefik-public` to already exist. (Before PMS-295 it also needed a local Ed25519 keypair for mokosh-auth's OP signing; that subsystem is gone, so no key material is provisioned now. The bunyip-as-OP Resource-Server path verifies tokens against bunyip's JWKS over the network.)
 
@@ -84,7 +85,7 @@ oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
 compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
 .forgejo/workflows/     CI (Forgejo)
-docs/                   Contributor/user docs; docs/dev-docs/ = internal notes (codebase-state.md = module/route catalog)
+docs/                   Contributor/user docs; docs/dev-docs/ = internal notes (codebase-state.md = frozen 2026-05-06 route catalog)
 ```
 
 ### Auth: two independent mechanisms (PMS-295)
@@ -123,7 +124,7 @@ Portal sessions are stateless, so revocation is a cutoff, not a delete (MAPPS-53
 
 ### Multi-tenancy
 
-No middleware-level tenant scoping. Every service method takes `tenant_id: Uuid` explicitly. Forgetting to thread `user.tenant_id` becomes a cross-tenant data leak. See `docs/dev-docs/codebase-state.md` cross-cutting issue #8.
+No middleware-level tenant scoping: every service method takes the scope explicitly. Since PMS-139 that scope is a `TenantId` newtype (`src/modules/auth/tenant.rs`) whose in-crate constructor is `pub(crate)` and is reached only through `CurrentUser::tenant()`, so a handler that forgets to thread the caller's tenant no longer compiles instead of leaking across tenants. The deliberate escape hatch is `TenantId::from_trusted`, for the paths where the scope genuinely is not a `CurrentUser` claim: the Stripe and RMM webhook receivers, super-admin `tenants` handlers addressing a path tenant, portal contact sessions, the seeders, and the cross-tenant workers (`calendar/worker.rs`, `sla/worker.rs`, the billing sweep). Cross-cutting issue #8 in `docs/dev-docs/codebase-state.md` records the rollout.
 
 ### Migrations
 
@@ -133,7 +134,7 @@ Per-feature files under `migrations/` (split from the original `001_initial_sche
 
 ### Module status
 
-Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 implemented modules (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, `saved_reports`, `workflows`, `time_tracking`, and more); the old `stub_routes()` 501 placeholder mechanism is gone. The report-export route (`src/modules/reports/routes.rs`) implements CSV only and rejects every other `format`, `pdf` included, with 400 and not 501: `format` is an enumerated query parameter, so a value outside the implemented set is an out-of-range request rather than a server-side gap (PMS-854; adding PDF is tracked in PMS-876). The schema is still ahead of the handler layer in places. Before adding a new module, read `docs/dev-docs/codebase-state.md` for the per-module status, open TODOs (`F1..F14`), and known shallow-DTO traps in tickets.
+Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 implemented modules (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, `saved_reports`, `workflows`, `time_tracking`, and more); the old `stub_routes()` 501 placeholder mechanism is gone. The report-export route (`src/modules/reports/routes.rs`) implements CSV only and rejects every other `format`, `pdf` included, with 400 and not 501: `format` is an enumerated query parameter, so a value outside the implemented set is an out-of-range request rather than a server-side gap (PMS-854; adding PDF is tracked in PMS-876). The schema is still ahead of the handler layer in places. `docs/dev-docs/codebase-state.md` is a frozen 2026-05-06 snapshot (PMS-849), not a current per-module status: read it for the `F1..F14` fix ids, the numbered cross-cutting issues that source comments cite, and the shallow-DTO traps in tickets, and read `src/api/router.rs` plus the "Routing model" section above for what is actually mounted. Do not append to it; a new route group is recorded in the "Routing model" list.
 
 ## Conventions specific to this repo
 
@@ -151,5 +152,6 @@ Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 imple
 - `CORS_ORIGIN` is comma-separated; required to be a valid header value or startup panics. Defaults to `[CLIENT_ORIGIN]`.
 - `LOGIN_APPROVAL_ENABLED` (PMS-658) turns on the suspicious-login notify-and-approve gate; off by default because it can withhold a login, so it is opt-in per deployment for a staged rollout. When on and a password login clears password/MFA but comes from a new country (needs `IP2LOCATION_DB_PATH`) or a new device (client-supplied `device_id` in the login body), the session/tokens are withheld and a single-use 6-digit code is emailed; the client re-POSTs `/auth/login` with `approval_code` to finish (mirrors the `mfa_required` flow). Off = the PMS-657 alert-only behaviour. Gates password login in v1 (the portal path is a follow-up); tables `login_approvals` + `user_login_devices`.
 - Outbound-URL screening (PMS-805, PMS-809): every outbound fetch whose URL comes from a request or from tenant-editable configuration runs through `utils::net::guard_outbound_url`, which resolves the host and refuses any address `is_non_public_ip` rejects, before the first connect and again on every redirect hop. Three callers: the company website probe (`modules/contacts/website_probe.rs`, ports pinned to 80/443), the ticket-automation `webhook` action (`modules/tickets/automation.rs`, refusal logged with the rule id and the blocked address), and `TacticalRmmProvider` (`modules/rmm/provider.rs`, refusal is an `AppError::Configuration` surfaced in `rmm_connections.last_error`; redirects are not followed). Do not copy the predicate or the resolve loop: a second definition of either fails `utils::net`'s `exactly_one_definition_in_the_crate` test. `OUTBOUND_PRIVATE_ALLOWLIST` is the operator escape hatch (comma-separated hostnames, IPs, or CIDRs) for a self-hosted integration that really does live on a private network; unset means no exemption. Fetches whose URL comes from operator env are deliberately NOT screened (`INFISICAL_ADDRESS`, the Stripe API base, the `OIDC_ISSUER` JWKS, the fixed upstream version check).
+- Client repository name (PMS-856): the SPA repository is `mokosh-apps`, and the name it replaced resolves to nothing. `repo_hygiene::the_former_client_repo_name_stays_gone` in `src/lib.rs` scans the working tree under `cargo test --lib` (a `check.yml` step) and fails if the old name reappears anywhere, so no new script, recipe or CI step carries the ban.
 - Docker resource naming: every service/volume/network is prefixed with the app name; dev resources get an extra `dev-` prefix. Sub-service data stores sort adjacent to their parent (`dev-backup-infisical-postgres`, not `dev-backup-postgres-infisical`).
 - Dev stack binds to a private LAN IP (br0/eth0), not 127.0.0.1, so sibling containers on the host can reach the API while the public internet cannot.

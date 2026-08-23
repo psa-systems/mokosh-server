@@ -22,7 +22,7 @@
 #
 # This stack contains the Mokosh API server plus its secrets-management
 # infrastructure (Infisical + its Postgres + Valkey, behind the `infisical`
-# profile). The Mokosh client apps run separately (see ../mokosh-clients) and
+# profile). The Mokosh client apps run separately (see ../mokosh-apps) and
 # reach the API through Traefik at https://${USER}-mokosh-api.a8n.run.
 #
 # The Mokosh API server runs as the `server` service, reachable inside the
@@ -176,8 +176,8 @@ services:
   # Mailpit captures every outgoing email locally. mokosh-server points
   # SMTP_HOST=mailpit in the dev env (see the server service below); the
   # web UI is at http://localhost:8025. State is intentionally
-  # ephemeral - no volume mount, restart clears the inbox. See
-  # docs/mokosh-smtp/01-dev-mailcatcher.md.
+  # ephemeral - no volume mount, restart clears the inbox. MP_DELIVER is
+  # false, so nothing leaves the box whatever SMTP_FROM says.
   mailpit:
     container_name: dev-mokosh-mailpit-${USER:?USER missing - run via just dev}
     image: axllent/mailpit:v1.27
@@ -235,7 +235,7 @@ services:
       # alongside this one; messages land in http://localhost:8025.
       # Production deploys override these via secrets; setting
       # SMTP_HOST empty drops back to LogMailer (links go to docker
-      # logs). See docs/mokosh-smtp/03-config-and-bootstrap.md.
+      # logs). The .env.example block above these keys is the reference.
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
@@ -250,9 +250,9 @@ services:
       # `just dev` and the readiness probe reports "skipped" instead of
       # 503ing against an absent host (PMS-707). `just dev-infisical`
       # writes the service-DNS URL into .env under the MOKOSH_SERVER_
-      # name; the plain INFISICAL_BASE_URL in .env is the host-side
-      # localhost URL that `just infisical-bootstrap` consumes, so the
-      # two contexts need two names.
+      # name; the plain INFISICAL_URL in .env is the host-side localhost
+      # URL that `just infisical-bootstrap` consumes, so the two contexts
+      # need two names.
       INFISICAL_ADDRESS: ${MOKOSH_SERVER_INFISICAL_ADDRESS:-}
       INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
@@ -401,12 +401,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      # NB: no dependency on infisical. The mokosh-server binary never
-      # reads Infisical at startup (only the one-shot mokosh-bootstrap
-      # CLI does), and Infisical is now opt-in behind the `infisical`
-      # compose profile. A hard depends_on a profiled-out service makes
-      # compose reject the whole project ("depends on undefined service
-      # infisical") for every `just dev` / `just down`.
+      # NB: no dependency on infisical. The mokosh-server binary reads
+      # INFISICAL_ADDRESS (the readiness probe in src/api/router.rs pings
+      # it, and reports "skipped" when the address is blank), but it does
+      # not require Infisical to be up to boot, and Infisical is opt-in
+      # behind the `infisical` compose profile. A hard depends_on a
+      # profiled-out service makes compose reject the whole project
+      # ("depends on undefined service infisical") for every
+      # `just dev` / `just down`.
       mailpit:
         # No healthcheck on mailpit; it accepts SMTP from cold start.
         # Wait for the container to be running, not healthy.
