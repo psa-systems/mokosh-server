@@ -259,7 +259,9 @@ pub async fn auth_middleware(
                         }
                         match auth_middleware
                             .auth_service
-                            .ensure_user_and_tenant_active(claims.tid, claims.sub, claims.iat)
+                            .ensure_user_and_tenant_active(
+                                claims.tid, claims.sub, claims.iat, claims.sid,
+                            )
                             .await
                         {
                             // PMS-681: ensure_user_and_tenant_active returns the
@@ -268,7 +270,8 @@ pub async fn auth_middleware(
                                 AuthState::authenticated(user.to_current_user(), claims.tid)
                             }
                             // PMS-769: the cause (deactivated user, suspended
-                            // tenant, post-password-change `iat`) is logged
+                            // tenant, post-password-change `iat`, MAPPS-531
+                            // signed-out session) is logged
                             // rather than discarded, so a support report of
                             // "it just 401s" has server-side evidence. `debug`,
                             // not `warn`: every one of these is an expected
