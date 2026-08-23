@@ -1670,3 +1670,76 @@ async fn project_summary_totals_the_tenant_not_a_page(pool: PgPool) {
         "money crosses the wire as a string"
     );
 }
+
+/// PMS-895: `?q=` matches the project name, and the count agrees with the page.
+///
+/// The SPA's project list searched names in the browser. Paging it server-side
+/// (MAPPS-546) without this would have left the search box filtering whichever
+/// page happened to be loaded and presenting that as the whole answer - the
+/// failure mode that is worse than no filter, because the control appears to
+/// work.
+///
+/// The `meta.total` assertions are the point: this list builds its data and
+/// count WHERE clauses separately with their own placeholder numbering, and a
+/// filter added to one but not the other is a 500 or a lie, which is the bug
+/// class the comment above that code names.
+#[sqlx::test]
+async fn project_search_matches_names_and_counts(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    for name in ["Network Upgrade", "Network Audit", "Office Move"] {
+        let resp = post(
+            &app,
+            &token,
+            "/api/v1/projects",
+            serde_json::json!({ "name": name, "company_id": company, "status": "active" }),
+        )
+        .await;
+        assert!(resp.status().is_success(), "create {name}");
+    }
+
+    let search = |query: &str| {
+        let client = app.client.clone();
+        let url = app.url(&format!("/api/v1/projects?{query}"));
+        let token = token.clone();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("list projects");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("projects JSON");
+            let names: Vec<String> = v["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .map(|p| p["name"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (names, v["meta"]["total"].as_u64().unwrap_or_default())
+        }
+    };
+
+    let (mut names, total) = search("q=Network").await;
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Network Audit".to_string(), "Network Upgrade".to_string()]
+    );
+    assert_eq!(total, 2, "the count query must apply the same filter");
+
+    // Combined with another filter, so the placeholder numbering is exercised
+    // with two conditions rather than one.
+    let (names, total) = search("status=active&q=Office").await;
+    assert_eq!(names, vec!["Office Move".to_string()]);
+    assert_eq!(total, 1);
+
+    // And it excludes.
+    let (names, total) = search("q=nothing-matches-this").await;
+    assert!(names.is_empty());
+    assert_eq!(total, 0);
+}
