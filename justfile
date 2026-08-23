@@ -62,7 +62,7 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths
 
 # Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
 # README.md or docs/quickstart.md names a recipe the justfile does not define.
@@ -70,6 +70,14 @@ check: check-compile check-clippy check-fmt check-migrations check-migration-imm
 [group: 'check']
 check-doc-recipes:
     nu scripts/check-doc-recipes.nu
+
+# Keep config-comment `docs/` pointers resolving (PMS-855). .env.example is
+# minted into every clone's .env, so a dead pointer there reaches every
+# developer. Fails if one of the three config files names a missing path.
+[doc("Fail if .env.example, compose.dev.yml or the justfile names a docs/ path that does not exist (PMS-855).")]
+[group: 'check']
+check-config-doc-paths:
+    nu scripts/check-config-doc-paths.nu
 
 # Keep .env.example and compose.dev.yml in step with what the code reads
 # (PMS-836). Fails if a variable the code reads has no .env.example key or no
