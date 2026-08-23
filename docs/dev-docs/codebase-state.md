@@ -586,7 +586,7 @@ the infrastructure or shared-helper layer.
     copy-paste.** All `.rs` files in
     [`src/modules/{auth,contacts,tenants,tickets}/`](../src/modules/)
     diff cleanly to zero against
-    [`mokosh-clients/src/modules/...`](../../mokosh-clients/src/modules/).
+    [`mokosh-apps/src/modules/...`](../../mokosh-apps/src/modules/).
     Each `mod.rs` uses `#[cfg(feature = "server")]` to omit handler
     and service code from the WASM build. Currently in lock-step;
     vulnerable to silent drift the moment one side is edited
@@ -736,7 +736,7 @@ Service Desk slice added on top:
   cannot-approve guard; `apply_rounding` / `resolve_billing` have
   pure-fn unit tests.
 
-DTOs were ported to `mokosh-clients`/`mokosh-apps` byte-identical (5th
+DTOs were ported to `mokosh-apps` byte-identical (5th
 shared module; `rust_decimal` added to the client with `db-postgres`
 omitted). Original note kept below for history.
 

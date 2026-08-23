@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     ".",
-    # Shared DTOs between mokosh-server and mokosh-clients (PMS-129).
+    # Shared DTOs between mokosh-server and mokosh-apps (PMS-129).
     "crates/mokosh-types",
     # Shared build-script logic for the root build.rs (PMS-198).
     "crates/build-metadata",
@@ -164,7 +164,7 @@ url = "2"
 # Shared DTOs (workspace member). The `models.rs` for each shared
 # module (auth, contacts, tenants, tickets, time_tracking) re-exports
 # from `mokosh_types::<module>::*`; same crate is consumed by
-# mokosh-clients to keep the wire format in lock-step (PMS-129).
+# mokosh-apps to keep the wire format in lock-step (PMS-129).
 mokosh-types = { path = "crates/mokosh-types" }
 
 # Shared Stripe primitives (DEV-495 / DEV-514): constant-time webhook signature

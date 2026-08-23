@@ -63,7 +63,7 @@ test.describe('auth login / session', () => {
 });
 
 // Open the avatar-button user menu in the top bar, then click Logout in the
-// popup. Markup pinned in mokosh-clients/src/components/layout.rs:386 - the
+// popup. Markup pinned in mokosh-apps/src/components/layout.rs:386 - the
 // button carries `aria-label="User menu"`, the dropdown is `role="menu"`,
 // and Logout is a `button` (not an `<a>`) so the menu does not navigate
 // before the SPA's logout handler can clear local state. The logout handler
@@ -103,7 +103,7 @@ async function logout(page: Page): Promise<void> {
     throw new Error(
       `User menu did not open after ${MENU_OPEN_ATTEMPTS} clicks on the avatar ` +
         `(${MENU_OPEN_WAIT_MS / 1000}s wait each). SPA likely still not interactive ` +
-        `or the markup has changed - check mokosh-clients/src/components/layout.rs.`,
+        `or the markup has changed - check mokosh-apps/src/components/layout.rs.`,
     );
   }
 
