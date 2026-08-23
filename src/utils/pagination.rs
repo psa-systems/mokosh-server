@@ -77,6 +77,43 @@ impl PaginationParams {
     /// so `"created_at DESC"` would yield `"created_at DESC DESC"` and a SQL
     /// syntax error. To keep that footgun non-fatal (it bit four call sites -
     /// PMS-145) we defensively keep only the first whitespace token.
+    /// PMS-894: `order_by` for a query whose sortable columns are joined, so
+    /// the name a client sends is not the SQL that sorts by it.
+    ///
+    /// Takes `(public key, SQL expression)` pairs and matches on the key, so
+    /// `sort=company` becomes `ORDER BY co.name` without the API ever
+    /// admitting a column name, let alone accepting one. The plain
+    /// [`Self::order_by`] cannot do this: it splices the client's string
+    /// straight in, which is safe only while the sortable columns and the
+    /// public names are the same word.
+    ///
+    /// Same silent fallback as its sibling, deliberately: an unknown key sorts
+    /// by the default rather than erroring. See the note on `order_by`.
+    pub fn order_by_mapped(&self, default_sql: &str, allowed: &[(&str, &str)]) -> String {
+        let sql = self
+            .sort
+            .as_ref()
+            .and_then(|k| {
+                allowed
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, expr)| *expr)
+            })
+            .unwrap_or(default_sql);
+
+        let direction = if self.is_ascending() { "ASC" } else { "DESC" };
+
+        format!("{} {}", sql, direction)
+    }
+
+    /// NOTE (PMS-894): an unrecognised `sort` is dropped and the default is
+    /// used, so a client that asks for a column this list does not allow gets
+    /// a differently-ordered page and a 200. That is deliberate - the value is
+    /// spliced into SQL, so anything not on the list must not reach it - but it
+    /// does turn a client bug into a wrong answer rather than an error.
+    /// Rejecting with a 400 was considered and left alone: every caller would
+    /// have to be audited first, and a page that sorts by the wrong column is a
+    /// smaller harm than a list that stops rendering.
     pub fn order_by(&self, default_field: &str, allowed_fields: &[&str]) -> String {
         let default_field = default_field
             .split_whitespace()
@@ -157,6 +194,61 @@ impl<T> PaginatedResponse<T> {
             data: self.data.into_iter().map(f).collect(),
             meta: self.meta,
         }
+    }
+}
+
+#[cfg(test)]
+mod pms894_tests {
+    use super::*;
+
+    fn params(sort: Option<&str>, dir: &str) -> PaginationParams {
+        PaginationParams {
+            page: 1,
+            per_page: 25,
+            sort: sort.map(|s| s.to_string()),
+            sort_dir: dir.to_string(),
+        }
+    }
+
+    const TICKET_SORTS: &[(&str, &str)] =
+        &[("company_name", "co.name"), ("priority", "tp.sort_order")];
+
+    /// PMS-894: the public key is what a client sends; the SQL is what sorts.
+    /// The API never admits a column name, which is the point of the mapped
+    /// variant: `order_by` splices the client's own string in, so it can only
+    /// ever offer columns whose public name IS their SQL name.
+    #[test]
+    fn a_mapped_key_sorts_by_its_expression_not_its_name() {
+        assert_eq!(
+            params(Some("company_name"), "asc").order_by_mapped("t.created_at", TICKET_SORTS),
+            "co.name ASC"
+        );
+        assert_eq!(
+            params(Some("priority"), "desc").order_by_mapped("t.created_at", TICKET_SORTS),
+            "tp.sort_order DESC"
+        );
+    }
+
+    /// An unknown key falls back rather than reaching the query. This is the
+    /// behaviour the note on `order_by` describes: it keeps arbitrary text out
+    /// of the SQL, and it means a client asking for a column that is not on the
+    /// list gets a differently-ordered page and a 200.
+    #[test]
+    fn an_unknown_key_falls_back_to_the_default() {
+        assert_eq!(
+            params(Some("co.name"), "asc").order_by_mapped("t.created_at", TICKET_SORTS),
+            "t.created_at ASC",
+            "the SQL expression is not itself an accepted key"
+        );
+        assert_eq!(
+            params(Some("; DROP TABLE tickets"), "asc")
+                .order_by_mapped("t.created_at", TICKET_SORTS),
+            "t.created_at ASC"
+        );
+        assert_eq!(
+            params(None, "desc").order_by_mapped("t.created_at", TICKET_SORTS),
+            "t.created_at DESC"
+        );
     }
 }
 
