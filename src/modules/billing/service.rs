@@ -393,7 +393,7 @@ impl BillingService {
         let order_by = pagination.order_by(
             "invoice_date",
             &["invoice_date", "due_date", "total", "created_at"],
-        );
+        )?;
         let query = format!(
             r#"
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
@@ -2032,7 +2032,7 @@ impl BillingService {
         let count_where = count_conds.join(" AND ");
         // Bare column only (order_by appends the direction).
         let order_by =
-            pagination.order_by("payment_date", &["payment_date", "amount", "created_at"]);
+            pagination.order_by("payment_date", &["payment_date", "amount", "created_at"])?;
         let query = format!(
             r#"
             SELECT id, tenant_id, invoice_id, company_id, payment_date, amount,
