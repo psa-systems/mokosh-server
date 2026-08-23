@@ -438,3 +438,62 @@ async fn delete_asset_writes_surviving_deleted_audit_row(pool: PgPool) {
         "the failed re-delete writes no extra audit row (tx rolled back)"
     );
 }
+
+/// PMS-894: `?q=` matches serial numbers, not just names.
+///
+/// The SPA's asset list searches both. Moving that filter server-side so the
+/// page can be paged (MAPPS-546) would, on name-only matching, have silently
+/// dropped serial search - and a serial is the string an operator is most
+/// likely to paste into an asset search, off a sticker on the hardware.
+#[sqlx::test]
+async fn asset_search_matches_serial_numbers(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Laptop").await;
+
+    // `create_asset` stamps serial_number = "SN-12345".
+    create_asset(&app, &token, "Reception laptop", &type_id, company).await;
+    create_asset(&app, &token, "Server rack", &type_id, company).await;
+
+    let search = |q: &str| {
+        let client = app.client.clone();
+        let url = app.url(&format!("/api/v1/assets?q={q}"));
+        let token = token.clone();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("search assets");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("assets JSON");
+            v["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .map(|a| a["name"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Name matching still works.
+    let by_name = search("Reception").await;
+    assert_eq!(by_name, vec!["Reception laptop".to_string()]);
+
+    // The serial matches both assets, because the fixture gives them the same
+    // one; what matters is that a serial matches at all, and that it is the
+    // serial doing it rather than the name.
+    let by_serial = search("SN-12345").await;
+    assert_eq!(
+        by_serial.len(),
+        2,
+        "a serial number must match, got {by_serial:?}"
+    );
+
+    // And a string in neither field still matches nothing, so the predicate is
+    // filtering rather than passing everything through.
+    assert!(search("nothing-matches-this").await.is_empty());
+}

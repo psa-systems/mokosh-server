@@ -1457,3 +1457,185 @@ async fn list_filters_by_contact_id(pool: PgPool) {
         "unfiltered list must include the seeded ticket"
     );
 }
+
+use uuid::Uuid;
+
+/// Seed a company with a chosen name, for the PMS-894 search tests.
+async fn seed_named_company(pool: &PgPool, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed named company");
+    id
+}
+
+/// PMS-894: `?q=` matches the company and the assignee, not only the title and
+/// the ticket number.
+///
+/// The SPA's ticket list searches all four in the browser. Moving that search
+/// server-side so the list can be paged (MAPPS-546) would, on the old
+/// predicate, have quietly stopped finding tickets by client name - the way
+/// most people look for a ticket.
+///
+/// The company and assignee arms are correlated `EXISTS`, not joins, and the
+/// last assertion is why: an INNER JOIN to `users` would drop every unassigned
+/// ticket, turning a search into a filter nobody asked for.
+#[sqlx::test]
+async fn ticket_search_matches_company_and_assignee(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let northwind = seed_named_company(&pool, "Northwind Traders").await;
+    let other = seed_named_company(&pool, "Contoso").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let create = |title: &str, company: Uuid, assignee: Option<Uuid>| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/tickets");
+        let token = token.clone();
+        let mut body = serde_json::json!({
+            "title": title,
+            "company_id": company,
+            "custom_fields": {},
+        });
+        if let Some(a) = assignee {
+            body["assigned_to_id"] = serde_json::json!(a);
+        }
+        async move {
+            let resp = client
+                .post(url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("create ticket");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+        }
+    };
+
+    create("Printer jam", northwind, None).await;
+    create("Mailbox full", other, Some(admin_id)).await;
+    create("Unassigned and unrelated", other, None).await;
+
+    let search = |q: &str| {
+        let client = app.client.clone();
+        let url = app.url(&format!("/api/v1/tickets?q={q}"));
+        let token = token.clone();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("search tickets");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("tickets JSON");
+            let titles: Vec<String> = v["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .map(|t| t["title"].as_str().unwrap_or_default().to_string())
+                .collect();
+            let total = v["meta"]["total"].as_u64().unwrap_or_default();
+            (titles, total)
+        }
+    };
+
+    // Title still matches.
+    let (titles, total) = search("Printer").await;
+    assert_eq!(titles, vec!["Printer jam".to_string()]);
+    assert_eq!(total, 1, "the count query must apply the same predicate");
+
+    // The company name matches, which it did not before.
+    let (titles, total) = search("Northwind").await;
+    assert_eq!(titles, vec!["Printer jam".to_string()]);
+    assert_eq!(total, 1);
+
+    // The assignee's name matches. `seed_admin` names the user Admin User.
+    let (titles, _) = search("Admin").await;
+    assert_eq!(titles, vec!["Mailbox full".to_string()]);
+
+    // And the search still excludes: three tickets exist, one matches.
+    let (titles, total) = search("Contoso").await;
+    assert_eq!(total, 2, "both Contoso tickets, assigned or not");
+    assert!(
+        titles.contains(&"Unassigned and unrelated".to_string()),
+        "an unassigned ticket must not be dropped by the assignee arm, got {titles:?}"
+    );
+}
+
+/// PMS-894: the columns the SPA's ticket list offers are sortable.
+///
+/// Before this, `order_by`'s allow-list held none of them, and an unknown field
+/// is dropped in favour of the default - so a client that started sending
+/// `sort=company_name` would have got `created_at DESC` and a 200. A page that
+/// looks sorted and is not is worse than one that cannot sort.
+#[sqlx::test]
+async fn ticket_list_sorts_by_the_columns_the_client_offers(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let zeta = seed_named_company(&pool, "Zeta Industries").await;
+    let alpha = seed_named_company(&pool, "Alpha Corp").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (title, company) in [("First ticket", zeta), ("Second ticket", alpha)] {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/tickets"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "title": title,
+                "company_id": company,
+                "custom_fields": {},
+            }))
+            .send()
+            .await
+            .expect("create ticket");
+        assert!(resp.status().is_success(), "got {}", resp.status());
+    }
+
+    let sorted = |sort: &str, dir: &str| {
+        let client = app.client.clone();
+        let url = app.url(&format!("/api/v1/tickets?sort={sort}&sort_dir={dir}"));
+        let token = token.clone();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("list tickets");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("tickets JSON");
+            v["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .map(|t| t["company_name"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(
+        sorted("company_name", "asc").await,
+        vec!["Alpha Corp".to_string(), "Zeta Industries".to_string()],
+        "sorting by the joined company name must actually order by it"
+    );
+    assert_eq!(
+        sorted("company_name", "desc").await,
+        vec!["Zeta Industries".to_string(), "Alpha Corp".to_string()],
+        "and must respect the direction"
+    );
+
+    // The guard the mapped allow-list exists for: the SQL expression is not
+    // itself an accepted key, so a client cannot name a column.
+    let raw = sorted("co.name", "asc").await;
+    assert_eq!(
+        raw.len(),
+        2,
+        "an unaccepted sort key still returns the page"
+    );
+}
