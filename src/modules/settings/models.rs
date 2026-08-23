@@ -212,6 +212,8 @@ mod tests {
             ("logo_mime", json!("image/png")),
             ("logo_mime", json!("image/svg+xml")),
             ("company_name", json!("Acme IT")),
+            ("website", json!("https://acme.example")),
+            ("website", json!("javascript:alert(1)")),
             ("portal_domain", json!("portal.acme.example")),
             ("supprt_email", json!("help@acme.example")),
         ];

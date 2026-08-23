@@ -160,7 +160,11 @@ fn validate_update_company_link(req: &UpdateContactRequest) -> Result<(), Valida
 /// value" and accepted; any other value must use an `http`/`https` scheme and
 /// carry a host. The scheme allowlist blocks `javascript:`/`data:` URLs that
 /// would otherwise drive stored XSS in the SPA (MAPPS-149).
-fn validate_website(value: &str) -> Result<(), ValidationError> {
+///
+/// Public since PMS-896: the organisation's own website
+/// (`tenants.branding.website`) is rendered as a link by the same SPA, so it is
+/// held to this rule rather than to a second copy of it.
+pub fn validate_website(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
     }

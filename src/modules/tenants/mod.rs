@@ -12,6 +12,9 @@ pub mod identity;
 // because the settings validator that shares it is ungated.
 pub mod branding;
 mod models;
+// PMS-896: the organisation record as onboarding submits it. Ungated with
+// `branding`, whose table it validates against.
+pub mod organization;
 
 // PMS-21 AC3: `routes` and `service` only need to exist when this
 // build actually exposes tenant management. The router gates the

@@ -75,7 +75,41 @@ pub struct TenantBranding {
     /// [`Tenant::billing_contact_name`], which is who an invoice goes to. These
     /// are routinely different people, so the billing column is not reused.
     pub support_contact_name: Option<String>,
+    /// PMS-896: the organisation's own web address, the one optional field of
+    /// the organisation record. Read back by every caller of
+    /// `GET /api/v1/tenants/current`, which is the organisation settings page.
+    pub website: Option<String>,
     pub portal_domain: Option<String>,
+}
+
+/// PMS-896: the organisation record, as the onboarding flow submits it.
+///
+/// A whole-record submission, NOT a patch: this is the one place that states
+/// which organisation fields an account must supply, so an omitted optional
+/// field is a cleared field rather than an untouched one. The fields are
+/// `Option` so a missing key is refused by name (`phone is required`) instead
+/// of by a serde rejection that names no field.
+///
+/// [`UpdateTenantRequest::branding`] cannot carry these rules: it is a PATCH
+/// document shared with the logo upload and the per-key settings writer
+/// (PMS-758), and a logo upload sends two keys and must not be refused for
+/// carrying no phone number.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrganizationProfileRequest {
+    /// The organisation's name; `tenants.name`. Required.
+    pub name: Option<String>,
+    /// Who a client should ask for. Optional, and cleared when omitted.
+    #[serde(default)]
+    pub contact_name: Option<String>,
+    /// Contact phone. Required (mirrors the MAPPS-429 onboarding flow).
+    #[serde(default)]
+    pub phone: Option<String>,
+    /// Contact email. Required (mirrors the MAPPS-429 onboarding flow).
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The organisation's website. Optional, and cleared when omitted.
+    #[serde(default)]
+    pub website: Option<String>,
 }
 
 /// Create tenant request

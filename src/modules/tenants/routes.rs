@@ -12,7 +12,11 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::logo::{logo_path, TenantLogoConfig, TenantLogoStore};
-use super::{CreateTenantRequest, TenantResponse, TenantService, TenantUsage, UpdateTenantRequest};
+use super::organization::organization_update;
+use super::{
+    CreateTenantRequest, OrganizationProfileRequest, TenantResponse, TenantService, TenantUsage,
+    UpdateTenantRequest,
+};
 use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole};
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
@@ -62,6 +66,11 @@ pub fn tenant_routes(
         // the browser supply it was the defect.
         .route("/current", get(get_current_tenant))
         .route("/current", put(update_current_tenant))
+        // PMS-896: the organisation record, submitted whole. Separate from the
+        // PATCH above because this is the one surface that states which fields
+        // an account must supply; see `super::organization`. Read back off
+        // `GET /current`, which already returns the name and the branding.
+        .route("/current/organization", put(update_current_organization))
         // MAPPS-429: the organisation's logo. Written here, read from the
         // PUBLIC router below, because the two places it has to appear (a
         // client's browser on the request-form page, a client's mail client)
@@ -339,6 +348,32 @@ async fn update_current_tenant(
     let tenant = state
         .tenant_service
         .update_tenant(user.tenant(), &request, &ctx)
+        .await?;
+    Ok(Json(tenant.into()))
+}
+
+/// PMS-896: save the caller's organisation record.
+///
+/// Name, contact phone and contact email are required; the contact name and the
+/// website are optional and are cleared when the submission omits them. Same
+/// admin gate as the rename it performs: the organisation name, contact and
+/// website are what every client sees on the forms and email this tenant sends.
+/// A non-admin's onboarding does not reach here (MAPPS-524).
+async fn update_current_organization(
+    State(state): State<TenantRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<OrganizationProfileRequest>,
+) -> AppResult<Json<TenantResponse>> {
+    if !user.role.is_admin() {
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
+    }
+    let update = organization_update(&request)?;
+    let tenant = state
+        .tenant_service
+        .update_tenant(user.tenant(), &update, &ctx)
         .await?;
     Ok(Json(tenant.into()))
 }
