@@ -1923,7 +1923,7 @@ impl AuthService {
                 "status",
                 "created_at",
             ],
-        );
+        )?;
 
         let data_query = format!(
             r#"

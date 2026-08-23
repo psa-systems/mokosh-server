@@ -289,7 +289,7 @@ impl QuotesService {
         let order_by = pagination.order_by(
             "created_at",
             &["created_at", "valid_until", "total", "title"],
-        );
+        )?;
         let query = format!(
             r#"
             SELECT {QUOTE_COLUMNS}
@@ -828,7 +828,8 @@ impl QuotesService {
     ) -> AppResult<(Vec<QuoteResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
-        let order_by = pagination.order_by("created_at", &["created_at", "valid_until", "total"]);
+        let order_by =
+            pagination.order_by("created_at", &["created_at", "valid_until", "total"])?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, QuoteRow>(&format!(

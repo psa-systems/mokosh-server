@@ -428,7 +428,7 @@ impl TicketService {
         let order_by = pagination.order_by(
             "t.created_at",
             &["created_at", "updated_at", "sla_due_date", "priority_id"],
-        );
+        )?;
 
         let query = format!(
             r#"
@@ -2389,7 +2389,7 @@ impl TicketService {
                 ("priority", "tp.sort_order"),
                 ("assigned_to_name", "au.first_name"),
             ],
-        );
+        )?;
 
         let query = format!(
             "{select} WHERE {data_where} ORDER BY {order_by} LIMIT $2 OFFSET $3",

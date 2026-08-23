@@ -108,7 +108,7 @@ impl ProjectsService {
         let count_where = count_conds.join(" AND ");
         // Bare column only (order_by appends the direction); "created_at DESC"
         // produced "... DESC DESC" -> 500 (PMS-145).
-        let order_by = pagination.order_by("created_at", &["name", "start_date", "created_at"]);
+        let order_by = pagination.order_by("created_at", &["name", "start_date", "created_at"])?;
         let query = format!(
             r#"
             SELECT id, name, description, project_number, company_id,

@@ -2127,3 +2127,67 @@ async fn a_scalar_only_update_keeps_the_child_rows_in_step(pool: PgPool) {
     assert_eq!(phones[1]["phone_type"].as_str(), Some("mobile"));
     assert_eq!(phones[1]["number"].as_str(), Some("+15550200"));
 }
+
+/// MAPPS-533: an unrecognised `?sort=` is a 422 that says what is accepted,
+/// not a silently different ordering.
+///
+/// `order_by` used to drop an unknown field and sort by the default, answering
+/// 200 with rows in an order the caller never asked for. That silence is what
+/// let a client-side mismatch survive three parity audits (2026-07-30 F7,
+/// 2026-08-07, 2026-08-14 CF-2): the SPA sent `company_type`, `company_name`
+/// and `-updated_at`, none allow-listed, and no request ever failed.
+///
+/// `company_type` is the exact key from that finding, which is why it is the
+/// one used here.
+#[sqlx::test]
+async fn an_unknown_sort_field_is_rejected_with_what_is_accepted(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contacts/companies?sort=company_type"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send companies list with a bad sort");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    let field_errors = body["error"]["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the 422 carries field errors, got {body}"));
+    let sort_error = field_errors
+        .iter()
+        .find(|e| e["field"].as_str() == Some("sort"))
+        .unwrap_or_else(|| panic!("the 422 names the `sort` field, got {body}"));
+    let message = sort_error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("company_type"),
+        "it says which value was rejected, got {message}"
+    );
+    for accepted in ["name", "created_at", "updated_at"] {
+        assert!(
+            message.contains(accepted),
+            "it lists `{accepted}` as accepted, got {message}"
+        );
+    }
+
+    // An allow-listed key is unaffected, and so is a request that asks for no
+    // sort at all - which is every caller that never touched the parameter.
+    for query in ["?sort=name", ""] {
+        let resp = app
+            .client
+            .get(app.url(&format!("/api/v1/contacts/companies{query}")))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("send companies list");
+        assert!(
+            resp.status().is_success(),
+            "`{query}` must still work, got {}",
+            resp.status()
+        );
+    }
+}

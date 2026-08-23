@@ -253,7 +253,7 @@ impl TimeTrackingService {
         // Every allowed sort field lives on time_entries; qualify it with the
         // `te` alias so a `created_at` sort is not ambiguous against the joined
         // tables (each of which also has a created_at).
-        let order_by = pagination.order_by("date", &["date", "duration_minutes", "created_at"]);
+        let order_by = pagination.order_by("date", &["date", "duration_minutes", "created_at"])?;
         let order_by = format!("te.{order_by}");
         let query = format!(
             r#"

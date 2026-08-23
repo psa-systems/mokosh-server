@@ -64,7 +64,7 @@ impl MileageTrackingService {
         }
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
-        let order_by = pagination.order_by("date", &["date", "distance_miles", "created_at"]);
+        let order_by = pagination.order_by("date", &["date", "distance_miles", "created_at"])?;
         let order_by = format!("me.{order_by}");
         let query = format!(
             r#"

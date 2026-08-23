@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::utils::error::{AppError, AppResult};
+
 /// Pagination parameters from query string
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PaginationParams {
@@ -43,6 +45,22 @@ fn default_per_page() -> u32 {
 
 fn default_sort_dir() -> String {
     "desc".to_string()
+}
+
+/// MAPPS-533: the 422 both `order_by` helpers return.
+///
+/// Names the parameter and lists what it accepts, because a rejection that does
+/// not say what would have worked just moves the guessing to the client.
+/// `validation_field` is this codebase's existing 422 shape, so this reads like
+/// every other field-level rejection rather than introducing a convention.
+fn unknown_sort(requested: &str, allowed: &[&str]) -> AppError {
+    AppError::validation_field(
+        "sort",
+        format!(
+            "unknown sort field `{requested}`; accepted: {}",
+            allowed.join(", ")
+        ),
+    )
 }
 
 impl PaginationParams {
@@ -87,48 +105,57 @@ impl PaginationParams {
     /// straight in, which is safe only while the sortable columns and the
     /// public names are the same word.
     ///
-    /// Same silent fallback as its sibling, deliberately: an unknown key sorts
-    /// by the default rather than erroring. See the note on `order_by`.
-    pub fn order_by_mapped(&self, default_sql: &str, allowed: &[(&str, &str)]) -> String {
-        let sql = self
-            .sort
-            .as_ref()
-            .and_then(|k| {
-                allowed
-                    .iter()
-                    .find(|(key, _)| key == k)
-                    .map(|(_, expr)| *expr)
-            })
-            .unwrap_or(default_sql);
+    /// MAPPS-533: rejects an unknown key exactly as [`Self::order_by`] does.
+    /// The 422 names the public keys, never the SQL they map to.
+    pub fn order_by_mapped(
+        &self,
+        default_sql: &str,
+        allowed: &[(&str, &str)],
+    ) -> AppResult<String> {
+        let sql = match self.sort.as_deref() {
+            Some(requested) => match allowed.iter().find(|(key, _)| *key == requested) {
+                Some((_, expr)) => *expr,
+                None => {
+                    let keys: Vec<&str> = allowed.iter().map(|(key, _)| *key).collect();
+                    return Err(unknown_sort(requested, &keys));
+                }
+            },
+            None => default_sql,
+        };
 
         let direction = if self.is_ascending() { "ASC" } else { "DESC" };
 
-        format!("{} {}", sql, direction)
+        Ok(format!("{} {}", sql, direction))
     }
 
-    /// NOTE (PMS-894): an unrecognised `sort` is dropped and the default is
-    /// used, so a client that asks for a column this list does not allow gets
-    /// a differently-ordered page and a 200. That is deliberate - the value is
-    /// spliced into SQL, so anything not on the list must not reach it - but it
-    /// does turn a client bug into a wrong answer rather than an error.
-    /// Rejecting with a 400 was considered and left alone: every caller would
-    /// have to be audited first, and a page that sorts by the wrong column is a
-    /// smaller harm than a list that stops rendering.
-    pub fn order_by(&self, default_field: &str, allowed_fields: &[&str]) -> String {
+    /// MAPPS-533: an unrecognised `sort` is a 422, not a silent fallback.
+    ///
+    /// This used to drop the value and sort by the default, answering 200 with
+    /// rows in an order the caller never asked for. That silence is what let a
+    /// client-side mismatch survive three parity audits: the SPA sent
+    /// `company_type`, `company_name` and `-updated_at`, none of them
+    /// allow-listed, and no request ever failed.
+    ///
+    /// The allow-list itself stays, and stays the only thing that reaches SQL.
+    /// Rejecting is about telling the caller, not about what is safe to splice.
+    /// A `sort` that is absent is unchanged - it uses `default_field` - so a
+    /// caller that never asks to sort can never see a 422.
+    pub fn order_by(&self, default_field: &str, allowed_fields: &[&str]) -> AppResult<String> {
         let default_field = default_field
             .split_whitespace()
             .next()
             .unwrap_or(default_field);
-        let field = self
-            .sort
-            .as_ref()
-            .filter(|f| allowed_fields.contains(&f.as_str()))
-            .map(|s| s.as_str())
-            .unwrap_or(default_field);
+        let field = match self.sort.as_deref() {
+            Some(requested) if !allowed_fields.contains(&requested) => {
+                return Err(unknown_sort(requested, allowed_fields));
+            }
+            Some(requested) => requested,
+            None => default_field,
+        };
 
         let direction = if self.is_ascending() { "ASC" } else { "DESC" };
 
-        format!("{} {}", field, direction)
+        Ok(format!("{} {}", field, direction))
     }
 }
 
@@ -220,34 +247,96 @@ mod pms894_tests {
     #[test]
     fn a_mapped_key_sorts_by_its_expression_not_its_name() {
         assert_eq!(
-            params(Some("company_name"), "asc").order_by_mapped("t.created_at", TICKET_SORTS),
+            params(Some("company_name"), "asc")
+                .order_by_mapped("t.created_at", TICKET_SORTS)
+                .expect("an allow-listed key is accepted"),
             "co.name ASC"
         );
         assert_eq!(
-            params(Some("priority"), "desc").order_by_mapped("t.created_at", TICKET_SORTS),
+            params(Some("priority"), "desc")
+                .order_by_mapped("t.created_at", TICKET_SORTS)
+                .expect("an allow-listed key is accepted"),
             "tp.sort_order DESC"
         );
     }
 
-    /// An unknown key falls back rather than reaching the query. This is the
-    /// behaviour the note on `order_by` describes: it keeps arbitrary text out
-    /// of the SQL, and it means a client asking for a column that is not on the
-    /// list gets a differently-ordered page and a 200.
+    /// The field-level message inside a `Validation` error. The `Display` of
+    /// that variant is a fixed summary ("one or more fields are invalid"), so
+    /// the detail a caller acts on lives in its `errors`, not in `to_string()`.
+    fn sort_field_message(err: &AppError) -> String {
+        match err {
+            AppError::Validation { errors, .. } => {
+                let e = errors
+                    .iter()
+                    .find(|e| e.field == "sort")
+                    .expect("the rejection names the `sort` field");
+                e.message.clone()
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// MAPPS-533: an unknown key is rejected, not quietly swapped for the
+    /// default. PMS-894 wrote this test the other way round and left the
+    /// question open; this is the answer.
+    ///
+    /// The rejection still keeps arbitrary text out of the SQL - that never
+    /// depended on the fallback - and it now also tells the caller, which the
+    /// fallback could not.
     #[test]
-    fn an_unknown_key_falls_back_to_the_default() {
-        assert_eq!(
-            params(Some("co.name"), "asc").order_by_mapped("t.created_at", TICKET_SORTS),
-            "t.created_at ASC",
-            "the SQL expression is not itself an accepted key"
+    fn an_unknown_key_is_rejected() {
+        let err = params(Some("co.name"), "asc")
+            .order_by_mapped("t.created_at", TICKET_SORTS)
+            .expect_err("the SQL expression is not itself an accepted key");
+        assert_eq!(err.status_code(), 422);
+        let message = sort_field_message(&err);
+        assert!(
+            message.contains("co.name") && message.contains("company_name"),
+            "the 422 names what was asked for and what is accepted, got {message}"
         );
+
+        assert!(params(Some("; DROP TABLE tickets"), "asc")
+            .order_by_mapped("t.created_at", TICKET_SORTS)
+            .is_err());
+
+        // No `sort` at all is not an error: a caller that never asks to sort
+        // cannot be told it asked wrongly.
         assert_eq!(
-            params(Some("; DROP TABLE tickets"), "asc")
-                .order_by_mapped("t.created_at", TICKET_SORTS),
-            "t.created_at ASC"
-        );
-        assert_eq!(
-            params(None, "desc").order_by_mapped("t.created_at", TICKET_SORTS),
+            params(None, "desc")
+                .order_by_mapped("t.created_at", TICKET_SORTS)
+                .expect("absent sort uses the default"),
             "t.created_at DESC"
+        );
+    }
+
+    /// The same contract on the plain helper, where the twelve list endpoints
+    /// live.
+    #[test]
+    fn the_plain_helper_rejects_and_lists_what_it_accepts() {
+        let allowed = ["name", "created_at", "updated_at"];
+        let err = params(Some("company_type"), "asc")
+            .order_by("name", &allowed)
+            .expect_err("company_type is not allow-listed");
+        assert_eq!(err.status_code(), 422);
+        let message = sort_field_message(&err);
+        for key in allowed {
+            assert!(
+                message.contains(key),
+                "the 422 must list `{key}`, got {message}"
+            );
+        }
+
+        assert_eq!(
+            params(Some("name"), "asc")
+                .order_by("created_at", &allowed)
+                .expect("an allow-listed key is accepted"),
+            "name ASC"
+        );
+        assert_eq!(
+            params(None, "desc")
+                .order_by("created_at", &allowed)
+                .expect("absent sort uses the default"),
+            "created_at DESC"
         );
     }
 }
@@ -329,16 +418,15 @@ mod tests {
             ..Default::default()
         };
         let allowed = &["name", "created_at", "updated_at"];
-        assert_eq!(params.order_by("created_at", allowed), "name ASC");
+        assert_eq!(params.order_by("created_at", allowed).unwrap(), "name ASC");
 
+        // MAPPS-533: this asserted `"created_at DESC"` - the silent fallback.
+        // An unknown field is now the caller's error, which is the whole change.
         let invalid_sort = PaginationParams {
             sort: Some("invalid_field".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            invalid_sort.order_by("created_at", allowed),
-            "created_at DESC"
-        );
+        assert!(invalid_sort.order_by("created_at", allowed).is_err());
     }
 
     #[test]
