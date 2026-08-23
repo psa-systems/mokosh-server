@@ -1,11 +1,17 @@
 # Changelog
 
-Internal, name-free history for mokosh-server. Retired point-in-time docs (milestone handoffs, audit reports) are distilled here so the tree keeps only forward-useful reference material. The living module/route status doc is `codebase-state.md` (kept, not folded). Entries are newest-first and vary in depth.
+Internal, name-free history for mokosh-server. Retired point-in-time docs (milestone handoffs, audit reports) are distilled here so the tree keeps only forward-useful reference material. Entries are newest-first and vary in depth.
+
+## 2026-08-22 - `codebase-state.md` frozen at its snapshot date (PMS-849)
+
+- `codebase-state.md` is now titled and dated as the 2026-05-06 snapshot it always was, and is no longer described anywhere as living, authoritative or current. Three consecutive doc audits (2026-08-08, 2026-08-10, 2026-08-15) found it stale while it claimed to be current, after PMS-684 had already corrected it once; the claim was the defect, not any single wrong cell. It stays in place, and stays worth reading, for the `F1..F14` ids and the numbered cross-cutting issues that source comments and YouTrack issues cite.
+- Its "At a glance" metrics table was deleted rather than corrected. Every row was derivable from the tree in one command (it still read `Tests | 0`, and counted schema tables in the pre-PMS-128 migration monolith), so the section now names the commands instead of carrying the numbers.
+- `dev-docs/README.md` stopped calling the directory a living snapshot of one 2026-05-06 audit. It now lists every file in the set with what kind of document it is, since most of them are topical decision records with nothing to do with that audit.
 
 ## 2026-07-01 - Docs reorganization and history sanitization
 
 - Markdown consolidated under `docs/` (public / how-to) and `docs/dev-docs/` (internal working notes); `README.md` and `CLAUDE.md` stay at the repo root, README files stay colocated with their code. References in `CLAUDE.md`, source comments, migration comments, and the e2e specs were repointed.
-- Retired audits and the 2026-05 milestone-1 handoff were removed and distilled into the entries below. `codebase-state.md` was kept (it is the authoritative per-module status and F1..F14 tracker) and moved to `docs/dev-docs/`.
+- Retired audits and the 2026-05 milestone-1 handoff were removed and distilled into the entries below. `codebase-state.md` was kept (it was then treated as the authoritative per-module status and F1..F14 tracker) and moved to `docs/dev-docs/`.
 - Test fixtures that used a real person's name now use a fictitious one. The local-only `For AI/` scratch directory is now gitignored. Contributor names were stripped from commit-message text in a companion history rewrite; git author/committer fields were left unchanged.
 
 ## 2026-06-25 - Security audit (distilled)
@@ -38,4 +44,4 @@ Cross-cutting themes and the full per-finding detail lived in the audit tree tha
 
 ## 2026-05 - Milestone 1: foundation (distilled)
 
-Milestone 1 stood up mokosh-server as the PSA backend (multi-module Axum service, SQLx migrations embedded at compile time, tenant-scoped services taking `tenant_id` explicitly with no middleware-level scoping). At the milestone the schema was well ahead of the handler layer: only a few module groups (auth, contacts, tenants, tickets) had real handlers while the rest returned HTTP 501. Per-module status and the running fix list (`F1..F14`) are tracked in `docs/dev-docs/codebase-state.md`.
+Milestone 1 stood up mokosh-server as the PSA backend (multi-module Axum service, SQLx migrations embedded at compile time, tenant-scoped services taking `tenant_id` explicitly with no middleware-level scoping). At the milestone the schema was well ahead of the handler layer: only a few module groups (auth, contacts, tenants, tickets) had real handlers while the rest returned HTTP 501. Per-module status and the running fix list (`F1..F14`) were recorded in `docs/dev-docs/codebase-state.md`, frozen at its 2026-05-06 snapshot since PMS-849.
