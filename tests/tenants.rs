@@ -180,30 +180,35 @@ async fn create_tenant_copies_auth_welcome_template_and_rule(pool: PgPool) {
     );
 }
 
-/// PMS-729 follow-up: a super-admin `create_tenant` call must produce an
-/// emailed setup link for the fresh admin, matching the
-/// `AuthService::create_user(send_welcome_email = true)` path. Without
-/// this, a newly provisioned tenant lands with a `status = 'pending'`
-/// admin user who has no password and no way to activate: legal in the
-/// schema, unreachable from a browser.
+/// MAPPS-554 (was PMS-729 follow-up): a super-admin `create_tenant`
+/// call must provision the tenant's PORTAL admin CONTACT and email
+/// them a portal-side setup link, not a `users` row + mokosh-workspace
+/// setup link. Without this, a newly provisioned tenant lands with no
+/// way for the client to sign in to their own portal.
 ///
-/// Pinned end-to-end: the token row that redeems the link, and the
-/// queued notification row the dispatcher will drain into an SMTP send.
-/// Either missing = the admin has no way in.
+/// Pinned end-to-end:
+/// - No `users` row for the admin email (that path retired in MAPPS-554).
+/// - One `contacts` row for the admin email: is_portal_user=true,
+///   portal_role='admin', linked to the tenant's own_company.
+/// - One `portal_setup_tokens` row for that contact (redeemable).
+/// - One queued `auth.welcome` notification whose body carries
+///   `<portal_url>/portal/set-password?token=`, NOT the mokosh apex
+///   `/set-password/` (or `/reset-password/`) shape.
 #[sqlx::test]
-async fn create_tenant_emails_admin_setup_link(pool: PgPool) {
+async fn create_tenant_emails_portal_admin_setup_link(pool: PgPool) {
     let notifications =
         NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
     let svc = TenantService::new(Database::from_pool(pool.clone()))
-        .with_dispatcher(notifications, "https://spa.test".into());
+        .with_dispatcher(notifications, "https://spa.test".into())
+        .with_portal_host_suffix(".client.spa.test");
 
     let req = CreateTenantRequest {
-        name: "PMS-729 Admin Welcome".into(),
-        slug: "pms729-admin-welcome".into(),
+        name: "MAPPS-554 Portal Admin Welcome".into(),
+        slug: "mapps554-portal-admin-welcome".into(),
         billing_email: None,
         billing_contact_name: None,
         subscription_plan: None,
-        admin_email: "admin-pms729-welcome@example.test".into(),
+        admin_email: "admin-mapps554-welcome@example.test".into(),
         admin_first_name: "Ada".into(),
         admin_last_name: "Admin".into(),
         branding: None,
@@ -211,28 +216,68 @@ async fn create_tenant_emails_admin_setup_link(pool: PgPool) {
     let tenant = svc
         .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
         .await
-        .expect("create_tenant with dispatcher");
+        .expect("create_tenant with dispatcher + portal suffix");
 
-    let admin_id: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = $1 AND email = $2")
+    // MAPPS-554: no `users` row for the admin email.
+    let users_for_admin: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND email = $2")
             .bind(tenant.id)
             .bind(&req.admin_email)
             .fetch_one(&pool)
             .await
-            .expect("read admin user id");
+            .expect("count admin users row");
+    assert_eq!(
+        users_for_admin, 0,
+        "MAPPS-554: create_tenant must NOT insert a users row for the admin email"
+    );
 
-    let token_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM password_reset_tokens \
-         WHERE tenant_id = $1 AND user_id = $2 AND used_at IS NULL",
+    // Exactly one portal admin contact, linked to the tenant's own_company.
+    let (contact_id, contact_company_id, contact_is_portal, contact_portal_role): (
+        uuid::Uuid,
+        uuid::Uuid,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT id, company_id, is_portal_user, portal_role FROM contacts \
+         WHERE tenant_id = $1 AND email = $2 ORDER BY created_at LIMIT 1",
     )
     .bind(tenant.id)
-    .bind(admin_id)
+    .bind(&req.admin_email)
     .fetch_one(&pool)
     .await
-    .expect("count admin setup tokens");
+    .expect("read admin contact row");
+    assert!(
+        contact_is_portal,
+        "MAPPS-554: provisioned admin contact must have is_portal_user = TRUE"
+    );
+    assert_eq!(
+        contact_portal_role.as_deref(),
+        Some("admin"),
+        "MAPPS-554: provisioned admin contact must have portal_role = 'admin'"
+    );
+    let own_company_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+            .bind(tenant.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read own_company_id");
+    assert_eq!(
+        contact_company_id, own_company_id,
+        "MAPPS-554: admin contact must be linked to the tenant's own_company"
+    );
+
+    let token_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_setup_tokens \
+         WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+    )
+    .bind(tenant.id)
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count portal setup tokens");
     assert_eq!(
         token_count, 1,
-        "create_tenant must mint exactly one redeemable setup token for the admin"
+        "MAPPS-554: create_tenant must mint exactly one redeemable portal_setup_token for the admin contact"
     );
 
     let queued: (String, String, String) = sqlx::query_as(
@@ -246,12 +291,21 @@ async fn create_tenant_emails_admin_setup_link(pool: PgPool) {
     .expect("read queued welcome notification");
     assert_eq!(
         queued.0, req.admin_email,
-        "queued email must be addressed to the freshly-created admin"
+        "queued email must be addressed to the freshly-created portal admin contact"
+    );
+    let expected_prefix = format!(
+        "https://{}.client.spa.test/portal/set-password?token=",
+        req.slug,
     );
     assert!(
-        queued.2.contains("https://spa.test/reset-password/"),
-        "queued body must carry the SPA-origin setup link, got: {}",
-        queued.2
+        queued.2.contains(&expected_prefix),
+        "MAPPS-554: queued body must carry the tenant-subdomain portal setup link {expected_prefix}, got: {}",
+        queued.2,
+    );
+    assert!(
+        !queued.2.contains("/reset-password/") && !queued.2.contains("/set-password/"),
+        "MAPPS-554: queued body must NOT carry the mokosh-apex users-side link shape, got: {}",
+        queued.2,
     );
     assert!(
         !queued.1.is_empty(),

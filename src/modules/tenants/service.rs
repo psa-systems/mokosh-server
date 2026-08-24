@@ -283,21 +283,18 @@ impl TenantService {
         .execute(&mut *tx)
         .await?;
 
-        // Create admin user
-        let admin_id = Uuid::new_v4();
-        sqlx::query(
-            r#"
-            INSERT INTO users (id, tenant_id, email, first_name, last_name, role, status)
-            VALUES ($1, $2, $3, $4, $5, 'admin', 'pending')
-            "#,
-        )
-        .bind(admin_id)
-        .bind(tenant_id)
-        .bind(&request.admin_email)
-        .bind(&request.admin_first_name)
-        .bind(&request.admin_last_name)
-        .execute(&mut *tx)
-        .await?;
+        // MAPPS-554: no `users` row for the client admin. Pre-554 the
+        // provisioner inserted a `users` row (`role='admin',
+        // status='pending'`) and mailed a mokosh-workspace setup link
+        // pointing at `/set-password/<user-token>`. The operator's
+        // 2026-08-24 walkthrough made explicit that a mokosh-client's
+        // world is the customer portal (`/portal/*`), not the mokosh
+        // workspace: "the owner of the client portal be an admin in
+        // their own client portal which is the customer portal that
+        // we made earlier." The portal-admin CONTACT + `portal_setup_tokens`
+        // row are provisioned after this tx commits (once `ensure_own_company`
+        // has minted the tenant's own_company for the contact FK), via
+        // `provision_portal_admin_and_send_welcome` below. See MAPPS-554.
 
         // The `tenants` table is keyed by `id` alone (it has no `tenant_id`
         // column), so the snapshot filters on `id`.
@@ -332,14 +329,19 @@ impl TenantService {
         // overhead time entries have a stable company_id. Idempotent.
         self.ensure_own_company(tenant_id).await?;
 
-        // PMS-729 finalize: send the admin an emailed setup link so they can
-        // choose a password and sign in. Best-effort: a failed dispatch is
-        // logged but not fatal, matching `AuthService::create_user`'s welcome
-        // path. Runs only when both the notifications dispatcher and the SPA
-        // origin were wired via `with_dispatcher`; the seed / placement paths
-        // that construct a bare service skip it and stay on their
+        // MAPPS-554: provision the portal admin CONTACT (not a users
+        // row) and mint a portal_setup_tokens row. Runs after
+        // `ensure_own_company` so `company_id` is available for the
+        // contacts FK. Best-effort like the pre-554 welcome dispatch:
+        // a failed contact insert or dispatch is logged but not
+        // fatal, matching the existing `AuthService::create_user`
+        // welcome path. Runs only when the notifications dispatcher +
+        // frontend base URL were wired via `with_dispatcher` /
+        // `with_frontend_base_url`; the seed / placement paths that
+        // construct a bare service skip it and stay on their
         // pre-existing behaviour.
-        self.send_admin_welcome(tenant_id, admin_id, request).await;
+        self.provision_portal_admin_and_send_welcome(tenant_id, request)
+            .await;
 
         // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
         // is the same minted id, bridged via `from_trusted`.
@@ -510,15 +512,38 @@ impl TenantService {
     /// did not send would strand the super-admin with a half-created
     /// tenant that already exists in the DB. The admin can still trigger
     /// a password-reset from the login page as a fallback.
-    async fn send_admin_welcome(
+    async fn provision_portal_admin_and_send_welcome(
         &self,
         tenant_id: Uuid,
-        admin_id: Uuid,
         request: &CreateTenantRequest,
     ) {
-        self.mint_and_send_welcome(
+        // MAPPS-554: provision the portal admin CONTACT first (needs
+        // the tenant's own_company for the FK), then mint the portal
+        // setup token and dispatch the welcome. Two calls so a token
+        // insert / dispatch failure does not roll back the contact.
+        let contact_id = match self
+            .insert_portal_admin_contact(
+                tenant_id,
+                &request.admin_email,
+                &request.admin_first_name,
+                &request.admin_last_name,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    error = ?e,
+                    "MAPPS-554: portal admin contact insert failed; tenant is created \
+                     but has no portal owner. Retry via TenantService::resend_admin_welcome.",
+                );
+                return;
+            }
+        };
+        self.mint_and_send_portal_welcome(
             tenant_id,
-            admin_id,
+            contact_id,
             &request.admin_email,
             &request.admin_first_name,
             &request.admin_last_name,
@@ -527,28 +552,98 @@ impl TenantService {
         .await;
     }
 
-    /// Mint a fresh `password_reset_tokens` row for the tenant admin and
-    /// dispatch the `auth.welcome` email. Shared by [`send_admin_welcome`]
-    /// (create path) and [`resend_admin_welcome`] (MAPPS-448 re-issue path),
-    /// so both paths use the same token shape, expiry, template context, and
-    /// best-effort failure semantics.
+    /// MAPPS-554: insert the tenant's portal-owner contact.
     ///
-    /// Best-effort: absence of a dispatcher, a dispatch failure, and even a
-    /// token-insert failure all log-and-return. Callers that need to know
-    /// whether the mail was queued should read tracing spans; the on-disk
-    /// state (the token row) is committed before this returns success.
-    async fn mint_and_send_welcome(
+    /// Runs in its own `begin_with_tenant` tx so the contacts insert
+    /// passes the RLS WITH CHECK policy against `app.current_tenant`.
+    /// Reads the tenant's `own_company_id` under the same GUC (the
+    /// caller's prior `ensure_own_company` populated it). Fails
+    /// closed if `own_company_id` is still NULL: that means the
+    /// caller skipped `ensure_own_company` (a programming error - the
+    /// contacts.company_id FK is NOT NULL).
+    async fn insert_portal_admin_contact(
         &self,
         tenant_id: Uuid,
-        admin_id: Uuid,
+        admin_email: &str,
+        admin_first_name: &str,
+        admin_last_name: &str,
+    ) -> AppResult<Uuid> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let own_company_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let Some(company_id) = own_company_id else {
+            return Err(AppError::Internal(
+                "tenant has no own_company_id; ensure_own_company must run before \
+                 insert_portal_admin_contact"
+                    .to_string(),
+            ));
+        };
+        let contact_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO contacts (
+                id, tenant_id, company_id, first_name, last_name, email,
+                is_portal_user, portal_role, contact_type, status
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE, 'admin', 'primary', 'active')
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(admin_first_name)
+        .bind(admin_last_name)
+        .bind(admin_email)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(contact_id)
+    }
+
+    /// MAPPS-554: mint a fresh `portal_setup_tokens` row for the tenant's
+    /// portal admin contact and dispatch the `auth.welcome` email. Shared
+    /// by `provision_portal_admin_and_send_welcome` (create path) and
+    /// `resend_admin_welcome` (MAPPS-448 re-issue path), so both use the
+    /// same token shape, 72h expiry (mirrors PMS-136), template context,
+    /// and best-effort failure semantics.
+    ///
+    /// Best-effort: absence of a dispatcher, absence of a frontend base
+    /// URL, absence of a portal host suffix, a failed token insert, and
+    /// a failed dispatch each log-and-return. On-disk state (the token
+    /// row) is committed before dispatch, so a mail failure leaves a
+    /// redeemable link the operator can resend.
+    async fn mint_and_send_portal_welcome(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
         admin_email: &str,
         admin_first_name: &str,
         admin_last_name: &str,
         tenant_slug: &str,
     ) {
-        let (Some(notify), Some(base_url)) =
-            (self.notifications.as_ref(), self.frontend_base_url.as_ref())
-        else {
+        // MAPPS-554: dispatch requires the notifications wire; the
+        // portal setup URL requires the portal host suffix (there is
+        // no legacy same-origin fallback here - the point of the
+        // ticket is that the mokosh apex is NOT the destination).
+        // Absence of either logs-and-returns; the token row is not
+        // minted in that case, so a later resend re-issues cleanly.
+        let Some(notify) = self.notifications.as_ref() else {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                contact_id = %contact_id,
+                "MAPPS-554: no notifications dispatcher wired; portal welcome not queued",
+            );
+            return;
+        };
+        let Some(portal_suffix) = self.portal_host_suffix.as_deref() else {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                contact_id = %contact_id,
+                "MAPPS-554: no portal host suffix configured; cannot build portal setup URL",
+            );
             return;
         };
 
@@ -558,36 +653,41 @@ impl TenantService {
             Err(e) => {
                 tracing::warn!(
                     tenant_id = %tenant_id,
-                    admin_id = %admin_id,
+                    contact_id = %contact_id,
                     error = ?e,
-                    "hash_password failed while minting admin welcome token",
+                    "MAPPS-554: hash_password failed while minting portal setup token",
                 );
                 return;
             }
         };
-        let token = format!("{}.{}", admin_id, secret);
-        let expires_at = Utc::now() + Duration::days(7);
+        let token = format!("{}.{}", contact_id, secret);
+        // 72h TTL mirrors PMS-136's PORTAL_SETUP_TOKEN_TTL_HOURS. Deliberately
+        // shorter than the pre-554 7-day users-welcome window: the portal
+        // path is what agents already use when flipping is_portal_user, so
+        // both entry points share one operator-facing "how long is a portal
+        // setup link good for?" answer.
+        let expires_at = Utc::now() + Duration::hours(72);
 
         let mut tx = match self.db.begin_with_tenant(tenant_id).await {
             Ok(tx) => tx,
             Err(e) => {
                 tracing::warn!(
                     tenant_id = %tenant_id,
-                    admin_id = %admin_id,
+                    contact_id = %contact_id,
                     error = ?e,
-                    "begin_with_tenant failed while minting admin welcome token",
+                    "MAPPS-554: begin_with_tenant failed while minting portal setup token",
                 );
                 return;
             }
         };
         let insert = sqlx::query(
             r#"
-            INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
             VALUES ($1, $2, $3, $4)
             "#,
         )
         .bind(tenant_id)
-        .bind(admin_id)
+        .bind(contact_id)
         .bind(&token_hash)
         .bind(expires_at)
         .execute(&mut *tx)
@@ -595,66 +695,52 @@ impl TenantService {
         if let Err(e) = insert {
             tracing::warn!(
                 tenant_id = %tenant_id,
-                admin_id = %admin_id,
+                contact_id = %contact_id,
                 error = ?e,
-                "failed to insert admin welcome password_reset_tokens row",
+                "MAPPS-554: failed to insert portal_setup_tokens row",
             );
             return;
         }
         if let Err(e) = tx.commit().await {
             tracing::warn!(
                 tenant_id = %tenant_id,
-                admin_id = %admin_id,
+                contact_id = %contact_id,
                 error = ?e,
-                "commit failed on admin welcome password_reset_tokens tx",
+                "MAPPS-554: commit failed on portal_setup_tokens tx",
             );
             return;
         }
 
-        // MAPPS-552: the welcome-email link goes to /set-password/{token},
-        // not /reset-password/{token}. The SPA has a dedicated
-        // `SetPasswordPage` at that route whose heading reads "Set
-        // your password for [Client Name]" so a fresh client-admin
-        // does not see a confusing "Reset your password" title.
-        // Post-MAPPS-551 the underlying POST /api/v1/auth/reset-password
-        // handler is the sole password-write path (setup + forgot),
-        // so no server routing change is needed here beyond the
-        // emitted URL.
-        let setup_link = format!("{}/set-password/{}", base_url, token);
+        // Build the tenant subdomain portal URL. `<scheme>://<slug><suffix>`
+        // mirrors `client_portal_url` below (both use the same suffix), so
+        // the setup link and the portal-root link land on the same origin.
+        let slug = slugify(tenant_slug);
+        let scheme = if portal_suffix.contains("localhost") {
+            "http"
+        } else {
+            "https"
+        };
+        let portal_origin = format!("{scheme}://{slug}{portal_suffix}");
+        let setup_link = format!("{portal_origin}/portal/set-password?token={token}");
+        let client_portal_url = portal_origin;
+
         let display_name = match (admin_first_name.trim(), admin_last_name.trim()) {
             ("", "") => String::new(),
             (f, "") => f.to_string(),
             ("", l) => l.to_string(),
             (f, l) => format!("{f} {l}"),
         };
-        // Client-portal URL a template can reference to tell the fresh
-        // admin where to send their own clients. Absent (`""`) on a
-        // legacy deploy that has no portal host suffix configured; a
-        // template that references `{{client_portal_url}}` will still
-        // render, just with the placeholder braces (harmless).
-        let client_portal_url = self
-            .portal_host_suffix
-            .as_deref()
-            .map(|suffix| {
-                let scheme = if suffix.contains("localhost") {
-                    "http"
-                } else {
-                    "https"
-                };
-                let slug = slugify(tenant_slug);
-                format!("{scheme}://{slug}{suffix}")
-            })
-            .unwrap_or_default();
         let context = serde_json::json!({
-            "recipient_user_id": admin_id.to_string(),
+            "recipient_contact_id": contact_id.to_string(),
             "recipient_email": admin_email,
             "display_name": display_name,
             "setup_link": setup_link,
             "client_portal_url": client_portal_url,
         });
-        // SAFETY (PMS-261): `tenant_id` is freshly minted for the tenant just
-        // created; `from_trusted` bridges it into the typed scope, and
-        // `dispatch` sets the GUC per query via `begin_with_tenant`.
+        // SAFETY (PMS-261): `tenant_id` is the tenant we just provisioned
+        // (create path) or resolved (resend path); `from_trusted` bridges
+        // into the typed scope, and `dispatch` sets the GUC per query via
+        // `begin_with_tenant`.
         match notify
             .dispatch(TenantId::from_trusted(tenant_id), "auth.welcome", &context)
             .await
@@ -662,57 +748,74 @@ impl TenantService {
             Ok(_) => {
                 tracing::info!(
                     tenant_id = %tenant_id,
-                    admin_id = %admin_id,
-                    "admin welcome email queued via notifications dispatcher",
+                    contact_id = %contact_id,
+                    "MAPPS-554: portal admin welcome email queued via notifications dispatcher",
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     tenant_id = %tenant_id,
-                    admin_id = %admin_id,
+                    contact_id = %contact_id,
                     error = ?e,
-                    "welcome dispatch failed; setup token persisted but no message queued",
+                    "MAPPS-554: welcome dispatch failed; portal setup token persisted but no message queued",
                 );
             }
         }
     }
 
-    /// MAPPS-448: re-issue the tenant admin's setup token and re-send the
-    /// `auth.welcome` email. Super-admin path, invoked when the original mail
-    /// went missing (SMTP outage, wrong-address typo caught later, admin lost
-    /// the email) and the admin is still `status='pending'`.
+    /// MAPPS-448 / MAPPS-554: re-issue the tenant portal admin's setup
+    /// token and re-send the `auth.welcome` email. Super-admin path,
+    /// invoked when the original mail went missing (SMTP outage,
+    /// wrong-address typo caught later, admin lost the email) and the
+    /// portal admin contact has not redeemed yet.
     ///
-    /// Steps:
-    /// 1. Resolve the tenant's single `role='admin'` user; 404 if absent.
-    /// 2. 409 if the admin has already redeemed (`status != 'pending'`) - a
-    ///    resend against an active account would be a mystery mail from the
-    ///    caller's perspective and a security-adjacent surface (super-admin
-    ///    forcing a password-reset link to someone else's inbox).
-    /// 3. Invalidate every unredeemed `password_reset_tokens` row for that
-    ///    admin so the old email's link stops working (single one-shot token).
-    /// 4. Audit an `Update` on the users row so the log names the super-admin
-    ///    who re-issued the invite.
-    /// 5. Mint + dispatch via [`mint_and_send_welcome`], same helper the
-    ///    create path uses.
+    /// Post-MAPPS-554 the identity a tenant is provisioned around is a
+    /// portal admin CONTACT (`is_portal_user = true`, `portal_role =
+    /// 'admin'`), NOT a `users` row. Steps:
+    ///
+    /// 1. Resolve the tenant's single portal-admin contact; 404 if
+    ///    absent (pre-554 tenants that still hold a `users` row for
+    ///    the admin follow the pre-554 users-side path via
+    ///    `AuthService::resend_user_welcome` - not covered here).
+    /// 2. 409 if the admin has already redeemed
+    ///    (`portal_password_hash IS NOT NULL`) - a resend against an
+    ///    active portal account would be a mystery mail from the
+    ///    caller's perspective and a security-adjacent surface
+    ///    (super-admin forcing a portal-setup link to someone else's
+    ///    inbox).
+    /// 3. Invalidate every unredeemed `portal_setup_tokens` row for
+    ///    that contact so the old email's link stops working.
+    /// 4. Audit an `Update` on the contacts row so the log names the
+    ///    super-admin who re-issued the invite.
+    /// 5. Mint + dispatch via [`mint_and_send_portal_welcome`], same
+    ///    helper the create path uses.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn resend_admin_welcome(&self, tenant_id: TenantId, ctx: &AuditCtx) -> AppResult<()> {
-        // Cross-tenant super-admin read against the RLS-protected `users`
+        // Cross-tenant super-admin read against the RLS-protected `contacts`
         // table: run under the tenant GUC so the SELECT sees the row.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let admin: Option<(Uuid, String, String, String, String)> = sqlx::query_as(
-            "SELECT id, email, first_name, last_name, status FROM users \
-             WHERE tenant_id = $1 AND role = 'admin' \
-             ORDER BY created_at LIMIT 1",
+        let admin: Option<(Uuid, Option<String>, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, email, first_name, last_name, portal_password_hash FROM contacts \
+                 WHERE tenant_id = $1 AND is_portal_user = TRUE AND portal_role = 'admin' \
+                 ORDER BY created_at LIMIT 1",
         )
         .bind(*tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((admin_id, admin_email, admin_first_name, admin_last_name, status)) = admin else {
-            return Err(AppError::not_found("No admin user found for this tenant"));
+        let Some((contact_id, admin_email_opt, admin_first_name, admin_last_name, pw_hash)) = admin
+        else {
+            return Err(AppError::not_found(
+                "No portal admin contact found for this tenant",
+            ));
         };
-        if status != "pending" {
+        let Some(admin_email) = admin_email_opt.filter(|s| !s.trim().is_empty()) else {
             return Err(AppError::conflict(
-                "Tenant admin has already activated their account; no resend needed",
+                "Portal admin contact has no email on file; cannot resend welcome",
+            ));
+        };
+        if pw_hash.is_some() {
+            return Err(AppError::conflict(
+                "Portal admin has already activated their account; no resend needed",
             ));
         }
         // Slug is on the RLS-exempt `tenants` root row, but reading it under
@@ -721,12 +824,13 @@ impl TenantService {
             .bind(*tenant_id)
             .fetch_one(&mut *tx)
             .await?;
-        // Invalidate any prior unredeemed setup link so only the freshly
-        // emailed one works. Redeemed rows are deleted at redeem-time so
-        // this DELETE is bounded to at most a handful of pending tokens.
-        sqlx::query("DELETE FROM password_reset_tokens WHERE tenant_id = $1 AND user_id = $2")
+        // Invalidate any prior unredeemed portal setup link so only the
+        // freshly emailed one works. Redeemed rows are deleted at redeem
+        // time (see PMS-136 flow) so this DELETE is bounded to at most a
+        // handful of pending tokens.
+        sqlx::query("DELETE FROM portal_setup_tokens WHERE tenant_id = $1 AND contact_id = $2")
             .bind(*tenant_id)
-            .bind(admin_id)
+            .bind(contact_id)
             .execute(&mut *tx)
             .await?;
         audit_write(
@@ -734,20 +838,20 @@ impl TenantService {
             tenant_id,
             ctx,
             AuditAction::Update,
-            "users",
-            Some(admin_id),
+            "contacts",
+            Some(contact_id),
             None,
             None,
         )
         .await?;
         tx.commit().await?;
 
-        // mint_and_send_welcome is best-effort: on dispatch failure the
-        // token is committed but the mail is not queued (same posture as
-        // the create path). A follow-up resend can be triggered.
-        self.mint_and_send_welcome(
+        // mint_and_send_portal_welcome is best-effort: on dispatch failure
+        // the token is committed but the mail is not queued (same posture
+        // as the create path). A follow-up resend can be triggered.
+        self.mint_and_send_portal_welcome(
             *tenant_id,
-            admin_id,
+            contact_id,
             &admin_email,
             &admin_first_name,
             &admin_last_name,
@@ -1151,34 +1255,53 @@ impl TenantService {
         self.get_tenant(tenant_id).await
     }
 
-    /// MAPPS-450: read the tenant admin's `users` row for the tenant
-    /// management modal. Returns the single `role='admin'` row seeded by
-    /// [`create_tenant`], projected down to what the SPA needs (id, email,
-    /// name pair, raw status).
+    /// MAPPS-450 / MAPPS-554: read the tenant admin's identity row for the
+    /// tenant management modal. Post-554 the identity is a portal admin
+    /// CONTACT (`is_portal_user = true`, `portal_role = 'admin'`), not
+    /// a `users` row, so the read pivots to `contacts` and derives
+    /// pending/active from `portal_password_hash IS NULL`. `TenantAdminInfo`
+    /// stays wire-compatible: its `user_id` field is now the contact_id
+    /// (see the type's docstring).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_tenant_admin(&self, tenant_id: TenantId) -> AppResult<TenantAdminInfo> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let admin: Option<(Uuid, String, String, String, String)> = sqlx::query_as(
-            "SELECT id, email, first_name, last_name, status FROM users \
-             WHERE tenant_id = $1 AND role = 'admin' \
+        // MAPPS-554: `email` is Option<String> on contacts (nullable
+        // column) but TenantAdminInfo.email is String; fill an empty
+        // string when absent (the update path 400s empty email inputs
+        // so the round-trip is safe).
+        let admin: Option<(Uuid, Option<String>, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, email, first_name, last_name, portal_password_hash FROM contacts \
+             WHERE tenant_id = $1 AND is_portal_user = TRUE AND portal_role = 'admin' \
              ORDER BY created_at LIMIT 1",
         )
         .bind(*tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((user_id, email, first_name, last_name, status)) = admin else {
-            return Err(AppError::not_found("No admin user found for this tenant"));
+        let Some((contact_id, email_opt, first_name, last_name, pw_hash)) = admin else {
+            return Err(AppError::not_found(
+                "No portal admin contact found for this tenant",
+            ));
+        };
+        // MAPPS-554: `status` is derived - pending until the portal
+        // password is set, active thereafter. Matches the pre-554
+        // users.status semantics as far as the UI cares (email
+        // editable + resend affordance both gate on 'pending').
+        let status = if pw_hash.is_some() {
+            "active".to_string()
+        } else {
+            "pending".to_string()
         };
         Ok(TenantAdminInfo {
-            user_id,
-            email,
+            user_id: contact_id,
+            email: email_opt.unwrap_or_default(),
             first_name,
             last_name,
             status,
         })
     }
 
-    /// MAPPS-450: super-admin edits the tenant admin's email + name pair.
+    /// MAPPS-450 / MAPPS-554: super-admin edits the tenant portal admin's
+    /// email + name pair.
     ///
     /// Guards:
     /// - Empty request (nothing to change and `resend_welcome=false`) -> 400.
@@ -1210,20 +1333,30 @@ impl TenantService {
             ));
         }
 
-        // Load current row + status guard, all under the tenant GUC so the
-        // SELECT sees the row and any subsequent UPDATE + audit-write on
-        // the same tx share the scope.
+        // MAPPS-554: the admin identity lives on `contacts` now
+        // (is_portal_user=true, portal_role='admin'), not `users`.
+        // Load current row + status guard, all under the tenant GUC
+        // so the SELECT sees the row and any subsequent UPDATE +
+        // audit-write on the same tx share the scope.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let existing: Option<(Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, email, status FROM users \
-             WHERE tenant_id = $1 AND role = 'admin' \
+        let existing: Option<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, email, portal_password_hash FROM contacts \
+             WHERE tenant_id = $1 AND is_portal_user = TRUE AND portal_role = 'admin' \
              ORDER BY created_at LIMIT 1",
         )
         .bind(*tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((admin_id, current_email, current_status)) = existing else {
-            return Err(AppError::not_found("No admin user found for this tenant"));
+        let Some((admin_id, current_email_opt, pw_hash)) = existing else {
+            return Err(AppError::not_found(
+                "No portal admin contact found for this tenant",
+            ));
+        };
+        let current_email = current_email_opt.unwrap_or_default();
+        let current_status = if pw_hash.is_some() {
+            "active".to_string()
+        } else {
+            "pending".to_string()
         };
 
         let email_changed = request
@@ -1243,14 +1376,14 @@ impl TenantService {
         // becomes a `COALESCE`-shaped ternary so callers can send just the
         // fields that changed without threading a builder.
         let before: Option<serde_json::Value> =
-            sqlx::query_scalar("SELECT to_jsonb(u) FROM users u WHERE id = $1")
+            sqlx::query_scalar("SELECT to_jsonb(c) FROM contacts c WHERE id = $1")
                 .bind(admin_id)
                 .fetch_optional(&mut *tx)
                 .await?;
 
         if has_any_change {
             sqlx::query(
-                "UPDATE users SET \
+                "UPDATE contacts SET \
                  email = COALESCE($2, email), \
                  first_name = COALESCE($3, first_name), \
                  last_name = COALESCE($4, last_name), \
@@ -1284,7 +1417,7 @@ impl TenantService {
         }
 
         let after: Option<serde_json::Value> =
-            sqlx::query_scalar("SELECT to_jsonb(u) FROM users u WHERE id = $1")
+            sqlx::query_scalar("SELECT to_jsonb(c) FROM contacts c WHERE id = $1")
                 .bind(admin_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -1294,7 +1427,7 @@ impl TenantService {
             tenant_id,
             ctx,
             AuditAction::Update,
-            "users",
+            "contacts",
             Some(admin_id),
             before,
             after,
