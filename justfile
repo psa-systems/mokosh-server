@@ -121,6 +121,23 @@ check-migration-immutability:
 check-pool-safety:
     nu scripts/check-pool-safety.nu
 
+# Report CI runs that outlived their own job's `timeout-minutes` (PMS-906).
+# NOT part of `just check`: it needs network access and a FORGEJO_TOKEN, and it
+# answers a question about history rather than about the diff. A run that
+# exceeds its bound and still reports success was never bounded, because
+# nothing was executing it - which is the one thing PMS-829's job bounds cannot
+# catch.
+[doc("Report CI runs that outlived their job's timeout-minutes (PMS-906). Needs FORGEJO_TOKEN.")]
+[group: 'ci']
+ci-stalls days="3":
+    nu scripts/check-ci-stalls.nu {{days}}
+
+# Prove the stall report still reports (PMS-906). Fixtures, no network.
+[doc("Self-test for `just ci-stalls`; runs on fixtures, needs no token.")]
+[group: 'ci']
+ci-stalls-self-test:
+    nu scripts/check-ci-stalls.nu --self-test
+
 # Keep a Create*Request and its Update*Request agreeing about every same-named
 # field (PMS-867). A cap on one side and nothing on the other is two contracts
 # for one column: over the max the update path 500s on a raw Postgres 22001
