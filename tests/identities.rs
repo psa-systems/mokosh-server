@@ -183,22 +183,53 @@ async fn update_users_status_propagates_to_membership(pool: PgPool) {
     assert_eq!(membership.status, "inactive");
 }
 
+// MAPPS-551 (rewrite of the pre-551 mirror pin): a UPDATE users
+// password_hash write must NOT propagate to identities. The MAPPS-498
+// mirror still fires for every OTHER per-human column (see
+// `update_identity_propagates_to_users` below), but password_hash is
+// authoritative per-tenant on `users`. Two portals sharing an email
+// hold independent passwords, forever, and a change on one row must
+// not overwrite the identity's hash (which would then re-mirror to
+// every other users row at that email via the reverse trigger).
 #[sqlx::test]
-async fn update_users_password_hash_propagates_to_identity(pool: PgPool) {
+async fn update_users_password_hash_does_not_propagate_to_identity(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Epsilon Co", "epsilon").await;
     let user_id = insert_user(&pool, tenant, "pw@example.com", "technician", "active").await;
 
-    sqlx::query("UPDATE users SET password_hash = 'new-hash' WHERE id = $1")
+    // Read the identity's password_hash as it was seeded by the
+    // users INSERT (identity's INSERT branch still copies
+    // password_hash on first-seen email; that seed is intentional
+    // per migration 135's inline comment).
+    let identity_hash_before: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM identities WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read identity hash before");
+
+    sqlx::query("UPDATE users SET password_hash = 'new-hash-post-551' WHERE id = $1")
         .bind(user_id)
         .execute(&pool)
         .await
         .expect("update pw");
 
-    let identity = IdentityRepo::find_by_id(&pool, user_id)
+    let identity_after = IdentityRepo::find_by_id(&pool, user_id)
         .await
         .expect("find")
         .expect("exists");
-    assert_eq!(identity.password_hash.as_deref(), Some("new-hash"));
+    assert_eq!(
+        identity_after.password_hash, identity_hash_before,
+        "MAPPS-551: users password_hash UPDATE must NOT touch identities.password_hash"
+    );
+    // And the users row DID change (sanity check we actually ran the
+    // update).
+    let users_hash_after: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read users hash after");
+    assert_eq!(users_hash_after.as_deref(), Some("new-hash-post-551"));
 }
 
 /// MAPPS-498 (MAPPS-496 stage 1): UPDATE identities.<per-human>

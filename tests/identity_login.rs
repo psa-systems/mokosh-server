@@ -368,3 +368,93 @@ async fn tenant_hint_login_still_works_unchanged(pool: PgPool) {
     let body: Value = resp.json().await.expect("json");
     assert!(!body["access_token"].as_str().unwrap().is_empty());
 }
+
+// MAPPS-551: identity-first login verifies against each membership's
+// users.password_hash, not identities.password_hash. An identity with
+// TWO memberships whose users rows carry DIFFERENT password hashes must
+// auto-scope to the tenant whose users row password matches the caller's
+// input, without a picker step and without asking the identity plane.
+#[sqlx::test]
+async fn identity_first_finds_the_matching_membership_when_hashes_diverged(pool: PgPool) {
+    let email = "diverged@example.com".to_string();
+    let password_a = "TENANT-A-PW-12345".to_string();
+    let password_b = "TENANT-B-PW-67890".to_string();
+    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a).expect("hash A");
+    let hash_b = mokosh_server::utils::crypto::hash_password(&password_b).expect("hash B");
+
+    let tenant_a = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, kind, status) \
+         VALUES ($1, 'A', 'a-mapps551', 'org', 'active')",
+    )
+    .bind(tenant_a)
+    .execute(&pool)
+    .await
+    .expect("insert tenant a");
+    let user_a = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'A', 'Admin', 'admin', 'active', NOW())",
+    )
+    .bind(user_a)
+    .bind(tenant_a)
+    .bind(&email)
+    .bind(&hash_a)
+    .execute(&pool)
+    .await
+    .expect("insert user a");
+
+    let tenant_b = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, kind, status) \
+         VALUES ($1, 'B', 'b-mapps551', 'org', 'active')",
+    )
+    .bind(tenant_b)
+    .execute(&pool)
+    .await
+    .expect("insert tenant b");
+    let user_b = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'B', 'Admin', 'admin', 'active', NOW())",
+    )
+    .bind(user_b)
+    .bind(tenant_b)
+    .bind(&email)
+    .bind(&hash_b)
+    .execute(&pool)
+    .await
+    .expect("insert user b");
+
+    let app = common::boot(pool).await;
+
+    // Login with password A: auto-scope to tenant A.
+    let resp_a = post_login(
+        &app,
+        serde_json::json!({ "email": email, "password": password_a }),
+    )
+    .await;
+    assert!(resp_a.status().is_success(), "got {}", resp_a.status());
+    let body_a: Value = resp_a.json().await.expect("json a");
+    assert_eq!(body_a["needs_selection"], false, "auto-scope to tenant A");
+    assert_eq!(body_a["needs_setup"], false);
+    assert_eq!(
+        body_a["user"]["tenant_id"].as_str().unwrap(),
+        tenant_a.to_string(),
+        "MAPPS-551: password A auto-scoped to tenant A"
+    );
+
+    // Login with password B: auto-scope to tenant B.
+    let resp_b = post_login(
+        &app,
+        serde_json::json!({ "email": email, "password": password_b }),
+    )
+    .await;
+    assert!(resp_b.status().is_success(), "got {}", resp_b.status());
+    let body_b: Value = resp_b.json().await.expect("json b");
+    assert_eq!(
+        body_b["user"]["tenant_id"].as_str().unwrap(),
+        tenant_b.to_string(),
+        "MAPPS-551: password B auto-scoped to tenant B"
+    );
+}

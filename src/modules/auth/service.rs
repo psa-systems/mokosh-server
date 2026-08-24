@@ -1501,91 +1501,38 @@ impl AuthService {
         // Hash new password
         let new_hash = hash_password(&request.new_password)?;
 
-        // Update password. PMS-681: stamp `password_changed_at` so the auth
-        // middleware rejects every access token issued before now (the `logout_all`
-        // below only revokes refresh sessions).
+        // MAPPS-551: password_hash lives per-tenant on `users`. The
+        // MAPPS-498 mirror no longer touches password (see migration
+        // 135), and the MAPPS-548 setup/reset distinction is retired
+        // here - every redemption of a reset token, whether it is a
+        // first-time client-admin setup or a forgot-password by an
+        // existing tenant user, writes ONLY the users row the token
+        // resolves to. Two portals sharing an email keep independent
+        // passwords, forever.
         //
-        // MAPPS-502 (MAPPS-496 stage 2d): identities is source of truth
-        // for password_hash (same shape as MAPPS-499 change_password);
-        // the MAPPS-498 bidir mirror keeps every matching users row
-        // current. `password_changed_at` is users-only (PMS-681
-        // revocation gate) and stays on the users UPDATE below.
+        // `status = 'active'` promotes a pending users row (fresh
+        // client-admin from `TenantService::create_tenant`) so the
+        // newly-set password is usable at login. Idempotent for a
+        // user already 'active' - the SET is a no-op write.
         //
-        // MAPPS-548: the `password_reset_tokens` table is reused by the
-        // tenant-admin welcome-email flow (see
-        // `TenantService::send_admin_welcome`) as a first-time setup
-        // path, not just for existing users doing a forgot-password
-        // reset. Detect the setup path by the users row's
-        // `password_hash IS NULL` state at the moment of the reset
-        // (a real user reset always has a hash to overwrite); when
-        // it's a setup, flip the migration-134 session guard so the
-        // password write lands on THIS users row only. A pre-existing
-        // account at the same email (mokosh super-admin, another
-        // tenant's admin, another client's admin) keeps its
-        // credential untouched. Existing forgot-password path is
-        // unaffected: their users row has a hash, the flag stays
-        // unset, the identity mirror fires exactly as before.
+        // The MAPPS-548 `app.skip_users_identity_mirror` flag is
+        // kept as belt-and-braces: post-135 the trigger no longer
+        // touches password, but a future column addition to the
+        // mirror should not silently escape this write. Cheap.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT email, password_hash FROM users WHERE id = $1 AND tenant_id = $2",
+        sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE users SET password_hash = $1, status = 'active', \
+             password_changed_at = NOW(), updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
         )
+        .bind(&new_hash)
         .bind(user_id)
         .bind(tenant_id)
-        .fetch_optional(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        let (email, current_hash) = row.ok_or_else(|| AppError::NotFound("User".to_string()))?;
-        let is_first_time_setup = current_hash.is_none();
-        if is_first_time_setup {
-            // Use set_config('name', 'val', true) rather than a
-            // `SET LOCAL name = val` statement: same semantics
-            // (transaction-scoped), matches how
-            // `Database::begin_with_tenant` already sets
-            // `app.current_tenant`, and reliably runs on the
-            // transaction connection through the sqlx executor
-            // instead of opening a parser-level ambiguity around
-            // the reserved `SET LOCAL` form.
-            sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
-                .execute(&mut *tx)
-                .await?;
-            // Setup path writes only to the users row's password_hash.
-            // Skip the identities UPDATE entirely; the migration-134
-            // guard would short-circuit the trigger even if we did,
-            // but avoiding the UPDATE avoids clobbering identity data
-            // for an existing identity at the same email. Also flip
-            // `status` to `'active'` in the same write - the row was
-            // seeded as `'pending'` by `create_tenant`, and
-            // `ensure_principal_usable` refuses to authenticate a
-            // non-active users row, so the setup flow has to promote
-            // the row for the newly-set password to actually be
-            // usable at login time.
-            sqlx::query(
-                "UPDATE users SET password_hash = $1, status = 'active', \
-                 password_changed_at = NOW(), updated_at = NOW() \
-                 WHERE id = $2 AND tenant_id = $3",
-            )
-            .bind(&new_hash)
-            .bind(user_id)
-            .bind(tenant_id)
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            sqlx::query(
-                "UPDATE identities SET password_hash = $1, updated_at = NOW() \
-                 WHERE lower(email) = lower($2)",
-            )
-            .bind(&new_hash)
-            .bind(&email)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE users SET password_changed_at = NOW(), updated_at = NOW() \
-                 WHERE id = $1 AND tenant_id = $2",
-            )
-            .bind(user_id)
-            .bind(tenant_id)
-            .execute(&mut *tx)
-            .await?;
-        }
 
         // Mark token as used
         sqlx::query(
@@ -1650,28 +1597,28 @@ impl AuthService {
         // Hash and update new password
         let new_hash = hash_password(&request.new_password)?;
 
-        // MAPPS-499 (MAPPS-496 stage 2a): identities is now the source
-        // of truth for password_hash. The bidir trigger from
-        // migration 130 (MAPPS-498) mirrors this write back to every
-        // matching users.password_hash so legacy readers still see
-        // the new value. `password_changed_at` is users-only (PMS-681
-        // access-token revocation gate) and stays on the users
-        // UPDATE below. Both writes share the same tenant-scoped tx;
-        // identities is RLS-exempt so its UPDATE runs cleanly under
-        // any tenant GUC.
+        // MAPPS-551: retire the identity write. Password lives on the
+        // per-tenant users row only; migration 135's mirror no longer
+        // touches password_hash in either direction. Two portals
+        // sharing an email hold independent passwords, and this
+        // signed-in change writes ONLY the caller's own (user_id,
+        // tenant_id) row. `email` is still bound above for the
+        // pre-551 identity write path and is now unused; leaving the
+        // binding in place is a tiny inefficiency, kept for the
+        // audit trail hooks below that reference `current_hash`.
+        //
+        // MAPPS-548 belt-and-braces flag stays set on the tx: the
+        // trigger is already toothless for password_hash post-135,
+        // but a future mirror addition should not silently escape.
+        let _ = &email;
+        sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
-            "UPDATE identities SET password_hash = $1, updated_at = NOW() \
-             WHERE lower(email) = lower($2)",
+            "UPDATE users SET password_hash = $1, password_changed_at = NOW(), \
+             updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&new_hash)
-        .bind(&email)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "UPDATE users SET password_changed_at = NOW(), updated_at = NOW() \
-             WHERE id = $1 AND tenant_id = $2",
-        )
         .bind(user_id)
         .bind(tenant_id)
         .execute(&mut *tx)
@@ -3273,16 +3220,73 @@ impl AuthService {
             .map_err(|_| AppError::Unauthorized)?
             .ok_or(AppError::Unauthorized)?;
 
-        // 2. Password check against the identity plane. Bunyip-only
-        //    identities have no hash -> Unauthorized (this path is
-        //    password-only, bunyip callers go through the bunyip
-        //    verifier in the middleware).
-        let hash = identity
-            .password_hash
-            .as_deref()
-            .ok_or(AppError::Unauthorized)?;
-        if !verify_password(&request.password, hash)? {
-            return Err(AppError::Unauthorized);
+        // 2. MAPPS-551: password is authoritative per-tenant on
+        //    `users`, not on identities. Verify the supplied password
+        //    against each active membership's users row and collect
+        //    the memberships that verified. Empty match set ->
+        //    Unauthorized (same 401 an unknown identity yields, so
+        //    timing does not leak "identity exists but password wrong"
+        //    vs "identity does not exist").
+        //
+        //    Pre-551 this branch verified against
+        //    `identities.password_hash`; that value is no longer
+        //    authoritative post-135 (the mirror no longer writes it
+        //    on UPDATE, so it stales the moment any per-tenant
+        //    password changes). Walking memberships is O(N) verifies;
+        //    Argon2 is ~50ms so a caller with 5 memberships pays
+        //    ~250ms on identity-first login. Acceptable - the caller
+        //    typed a password and expects to wait, and MAPPS-549
+        //    auto-picks so the picker case is rare.
+        let all_memberships =
+            crate::db::identity::MembershipRepo::list_views_for_identity(pool, identity.id, None)
+                .await
+                .map_err(|_| AppError::Unauthorized)?;
+        let mut matched_memberships = Vec::with_capacity(all_memberships.len());
+        let mut any_verified_user: Option<User> = None;
+        if all_memberships.is_empty() {
+            // MAPPS-551: orphan identity (no memberships) is the
+            // needs_setup case. Post-551 the identity's
+            // password_hash is not authoritative for
+            // per-membership login, but it IS authoritative for
+            // this specific "no memberships yet" state - the
+            // MAPPS-498 INSERT branch of the mirror seeded it from
+            // the first users row, and until a membership exists
+            // there is no per-tenant users row to verify against.
+            // Preserves the MAPPS-492 phase-3 self-serve flow
+            // (identity signs up, verifies password, lands on
+            // /create-org to mint their first tenant).
+            let identity_hash = identity
+                .password_hash
+                .as_deref()
+                .ok_or(AppError::Unauthorized)?;
+            if !verify_password(&request.password, identity_hash)? {
+                return Err(AppError::Unauthorized);
+            }
+        } else {
+            for m in &all_memberships {
+                let user = match self
+                    .find_user_by_email_for_tenant(m.tenant_id, &identity.email)
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let Some(hash) = user.password_hash.as_deref() else {
+                    continue;
+                };
+                match verify_password(&request.password, hash) {
+                    Ok(true) => {
+                        matched_memberships.push(m.clone());
+                        if any_verified_user.is_none() {
+                            any_verified_user = Some(user);
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            if matched_memberships.is_empty() {
+                return Err(AppError::Unauthorized);
+            }
         }
 
         // 3. MFA at the identity level. Mirrors the tenant-hint branch's
@@ -3347,38 +3351,53 @@ impl AuthService {
             }
         }
 
-        // 4. Enumerate active memberships across all tenants.
-        let memberships =
-            crate::db::identity::MembershipRepo::list_views_for_identity(pool, identity.id, None)
-                .await
-                .map_err(|_| AppError::Unauthorized)?;
-
-        match memberships.len() {
-            0 => {
-                let identity_token = self.mint_identity_token(identity.id, &identity.email)?;
-                Ok(LoginResponse {
-                    access_token: String::new(),
-                    refresh_token: String::new(),
-                    expires_at: Utc::now(),
-                    user: None,
-                    mfa_required: false,
-                    approval_required: false,
-                    needs_selection: false,
-                    needs_setup: true,
-                    identity_token: Some(identity_token),
-                    memberships: None,
-                })
-            }
+        // 4. MAPPS-551: the "how many places does this identity live"
+        //    branch operates over the memberships whose users row
+        //    password actually verified in step 2 above. A caller
+        //    with memberships whose passwords do not match is
+        //    treated as if those memberships did not exist for this
+        //    request; only matching memberships count toward
+        //    auto-scope vs picker.
+        //
+        //    `needs_setup` (zero memberships branch) is preserved
+        //    for the orphan-identity case: an identity with no
+        //    memberships whose password verified against
+        //    `identities.password_hash` in step 2's "no memberships"
+        //    branch. `all_memberships` empty AND we did not 401
+        //    above means the caller is a self-serve signup landing
+        //    on the create-org flow (MAPPS-492 phase 3 /
+        //    MAPPS-493 phase 4).
+        if all_memberships.is_empty() {
+            let identity_token = self.mint_identity_token(identity.id, &identity.email)?;
+            return Ok(LoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: Utc::now(),
+                user: None,
+                mfa_required: false,
+                approval_required: false,
+                needs_selection: false,
+                needs_setup: true,
+                identity_token: Some(identity_token),
+                memberships: None,
+            });
+        }
+        match matched_memberships.len() {
             1 => {
                 // MAPPS-497 item 5 (PMS-658 identity-first extension):
                 // resolve the user + run the approval gate BEFORE
                 // session mint. The tenant-hint `login` path runs the
                 // same gate at the same spot; identity-first now
                 // matches for the single-membership (auto-scope) case.
-                let tenant_id = memberships[0].tenant_id;
-                let user = self
-                    .find_user_by_email_for_tenant(tenant_id, &identity.email)
-                    .await?;
+                //
+                // MAPPS-551: reuse the users row already loaded +
+                // password-verified in step 2 rather than fetching it
+                // again. `any_verified_user` is `Some` whenever
+                // `matched_memberships` is non-empty (both are
+                // populated in the same loop).
+                let user = any_verified_user.expect(
+                    "MAPPS-551: any_verified_user set when matched_memberships is non-empty",
+                );
                 self.ensure_principal_usable(&user).await?;
                 if let Some(response) = self
                     .check_login_approval(
@@ -3407,7 +3426,7 @@ impl AuthService {
                     needs_selection: true,
                     needs_setup: false,
                     identity_token: Some(identity_token),
-                    memberships: Some(memberships),
+                    memberships: Some(matched_memberships),
                 })
             }
         }
