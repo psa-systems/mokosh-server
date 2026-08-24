@@ -63,6 +63,37 @@ const MAX_TENANT_NAME_LEN: usize = 255;
 ///
 /// The possessive is always `'s`, including after a trailing s ("Chris's
 /// workspace"), which is the common style and avoids branching on spelling.
+/// MAPPS-554: extract an explicit non-default port out of a base-URL
+/// string. Returns `Some(port)` only when the URL has an explicit
+/// `host:port` (colon-and-digits between the host and the next path
+/// slash) AND the port is non-standard for the scheme (80 for http,
+/// 443 for https). `None` for a bare `https://example.com` or a
+/// malformed input. Used to carry the dev port from
+/// `frontend_base_url` over onto the tenant-subdomain URL when the
+/// portal_host_suffix itself lacks a port (dev
+/// `PORTAL_HOST_SUFFIX=.client.localhost`).
+///
+/// Intentionally string-based to avoid taking a `url` crate dep just
+/// for this one call site.
+fn extract_explicit_port(base_url: &str) -> Option<u16> {
+    let (scheme, rest) = base_url.split_once("://")?;
+    let host_and_port = rest.split('/').next()?;
+    let (_host, port_str) = host_and_port.rsplit_once(':')?;
+    // A `:` inside an IPv6 literal wrapped in brackets would trip this,
+    // but the config values we see here are always hostname-based.
+    let port = port_str.parse::<u16>().ok()?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    if port == default_port {
+        None
+    } else {
+        Some(port)
+    }
+}
+
 fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String {
     let from_given = given_name
         .map(str::trim)
@@ -711,16 +742,33 @@ impl TenantService {
             return;
         }
 
-        // Build the tenant subdomain portal URL. `<scheme>://<slug><suffix>`
-        // mirrors `client_portal_url` below (both use the same suffix), so
-        // the setup link and the portal-root link land on the same origin.
+        // Build the tenant subdomain portal URL.
+        //
+        // MAPPS-554 fix (2026-08-24 operator report): the naive
+        // `<scheme>://<slug><suffix>` shape lost the dev port. Dev
+        // `PORTAL_HOST_SUFFIX=.client.localhost` on the server plus a
+        // frontend served at `http://localhost:4301` = the emailed link
+        // resolved to `http://<slug>.client.localhost/portal/set-password?token=...`
+        // (port 80), which nothing serves, so the customer saw "This
+        // link is expired or invalid" the first time they clicked it.
+        // Carry the port over from `frontend_base_url` when the URL
+        // has an explicit non-default port so the emitted link stays
+        // reachable in dev. Prod URLs (`https://msp.<apex>` on 443,
+        // no port in the base URL) are unaffected.
         let slug = slugify(tenant_slug);
         let scheme = if portal_suffix.contains("localhost") {
             "http"
         } else {
             "https"
         };
-        let portal_origin = format!("{scheme}://{slug}{portal_suffix}");
+        let port = self
+            .frontend_base_url
+            .as_deref()
+            .and_then(extract_explicit_port);
+        let portal_origin = match port {
+            Some(p) => format!("{scheme}://{slug}{portal_suffix}:{p}"),
+            None => format!("{scheme}://{slug}{portal_suffix}"),
+        };
         let setup_link = format!("{portal_origin}/portal/set-password?token={token}");
         let client_portal_url = portal_origin;
 

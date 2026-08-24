@@ -198,8 +198,14 @@ async fn create_tenant_copies_auth_welcome_template_and_rule(pool: PgPool) {
 async fn create_tenant_emails_portal_admin_setup_link(pool: PgPool) {
     let notifications =
         NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
+    // MAPPS-554 dev-port pin: pass a `http://host:PORT` frontend base URL
+    // so the emitted portal URL should preserve the port. Regression
+    // gate for the operator's 2026-08-24 report ("This link is
+    // expired or invalid" on first click) - pre-fix the emitted URL
+    // lost the dev port because portal_host_suffix does not carry
+    // one, and browsers hit port 80 where nothing serves.
     let svc = TenantService::new(Database::from_pool(pool.clone()))
-        .with_dispatcher(notifications, "https://spa.test".into())
+        .with_dispatcher(notifications, "http://spa.test:4301".into())
         .with_portal_host_suffix(".client.spa.test");
 
     let req = CreateTenantRequest {
@@ -293,8 +299,12 @@ async fn create_tenant_emails_portal_admin_setup_link(pool: PgPool) {
         queued.0, req.admin_email,
         "queued email must be addressed to the freshly-created portal admin contact"
     );
+    // MAPPS-554: URL carries the port from `frontend_base_url` when
+    // `portal_host_suffix` lacks one (dev). https for the non-localhost
+    // suffix (see the dev-vs-prod scheme derivation in
+    // `mint_and_send_portal_welcome`).
     let expected_prefix = format!(
-        "https://{}.client.spa.test/portal/set-password?token=",
+        "https://{}.client.spa.test:4301/portal/set-password?token=",
         req.slug,
     );
     assert!(
@@ -310,6 +320,42 @@ async fn create_tenant_emails_portal_admin_setup_link(pool: PgPool) {
     assert!(
         !queued.1.is_empty(),
         "queued subject must be non-empty so the mail client renders a subject line"
+    );
+
+    // MAPPS-554 end-to-end: the emailed token must be redeemable via
+    // `PortalAuthService::setup_password`. Extracts the token straight
+    // out of the queued email body, feeds it to the same service the
+    // portal handler calls, and asserts the redemption returns 204 +
+    // writes `portal_password_hash`. Regression gate for the operator's
+    // 2026-08-24 report: "This link is expired or invalid. Ask your
+    // account team for a new one. But this is a brand new and fresh
+    // link only clicked ONCE!"
+    let token = queued
+        .2
+        .split(&expected_prefix)
+        .nth(1)
+        .and_then(|tail| {
+            tail.split(|c: char| c == '"' || c == '<' || c == ' ' || c == '\n')
+                .next()
+        })
+        .expect("extract token from queued body");
+    let portal_svc = mokosh_server::modules::portal::PortalAuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-jwt-secret".to_string(),
+    );
+    portal_svc
+        .setup_password(token, "MAPPS-554-fresh-token-pass-01!")
+        .await
+        .expect("fresh token from create_tenant welcome must redeem cleanly");
+    let hash: Option<String> =
+        sqlx::query_scalar("SELECT portal_password_hash FROM contacts WHERE id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_password_hash");
+    assert!(
+        hash.is_some(),
+        "MAPPS-554: setup_password must persist portal_password_hash on redemption"
     );
 }
 
