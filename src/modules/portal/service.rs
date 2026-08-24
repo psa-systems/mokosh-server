@@ -1648,6 +1648,29 @@ impl PortalAuthService {
         Ok(enabled.unwrap_or(false))
     }
 
+    /// MAPPS-557: fail-closed check that the portal's owning tenant is
+    /// `status = 'active'`. Called by `portal_auth_middleware` on every
+    /// authenticated portal request so a `TenantService::suspend_tenant`
+    /// call kicks live portal sessions on the NEXT fetch (previously
+    /// a live session survived until its 15-min access token expired,
+    /// since only the login + refresh paths gated on tenant status).
+    ///
+    /// Mirrors `AuthService::ensure_tenant_active`. Reads `tenants` on
+    /// the app pool (tenants is RLS-exempt per migration 038, so no
+    /// GUC needed) with one indexed by-id SELECT. Returns
+    /// `AppError::Forbidden` for any status other than 'active' and
+    /// for a missing tenant row.
+    pub async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+        match status.as_deref() {
+            Some("active") => Ok(()),
+            _ => Err(AppError::Forbidden("This portal is not active".to_string())),
+        }
+    }
+
     /// MAPPS-556: read `contacts.portal_role` for the caller. `Ok(None)`
     /// covers both a NULL column (pre-554 rows, no role concept) and
     /// a missing / non-portal contact (extractor treats both alike -

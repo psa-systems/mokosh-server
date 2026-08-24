@@ -982,3 +982,78 @@ async fn portal_me_includes_portal_role(pool: PgPool) {
         );
     }
 }
+
+/// MAPPS-557: a live portal session must die on the NEXT request
+/// after `TenantService::suspend_tenant` flips `tenants.status`, not
+/// after the 15-min access-token TTL. Pre-557 the middleware trusted
+/// the JWT for the full access window because only login + refresh
+/// gated on tenant status; post-557 the middleware calls
+/// `PortalAuthService::ensure_tenant_active` on every authenticated
+/// request and degrades the auth state to unauthenticated when the
+/// tenant is not active. Downstream extractors then 401 in the
+/// standard shape.
+#[sqlx::test]
+async fn portal_request_against_suspended_tenant_returns_401(pool: PgPool) {
+    let company = seed_company(&pool, "MAPPS-557 Co").await;
+    seed_portal_contact(&pool, company, "suspended@mapps557.example").await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = portal_token(&app, "suspended@mapps557.example").await;
+
+    // Sanity: the fresh session works.
+    let before = app
+        .client
+        .get(app.url("/api/v1/portal/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("GET /portal/auth/me before suspend");
+    assert!(
+        before.status().is_success(),
+        "portal/auth/me for a live session should 200 before suspend, got {}",
+        before.status()
+    );
+
+    // Suspend the tenant directly on the DB (bypasses the API to
+    // keep the test focused on the middleware gate, not the suspend
+    // endpoint).
+    sqlx::query("UPDATE tenants SET status = 'suspended' WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(&pool)
+        .await
+        .expect("suspend tenant");
+
+    let after = app
+        .client
+        .get(app.url("/api/v1/portal/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("GET /portal/auth/me after suspend");
+    assert_eq!(
+        after.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "MAPPS-557: portal request after suspend must 401 on the next fetch, got {}",
+        after.status()
+    );
+
+    // Reactivating restores access on the next request (no cache).
+    sqlx::query("UPDATE tenants SET status = 'active' WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(&pool)
+        .await
+        .expect("reactivate tenant");
+
+    let restored = app
+        .client
+        .get(app.url("/api/v1/portal/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("GET /portal/auth/me after reactivate");
+    assert!(
+        restored.status().is_success(),
+        "MAPPS-557: portal request after reactivate must 200, got {}",
+        restored.status()
+    );
+}

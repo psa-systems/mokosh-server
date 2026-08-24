@@ -38,6 +38,30 @@ pub async fn portal_auth_middleware(
     let auth_state = match bearer(&request) {
         Some(token) => match state.service.decode_token(token) {
             Ok(claims) => {
+                // MAPPS-557: gate on tenant status BEFORE trusting the
+                // JWT further. A suspended tenant's live portal
+                // sessions must die on the next request, not after
+                // the 15-min access token TTL. `ensure_tenant_active`
+                // 403s for anything other than status='active'; here
+                // we degrade that to unauthenticated so the downstream
+                // extractors (`RequirePortalAuth` /
+                // `RequirePortalAdmin`) return 401 in the standard
+                // shape rather than 403 mid-chain.
+                if state
+                    .service
+                    .ensure_tenant_active(claims.tid)
+                    .await
+                    .is_err()
+                {
+                    tracing::info!(
+                        tenant_id = %claims.tid,
+                        contact_id = %claims.sub,
+                        "portal request rejected: owning tenant is not active",
+                    );
+                    request.extensions_mut().insert(PortalAuthState::default());
+                    request.extensions_mut().insert(state.clone());
+                    return next.run(request).await;
+                }
                 // Names are not minted into the JWT (PII minimisation), so
                 // hydrate them from the contacts row (PMS-195). A missing
                 // row or read error degrades to empty names rather than
