@@ -35,6 +35,13 @@ jobs:
     # probes. Base fails at `linker cc not found` (PMS-705, CLAUDE-203).
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
+    # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
+    # 2026-08-24 took 1.9-9.0 minutes, median 3.5. The headroom is for a cold
+    # `rust-cache`, which none of those runs exercised and which recompiles the
+    # whole workspace. No step here has a reporting block to protect, so this
+    # is the job bound only, with no inner `timeout` wrapper.
+    timeout-minutes: 30
+
     steps:
       - name: Clone the repository
         # fetch-depth: 0 so the migration-immutability check can diff against

@@ -52,6 +52,12 @@ jobs:
     # Base label: the musl compile happens inside `docker buildx`, so the runner
     # only needs docker, nu and git. Nothing compiles natively here.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+
+    # Backstop, not a target (PMS-829): 10 green runs took 6.3-20.5 minutes,
+    # median 14.8. The headroom is for a cold `type=gha` cache, where the
+    # dependency layer recompiles ~330 crates (PMS-781); the wedge this bounds
+    # is a registry or cache round trip that never returns.
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
