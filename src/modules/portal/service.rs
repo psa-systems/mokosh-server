@@ -998,6 +998,41 @@ impl PortalAuthService {
         )
     }
 
+    /// MAPPS-559: like [`resolve_host_tenant`] but does NOT filter on
+    /// `status = 'active'`. Used by the `/portal/host` branding hint
+    /// endpoint so a suspended / cancelled tenant still resolves and
+    /// the SPA can render a "This client is suspended" splash rather
+    /// than a login form that will always 401. Returns `(name,
+    /// branding, status)` so the caller doesn't have to distinguish
+    /// active from inactive at the SQL layer.
+    ///
+    /// Enumeration posture: this DOES leak "yes, this slug is a real
+    /// tenant" for slugs that were once real. The operator's UX cost
+    /// of hiding a real suspend state behind 404 (customer can't
+    /// tell if the portal is dead or their memory of the URL is
+    /// wrong) outweighs that leak. Login itself stays enumeration-
+    /// resistant via `resolve_host_tenant` (which still 404s inactive).
+    #[tracing::instrument(skip_all)]
+    pub async fn resolve_host_tenant_including_inactive(
+        &self,
+        slug: &str,
+    ) -> AppResult<Option<(String, PortalBranding, String)>> {
+        let row: Option<(String, serde_json::Value, String)> = sqlx::query_as(
+            r#"
+                SELECT name, branding, status
+                FROM tenants
+                WHERE slug = $1
+                "#,
+        )
+        .bind(slug)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        Ok(row.map(|(display_name, branding, status)| {
+            (display_name, PortalBranding::from_jsonb(&branding), status)
+        }))
+    }
+
     /// PMS-501: persist one more failed portal login for `contact_id` and
     /// arm the exponential-backoff lockout once the failures cross the
     /// threshold (see [`lockout_until`]). Runs on the migrator pool for the
@@ -1094,8 +1129,27 @@ impl PortalAuthService {
     ///   stale token is indistinguishable from an expired one.
     #[tracing::instrument(skip_all)]
     pub async fn setup_password(&self, token: &str, new_password: &str) -> AppResult<()> {
-        let (contact_id, secret) = parse_contact_bound_token(token)
-            .ok_or_else(|| AppError::BadRequest("Invalid or expired setup token".to_string()))?;
+        // MAPPS-559: diagnostic logging around the setup-password path.
+        // The operator's 2026-08-24 report ("This link is expired or
+        // invalid" on a fresh link that redeems cleanly in the tenants
+        // test) hinges on being able to see WHY the token rejected -
+        // parse fail vs no-candidates vs verify-mismatch vs
+        // used/expired look identical from the client. INFO-level
+        // (not warn) because a legitimate expired/replayed token also
+        // lands here and we do not want to page on that.
+        let token_len = token.len();
+        let (contact_id, secret) = match parse_contact_bound_token(token) {
+            Some(pair) => pair,
+            None => {
+                tracing::info!(
+                    token_len,
+                    "MAPPS-559: portal setup-password rejected: token failed to parse (not `{{uuid}}.{{secret}}`)",
+                );
+                return Err(AppError::BadRequest(
+                    "Invalid or expired setup token".to_string(),
+                ));
+            }
+        };
 
         // All tokens ever minted for this contact, newest first. We need the
         // used/expired rows too so a replay can be told apart from an expired
@@ -1121,22 +1175,51 @@ impl PortalAuthService {
             .fetch_all(self.db.migrator_pool())
             .await?;
 
+        if candidates.is_empty() {
+            tracing::info!(
+                contact_id = %contact_id,
+                "MAPPS-559: portal setup-password rejected: no portal_setup_tokens rows for that contact_id (was the contact created by a different code path? does the contact exist?)",
+            );
+        }
+
         let mut matched: Option<(Uuid, Uuid)> = None; // (token_id, tenant_id)
+        let mut verify_mismatches: usize = 0;
         for (token_id, tenant_id, token_hash, used_at, expires_at) in &candidates {
             if verify_password(secret, token_hash)? {
                 if used_at.is_some() {
+                    tracing::info!(
+                        token_id = %token_id,
+                        contact_id = %contact_id,
+                        tenant_id = %tenant_id,
+                        "MAPPS-559: portal setup-password rejected: token already used (410 Gone)",
+                    );
                     return Err(AppError::Gone("Setup token already used".to_string()));
                 }
                 if *expires_at <= Utc::now() {
+                    tracing::info!(
+                        token_id = %token_id,
+                        contact_id = %contact_id,
+                        tenant_id = %tenant_id,
+                        expires_at = %expires_at,
+                        "MAPPS-559: portal setup-password rejected: token expired",
+                    );
                     return Err(AppError::BadRequest(
                         "Invalid or expired setup token".to_string(),
                     ));
                 }
                 matched = Some((*token_id, *tenant_id));
                 break;
+            } else {
+                verify_mismatches += 1;
             }
         }
         let Some((token_id, tenant_id)) = matched else {
+            tracing::info!(
+                contact_id = %contact_id,
+                candidate_count = candidates.len(),
+                verify_mismatches,
+                "MAPPS-559: portal setup-password rejected: secret did not verify against any token_hash for this contact (candidates checked but no hash matched the presented secret)",
+            );
             return Err(AppError::BadRequest(
                 "Invalid or expired setup token".to_string(),
             ));

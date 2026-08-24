@@ -589,3 +589,50 @@ async fn host_hint_rate_limits_per_ip(pool: PgPool) {
     let body: serde_json::Value = over.json().await.expect("429 body");
     assert_eq!(body["error"].as_str(), Some("rate_limited"));
 }
+
+// MAPPS-559: `/portal/host` now returns 200 with `status:"suspended"`
+// (or `"cancelled"`) for a known-but-inactive tenant so the SPA can
+// render a "This client is suspended" splash instead of the login
+// form. Pre-559 the endpoint fail-closed 404'd for anything other
+// than `status='active'`, which forced the SPA to render the generic
+// login form + let the eventual login POST 401 with misleading
+// "Invalid email or password" copy.
+#[sqlx::test]
+async fn host_hint_returns_suspended_for_inactive_tenant(pool: PgPool) {
+    seed_tenant(&pool, "acme", "Acme MSP", None).await;
+    sqlx::query("UPDATE tenants SET status = 'suspended' WHERE slug = $1")
+        .bind("acme")
+        .execute(&pool)
+        .await
+        .expect("suspend Acme");
+    let app = common::boot_with_portal_host(pool, portal_host_enabled()).await;
+
+    let resp = portal_host_hint(&app, "acme.client.a8n.systems").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "MAPPS-559: /portal/host must 200 for a known-but-suspended tenant"
+    );
+    let body: serde_json::Value = resp.json().await.expect("host hint body");
+    assert_eq!(body["name"].as_str(), Some("Acme MSP"));
+    assert_eq!(
+        body["status"].as_str(),
+        Some("suspended"),
+        "MAPPS-559: /portal/host must echo the raw tenant status so the SPA can render a suspended splash"
+    );
+}
+
+// MAPPS-559: unknown slug still 404s (enumeration-resistant for the
+// "does this MSP exist at all" question). Regression pin so the
+// suspend/cancelled 200 does not accidentally leak unknown-slug info.
+#[sqlx::test]
+async fn host_hint_still_404s_unknown_slug(pool: PgPool) {
+    let app = common::boot_with_portal_host(pool, portal_host_enabled()).await;
+
+    let resp = portal_host_hint(&app, "ghost.client.a8n.systems").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "MAPPS-559: /portal/host must still 404 for an unknown slug"
+    );
+}

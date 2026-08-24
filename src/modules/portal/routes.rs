@@ -821,12 +821,26 @@ async fn host_hint(
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return Ok(resp);
     }
-    let tenant = lookup_host_tenant(&state, &headers)
+    // MAPPS-559: resolve the slug INCLUDING suspended / cancelled
+    // tenants so the SPA can render a "This client is suspended"
+    // splash instead of a login form that will always 401. A
+    // completely unknown slug still 404s (enumeration-resistant for
+    // "does this MSP exist at all").
+    let Some(host_hdr) = effective_host(&headers) else {
+        return Err(AppError::NotFound("portal host".to_string()));
+    };
+    let Some(slug) = state.host_config.extract_slug(host_hdr) else {
+        return Err(AppError::NotFound("portal host".to_string()));
+    };
+    let (name, branding, status) = state
+        .service
+        .resolve_host_tenant_including_inactive(&slug)
         .await?
-        .ok_or(AppError::NotFound("portal host".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("portal host".to_string()))?;
     Ok(Json(PortalHostHint {
-        name: tenant.display_name,
-        branding: tenant.branding,
+        name,
+        status,
+        branding,
     })
     .into_response())
 }

@@ -794,9 +794,17 @@ impl TenantService {
             .await
         {
             Ok(_) => {
+                // MAPPS-559: log the emitted setup_link so an operator
+                // troubleshooting "This link is expired or invalid"
+                // can eyeball whether the URL that shipped matches
+                // what the customer clicked. The token embedded in
+                // the URL is single-use; logging it is fine (a leak
+                // is no worse than the leak that already happens by
+                // emailing it).
                 tracing::info!(
                     tenant_id = %tenant_id,
                     contact_id = %contact_id,
+                    setup_link = %setup_link,
                     "MAPPS-554: portal admin welcome email queued via notifications dispatcher",
                 );
             }

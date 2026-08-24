@@ -450,11 +450,19 @@ impl PortalBranding {
 }
 
 /// PMS-729: response body for `GET /api/v1/portal/host`. Returns the
-/// active tenant's display name + full branding surface so the SPA
-/// can paint MSP-owned chrome (logo, favicon, primary color, welcome
-/// message, support contact) before a session exists. Fail-closed:
-/// an unknown or malformed host returns `404 Not Found` with an empty
-/// body so the endpoint cannot be used to enumerate live MSPs.
+/// tenant's display name + full branding surface so the SPA can paint
+/// MSP-owned chrome (logo, favicon, primary color, welcome message,
+/// support contact) before a session exists.
+///
+/// Enumeration posture (MAPPS-559): a MALFORMED host still 404s (empty
+/// body) so the endpoint cannot be used to fish for MSPs. But a known
+/// tenant whose `status != 'active'` (suspended / cancelled) now
+/// returns a 200 with the branding + a `status` field so the portal
+/// SPA can render "This client is suspended" splash instead of the
+/// generic login form. This narrows enumeration only to slugs that
+/// were once real; the operator's UX cost of hiding a real suspend
+/// state behind a 404 outweighs the info-leak of "yes, this MSP
+/// exists but is not accepting logins right now".
 ///
 /// PMS-729 phase 2 §6: extended from `{name, logo_url}` to carry the
 /// full branding shape via [`PortalBranding`] (flattened into the
@@ -463,6 +471,10 @@ impl PortalBranding {
 #[derive(Debug, Clone, Serialize)]
 pub struct PortalHostHint {
     pub name: String,
+    /// MAPPS-559: raw `tenants.status` value (`'active' | 'suspended'
+    /// | 'cancelled'`). The SPA gates the login form on `status ==
+    /// "active"` and renders a suspended splash otherwise.
+    pub status: String,
     #[serde(flatten)]
     pub branding: PortalBranding,
 }
