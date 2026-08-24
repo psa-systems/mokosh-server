@@ -314,7 +314,7 @@ impl TenantService {
         .execute(&mut *tx)
         .await?;
 
-        // MAPPS-554: no `users` row for the client admin. Pre-554 the
+        // MAPPS-554: no `users` row for the client ADMIN. Pre-554 the
         // provisioner inserted a `users` row (`role='admin',
         // status='pending'`) and mailed a mokosh-workspace setup link
         // pointing at `/set-password/<user-token>`. The operator's
@@ -326,6 +326,32 @@ impl TenantService {
         // row are provisioned after this tx commits (once `ensure_own_company`
         // has minted the tenant's own_company for the contact FK), via
         // `provision_portal_admin_and_send_welcome` below. See MAPPS-554.
+        //
+        // MAPPS-562: even though NO human user gets a users row,
+        // several server code paths still need SOME users row to
+        // attribute writes to (tickets.created_by_id is a NOT NULL
+        // FK to users; email intake + portal ticket creation +
+        // portal note acceptance all fall back to
+        // `SELECT id FROM users WHERE tenant_id=$1 AND status='active'
+        // AND role IN ('super_admin','admin','manager') ORDER BY
+        // created_at LIMIT 1`). Insert a hidden "system" row whose
+        // email is a reserved suffix and whose password_hash is NULL
+        // (AuthService::login 401s on NULL hash so the row is
+        // unloginable). Migration 137 backfills the same shape for
+        // pre-562 tenants. The MAPPS-498 mirror trigger will fan
+        // this insert out to identities + memberships; both stay
+        // unloginable since there is no password_hash.
+        sqlx::query(
+            r#"
+            INSERT INTO users (tenant_id, email, first_name, last_name, role, status)
+            VALUES ($1, 'system+' || $2 || '@mokosh.local',
+                    'System', 'Attribution', 'admin', 'active')
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&slug)
+        .execute(&mut *tx)
+        .await?;
 
         // The `tenants` table is keyed by `id` alone (it has no `tenant_id`
         // column), so the snapshot filters on `id`.
@@ -1572,10 +1598,16 @@ impl TenantService {
         // USING policies see app.current_tenant. Reads need no commit. PMS-256.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
-            .bind(tenant_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        // MAPPS-562: exclude the hidden system attribution users row
+        // from the operator-facing user count so a fresh tenant with no
+        // human users still reports zero, not one.
+        let user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users \
+             WHERE tenant_id = $1 AND email NOT LIKE 'system+%@mokosh.local'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
         let company_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM companies WHERE tenant_id = $1")

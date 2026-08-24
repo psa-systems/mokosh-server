@@ -1854,3 +1854,83 @@ async fn cancel_and_reactivate_flip_tenant_status(pool: PgPool) {
         "MAPPS-558: activate_tenant must un-cancel a Cancelled tenant"
     );
 }
+
+/// MAPPS-562: `create_tenant` must provision a hidden "system"
+/// `users` row so `tickets.created_by_id` (NOT NULL FK to users)
+/// has an attribution target on tenants that otherwise carry no
+/// admin/manager rows. Pre-562 the client provisioning path
+/// stopped inserting any users row (MAPPS-554), so portal ticket
+/// creation 500'd with CONFIGURATION_ERROR ("tenant has no
+/// admin/manager user to attribute it to"). Migration 137 backfills
+/// the same shape for pre-562 tenants.
+///
+/// Pins the row shape end-to-end: exists, role='admin' + status='active'
+/// (both required for the fallback query in
+/// TicketService::create_portal_ticket to see it), password_hash IS NULL
+/// (login is blocked - the row is unloginable by construction), email
+/// on the reserved suffix so a human user list can filter it out.
+#[sqlx::test]
+async fn create_tenant_provisions_system_attribution_user(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "MAPPS-562 System User".into(),
+        slug: "mapps562-system-user".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "admin@mapps562.example".into(),
+        admin_first_name: "Ada".into(),
+        admin_last_name: "Admin".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant");
+
+    let row: Option<(String, String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT email, role, status, password_hash, first_name, last_name \
+         FROM users WHERE tenant_id = $1 \
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(tenant.id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read attribution user");
+    let (email, role, status, password_hash, first_name, last_name) =
+        row.expect("MAPPS-562: create_tenant must insert exactly one hidden system users row");
+
+    assert_eq!(
+        email, "system+mapps562-system-user@mokosh.local",
+        "MAPPS-562: attribution user email uses the reserved suffix"
+    );
+    assert_eq!(role, "admin", "MAPPS-562: attribution user role='admin'");
+    assert_eq!(
+        status, "active",
+        "MAPPS-562: attribution user status='active'"
+    );
+    assert!(
+        password_hash.is_none(),
+        "MAPPS-562: attribution user password_hash is NULL so it cannot log in"
+    );
+    assert_eq!(first_name, "System");
+    assert_eq!(last_name, "Attribution");
+
+    // Also pin: the fallback query in TicketService::create_portal_ticket
+    // sees this row. If someone changes the row shape and forgets to update
+    // the query (or vice versa), this test fails first.
+    let fallback: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users \
+         WHERE tenant_id = $1 AND status = 'active' \
+         AND role IN ('super_admin', 'admin', 'manager') \
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(tenant.id)
+    .fetch_optional(&pool)
+    .await
+    .expect("run fallback query");
+    assert!(
+        fallback.is_some(),
+        "MAPPS-562: fallback query must find the system attribution user"
+    );
+}

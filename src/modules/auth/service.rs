@@ -2324,8 +2324,21 @@ impl AuthService {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
 
-        let mut data_conds: Vec<String> = vec!["tenant_id = $1".to_string()];
-        let mut count_conds: Vec<String> = vec!["tenant_id = $1".to_string()];
+        // MAPPS-562: the auto-provisioned system attribution users row
+        // (email = 'system+<slug>@mokosh.local', password_hash NULL,
+        // unloginable) exists only to satisfy the tickets.created_by_id
+        // FK on client-plane tenants. It's not a human user and must
+        // not appear in the operator-facing users list. Hide by the
+        // reserved email suffix so a future rename of the row shape
+        // doesn't quietly leak.
+        let mut data_conds: Vec<String> = vec![
+            "tenant_id = $1".to_string(),
+            "email NOT LIKE 'system+%@mokosh.local'".to_string(),
+        ];
+        let mut count_conds: Vec<String> = vec![
+            "tenant_id = $1".to_string(),
+            "email NOT LIKE 'system+%@mokosh.local'".to_string(),
+        ];
         let mut data_idx: i32 = 4;
         let mut count_idx: i32 = 2;
 

@@ -1189,3 +1189,77 @@ async fn portal_setup_password_redeems_the_token_create_tenant_mints(pool: PgPoo
         "MAPPS-560: server must include a password-policy message so the SPA can surface it, got: {weak_body:?}",
     );
 }
+
+/// MAPPS-562 end-to-end: a portal contact of a tenant provisioned via
+/// `TenantService::create_tenant` (the post-554 shape - NO admin user
+/// row for the client) must still be able to raise a ticket. Pre-562
+/// this returned 500 CONFIGURATION_ERROR because the create_portal_ticket
+/// fallback query found no admin/manager users row to attribute the
+/// ticket to. Post-562 the auto-provisioned system users row (migration
+/// 137 + TenantService::create_tenant insert) satisfies the fallback.
+///
+/// Uses the DEFAULT_TENANT test scaffold + manually seeds an additional
+/// system users row on it (matching what create_tenant does), because
+/// the portal test scaffold (`common::boot` + `portal_token`) is hardcoded
+/// to tenant_slug='default' at login time. The invariant we need to pin
+/// is "portal ticket creation succeeds without a human admin user";
+/// whether the row was inserted by TenantService::create_tenant or by
+/// migration 137 does not matter to the fallback query.
+#[sqlx::test]
+async fn portal_ticket_creation_uses_system_attribution_user_when_no_admin(pool: PgPool) {
+    // Deliberately do NOT call `common::seed_admin` - that's the pre-562
+    // reason the flow worked. Seed the MAPPS-562 system users row instead
+    // so the fallback query has something to find.
+    sqlx::query(
+        "INSERT INTO users (tenant_id, email, first_name, last_name, role, status) \
+         VALUES ($1, 'system+default@mokosh.local', 'System', 'Attribution', 'admin', 'active') \
+         ON CONFLICT (tenant_id, email) DO NOTHING",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("seed system attribution user");
+
+    let company = seed_company(&pool, "MAPPS-562 Co").await;
+    seed_portal_contact(&pool, company, "raise@mapps562.example").await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = portal_token(&app, "raise@mapps562.example").await;
+
+    let created = app
+        .client
+        .post(app.url("/api/v1/portal/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "title": "Printer down (MAPPS-562)" }))
+        .send()
+        .await
+        .expect("create portal ticket");
+    assert!(
+        created.status().is_success(),
+        "MAPPS-562: portal ticket create must 2xx when a system attribution user exists, got {}",
+        created.status()
+    );
+    let ticket: serde_json::Value = created.json().await.expect("ticket JSON");
+    let ticket_id: uuid::Uuid = ticket["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .expect("ticket id");
+
+    // Pin the attribution: the ticket's created_by_id must point at the
+    // system row (not a random human user, and not NULL).
+    let (created_by,): (uuid::Uuid,) =
+        sqlx::query_as("SELECT created_by_id FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read created_by_id");
+    let (attr_email,): (String,) = sqlx::query_as("SELECT email FROM users WHERE id = $1")
+        .bind(created_by)
+        .fetch_one(&pool)
+        .await
+        .expect("read attribution user email");
+    assert_eq!(
+        attr_email, "system+default@mokosh.local",
+        "MAPPS-562: portal-created tickets attribute to the system users row",
+    );
+}
