@@ -93,6 +93,18 @@ jobs:
         run: |
           nu scripts/check-pool-safety.nu
 
+      - name: Create/update validate parity
+        # PMS-867: `CreateXRequest` and `UpdateXRequest` describe the same row
+        # from two directions, so a `#[validate(...)]` on one side and nothing
+        # on the other is two contracts for one column. Over a max the update
+        # path answers 500 on a raw Postgres 22001 where create answers a 422
+        # naming the field; under a min it stores `""` where create refuses it.
+        # Fails loud if a same-named field's attributes differ without an
+        # allowlist row stating why.
+        shell: nu {0}
+        run: |
+          nu scripts/check-create-update-validate-parity.nu
+
       - name: Rate-limit helper
         # PMS-773: `rate_limited_response` builds every 429 (body, Retry-After,
         # no-store). It was copied instead of called three times because it was

@@ -23,6 +23,7 @@ one alone and you have not.
 | Migration immutability | `nu scripts/check-migration-immutability.nu` | `check-migration-immutability` | no |
 | No duplicate mail copy | `nu scripts/check-no-duplicate-mail-copy.nu` | `check-mail-copy` | no |
 | Pool safety (RLS tenant GUC) | `nu scripts/check-pool-safety.nu` | `check-pool-safety` | no |
+| Create/update validate parity | `nu scripts/check-create-update-validate-parity.nu` | `check-validate-parity` | no |
 | Rate-limit helper | `nu scripts/check-rate-limit-helper.nu` | `check-rate-limit-helper` | no |
 | Runner labels | `nu scripts/check-runner-labels.nu` | `check-runner-labels` | no |
 | OCI build cache | `nu scripts/check-oci-build-cache.nu` | `check-oci-cache` | no |
