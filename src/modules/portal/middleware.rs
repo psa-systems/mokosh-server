@@ -67,6 +67,11 @@ pub async fn portal_auth_middleware(
     };
 
     request.extensions_mut().insert(auth_state);
+    // MAPPS-556: also carry the middleware itself into extensions so
+    // downstream extractors (`RequirePortalAdmin`) can reach the
+    // shared `PortalAuthService` for a portal_role lookup. Cheap
+    // (arc clone); the middleware value is already a State handle.
+    request.extensions_mut().insert(state.clone());
     next.run(request).await
 }
 
@@ -100,6 +105,62 @@ where
         match auth_state.contact {
             Some(c) => Ok(RequirePortalAuth(c)),
             None => Err(AppError::Unauthorized),
+        }
+    }
+}
+
+/// MAPPS-556: extractor that yields the authenticated portal contact
+/// ONLY when they hold `contacts.portal_role = 'admin'` (or a NULL
+/// row, treated as admin-equivalent for pre-554 backwards compat).
+/// 401 when there is no portal session; 403 when the session belongs
+/// to a `portal_role = 'user'` contact.
+///
+/// Used to gate the sub-user management endpoints under
+/// `/portal/company/contacts` (invite, resend, deactivate) so
+/// non-admin portal users cannot mint / evict colleagues.
+///
+/// Runs one DB round-trip per gated call. The gated endpoints are
+/// low-frequency (invite / resend / remove), so the cost is fine.
+/// A future extension can cache the role on the JWT if that changes.
+#[derive(Clone)]
+pub struct RequirePortalAdmin(pub CurrentContact);
+
+impl<S> axum::extract::FromRequestParts<S> for RequirePortalAdmin
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_state = parts
+            .extensions
+            .get::<PortalAuthState>()
+            .cloned()
+            .unwrap_or_default();
+        let Some(contact) = auth_state.contact else {
+            return Err(AppError::Unauthorized);
+        };
+        let mw = parts
+            .extensions
+            .get::<PortalAuthMiddleware>()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "PortalAuthMiddleware not present in request extensions".to_string(),
+                )
+            })?;
+        let role = mw
+            .service
+            .contact_portal_role(contact.tenant_id, contact.id)
+            .await?;
+        match role.as_deref() {
+            Some("admin") | None => Ok(RequirePortalAdmin(contact)),
+            _ => Err(AppError::Forbidden(
+                "Only your account admin can perform this action.".to_string(),
+            )),
         }
     }
 }

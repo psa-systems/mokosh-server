@@ -21,7 +21,8 @@ use validator::Validate;
 use super::captcha::{TurnstileError, TurnstileGate};
 use super::host_tenant::{portal_origin_from_host, resolve_slug, PortalHostConfig};
 use super::middleware::{
-    portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth, RequirePortalSession,
+    portal_auth_middleware, PortalAuthMiddleware, RequirePortalAdmin, RequirePortalAuth,
+    RequirePortalSession,
 };
 use super::rate_limit::{PortalDecisionLimiter, PortalHostLimiter, PortalLoginLimiter};
 use super::service::PortalAuthService;
@@ -1030,7 +1031,7 @@ async fn list_company_contacts(
 /// emailed rather than returned.
 async fn invite_colleague(
     State(state): State<PortalRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
+    RequirePortalAdmin(contact): RequirePortalAdmin,
     headers: HeaderMap,
     Json(request): Json<PortalInviteColleagueRequest>,
 ) -> AppResult<Json<PortalInviteColleagueResponse>> {
@@ -1068,7 +1069,7 @@ async fn invite_colleague(
 /// `{slug}.client.<apex>/portal/set-password`.
 async fn resend_invite(
     State(state): State<PortalRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
+    RequirePortalAdmin(contact): RequirePortalAdmin,
     Path(target_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> AppResult<StatusCode> {
@@ -1100,7 +1101,7 @@ async fn resend_invite(
 /// refused (the customer should use /auth/logout for that).
 async fn deactivate_contact(
     State(state): State<PortalRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
+    RequirePortalAdmin(contact): RequirePortalAdmin,
     Path(target_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     state
@@ -1375,6 +1376,14 @@ async fn me(
         .contact_mfa_enabled(contact.tenant_id, contact.id)
         .await
         .unwrap_or(false);
+    // MAPPS-556: expose portal_role so the SPA can gate the
+    // sub-user management UI. Same "None = admin-equivalent" convention
+    // the server extractor uses; the client mirrors it.
+    let portal_role = state
+        .service
+        .contact_portal_role(contact.tenant_id, contact.id)
+        .await
+        .unwrap_or(None);
     Ok(Json(CurrentContactMe {
         id: contact.id,
         tenant_id: contact.tenant_id,
@@ -1383,6 +1392,7 @@ async fn me(
         first_name: contact.first_name,
         last_name: contact.last_name,
         mfa_enabled,
+        portal_role,
     }))
 }
 

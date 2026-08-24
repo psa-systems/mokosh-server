@@ -768,3 +768,217 @@ async fn portal_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
         );
     }
 }
+
+/// MAPPS-556: `POST /portal/company/contacts` is a portal-admin-only
+/// mutation. A caller whose `contacts.portal_role = 'user'` gets 403
+/// so a sub-user cannot mint or evict colleagues. Pin the gate at the
+/// HTTP layer since a service-only test would not exercise the
+/// `RequirePortalAdmin` extractor path.
+#[sqlx::test]
+async fn invite_colleague_from_user_returns_403(pool: PgPool) {
+    let company = seed_company(&pool, "MAPPS-556 Co").await;
+    // Sub-user: is_portal_user = TRUE + portal_role = 'user'. Uses a
+    // real password hash so /portal/auth/login gives them a token.
+    let hash =
+        mokosh_server::utils::crypto::hash_password(PORTAL_PASSWORD).expect("hash portal password");
+    let sub_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO contacts (
+            id, tenant_id, company_id, first_name, last_name, email,
+            is_portal_user, portal_role, portal_password_hash
+        )
+        VALUES ($1, $2, $3, 'Sub', 'User', 'sub@mapps556.example', TRUE, 'user', $4)
+        "#,
+    )
+    .bind(sub_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .expect("seed sub-user contact");
+
+    let app = common::boot(pool.clone()).await;
+    let token = portal_token(&app, "sub@mapps556.example").await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/portal/company/contacts"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "first_name": "New",
+            "last_name": "Colleague",
+            "email": "new@mapps556.example",
+        }))
+        .send()
+        .await
+        .expect("invite POST");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "MAPPS-556: sub-user (portal_role='user') must not be able to invite colleagues"
+    );
+}
+
+/// MAPPS-556: `POST /portal/company/contacts` from a `portal_role='admin'`
+/// caller returns 200 with the fresh contact id (existing invite_colleague
+/// behavior, now behind RequirePortalAdmin).
+#[sqlx::test]
+async fn invite_colleague_from_admin_returns_id(pool: PgPool) {
+    let company = seed_company(&pool, "MAPPS-556 Admin Co").await;
+    let hash =
+        mokosh_server::utils::crypto::hash_password(PORTAL_PASSWORD).expect("hash portal password");
+    let admin_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO contacts (
+            id, tenant_id, company_id, first_name, last_name, email,
+            is_portal_user, portal_role, portal_password_hash
+        )
+        VALUES ($1, $2, $3, 'Admin', 'User', 'admin@mapps556.example', TRUE, 'admin', $4)
+        "#,
+    )
+    .bind(admin_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .expect("seed admin contact");
+
+    let app = common::boot(pool.clone()).await;
+    let token = portal_token(&app, "admin@mapps556.example").await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/portal/company/contacts"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "first_name": "New",
+            "last_name": "Colleague",
+            "email": "invited@mapps556.example",
+        }))
+        .send()
+        .await
+        .expect("invite POST");
+    assert!(
+        resp.status().is_success(),
+        "MAPPS-556: portal_role='admin' must be able to invite, got {}",
+        resp.status(),
+    );
+    let body: serde_json::Value = resp.json().await.expect("invite JSON");
+    assert!(body["id"].as_str().is_some(), "invite response returns id");
+
+    // Post-554 invite path also pins the new colleague to
+    // portal_role='user' so a future sub-user cannot themselves invite.
+    let invited_role: Option<String> = sqlx::query_scalar(
+        "SELECT portal_role FROM contacts WHERE tenant_id = $1 AND email = 'invited@mapps556.example'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("read invited contact portal_role");
+    assert_eq!(
+        invited_role.as_deref(),
+        Some("user"),
+        "MAPPS-556: invite_colleague must INSERT portal_role='user' explicitly"
+    );
+}
+
+/// MAPPS-556: pre-554 portal contacts have `portal_role = NULL` (the
+/// column did not exist at their creation time). The extractor treats
+/// NULL as admin-equivalent so their invite privilege - which they
+/// held before this ticket - keeps working. Regression gate against a
+/// silent demotion of pre-554 rows.
+#[sqlx::test]
+async fn invite_colleague_from_legacy_null_role_still_works(pool: PgPool) {
+    let company = seed_company(&pool, "MAPPS-556 Legacy Co").await;
+    // Same shape as `seed_portal_contact` - portal_role stays NULL,
+    // matching pre-554 agent-flipped `is_portal_user` rows.
+    seed_portal_contact(&pool, company, "legacy@mapps556.example").await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = portal_token(&app, "legacy@mapps556.example").await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/portal/company/contacts"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "first_name": "New",
+            "last_name": "Colleague",
+            "email": "legacy-invited@mapps556.example",
+        }))
+        .send()
+        .await
+        .expect("invite POST");
+    assert!(
+        resp.status().is_success(),
+        "MAPPS-556: pre-554 portal_role=NULL row must keep invite privilege (admin-equivalent), got {}",
+        resp.status(),
+    );
+}
+
+/// MAPPS-556: `GET /portal/auth/me` carries `portal_role` so the SPA
+/// can gate the sub-user management UI without a second round-trip.
+/// Pins all three role states (admin / user / NULL) in one shot.
+#[sqlx::test]
+async fn portal_me_includes_portal_role(pool: PgPool) {
+    let company = seed_company(&pool, "MAPPS-556 Me Co").await;
+    let hash =
+        mokosh_server::utils::crypto::hash_password(PORTAL_PASSWORD).expect("hash portal password");
+    for (email, role) in [
+        ("me-admin@mapps556.example", Some("admin")),
+        ("me-user@mapps556.example", Some("user")),
+    ] {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO contacts (
+                id, tenant_id, company_id, first_name, last_name, email,
+                is_portal_user, portal_role, portal_password_hash
+            )
+            VALUES ($1, $2, $3, 'Me', 'Test', $4, TRUE, $5, $6)
+            "#,
+        )
+        .bind(id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(company)
+        .bind(email)
+        .bind(role)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("seed me-test contact");
+    }
+    // Legacy pre-554 row: portal_role stays NULL.
+    seed_portal_contact(&pool, company, "me-legacy@mapps556.example").await;
+
+    let app = common::boot(pool.clone()).await;
+    for (email, expected) in [
+        ("me-admin@mapps556.example", Some("admin")),
+        ("me-user@mapps556.example", Some("user")),
+        ("me-legacy@mapps556.example", None::<&str>),
+    ] {
+        let token = portal_token(&app, email).await;
+        let resp = app
+            .client
+            .get(app.url("/api/v1/portal/auth/me"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("GET /portal/auth/me");
+        assert!(
+            resp.status().is_success(),
+            "portal/auth/me for {email} should 200, got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("me JSON");
+        assert_eq!(
+            body["portal_role"].as_str(),
+            expected,
+            "MAPPS-556: /portal/auth/me must echo portal_role for {email}"
+        );
+    }
+}

@@ -85,6 +85,14 @@ pub struct CurrentContactMe {
     /// lets the login SPA decide (later) whether to short-circuit the
     /// MFA prompt entirely.
     pub mfa_enabled: bool,
+    /// MAPPS-556: `contacts.portal_role` (`'admin' | 'user' | NULL`).
+    /// The SPA reads this to render the sub-user management UI only
+    /// for admins. `None` = pre-554 row with no role concept; the
+    /// SPA treats it as admin-equivalent to keep pre-554 portal
+    /// contacts' privilege in place (server enforces the same
+    /// convention in `RequirePortalAdmin`).
+    #[serde(default)]
+    pub portal_role: Option<String>,
 }
 
 /// `POST /api/v1/portal/auth/login` request body.

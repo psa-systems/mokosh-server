@@ -1648,6 +1648,30 @@ impl PortalAuthService {
         Ok(enabled.unwrap_or(false))
     }
 
+    /// MAPPS-556: read `contacts.portal_role` for the caller. `Ok(None)`
+    /// covers both a NULL column (pre-554 rows, no role concept) and
+    /// a missing / non-portal contact (extractor treats both alike -
+    /// the token was verifed so the contact exists, and a stale JWT
+    /// against a since-demoted row also lands here). Callers decide
+    /// whether NULL is admin-equivalent (`RequirePortalAdmin` does;
+    /// `/portal/auth/me` exposes it verbatim for the SPA to gate on).
+    pub async fn contact_portal_role(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<Option<String>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let role: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT portal_role FROM contacts \
+             WHERE tenant_id = $1 AND id = $2 AND is_portal_user = TRUE",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(role.flatten())
+    }
+
     /// PMS-729 phase 2 H4: start portal MFA enrollment. Generates a
     /// fresh TOTP secret, stores it on the contact row, and returns
     /// the base32 secret + `otpauth://` provisioning URI for the SPA
@@ -3091,8 +3115,8 @@ impl PortalAuthService {
             r#"
             INSERT INTO contacts (
                 id, tenant_id, company_id, first_name, last_name, email,
-                is_portal_user, contact_type
-            ) VALUES ($1, $2, $3, $4, $5, $6, TRUE, 'other')
+                is_portal_user, portal_role, contact_type
+            ) VALUES ($1, $2, $3, $4, $5, $6, TRUE, 'user', 'other')
             "#,
         )
         .bind(contact_id)
@@ -3103,6 +3127,13 @@ impl PortalAuthService {
         .bind(&email_norm)
         .execute(&mut *tx)
         .await?;
+        // MAPPS-556: portal_role='user' distinguishes post-554
+        // invited sub-users from the tenant's provisioned admin
+        // (portal_role='admin', TenantService::create_tenant) and
+        // from pre-554 rows (portal_role NULL, agent-flipped
+        // is_portal_user). RequirePortalAdmin treats NULL as
+        // admin-equivalent for backwards compat so pre-554 agent-
+        // enabled portal contacts keep their invite privilege.
 
         // Mint the setup token in the SAME tx so a rollback cleans up
         // both. Format `{contact_id}.{secret}` matches the shape the
