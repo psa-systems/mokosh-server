@@ -93,6 +93,15 @@ pub fn auth_routes(
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
         .route("/reset-password", post(reset_password))
+        // MAPPS-552: SetPasswordPage reads this on mount to render
+        // "Set your password for [Client Name]" instead of a generic
+        // heading. Public (token IS the credential). 404 on unknown /
+        // expired token so an attacker cannot enumerate valid tokens
+        // via this surface.
+        .route(
+            "/set-password/context/{token}",
+            axum::routing::get(set_password_context),
+        )
         // Google OAuth
         .route("/google", get(google_authorize))
         .route("/google/callback", get(google_callback))
@@ -400,6 +409,28 @@ async fn reset_password(
     request.validate()?;
     state.auth_service.reset_password(&request).await?;
     Ok(())
+}
+
+/// MAPPS-552: return the tenant name + slug for the client-admin
+/// welcome flow so the SPA's `SetPasswordPage` can render a heading
+/// like "Set your password for Acme Co". Token IS the credential -
+/// no auth extractor. 404 for any invalid / expired / redeemed token
+/// so the shape does not enumerate valid tokens to an attacker.
+#[derive(serde::Serialize)]
+struct SetPasswordContext {
+    tenant_name: String,
+    tenant_slug: String,
+}
+
+async fn set_password_context(
+    State(state): State<AuthRouterState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> AppResult<Json<SetPasswordContext>> {
+    let (tenant_name, tenant_slug) = state.auth_service.set_password_context(&token).await?;
+    Ok(Json(SetPasswordContext {
+        tenant_name,
+        tenant_slug,
+    }))
 }
 
 /// Get current user endpoint

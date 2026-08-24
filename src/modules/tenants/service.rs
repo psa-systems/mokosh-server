@@ -611,7 +611,16 @@ impl TenantService {
             return;
         }
 
-        let setup_link = format!("{}/reset-password/{}", base_url, token);
+        // MAPPS-552: the welcome-email link goes to /set-password/{token},
+        // not /reset-password/{token}. The SPA has a dedicated
+        // `SetPasswordPage` at that route whose heading reads "Set
+        // your password for [Client Name]" so a fresh client-admin
+        // does not see a confusing "Reset your password" title.
+        // Post-MAPPS-551 the underlying POST /api/v1/auth/reset-password
+        // handler is the sole password-write path (setup + forgot),
+        // so no server routing change is needed here beyond the
+        // emitted URL.
+        let setup_link = format!("{}/set-password/{}", base_url, token);
         let display_name = match (admin_first_name.trim(), admin_last_name.trim()) {
             ("", "") => String::new(),
             (f, "") => f.to_string(),

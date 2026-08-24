@@ -1444,6 +1444,54 @@ impl AuthService {
 
     /// Reset password with token
     #[tracing::instrument(skip_all)]
+    /// MAPPS-552: pre-render metadata for the SPA's SetPasswordPage.
+    /// Consumes the same `{user_id}.{secret}` token shape the
+    /// welcome email carries, verifies it against
+    /// `password_reset_tokens`, and returns the tenant's
+    /// human-readable name + slug so the SPA can render
+    /// "Set your password for [Client Name]". No side effect: does
+    /// NOT mark the token used - the actual password write happens
+    /// on the subsequent `POST /reset-password`.
+    ///
+    /// Fail-closed: returns `NotFound` for any invalid, unknown,
+    /// expired, or already-redeemed token. Same error shape for
+    /// every failure mode so an attacker cannot enumerate valid
+    /// tokens through this surface.
+    pub async fn set_password_context(&self, token: &str) -> AppResult<(String, String)> {
+        let (user_id, secret) =
+            parse_user_bound_token(token).ok_or_else(|| AppError::NotFound("token".to_string()))?;
+        let candidates = sqlx::query_as::<_, (Uuid, String)>(
+            r#"
+            SELECT tenant_id, token_hash
+            FROM password_reset_tokens
+            WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(self.db.migrator_pool())
+        .await
+        .map_err(|_| AppError::NotFound("token".to_string()))?;
+
+        let mut matched_tenant: Option<Uuid> = None;
+        for (tenant_id, token_hash) in &candidates {
+            if verify_password(secret, token_hash).unwrap_or(false) {
+                matched_tenant = Some(*tenant_id);
+                break;
+            }
+        }
+        let tenant_id = matched_tenant.ok_or_else(|| AppError::NotFound("token".to_string()))?;
+
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT name, slug FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(self.db.migrator_pool())
+                .await
+                .map_err(|_| AppError::NotFound("token".to_string()))?;
+        let (name, slug) = row.ok_or_else(|| AppError::NotFound("token".to_string()))?;
+        Ok((name, slug))
+    }
+
     pub async fn reset_password(&self, request: &ResetPasswordRequest) -> AppResult<()> {
         if request.new_password != request.confirm_password {
             return Err(AppError::validation_field(
