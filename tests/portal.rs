@@ -1263,3 +1263,64 @@ async fn portal_ticket_creation_uses_system_attribution_user_when_no_admin(pool:
         "MAPPS-562: portal-created tickets attribute to the system users row",
     );
 }
+
+/// MAPPS-564: `GET /portal/auth/me/notification-preferences` used to
+/// 500 with DATABASE_ERROR because the underlying SQL aggregated
+/// `event_type` while referencing `channels` in a non-grouped
+/// subquery. Rewrote as LATERAL unnest + ARRAY_AGG. Pin: the
+/// endpoint returns 200 with the expected shape (available rules +
+/// caller preferences) when the tenant has multiple rules for the
+/// same event_type that share channels.
+#[sqlx::test]
+async fn portal_notification_preferences_lists_rules(pool: PgPool) {
+    let company = seed_company(&pool, "MAPPS-564 Co").await;
+    seed_portal_contact(&pool, company, "prefs@mapps564.example").await;
+
+    // Seed two active rules on the SAME event_type sharing channels
+    // so the pre-fix query would have hit the GROUP-BY error.
+    for i in 0..2 {
+        sqlx::query(
+            r#"
+            INSERT INTO notification_rules
+                (tenant_id, name, event_type, channels, recipients, is_active)
+            VALUES ($1, $2, 'ticket.assigned', ARRAY['email', 'in_app'],
+                    '{"recipients":[]}'::jsonb, TRUE)
+            "#,
+        )
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(format!("MAPPS-564 rule {i}"))
+        .execute(&pool)
+        .await
+        .expect("seed notification rule");
+    }
+
+    let app = common::boot(pool.clone()).await;
+    let token = portal_token(&app, "prefs@mapps564.example").await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/portal/auth/me/notification-preferences"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("GET /portal/auth/me/notification-preferences");
+    assert!(
+        resp.status().is_success(),
+        "MAPPS-564: notification-preferences must 200, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("prefs JSON");
+    let available = body["available"].as_array().expect("available is an array");
+    let ticket_assigned = available
+        .iter()
+        .find(|row| row["event_type"].as_str() == Some("ticket.assigned"))
+        .expect("ticket.assigned row surfaces exactly once (aggregated across rules)");
+    let channels = ticket_assigned["channels"]
+        .as_array()
+        .expect("channels is an array");
+    assert!(
+        channels.iter().any(|c| c.as_str() == Some("email"))
+            && channels.iter().any(|c| c.as_str() == Some("in_app")),
+        "MAPPS-564: aggregated channels must include both seeded values, got {channels:?}"
+    );
+}

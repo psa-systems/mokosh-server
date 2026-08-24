@@ -1613,13 +1613,20 @@ impl PortalAuthService {
         // the channels each rule fires on. We aggregate to one row per
         // event so the SPA renders a single toggle even when multiple
         // rules fan the same event out to different recipient sets.
+        //
+        // MAPPS-564: the pre-fix query used a `SELECT DISTINCT unnest(channels)`
+        // subquery that referenced `channels` at the outer level while the
+        // outer row was GROUP BY'd on `event_type` alone. Postgres rejected
+        // the non-grouped column reference (DATABASE_ERROR / 500 on
+        // GET /portal/auth/me/notification-preferences). Rewrite as a
+        // LATERAL unnest + array_agg so the aggregation happens under the
+        // group.
         let available_rows: Vec<(String, Vec<String>)> = sqlx::query_as(
             r#"
             SELECT event_type,
-                   ARRAY(
-                     SELECT DISTINCT unnest(channels)
-                   ) AS channels
-            FROM notification_rules
+                   ARRAY_AGG(DISTINCT ch) AS channels
+            FROM notification_rules,
+                 LATERAL unnest(channels) AS ch
             WHERE tenant_id = $1
               AND is_active = TRUE
             GROUP BY event_type
