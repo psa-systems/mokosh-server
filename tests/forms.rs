@@ -864,7 +864,7 @@ async fn an_over_length_contact_line_is_refused_on_create_and_on_update(pool: Pg
 #[sqlx::test]
 async fn a_rule_kind_the_server_cannot_name_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool).await;
+    let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
     let mut body = departure_form();
@@ -915,4 +915,164 @@ async fn a_rule_kind_the_server_cannot_name_is_refused(pool: PgPool) {
     ok_body["slug"] = json!("departure-known-rule-only");
     let created = create_form(&app, &token, ok_body).await;
     assert_eq!(created["rules"].as_array().map(|r| r.len()), Some(1));
+
+    // Update refuses what create refuses. PMS-841 is the precedent for testing
+    // both: the `contact_info` cap was enforced on create and ignored on
+    // update, so the rule held only for whoever authored the form first. The
+    // refusal names the rule by its own index, not the first one.
+    let form_id = created["id"].as_str().expect("form id").to_string();
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({
+            "rules": [
+                {
+                    "kind": "required_if",
+                    "field": "forward_to",
+                    "when_field": "mailbox_handling",
+                    "equals": "forward"
+                },
+                { "kind": "invented_by_a_newer_server", "field": "forward_to" }
+            ]
+        }))
+        .send()
+        .await
+        .expect("send patch with an unknown rule kind");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "update must refuse the rule kind create refuses"
+    );
+    let error: serde_json::Value = resp.json().await.expect("update error JSON");
+    assert_eq!(
+        field_codes(&error),
+        vec![("rules[1].kind".to_string(), "unknown_rule_kind".to_string())],
+        "the refusal names the offending rule's own index, got {:?}",
+        field_codes(&error)
+    );
+
+    // The stored definition is untouched: a refused write leaves the rule set
+    // that was already enforceable.
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("read the definition back")
+        .json()
+        .await
+        .expect("definition JSON");
+    assert_eq!(after["rules"].as_array().map(|r| r.len()), Some(1));
+}
+
+/// PMS-898: the same tolerant-read / strict-write split for `field_type`, and
+/// the reason it is sharper than the rule case. The public request form is
+/// rendered for someone with no account, off an emailed link, so a client that
+/// predates a field type has to render it as a text input rather than fail to
+/// deserialise the definition and show a blank page.
+///
+/// On this server the write refusal is what makes that safe to keep: the
+/// definition can never store a type this build cannot validate, so the
+/// tolerant read is only ever exercised by a client talking to a NEWER server.
+/// `migrations/100_form_definitions.sql` also has a CHECK constraint on the
+/// column, which is the backstop, not the contract - it would answer a 500.
+/// The service check is what turns an unknown type into a 422 that names the
+/// field.
+#[sqlx::test]
+async fn a_field_type_the_server_cannot_name_is_refused(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let unknown_field = json!({
+        "name": "signature",
+        "label": "Signature",
+        "field_type": "signature",
+        "is_required": false,
+        "sort_order": 6
+    });
+
+    // Create: refused, naming the field rather than the payload.
+    let mut body = departure_form();
+    body["slug"] = json!("departure-unknown-field-type");
+    body["fields"]
+        .as_array_mut()
+        .expect("the fixture carries a field array")
+        .push(unknown_field.clone());
+    let resp = app
+        .client
+        .post(app.url("/api/v1/forms"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send create with an unknown field type");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a type this build cannot validate must not be storable"
+    );
+    let error: serde_json::Value = resp.json().await.expect("create error JSON");
+    assert!(
+        field_codes(&error)
+            .iter()
+            .any(|(f, c)| f.starts_with("fields[") && c == "unknown_field_type"),
+        "the refusal names which field, got {:?}",
+        field_codes(&error)
+    );
+
+    // Update: the field set is replaced wholesale, so the same value arrives on
+    // the other write path and must be refused there too.
+    let form = create_form(&app, &token, departure_form()).await;
+    let form_id = form["id"].as_str().expect("form id").to_string();
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({ "fields": [unknown_field] }))
+        .send()
+        .await
+        .expect("send patch with an unknown field type");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "update must refuse the field type create refuses"
+    );
+    let error: serde_json::Value = resp.json().await.expect("update error JSON");
+    assert!(
+        field_codes(&error)
+            .iter()
+            .any(|(f, c)| f.starts_with("fields[") && c == "unknown_field_type"),
+        "the update refusal names which field, got {:?}",
+        field_codes(&error)
+    );
+
+    // The known types on the same path still write, so the refusal is about the
+    // unnamed type and not about replacing a field set.
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&token)
+        .json(&json!({
+            "fields": [
+                {
+                    "name": "employee_name",
+                    "label": "Employee name",
+                    "field_type": "text",
+                    "is_required": true,
+                    "sort_order": 1
+                }
+            ],
+            "rules": []
+        }))
+        .send()
+        .await
+        .expect("send patch with a known field type");
+    assert!(
+        resp.status().is_success(),
+        "a recognised type must still be accepted, got {}",
+        resp.status()
+    );
 }
