@@ -2,7 +2,8 @@
 # Application specific
 ################################################################################
 
-.env.infisical
+.env*
+!.env.example
 
 # =============================================================================
 # Database
@@ -126,13 +127,6 @@ web_modules/
 # Yarn Integrity file
 .yarn-integrity
 
-# dotenv environment variable files
-.env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
-
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
@@ -193,14 +187,6 @@ dist
 
 # End of https://www.toptal.com/developers/gitignore/api/node
 
-
-# Created by https://www.toptal.com/developers/gitignore/api/dotenv
-# Edit at https://www.toptal.com/developers/gitignore?templates=dotenv
-
-### dotenv ###
-.env
-
-# End of https://www.toptal.com/developers/gitignore/api/dotenv
 
 
 # Created by https://www.toptal.com/developers/gitignore/api/rust
