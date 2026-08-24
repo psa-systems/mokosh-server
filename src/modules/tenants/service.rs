@@ -1526,7 +1526,29 @@ impl TenantService {
     pub async fn activate_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
         // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
         // RLS-exempt `tenants` root row by id. Migrator pool.
+        //
+        // Doubles as the un-cancel path (MAPPS-558): any non-active
+        // status flips back to 'active' here, so an operator who
+        // clicks Reactivate on a Cancelled row gets the same restore
+        // shape as they do on a Suspended row.
         sqlx::query("UPDATE tenants SET status = 'active', updated_at = NOW() WHERE id = $1")
+            .bind(tenant_id)
+            .execute(self.db.migrator_pool())
+            .await?;
+
+        Ok(())
+    }
+
+    /// MAPPS-558: cancel a client. Flips `tenants.status` to
+    /// 'cancelled' (permitted by the CHECK constraint in migration
+    /// 002). Portal middleware (MAPPS-557) 401s every subsequent
+    /// request from that tenant's contacts on the next fetch.
+    /// Reversible via `activate_tenant`.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn cancel_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
+        // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
+        // RLS-exempt `tenants` root row by id. Migrator pool.
+        sqlx::query("UPDATE tenants SET status = 'cancelled', updated_at = NOW() WHERE id = $1")
             .bind(tenant_id)
             .execute(self.db.migrator_pool())
             .await?;

@@ -159,6 +159,9 @@ pub fn tenant_routes(
         .route("/{tenant_id}", put(update_tenant))
         .route("/{tenant_id}/suspend", post(suspend_tenant))
         .route("/{tenant_id}/activate", post(activate_tenant))
+        // MAPPS-558: cancel client. Flips tenants.status to 'cancelled';
+        // reversible via /activate. Same guard as suspend / activate.
+        .route("/{tenant_id}/cancel", post(cancel_tenant))
         // MAPPS-448: super-admin re-issues the tenant admin's welcome email
         // (fresh setup token, invalidating any prior unredeemed one).
         .route(
@@ -600,6 +603,24 @@ async fn suspend_tenant(
     state
         .tenant_service
         .suspend_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
+
+    Ok(())
+}
+
+/// MAPPS-558: cancel a client (super admin only). Reversible via
+/// `activate_tenant`; both are the same guard shape.
+async fn cancel_tenant(
+    State(state): State<TenantRouterState>,
+    _platform: RequirePlatformAdmin,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<()> {
+    // SAFETY (PMS-261): super-admin-only path (the RequirePlatformAdmin
+    // extractor is the guard); the arbitrary path `tenant_id` is an
+    // administrative target, bridged via `from_trusted`.
+    state
+        .tenant_service
+        .cancel_tenant(TenantId::from_trusted(tenant_id))
         .await?;
 
     Ok(())

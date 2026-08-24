@@ -1808,3 +1808,49 @@ async fn the_ticket_note_template_asks_for_the_organisation_identity(pool: PgPoo
         );
     }
 }
+
+/// MAPPS-558: `cancel_tenant` flips `tenants.status` to 'cancelled'
+/// (permitted by the CHECK constraint in migration 002) and
+/// `activate_tenant` reverses it. Pins the write shape.
+#[sqlx::test]
+async fn cancel_and_reactivate_flip_tenant_status(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "MAPPS-558 Cancel Test".into(),
+        slug: "mapps558-cancel".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "cancel@mapps558.example".into(),
+        admin_first_name: "Cancel".into(),
+        admin_last_name: "Test".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant");
+    let tid = mokosh_server::modules::auth::TenantId::from_trusted(tenant.id);
+
+    svc.cancel_tenant(tid).await.expect("cancel_tenant");
+    let status: String = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read status after cancel");
+    assert_eq!(
+        status, "cancelled",
+        "MAPPS-558: cancel_tenant must set tenants.status = 'cancelled'"
+    );
+
+    svc.activate_tenant(tid).await.expect("activate_tenant");
+    let status_after: String = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read status after reactivate");
+    assert_eq!(
+        status_after, "active",
+        "MAPPS-558: activate_tenant must un-cancel a Cancelled tenant"
+    );
+}
