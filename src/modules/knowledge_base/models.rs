@@ -88,8 +88,11 @@ fn default_draft() -> String {
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateKbArticleRequest {
+    #[validate(length(min = 1, max = 255))]
     pub title: Option<String>,
+    #[validate(length(min = 1, max = 255))]
     pub slug: Option<String>,
+    #[validate(length(min = 1))]
     pub content: Option<String>,
     pub summary: Option<String>,
     pub category_id: Option<Uuid>,
