@@ -21,6 +21,7 @@ just check-clippy          # cargo clippy --all-targets -- -D warnings (same as 
 just check-fmt             # cargo fmt --all --check
 just check-migration-immutability # fail if a migration already on main is modified or deleted
 just check-pool-safety     # fail if a serving `.pool()` call lacks its `// SAFETY (PMS-285` note
+just check-validate-parity # fail if a Create*Request and its Update*Request validate a field differently
 just check-workspace-deps  # [workspace.dependencies] matches what members inherit
 just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just check-env-example     # every var the code reads has a .env.example key and a compose.dev.yml line

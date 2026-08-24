@@ -93,6 +93,7 @@ fn validate_contract_date_range(
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateContractRequest {
     pub contract_number: Option<String>,
+    #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
     #[validate(custom(function = crate::utils::validation::validate_contract_status))]
     pub status: Option<String>,

@@ -62,7 +62,7 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-validate-parity check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
 
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
@@ -120,6 +120,16 @@ check-migration-immutability:
 [group: 'check']
 check-pool-safety:
     nu scripts/check-pool-safety.nu
+
+# Keep a Create*Request and its Update*Request agreeing about every same-named
+# field (PMS-867). A cap on one side and nothing on the other is two contracts
+# for one column: over the max the update path 500s on a raw Postgres 22001
+# where create answers 422, and under the min it stores `""` where create
+# refuses it.
+[doc("Fail if a Create*Request and its Update*Request validate a field differently (PMS-867).")]
+[group: 'check']
+check-validate-parity:
+    nu scripts/check-create-update-validate-parity.nu
 
 # Keep transactional email body copy in notification_templates, not in Rust
 # (PMS-700). Fails if a `Mailer` helper re-adds a seeded template's wording.
