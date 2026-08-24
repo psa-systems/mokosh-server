@@ -1057,3 +1057,135 @@ async fn portal_request_against_suspended_tenant_returns_401(pool: PgPool) {
         restored.status()
     );
 }
+
+/// MAPPS-560: end-to-end regression that the token minted by
+/// `TenantService::create_tenant` (the post-554 portal-admin
+/// provisioning path) redeems cleanly via the HTTP endpoint
+/// `POST /api/v1/portal/auth/setup-password`. Pre-560 the client
+/// SPA showed "This link is expired or invalid" on submit because
+/// the Dioxus router stripped the `?token=...` query segment from
+/// the URL before the page could read it; the token itself was
+/// fine, and this test proves the server side of that assertion.
+/// The Dioxus fix lives in `mokosh-apps` (route becomes
+/// `#[route("/portal/set-password?:token")]`).
+#[sqlx::test]
+async fn portal_setup_password_redeems_the_token_create_tenant_mints(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::notifications::NotificationsService;
+    use mokosh_server::modules::tenants::{CreateTenantRequest, TenantService};
+    use mokosh_server::Database;
+
+    // Wire the TenantService exactly like the HTTP router does:
+    // dispatcher, frontend base URL (with a dev-port so
+    // `extract_explicit_port` picks it up per MAPPS-554 fix), and the
+    // portal host suffix (so the setup link points at the tenant
+    // subdomain).
+    let notifications =
+        NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
+    let tenant_svc = TenantService::new(Database::from_pool(pool.clone()))
+        .with_dispatcher(notifications, "http://spa.test:4301".into())
+        .with_portal_host_suffix(".client.spa.test");
+
+    let req = CreateTenantRequest {
+        name: "MAPPS-560 HTTP Redeem".into(),
+        slug: "mapps560-http-redeem".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "http-redeem@mapps560.example".into(),
+        admin_first_name: "Aaron".into(),
+        admin_last_name: "Redeem".into(),
+        branding: None,
+    };
+    let tenant = tenant_svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant");
+
+    // Grab the fresh token straight out of the queued welcome email.
+    let body: String = sqlx::query_scalar(
+        "SELECT body FROM notifications \
+         WHERE tenant_id = $1 AND channel_type = 'email' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read queued welcome body");
+    let prefix =
+        format!("https://mapps560-http-redeem.client.spa.test:4301/portal/set-password?token=",);
+    let token = body
+        .split(&prefix)
+        .nth(1)
+        .and_then(|tail| {
+            tail.split(|c: char| c == '"' || c == '<' || c == ' ' || c == '\n')
+                .next()
+        })
+        .expect("extract token from body")
+        .to_string();
+
+    // Redeem through the HTTP surface, not the service.
+    let app = common::boot(pool.clone()).await;
+    // MAPPS-560: use a password that clears zxcvbn score >= 3 + the
+    // 12-char floor + the blocklist. `Devpassword1` (the operator's
+    // 2026-08-24 attempt) fails zxcvbn but the SERVER 400 message
+    // (`Password is too easy to guess...`) must reach the SPA - the
+    // SPA-side symptom is handled by the client route change, not
+    // here.
+    let strong = "Kq7$mZ2n#PxR9wLf";
+    let resp = app
+        .client
+        .post(app.url("/api/v1/portal/auth/setup-password"))
+        .json(&serde_json::json!({ "token": token, "password": strong }))
+        .send()
+        .await
+        .expect("setup-password POST");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "MAPPS-560: token minted by create_tenant must redeem cleanly via the HTTP setup-password endpoint",
+    );
+
+    // Also pin that a weak password against the same shape returns
+    // a 400 with a non-empty `message` so the SPA can surface the
+    // real cause. The SPA already prefers the server message when
+    // present (`if !message.is_empty() => error.set(message)`), so
+    // once the token gets through routing this branch fires with the
+    // real weak-password copy.
+    let (contact_id, _rest) = token
+        .split_once('.')
+        .expect("token has {uuid}.{secret} shape");
+    let secret2 = mokosh_server::utils::crypto::generate_token(64);
+    let hash2 = mokosh_server::utils::crypto::hash_password(&secret2).expect("hash");
+    let expires = chrono::Utc::now() + chrono::Duration::hours(72);
+    sqlx::query(
+        "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(tenant.id)
+    .bind(uuid::Uuid::parse_str(contact_id).expect("uuid"))
+    .bind(&hash2)
+    .bind(expires)
+    .execute(&pool)
+    .await
+    .expect("seed second token");
+    let token2 = format!("{contact_id}.{secret2}");
+    let weak_resp = app
+        .client
+        .post(app.url("/api/v1/portal/auth/setup-password"))
+        .json(&serde_json::json!({ "token": token2, "password": "Devpassword1" }))
+        .send()
+        .await
+        .expect("weak-password POST");
+    assert_eq!(
+        weak_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "weak password rejects with 400",
+    );
+    let weak_body: serde_json::Value = weak_resp.json().await.expect("weak body JSON");
+    let msg = weak_body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.is_empty() && msg.to_ascii_lowercase().contains("password"),
+        "MAPPS-560: server must include a password-policy message so the SPA can surface it, got: {weak_body:?}",
+    );
+}
