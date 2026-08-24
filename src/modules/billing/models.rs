@@ -263,6 +263,14 @@ pub struct UpdateInvoiceRequest {
     pub notes: Option<String>,
     pub po_number: Option<String>,
     /// `Some` -> replace all lines (transactional). `None` -> leave alone.
+    ///
+    /// PMS-867: `min = 1` is the create-side rule, and it applies here for the
+    /// same reason. `Some([])` used to delete every line and leave a zero-total
+    /// invoice that `create_invoice` would have refused, and the same request
+    /// can carry `status`, so it could be sent in that state. Omitting the key
+    /// is how a caller leaves the existing lines alone; there is no edit that
+    /// means "this invoice bills for nothing".
+    #[validate(length(min = 1, message = "At least one line item is required"))]
     pub lines: Option<Vec<CreateInvoiceLineRequest>>,
     /// Transition status. Same set as the schema CHECK constraint.
     pub status: Option<InvoiceStatus>,
