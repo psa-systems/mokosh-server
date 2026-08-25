@@ -99,6 +99,10 @@ pub fn create_api_router(
     // main.rs. Only the emailed logo needs it (a mail client cannot resolve a
     // relative src); `None` omits the logo rather than emitting a broken image.
     public_api_base_url: Option<String>,
+    // PMS-904: self-hosted (mokosh owns platform identity) or saas (federated
+    // to Bunyip SSO), from MOKOSH_DEPLOYMENT_MODE in main.rs. Decides whether
+    // the mail that exists only to service a local password is sent at all.
+    deployment_mode: crate::utils::deployment::DeploymentMode,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -131,7 +135,8 @@ pub fn create_api_router(
         notifications_service.clone(),
     )
     .with_geoip(geoip)
-    .with_login_approval(login_approval_enabled);
+    .with_login_approval(login_approval_enabled)
+    .with_deployment_mode(deployment_mode);
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
     // PMS-136: ContactService emails a `/portal/set-password` setup link when

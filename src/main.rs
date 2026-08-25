@@ -1,5 +1,6 @@
 //! Mokosh Server - API server entrypoint
 
+use mokosh_server::utils::deployment::DeploymentMode;
 use mokosh_server::{api::create_api_router, version::VersionInfo, Database};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -89,6 +90,10 @@ pub struct AppConfig {
     /// PMS-658: opt-in switch for the suspicious-login notify-and-approve gate
     /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
     pub login_approval_enabled: bool,
+    /// PMS-902 / PMS-904: whether this instance owns its platform identities
+    /// (`self-hosted`, the default) or federates them to Bunyip SSO (`saas`).
+    /// Read from `MOKOSH_DEPLOYMENT_MODE`; see [`DeploymentMode`].
+    pub deployment_mode: DeploymentMode,
 }
 
 /// Dev-only fallback for `JWT_SECRET`. Accepted only in dev/test
@@ -294,6 +299,10 @@ impl AppConfig {
             login_approval_enabled: std::env::var("LOGIN_APPROVAL_ENABLED")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
+            // PMS-902: self-hosted (default) or saas. Unset and unrecognised
+            // both resolve to self-hosted, so a typo cannot silently stop a
+            // self-hosted deployment's account email.
+            deployment_mode: DeploymentMode::from_env(),
         })
     }
 
@@ -610,6 +619,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.login_approval_enabled,
         config.abuse_contact_email,
         config.public_api_base_url,
+        config.deployment_mode,
     );
     let router = psa_router;
 

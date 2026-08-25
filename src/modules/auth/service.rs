@@ -29,6 +29,7 @@ use crate::modules::audit::{audit_auth_event, audit_write, AuditAction, AuditCtx
 use crate::modules::notifications::NotificationsService;
 #[cfg(feature = "server")]
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
+use crate::utils::deployment::DeploymentMode;
 #[cfg(feature = "server")]
 use crate::utils::email::{salutation, LogMailer, Mailer};
 #[cfg(feature = "server")]
@@ -73,6 +74,11 @@ pub struct AuthService {
     /// exactly as before (PMS-657 alert only). Wired via
     /// [`Self::with_login_approval`].
     login_approval_enabled: bool,
+    /// PMS-904: whether this deployment federates platform identity to Bunyip
+    /// SSO. In `saas` the mokosh-side password is not the credential anybody
+    /// signs in with, so the mail that exists only to service it is suppressed.
+    /// Defaults to self-hosted; wired via [`Self::with_deployment_mode`].
+    deployment_mode: DeploymentMode,
 }
 
 /// PMS-658: outcome of screening a login for suspicious signals. `country` and
@@ -123,6 +129,7 @@ impl AuthService {
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
             geoip: None,
             login_approval_enabled: false,
+            deployment_mode: DeploymentMode::SelfHosted,
         }
     }
 
@@ -151,6 +158,7 @@ impl AuthService {
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
             geoip: None,
             login_approval_enabled: false,
+            deployment_mode: DeploymentMode::SelfHosted,
         }
     }
 
@@ -171,6 +179,26 @@ impl AuthService {
     pub fn with_login_approval(mut self, enabled: bool) -> Self {
         self.login_approval_enabled = enabled;
         self
+    }
+
+    /// PMS-904: declare the deployment shape. Set from `MOKOSH_DEPLOYMENT_MODE`
+    /// at server startup (see `create_api_router`); test fixtures leave it at
+    /// the self-hosted default, which is today's behaviour unchanged.
+    #[must_use]
+    pub fn with_deployment_mode(mut self, mode: DeploymentMode) -> Self {
+        self.deployment_mode = mode;
+        self
+    }
+
+    /// PMS-904: whether account email for the local platform credential should
+    /// be sent at all.
+    ///
+    /// One predicate rather than `deployment_mode.is_saas()` repeated at each
+    /// gate, so the three sites cannot drift apart and so the question reads as
+    /// what it is: not "which mode is this" but "is there a local account here
+    /// for this mail to be about".
+    fn sends_local_account_email(&self) -> bool {
+        !self.deployment_mode.is_saas()
     }
 
     /// PMS-657: on a genuine login, resolve the client IP to a country and, when
@@ -212,7 +240,15 @@ impl AuthService {
             // Country changed: alert (unless opted out), then persist the new one.
             LoginLocationDecision::Alert => {
                 let previous = user.last_login_country.as_deref().unwrap_or("?");
-                if user.login_location_alerts {
+                // PMS-904: this alert is about a LOCAL password sign-in, which
+                // is the only path that reaches here - a Bunyip-issued token
+                // never runs `login`. In a SaaS deployment Bunyip owns sign-in
+                // and therefore owns telling the user about an unfamiliar one,
+                // so a mokosh alert is at best a duplicate and at worst points
+                // the user at a mokosh password that is not their credential.
+                // The country is still recorded below either way: it is the
+                // state this decision is made from next time, not a message.
+                if user.login_location_alerts && self.sends_local_account_email() {
                     // Send the alert on a detached task so a slow or failing SMTP
                     // round-trip never adds latency to (or fails) the login. The
                     // direct mailer is used rather than the notifications
@@ -470,6 +506,22 @@ impl AuthService {
         .await?;
         tx.commit().await?;
 
+        // PMS-904: deliberately NOT gated on the deployment mode, unlike the
+        // password-reset, welcome and new-login-location mail.
+        //
+        // This is not a notification about an account, it is one half of a
+        // challenge-response. `login` returns `approval_required: true` with
+        // empty tokens and `verify_login_approval` demands the code that was
+        // emailed here, so suppressing the send in `saas` would strand the
+        // caller mid-login with nothing able to complete it - a lockout
+        // introduced by a mail-dispatch change, which is worse than the
+        // redundant email it would have saved.
+        //
+        // In practice the question rarely arises: the gate is opt-in via
+        // `LOGIN_APPROVAL_ENABLED` and only local password logins reach here,
+        // which a SaaS deployment does not use. Whether those endpoints should
+        // answer at all in `saas` is PMS-905, and that is the right place to
+        // remove this path rather than half-removing it here.
         let mailer = self.mailer.clone();
         let email = user.email.clone();
         let country = assessment.country.clone();
@@ -1026,6 +1078,27 @@ impl AuthService {
             Err(_) => return Ok(()), // Silently succeed to not reveal user existence
         };
 
+        // PMS-904: in a SaaS deployment the platform credential lives in Bunyip,
+        // so a mokosh-side reset link would set a password nobody signs in with
+        // and read as though it had fixed the user's problem. Nothing below this
+        // point runs: the token is only ever delivered by the mail being
+        // suppressed, so minting one would leave a live credential-bearing row
+        // that no recipient can redeem and no code path can retire.
+        //
+        // Placed AFTER the user lookup so the early `Ok(())` for an unknown
+        // address still comes first, and returning the same `Ok(())` here keeps
+        // this endpoint's contract intact: it never reveals whether an address
+        // has an account, in either mode.
+        if !self.sends_local_account_email() {
+            tracing::info!(
+                user_id = %user.id,
+                deployment_mode = %self.deployment_mode,
+                "password-reset email suppressed: platform identity is federated to Bunyip SSO, \
+                 so a mokosh-side password is not the credential this user signs in with (PMS-904)",
+            );
+            return Ok(());
+        }
+
         // Generate a reset token bound to the user. The emailed token is
         // `{user_id}.{secret}`; only the secret is hashed and stored so
         // reset_password can scope its lookup to this user.
@@ -1342,7 +1415,19 @@ impl AuthService {
         .await?;
         tx.commit().await?;
 
-        if request.send_welcome_email {
+        // PMS-904: `send_welcome_email` asks for a "set your password" link,
+        // and in a SaaS deployment there is no password to set: the user will
+        // sign in through Bunyip with an identity mokosh does not own. The
+        // account row above is still created, because that is what scopes the
+        // user to this tenant; only the mail about the local credential goes.
+        if request.send_welcome_email && !self.sends_local_account_email() {
+            tracing::info!(
+                user_id = %user_id,
+                deployment_mode = %self.deployment_mode,
+                "welcome email suppressed: the account was created, but its sign-in credential \
+                 lives in Bunyip SSO, so there is no password for this mail to set (PMS-904)",
+            );
+        } else if request.send_welcome_email {
             // Reuse the password_reset_tokens machinery so the recipient
             // can pick a password without going through "Forgot password"
             // first. 7-day window: long enough for admins who batch-create
@@ -3189,6 +3274,41 @@ fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLocati
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    /// PMS-904: the predicate the three gated mail sites consult.
+    ///
+    /// Covered here rather than only through the two integration tests because
+    /// the third site, the new-login-location alert, cannot be reached in the
+    /// test suite at all: `check_login_location` returns immediately with no
+    /// IP2Location DB configured, and the harness configures none. Its gate is
+    /// this predicate, so this is the level at which it is testable.
+    #[tokio::test]
+    async fn local_account_email_is_sent_only_when_this_deployment_owns_the_credential() {
+        // `connect_lazy` opens no socket and this test issues no query: what is
+        // under test is a field read, so a live database would be scaffolding
+        // around the thing being measured. It still needs a Tokio context to
+        // build the pool, hence `#[tokio::test]` rather than `#[test]`.
+        let build = || {
+            let pool = sqlx::postgres::PgPool::connect_lazy("postgres://unused/unused")
+                .expect("a lazy pool needs no server");
+            AuthService::new(crate::db::Database::from_pool(pool), "test-secret".into())
+        };
+
+        assert!(
+            build().sends_local_account_email(),
+            "the default is self-hosted, which owns its passwords and must keep mailing about them"
+        );
+        assert!(build()
+            .with_deployment_mode(DeploymentMode::SelfHosted)
+            .sends_local_account_email());
+        assert!(
+            !build()
+                .with_deployment_mode(DeploymentMode::Saas)
+                .sends_local_account_email(),
+            "in saas the credential lives in Bunyip, so mail about a mokosh password is \
+             mail about an account nobody signs in to"
+        );
+    }
 
     #[test]
     fn parse_user_bound_token_splits_valid() {

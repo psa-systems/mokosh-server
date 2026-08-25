@@ -3,6 +3,9 @@
 pub mod client_ip;
 pub mod crypto;
 pub mod datetime;
+// PMS-902: self-hosted vs SaaS. Decides whether mokosh owns platform identity
+// or federates it to Bunyip, which is what makes local-account email moot.
+pub mod deployment;
 pub mod email;
 pub mod error;
 pub mod geoip;
