@@ -83,8 +83,18 @@ async fn delete_company_with_stored_credentials_returns_400_not_500(pool: PgPool
         "a company with stored credentials should be 400, got {status} (body: {body})"
     );
     assert!(
-        body.contains("credentials"),
+        body.contains("stored credentials"),
         "the refusal must name what blocked it; got: {body}"
+    );
+    // PMS-920: credentials are removable, so the "remove or reassign" advice is
+    // advice the operator can actually take here.
+    assert!(
+        body.contains("Remove or reassign"),
+        "a removable blocker must offer removal; got: {body}"
+    );
+    assert!(
+        body.contains("Inactive"),
+        "every refusal names the archive alternative; got: {body}"
     );
 }
 
@@ -316,6 +326,93 @@ async fn deleting_the_tenants_own_company_names_its_role(pool: PgPool) {
         Some(own),
         "a refused delete must leave the pointer intact"
     );
+}
+
+/// PMS-920: a blocker that must be KEPT does not tell the operator to remove it.
+///
+/// The old message listed every blocking table and said "remove them first".
+/// For an invoice that is advice they must not take: deleting the billing
+/// record to tidy a client list destroys exactly what the refusal exists to
+/// protect. This is the half of the message that was actively harmful.
+#[sqlx::test]
+async fn a_retained_blocker_is_not_something_the_operator_is_told_to_delete(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = seed_company_named(&pool, "Billed Co").await;
+
+    sqlx::query(
+        "INSERT INTO invoices (tenant_id, company_id, invoice_number, invoice_date, due_date) \
+         VALUES ($1, $2, 'INV-0001', CURRENT_DATE, CURRENT_DATE + 30)",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .execute(&pool)
+    .await
+    .expect("seed invoice");
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let (status, body) = delete_company_raw(&app, &token, company).await;
+
+    assert_eq!(status, 400, "an invoice must block; body: {body}");
+    assert!(
+        body.contains("invoices"),
+        "the refusal must name the blocker; got: {body}"
+    );
+    assert!(
+        !body.contains("Remove or reassign") && !body.contains("remove them first"),
+        "an invoice must never be something the operator is told to remove to enable \
+         a delete; got: {body}"
+    );
+    assert!(
+        body.contains("Inactive"),
+        "and the refusal must offer the alternative that actually applies; got: {body}"
+    );
+}
+
+/// The two halves must be distinguishable from each other, or splitting them
+/// bought nothing. Same company shape, different blocker, different advice.
+#[sqlx::test]
+async fn retained_and_removable_blockers_give_different_advice(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let retained = seed_company_named(&pool, "Retained Co").await;
+    let removable = seed_company_named(&pool, "Removable Co").await;
+
+    sqlx::query(
+        "INSERT INTO invoices (tenant_id, company_id, invoice_number, invoice_date, due_date) \
+         VALUES ($1, $2, 'INV-0002', CURRENT_DATE, CURRENT_DATE + 30)",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(retained)
+    .execute(&pool)
+    .await
+    .expect("seed invoice");
+
+    sqlx::query(
+        "INSERT INTO credential_vault \
+           (tenant_id, name, company_id, credential_type, username_encrypted, password_encrypted) \
+         VALUES ($1, 'Domain admin', $2, 'domain', 'x', 'y')",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(removable)
+    .execute(&pool)
+    .await
+    .expect("seed credential");
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let (_, retained_body) = delete_company_raw(&app, &token, retained).await;
+    let (_, removable_body) = delete_company_raw(&app, &token, removable).await;
+
+    assert_ne!(
+        retained_body, removable_body,
+        "a blocker that must be kept and one that can be cleared must not read \
+         identically, which is the whole point of PMS-920"
+    );
+    assert!(retained_body.contains("must not be removed"));
+    assert!(removable_body.contains("Remove or reassign"));
+    // Both still end at the same place, because archiving is what the operator
+    // wanted in either case.
+    assert!(retained_body.contains("Inactive") && removable_body.contains("Inactive"));
 }
 
 async fn create_company(app: &common::TestApp, token: &str, name: &str) -> String {

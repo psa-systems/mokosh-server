@@ -14,6 +14,80 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// PMS-920: the alternative every company-delete refusal ends with.
+///
+/// Phrased as the data change rather than as a UI gesture. The field has
+/// existed since migration 004 and `UpdateCompanyRequest` already accepts it,
+/// so this stays true regardless of whether a given client has caught up
+/// (MAPPS-575 is the SPA half).
+const ARCHIVE_INSTEAD: &str =
+    "archive it instead by setting its status to Inactive, which keeps its history \
+     and takes it out of your active lists";
+
+/// Turn a `23503` on the company DELETE into a refusal that says which records
+/// blocked it and what to do about them.
+///
+/// PMS-920: the previous message listed every table that could block and told
+/// the operator to "remove them first". For half of them that is advice they
+/// must not take: deleting invoices, payments, contracts or time entries to
+/// tidy a client list destroys the financial and billing record the deletion
+/// was refused to protect. Those two cases now read differently, and both name
+/// archiving, which is what the operator almost always actually wants.
+///
+/// Driven off the constraint name Postgres reports rather than a pre-flight
+/// count per table: it is the authority on which FK actually fired, it costs no
+/// extra queries, and a table added later cannot silently fall out of a
+/// hand-maintained list - it lands on the generic arm instead.
+fn company_delete_blocked(constraint: Option<&str>) -> AppError {
+    // Records that exist to be kept. Removing them to enable a delete is worse
+    // than not deleting.
+    const RETAINED: &[(&str, &str)] = &[
+        ("invoices_company_id_fkey", "invoices"),
+        ("payments_company_id_fkey", "payments"),
+        ("contracts_company_id_fkey", "contracts"),
+        ("time_entries_company_id_fkey", "time entries"),
+        ("mileage_entries_company_id_fkey", "mileage entries"),
+    ];
+    // Records the operator can legitimately clear or reassign first.
+    const REMOVABLE: &[(&str, &str)] = &[
+        ("assets_company_id_fkey", "assets"),
+        ("quotes_company_id_fkey", "quotes"),
+        ("credential_vault_company_id_fkey", "stored credentials"),
+    ];
+
+    let named = constraint.and_then(|c| {
+        RETAINED
+            .iter()
+            .find(|(fk, _)| *fk == c)
+            .map(|(_, label)| (*label, true))
+            .or_else(|| {
+                REMOVABLE
+                    .iter()
+                    .find(|(fk, _)| *fk == c)
+                    .map(|(_, label)| (*label, false))
+            })
+    });
+
+    let message = match named {
+        Some((label, true)) => format!(
+            "Cannot delete company: it has {label}, which are kept as a permanent \
+             financial and billing record and must not be removed to allow a \
+             deletion. You can {ARCHIVE_INSTEAD}"
+        ),
+        Some((label, false)) => format!(
+            "Cannot delete company: it has {label}. Remove or reassign them first, \
+             or {ARCHIVE_INSTEAD}"
+        ),
+        // An FK this function has not been taught about. Say so plainly rather
+        // than guessing which half it belongs to; the alternative still holds.
+        None => format!(
+            "Cannot delete company: other records still reference it. Remove or \
+             reassign whatever can be moved, or {ARCHIVE_INSTEAD}"
+        ),
+    };
+    AppError::BadRequest(message)
+}
+
 /// How long a portal setup link remains redeemable. Mirrors the
 /// password-reset redemption window (PMS-136).
 const PORTAL_SETUP_TOKEN_TTL_HOURS: i64 = 72;
@@ -791,9 +865,13 @@ impl ContactService {
         .await?;
 
         if ticket_count > 0 {
-            return Err(AppError::BadRequest(
-                "Cannot delete company with existing tickets".to_string(),
-            ));
+            // PMS-920: tickets are removable, so "delete them first" is advice
+            // the operator can actually take, but it is rarely the one they
+            // want. Name the alternative alongside it.
+            return Err(AppError::BadRequest(format!(
+                "Cannot delete company: it has {ticket_count} ticket(s). Delete or \
+                 reassign them first, or {ARCHIVE_INSTEAD}"
+            )));
         }
 
         let before: Option<serde_json::Value> = sqlx::query_scalar(
@@ -872,12 +950,10 @@ impl ContactService {
             .execute(&mut *tx)
             .await
         {
-            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
-                return Err(AppError::BadRequest(
-                    "Cannot delete company with related records (contracts, invoices, \
-                     payments, quotes, assets, time entries, mileage entries, or stored \
-                     credentials); remove them first"
-                        .to_string(),
+            let db_err = e.as_database_error();
+            if db_err.and_then(|d| d.code()).as_deref() == Some("23503") {
+                return Err(company_delete_blocked(
+                    db_err.and_then(|d| d.constraint()),
                 ));
             }
             return Err(e.into());
