@@ -2057,6 +2057,73 @@ impl AuthService {
     /// $4+ = filters`; count has `$1 = tenant_id, $2+ = filters`.
     /// Same condition set, different placeholder offsets.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-921: the tenant's staff, as the minimum needed to name one.
+    ///
+    /// Separate from [`Self::list_users`] rather than a filtered call into it.
+    /// That method serves user management: it selects the whole `users` row,
+    /// including `password_hash`, MFA secret, login history and notification
+    /// preferences, and maps it through `UserResponse`. Reusing it for an
+    /// unprivileged caller would mean the projection is the only thing standing
+    /// between a Technician and a colleague's security posture, and a
+    /// projection is easy to widen by accident. This query selects three
+    /// columns, so there is nothing to leak.
+    ///
+    /// Active users only. The directory answers "who can I name", and a mention
+    /// is normally about current work; a mention of somebody who has left then
+    /// renders as the plain text it always was, which is a truthful signal
+    /// rather than a broken one.
+    pub async fn list_directory(
+        &self,
+        tenant_id: TenantId,
+        pagination: &crate::utils::pagination::PaginationParams,
+    ) -> AppResult<(Vec<mokosh_types::auth::DirectoryEntry>, u64)> {
+        let offset = pagination.offset() as i64;
+        let limit = pagination.limit() as i64;
+
+        // Ordered by name then id: name alone is not unique, and an unstable
+        // ORDER BY makes paging repeat and skip rows.
+        //
+        // `split_part(email, '@', 1)` is the handle. Doing it in SQL keeps the
+        // address itself from ever entering the response type, so there is no
+        // point in the call path where a full email is in hand and could be
+        // returned by mistake.
+        // One transaction for both queries, as `list_users` does: the RLS
+        // tenant GUC is set per transaction, so a second one would repeat the
+        // round trip for nothing.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            r#"
+            SELECT id,
+                   COALESCE(NULLIF(TRIM(first_name || ' ' || last_name), ''), email) AS name,
+                   LOWER(split_part(email, '@', 1)) AS handle
+            FROM users
+            WHERE tenant_id = $1 AND status = 'active'
+            ORDER BY name, id
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        Ok((
+            rows.into_iter()
+                .map(|(id, name, handle)| mokosh_types::auth::DirectoryEntry { id, name, handle })
+                .collect(),
+            total as u64,
+        ))
+    }
+
     pub async fn list_users(
         &self,
         tenant_id: Uuid,

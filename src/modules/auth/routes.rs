@@ -19,6 +19,7 @@ use super::{
     RefreshTokenResponse, ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::{RequireAuth, RequireManager};
+use crate::modules::auth::TenantScoped;
 use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -79,6 +80,12 @@ pub fn auth_routes(auth_service: AuthService) -> Router {
         .route("/me/api-keys", get(list_api_keys))
         .route("/me/api-keys", post(create_api_key))
         .route("/me/api-keys/{key_id}", delete(revoke_api_key))
+        // PMS-921: the staff directory. Any authenticated user of the tenant,
+        // unlike the user-management routes below. Placed apart from them on
+        // purpose: it is a different audience and a different projection, and
+        // grouping it with `/users` invites somebody to "tidy" it under the
+        // same guard.
+        .route("/directory", get(list_directory))
         // User management (admin only)
         .route("/users", get(list_users))
         .route("/users", post(create_user))
@@ -467,6 +474,36 @@ async fn revoke_api_key(
 }
 
 /// List users (admin / manager only). Supports paginated browsing
+/// PMS-921: the tenant's staff, as the minimum needed to name one.
+///
+/// `RequireAuth`, not `RequireManager`. MAPPS-578 renders `@handle` in Markdown
+/// as a resolved person, and it resolved against `GET /auth/users`, which is
+/// manager-gated, so a Technician saw every mention as plain text. A KB article
+/// is written for technicians and the mentions in it assign ownership, so the
+/// reader who most needs to know who is named was the one who could not see it.
+///
+/// Relaxing `/users` instead was the wrong shape: its `UserResponse` carries
+/// role, status, MFA state, login history and phone numbers, so it would have
+/// handed every technician a colleague's security posture to solve a name
+/// lookup. That gate stays exactly where it is.
+async fn list_directory(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<mokosh_types::auth::DirectoryEntry>>> {
+    let (entries, total) = state
+        .auth_service
+        .list_directory(user.tenant(), &pagination)
+        .await?;
+
+    Ok(Json(PaginatedResponse::new(
+        entries,
+        pagination.page,
+        pagination.per_page(),
+        total,
+    )))
+}
+
 /// plus optional filters: `q` (substring across email + names),
 /// `role`, and `status`. Filter struct derives `Validate` (F9
 /// closeout for the auth module).
