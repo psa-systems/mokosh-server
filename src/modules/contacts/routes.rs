@@ -57,6 +57,11 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         .route("/companies/{company_id}", get(get_company))
         .route("/companies/{company_id}", put(update_company))
         .route("/companies/{company_id}", delete(delete_company))
+        // PMS-926: what a delete would do, without doing it.
+        .route(
+            "/companies/{company_id}/deletion-preview",
+            get(company_deletion_preview),
+        )
         .route(
             "/companies/{company_id}/contacts",
             get(get_company_contacts),
@@ -169,6 +174,25 @@ async fn update_company(
         .await?;
 
     Ok(Json(company.into()))
+}
+
+/// PMS-926: what deleting this company would do, and what stops it.
+///
+/// `RequireAuth`, not the authority a delete needs: this is a read, and the
+/// counts it reports are already visible on the company page. Gating it harder
+/// than the page it serves would only mean the dialog cannot explain itself to
+/// somebody who can already see the numbers.
+async fn company_deletion_preview(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(company_id): Path<Uuid>,
+) -> AppResult<Json<crate::modules::contacts::CompanyDeletionPreview>> {
+    Ok(Json(
+        state
+            .contact_service
+            .deletion_preview(user.tenant(), company_id)
+            .await?,
+    ))
 }
 
 async fn delete_company(
