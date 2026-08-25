@@ -1924,3 +1924,121 @@ async fn create_tenant_provisions_system_attribution_user(pool: PgPool) {
         "MAPPS-562: fallback query must find the system attribution user"
     );
 }
+
+/// mokosh-contact-login prompt 002: `create_tenant` must seed the
+/// three built-in portal_roles (Billing Contact / Support Contact /
+/// Read-Only) so a fresh tenant has something to assign in the
+/// Contact edit page from day one. Mirrors migration 142's shape for
+/// existing tenants; ON CONFLICT keeps a re-run idempotent.
+///
+/// Pin end-to-end: rows exist, capability sets match the spec, all
+/// three carry `is_builtin = TRUE`.
+#[sqlx::test]
+async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "mokosh-contact-login Builtin Roles".into(),
+        slug: "mcl-builtin-roles".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "admin@mcl-builtin-roles.example".into(),
+        admin_first_name: "Ada".into(),
+        admin_last_name: "Admin".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant");
+
+    let rows: Vec<(String, Vec<String>, bool)> = sqlx::query_as(
+        "SELECT name, capabilities, is_builtin \
+         FROM portal_roles WHERE tenant_id = $1 ORDER BY name",
+    )
+    .bind(tenant.id)
+    .fetch_all(&pool)
+    .await
+    .expect("read portal_roles");
+    let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Billing Contact", "Read-Only", "Support Contact"],
+        "mokosh-contact-login prompt 002: create_tenant must seed exactly three built-in portal_roles"
+    );
+
+    for (_, _, is_builtin) in &rows {
+        assert!(
+            *is_builtin,
+            "mokosh-contact-login prompt 002: every seeded portal_role must carry is_builtin = TRUE"
+        );
+    }
+
+    let billing_caps = &rows.iter().find(|r| r.0 == "Billing Contact").unwrap().1;
+    assert!(
+        billing_caps.iter().any(|c| c == "invoices:pay")
+            && billing_caps.iter().any(|c| c == "quotes:accept"),
+        "Billing Contact must carry invoices:pay + quotes:accept, got {billing_caps:?}"
+    );
+
+    let support_caps = &rows.iter().find(|r| r.0 == "Support Contact").unwrap().1;
+    assert!(
+        support_caps.iter().any(|c| c == "tickets:write")
+            && support_caps.iter().any(|c| c == "kb:read"),
+        "Support Contact must carry tickets:write + kb:read, got {support_caps:?}"
+    );
+
+    let readonly_caps = &rows.iter().find(|r| r.0 == "Read-Only").unwrap().1;
+    assert!(
+        readonly_caps.iter().all(|c| c.ends_with(":read")),
+        "Read-Only must carry only *:read capabilities, got {readonly_caps:?}"
+    );
+
+    // Re-invoke: idempotency + ON CONFLICT DO NOTHING.
+    svc.seed_builtin_portal_roles(tenant.id)
+        .await
+        .expect("re-seed idempotently");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_roles WHERE tenant_id = $1 AND is_builtin = TRUE",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count built-in roles");
+    assert_eq!(
+        count, 3,
+        "mokosh-contact-login prompt 002: seed must stay idempotent (still 3 rows)"
+    );
+}
+
+/// mokosh-contact-login prompt 002: migration 138 added
+/// `companies.portal_slug`. Pin the column exists, is nullable, and
+/// starts unset on a fresh Company.
+#[sqlx::test]
+async fn companies_carry_a_nullable_portal_slug_column(pool: PgPool) {
+    let (admin_id, ..) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+        .bind(admin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read admin tenant");
+    let company_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'MCL Slug Column Test')",
+    )
+    .bind(company_id)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("insert company");
+    let slug: Option<String> =
+        sqlx::query_scalar("SELECT portal_slug FROM companies WHERE id = $1")
+            .bind(company_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_slug column");
+    assert!(
+        slug.is_none(),
+        "mokosh-contact-login prompt 002: portal_slug must default to NULL"
+    );
+}

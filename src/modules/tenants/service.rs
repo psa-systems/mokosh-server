@@ -386,19 +386,21 @@ impl TenantService {
         // overhead time entries have a stable company_id. Idempotent.
         self.ensure_own_company(tenant_id).await?;
 
-        // MAPPS-554: provision the portal admin CONTACT (not a users
-        // row) and mint a portal_setup_tokens row. Runs after
-        // `ensure_own_company` so `company_id` is available for the
-        // contacts FK. Best-effort like the pre-554 welcome dispatch:
-        // a failed contact insert or dispatch is logged but not
-        // fatal, matching the existing `AuthService::create_user`
-        // welcome path. Runs only when the notifications dispatcher +
-        // frontend base URL were wired via `with_dispatcher` /
-        // `with_frontend_base_url`; the seed / placement paths that
-        // construct a bare service skip it and stay on their
-        // pre-existing behaviour.
-        self.provision_portal_admin_and_send_welcome(tenant_id, request)
-            .await;
+        // mokosh-contact-login prompt 001: the MAPPS-554
+        // `provision_portal_admin_and_send_welcome` call retired with
+        // the /portal/* customer-portal surface. Client-side portal
+        // access now comes from the CRM: MSP admin creates a Company +
+        // Contacts in the standard Contacts tab, then explicitly
+        // grants portal access via
+        // `ContactService::grant_portal_access` (prompt 003).
+        //
+        // mokosh-contact-login prompt 002: seed the three built-in
+        // portal roles (Billing Contact / Support Contact / Read-
+        // Only) so a fresh tenant has something to assign in the
+        // Contact edit page from day one. Mirrors migration 142's
+        // shape for existing tenants; ON CONFLICT keeps this idempotent
+        // against a re-run.
+        self.seed_builtin_portal_roles(tenant_id).await?;
 
         // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
         // is the same minted id, bridged via `from_trusted`.
@@ -1675,6 +1677,43 @@ impl TenantService {
     /// so the companies WITH CHECK policy passes; the `tenants` update is exempt
     /// regardless. The guard + single tx keep concurrent provisioning races
     /// converging on one own-company.
+    /// mokosh-contact-login prompt 002: seed the three built-in
+    /// portal roles for a freshly provisioned tenant.
+    ///
+    /// Called by `create_tenant` after the tenant + own_company are in
+    /// place. Idempotent via `ON CONFLICT (tenant_id, name) DO NOTHING`
+    /// so a re-run (or a race with migration 142's backfill against
+    /// this tenant) collapses cleanly. Mirrors the capability sets in
+    /// migration 142 exactly; the `all_capabilities_match_seed_migration`
+    /// test in `contact_portal::capabilities` guards drift.
+    ///
+    /// SAFETY (PMS-285): runs under the new tenant's GUC tx so the
+    /// `portal_roles` RLS WITH CHECK policy sees `app.current_tenant`.
+    pub async fn seed_builtin_portal_roles(&self, tenant_id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO portal_roles (tenant_id, name, capabilities, is_builtin)
+            VALUES
+                ($1, 'Billing Contact',
+                 ARRAY['invoices:read', 'invoices:pay', 'quotes:read', 'quotes:accept',
+                       'notifications:read', 'settings:manage_own'], TRUE),
+                ($1, 'Support Contact',
+                 ARRAY['tickets:read', 'tickets:write', 'tickets:comment', 'kb:read',
+                       'notifications:read', 'settings:manage_own'], TRUE),
+                ($1, 'Read-Only',
+                 ARRAY['tickets:read', 'invoices:read', 'quotes:read', 'contracts:read',
+                       'assets:read', 'projects:read', 'kb:read', 'notifications:read'], TRUE)
+            ON CONFLICT (tenant_id, name) DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn ensure_own_company(&self, tenant_id: Uuid) -> AppResult<()> {
         // Cheap guard so the already-provisioned common case skips the write tx.
         // SAFETY (PMS-285 / PMS-692): `tenants` is the RLS-exempt isolation root

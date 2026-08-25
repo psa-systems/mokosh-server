@@ -9,6 +9,7 @@ pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod calendar;
+pub mod contact_portal;
 pub mod contacts;
 pub mod contracts;
 pub mod dashboards;
