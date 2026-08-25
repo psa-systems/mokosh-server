@@ -38,34 +38,135 @@ const ARCHIVE_INSTEAD: &str =
 /// count per table: it is the authority on which FK actually fired, it costs no
 /// extra queries, and a table added later cannot silently fall out of a
 /// hand-maintained list - it lands on the generic arm instead.
-fn company_delete_blocked(constraint: Option<&str>) -> AppError {
-    // Records that exist to be kept. Removing them to enable a delete is worse
-    // than not deleting.
-    const RETAINED: &[(&str, &str)] = &[
-        ("invoices_company_id_fkey", "invoices"),
-        ("payments_company_id_fkey", "payments"),
-        ("contracts_company_id_fkey", "contracts"),
-        ("time_entries_company_id_fkey", "time entries"),
-        ("mileage_entries_company_id_fkey", "mileage entries"),
-    ];
-    // Records the operator can legitimately clear or reassign first.
-    const REMOVABLE: &[(&str, &str)] = &[
-        ("assets_company_id_fkey", "assets"),
-        ("quotes_company_id_fkey", "quotes"),
-        ("credential_vault_company_id_fkey", "stored credentials"),
-    ];
+/// One kind of record that stops a company being deleted.
+pub struct CompanyBlocker {
+    /// The foreign key Postgres names when it fires. Empty for `tickets`, which
+    /// has its own pre-flight guard and never reaches the 23503 arm.
+    pub constraint: &'static str,
+    /// The table to count, for the deletion preview (PMS-926).
+    pub table: &'static str,
+    /// What to call it in a message a person reads.
+    pub label: &'static str,
+    /// Whether these records exist to be KEPT. PMS-920: telling somebody to
+    /// delete their invoices to tidy a client list destroys exactly the record
+    /// the refusal is protecting, so retained blockers must never be phrased as
+    /// something to clear first.
+    pub retained: bool,
+}
 
+/// Every record that can stop a company delete.
+///
+/// PMS-926 lifted this out of `company_delete_blocked` so the refusal message
+/// and the deletion preview read the same table. Two lists that have to agree
+/// is how the CLIENT's hardcoded copy of these rules went stale within a week
+/// of PMS-919 changing them; a second copy on the server would go the same way.
+///
+/// Anything NOT here either unlinks on delete (`projects`, `appointments`,
+/// `active_timers`, `rmm_device_mappings`, `parent_company_id`, and `contacts`
+/// via PMS-812) or cascades (`sites`, `contact_companies`,
+/// `form_request_tokens`). See migration 113.
+pub const COMPANY_BLOCKERS: &[CompanyBlocker] = &[
+    CompanyBlocker {
+        constraint: "invoices_company_id_fkey",
+        table: "invoices",
+        label: "invoices",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "payments_company_id_fkey",
+        table: "payments",
+        label: "payments",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "contracts_company_id_fkey",
+        table: "contracts",
+        label: "contracts",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "time_entries_company_id_fkey",
+        table: "time_entries",
+        label: "time entries",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "mileage_entries_company_id_fkey",
+        table: "mileage_entries",
+        label: "mileage entries",
+        retained: true,
+    },
+    // `tickets` is guarded by an explicit pre-flight count in `delete_company`
+    // rather than by its FK, so it has no constraint name to match. It is a
+    // blocker all the same, and the preview has to say so.
+    CompanyBlocker {
+        constraint: "",
+        table: "tickets",
+        label: "tickets",
+        retained: false,
+    },
+    CompanyBlocker {
+        constraint: "assets_company_id_fkey",
+        table: "assets",
+        label: "assets",
+        retained: false,
+    },
+    CompanyBlocker {
+        constraint: "quotes_company_id_fkey",
+        table: "quotes",
+        label: "quotes",
+        retained: false,
+    },
+    CompanyBlocker {
+        constraint: "credential_vault_company_id_fkey",
+        table: "credential_vault",
+        label: "stored credentials",
+        retained: false,
+    },
+];
+
+/// PMS-926: what deleting this company would do, and what stops it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompanyDeletionPreview {
+    pub can_delete: bool,
+    /// The PMS-919 refusal that is about what the company IS rather than what
+    /// references it. Reported separately so a client can say so instead of
+    /// showing an empty blocker list beside a delete that still fails.
+    pub is_own_company: bool,
+    pub blocking: Vec<BlockingRecords>,
+    /// Detached rather than destroyed (migration 113, PMS-812).
+    pub unlinked: Vec<BlockingRecords>,
+    /// Destroyed along with the company.
+    pub removed: Vec<BlockingRecords>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockingRecords {
+    pub label: String,
+    pub count: i64,
+    /// Only meaningful in `blocking`: these records exist to be KEPT, so a
+    /// client must not phrase them as something to clear first.
+    pub retained: bool,
+}
+
+/// What a delete would unlink rather than destroy. Mirrors migration 113 plus
+/// PMS-812's `contacts` rule.
+const COMPANY_UNLINKED: &[(&str, &str)] = &[
+    ("contacts", "contacts"),
+    ("projects", "projects"),
+    ("appointments", "appointments"),
+];
+
+/// What a delete destroys outright.
+const COMPANY_REMOVED: &[(&str, &str)] = &[("sites", "sites")];
+
+fn company_delete_blocked(constraint: Option<&str>) -> AppError {
     let named = constraint.and_then(|c| {
-        RETAINED
+        COMPANY_BLOCKERS
             .iter()
-            .find(|(fk, _)| *fk == c)
-            .map(|(_, label)| (*label, true))
-            .or_else(|| {
-                REMOVABLE
-                    .iter()
-                    .find(|(fk, _)| *fk == c)
-                    .map(|(_, label)| (*label, false))
-            })
+            // An empty constraint never matches a real one Postgres reports.
+            .find(|b| !b.constraint.is_empty() && b.constraint == c)
+            .map(|b| (b.label, b.retained))
     });
 
     let message = match named {
@@ -816,6 +917,127 @@ impl ContactService {
 
     /// Delete company
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-926: what deleting this company would do, without doing it.
+    ///
+    /// Exists because the CLIENT was keeping its own English copy of these
+    /// rules, and that copy went stale the moment PMS-919 changed which tables
+    /// block. Reporting the rules from the place that enforces them is the only
+    /// arrangement that cannot drift.
+    ///
+    /// Counts are read the way the delete reads them, in particular `tickets`
+    /// with no `closed_at` filter: `open_ticket_count` on the company response
+    /// counts only OPEN tickets, so a company with five closed tickets and none
+    /// open reports zero there and is still refused. A preview built on that
+    /// number would promise a delete that then fails.
+    pub async fn deletion_preview(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<CompanyDeletionPreview> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // 404 rather than an empty preview for a company that is not there, so
+        // this cannot be used to probe ids in another tenant.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("Company".to_string()));
+        }
+
+        let is_own_company: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND own_company_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Every table name here is a compile-time constant from
+        // `COMPANY_BLOCKERS` and the two lists beside it, never anything a
+        // caller supplied, so the interpolation cannot carry input.
+        async fn count_in(
+            tx: &mut sqlx::PgConnection,
+            table: &str,
+            tenant_id: TenantId,
+            company_id: Uuid,
+        ) -> AppResult<i64> {
+            let sql =
+                format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1 AND company_id = $2");
+            Ok(sqlx::query_scalar(&sql)
+                .bind(tenant_id)
+                .bind(company_id)
+                .fetch_one(&mut *tx)
+                .await?)
+        }
+
+        let mut blocking = Vec::new();
+        for b in COMPANY_BLOCKERS {
+            let count = count_in(&mut tx, b.table, tenant_id, company_id).await?;
+            if count > 0 {
+                blocking.push(BlockingRecords {
+                    label: b.label.to_string(),
+                    count,
+                    retained: b.retained,
+                });
+            }
+        }
+
+        let mut unlinked = Vec::new();
+        for (table, label) in COMPANY_UNLINKED {
+            let count = count_in(&mut tx, table, tenant_id, company_id).await?;
+            if count > 0 {
+                unlinked.push(BlockingRecords {
+                    label: label.to_string(),
+                    count,
+                    retained: false,
+                });
+            }
+        }
+
+        let mut removed = Vec::new();
+        for (table, label) in COMPANY_REMOVED {
+            let count = count_in(&mut tx, table, tenant_id, company_id).await?;
+            if count > 0 {
+                removed.push(BlockingRecords {
+                    label: label.to_string(),
+                    count,
+                    retained: false,
+                });
+            }
+        }
+
+        // Sub-companies unlink rather than block (PMS-919 promotes them to top
+        // level), and they hang off `parent_company_id` rather than a
+        // `company_id`, so they need their own count.
+        let children: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM companies WHERE tenant_id = $1 AND parent_company_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if children > 0 {
+            unlinked.push(BlockingRecords {
+                label: "sub-companies".to_string(),
+                count: children,
+                retained: false,
+            });
+        }
+
+        Ok(CompanyDeletionPreview {
+            can_delete: blocking.is_empty() && !is_own_company,
+            is_own_company,
+            blocking,
+            unlinked,
+            removed,
+        })
+    }
+
     pub async fn delete_company(
         &self,
         tenant_id: TenantId,
