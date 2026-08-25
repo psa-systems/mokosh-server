@@ -3,7 +3,7 @@
 use axum::{
     extract::{Request, State},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::sync::Arc;
 
@@ -135,6 +135,13 @@ pub async fn auth_middleware(
     // memberships) so the hint stays None on that path and the enrich
     // pass falls back to an (email, tenant_id) lookup.
     let mut mid_hint: Option<uuid::Uuid> = None;
+    // Captures a "principal was definitively rejected" AppError (suspended
+    // tenant, deactivated user) from either the bunyip path or the legacy
+    // path. When set AND no auth path succeeded, short-circuit with the
+    // AppError's own response after the block, so the SPA sees the real
+    // 403 + copy instead of a generic 401 the AuthGuard reads as
+    // "session expired" and loops on.
+    let mut principal_rejection: Option<AppError> = None;
     let auth_state = match bearer(&request) {
         Some(token) => {
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
@@ -143,7 +150,7 @@ pub async fn auth_middleware(
                 Some(v) => match v.verify_at_jwt(token).await {
                     Ok(claims) => {
                         candidate_sub = uuid::Uuid::parse_str(&claims.sub).ok();
-                        ensure_user_from_bunyip(
+                        let (state, rejection) = ensure_user_from_bunyip(
                             &auth_middleware.auth_service,
                             auth_middleware.tenants.as_ref(),
                             auth_middleware.invitations.as_ref(),
@@ -151,7 +158,11 @@ pub async fn auth_middleware(
                             token,
                             &claims,
                         )
-                        .await
+                        .await;
+                        if principal_rejection.is_none() {
+                            principal_rejection = rejection;
+                        }
+                        state
                     }
                     Err(_) => None,
                 },
@@ -195,7 +206,17 @@ pub async fn auth_middleware(
                             Ok(user) => {
                                 AuthState::authenticated(user.to_current_user(), claims.tid)
                             }
-                            Err(_) => AuthState::default(),
+                            Err(e) => {
+                                // Capture the reason so the outer function can
+                                // return the AppError's own response (e.g. 403
+                                // "This organization is not active") instead of
+                                // dropping to a generic 401 the SPA reads as
+                                // "session expired" and loops on.
+                                if principal_rejection.is_none() {
+                                    principal_rejection = Some(e);
+                                }
+                                AuthState::default()
+                            }
                         }
                     }
                     _ => AuthState::default(),
@@ -224,6 +245,20 @@ pub async fn auth_middleware(
     } else {
         auth_state
     };
+
+    // When neither auth path succeeded AND we captured a definitive principal
+    // rejection (suspended tenant, deactivated user - PMS-698 semantics), return
+    // the AppError's own response NOW instead of running the request through
+    // `next` with an empty AuthState (which downstream extractors turn into a
+    // generic 401 the SPA reads as "session expired" and prompts the user to
+    // sign in again). The MAPPS-348 tombstone upgrade above takes precedence
+    // over principal_rejection - a deleted-account 410 is more specific than a
+    // suspended-tenant 403.
+    if !auth_state.is_authenticated && !auth_state.deleted {
+        if let Some(err) = principal_rejection {
+            return err.into_response();
+        }
+    }
 
     // MAPPS-491 (MAPPS-474 phase 2): backfill identity + membership fields
     // on the authenticated state so extractors and `GET /auth/memberships`
@@ -598,8 +633,10 @@ async fn ensure_user_from_bunyip(
     verifier: &BunyipVerifier,
     bearer: &str,
     claims: &super::oidc_rs::AtClaims,
-) -> Option<AuthState> {
-    let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
+) -> (Option<AuthState>, Option<AppError>) {
+    let Some(sub) = uuid::Uuid::parse_str(&claims.sub).ok() else {
+        return (None, None);
+    };
 
     // PMS-244: orgs live in Mokosh (Bunyip is a personal-subscription IdP with
     // no org concept), so the tenant is resolved from Mokosh's own membership
@@ -664,7 +701,7 @@ async fn ensure_user_from_bunyip(
             (None, false, None, None)
         };
 
-    place_bunyip_user(
+    place_bunyip_user_with_rejection(
         auth_service,
         tenants,
         invitations,
@@ -743,6 +780,9 @@ pub async fn bunyip_userinfo_needed(
 // integration tests) to construct that struct from the same fields. Suppress
 // here rather than refactor; the surface is internal to the auth module.
 #[allow(clippy::too_many_arguments)]
+/// Backward-compatible wrapper: discards any principal-rejection reason and
+/// returns only the resolved `AuthState`. The bunyip_login integration test
+/// suite calls this directly and does not need the rejection detail.
 pub async fn place_bunyip_user(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -754,6 +794,38 @@ pub async fn place_bunyip_user(
     family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
 ) -> Option<AuthState> {
+    place_bunyip_user_with_rejection(
+        auth_service,
+        tenants,
+        invitations,
+        sub,
+        email,
+        email_verified,
+        given_name,
+        family_name,
+        claims,
+    )
+    .await
+    .0
+}
+
+/// Variant that returns both the resolved `AuthState` AND any principal
+/// rejection reason (deactivated user / suspended tenant). The middleware
+/// uses this so it can short-circuit the request with the AppError's own
+/// 403 response instead of dropping to a generic 401 the SPA reads as
+/// "session expired" and loops on.
+#[allow(clippy::too_many_arguments)]
+pub async fn place_bunyip_user_with_rejection(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    email: Option<String>,
+    email_verified: bool,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    claims: &super::oidc_rs::AtClaims,
+) -> (Option<AuthState>, Option<AppError>) {
     let placement = auth_service.find_user_placement(sub).await.ok().flatten();
     let current = placement.as_ref().map(|(t, _)| *t);
 
@@ -788,7 +860,7 @@ pub async fn place_bunyip_user(
             email = email.as_deref().unwrap_or("<absent>"),
             "bunyip-authenticated identity has no local placement and no pending invitation; rejecting per MAPPS-458"
         );
-        return None;
+        return (None, None);
     }
 
     // PMS-245: a non-admin user still parked in the shared default tenant (dumped
@@ -816,7 +888,7 @@ pub async fn place_bunyip_user(
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, sub = %sub, "personal tenant provisioning failed");
-                    return None;
+                    return (None, None);
                 }
             },
             None => default_bunyip_tenant_id(),
@@ -883,7 +955,7 @@ pub async fn place_bunyip_user(
             // so a bunyip-provisioned user lands with their real name on
             // first sight. Both are Option<String>; None falls back to
             // `synthetic_name_from_email` inside the service.
-            auth_service
+            match auth_service
                 .upsert_user_from_oidc(
                     sub,
                     target,
@@ -894,8 +966,13 @@ pub async fn place_bunyip_user(
                     email_verified,
                 )
                 .await
-                .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
-                .ok()?
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed");
+                    return (None, None);
+                }
+            }
         }
     };
 
@@ -960,7 +1037,11 @@ pub async fn place_bunyip_user(
     // a revocation signal for a bunyip token.
     if let Err(e) = auth_service.ensure_principal_usable(&user).await {
         tracing::info!(error = %e, user = %user.id, tenant_id = %user.tenant_id, "rejecting bunyip principal");
-        return None;
+        // Propagate the rejection so the middleware can short-circuit with the
+        // AppError's 403 "This organization is not active" response instead of
+        // falling through to legacy + landing on a generic 401 the SPA reads
+        // as "session expired" and loops on.
+        return (None, Some(e));
     }
 
     // Mark the invite accepted now the user is placed (best-effort).
@@ -1016,7 +1097,10 @@ pub async fn place_bunyip_user(
     }
 
     let tenant_id = user.tenant_id;
-    Some(AuthState::authenticated(user.to_current_user(), tenant_id))
+    (
+        Some(AuthState::authenticated(user.to_current_user(), tenant_id)),
+        None,
+    )
 }
 
 /// Translate Bunyip's system role (the `bunyip_role` claim) into mokosh's

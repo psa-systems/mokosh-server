@@ -909,9 +909,16 @@ impl AuthService {
         // is not a revocation signal for a bunyip token.
         if let Some(changed_at) = user.password_changed_at {
             if token_iat < changed_at.timestamp() {
-                return Err(AppError::Forbidden(
-                    "Access token predates a password change".to_string(),
-                ));
+                // Return Unauthorized (401), not Forbidden (403), so the SPA's
+                // 401-refresh-and-retry flow kicks in and mints a fresh token
+                // instead of surfacing a permanent 403. Distinct from the
+                // suspended-tenant / deactivated-user case above, which stays
+                // 403 and short-circuits the middleware so the SPA can render
+                // the "This organization is not active" splash. The prior 403
+                // shape here was defensible but conflated a stale-token
+                // condition (recoverable via refresh) with a policy denial
+                // (not recoverable).
+                return Err(AppError::Unauthorized);
             }
         }
         Ok(user)
@@ -2959,11 +2966,17 @@ impl AuthService {
     /// (same status the downstream password-verify path returns), so
     /// the endpoint cannot be walked to enumerate tenant slugs.
     async fn resolve_tenant_slug(&self, slug: &str) -> AppResult<Uuid> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM tenants WHERE slug = $1 AND status = 'active'")
-                .bind(slug)
-                .fetch_optional(self.db.migrator_pool())
-                .await?;
+        // Deliberately does NOT filter on `status = 'active'`: a filtered lookup
+        // collapses a suspended tenant into "unknown slug" and returns 401, which
+        // the SPA then reads as a session-expired prompt and asks the user to
+        // sign in again (into a tenant they cannot access). Return the id
+        // regardless of status; `ensure_tenant_active` runs downstream and turns
+        // the non-active case into a 403 with the "This organization is not
+        // active" copy the SPA renders instead of the sign-in prompt.
+        let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM tenants WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(self.db.migrator_pool())
+            .await?;
         row.map(|(id,)| id).ok_or(AppError::Unauthorized)
     }
 
