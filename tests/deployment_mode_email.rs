@@ -35,6 +35,7 @@ use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::AuthService;
 use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::utils::deployment::DeploymentMode;
+use mokosh_server::utils::error::AppError;
 use mokosh_server::Database;
 use mokosh_types::auth::CreateUserRequest;
 
@@ -45,6 +46,16 @@ use mokosh_types::auth::CreateUserRequest;
 /// fixture without a dispatcher would take the `None` branch and queue nothing
 /// in either mode - a test that passes for the wrong reason.
 fn service(pool: &PgPool, mode: DeploymentMode) -> AuthService {
+    // PMS-905: `sso_mounted` tracks the mode, because that is the configuration
+    // each mode is meant to run in - a `saas` deployment has the bunyip verifier
+    // mounted. The mismatched state (`saas` with no verifier) is the break-glass
+    // one and has its own tests in `tests/saas_local_auth.rs`; it must not be
+    // the shape the suppression suite silently runs in.
+    with_sso(pool, mode, mode.is_saas())
+}
+
+/// [`service`] with the SSO posture chosen explicitly.
+fn with_sso(pool: &PgPool, mode: DeploymentMode, sso_mounted: bool) -> AuthService {
     let db = Database::from_pool(pool.clone());
     AuthService::with_dispatcher(
         db.clone(),
@@ -54,6 +65,7 @@ fn service(pool: &PgPool, mode: DeploymentMode) -> AuthService {
         NotificationsService::with_encryption_key(db, [0u8; 32]),
     )
     .with_deployment_mode(mode)
+    .with_sso_mounted(sso_mounted)
 }
 
 /// How many email rows are queued for `recipient`. The dispatcher writes one
@@ -130,10 +142,16 @@ async fn password_reset_queues_in_self_hosted_and_is_suppressed_in_saas(pool: Pg
         "a self-hosted deployment owns the credential, so it must still send the reset link"
     );
 
-    service(&pool, DeploymentMode::Saas)
+    // PMS-905 changed this from a silent `Ok(())` to an explicit refusal: a
+    // reset request that reports success and does nothing is the dead end that
+    // issue exists to remove.
+    let refused = service(&pool, DeploymentMode::Saas)
         .request_password_reset(Some(common::DEFAULT_TENANT_ID), saas)
-        .await
-        .expect("saas reset still returns Ok, exactly as an unknown address does");
+        .await;
+    assert!(
+        matches!(refused, Err(AppError::Forbidden(_))),
+        "saas refuses the reset outright, got {refused:?}"
+    );
     assert_eq!(
         queued_for(&pool, saas).await,
         0,
@@ -142,11 +160,16 @@ async fn password_reset_queues_in_self_hosted_and_is_suppressed_in_saas(pool: Pg
     );
 }
 
-/// The suppression must not become an enumeration oracle. A caller cannot tell
-/// a suppressed reset from one for an address with no account, because both
-/// return the same `Ok(())` and neither queues anything.
+/// The refusal must not become an enumeration oracle.
+///
+/// PMS-905 replaced a silent `Ok(())` with a 403, which is only safe because
+/// the 403 is a statement about the DEPLOYMENT, not about the address: a known
+/// and an unknown address must get byte-identical answers. An implementation
+/// that refused only for real accounts, and kept the old silent success for
+/// the rest, would turn this endpoint into the account oracle it has always
+/// been written to avoid.
 #[sqlx::test]
-async fn a_suppressed_reset_is_indistinguishable_from_an_unknown_address(pool: PgPool) {
+async fn the_refusal_is_the_same_for_a_known_and_an_unknown_address(pool: PgPool) {
     let known = "known@example.test";
     seed_user(&pool, known).await;
     let svc = service(&pool, DeploymentMode::Saas);
@@ -158,7 +181,13 @@ async fn a_suppressed_reset_is_indistinguishable_from_an_unknown_address(pool: P
         .request_password_reset(Some(common::DEFAULT_TENANT_ID), "nobody@example.test")
         .await;
 
-    assert!(for_known.is_ok() && for_unknown.is_ok());
+    match (&for_known, &for_unknown) {
+        (Err(AppError::Forbidden(a)), Err(AppError::Forbidden(b))) => assert_eq!(
+            a, b,
+            "the two answers differ, which tells a caller whether the account exists"
+        ),
+        other => panic!("both must be the same Forbidden, got {other:?}"),
+    }
     assert_eq!(queued_for(&pool, known).await, 0);
     assert_eq!(queued_for(&pool, "nobody@example.test").await, 0);
 }
@@ -216,12 +245,12 @@ async fn saas_mints_no_token_whose_only_carrier_was_suppressed(pool: PgPool) {
     let saas = service(&pool, DeploymentMode::Saas);
 
     let reset_user = seed_user(&pool, "token-reset-saas@example.test").await;
-    saas.request_password_reset(
-        Some(common::DEFAULT_TENANT_ID),
-        "token-reset-saas@example.test",
-    )
-    .await
-    .expect("saas reset");
+    let _ = saas
+        .request_password_reset(
+            Some(common::DEFAULT_TENANT_ID),
+            "token-reset-saas@example.test",
+        )
+        .await;
 
     let created = saas
         .create_user(

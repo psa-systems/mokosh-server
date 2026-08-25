@@ -114,6 +114,23 @@ pub fn create_api_router(
         .collect();
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
 
+    // PMS-905: `bunyip_verifier` is moved into the auth middleware below, so
+    // capture the one fact the auth service needs from it first.
+    let sso_mounted = bunyip_verifier.is_some();
+    if deployment_mode.is_saas() && !sso_mounted {
+        // Loud, but not fatal. A `saas` deployment with no verifier can
+        // authenticate nobody through SSO, so the local password path is the
+        // only way in and stays open deliberately (see
+        // `AuthService::local_password_auth_disabled`). Making this a boot
+        // failure instead is precisely PMS-289, which took staging and
+        // production down and needed PMS-292 to restore service.
+        tracing::error!(
+            "MOKOSH_DEPLOYMENT_MODE=saas but no Bunyip RS verifier is mounted (OIDC_ISSUER / \
+             OIDC_AUDIENCE unset): local password login remains ENABLED because it is the only \
+             auth path this instance has. Configure the verifier, or set the mode to self-hosted.",
+        );
+    }
+
     // Create services. NotificationsService is constructed first so a
     // shared clone can be threaded into AuthService and TicketService,
     // letting them dispatch transactional messages (password reset,
@@ -136,7 +153,12 @@ pub fn create_api_router(
     )
     .with_geoip(geoip)
     .with_login_approval(login_approval_enabled)
-    .with_deployment_mode(deployment_mode);
+    .with_deployment_mode(deployment_mode)
+    // PMS-905: local password auth closes only when a working alternative
+    // exists. `bunyip_verifier` is `Some` exactly when OIDC_ISSUER and
+    // OIDC_AUDIENCE are configured, so it is the signal for "SSO is set up
+    // here" rather than a guess from the mode alone.
+    .with_sso_mounted(sso_mounted);
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
     // PMS-136: ContactService emails a `/portal/set-password` setup link when

@@ -79,6 +79,11 @@ pub struct AuthService {
     /// signs in with, so the mail that exists only to service it is suppressed.
     /// Defaults to self-hosted; wired via [`Self::with_deployment_mode`].
     deployment_mode: DeploymentMode,
+    /// PMS-905: whether the bunyip Resource-Server verifier is mounted, i.e.
+    /// whether this instance has a working alternative to the local password.
+    /// Set from `bunyip_verifier.is_some()` in `create_api_router`; false in
+    /// fixtures. See [`Self::local_password_auth_disabled`].
+    sso_mounted: bool,
 }
 
 /// PMS-658: outcome of screening a login for suspicious signals. `country` and
@@ -130,6 +135,7 @@ impl AuthService {
             geoip: None,
             login_approval_enabled: false,
             deployment_mode: DeploymentMode::SelfHosted,
+            sso_mounted: false,
         }
     }
 
@@ -159,6 +165,7 @@ impl AuthService {
             geoip: None,
             login_approval_enabled: false,
             deployment_mode: DeploymentMode::SelfHosted,
+            sso_mounted: false,
         }
     }
 
@@ -190,15 +197,63 @@ impl AuthService {
         self
     }
 
+    /// PMS-905: declare whether the bunyip Resource-Server verifier is mounted.
+    /// Set from `bunyip_verifier.is_some()` at server startup; fixtures leave it
+    /// false, which is the "no alternative credential exists" posture.
+    #[must_use]
+    pub fn with_sso_mounted(mut self, mounted: bool) -> Self {
+        self.sso_mounted = mounted;
+        self
+    }
+
+    /// PMS-905: whether the local password is a credential on this instance.
+    ///
+    /// Disabled only when BOTH conditions hold: this is a `saas` deployment,
+    /// AND the bunyip verifier is mounted so a working alternative demonstrably
+    /// exists. The conjunction is the whole design.
+    ///
+    /// Rejecting on the mode alone would mean a `saas` instance whose OIDC
+    /// configuration is missing or broken has no way in at all: SSO cannot
+    /// authenticate anyone (that is what broken means) and the local path has
+    /// been closed behind it. That is the PMS-289 shape - a misconfigured IdP
+    /// made fatal, which took staging and production down and needed PMS-292 to
+    /// restore service. Keeping the local path open in exactly that state is
+    /// the break-glass, and it is narrow: a bunyip-provisioned user has no
+    /// `password_hash` at all (`upsert_user_from_oidc` writes none) and is
+    /// already refused by the `ok_or(Unauthorized)` in `login`, so the only
+    /// accounts it admits are the bootstrap admin and pre-migration ones.
+    ///
+    /// `create_api_router` reports the misconfigured state at `error` on the
+    /// way past, so it is loud without being fatal.
+    fn local_password_auth_disabled(&self) -> bool {
+        self.deployment_mode.is_saas() && self.sso_mounted
+    }
+
     /// PMS-904: whether account email for the local platform credential should
     /// be sent at all.
     ///
-    /// One predicate rather than `deployment_mode.is_saas()` repeated at each
-    /// gate, so the three sites cannot drift apart and so the question reads as
-    /// what it is: not "which mode is this" but "is there a local account here
-    /// for this mail to be about".
+    /// Defined as the negation of [`Self::local_password_auth_disabled`] rather
+    /// than as its own test of the mode, so the mail and the endpoints can
+    /// never disagree. The state that would otherwise fall between them is
+    /// `saas` with no verifier: mail keyed on the mode alone would suppress the
+    /// reset email there while login stayed open, leaving a break-glass path
+    /// nobody could recover a password for - the exact silent dead end PMS-905
+    /// exists to remove.
     fn sends_local_account_email(&self) -> bool {
-        !self.deployment_mode.is_saas()
+        !self.local_password_auth_disabled()
+    }
+
+    /// The rejection every closed local-credential entry point returns.
+    ///
+    /// One message, so a customer who tries the password box, then "forgot
+    /// password", then their old reset link is told the same thing three times
+    /// instead of assembling three different guesses about what is wrong.
+    fn sso_only_rejection() -> AppError {
+        AppError::Forbidden(
+            "This deployment signs in with single sign-on. Use your organisation's \
+             sign-in page; a password set here would not sign you in."
+                .to_string(),
+        )
     }
 
     /// PMS-657: on a genuine login, resolve the client IP to a country and, when
@@ -639,6 +694,24 @@ impl AuthService {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
 
+        // PMS-905: the local password is not a credential on this instance.
+        //
+        // Placed after the user lookup and the status check so the answer does
+        // not depend on whether the address exists, and before the password
+        // verify so no Argon2 work is spent on a credential that cannot be
+        // accepted. `warn`, not `info`: in a deployment that federates identity
+        // this is somebody presenting a password at a door that is supposed to
+        // be closed, which is worth seeing in the log even though the outcome
+        // is correct.
+        if self.local_password_auth_disabled() {
+            tracing::warn!(
+                user_id = %user.id,
+                deployment_mode = %self.deployment_mode,
+                "local password login refused: platform identity is federated to Bunyip SSO (PMS-905)",
+            );
+            return Err(Self::sso_only_rejection());
+        }
+
         // Reject sign-in when the owning tenant is suspended/cancelled, so a
         // tenant-level suspension takes effect immediately.
         self.ensure_tenant_active(user.tenant_id).await?;
@@ -1071,6 +1144,25 @@ impl AuthService {
         tenant_hint: Option<Uuid>,
         email: &str,
     ) -> AppResult<()> {
+        // PMS-905: refused BEFORE the user lookup, and the ordering is
+        // load-bearing.
+        //
+        // This endpoint answers the same way for a known and an unknown address
+        // on purpose, so it never reveals whether an account exists. Placing the
+        // refusal after the lookup would have handed a known address a 403 while
+        // an unknown one kept the silent `Ok(())` below - turning the fix into
+        // the account oracle the endpoint is written to avoid. The deployment
+        // mode is not a property of the address, so it is decided before any
+        // address is resolved and every caller gets one answer.
+        if self.local_password_auth_disabled() {
+            tracing::info!(
+                deployment_mode = %self.deployment_mode,
+                "password-reset refused: platform identity is federated to Bunyip SSO, so a \
+                 mokosh-side password is not a credential on this instance (PMS-905)",
+            );
+            return Err(Self::sso_only_rejection());
+        }
+
         // Find user - don't reveal if user exists
         let tenant_id = Self::resolve_tenant_for_login(tenant_hint);
         let user = match self.find_user_by_email_for_tenant(tenant_id, email).await {
@@ -1089,16 +1181,6 @@ impl AuthService {
         // address still comes first, and returning the same `Ok(())` here keeps
         // this endpoint's contract intact: it never reveals whether an address
         // has an account, in either mode.
-        if !self.sends_local_account_email() {
-            tracing::info!(
-                user_id = %user.id,
-                deployment_mode = %self.deployment_mode,
-                "password-reset email suppressed: platform identity is federated to Bunyip SSO, \
-                 so a mokosh-side password is not the credential this user signs in with (PMS-904)",
-            );
-            return Ok(());
-        }
-
         // Generate a reset token bound to the user. The emailed token is
         // `{user_id}.{secret}`; only the secret is hashed and stored so
         // reset_password can scope its lookup to this user.
@@ -1170,6 +1252,23 @@ impl AuthService {
     /// Reset password with token
     #[tracing::instrument(skip_all)]
     pub async fn reset_password(&self, request: &ResetPasswordRequest) -> AppResult<()> {
+        // PMS-905: refuse to redeem, ahead of every other check.
+        //
+        // No new token is minted in this state (PMS-904 stops that), but one
+        // issued before the deployment was switched over stays valid for its
+        // 24h - or 7 days for a welcome link - and redeeming it would set a
+        // password that signs nobody in. Answering 403 says so; succeeding
+        // would be the dead end this issue exists to remove, and the most
+        // convincing kind, because the customer would have just been told their
+        // password was changed.
+        if self.local_password_auth_disabled() {
+            tracing::info!(
+                deployment_mode = %self.deployment_mode,
+                "password-reset redemption refused: platform identity is federated to Bunyip SSO (PMS-905)",
+            );
+            return Err(Self::sso_only_rejection());
+        }
+
         if request.new_password != request.confirm_password {
             return Err(AppError::validation_field(
                 "confirm_password",
@@ -3282,32 +3381,76 @@ mod tests {
     /// test suite at all: `check_login_location` returns immediately with no
     /// IP2Location DB configured, and the harness configures none. Its gate is
     /// this predicate, so this is the level at which it is testable.
+    /// PMS-904 / PMS-905: the predicate every gated site consults, over all
+    /// four configurations.
+    ///
+    /// A truth table rather than the two cases PMS-904 needed, because PMS-905
+    /// made the condition a conjunction and the interesting cell is the one
+    /// neither issue's happy path visits: `saas` with no verifier, where the
+    /// local path must stay open because it is the only one the instance has.
+    ///
+    /// Covered here rather than only through the integration suites because the
+    /// third gated mail site, the new-login-location alert, cannot be reached in
+    /// a test at all: `check_login_location` returns immediately with no
+    /// IP2Location DB and no harness configures one. This is the level at which
+    /// its gate is testable.
     #[tokio::test]
-    async fn local_account_email_is_sent_only_when_this_deployment_owns_the_credential() {
-        // `connect_lazy` opens no socket and this test issues no query: what is
-        // under test is a field read, so a live database would be scaffolding
-        // around the thing being measured. It still needs a Tokio context to
-        // build the pool, hence `#[tokio::test]` rather than `#[test]`.
-        let build = || {
+    async fn local_password_auth_closes_only_when_a_working_alternative_exists() {
+        // `connect_lazy` opens no socket and nothing here issues a query: what
+        // is under test is a pair of field reads, so a live database would be
+        // scaffolding around the thing being measured. It still needs a Tokio
+        // context to build the pool, hence `#[tokio::test]`.
+        let build = |mode, sso| {
             let pool = sqlx::postgres::PgPool::connect_lazy("postgres://unused/unused")
                 .expect("a lazy pool needs no server");
             AuthService::new(crate::db::Database::from_pool(pool), "test-secret".into())
+                .with_deployment_mode(mode)
+                .with_sso_mounted(sso)
         };
 
-        assert!(
-            build().sends_local_account_email(),
-            "the default is self-hosted, which owns its passwords and must keep mailing about them"
-        );
-        assert!(build()
-            .with_deployment_mode(DeploymentMode::SelfHosted)
-            .sends_local_account_email());
-        assert!(
-            !build()
-                .with_deployment_mode(DeploymentMode::Saas)
-                .sends_local_account_email(),
-            "in saas the credential lives in Bunyip, so mail about a mokosh password is \
-             mail about an account nobody signs in to"
-        );
+        for (mode, sso, closed, why) in [
+            (
+                DeploymentMode::SelfHosted,
+                false,
+                false,
+                "self-hosted owns its passwords",
+            ),
+            (
+                DeploymentMode::SelfHosted,
+                true,
+                false,
+                "a self-hosted operator may run SSO alongside local accounts and expect both",
+            ),
+            (
+                DeploymentMode::Saas,
+                false,
+                false,
+                "no verifier means SSO can authenticate nobody, so closing the local path \
+                 would leave no way in at all (PMS-289)",
+            ),
+            (
+                DeploymentMode::Saas,
+                true,
+                true,
+                "the credential lives in Bunyip and a working alternative is mounted",
+            ),
+        ] {
+            let service = build(mode, sso);
+            assert_eq!(
+                service.local_password_auth_disabled(),
+                closed,
+                "mode={mode} sso_mounted={sso}: {why}"
+            );
+            // The mail follows the endpoints by construction, never separately.
+            assert_eq!(
+                service.sends_local_account_email(),
+                !closed,
+                "mode={mode} sso_mounted={sso}: the mail and the endpoints must agree"
+            );
+        }
+
+        // The default, with nothing configured, is the fully open one.
+        assert!(build(DeploymentMode::default(), false).sends_local_account_email());
     }
 
     #[test]
