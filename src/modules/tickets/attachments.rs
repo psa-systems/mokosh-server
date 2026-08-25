@@ -38,9 +38,6 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
-use crate::modules::portal::{
-    portal_auth_middleware, PortalAuthMiddleware, PortalAuthService, RequirePortalAuth,
-};
 use crate::utils::error::{AppError, AppResult};
 
 /// Default size cap when `ATTACHMENT_MAX_BYTES` is unset. 25 MiB
@@ -471,40 +468,6 @@ pub fn agent_attachment_routes(service: AttachmentService) -> Router {
         .with_state(state)
 }
 
-pub fn portal_attachment_routes(
-    service: AttachmentService,
-    portal_auth_service: PortalAuthService,
-) -> Router {
-    let state = AttachmentsRouterState {
-        service: Arc::new(service),
-    };
-    // PMS-483 follow-up: the portal sub-router's `RequirePortalAuth`
-    // extractor relies on the `portal_auth_middleware` layer to decode
-    // the Bearer token and stash the resulting `CurrentContact` into
-    // request extensions. `portal_routes` applies that layer to its
-    // own routes; merging this router into the portal tree does NOT
-    // inherit it (layers are per-Router in axum), so without spelling
-    // it out here every portal upload / list / download / delete
-    // would 401 before reaching the handler. Build the same middleware
-    // off a separate `PortalAuthService` clone (cheap - the service is
-    // pool + jwt_secret) and layer it onto this sub-router.
-    let mw = PortalAuthMiddleware::new(portal_auth_service);
-    Router::new()
-        .route(
-            "/tickets/{ticket_id}/notes/{note_id}/attachments",
-            get(list_portal).post(upload_portal),
-        )
-        .route(
-            "/tickets/{ticket_id}/notes/{note_id}/attachments/{attachment_id}",
-            get(download_portal).delete(delete_portal),
-        )
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(
-            mw,
-            portal_auth_middleware,
-        ))
-}
-
 async fn list_agent(
     State(s): State<AttachmentsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -570,97 +533,6 @@ async fn delete_agent(
         .assert_note_in_ticket(tenant_uuid, ticket_id, note_id)
         .await?;
     s.service.delete_one(tenant_uuid, attachment_id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn list_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id)): Path<(Uuid, Uuid)>,
-) -> AppResult<Json<Vec<AttachmentResponse>>> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    let rows = s
-        .service
-        .list(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    Ok(Json(rows))
-}
-
-async fn upload_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id)): Path<(Uuid, Uuid)>,
-    multipart: Multipart,
-) -> AppResult<Json<AttachmentResponse>> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    let (file_name, mime_type, bytes) = read_multipart_file(multipart).await?;
-    let resp = s
-        .service
-        .create(
-            contact.tenant_id,
-            ticket_id,
-            note_id,
-            file_name,
-            mime_type,
-            bytes,
-            Uploader::Portal {
-                contact_id: contact.id,
-            },
-        )
-        .await?;
-    Ok(Json(resp))
-}
-
-async fn download_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id, attachment_id)): Path<(Uuid, Uuid, Uuid)>,
-) -> AppResult<Response> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    let (row, bytes) = s.service.get(contact.tenant_id, attachment_id).await?;
-    if row.ticket_id != ticket_id || row.note_id != Some(note_id) {
-        return Err(AppError::NotFound("attachment not on this note".into()));
-    }
-    Ok(attachment_response(row, bytes))
-}
-
-async fn delete_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id, attachment_id)): Path<(Uuid, Uuid, Uuid)>,
-) -> AppResult<StatusCode> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    // Portal contacts can only delete their own uploads. Look up the
-    // row first to enforce the constraint before delete_one runs.
-    let (row, _) = s.service.get(contact.tenant_id, attachment_id).await?;
-    if row.created_by_contact_id != Some(contact.id) {
-        return Err(AppError::Forbidden(
-            "portal contacts can only delete their own uploads".into(),
-        ));
-    }
-    s.service
-        .delete_one(contact.tenant_id, attachment_id)
-        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

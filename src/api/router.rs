@@ -31,13 +31,12 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
-use crate::modules::forms::{forms_routes, portal_form_routes, public_form_routes, FormsService};
+use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::platform::{platform_routes, PlatformAdminService};
-use crate::modules::portal::{portal_routes, PortalAuthService};
 use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::quotes::{quotes_routes, QuotesService};
 use crate::modules::reports::{reports_routes, ReportsService};
@@ -51,8 +50,8 @@ use crate::modules::teams::{me_teams_routes, teams_routes, TeamsService};
 use crate::modules::tenants::{public_tenant_routes, tenant_routes, TenantService};
 use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
-    agent_attachment_routes, contact_notes_routes, portal_attachment_routes, ticket_routes,
-    AttachmentConfig, AttachmentService, TicketService,
+    agent_attachment_routes, contact_notes_routes, ticket_routes, AttachmentConfig,
+    AttachmentService, TicketService,
 };
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::modules::workflows::{workflow_routes, WorkflowsService};
@@ -98,12 +97,6 @@ pub fn create_api_router(
     // PMS-658: master switch for the suspicious-login notify-and-approve gate,
     // from LOGIN_APPROVAL_ENABLED in main.rs. Off by default (can block logins).
     login_approval_enabled: bool,
-    // PMS-729: host-to-tenant resolution config for the client portal. Built
-    // by the caller (main.rs from `PORTAL_HOST_SUFFIX`, integration tests
-    // from an explicit suffix so they do not have to mutate process env). An
-    // empty suffix keeps the feature off; the login handler then reads the
-    // slug from the body exactly like the pre-PMS-729 path.
-    portal_host_config: crate::modules::portal::PortalHostConfig,
     // PMS-748: address a client can report an unwanted request-form email to,
     // from ABUSE_CONTACT_EMAIL in main.rs. `None` drops the line from the mail
     // rather than pointing it at the noreply from-address.
@@ -155,11 +148,6 @@ pub fn create_api_router(
     // admin welcome.
     let tenant_service = TenantService::new(db.clone())
         .with_dispatcher(notifications_service.clone(), client_origin.clone())
-        // Give the tenant service the portal host suffix so the admin
-        // welcome email context carries a computed `client_portal_url`
-        // (`{slug}.client.<apex>`). Templates that reference it
-        // render the URL inline; templates that don't ignore it.
-        .with_portal_host_suffix(portal_host_config.suffix())
         // MAPPS-457: attach the instance-wide tenant cap. `None` (unset
         // env) leaves the service uncapped, matching production today.
         .with_max_tenants(max_tenants);
@@ -528,82 +516,10 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
-    // Build portal API routes. Portal identity is the contacts row,
-    // so this surface runs its own auth middleware (mounted inside
-    // `portal_routes`) and never sees `AuthMiddleware` / `AuthState`.
-    // PMS-729 phase 2 H3: attach the notifications dispatcher so the
-    // password-reset email path lands. PMS-729 phase 2 H7: attach the
-    // geoip + mailer so the new-sign-in email fires on a country
-    // change. The attachment auth-service instance below skips both:
-    // that clone is used only by the extractor for portal-attachment
-    // routes and never dispatches mail.
-    let portal_service = PortalAuthService::new(db.clone(), jwt_secret.clone())
-        .with_notifications(notifications_service.clone())
-        .with_login_alerts(geoip.clone(), mailer.clone(), client_origin.clone());
-    // PMS-483: `portal_attachment_routes` needs its own clone of the
-    // service so it can build the same `portal_auth_middleware` layer
-    // independently (the layer is per-Router in axum, not inherited
-    // from the merged-into parent).
-    let portal_attachment_auth_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
-    let portal_ticket_service = TicketService::new(db.clone());
-    let portal_kb_service = KbService::new(db.clone());
-    let portal_billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
-    let portal_quotes_service = QuotesService::with_delivery(
-        db.clone(),
-        shared_mailer.clone(),
-        notifications_service.clone(),
-        spa_base_url.clone(),
-    );
-    // PMS-729 phase 2 H8: Cloudflare Turnstile gate, built once at
-    // router-build time and shared across every request. Both env
-    // keys absent = feature off (gate always allows through), but the
-    // per-IP failure counter still ticks so a future toggle-on picks
-    // up warm state.
-    let portal_captcha = crate::modules::portal::TurnstileGate::new(
-        crate::modules::portal::TurnstileConfig::from_env(),
-    );
-    let portal_api = Router::new()
-        .route("/health", get(health_check))
-        .merge(portal_routes(
-            portal_service,
-            portal_ticket_service,
-            portal_kb_service,
-            portal_billing_service,
-            portal_quotes_service,
-            // MAPPS-425: the Stripe checkout success/cancel URLs are
-            // `/portal/invoices/{id}`, mokosh-apps routes, so the portal
-            // origin is the SPA origin and not the apex.
-            spa_base_url.clone(),
-            portal_host_config,
-            portal_captcha,
-        ))
-        // PMS-483: portal-side ticket-note attachments. Same routes as
-        // the agent surface, but behind `RequirePortalAuth` and
-        // company-scoped via the contact's authenticated `company_id`.
-        // The portal auth middleware is layered inside this builder
-        // because `.merge` does NOT inherit the parent router's layers
-        // - without that, every portal upload would 401 before the
-        // handler.
-        .merge(portal_attachment_routes(
-            AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
-            portal_attachment_auth_service,
-        ))
-        // PMS-729 phase 2 §7 slice B / I8: authenticated portal form
-        // list / detail / submit. The middleware is layered inside the
-        // builder for the same reason `portal_attachment_routes` does
-        // (a merged sub-router does not inherit the parent's layers).
-        .merge(portal_form_routes(
-            FormsService::with_request_links(
-                db.clone(),
-                notifications_service.clone(),
-                TicketService::new(db.clone()),
-            ),
-            PortalAuthService::new(db.clone(), jwt_secret.clone()),
-        ))
-        // PMS-298: same envelope normalization for the portal surface.
-        .layer(middleware::from_fn(
-            crate::utils::error::normalize_error_envelope,
-        ));
+    // mokosh-contact-login: the /portal/* customer-portal surface retires
+    // on this branch. The whole PortalAuthService + PortalRouter tree
+    // built here pre-pivot is gone; the contact plane replaces it under
+    // /api/v1/contact/* in a later prompt (004).
 
     // CORS: SPA at msp.<tld> talks to api.msp.<tld> from a different origin,
     // so credentialed CORS must be tight (specific origins, not wildcard).
@@ -713,7 +629,6 @@ pub fn create_api_router(
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/public", public_api)
-        .nest("/api/v1/portal", portal_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
         .nest("/api/v1/stripe", stripe_webhooks)
         .fallback(get(move |headers| {

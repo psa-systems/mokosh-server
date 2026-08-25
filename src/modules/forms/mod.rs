@@ -20,7 +20,6 @@
 mod drafts;
 mod models;
 #[cfg(feature = "server")]
-mod portal_routes;
 #[cfg(feature = "server")]
 mod public_routes;
 #[cfg(feature = "server")]
@@ -35,7 +34,6 @@ mod validation;
 pub use drafts::{FormDraftResponse, UpsertFormDraftRequest};
 pub use models::*;
 #[cfg(feature = "server")]
-pub use portal_routes::portal_form_routes;
 #[cfg(feature = "server")]
 pub use public_routes::public_form_routes;
 #[cfg(feature = "server")]

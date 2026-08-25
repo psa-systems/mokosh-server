@@ -180,22 +180,12 @@ async fn create_tenant_copies_auth_welcome_template_and_rule(pool: PgPool) {
     );
 }
 
-/// MAPPS-554 (was PMS-729 follow-up): a super-admin `create_tenant`
-/// call must provision the tenant's PORTAL admin CONTACT and email
-/// them a portal-side setup link, not a `users` row + mokosh-workspace
-/// setup link. Without this, a newly provisioned tenant lands with no
-/// way for the client to sign in to their own portal.
-///
-/// Pinned end-to-end:
-/// - No `users` row for the admin email (that path retired in MAPPS-554).
-/// - One `contacts` row for the admin email: is_portal_user=true,
-///   portal_role='admin', linked to the tenant's own_company.
-/// - One `portal_setup_tokens` row for that contact (redeemable).
-/// - One queued `auth.welcome` notification whose body carries
-///   `<portal_url>/portal/set-password?token=`, NOT the mokosh apex
-///   `/set-password/` (or `/reset-password/`) shape.
-#[sqlx::test]
-async fn create_tenant_emails_portal_admin_setup_link(pool: PgPool) {
+// mokosh-contact-login: pre-pivot `create_tenant_emails_portal_admin_setup_link`
+// removed. That test exercised `TenantService::provision_portal_admin_and_send_welcome`
+// which retired on this branch (prompt 001). Replacement e2e test for the
+// new contact plane lands in prompt 004.
+#[cfg(any())]
+async fn RETIRED(pool: PgPool) {
     let notifications =
         NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
     // MAPPS-554 dev-port pin: pass a `http://host:PORT` frontend base URL
@@ -1809,11 +1799,11 @@ async fn the_ticket_note_template_asks_for_the_organisation_identity(pool: PgPoo
     }
 }
 
-/// MAPPS-558: `cancel_tenant` flips `tenants.status` to 'cancelled'
-/// (permitted by the CHECK constraint in migration 002) and
-/// `activate_tenant` reverses it. Pins the write shape.
-#[sqlx::test]
-async fn cancel_and_reactivate_flip_tenant_status(pool: PgPool) {
+// mokosh-contact-login: `cancel_tenant` retired with the Clients
+// tab (prompt 001). Removed alongside the pre-pivot test that
+// exercised it.
+#[cfg(any())]
+async fn cancel_and_reactivate_flip_tenant_status_RETIRED(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let req = CreateTenantRequest {
         name: "MAPPS-558 Cancel Test".into(),

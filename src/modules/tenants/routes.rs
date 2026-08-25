@@ -159,21 +159,11 @@ pub fn tenant_routes(
         .route("/{tenant_id}", put(update_tenant))
         .route("/{tenant_id}/suspend", post(suspend_tenant))
         .route("/{tenant_id}/activate", post(activate_tenant))
-        // MAPPS-558: cancel client. Flips tenants.status to 'cancelled';
-        // reversible via /activate. Same guard as suspend / activate.
-        .route("/{tenant_id}/cancel", post(cancel_tenant))
-        // MAPPS-448: super-admin re-issues the tenant admin's welcome email
-        // (fresh setup token, invalidating any prior unredeemed one).
-        .route(
-            "/{tenant_id}/admin/resend-welcome",
-            post(resend_admin_welcome),
-        )
-        // MAPPS-450: read + edit the tenant admin's `users` row (email,
-        // first_name, last_name). Both super-admin-only. The PUT also
-        // accepts `resend_welcome: bool` so an email-change common case
-        // is a single round-trip.
-        .route("/{tenant_id}/admin", get(get_tenant_admin))
-        .route("/{tenant_id}/admin", put(update_tenant_admin))
+        // mokosh-contact-login: the /cancel + /admin routes + the
+        // resend-welcome route (MAPPS-558 / MAPPS-450 / MAPPS-448)
+        // retired with the Clients-tab UI in prompt 001. Handlers
+        // stay in the file as dead code and will be swept in a
+        // follow-up cleanup pass.
         .route("/{tenant_id}/usage", get(get_tenant_usage))
         // Audit F5: expose existing service-level module-config helpers
         // over HTTP so the client's settings/integrations page can read
