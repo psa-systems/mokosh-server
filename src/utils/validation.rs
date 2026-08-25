@@ -20,9 +20,17 @@ pub fn validate_email(email: &str) -> Result<(), ValidationError> {
     }
 }
 
-/// Validate a phone number (E.164 format)
+/// Validate a phone number (E.164 format).
+///
+/// PMS-924: normalizes before matching. A trailing U+200B is invisible, so a
+/// number that looks exactly right fails the regex and the user is told it
+/// "must be a valid phone number" with nothing on screen to act on. The JSON
+/// middleware already strips one from a request body; doing it here too means a
+/// value reaching this validator from a path the middleware does not cover
+/// (a worker, a seeder, an import helper) behaves the same way.
 pub fn validate_phone(phone: &str) -> Result<(), ValidationError> {
-    if phone.is_empty() || PHONE_REGEX.is_match(phone) {
+    let phone = crate::utils::text::sanitize_invisible(phone);
+    if phone.is_empty() || PHONE_REGEX.is_match(&phone) {
         Ok(())
     } else {
         Err(ValidationError::new("invalid_phone"))
@@ -475,6 +483,19 @@ mod tests {
         assert!(validate_phone("14155551234").is_ok());
         assert!(validate_phone("").is_ok()); // Empty is allowed
         assert!(validate_phone("abc123").is_err());
+    }
+
+    /// PMS-924: an invisible character must not decide whether a number is
+    /// valid, and a value that is only invisibles is "no phone", not a bad one.
+    #[test]
+    fn validate_phone_normalizes_invisible_characters_first() {
+        assert!(validate_phone("14155551234\u{200B}").is_ok());
+        assert!(validate_phone("\u{FEFF}+14155551234").is_ok());
+        assert!(validate_phone("+14155551234\u{00AD}").is_ok());
+        assert!(validate_phone(" +14155551234 ").is_ok());
+        assert!(validate_phone("\u{200B}\u{00A0}").is_ok());
+        // Still rejects what it rejected before.
+        assert!(validate_phone("abc\u{200B}123").is_err());
     }
 
     #[test]

@@ -262,6 +262,10 @@ where
 /// (optionally `+`-prefixed) form; validation of the result is left to
 /// [`validate_phone_e164`].
 fn normalize_phone(raw: &str) -> String {
+    // PMS-924: drop invisible characters first. `\u{00A0}` was already handled
+    // below, but a trailing U+200B survived and made `validate_phone_e164`
+    // reject a number that looked exactly right (MAPPS-581).
+    let raw = crate::text::sanitize_invisible(raw);
     // Strip only common formatting characters, NOT arbitrary non-digits: a value
     // like "not-a-phone" must survive normalization (minus its dashes) so the
     // E.164 check can reject it, rather than collapsing to empty and being
@@ -1872,5 +1876,31 @@ mod tests {
         assert!(req.phones.is_none());
         assert!(req.companies.is_none());
         assert!(req.validate().is_ok());
+    }
+
+    /// PMS-924: the MAPPS-581 report. A trailing zero width space made an
+    /// otherwise valid number fail `validate_phone_e164`, because normalization
+    /// dropped the dashes but left three bytes that are not ASCII digits.
+    #[test]
+    fn phone_normalization_drops_invisible_characters() {
+        let req = contact_req(serde_json::json!({ "phone": "919-397-4144\u{200B}" }));
+        assert!(
+            req.validate().is_ok(),
+            "invisible-suffixed phone must validate"
+        );
+        assert_eq!(req.phone.as_deref(), Some("9193974144"));
+
+        let req = contact_req(serde_json::json!({ "phone": "\u{FEFF}+1 (415) 555-1234\u{00A0}" }));
+        assert!(req.validate().is_ok());
+        assert_eq!(req.phone.as_deref(), Some("+14155551234"));
+
+        // A value that is nothing but invisibles is "no phone", not a bad one.
+        let req = contact_req(serde_json::json!({ "phone": "\u{200B}" }));
+        assert!(req.validate().is_ok());
+        assert_eq!(req.phone, None);
+
+        // Still rejects a genuinely bad number.
+        let req = contact_req(serde_json::json!({ "phone": "not-a-phone\u{200B}" }));
+        assert!(req.validate().is_err());
     }
 }
