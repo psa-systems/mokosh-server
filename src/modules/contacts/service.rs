@@ -1331,6 +1331,85 @@ impl ContactService {
         Ok(())
     }
 
+    /// mokosh-contact-login prompt 007: replace the contact's portal
+    /// role assignments with `role_ids`. Distinct from
+    /// `grant_portal_access` (which mints/rotates the setup token,
+    /// flips `is_portal_user`, and emails the invite): the role editor
+    /// on the contact page just rewires the assignment set for an
+    /// already-portal contact. No side effects on `is_portal_user`, no
+    /// token churn, no email.
+    ///
+    /// Empty `role_ids` is allowed and clears the assignment set (a
+    /// portal user with zero roles has no capabilities and can log in
+    /// but see nothing gated; the operator either re-adds a role or
+    /// revokes access outright).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn replace_portal_role_assignments(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        role_ids: &[Uuid],
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let _contact = self.get_contact(tenant_id, contact_id).await?;
+
+        // Dedup the caller's list so a repeated id doesn't fight the
+        // (contact_id, role_id) primary key.
+        let mut unique: Vec<Uuid> = role_ids.to_vec();
+        unique.sort();
+        unique.dedup();
+
+        for role_id in &unique {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM portal_roles WHERE tenant_id = $1 AND id = $2)",
+            )
+            .bind(*tenant_id)
+            .bind(role_id)
+            .fetch_one(self.db.pool())
+            .await?;
+            if !exists {
+                return Err(AppError::NotFound(format!("Portal role {role_id}")));
+            }
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "DELETE FROM contact_role_assignments \
+             WHERE contact_id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(*tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        for role_id in &unique {
+            sqlx::query(
+                "INSERT INTO contact_role_assignments (contact_id, role_id, tenant_id) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(contact_id)
+            .bind(role_id)
+            .bind(*tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contacts",
+            Some(contact_id),
+            None,
+            Some(serde_json::json!({
+                "portal_roles_replaced": true,
+                "role_ids": unique,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// mokosh-contact-login prompt 003: variant of `send_setup_email`
     /// that includes the Company's portal slug in the URL. Best-effort
     /// like its sibling; a failed dispatch does not roll back the

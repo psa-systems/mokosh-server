@@ -74,7 +74,7 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         )
         .route(
             "/contacts/{contact_id}/portal-roles",
-            get(get_contact_portal_role_ids),
+            get(get_contact_portal_role_ids).put(replace_contact_portal_role_ids),
         )
         // Company industries lookup (PMS-601). Reads are open to any authed
         // user (the company form's combobox needs them); writes are admin-only.
@@ -504,6 +504,21 @@ async fn resend_portal_invite(
     state
         .contact_service
         .resend_portal_invite(user.tenant(), contact_id, &ctx)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn replace_contact_portal_role_ids(
+    State(state): State<ContactRouterState>,
+    _manager: crate::modules::auth::RequireManager,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(contact_id): Path<Uuid>,
+    Json(request): Json<GrantPortalAccessRequest>,
+) -> AppResult<axum::http::StatusCode> {
+    state
+        .contact_service
+        .replace_portal_role_assignments(user.tenant(), contact_id, &request.role_ids, &ctx)
         .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

@@ -22,6 +22,7 @@ pub mod knowledge_base;
 pub mod mileage_tracking;
 pub mod notifications;
 pub mod platform;
+pub mod portal_roles;
 pub mod projects;
 pub mod quotes;
 pub mod reports;

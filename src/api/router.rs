@@ -37,6 +37,7 @@ use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::platform::{platform_routes, PlatformAdminService};
+use crate::modules::portal_roles::{portal_role_routes, PortalRoleService};
 use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::quotes::{quotes_routes, QuotesService};
 use crate::modules::reports::{reports_routes, ReportsService};
@@ -364,6 +365,14 @@ pub fn create_api_router(
         // `/api/v1/companies` returned a misleading 404 with no
         // explanation. Removed and documented (PMS-20).
         .nest("/contacts", contact_routes(contact_service.clone()))
+        // mokosh-contact-login prompt 007: MSP-admin portal-role CRUD.
+        // Distinct top-level nest so the SPA hits `/api/v1/portal-roles`
+        // and the routes inside stay uncluttered by the double-nest
+        // `/contacts/portal-roles` shape the older read-only surface uses.
+        .nest(
+            "/portal-roles",
+            portal_role_routes(PortalRoleService::new(db.clone())),
+        )
         // Ticketing
         .nest("/tickets", ticket_routes(ticket_service.clone()))
         // PMS-483: ticket-note attachment upload / download / delete.
