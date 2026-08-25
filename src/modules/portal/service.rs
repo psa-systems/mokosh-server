@@ -546,12 +546,30 @@ impl PortalAuthService {
         };
 
         let hash = hash_password(new_password)?;
-        // Tenant-scoped write: set the credential and burn the token in one
-        // transaction so a crash cannot leave a usable token behind a set
-        // password.
+        // Tenant-scoped write: set the credential, revoke the tokens it
+        // replaces, and burn the token, in one transaction so a crash cannot
+        // leave a usable token behind a set password.
+        //
+        // PMS-877: `portal_tokens_valid_from` is stamped here for the same
+        // reason `AuthService` stamps `users.password_changed_at` on the
+        // platform side (PMS-681). The portal plane is stateless - no session
+        // row to delete - so a password change that did not move the cutoff
+        // left every token minted before it decoding into a session for up to
+        // the full 8-hour TTL. That is the case a reset is most often for: a
+        // customer resets precisely because they think someone else is holding
+        // their password, and the reset has to end that someone's session, not
+        // just stop them signing in again.
+        //
+        // This runs for an initial PMS-136 setup link too, since one method
+        // serves both arrivals. Not merely harmless: a contact redeeming a
+        // first link holds no portal token yet, and an agent who re-issues a
+        // link to a contact who DOES hold one is changing the credential, so
+        // ending those sessions is the wanted behaviour rather than a side
+        // effect.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, updated_at = NOW() \
+            "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, \
+                                 portal_tokens_valid_from = NOW(), updated_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&hash)
@@ -588,8 +606,17 @@ impl PortalAuthService {
         // note above). Reached via an emailed setup link before any portal
         // session exists, so it sets no GUC and targets the one contact by id.
         // Migrator pool because `contacts` is RLS-covered.
+        //
+        // PMS-877: stamped here as well as in `setup_password`. This method has
+        // no caller today, and the endpoint it is waiting for is a signed-in
+        // customer changing their own password - the one arrival that certainly
+        // DOES hold a live portal token. Leaving the stamp to be remembered when
+        // that route is wired up is how the gap PMS-877 closed would come back,
+        // so the writer carries it rather than the caller.
         sqlx::query(
-            "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, updated_at = NOW() WHERE id = $2",
+            "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, \
+                                 portal_tokens_valid_from = NOW(), updated_at = NOW() \
+             WHERE id = $2",
         )
         .bind(&hash)
         .bind(contact_id)

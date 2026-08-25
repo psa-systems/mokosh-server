@@ -1588,6 +1588,167 @@ async fn portal_logout_revokes_every_token_the_contact_holds(pool: PgPool) {
     assert_eq!(me(fresh).await, reqwest::StatusCode::OK);
 }
 
+/// PMS-877: a portal password reset ends the sessions the old password could
+/// have opened.
+///
+/// The portal plane is stateless, so before this the reset set
+/// `portal_password_hash`, burned the token, and stopped. Every token minted
+/// before it kept decoding into a session for the rest of its 8-hour TTL. That
+/// is exactly backwards for the case a reset is usually for: a customer resets
+/// because they believe someone else has their password, and the old password
+/// being refused at the login form does nothing about the session that someone
+/// is already holding.
+///
+/// Same shape as `portal_logout_revokes_every_token_the_contact_holds`, and it
+/// has to cross a second boundary for the same reason: the cutoff is compared
+/// against the token's `iat`, which has one-second resolution, strictly `<`.
+#[sqlx::test]
+async fn portal_password_reset_revokes_every_token_the_contact_holds(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    let contact = seed_portal_contact(&pool, company, "customer@acme.example").await;
+    let app = common::boot(pool.clone()).await;
+
+    // Two "devices" signed in on the old password, so the assertion below is
+    // about every token the contact holds rather than only the one that
+    // happens to be nearest the reset.
+    let laptop = portal_token(&app, "customer@acme.example").await;
+    let attacker = portal_token(&app, "customer@acme.example").await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/portal/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send portal /auth/me")
+                .status()
+        }
+    };
+
+    assert_eq!(me(laptop.clone()).await, reqwest::StatusCode::OK);
+    assert_eq!(me(attacker.clone()).await, reqwest::StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let reset_token = seed_setup_token(
+        &pool,
+        contact,
+        "reset-secret",
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    )
+    .await;
+    let reset = portal_reset(&app, &reset_token, "a-brand-new-password").await;
+    assert_eq!(
+        reset.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "portal reset-password returns 204"
+    );
+
+    assert_eq!(
+        me(laptop).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the customer's own pre-reset session ends too: a reset is not a \
+         targeted revocation and cannot know which device to spare"
+    );
+    assert_eq!(
+        me(attacker).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a token minted before the reset must stop working, which is the whole \
+         point of resetting a password you think someone else has"
+    );
+
+    // The new credential is unaffected: the cutoff only looks backwards.
+    let resp = portal_login(&app, "customer@acme.example", "a-brand-new-password").await;
+    assert!(
+        resp.status().is_success(),
+        "signing in with the new password expected 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("portal login JSON");
+    let fresh = body["access_token"]
+        .as_str()
+        .expect("login response has access_token")
+        .to_string();
+    assert_eq!(
+        me(fresh).await,
+        reqwest::StatusCode::OK,
+        "a token minted after the reset works"
+    );
+}
+
+/// PMS-877: redeeming an initial setup link stamps the cutoff too, because one
+/// method serves both arrivals.
+///
+/// Pinned rather than left to be rediscovered. It is not a defect: a contact
+/// redeeming a first link holds no portal token to lose, and an agent
+/// re-issuing a link to a contact who DOES hold one is changing the credential,
+/// so ending those sessions is wanted. What this asserts is that the redemption
+/// path still hands out a working session immediately afterwards, i.e. the
+/// cutoff it just wrote does not revoke the token the customer is about to be
+/// issued.
+#[sqlx::test]
+async fn portal_setup_redemption_stamps_the_cutoff_without_locking_the_contact_out(pool: PgPool) {
+    let company = seed_company(&pool, "Acme Co").await;
+    let contact = seed_contact_awaiting_setup(&pool, company, "newcomer@acme.example").await;
+    let app = common::boot(pool.clone()).await;
+
+    let setup = seed_setup_token(
+        &pool,
+        contact,
+        "setup-secret",
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    )
+    .await;
+    let redeemed = app
+        .client
+        .post(app.url("/api/v1/portal/auth/setup-password"))
+        .json(&serde_json::json!({ "token": setup, "password": "first-password-here" }))
+        .send()
+        .await
+        .expect("setup-password");
+    assert_eq!(redeemed.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let cutoff: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT portal_tokens_valid_from FROM contacts WHERE id = $1")
+            .bind(contact)
+            .fetch_one(&pool)
+            .await
+            .expect("read the cutoff");
+    assert!(
+        cutoff.is_some(),
+        "redeeming a setup link stamps the revocation cutoff"
+    );
+
+    let resp = portal_login(&app, "newcomer@acme.example", "first-password-here").await;
+    assert!(
+        resp.status().is_success(),
+        "signing in right after redeeming expected 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("portal login JSON");
+    let token = body["access_token"]
+        .as_str()
+        .expect("login response has access_token")
+        .to_string();
+    let status = app
+        .client
+        .get(app.url("/api/v1/portal/auth/me"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("send portal /auth/me")
+        .status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the cutoff is compared strictly `<` against `iat`, so a token minted \
+         in the same second as the redemption survives"
+    );
+}
+
 /// MAPPS-532: the sign-out route is on the authenticated side of the portal
 /// router. Without a bearer there is no contact to revoke, and answering
 /// anything but 401 would let an anonymous caller name one.
