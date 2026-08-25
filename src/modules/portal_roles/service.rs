@@ -332,4 +332,23 @@ impl PortalRoleService {
             capabilities: capability_labels::descriptors(),
         }
     }
+
+    /// mokosh-contact-login prompt 008: DB-load the effective capability set
+    /// for a portal contact. Shared shape with
+    /// [`crate::modules::auth::caller_context::load_contact_capabilities`];
+    /// this thin wrapper lets the service layer reach for a
+    /// `PortalRoleService` handle without dragging `Database` around
+    /// separately. Both call sites resolve capabilities from
+    /// `portal_roles` per request (fresh reads, no JWT caps trust) so a
+    /// revoke lands on the very next request.
+    pub async fn load_contact_capabilities(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<String>> {
+        crate::modules::auth::caller_context::load_contact_capabilities(
+            &self.db, *tenant_id, contact_id,
+        )
+        .await
+    }
 }

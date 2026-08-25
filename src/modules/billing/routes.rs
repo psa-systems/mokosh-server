@@ -12,8 +12,12 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::BillingService;
-use crate::modules::auth::{RequireBilling, RequireFinance, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireBilling, RequireCallerContext, RequireFinance, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -349,29 +353,72 @@ async fn create_invoice_from_time_entries(
 
 async fn get_invoice(
     State(state): State<BillingRouterState>,
-    RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
-    let inv = state.service.get_invoice(user.tenant(), invoice_id).await?;
+    // mokosh-contact-login prompt 008: staff branch preserves the
+    // pre-sweep RequireBilling+RequireFinance gate via
+    // `assert_staff_billing_finance`; contact branch requires
+    // invoices:read + Company scope check, 404ing a foreign row.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+        }
+    }
+    let inv = state.service.get_invoice(tenant, invoice_id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if inv.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
     Ok(Json(inv))
 }
 
 async fn list_invoices(
     State(state): State<BillingRouterState>,
-    RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
-    Query(filter): Query<InvoiceFilter>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Query(mut filter): Query<InvoiceFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<InvoiceResponse>>> {
     filter.validate()?;
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+            filter.company_id = Some(session.company_id);
+        }
+    }
     let (invoices, total) = state
         .service
-        .list_invoices(user.tenant(), &filter, &pagination)
+        .list_invoices(tenant, &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         invoices,
         &pagination,
         total,
     )))
+}
+
+/// mokosh-contact-login prompt 008: reproduce the RequireBilling +
+/// RequireFinance behaviour inline for a handler that now takes
+/// `RequireCallerContext` instead of the two dedicated extractors, so
+/// the staff branch still 404s a tenant with billing disabled and
+/// 403s a non-finance role. Kept as a small helper because two of the
+/// swept invoice handlers need it verbatim.
+fn assert_staff_billing_finance(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+    let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    let role = user.role.as_str();
+    if !matches!(role, "super_admin" | "admin" | "finance") {
+        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+    }
+    Ok(())
 }

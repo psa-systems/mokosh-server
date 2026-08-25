@@ -10,13 +10,17 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    CreateNoteRequest, CreateTicketRequest, TicketCategoryResponse, TicketFilter,
+    CreateNoteRequest, CreateTicketRequest, NoteType, TicketCategoryResponse, TicketFilter,
     TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService, TicketStatus,
     TicketType, UpdateTicketRequest, UpsertTicketCategoryRequest, UpsertTicketPriorityRequest,
     UpsertTicketQueueRequest, UpsertTicketStatusRequest, UpsertTicketTypeRequest,
 };
-use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireAdmin, RequireAuth, RequireCallerContext, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -78,15 +82,30 @@ pub fn ticket_routes(ticket_service: TicketService) -> Router {
 
 async fn list_tickets(
     State(state): State<TicketRouterState>,
-    RequireAuth(user): RequireAuth,
-    Query(filter): Query<TicketFilter>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Query(mut filter): Query<TicketFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
     // F9: validate filter inputs.
     filter.validate()?;
+    // mokosh-contact-login prompt 008: contact-plane callers must hold
+    // tickets:read AND get their listing scoped to their own Company so a
+    // guessed `company_id` query param cannot widen visibility.
+    let (tenant, caller_user_id) = match &caller {
+        CallerContext::Staff(state) => {
+            let user = state.user.as_ref().ok_or(AppError::Unauthorized)?;
+            (user.tenant(), Some(user.id))
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::TICKETS_READ, &db).await?;
+            filter.company_id = Some(session.company_id);
+            (caller.tenant(), None)
+        }
+    };
     let (responses, total) = state
         .ticket_service
-        .list_ticket_responses(user.tenant(), Some(user.id), &filter, &pagination)
+        .list_ticket_responses(tenant, caller_user_id, &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         responses,
@@ -97,31 +116,69 @@ async fn list_tickets(
 
 async fn create_ticket(
     State(state): State<TicketRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
     request.validate()?;
-    let ticket = state
-        .ticket_service
-        .create_ticket(user.tenant(), user.id, &request, &ctx)
-        .await?;
-    let resp = state
-        .ticket_service
-        .get_ticket_response(user.tenant(), ticket.id)
-        .await?;
+    let resp = match &caller {
+        CallerContext::Staff(auth) => {
+            let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            let ticket = state
+                .ticket_service
+                .create_ticket(user.tenant(), user.id, &request, &ctx)
+                .await?;
+            state
+                .ticket_service
+                .get_ticket_response(user.tenant(), ticket.id)
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            // mokosh-contact-login prompt 008: gate on the DB-loaded cap
+            // set (JWT `caps` is UI-only). Force the ticket's
+            // `company_id` and `contact_id` to the session's own so a
+            // spoofed body cannot open a ticket against another
+            // Company; stamp `source = "portal"` so downstream
+            // reporting can attribute contact-originated volume.
+            caller.require_capability(caps::TICKETS_WRITE, &db).await?;
+            state
+                .ticket_service
+                .create_portal_ticket(
+                    caller.tenant(),
+                    session.company_id,
+                    session.id,
+                    request.title.clone(),
+                    request.description.clone(),
+                    request.priority_id,
+                    request.type_id,
+                )
+                .await?
+        }
+    };
     Ok(Json(resp))
 }
 
 async fn get_ticket(
     State(state): State<TicketRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(ticket_id): Path<Uuid>,
 ) -> AppResult<Json<TicketResponse>> {
+    // mokosh-contact-login prompt 008: contact-plane callers must hold
+    // tickets:read AND own the ticket's Company; a foreign ticket
+    // surfaces as 404 (not 403) so a probe cannot confirm existence.
+    let tenant = caller.tenant();
     let resp = state
         .ticket_service
-        .get_ticket_response(user.tenant(), ticket_id)
+        .get_ticket_response(tenant, ticket_id)
         .await?;
+    if let CallerContext::Contact(session) = &caller {
+        caller.require_capability(caps::TICKETS_READ, &db).await?;
+        if resp.company_id != session.company_id {
+            return Err(AppError::NotFound("Ticket".to_string()));
+        }
+    }
     Ok(Json(resp))
 }
 
@@ -249,17 +306,50 @@ async fn list_contact_notes(
 
 async fn add_note(
     State(state): State<TicketRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     ctx: crate::modules::audit::AuditCtx,
     Path(ticket_id): Path<Uuid>,
     Json(request): Json<CreateNoteRequest>,
 ) -> AppResult<Json<TicketNoteResponse>> {
     request.validate()?;
 
-    let note = state
-        .ticket_service
-        .add_note(user.tenant(), ticket_id, user.id, &request, &ctx)
-        .await?;
+    let (note, name_fallback) = match &caller {
+        CallerContext::Staff(auth) => {
+            let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            let note = state
+                .ticket_service
+                .add_note(user.tenant(), ticket_id, user.id, &request, &ctx)
+                .await?;
+            let fallback = user.full_name();
+            (note, fallback)
+        }
+        CallerContext::Contact(session) => {
+            // mokosh-contact-login prompt 008: gate on tickets:comment
+            // AND refuse anything but `public` notes so a customer
+            // cannot post an `internal` or `resolution` note against
+            // agent back-channel discussion.
+            caller
+                .require_capability(caps::TICKETS_COMMENT, &db)
+                .await?;
+            if request.note_type != NoteType::Public {
+                return Err(AppError::Forbidden(
+                    "Contacts may only post public notes.".to_string(),
+                ));
+            }
+            let note = state
+                .ticket_service
+                .create_portal_ticket_note(
+                    caller.tenant(),
+                    session.company_id,
+                    session.id,
+                    ticket_id,
+                    request.content.clone(),
+                )
+                .await?;
+            (note, session.email.clone())
+        }
+    };
 
     Ok(Json(TicketNoteResponse {
         id: note.id,
@@ -267,7 +357,7 @@ async fn add_note(
         content: note.content,
         is_email_sent: note.is_email_sent,
         created_by_id: note.created_by_id,
-        created_by_name: note.created_by_name.unwrap_or_else(|| user.full_name()),
+        created_by_name: note.created_by_name.unwrap_or(name_fallback),
         created_by_contact_id: note.created_by_contact_id,
         created_at: note.created_at,
     }))

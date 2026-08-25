@@ -1,13 +1,21 @@
 //! Contact API routes
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
+    middleware,
+    middleware::Next,
+    response::Response,
     routing::{delete, get, post, put},
     Json, Router,
 };
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
+
+use axum::response::IntoResponse;
+
+use crate::modules::contact_portal::middleware::ContactAuthState;
+use crate::utils::error::AppError;
 
 use super::{
     CompanyFilter, CompanyIndustryResponse, CompanyResponse, ContactFieldValuesQuery,
@@ -92,6 +100,28 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         .route("/sites/{site_id}", put(update_site))
         .route("/sites/{site_id}", delete(delete_site))
         .with_state(state)
+        // mokosh-contact-login prompt 008: Companies + Contacts are the
+        // staff-owned CRM surface. A portal contact must never reach any
+        // route on this router - not even the read side - so the whole
+        // sub-router is layered with an explicit 403 for the contact
+        // plane. Staff (or unauthenticated) requests pass through and
+        // the per-handler `RequireAuth` / `RequireAdmin` extractors run
+        // normally.
+        .layer(middleware::from_fn(reject_contact_plane))
+}
+
+/// mokosh-contact-login prompt 008: block a contact bearer from reaching
+/// the Companies + Contacts staff CRM. The presence of a decoded
+/// `ContactAuthState.session` is enough to short-circuit with 403; the
+/// staff path leaves that extension defaulted and passes through.
+async fn reject_contact_plane(request: Request, next: Next) -> Response {
+    if let Some(state) = request.extensions().get::<ContactAuthState>() {
+        if state.session.is_some() {
+            return AppError::Forbidden("The Companies + Contacts CRM is staff-only.".to_string())
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 // ============================================================================

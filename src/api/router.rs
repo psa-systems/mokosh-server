@@ -500,6 +500,28 @@ pub fn create_api_router(
             auth_middleware.clone(),
             crate::modules::auth::middleware::auth_middleware,
         ))
+        // mokosh-contact-login prompt 008: the contact-plane middleware runs
+        // on /api/v1/* too (not just /api/v1/contact/*) so a contact bearer
+        // reaching a dual-plane endpoint (tickets, invoices, quotes) lands
+        // in ContactAuthState. The `typ` claim isolation still holds - a
+        // staff bearer decodes only in the staff branch and vice versa - so
+        // this layer never overwrites an authenticated staff request; it
+        // simply attaches ContactAuthState (default when the bearer is not
+        // a contact token) so `RequireCallerContext` can fall back to it.
+        .layer(middleware::from_fn_with_state(
+            crate::modules::contact_portal::ContactAuthMiddleware::new(
+                crate::modules::contact_portal::ContactAuthService::new(
+                    db.clone(),
+                    jwt_secret.clone(),
+                ),
+            ),
+            crate::modules::contact_portal::middleware::portal_contact_middleware,
+        ))
+        // mokosh-contact-login prompt 008: `Extension<Database>` powers
+        // `CallerContext::require_capability`'s DB-load of the effective
+        // capability set. Attaching it once here lets every dual-plane
+        // handler pull the db without threading it through router state.
+        .layer(axum::Extension(db.clone()))
         // PMS-113 AC3: make SettingsService reachable from
         // `RequireModuleEnabled` extractors via the request's
         // extensions. The extractor reads

@@ -4,6 +4,11 @@
 
 #[cfg(feature = "server")]
 pub mod bootstrap;
+// mokosh-contact-login prompt 008: `CallerContext` + `RequireCallerContext`.
+// Dual-plane extractor for routes a staff user OR a portal contact may
+// reach; contact branches gate on `require_capability` (DB-loaded).
+#[cfg(feature = "server")]
+pub mod caller_context;
 // PMS-591: receiver for Bunyip's `account_deleted` webhook. Wired outside
 // the JWT auth chain in `create_api_router`.
 #[cfg(feature = "server")]
@@ -25,6 +30,8 @@ mod routes;
 mod service;
 pub mod tenant;
 
+#[cfg(feature = "server")]
+pub use caller_context::{load_contact_capabilities, CallerContext, RequireCallerContext};
 #[cfg(feature = "server")]
 pub use middleware::{
     AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,

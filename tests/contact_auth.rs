@@ -394,7 +394,13 @@ async fn contact_token_rejected_on_staff_endpoint(pool: PgPool) {
         .expect("access_token")
         .to_string();
 
-    // Contact bearer on a staff endpoint (contacts list) -> 401.
+    // Contact bearer on a staff endpoint (contacts list) -> 403.
+    // Prompt 004 asserted 401 here because the staff `RequireAuth`
+    // extractor did not see an AuthState and folded to Unauthorized.
+    // Prompt 008 layers the Companies + Contacts CRM with an explicit
+    // contact-plane rejection so an authenticated contact bearer that
+    // reaches the staff CRM now returns 403 instead: the caller IS
+    // authenticated, but the surface is staff-only.
     let resp = app
         .client
         .get(app.url("/api/v1/contacts/contacts"))
@@ -404,8 +410,8 @@ async fn contact_token_rejected_on_staff_endpoint(pool: PgPool) {
         .expect("staff endpoint with contact bearer");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "prompt 004: staff endpoint must 401 on a `typ: contact` bearer"
+        reqwest::StatusCode::FORBIDDEN,
+        "prompt 008: staff CRM must 403 on a `typ: contact` bearer"
     );
 
     // Staff bearer on /contact/auth/me -> 401.
