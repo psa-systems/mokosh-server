@@ -640,6 +640,15 @@ pub fn create_api_router(
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))
+        // PMS-924: strip invisible characters from every JSON request body
+        // before any extractor deserializes it. Added first, so it is the
+        // INNERMOST of the outer layers: it runs after CORS has answered any
+        // preflight, and it sees the full `/api/v1/...` path (nesting strips the
+        // prefix only once routing starts), which is what lets it exempt the
+        // three signature-verified receivers by path. One layer rather than a
+        // `SanitizedJson<T>` extractor on 157 `Json<T>` handlers, so a route
+        // added later cannot forget to opt in.
+        .layer(middleware::from_fn(crate::utils::text::sanitize_json_body))
         // Apply global middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())

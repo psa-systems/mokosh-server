@@ -21,6 +21,9 @@ pub mod security_headers;
 // legacy login path is the only consumer, so the primitives live in the host
 // crate now that the mokosh-auth (mechanism 2) workspace members are gone.
 pub mod recovery;
+// PMS-924: invisible-character normalization plus the JSON-body middleware
+// that applies it before any handler deserializes a request.
+pub mod text;
 pub mod totp;
 pub mod validation;
 
