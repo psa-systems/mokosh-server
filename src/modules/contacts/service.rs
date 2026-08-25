@@ -754,6 +754,33 @@ impl ContactService {
         // GUC is set for it too.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // PMS-919: the tenant's own company is refused here rather than by its
+        // foreign key, because the FK is the wrong messenger twice over. It is
+        // nullable, so it does not block on a fresh tenant at all: the delete
+        // would succeed, `own_company_id` would go NULL, and the failure would
+        // surface later as a NOT NULL violation on `time_entries` the next time
+        // someone logged overhead time (PMS-413 makes this the anchor for that,
+        // and MAPPS-243 sends it as the company). On a tenant that already has
+        // overhead time it blocks, but as a generic related-records error
+        // naming `time_entries`, which does not tell the operator that the real
+        // problem is the company's role. Checked first because it is a
+        // statement about what this company IS, not about what references it.
+        let is_own_company: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND own_company_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if is_own_company {
+            return Err(AppError::BadRequest(
+                "This is your organisation's own company record, which general and \
+                 overhead time is logged against; it cannot be deleted"
+                    .to_string(),
+            ));
+        }
+
         // Check for related records
         let ticket_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND company_id = $2",
@@ -825,13 +852,20 @@ impl ContactService {
             }
         }
 
-        // The explicit ticket guard above only covers one of the many tables
-        // that foreign-key `companies` (contracts, invoices, payments,
-        // projects, assets, time entries, appointments, sub-companies, ...).
-        // Those references are `ON DELETE RESTRICT`, so the DELETE raises
-        // Postgres `23503`; map it to a 400 instead of letting the generic
-        // `From<sqlx::Error>` turn it into a 500 (PMS-170, same shape as the
-        // PMS-149 ticket-delete fix).
+        // The explicit ticket guard above only covers one of the tables that
+        // foreign-key `companies`. The rest still default to NO ACTION, so the
+        // DELETE raises Postgres `23503`; map it to a 400 instead of letting
+        // the generic `From<sqlx::Error>` turn it into a 500 (PMS-170, same
+        // shape as the PMS-149 ticket-delete fix).
+        //
+        // PMS-919 narrowed which tables can reach this. `projects`,
+        // `appointments`, `active_timers`, `rmm_device_mappings` and
+        // `parent_company_id` are nullable and now `ON DELETE SET NULL`
+        // (migration 113), so they unlink rather than block and must not be
+        // named. What is left is the `NOT NULL` group, where a company-less row
+        // is not a valid state, plus `credential_vault`, which is nullable but
+        // keeps blocking on purpose: nulling it would leave encrypted secrets
+        // owned by nothing and cascading would destroy them silently.
         if let Err(e) = sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(company_id)
@@ -841,8 +875,8 @@ impl ContactService {
             if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
                 return Err(AppError::BadRequest(
                     "Cannot delete company with related records (contracts, invoices, \
-                     payments, projects, assets, time entries, appointments, or \
-                     sub-companies); remove them first"
+                     payments, quotes, assets, time entries, mileage entries, or stored \
+                     credentials); remove them first"
                         .to_string(),
                 ));
             }
