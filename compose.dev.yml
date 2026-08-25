@@ -317,6 +317,10 @@ services:
       IP2PROXY_DB_PATH: ${IP2PROXY_DB_PATH:-}
       LOGIN_APPROVAL_ENABLED: ${LOGIN_APPROVAL_ENABLED:-}
 
+      # PMS-904: self-hosted (default) or saas. Empty means unset, which the
+      # code resolves to self-hosted, so the dev stack sends every email.
+      MOKOSH_DEPLOYMENT_MODE: ${MOKOSH_DEPLOYMENT_MODE:-}
+
       # Upload root, shared by ticket attachments and tenant logos (which live
       # in a `tenant-logos/` subdirectory of it). Defaulted to the `attachments`
       # named volume below rather than the code's CWD-relative `./attachments`,
