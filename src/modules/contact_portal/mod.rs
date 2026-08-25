@@ -12,3 +12,11 @@
 //! configurable capability set.
 
 pub mod capabilities;
+pub mod middleware;
+pub mod models;
+pub mod routes;
+pub mod service;
+
+pub use middleware::{ContactAuthMiddleware, ContactAuthState, RequireContactAuth};
+pub use routes::contact_routes;
+pub use service::ContactAuthService;

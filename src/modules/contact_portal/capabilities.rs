@@ -124,7 +124,7 @@ mod tests {
             CONTACTS_MANAGE_SUB_USER,
         ] {
             assert!(
-                ALL_CAPABILITIES.iter().any(|k| *k == cap),
+                ALL_CAPABILITIES.contains(&cap),
                 "capability {cap} is missing from ALL_CAPABILITIES"
             );
         }

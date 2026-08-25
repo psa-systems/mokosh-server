@@ -626,9 +626,22 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
+    // mokosh-contact-login prompt 004: contact-plane sub-router at
+    // /api/v1/contact/*. Distinct from /api/v1 (staff plane) - the
+    // portal_contact_middleware only decodes `typ: "contact"` tokens,
+    // so a staff bearer here is a 401 by construction.
+    let contact_service =
+        crate::modules::contact_portal::ContactAuthService::new(db.clone(), jwt_secret.clone())
+            .with_notifications(notifications_service.clone())
+            .with_spa_base_url(spa_base_url.clone());
+    let contact_api = crate::modules::contact_portal::contact_routes(contact_service).layer(
+        middleware::from_fn(crate::utils::error::normalize_error_envelope),
+    );
+
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/public", public_api)
+        .nest("/api/v1/contact", contact_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
         .nest("/api/v1/stripe", stripe_webhooks)
         .fallback(get(move |headers| {

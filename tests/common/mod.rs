@@ -238,7 +238,7 @@ async fn boot_with_db(
         // for the constructor; specs that hit the webhook build their own
         // signature against the same secret.
         b"test-bunyip-webhook-secret".to_vec(),
-        None,               // PMS-657: no geoip DB in tests; login-location alerts disabled
+        None,  // PMS-657: no geoip DB in tests; login-location alerts disabled
         None,  // BUNYIP-475: no IP2Proxy DB in tests; enrichment lookup reports nothing
         false, // PMS-658: login-approval gate off in the default test router
         // PMS-748: an abuse address IS configured here, so the request-form
