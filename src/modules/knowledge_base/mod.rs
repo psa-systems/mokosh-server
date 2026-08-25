@@ -1,4 +1,5 @@
 //! Knowledge base module: categories, articles, versions, portal visibility.
+pub mod attachments;
 
 pub mod models;
 pub mod routes;

@@ -31,6 +31,9 @@ use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
 use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
+use crate::modules::knowledge_base::attachments::{
+    kb_attachment_routes, public_kb_attachment_routes, KbAttachmentConfig, KbAttachmentService,
+};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
@@ -387,6 +390,13 @@ pub fn create_api_router(
         .merge(assets_routes(assets_service))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // PMS-923: images an article embeds. Upload / list / delete are
+        // manager-gated here; the READ is public (see the public tree below),
+        // because an `<img>` cannot carry an Authorization header.
+        .merge(kb_attachment_routes(KbAttachmentService::new(
+            db.clone(),
+            KbAttachmentConfig::from_env(),
+        )))
         // Org membership invitations (PMS-244): admin-only, tenant-scoped.
         .merge(invitations_routes(invitations_service))
         // Notifications: channels + templates + prefs + inbox + rules
@@ -618,6 +628,16 @@ pub fn create_api_router(
         // mail client renders it straight out of the request-form email and
         // will never authenticate.
         .merge(public_tenant_routes(TenantService::new(db.clone())))
+        // PMS-923: an image embedded in a KB article. Unauthenticated by
+        // necessity, not by preference: the browser fetches it as `<img src>`,
+        // which carries no Authorization header, and the SPA holds a bearer
+        // rather than a cookie. The attachment's v4 UUID is the only
+        // credential, so anyone holding the URL can fetch the image even for an
+        // `internal` article. Same bargain as the logo above.
+        .merge(public_kb_attachment_routes(KbAttachmentService::new(
+            db.clone(),
+            KbAttachmentConfig::from_env(),
+        )))
         .merge(public_form_routes(
             FormsService::with_request_links(
                 db.clone(),
