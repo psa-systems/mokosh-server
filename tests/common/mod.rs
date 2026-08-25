@@ -297,6 +297,12 @@ async fn boot_with_db(
         // MAPPS-429: a public API base IS configured here, so the request-form
         // suite can assert an emailed logo resolves absolutely.
         Some("http://api.localhost".to_string()),
+        // PMS-904: self-hosted, so the integration suite exercises the mode
+        // that sends everything. The suppression is a unit test on
+        // `AuthService`, which can hold both modes in one binary; flipping the
+        // shared router here would silently change what every other suite is
+        // testing.
+        mokosh_server::utils::deployment::DeploymentMode::SelfHosted,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
