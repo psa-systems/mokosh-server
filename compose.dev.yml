@@ -327,6 +327,8 @@ services:
       # so an uploaded logo survives `just dev` rebuilding the image.
       ATTACHMENT_DIR: ${ATTACHMENT_DIR:-/data/attachments}
       ATTACHMENT_MAX_BYTES: ${ATTACHMENT_MAX_BYTES:-}
+      # PMS-923: KB article images. Default reproduces the code's own 5 MiB.
+      KB_ATTACHMENT_MAX_BYTES: ${KB_ATTACHMENT_MAX_BYTES:-}
       TENANT_LOGO_MAX_BYTES: ${TENANT_LOGO_MAX_BYTES:-}
 
       # RS verifier knobs beyond the issuer/audience pair above; empty keeps the
