@@ -902,6 +902,487 @@ impl ContactService {
         }
     }
 
+    /// mokosh-contact-login prompt 003: list the portal roles the MSP
+    /// admin can pick from when granting a contact portal access.
+    /// Returns every row in `portal_roles` for the caller's tenant
+    /// (including the three built-ins seeded by migration 142 +
+    /// `TenantService::seed_builtin_portal_roles`).
+    pub async fn list_portal_roles(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Vec<PortalRoleSummary>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, String, Vec<String>, bool)> = sqlx::query_as(
+            "SELECT id, name, capabilities, is_builtin FROM portal_roles \
+             WHERE tenant_id = $1 ORDER BY is_builtin DESC, name",
+        )
+        .bind(*tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, capabilities, is_builtin)| PortalRoleSummary {
+                id,
+                name,
+                capabilities,
+                is_builtin,
+            })
+            .collect())
+    }
+
+    /// mokosh-contact-login prompt 003: return the role ids currently
+    /// assigned to a contact. Used by the SPA to pre-check boxes in the
+    /// grant modal when opened on an already-portal-user contact.
+    pub async fn list_contact_portal_role_ids(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<Uuid>> {
+        // Verify the contact belongs to this tenant before returning
+        // any row so a foreign contact_id fails closed with 404.
+        let _contact = self.get_contact(tenant_id, contact_id).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT role_id FROM contact_role_assignments \
+             WHERE contact_id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(*tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(ids)
+    }
+
+    /// mokosh-contact-login prompt 003: grant portal access to a
+    /// contact + assign one or more portal roles atomically.
+    ///
+    /// Mints (or reuses) the Company's `portal_slug`, rewrites the
+    /// contact's `contact_role_assignments` to exactly `role_ids`,
+    /// flips `contacts.is_portal_user = TRUE`, invalidates any prior
+    /// unredeemed setup token, mints a fresh one, and dispatches the
+    /// `auth.welcome` email carrying
+    /// `{app_url}/portal/{slug}/set-password?token={contact_id}.{secret}`.
+    ///
+    /// Steps in one transaction (so a rollback wipes both the role
+    /// assignments and the token row); the email dispatch is
+    /// best-effort AFTER the tx commits so a mailer outage does not
+    /// undo the grant. Returns `PortalGrantOutcome { portal_slug,
+    /// setup_link }` so the SPA can display + copy the URL to the
+    /// operator (useful when email delivery is delayed or the
+    /// operator wants to relay it via chat).
+    ///
+    /// Guards:
+    /// - Contact must exist under `tenant_id`.
+    /// - Contact's `company_id` must NOT be the tenant's own_company
+    ///   (own_company contacts are bookkeeping placeholders).
+    /// - Every `role_ids[i]` must belong to the same tenant.
+    /// - `role_ids` must be non-empty (a contact needs at least one
+    ///   role to hold any capability).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn grant_portal_access(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        role_ids: &[Uuid],
+        ctx: &AuditCtx,
+    ) -> AppResult<PortalGrantOutcome> {
+        if role_ids.is_empty() {
+            return Err(AppError::validation_field(
+                "role_ids",
+                "at least one portal role is required",
+            ));
+        }
+
+        let contact = self.get_contact(tenant_id, contact_id).await?;
+
+        // Portal access needs a company - the slug lives on the
+        // companies row and every scoped query filters on
+        // company_id. Freeform-company contacts (PMS-402) do not
+        // have a company_id and cannot get portal access without
+        // being linked to a real Company first.
+        let Some(company_id) = contact.company_id else {
+            return Err(AppError::BadRequest(
+                "contact has no company_id; link the contact to a Company before granting portal access"
+                    .to_string(),
+            ));
+        };
+
+        // Refuse to grant on an own_company contact. Those rows are
+        // internal bookkeeping (see `TenantService::ensure_own_company`)
+        // and are never a real customer.
+        let own_company_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+                .bind(*tenant_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .flatten();
+        if own_company_id == Some(company_id) {
+            return Err(AppError::BadRequest(
+                "cannot grant portal access to a contact on the tenant's own_company".to_string(),
+            ));
+        }
+
+        // Every submitted role must belong to this tenant. One SELECT
+        // returns the matching count so a mismatched-id request fails
+        // closed rather than silently landing a foreign role_id (the
+        // FK would reject the insert anyway, but a clearer error is
+        // worth the round trip).
+        let matched_role_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portal_roles WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(*tenant_id)
+        .bind(role_ids)
+        .fetch_one(self.db.pool())
+        .await?;
+        if (matched_role_count as usize) != role_ids.len() {
+            return Err(AppError::BadRequest(
+                "one or more role_ids do not belong to this tenant".to_string(),
+            ));
+        }
+
+        // Mint or reuse the Company's slug. Uses a small retry loop
+        // in case `generate_portal_slug` returns a value already taken
+        // by another Company (astronomically unlikely at 80 bits of
+        // entropy, but cheap to guard).
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let existing_slug: Option<String> = sqlx::query_scalar(
+            "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(company_id)
+        .bind(*tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let portal_slug: String = match existing_slug {
+            Some(s) => s,
+            None => {
+                let mut candidate = crate::utils::crypto::generate_portal_slug();
+                for _ in 0..3 {
+                    let updated: Option<String> = sqlx::query_scalar(
+                        "UPDATE companies SET portal_slug = $1, updated_at = NOW() \
+                         WHERE id = $2 AND tenant_id = $3 AND portal_slug IS NULL \
+                         RETURNING portal_slug",
+                    )
+                    .bind(&candidate)
+                    .bind(company_id)
+                    .bind(*tenant_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(s) = updated {
+                        break;
+                    }
+                    // Either the slug was taken elsewhere (unique
+                    // violation - refresh from disk) or a concurrent
+                    // grant on the same Company populated it first.
+                    // Re-read the row to see which.
+                    let now: Option<String> = sqlx::query_scalar(
+                        "SELECT portal_slug FROM companies \
+                         WHERE id = $1 AND tenant_id = $2",
+                    )
+                    .bind(company_id)
+                    .bind(*tenant_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten();
+                    if let Some(s) = now {
+                        candidate = s;
+                        break;
+                    }
+                    // Neither branch fired: the candidate collided with
+                    // ANOTHER Company. Mint a fresh one and retry.
+                    candidate = crate::utils::crypto::generate_portal_slug();
+                }
+                // At this point either the UPDATE landed our candidate
+                // (companies.portal_slug now holds it) or we absorbed
+                // an existing value. Re-read to confirm.
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
+                )
+                .bind(company_id)
+                .bind(*tenant_id)
+                .fetch_one(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "portal slug still NULL after generate_portal_slug retries".to_string(),
+                    )
+                })?
+            }
+        };
+
+        // Rewrite the role assignments: delete anything not in the new
+        // set, upsert the new set. Atomic + idempotent so re-invoking
+        // with the same set is a no-op and re-invoking with a smaller
+        // set drops the removed rows.
+        sqlx::query(
+            "DELETE FROM contact_role_assignments \
+             WHERE contact_id = $1 AND tenant_id = $2 AND NOT (role_id = ANY($3))",
+        )
+        .bind(contact_id)
+        .bind(*tenant_id)
+        .bind(role_ids)
+        .execute(&mut *tx)
+        .await?;
+        for role_id in role_ids {
+            sqlx::query(
+                "INSERT INTO contact_role_assignments (contact_id, role_id, tenant_id) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (contact_id, role_id) DO NOTHING",
+            )
+            .bind(contact_id)
+            .bind(role_id)
+            .bind(*tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Flip is_portal_user if it is not already TRUE. Bookkeeping,
+        // and (post-pivot) belt-and-braces: the contact plane's login
+        // handler will also gate on `is_portal_user = TRUE`.
+        sqlx::query(
+            "UPDATE contacts SET is_portal_user = TRUE, updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(*tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Invalidate every prior unredeemed setup token for this
+        // contact so only the freshly minted link works.
+        sqlx::query(
+            "DELETE FROM portal_setup_tokens \
+             WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+        )
+        .bind(*tenant_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        let token = self
+            .insert_setup_token(&mut tx, tenant_id, contact_id)
+            .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contacts",
+            Some(contact_id),
+            None,
+            Some(serde_json::json!({
+                "portal_access_granted": true,
+                "role_ids": role_ids,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+
+        let setup_link = format!(
+            "{}/portal/{}/set-password?token={}",
+            self.app_url.trim_end_matches('/'),
+            portal_slug,
+            token,
+        );
+        self.send_grant_email(&contact, &portal_slug, &token).await;
+
+        Ok(PortalGrantOutcome {
+            portal_slug,
+            setup_link,
+        })
+    }
+
+    /// mokosh-contact-login prompt 003: resend the setup link to an
+    /// existing portal contact. Invalidates any prior unredeemed
+    /// token, mints a fresh one, dispatches the email. 400 when the
+    /// contact is not `is_portal_user = TRUE` (grant first) or has no
+    /// email on file.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn resend_portal_invite(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let contact = self.get_contact(tenant_id, contact_id).await?;
+        if !contact.is_portal_user {
+            return Err(AppError::conflict(
+                "contact does not have portal access; grant it first",
+            ));
+        }
+        if contact.email.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(AppError::conflict(
+                "contact has no email on file; add one before resending",
+            ));
+        }
+        let portal_slug: Option<String> = sqlx::query_scalar(
+            "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact.company_id)
+        .bind(*tenant_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .flatten();
+        let Some(slug) = portal_slug else {
+            return Err(AppError::Internal(
+                "portal access is on but company has no portal_slug; re-grant".to_string(),
+            ));
+        };
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "DELETE FROM portal_setup_tokens \
+             WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+        )
+        .bind(*tenant_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        let token = self
+            .insert_setup_token(&mut tx, tenant_id, contact_id)
+            .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contacts",
+            Some(contact_id),
+            None,
+            Some(serde_json::json!({ "portal_invite_resent": true })),
+        )
+        .await?;
+        tx.commit().await?;
+
+        self.send_grant_email(&contact, &slug, &token).await;
+        Ok(())
+    }
+
+    /// mokosh-contact-login prompt 003: revoke portal access. Deletes
+    /// the contact's role assignments, flips `is_portal_user = FALSE`,
+    /// deletes any pending setup tokens, and marks every live
+    /// `contact_sessions` row for this contact revoked so an in-flight
+    /// access token dies on the next request-tick.
+    ///
+    /// Does NOT rotate the Company's slug; a later re-grant reuses it.
+    /// Does NOT clear `portal_password_hash` so a re-grant preserves
+    /// the customer's chosen password (they can log in again without
+    /// re-setting).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn revoke_portal_access(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        // Verify the contact exists under this tenant before mutating.
+        let _contact = self.get_contact(tenant_id, contact_id).await?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "DELETE FROM contact_role_assignments WHERE contact_id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(*tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE contacts SET is_portal_user = FALSE, updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(*tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM portal_setup_tokens \
+             WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+        )
+        .bind(*tenant_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        // Revoke live sessions so the pre-revoke access token dies on
+        // the next request (mirrors MAPPS-557 on the retired portal
+        // plane; prompt 004's contact-auth middleware re-checks this
+        // on every hit).
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE tenant_id = $1 AND contact_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(*tenant_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contacts",
+            Some(contact_id),
+            None,
+            Some(serde_json::json!({ "portal_access_revoked": true })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// mokosh-contact-login prompt 003: variant of `send_setup_email`
+    /// that includes the Company's portal slug in the URL. Best-effort
+    /// like its sibling; a failed dispatch does not roll back the
+    /// grant/resend transaction.
+    async fn send_grant_email(&self, contact: &Contact, portal_slug: &str, token: &str) {
+        let Some(ref email) = contact.email else {
+            tracing::warn!(
+                contact_id = %contact.id,
+                "portal access granted but contact has no email; setup link not delivered",
+            );
+            return;
+        };
+        let setup_link = format!(
+            "{}/portal/{}/set-password?token={}",
+            self.app_url.trim_end_matches('/'),
+            portal_slug,
+            token,
+        );
+        let Some(notify) = self.notifications.as_ref() else {
+            tracing::warn!(
+                contact_id = %contact.id,
+                setup_link = %setup_link,
+                "no notifications dispatcher wired; portal setup token persisted but no message queued (setup_link logged for manual relay)",
+            );
+            return;
+        };
+        let context = serde_json::json!({
+            "recipient_email": email,
+            "display_name": contact.first_name,
+            "setup_link": setup_link,
+        });
+        match notify
+            .dispatch(
+                TenantId::from_trusted(contact.tenant_id),
+                "auth.welcome",
+                &context,
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(
+                contact_id = %contact.id,
+                setup_link = %setup_link,
+                "portal grant email queued"
+            ),
+            Err(e) => tracing::warn!(
+                contact_id = %contact.id,
+                error = ?e,
+                "portal grant email dispatch failed; token persisted but link unreachable",
+            ),
+        }
+    }
+
     /// Create a new contact
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contact(

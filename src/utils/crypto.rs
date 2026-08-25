@@ -126,6 +126,26 @@ pub fn generate_api_key() -> String {
     format!("psa_{}", generate_token(40))
 }
 
+/// mokosh-contact-login prompt 003: 16-char Crockford base32 slug used
+/// as `companies.portal_slug`. 80 bits of entropy so a targeted
+/// attacker cannot enumerate portals. Excludes visually confusable
+/// characters (I, L, O, U).
+///
+/// The contact portal URL shape is `msp.<apex>/portal/{slug}/*` (no
+/// per-tenant wildcard subdomain), so the slug is the ONLY thing
+/// standing between an attacker and the login page. All sensitive
+/// endpoints gate on capability + session; a leaked slug only reveals
+/// the login form.
+pub fn generate_portal_slug() -> String {
+    use rand::seq::IndexedRandom;
+    // 32 chars: Crockford base32 minus I / L / O / U.
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut rng = rand::rng();
+    (0..16)
+        .map(|_| *ALPHABET.choose(&mut rng).expect("non-empty alphabet") as char)
+        .collect()
+}
+
 /// Generate a short numeric code (for MFA, etc.)
 pub fn generate_numeric_code(length: usize) -> String {
     let mut rng = rand::rng();
@@ -234,6 +254,27 @@ mod tests {
         let code = generate_numeric_code(6);
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn portal_slug_shape() {
+        // mokosh-contact-login prompt 003: pin the length, alphabet,
+        // and collision rate of the slug generator.
+        let slug = generate_portal_slug();
+        assert_eq!(slug.len(), 16, "portal slug must be 16 chars");
+        const ALLOWED: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        assert!(
+            slug.chars().all(|c| ALLOWED.contains(c)),
+            "portal slug must use Crockford base32 minus I/L/O/U, got {slug:?}"
+        );
+        // Collision smoke-test: 10_000 slugs should all be unique. 80
+        // bits of entropy makes an actual collision astronomically
+        // unlikely; a duplicate here would flag a broken RNG.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let s = generate_portal_slug();
+            assert!(seen.insert(s), "portal slug collision in 10k samples");
+        }
     }
 
     #[cfg(feature = "server")]

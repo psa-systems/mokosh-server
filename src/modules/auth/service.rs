@@ -4142,10 +4142,10 @@ mod tests {
     #[test]
     fn attempt_counters_are_incremented_in_sql() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let sources = [
-            root.join("src/modules/auth/service.rs"),
-            root.join("src/modules/portal/service.rs"),
-        ];
+        // mokosh-contact-login prompt 001: portal/service.rs retired.
+        // Contact-plane replacement lands in prompt 004; extend this
+        // list to include it once that lands.
+        let sources = [root.join("src/modules/auth/service.rs")];
         let banned = [
             concat!("SET mfa_failed_attempts", " = $"),
             concat!("SET portal_failed_login_count", " = $"),

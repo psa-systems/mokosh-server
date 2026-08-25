@@ -12,7 +12,8 @@ use validator::Validate;
 use super::{
     CompanyFilter, CompanyIndustryResponse, CompanyResponse, ContactFieldValuesQuery,
     ContactFilter, ContactResponse, ContactService, CreateCompanyRequest, CreateContactRequest,
-    CreateSiteRequest, SiteResponse, UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
+    CreateSiteRequest, GrantPortalAccessRequest, PortalGrantOutcome, PortalRoleSummary,
+    SiteResponse, UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
     UpsertCompanyIndustryRequest,
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
@@ -52,6 +53,29 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
         .route("/contacts/{contact_id}", get(get_contact))
         .route("/contacts/{contact_id}", put(update_contact))
         .route("/contacts/{contact_id}", delete(delete_contact))
+        // mokosh-contact-login prompt 003: portal-access lifecycle
+        // for a contact. Guard = staff-only (super_admin/admin/manager,
+        // enforced inside the handler); the contact plane never hits
+        // these routes. `contact_routes` is nested at `/contacts` in
+        // the top-level router, so these paths resolve as
+        // `/api/v1/contacts/*` at the HTTP layer.
+        .route("/contacts/portal-roles", get(list_portal_roles))
+        .route(
+            "/contacts/{contact_id}/grant-portal-access",
+            post(grant_portal_access),
+        )
+        .route(
+            "/contacts/{contact_id}/resend-portal-invite",
+            post(resend_portal_invite),
+        )
+        .route(
+            "/contacts/{contact_id}/revoke-portal-access",
+            post(revoke_portal_access),
+        )
+        .route(
+            "/contacts/{contact_id}/portal-roles",
+            get(get_contact_portal_role_ids),
+        )
         // Company industries lookup (PMS-601). Reads are open to any authed
         // user (the company form's combobox needs them); writes are admin-only.
         .route(
@@ -424,4 +448,76 @@ async fn delete_company_industry(
         .contact_service
         .delete_company_industry(user.tenant(), id)
         .await
+}
+
+// ============================================================================
+// mokosh-contact-login prompt 003: PORTAL-ACCESS LIFECYCLE HANDLERS
+// ============================================================================
+
+async fn list_portal_roles(
+    State(state): State<ContactRouterState>,
+    _manager: crate::modules::auth::RequireManager,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<Vec<PortalRoleSummary>>> {
+    let roles = state
+        .contact_service
+        .list_portal_roles(user.tenant())
+        .await?;
+    Ok(Json(roles))
+}
+
+async fn get_contact_portal_role_ids(
+    State(state): State<ContactRouterState>,
+    _manager: crate::modules::auth::RequireManager,
+    RequireAuth(user): RequireAuth,
+    Path(contact_id): Path<Uuid>,
+) -> AppResult<Json<Vec<Uuid>>> {
+    let ids = state
+        .contact_service
+        .list_contact_portal_role_ids(user.tenant(), contact_id)
+        .await?;
+    Ok(Json(ids))
+}
+
+async fn grant_portal_access(
+    State(state): State<ContactRouterState>,
+    _manager: crate::modules::auth::RequireManager,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(contact_id): Path<Uuid>,
+    Json(request): Json<GrantPortalAccessRequest>,
+) -> AppResult<Json<PortalGrantOutcome>> {
+    let outcome = state
+        .contact_service
+        .grant_portal_access(user.tenant(), contact_id, &request.role_ids, &ctx)
+        .await?;
+    Ok(Json(outcome))
+}
+
+async fn resend_portal_invite(
+    State(state): State<ContactRouterState>,
+    _manager: crate::modules::auth::RequireManager,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(contact_id): Path<Uuid>,
+) -> AppResult<axum::http::StatusCode> {
+    state
+        .contact_service
+        .resend_portal_invite(user.tenant(), contact_id, &ctx)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn revoke_portal_access(
+    State(state): State<ContactRouterState>,
+    _manager: crate::modules::auth::RequireManager,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(contact_id): Path<Uuid>,
+) -> AppResult<axum::http::StatusCode> {
+    state
+        .contact_service
+        .revoke_portal_access(user.tenant(), contact_id, &ctx)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
