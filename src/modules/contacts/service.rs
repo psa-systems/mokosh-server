@@ -14,6 +14,80 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// PMS-920: the alternative every company-delete refusal ends with.
+///
+/// Phrased as the data change rather than as a UI gesture. The field has
+/// existed since migration 004 and `UpdateCompanyRequest` already accepts it,
+/// so this stays true regardless of whether a given client has caught up
+/// (MAPPS-575 is the SPA half).
+const ARCHIVE_INSTEAD: &str =
+    "archive it instead by setting its status to Inactive, which keeps its history \
+     and takes it out of your active lists";
+
+/// Turn a `23503` on the company DELETE into a refusal that says which records
+/// blocked it and what to do about them.
+///
+/// PMS-920: the previous message listed every table that could block and told
+/// the operator to "remove them first". For half of them that is advice they
+/// must not take: deleting invoices, payments, contracts or time entries to
+/// tidy a client list destroys the financial and billing record the deletion
+/// was refused to protect. Those two cases now read differently, and both name
+/// archiving, which is what the operator almost always actually wants.
+///
+/// Driven off the constraint name Postgres reports rather than a pre-flight
+/// count per table: it is the authority on which FK actually fired, it costs no
+/// extra queries, and a table added later cannot silently fall out of a
+/// hand-maintained list - it lands on the generic arm instead.
+fn company_delete_blocked(constraint: Option<&str>) -> AppError {
+    // Records that exist to be kept. Removing them to enable a delete is worse
+    // than not deleting.
+    const RETAINED: &[(&str, &str)] = &[
+        ("invoices_company_id_fkey", "invoices"),
+        ("payments_company_id_fkey", "payments"),
+        ("contracts_company_id_fkey", "contracts"),
+        ("time_entries_company_id_fkey", "time entries"),
+        ("mileage_entries_company_id_fkey", "mileage entries"),
+    ];
+    // Records the operator can legitimately clear or reassign first.
+    const REMOVABLE: &[(&str, &str)] = &[
+        ("assets_company_id_fkey", "assets"),
+        ("quotes_company_id_fkey", "quotes"),
+        ("credential_vault_company_id_fkey", "stored credentials"),
+    ];
+
+    let named = constraint.and_then(|c| {
+        RETAINED
+            .iter()
+            .find(|(fk, _)| *fk == c)
+            .map(|(_, label)| (*label, true))
+            .or_else(|| {
+                REMOVABLE
+                    .iter()
+                    .find(|(fk, _)| *fk == c)
+                    .map(|(_, label)| (*label, false))
+            })
+    });
+
+    let message = match named {
+        Some((label, true)) => format!(
+            "Cannot delete company: it has {label}, which are kept as a permanent \
+             financial and billing record and must not be removed to allow a \
+             deletion. You can {ARCHIVE_INSTEAD}"
+        ),
+        Some((label, false)) => format!(
+            "Cannot delete company: it has {label}. Remove or reassign them first, \
+             or {ARCHIVE_INSTEAD}"
+        ),
+        // An FK this function has not been taught about. Say so plainly rather
+        // than guessing which half it belongs to; the alternative still holds.
+        None => format!(
+            "Cannot delete company: other records still reference it. Remove or \
+             reassign whatever can be moved, or {ARCHIVE_INSTEAD}"
+        ),
+    };
+    AppError::BadRequest(message)
+}
+
 /// How long a portal setup link remains redeemable. Mirrors the
 /// password-reset redemption window (PMS-136).
 const PORTAL_SETUP_TOKEN_TTL_HOURS: i64 = 72;
@@ -754,6 +828,33 @@ impl ContactService {
         // GUC is set for it too.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // PMS-919: the tenant's own company is refused here rather than by its
+        // foreign key, because the FK is the wrong messenger twice over. It is
+        // nullable, so it does not block on a fresh tenant at all: the delete
+        // would succeed, `own_company_id` would go NULL, and the failure would
+        // surface later as a NOT NULL violation on `time_entries` the next time
+        // someone logged overhead time (PMS-413 makes this the anchor for that,
+        // and MAPPS-243 sends it as the company). On a tenant that already has
+        // overhead time it blocks, but as a generic related-records error
+        // naming `time_entries`, which does not tell the operator that the real
+        // problem is the company's role. Checked first because it is a
+        // statement about what this company IS, not about what references it.
+        let is_own_company: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND own_company_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if is_own_company {
+            return Err(AppError::BadRequest(
+                "This is your organisation's own company record, which general and \
+                 overhead time is logged against; it cannot be deleted"
+                    .to_string(),
+            ));
+        }
+
         // Check for related records
         let ticket_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND company_id = $2",
@@ -764,9 +865,13 @@ impl ContactService {
         .await?;
 
         if ticket_count > 0 {
-            return Err(AppError::BadRequest(
-                "Cannot delete company with existing tickets".to_string(),
-            ));
+            // PMS-920: tickets are removable, so "delete them first" is advice
+            // the operator can actually take, but it is rarely the one they
+            // want. Name the alternative alongside it.
+            return Err(AppError::BadRequest(format!(
+                "Cannot delete company: it has {ticket_count} ticket(s). Delete or \
+                 reassign them first, or {ARCHIVE_INSTEAD}"
+            )));
         }
 
         let before: Option<serde_json::Value> = sqlx::query_scalar(
@@ -825,26 +930,29 @@ impl ContactService {
             }
         }
 
-        // The explicit ticket guard above only covers one of the many tables
-        // that foreign-key `companies` (contracts, invoices, payments,
-        // projects, assets, time entries, appointments, sub-companies, ...).
-        // Those references are `ON DELETE RESTRICT`, so the DELETE raises
-        // Postgres `23503`; map it to a 400 instead of letting the generic
-        // `From<sqlx::Error>` turn it into a 500 (PMS-170, same shape as the
-        // PMS-149 ticket-delete fix).
+        // The explicit ticket guard above only covers one of the tables that
+        // foreign-key `companies`. The rest still default to NO ACTION, so the
+        // DELETE raises Postgres `23503`; map it to a 400 instead of letting
+        // the generic `From<sqlx::Error>` turn it into a 500 (PMS-170, same
+        // shape as the PMS-149 ticket-delete fix).
+        //
+        // PMS-919 narrowed which tables can reach this. `projects`,
+        // `appointments`, `active_timers`, `rmm_device_mappings` and
+        // `parent_company_id` are nullable and now `ON DELETE SET NULL`
+        // (migration 113), so they unlink rather than block and must not be
+        // named. What is left is the `NOT NULL` group, where a company-less row
+        // is not a valid state, plus `credential_vault`, which is nullable but
+        // keeps blocking on purpose: nulling it would leave encrypted secrets
+        // owned by nothing and cascading would destroy them silently.
         if let Err(e) = sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(company_id)
             .execute(&mut *tx)
             .await
         {
-            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
-                return Err(AppError::BadRequest(
-                    "Cannot delete company with related records (contracts, invoices, \
-                     payments, projects, assets, time entries, appointments, or \
-                     sub-companies); remove them first"
-                        .to_string(),
-                ));
+            let db_err = e.as_database_error();
+            if db_err.and_then(|d| d.code()).as_deref() == Some("23503") {
+                return Err(company_delete_blocked(db_err.and_then(|d| d.constraint())));
             }
             return Err(e.into());
         }
