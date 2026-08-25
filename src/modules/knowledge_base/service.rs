@@ -1,6 +1,7 @@
 //! Knowledge base service.
 
 use crate::modules::auth::TenantId;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -522,8 +523,120 @@ impl KbService {
             )
             .await?;
         }
+
+        // PMS-922: the save supersedes this author's draft, so it goes. Only
+        // theirs: another editor's in-progress text is not resolved by someone
+        // else pressing Save. In the same transaction as the write it
+        // supersedes, so a failed commit cannot discard a draft whose article
+        // never changed.
+        sqlx::query(
+            "DELETE FROM kb_article_drafts \
+             WHERE tenant_id = $1 AND article_id = $2 AND user_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(editor)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         self.get_article_inner(tenant_id, id, false).await
+    }
+
+    /// PMS-922: upsert the caller's draft for `article_id`.
+    ///
+    /// Writes NO `kb_article_versions` row, which is the entire point: autosave
+    /// against `update_article` would append a revision per interval and bury
+    /// the real edits. Nothing here is ever promoted to a version; a draft is
+    /// superseded by a real save, which deletes it.
+    ///
+    /// Reads the article first so a draft cannot become a way to write against
+    /// an article the caller cannot open, and so the row's `article_id` FK is
+    /// never the thing that reports a wrong id.
+    pub async fn save_draft(
+        &self,
+        tenant_id: TenantId,
+        article_id: Uuid,
+        user_id: Uuid,
+        request: &SaveKbDraftRequest,
+    ) -> AppResult<KbDraftResponse> {
+        self.get_article_inner(tenant_id, article_id, false).await?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let updated_at: DateTime<Utc> = sqlx::query_scalar(
+            r#"
+            INSERT INTO kb_article_drafts (tenant_id, article_id, user_id, title, content)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (tenant_id, article_id, user_id)
+            DO UPDATE SET title = EXCLUDED.title,
+                          content = EXCLUDED.content,
+                          updated_at = NOW()
+            RETURNING updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(user_id)
+        .bind(&request.title)
+        .bind(&request.content)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(KbDraftResponse {
+            article_id,
+            title: request.title.clone(),
+            content: request.content.clone(),
+            updated_at,
+        })
+    }
+
+    /// The caller's draft for `article_id`, if they have one.
+    pub async fn get_draft(
+        &self,
+        tenant_id: TenantId,
+        article_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<Option<KbDraftResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT title, content, updated_at FROM kb_article_drafts \
+             WHERE tenant_id = $1 AND article_id = $2 AND user_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        Ok(row.map(|(title, content, updated_at)| KbDraftResponse {
+            article_id,
+            title,
+            content,
+            updated_at,
+        }))
+    }
+
+    /// Discard the caller's draft. Idempotent: discarding one that is already
+    /// gone is a success, because the caller's intent is satisfied either way.
+    pub async fn delete_draft(
+        &self,
+        tenant_id: TenantId,
+        article_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "DELETE FROM kb_article_drafts \
+             WHERE tenant_id = $1 AND article_id = $2 AND user_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Append a new monotonic version row for `article_id` inside an open
