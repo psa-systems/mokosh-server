@@ -37,6 +37,31 @@ const RESET_TOKEN_TTL_MIN: i64 = 30;
 /// exactly so a staff-plane bearer cannot cross the plane.
 pub const CONTACT_TOKEN_TYP: &str = "contact";
 
+/// mokosh-contact-login prompt 010 (PMS-918): magic-link intent TTL.
+/// 15 min - long enough to check email + short enough to blunt
+/// exposure of a leaked link.
+pub const LOGIN_INTENT_TTL_MIN: i64 = 15;
+
+/// mokosh-contact-login prompt 010: TTL of the intermediate
+/// `contact_login_select` JWT the redeem endpoint hands the SPA when
+/// a magic link resolves to two or more portal contacts. 5 min is
+/// enough for a human to pick a tile; beyond that the SPA bounces
+/// back to `/portal/login` to request a fresh link.
+pub const LOGIN_SELECTION_TOKEN_TTL_MIN: i64 = 5;
+
+/// mokosh-contact-login prompt 010: JWT `typ` claim value for the
+/// selection token. Distinct from `CONTACT_TOKEN_TYP` so a caller
+/// cannot present a selection token as a Bearer on a normal API call
+/// (and vice versa).
+pub const LOGIN_LINK_TOKEN_TYP: &str = "contact_login_select";
+
+/// mokosh-contact-login prompt 010: rate-limit windows for the
+/// finder. Silent-drop shape: an over-limit request still returns
+/// 204 so an attacker cannot use the response shape as an
+/// enumeration oracle; it just doesn't insert or dispatch.
+const LOGIN_INTENT_MAX_PER_IP_PER_MINUTE: i64 = 20;
+const LOGIN_INTENT_MAX_PER_EMAIL_PER_15_MIN: i64 = 5;
+
 /// mokosh-contact-login prompt 004: contact-portal auth service.
 ///
 /// Clone-cheap - holds a `Database` handle + a jwt_secret + a builder
@@ -578,6 +603,469 @@ impl ContactAuthService {
         )
     }
 
+    /// mokosh-contact-login prompt 010 (PMS-918): request a magic-link
+    /// sign-in for `email` on the tenant carrying `slug` (a Company
+    /// `portal_slug`) or, when no slug is supplied, drop silently. Always
+    /// returns `Ok(())` regardless of outcome so an attacker cannot use
+    /// the response shape to tell a matched email from an unmatched one.
+    ///
+    /// Tenant resolution: this endpoint has no bearer token and the
+    /// finder page lives at the tenant-agnostic `/portal/login` URL,
+    /// so the SPA passes the Company slug it remembers in
+    /// localStorage as `contact_last_slug`. The server maps that slug
+    /// to a Company + tenant. If the slug is absent or unknown, no
+    /// intent row is inserted (there is no Host-header-based tenant
+    /// lookup on this deployment: mokosh tenants share the same
+    /// `msp.<apex>` host). If the caller wants cross-tenant discovery
+    /// they visit each MSP's URL in turn - the tenant-isolation
+    /// invariant from prompt 010's threat model.
+    ///
+    /// Rate-limited via DB counting on `portal_login_intents`:
+    /// per-IP > 20 in 60 s and per-email > 5 in 15 min silently drop.
+    /// Both counters query the table directly so no in-process
+    /// middleware needs to be wired.
+    #[tracing::instrument(skip_all)]
+    pub async fn request_login_link(
+        &self,
+        email: &str,
+        slug: Option<&str>,
+        ip: Option<IpAddr>,
+        user_agent: Option<&str>,
+    ) -> AppResult<()> {
+        // Slug -> tenant. When slug is missing, silently drop.
+        // SAFETY (PMS-285): pre-auth path with no `app.current_tenant`
+        // GUC set; runs on the BYPASSRLS migrator pool. Data returned
+        // is only the tenant id (used to write a subsequent row under
+        // that tenant).
+        let Some(slug) = slug.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(());
+        };
+        let tenant_row: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT co.tenant_id
+            FROM companies co
+            INNER JOIN tenants t ON t.id = co.tenant_id
+            WHERE co.portal_slug = $1 AND t.status = 'active'
+            "#,
+        )
+        .bind(slug)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((tenant_id,)) = tenant_row else {
+            return Ok(());
+        };
+
+        // Per-IP rate limit. Silent drop shape.
+        // SAFETY (PMS-285): the counters are pre-auth and cross-tenant
+        // by design (an attacker's IP can fan out across tenants);
+        // running on the migrator pool bypasses RLS so the count
+        // includes rows from every tenant. That is the intended
+        // scope: rate-limit the requester's IP, not one tenant's.
+        if let Some(ip_addr) = ip {
+            let ip_text = ip_addr.to_string();
+            let per_ip: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM portal_login_intents \
+                 WHERE ip = $1::inet AND created_at > NOW() - INTERVAL '1 minute'",
+            )
+            .bind(&ip_text)
+            .fetch_one(self.db.migrator_pool())
+            .await?;
+            if per_ip >= LOGIN_INTENT_MAX_PER_IP_PER_MINUTE {
+                tracing::info!(
+                    ip = %ip_addr,
+                    "login-link request silently dropped: per-IP rate limit reached"
+                );
+                return Ok(());
+            }
+        }
+        // Per-email rate limit (scoped to the resolved tenant + the
+        // lowercased email; a real match is still gated below).
+        let per_email: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portal_login_intents \
+             WHERE tenant_id = $1 AND LOWER(email) = LOWER($2) \
+             AND created_at > NOW() - INTERVAL '15 minutes'",
+        )
+        .bind(tenant_id)
+        .bind(email)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if per_email >= LOGIN_INTENT_MAX_PER_EMAIL_PER_15_MIN {
+            tracing::info!(
+                tenant_id = %tenant_id,
+                "login-link request silently dropped: per-email rate limit reached"
+            );
+            return Ok(());
+        }
+
+        // Match check. If no active portal contact under this tenant
+        // has this email, no intent + no email.
+        let contact_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM contacts c
+            INNER JOIN companies co ON co.id = c.company_id
+            WHERE c.tenant_id = $1
+              AND LOWER(c.email) = LOWER($2)
+              AND c.is_portal_user = TRUE
+              AND co.portal_slug IS NOT NULL
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(email)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if contact_count == 0 {
+            return Ok(());
+        }
+
+        // Mint intent + dispatch. Best-effort dispatch (failed send
+        // leaves the intent row; the customer can request another).
+        let intent_id = Uuid::new_v4();
+        let secret = generate_token(32);
+        let secret_hash = hash_password(&secret)?;
+        let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
+        let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
+        // SAFETY (PMS-285): unauthenticated finder path; the tenant
+        // was resolved above, so the write lands under the correct
+        // tenant. Runs on the migrator pool because there is no
+        // session GUC to key RLS off.
+        sqlx::query(
+            r#"
+            INSERT INTO portal_login_intents
+                (id, tenant_id, email, secret_hash, expires_at, ip, user_agent)
+            VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::inet, $7)
+            "#,
+        )
+        .bind(intent_id)
+        .bind(tenant_id)
+        .bind(email)
+        .bind(&secret_hash)
+        .bind(expires_at)
+        .bind(&ip_text)
+        .bind(user_agent)
+        .execute(self.db.migrator_pool())
+        .await?;
+
+        let magic_link_url = format!(
+            "{}/portal/pick?token={}.{}",
+            self.spa_base_url.trim_end_matches('/'),
+            intent_id,
+            secret,
+        );
+        if let Some(notify) = self.notifications.as_ref() {
+            let context = serde_json::json!({
+                "recipient_email": email,
+                "magic_link_url": magic_link_url,
+            });
+            let _ = notify
+                .dispatch(
+                    TenantId::from_trusted(tenant_id),
+                    "auth.login_link",
+                    &context,
+                )
+                .await;
+        } else {
+            tracing::warn!(
+                magic_link_url = %magic_link_url,
+                "no notifications dispatcher wired; login-link intent persisted but no message queued (link logged for manual relay)"
+            );
+        }
+        Ok(())
+    }
+
+    /// mokosh-contact-login prompt 010 (PMS-918): redeem a magic link
+    /// minted by `request_login_link` (or by
+    /// `ContactService::grant_portal_access`). Parses `{intent_id}.{secret}`,
+    /// verifies the hash, marks the intent used (same tx, so a race
+    /// loses cleanly), then loads matching portal contacts.
+    ///
+    /// - 0 matches (revoked between mint + click) -> generic
+    ///   `AppError::BadRequest("This link is invalid or has expired")`.
+    /// - 1 match -> auto-mint access + refresh (or `mfa_required = true`
+    ///   if the contact has TOTP enrolled) and return in
+    ///   `LoginLinkRedeemOutcome.auto`.
+    /// - >=2 matches -> mint a short-lived selection JWT and return
+    ///   the picker payload in `LoginLinkRedeemOutcome.candidates`.
+    ///
+    /// Every failure path folds to the same generic 400 copy so the
+    /// caller cannot tell WHY the token was rejected (expired vs.
+    /// already-used vs. revoked vs. malformed).
+    #[tracing::instrument(skip_all)]
+    pub async fn redeem_login_link(
+        &self,
+        token: &str,
+        user_agent: Option<&str>,
+        ip: Option<IpAddr>,
+    ) -> AppResult<LoginLinkRedeemOutcome> {
+        let invalid = || AppError::BadRequest("This link is invalid or has expired".to_string());
+
+        let (intent_id, secret) = parse_intent_bound_token(token).ok_or_else(invalid)?;
+
+        // Load + verify + mark-used atomically in one BYPASSRLS tx so
+        // a race between two clicks lands exactly one winner. This
+        // path is unauthenticated (no `app.current_tenant` GUC to
+        // set), so it runs on the migrator pool; the tenant id is
+        // read off the intent row itself and threaded through the
+        // downstream candidate query as an explicit `WHERE tenant_id
+        // = $1` filter.
+        let mut tx = self.db.migrator_pool().begin().await?;
+        #[allow(clippy::type_complexity)]
+        let intent: Option<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            r#"
+                SELECT id, tenant_id, email, secret_hash, used_at, expires_at
+                FROM portal_login_intents
+                WHERE id = $1
+                FOR UPDATE
+                "#,
+        )
+        .bind(intent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((_, tenant_id, intent_email, secret_hash, used_at, expires_at)) = intent else {
+            return Err(invalid());
+        };
+        if used_at.is_some() || expires_at <= Utc::now() {
+            return Err(invalid());
+        }
+        if !verify_password(secret, &secret_hash)? {
+            return Err(invalid());
+        }
+        sqlx::query("UPDATE portal_login_intents SET used_at = NOW() WHERE id = $1")
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        // Candidate lookup. Rows where the tenant is suspended or the
+        // Company has no portal_slug never appear (a suspended tenant
+        // is not a valid destination and a slug-less Company cannot
+        // render its `/portal/{slug}/*` URLs anyway). Zero rows =
+        // same generic invalid error above; do NOT leak revocation.
+        #[allow(clippy::type_complexity)]
+        let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String, Option<String>)> =
+            sqlx::query_as(
+                r#"
+                SELECT c.id, c.tenant_id, c.company_id, c.email,
+                       co.name AS company_name, co.portal_slug,
+                       c.portal_mfa_secret
+                FROM contacts c
+                INNER JOIN companies co ON co.id = c.company_id
+                INNER JOIN tenants t ON t.id = c.tenant_id
+                WHERE c.tenant_id = $1
+                  AND LOWER(c.email) = LOWER($2)
+                  AND c.is_portal_user = TRUE
+                  AND t.status = 'active'
+                  AND co.portal_slug IS NOT NULL
+                ORDER BY co.name
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(&intent_email)
+            .fetch_all(self.db.migrator_pool())
+            .await?;
+        if candidates.is_empty() {
+            return Err(invalid());
+        }
+
+        // Single-match: auto-mint. MFA gate mirrors the shape prompt
+        // 004 login already returns (empty tokens + mfa_required =
+        // true). The SPA re-POSTs to a follow-up MFA endpoint with
+        // the code (out of scope for this ticket; contact MFA is
+        // off by default).
+        if candidates.len() == 1 {
+            let (contact_id, tid, company_id, email_row, _company_name, _slug, mfa_secret) =
+                candidates.into_iter().next().unwrap();
+            if mfa_secret.is_some() {
+                return Ok(LoginLinkRedeemOutcome {
+                    auto: Some(ContactLoginResponse {
+                        access_token: String::new(),
+                        refresh_token: String::new(),
+                        expires_at: Utc::now(),
+                        contact: None,
+                        mfa_required: true,
+                    }),
+                    candidates: None,
+                });
+            }
+            let response = self
+                .mint_session_for_contact(tid, contact_id, company_id, &email_row, user_agent, ip)
+                .await?;
+            return Ok(LoginLinkRedeemOutcome {
+                auto: Some(response),
+                candidates: None,
+            });
+        }
+
+        // Multi-match: mint the selection JWT + return the picker
+        // payload.
+        let candidate_contact_ids: Vec<Uuid> = candidates.iter().map(|c| c.0).collect();
+        let companies: Vec<LoginLinkCandidate> = candidates
+            .iter()
+            .map(
+                |(contact_id, _, _, _, company_name, portal_slug, _)| LoginLinkCandidate {
+                    contact_id: *contact_id,
+                    company_name: company_name.clone(),
+                    portal_slug: portal_slug.clone(),
+                },
+            )
+            .collect();
+        let selection_token =
+            self.mint_selection_token(intent_id, tenant_id, &candidate_contact_ids)?;
+        Ok(LoginLinkRedeemOutcome {
+            auto: None,
+            candidates: Some(LoginLinkCandidates {
+                selection_token,
+                companies,
+            }),
+        })
+    }
+
+    /// mokosh-contact-login prompt 010 (PMS-918): finish the multi-match
+    /// magic-link flow. Decodes the selection JWT, verifies that
+    /// `contact_id` is one of the ids that matched at redeem time
+    /// (prevents swapping to an unrelated contact), then mints a
+    /// contact session for that specific `contact_id`. MFA gate
+    /// mirrors the redeem path.
+    #[tracing::instrument(skip_all)]
+    pub async fn select_login_candidate(
+        &self,
+        selection_token: &str,
+        contact_id: Uuid,
+        user_agent: Option<&str>,
+        ip: Option<IpAddr>,
+    ) -> AppResult<ContactLoginResponse> {
+        let invalid = || AppError::BadRequest("This link is invalid or has expired".to_string());
+
+        let claims = self
+            .decode_selection_token(selection_token)
+            .map_err(|_| invalid())?;
+        if !claims.candidate_contact_ids.contains(&contact_id) {
+            return Err(invalid());
+        }
+
+        // Belt-and-braces re-check: tenant must still be active + the
+        // contact must still be a portal user + its Company still has
+        // a portal_slug. Any change between redeem and select folds
+        // to the same generic invalid error.
+        let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT c.company_id, c.email, c.portal_mfa_secret
+            FROM contacts c
+            INNER JOIN companies co ON co.id = c.company_id
+            INNER JOIN tenants t ON t.id = c.tenant_id
+            WHERE c.id = $1
+              AND c.tenant_id = $2
+              AND c.is_portal_user = TRUE
+              AND t.status = 'active'
+              AND co.portal_slug IS NOT NULL
+            "#,
+        )
+        .bind(contact_id)
+        .bind(claims.tid)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((company_id, email, mfa_secret)) = row else {
+            return Err(invalid());
+        };
+        if mfa_secret.is_some() {
+            return Ok(ContactLoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: Utc::now(),
+                contact: None,
+                mfa_required: true,
+            });
+        }
+        self.mint_session_for_contact(claims.tid, contact_id, company_id, &email, user_agent, ip)
+            .await
+    }
+
+    /// Shared session-minting used by `redeem_login_link` (single
+    /// match) and `select_login_candidate` (multi match). Returns the
+    /// same `ContactLoginResponse` shape the password login path uses.
+    async fn mint_session_for_contact(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        company_id: Uuid,
+        email: &str,
+        user_agent: Option<&str>,
+        ip: Option<IpAddr>,
+    ) -> AppResult<ContactLoginResponse> {
+        let caps = self.load_capabilities(tenant_id, contact_id).await?;
+        let session_id = Uuid::new_v4();
+        let (access_token, expires_at) =
+            self.mint_access_token(tenant_id, contact_id, company_id, email, &caps, session_id)?;
+        let refresh_token = self
+            .mint_refresh_token(tenant_id, contact_id, session_id, user_agent, ip)
+            .await?;
+        // Stamp last-login. Best-effort.
+        let _ = sqlx::query(
+            "UPDATE contacts \
+             SET portal_last_login_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await;
+        let me = self.me(tenant_id, contact_id).await?;
+        Ok(ContactLoginResponse {
+            access_token,
+            refresh_token,
+            expires_at,
+            contact: Some(me),
+            mfa_required: false,
+        })
+    }
+
+    fn mint_selection_token(
+        &self,
+        intent_id: Uuid,
+        tenant_id: Uuid,
+        candidate_contact_ids: &[Uuid],
+    ) -> AppResult<String> {
+        let now = Utc::now();
+        let claims = ContactLoginSelectClaims {
+            intent_id,
+            tid: tenant_id,
+            candidate_contact_ids: candidate_contact_ids.to_vec(),
+            token_type: LOGIN_LINK_TOKEN_TYP.to_string(),
+            iat: now.timestamp(),
+            exp: (now + Duration::minutes(LOGIN_SELECTION_TOKEN_TTL_MIN)).timestamp(),
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
+        )
+        .map_err(|e| AppError::Internal(format!("jwt encode: {e}")))
+    }
+
+    fn decode_selection_token(&self, token: &str) -> AppResult<ContactLoginSelectClaims> {
+        let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.required_spec_claims.clear();
+        validation.required_spec_claims.insert("exp".to_string());
+        let data = decode::<ContactLoginSelectClaims>(
+            token,
+            &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
+            &validation,
+        )
+        .map_err(|_| AppError::Unauthorized)?;
+        if data.claims.token_type != LOGIN_LINK_TOKEN_TYP {
+            return Err(AppError::Unauthorized);
+        }
+        Ok(data.claims)
+    }
+
     /// mokosh-contact-login prompt 004: fail-closed check that the
     /// contact-portal's owning tenant is `status = 'active'`. Called
     /// by the middleware on every authenticated /api/v1/contact/*
@@ -775,6 +1263,20 @@ pub(crate) fn parse_session_bound_token(token: &str) -> Option<(Uuid, &str)> {
     }
     let session_id = Uuid::parse_str(id).ok()?;
     Some((session_id, secret))
+}
+
+/// mokosh-contact-login prompt 010: `{intent_id}.{secret}` parser
+/// used by `redeem_login_link`. Same split-shape as
+/// `parse_session_bound_token` / `parse_contact_bound_token` above;
+/// duplicated for readability at the call site (the first half is
+/// keyed to a different table).
+pub(crate) fn parse_intent_bound_token(token: &str) -> Option<(Uuid, &str)> {
+    let (id, secret) = token.split_once('.')?;
+    if secret.is_empty() {
+        return None;
+    }
+    let intent_id = Uuid::parse_str(id).ok()?;
+    Some((intent_id, secret))
 }
 
 /// Trait-object alias so the middleware can take an `Arc<...>` handle

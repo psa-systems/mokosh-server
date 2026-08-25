@@ -48,6 +48,9 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         .route("/auth/set-password", post(set_password))
         .route("/auth/reset-password", post(reset_password))
         .route("/auth/forgot-password", post(forgot_password))
+        .route("/auth/login-link", post(request_login_link))
+        .route("/auth/login-link/redeem", post(redeem_login_link))
+        .route("/auth/login-link/select", post(select_login_candidate))
         .route("/auth/me", get(me))
         .route("/portal/{slug}/host", get(portal_host))
         .with_state(state)
@@ -155,6 +158,94 @@ async fn forgot_password(
         .request_password_reset(&request.slug, &request.email)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// mokosh-contact-login prompt 010 (PMS-918): POST /auth/login-link.
+/// Always returns 204 whether the (slug, email) matches a portal
+/// contact or not. Enumeration-resistant by construction.
+async fn request_login_link(
+    State(state): State<ContactRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<ContactRequestLoginLinkRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    state
+        .service
+        .request_login_link(
+            &request.email,
+            request.slug.as_deref(),
+            Some(addr.ip()),
+            ua.as_deref(),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// mokosh-contact-login prompt 010: POST /auth/login-link/redeem.
+/// Returns a `LoginLinkRedeemOutcome` JSON envelope. On the
+/// single-match auto path, also sets the refresh cookie so the SPA
+/// survives a hard-refresh cold-load.
+async fn redeem_login_link(
+    State(state): State<ContactRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<ContactRedeemLoginLinkRequest>,
+) -> Result<Response, AppError> {
+    request.validate()?;
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let outcome = state
+        .service
+        .redeem_login_link(&request.token, ua.as_deref(), Some(addr.ip()))
+        .await?;
+    // Attach the refresh cookie only on the auto-mint path where a
+    // real session was minted (mfa_required = false + tokens set).
+    let cookie = outcome
+        .auto
+        .as_ref()
+        .filter(|r| !r.mfa_required && !r.refresh_token.is_empty())
+        .map(|r| build_refresh_cookie(&r.refresh_token));
+    let mut resp = Json(outcome).into_response();
+    if let Some(c) = cookie {
+        add_cookie(resp.headers_mut(), &c);
+    }
+    Ok(resp)
+}
+
+/// mokosh-contact-login prompt 010: POST /auth/login-link/select.
+/// Multi-match completion path. Returns the same `ContactLoginResponse`
+/// shape the password login uses + Set-Cookie on the happy path.
+async fn select_login_candidate(
+    State(state): State<ContactRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<ContactSelectLoginCandidateRequest>,
+) -> Result<Response, AppError> {
+    request.validate()?;
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let resp = state
+        .service
+        .select_login_candidate(
+            &request.selection_token,
+            request.contact_id,
+            ua.as_deref(),
+            Some(addr.ip()),
+        )
+        .await?;
+    Ok(with_refresh_cookie(
+        &resp,
+        Json(resp.clone()).into_response(),
+    ))
 }
 
 async fn me(

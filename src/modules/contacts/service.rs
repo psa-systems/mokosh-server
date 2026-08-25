@@ -1410,56 +1410,146 @@ impl ContactService {
         Ok(())
     }
 
-    /// mokosh-contact-login prompt 003: variant of `send_setup_email`
-    /// that includes the Company's portal slug in the URL. Best-effort
-    /// like its sibling; a failed dispatch does not roll back the
-    /// grant/resend transaction.
+    /// mokosh-contact-login prompt 010 (PMS-918): the grant email
+    /// changes shape from the prompt-003 single-CTA "Set your
+    /// password" to a two-block "Sign in now via magic link (primary)
+    /// + Prefer a password? (secondary)" template.
+    ///
+    /// Both tokens are minted at grant time so the recipient can pick
+    /// whichever path they prefer without a second server round-trip.
+    /// The magic-link intent expires in 15 min (per the intent TTL);
+    /// if not clicked, the recipient can request a fresh one via
+    /// `/portal/login` or use the still-valid 72h set-password link.
+    ///
+    /// Best-effort dispatch: a failed send never rolls back the grant
+    /// transaction (both tokens are already persisted).
     async fn send_grant_email(&self, contact: &Contact, portal_slug: &str, token: &str) {
         let Some(ref email) = contact.email else {
             tracing::warn!(
                 contact_id = %contact.id,
-                "portal access granted but contact has no email; setup link not delivered",
+                "portal access granted but contact has no email; sign-in links not delivered",
             );
             return;
         };
-        let setup_link = format!(
+        let password_setup_link = format!(
             "{}/portal/{}/set-password?token={}",
             self.app_url.trim_end_matches('/'),
             portal_slug,
             token,
         );
+
+        // Mint the magic-link intent for this contact's email so the
+        // recipient can one-click into the portal without ever
+        // choosing a password. Failure to mint (DB error) skips the
+        // magic-link block but still dispatches the set-password
+        // link, so a partially-unreachable DB does not lose the whole
+        // grant email.
+        let magic_link_url = match self
+            .mint_grant_magic_link_url(contact.tenant_id, email)
+            .await
+        {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::warn!(
+                    contact_id = %contact.id,
+                    error = ?e,
+                    "failed to mint magic-link intent for grant email; falling back to password-only email",
+                );
+                None
+            }
+        };
+
         let Some(notify) = self.notifications.as_ref() else {
             tracing::warn!(
                 contact_id = %contact.id,
-                setup_link = %setup_link,
+                password_setup_link = %password_setup_link,
                 "no notifications dispatcher wired; portal setup token persisted but no message queued (setup_link logged for manual relay)",
             );
             return;
         };
-        let context = serde_json::json!({
+        let mut context = serde_json::json!({
             "recipient_email": email,
             "display_name": contact.first_name,
-            "setup_link": setup_link,
+            "password_setup_link": password_setup_link,
         });
+        if let (Some(url), Some(obj)) = (magic_link_url.as_ref(), context.as_object_mut()) {
+            obj.insert(
+                "magic_link_url".to_string(),
+                serde_json::Value::String(url.clone()),
+            );
+        }
         match notify
             .dispatch(
                 TenantId::from_trusted(contact.tenant_id),
-                "auth.welcome",
+                "auth.portal_grant",
                 &context,
             )
             .await
         {
             Ok(_) => tracing::info!(
                 contact_id = %contact.id,
-                setup_link = %setup_link,
+                magic_link_url = ?magic_link_url,
+                password_setup_link = %password_setup_link,
                 "portal grant email queued"
             ),
             Err(e) => tracing::warn!(
                 contact_id = %contact.id,
                 error = ?e,
-                "portal grant email dispatch failed; token persisted but link unreachable",
+                "portal grant email dispatch failed; tokens persisted but links unreachable",
             ),
         }
+    }
+
+    /// mokosh-contact-login prompt 010 (PMS-918): insert a fresh
+    /// `portal_login_intents` row for the granted contact's email so
+    /// the grant email's primary CTA drops them straight into the
+    /// portal. TTL matches `ContactAuthService::LOGIN_INTENT_TTL_MIN`
+    /// (15 min).
+    ///
+    /// Kept as a local helper (rather than a call into
+    /// `ContactAuthService`) to avoid wiring the auth service into
+    /// `ContactService`; the insert shape is small and any future
+    /// drift is caught by the shared test that asserts the emitted
+    /// URL redeems.
+    async fn mint_grant_magic_link_url(
+        &self,
+        tenant_id: uuid::Uuid,
+        email: &str,
+    ) -> AppResult<String> {
+        // 15 min - matches ContactAuthService::LOGIN_INTENT_TTL_MIN.
+        // A magic-link intent minted here shares the redeem path with
+        // the finder-issued intents.
+        const LOGIN_INTENT_TTL_MIN: i64 = 15;
+        let intent_id = Uuid::new_v4();
+        let secret = crate::utils::crypto::generate_token(32);
+        let secret_hash = crate::utils::crypto::hash_password(&secret)?;
+        let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
+        // SAFETY (PMS-285): grant email is called post-commit from
+        // `grant_portal_access` and there is no `app.current_tenant`
+        // GUC set at this point (the grant tx has already committed).
+        // Runs on the migrator pool; the tenant id is threaded
+        // explicitly onto the row so the write lands under the right
+        // tenant.
+        sqlx::query(
+            r#"
+            INSERT INTO portal_login_intents
+                (id, tenant_id, email, secret_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(intent_id)
+        .bind(tenant_id)
+        .bind(email)
+        .bind(&secret_hash)
+        .bind(expires_at)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(format!(
+            "{}/portal/pick?token={}.{}",
+            self.app_url.trim_end_matches('/'),
+            intent_id,
+            secret,
+        ))
     }
 
     /// Create a new contact

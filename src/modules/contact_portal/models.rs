@@ -163,6 +163,108 @@ pub struct ContactResetPasswordRequest {
     pub password: String,
 }
 
+/// mokosh-contact-login prompt 010 (PMS-918): request body for
+/// `POST /api/v1/contact/auth/login-link`. Slug-less: the finder
+/// resolves the tenant from an optional `slug` (a Company's
+/// `portal_slug`) the SPA passes when it has one in localStorage. If
+/// absent, the request cannot pin down a tenant and the server drops
+/// silently (still returns 204 so an attacker cannot use the shape as
+/// an enumeration oracle).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactRequestLoginLinkRequest {
+    #[validate(email)]
+    pub email: String,
+    /// Optional Company `portal_slug` the SPA remembers in
+    /// localStorage from a prior sign-in. The server maps it to a
+    /// tenant so the intent row lands under the right tenant and the
+    /// eventual redeem step sees the matching contacts. Omitted on a
+    /// fresh install.
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
+/// mokosh-contact-login prompt 010: response body of the redeem
+/// endpoint. Exactly one of the two Options is populated on any
+/// success:
+/// - `auto` for the single-match / MFA-pending case: session is either
+///   already minted (`mfa_required = false`) or gated on TOTP
+///   (`mfa_required = true`).
+/// - `candidates` for the multi-match case: the SPA renders a picker
+///   and posts back to `/login-link/select` with the chosen
+///   `contact_id` plus the `selection_token`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginLinkRedeemOutcome {
+    pub auto: Option<ContactLoginResponse>,
+    pub candidates: Option<LoginLinkCandidates>,
+}
+
+/// mokosh-contact-login prompt 010: multi-Company picker payload
+/// returned when a magic-link redeem resolves to two or more portal
+/// contacts under the same email. The SPA renders one tile per row,
+/// on click POSTs `{selection_token, contact_id}` to
+/// `/login-link/select`. The selection token is a JWT carrying the
+/// candidate contact-id set + an expiry so the caller cannot swap a
+/// contact_id that was never in the list.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginLinkCandidates {
+    pub selection_token: String,
+    pub companies: Vec<LoginLinkCandidate>,
+}
+
+/// mokosh-contact-login prompt 010: one row of `LoginLinkCandidates`.
+/// `contact_id` uniquely identifies the portal account (a single
+/// email can back several contacts under different Companies inside
+/// the same MSP tenant). `company_name` + `portal_slug` are pure
+/// display fields for the picker tile.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginLinkCandidate {
+    pub contact_id: Uuid,
+    pub company_name: String,
+    pub portal_slug: String,
+}
+
+/// mokosh-contact-login prompt 010: request body for
+/// `POST /api/v1/contact/auth/login-link/redeem`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactRedeemLoginLinkRequest {
+    #[validate(length(min = 1, message = "token is required"))]
+    pub token: String,
+}
+
+/// mokosh-contact-login prompt 010: request body for
+/// `POST /api/v1/contact/auth/login-link/select`. `contact_id` MUST
+/// be one of the ids carried in the `selection_token`'s
+/// `candidate_contact_ids` claim, otherwise the request 400s. This
+/// prevents a caller from swapping the selection token to an
+/// unrelated contact.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactSelectLoginCandidateRequest {
+    #[validate(length(min = 1, message = "selection_token is required"))]
+    pub selection_token: String,
+    pub contact_id: Uuid,
+    /// TOTP code, sent on the second attempt after a `mfa_required`
+    /// response. Optional today (contact MFA is off by default;
+    /// reserved for a follow-up ticket that adds the enrol flow).
+    #[serde(default)]
+    pub mfa_code: Option<String>,
+}
+
+/// mokosh-contact-login prompt 010: JWT claims for the short-lived
+/// `contact_login_select` token. Encodes the intent id, the tenant,
+/// and the candidate set so the select endpoint can verify the
+/// caller-supplied `contact_id` is one of the ones that actually
+/// matched at redeem time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactLoginSelectClaims {
+    pub intent_id: Uuid,
+    pub tid: Uuid,
+    pub candidate_contact_ids: Vec<Uuid>,
+    #[serde(rename = "typ")]
+    pub token_type: String,
+    pub iat: i64,
+    pub exp: i64,
+}
+
 /// Response body for `GET /api/v1/contact/portal/{slug}/host`. Public
 /// endpoint used by the SPA to render branding + a "This portal is
 /// not available" splash for suspended tenants (mirrors the pre-pivot

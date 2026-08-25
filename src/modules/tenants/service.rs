@@ -2146,7 +2146,14 @@ impl TenantService {
                                  -- tenant while the note row was still marked
                                  -- sent. Migration 104 backfills the tenants
                                  -- created before this line existed.
-                                 'ticket.note_added')
+                                 'ticket.note_added',
+                                 -- PMS-918 (mokosh-contact-login prompt 010):
+                                 -- the two-block grant email (magic-link
+                                 -- primary + set-password secondary). Seeded
+                                 -- for the default tenant by migration 144;
+                                 -- copied here so a tenant created after 010
+                                 -- can dispatch a grant email at all.
+                                 'auth.portal_grant')
             "#,
         )
         .bind(new_tenant_id)
@@ -2178,7 +2185,11 @@ impl TenantService {
                                    -- their rules were not, and `dispatch`
                                    -- iterates RULES: a template with no rule
                                    -- is a message that is never sent.
-                                   'forms.request_link', 'ticket.note_added')
+                                   'forms.request_link', 'ticket.note_added',
+                                   -- PMS-918 (mokosh-contact-login prompt 010):
+                                   -- pair the auth.portal_grant template above
+                                   -- with its rule so grant dispatch fans out.
+                                   'auth.portal_grant')
             "#,
         )
         .bind(new_tenant_id)
