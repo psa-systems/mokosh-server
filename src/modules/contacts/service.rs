@@ -952,9 +952,7 @@ impl ContactService {
         {
             let db_err = e.as_database_error();
             if db_err.and_then(|d| d.code()).as_deref() == Some("23503") {
-                return Err(company_delete_blocked(
-                    db_err.and_then(|d| d.constraint()),
-                ));
+                return Err(company_delete_blocked(db_err.and_then(|d| d.constraint())));
             }
             return Err(e.into());
         }

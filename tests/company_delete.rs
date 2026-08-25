@@ -37,11 +37,7 @@ async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
 }
 
 /// `DELETE` the company over HTTP and return `(status, body)`.
-async fn delete_company_raw(
-    app: &common::TestApp,
-    token: &str,
-    company_id: Uuid,
-) -> (u16, String) {
+async fn delete_company_raw(app: &common::TestApp, token: &str, company_id: Uuid) -> (u16, String) {
     let resp = app
         .client
         .delete(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
@@ -228,13 +224,12 @@ async fn deleting_a_company_unlinks_every_nullable_dependent(pool: PgPool) {
         ("active_timers", timer),
         ("rmm_device_mappings", mapping),
     ] {
-        let found: Option<Option<Uuid>> = sqlx::query_scalar(&format!(
-            "SELECT company_id FROM {table} WHERE id = $1"
-        ))
-        .bind(id)
-        .fetch_optional(&app.pool)
-        .await
-        .unwrap_or_else(|e| panic!("read {table}: {e}"));
+        let found: Option<Option<Uuid>> =
+            sqlx::query_scalar(&format!("SELECT company_id FROM {table} WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&app.pool)
+                .await
+                .unwrap_or_else(|e| panic!("read {table}: {e}"));
         assert_eq!(
             found,
             Some(None),
