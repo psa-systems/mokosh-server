@@ -2,6 +2,7 @@
 
 use crate::modules::auth::TenantId;
 use chrono::Utc;
+use mokosh_types::auth::CurrentUser;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -911,6 +912,150 @@ impl TicketService {
             self.send_note_email(tenant_id, ticket_id, note_id, &request.content)
                 .await;
         }
+
+        self.get_note(tenant_id, note_id).await
+    }
+
+    /// Why a note cannot be edited, or `None` when it can (PMS-931).
+    ///
+    /// An edit rewrites the record of what was said, and for some of these rows
+    /// the record is the point. Returned as a sentence because the caller turns
+    /// it into a 409 and the agent has to be able to act on it.
+    fn note_edit_block(note: &TicketNote) -> Option<String> {
+        // The customer's own words, posted through the portal (PMS-449). An
+        // agent editing them is putting words in the customer's mouth.
+        if note.created_by_contact_id.is_some() {
+            return Some(
+                "This note was written by the customer through the portal and cannot be edited."
+                    .to_string(),
+            );
+        }
+        match note.note_type {
+            // Never left the building.
+            NoteType::Internal | NoteType::Resolution => None,
+            NoteType::Public => {
+                // The customer holds the original in their inbox. Editing this
+                // row makes the system disagree with the customer's own
+                // evidence, which is the disagreement an MSP loses.
+                if note.is_email_sent {
+                    Some(
+                        "This note was emailed to the customer, so the copy they hold cannot be \
+                         changed. Add a new note instead."
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            }
+            // Nothing writes one today, but the type exists to mirror a time
+            // entry and the edit belongs on the entry.
+            NoteType::TimeEntry => {
+                Some("A time-entry note is edited through its time entry.".to_string())
+            }
+        }
+    }
+
+    /// Edit a note's text (PMS-931).
+    ///
+    /// `/tickets/{id}/notes` served GET and POST and nothing else, so a note was
+    /// append-only for everyone at every role, its author included. That is the
+    /// correction MAPPS-593 needed: there was no update path being denied to
+    /// admins, there was no update path.
+    ///
+    /// Two gates, and they answer differently on purpose. WHO may edit is a
+    /// permission, so a caller who is neither the author nor an admin gets 403.
+    /// WHETHER this row may be edited at all is the row's state rather than the
+    /// caller's rights, so it gets 409 with a message naming the reason; see
+    /// [`Self::note_edit_block`].
+    ///
+    /// The audit row carries the old content as well as the new one, which is
+    /// what makes editing acceptable at all: the original survives the edit and
+    /// the change-history pane renders it as a diff like any other change.
+    pub async fn update_note(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        note_id: Uuid,
+        editor: &CurrentUser,
+        request: &UpdateNoteRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<TicketNote> {
+        let note = self.get_note(tenant_id, note_id).await?;
+
+        // A note id from another ticket is a 404, not somebody else's note
+        // edited through the wrong path. Same answer as an id that does not
+        // exist, so this is not an existence oracle for other tickets' notes.
+        if note.ticket_id != ticket_id {
+            return Err(AppError::NotFound("Note".to_string()));
+        }
+
+        // The author, or an admin. `Manager` is deliberately absent: editing
+        // another person's words is worth granting on purpose rather than by
+        // inheriting `can_manage_users`.
+        if note.created_by_id != editor.id && !editor.role.is_admin() {
+            return Err(AppError::Forbidden(
+                "You can only edit notes you wrote.".to_string(),
+            ));
+        }
+
+        if let Some(reason) = Self::note_edit_block(&note) {
+            return Err(AppError::Conflict(reason));
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // `updated_at` is set explicitly: `ticket_notes` carries no trigger for
+        // it, which is why the column has sat equal to `created_at` on every row
+        // since migration 005.
+        sqlx::query(
+            "UPDATE ticket_notes SET content = $1, updated_at = NOW() \
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(&request.content)
+        .bind(tenant_id)
+        .bind(note_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // The ticket was touched, the same as adding a note does. NOT
+        // `first_response_at`: that records when the customer was first
+        // answered, which an edit does not change.
+        sqlx::query(
+            "UPDATE tickets SET updated_at = NOW(), last_updated_by_id = $1 \
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(editor.id)
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "ticket_notes",
+            Some(note_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_note(tenant_id, note_id).await
     }
@@ -3067,6 +3212,103 @@ mod pms897_tests {
                 !mokosh_types::sort::TICKETS.contains(expr) || key == expr,
                 "`{expr}` is a SQL expression and must not be an accepted wire key"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pms931_note_edit_tests {
+    use super::*;
+
+    fn note(note_type: NoteType, emailed: bool, contact: Option<Uuid>) -> TicketNote {
+        TicketNote {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            ticket_id: Uuid::new_v4(),
+            note_type,
+            content: "text".to_string(),
+            content_html: None,
+            is_email_sent: emailed,
+            email_sent_at: None,
+            created_by_id: Uuid::new_v4(),
+            created_by_name: None,
+            created_by_contact_id: contact,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// The reported case, and the one that is unambiguously safe: an internal
+    /// note never left the building, so correcting it costs nobody anything.
+    #[test]
+    fn an_internal_note_is_editable() {
+        assert!(TicketService::note_edit_block(&note(NoteType::Internal, false, None)).is_none());
+    }
+
+    /// A resolution note is staff-authored and the portal filters on
+    /// `note_type = 'public'`, so it is not customer-visible either.
+    #[test]
+    fn a_resolution_note_is_editable() {
+        assert!(TicketService::note_edit_block(&note(NoteType::Resolution, false, None)).is_none());
+    }
+
+    /// A public note the customer may have READ in the portal is still
+    /// editable: there is no copy of it outside the system to disagree with.
+    #[test]
+    fn a_public_note_that_was_never_emailed_is_editable() {
+        assert!(TicketService::note_edit_block(&note(NoteType::Public, false, None)).is_none());
+    }
+
+    /// And one that WAS emailed is not, at any role. The customer holds the
+    /// original in their inbox, and an edited row makes the system disagree
+    /// with the customer's own evidence.
+    #[test]
+    fn an_emailed_public_note_is_frozen() {
+        let reason = TicketService::note_edit_block(&note(NoteType::Public, true, None))
+            .expect("an emailed note refuses");
+        assert!(reason.contains("emailed"), "{reason}");
+        assert!(
+            reason.contains("new note"),
+            "and says what to do instead: {reason}"
+        );
+    }
+
+    /// The customer's own words, posted through the portal (PMS-449). An agent
+    /// editing them is putting words in the customer's mouth, so the refusal
+    /// holds whatever the note type says.
+    #[test]
+    fn a_note_the_customer_wrote_is_never_editable_by_an_agent() {
+        for note_type in [NoteType::Public, NoteType::Internal, NoteType::Resolution] {
+            let reason =
+                TicketService::note_edit_block(&note(note_type, false, Some(Uuid::new_v4())))
+                    .expect("a portal-authored note refuses");
+            assert!(reason.contains("customer"), "{note_type:?}: {reason}");
+        }
+    }
+
+    /// Nothing writes one today, but the type mirrors a time entry and the edit
+    /// belongs on the entry rather than on its shadow.
+    #[test]
+    fn a_time_entry_note_is_edited_through_its_time_entry() {
+        let reason = TicketService::note_edit_block(&note(NoteType::TimeEntry, false, None))
+            .expect("a time-entry note refuses");
+        assert!(reason.contains("time entry"), "{reason}");
+    }
+
+    /// Every refusal is a whole sentence an agent can act on, because it
+    /// reaches them as the body of a 409 and "Conflict" alone tells them
+    /// nothing about which of four rules they hit.
+    #[test]
+    fn every_refusal_is_a_sentence() {
+        let refusals = [
+            note(NoteType::Public, true, None),
+            note(NoteType::TimeEntry, false, None),
+            note(NoteType::Internal, false, Some(Uuid::new_v4())),
+        ];
+        for n in refusals {
+            let reason = TicketService::note_edit_block(&n).expect("refuses");
+            assert!(reason.ends_with('.'), "{reason}");
+            assert!(reason.split_whitespace().count() >= 6, "{reason}");
         }
     }
 }

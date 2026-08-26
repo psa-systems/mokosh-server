@@ -666,6 +666,23 @@ pub struct CreateNoteRequest {
     pub send_email: bool,
 }
 
+/// Edit an existing note's text (PMS-931).
+///
+/// Content only. `note_type` is deliberately absent: flipping an internal note
+/// to public would publish text written on the understanding that it never
+/// leaves the building, and flipping a public one to internal would retract
+/// something a customer may already have read. Either is a different operation
+/// from correcting a typo and neither should ride along inside one.
+///
+/// `send_email` is absent for the same shape of reason. It is a create-time
+/// concern: a public note that WAS emailed cannot be edited at all, and one
+/// that was not is not going to start now.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateNoteRequest {
+    #[validate(length(min = 1))]
+    pub content: String,
+}
+
 /// Note response
 #[derive(Debug, Clone, Serialize)]
 pub struct TicketNoteResponse {
@@ -682,6 +699,10 @@ pub struct TicketNoteResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_contact_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    /// PMS-931: when the note was last written. Equal to `created_at` for a
+    /// note nobody has edited, because both come from the same transaction's
+    /// `NOW()`, so a client marks a note as edited on a strict `>`.
+    pub updated_at: DateTime<Utc>,
 }
 
 // ============================================================================

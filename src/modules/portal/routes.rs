@@ -493,6 +493,7 @@ async fn list_ticket_notes(
             created_by_name: n.created_by_name.unwrap_or_default(),
             created_by_contact_id: n.created_by_contact_id,
             created_at: n.created_at,
+            updated_at: n.updated_at,
         })
         .collect();
     Ok(Json(PaginatedResponse::from_params(
@@ -531,6 +532,7 @@ async fn create_ticket_note(
         created_by_name: note.created_by_name.unwrap_or_default(),
         created_by_contact_id: note.created_by_contact_id,
         created_at: note.created_at,
+        updated_at: note.updated_at,
     }))
 }
 
