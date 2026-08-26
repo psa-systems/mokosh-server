@@ -25,18 +25,38 @@ use super::{
     UpsertCompanyIndustryRequest,
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
+use crate::modules::portal_roles::{
+    CreatePortalRoleRequest, PortalRole, PortalRoleService, UpdatePortalRoleRequest,
+};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct ContactRouterState {
     pub contact_service: Arc<ContactService>,
+    /// PMS-929 (prompt 012): the nested Company-scoped portal-role
+    /// endpoints under `/api/v1/contacts/companies/{company_id}/portal-roles`
+    /// delegate straight into `PortalRoleService`, so the state holds a
+    /// handle to it. Shared with the top-level `/api/v1/portal-roles`
+    /// mount (same underlying service, one pool).
+    pub portal_role_service: Arc<PortalRoleService>,
 }
 
 /// Create the contact management router
-pub fn contact_routes(contact_service: ContactService) -> Router {
+///
+/// PMS-929 (prompt 012): also accepts a `PortalRoleService` so the
+/// nested Company-scoped role endpoints under
+/// `/api/v1/contacts/companies/{company_id}/portal-roles` delegate into
+/// the same service that backs the top-level `/api/v1/portal-roles`
+/// mount. Passing it in (rather than building a second one here) keeps
+/// the pool + audit ctx path identical across both surfaces.
+pub fn contact_routes(
+    contact_service: ContactService,
+    portal_role_service: PortalRoleService,
+) -> Router {
     let state = ContactRouterState {
         contact_service: Arc::new(contact_service),
+        portal_role_service: Arc::new(portal_role_service),
     };
 
     Router::new()
@@ -51,6 +71,20 @@ pub fn contact_routes(contact_service: ContactService) -> Router {
             get(get_company_contacts),
         )
         .route("/companies/{company_id}/sites", get(get_company_sites))
+        // PMS-929 (prompt 012): Company-scoped portal-role CRUD. The
+        // Company detail page hits these for the "Roles this Company
+        // owns" section; the picker on ContactPortalCard hits GET for
+        // the tenant-wide-plus-scoped union view.
+        .route(
+            "/companies/{company_id}/portal-roles",
+            get(list_company_portal_roles).post(create_company_portal_role),
+        )
+        .route(
+            "/companies/{company_id}/portal-roles/{role_id}",
+            get(get_company_portal_role)
+                .put(update_company_portal_role)
+                .delete(delete_company_portal_role),
+        )
         // Contacts
         .route("/contacts", get(list_contacts))
         .route("/contacts", post(create_contact))
@@ -489,9 +523,12 @@ async fn list_portal_roles(
     _manager: crate::modules::auth::RequireManager,
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<Vec<PortalRoleSummary>>> {
+    // PMS-929 (prompt 012): this endpoint stays tenant-wide-only. The
+    // Company-detail-page union lives under the nested
+    // `/companies/{company_id}/portal-roles` GET below.
     let roles = state
         .contact_service
-        .list_portal_roles(user.tenant())
+        .list_portal_roles(user.tenant(), None)
         .await?;
     Ok(Json(roles))
 }
@@ -563,6 +600,136 @@ async fn revoke_portal_access(
     state
         .contact_service
         .revoke_portal_access(user.tenant(), contact_id, &ctx)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
+// PMS-929 (prompt 012): NESTED COMPANY-SCOPED PORTAL-ROLE HANDLERS
+// ============================================================================
+//
+// These live under `/api/v1/contacts/companies/{company_id}/portal-roles`.
+// All five gated on `RequireAdmin` (matching the top-level portal-role
+// CRUD in `modules::portal_roles::routes`); the whole router already
+// carries `reject_contact_plane` so a contact bearer never reaches them.
+//
+// The GET list returns the UNION of tenant-wide roles plus this
+// Company's own scoped roles, so the ContactPortalCard picker + the
+// Company detail page's roles table can drive off the same call.
+// CRUD-on-one uses a scope guard: the path's `company_id` must equal
+// `role.company_id` (a tenant-wide role or a role owned by a different
+// Company both 404 through this surface even though they are visible
+// through the top-level `/portal-roles/{id}` GET).
+
+async fn list_company_portal_roles(
+    State(state): State<ContactRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(company_id): Path<Uuid>,
+) -> AppResult<Json<Vec<PortalRoleSummary>>> {
+    let roles = state
+        .portal_role_service
+        .list_roles(user.tenant(), Some(company_id))
+        .await?;
+    Ok(Json(roles))
+}
+
+async fn create_company_portal_role(
+    State(state): State<ContactRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(company_id): Path<Uuid>,
+    Json(request): Json<CreatePortalRoleRequest>,
+) -> AppResult<Json<PortalRole>> {
+    request.validate()?;
+    // Defence-in-depth: the body may or may not carry `company_id`.
+    // If it does, it must match the path so a client cannot mint a
+    // scoped role for a different Company by lying in the body while
+    // the path pretends otherwise.
+    if let Some(body_cid) = request.company_id {
+        if body_cid != company_id {
+            return Err(AppError::BadRequest(
+                "company_id in body must equal the path company_id".to_string(),
+            ));
+        }
+    }
+    let role = state
+        .portal_role_service
+        .create_role(
+            user.tenant(),
+            Some(company_id),
+            request.name,
+            request.capabilities,
+            &ctx,
+        )
+        .await?;
+    Ok(Json(role))
+}
+
+/// Ensure the role at `role_id` is scoped to `company_id` under the
+/// caller's tenant. A tenant-wide role or a role owned by a different
+/// Company returns 404 through this surface (they exist, but this
+/// scoped surface is deliberately blind to anything not owned by the
+/// path Company). Callers use this before every one-role handler so
+/// the same 404 shape applies to GET/PUT/DELETE.
+async fn require_role_in_company_scope(
+    state: &ContactRouterState,
+    tenant: crate::modules::auth::TenantId,
+    company_id: Uuid,
+    role_id: Uuid,
+) -> AppResult<PortalRole> {
+    let role = state.portal_role_service.get_role(tenant, role_id).await?;
+    if role.company_id != Some(company_id) {
+        return Err(AppError::NotFound("Portal role".to_string()));
+    }
+    Ok(role)
+}
+
+async fn get_company_portal_role(
+    State(state): State<ContactRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path((company_id, role_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<Json<PortalRole>> {
+    let role = require_role_in_company_scope(&state, user.tenant(), company_id, role_id).await?;
+    Ok(Json(role))
+}
+
+async fn update_company_portal_role(
+    State(state): State<ContactRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path((company_id, role_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdatePortalRoleRequest>,
+) -> AppResult<Json<PortalRole>> {
+    request.validate()?;
+    let _ = require_role_in_company_scope(&state, user.tenant(), company_id, role_id).await?;
+    let role = state
+        .portal_role_service
+        .update_role(
+            user.tenant(),
+            role_id,
+            request.name,
+            request.capabilities,
+            &ctx,
+        )
+        .await?;
+    Ok(Json(role))
+}
+
+async fn delete_company_portal_role(
+    State(state): State<ContactRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path((company_id, role_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<axum::http::StatusCode> {
+    let _ = require_role_in_company_scope(&state, user.tenant(), company_id, role_id).await?;
+    state
+        .portal_role_service
+        .delete_role(user.tenant(), role_id, &ctx)
         .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

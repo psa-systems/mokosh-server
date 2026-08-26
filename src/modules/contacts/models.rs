@@ -36,10 +36,19 @@ pub struct GrantPortalAccessRequest {
 /// `GET /api/v1/portal-roles`. The SPA renders `capabilities` as a
 /// checkbox list in the role-picker modal + label chips on the
 /// contact edit page.
-#[derive(Debug, Clone, Serialize)]
+///
+/// PMS-929 (prompt 012): `company_id` marks whether the role is
+/// tenant-wide (`None`) or scoped to a single Company (`Some(id)`).
+/// `#[serde(default)]` so a wire payload from a pre-migration client or
+/// a hand-crafted test fixture without the field deserializes to
+/// tenant-wide instead of erroring, which matches the historical
+/// two-value shape and stays forward-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortalRoleSummary {
     pub id: Uuid,
     pub name: String,
     pub capabilities: Vec<String>,
     pub is_builtin: bool,
+    #[serde(default)]
+    pub company_id: Option<Uuid>,
 }

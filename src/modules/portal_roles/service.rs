@@ -6,6 +6,16 @@
 //! row for a mutation lives in a table without an
 //! `app.current_tenant` GUC of its own; the belt-and-braces WHERE
 //! keeps cross-tenant reads impossible even if the GUC drifts.
+//!
+//! PMS-929 (prompt 012): a portal role can now be tenant-wide
+//! (`company_id IS NULL`, existing shape) or scoped to a single Company
+//! (`company_id = <uuid>`). The list surface takes `Option<Uuid>`:
+//! `None` returns tenant-wide only (Settings > Contact Roles view), and
+//! `Some(cid)` returns the union of tenant-wide plus that Company's
+//! scoped roles (Company detail page + the ContactPortalCard picker).
+//! Uniqueness is enforced by the two partial indexes migration 148
+//! carries, so a same-name tenant-wide and a same-name Company-scoped
+//! role coexist and each Company independently owns its own name-space.
 
 use uuid::Uuid;
 
@@ -28,22 +38,57 @@ impl PortalRoleService {
         Self { db }
     }
 
-    pub async fn list_roles(&self, tenant_id: TenantId) -> AppResult<Vec<PortalRoleSummary>> {
-        let rows: Vec<(Uuid, String, Vec<String>, bool)> = sqlx::query_as(
-            "SELECT id, name, capabilities, is_builtin FROM portal_roles \
-             WHERE tenant_id = $1 ORDER BY is_builtin DESC, name",
-        )
-        .bind(*tenant_id)
-        .fetch_all(self.db.migrator_pool())
-        .await?;
+    /// mokosh-contact-login prompt 012 (PMS-929): list the portal roles
+    /// visible to a given caller scope. `company_id = None` returns
+    /// tenant-wide roles only (the Settings > Contact Roles view);
+    /// `company_id = Some(cid)` returns the union of tenant-wide roles
+    /// plus the Company-scoped roles owned by that Company (the Company
+    /// detail page + the ContactPortalCard picker union).
+    ///
+    /// Ordering: built-ins first (they are always tenant-wide), then
+    /// tenant-wide customs, then Company-scoped rows, name-alphabetical
+    /// inside each band. The `company_id NULLS FIRST` clause is a no-op
+    /// when `company_id = None` but keeps the shape symmetrical for the
+    /// Some branch.
+    pub async fn list_roles(
+        &self,
+        tenant_id: TenantId,
+        company_id: Option<Uuid>,
+    ) -> AppResult<Vec<PortalRoleSummary>> {
+        let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>)> = match company_id {
+            None => {
+                sqlx::query_as(
+                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
+                 WHERE tenant_id = $1 AND company_id IS NULL \
+                 ORDER BY is_builtin DESC, name",
+                )
+                .bind(*tenant_id)
+                .fetch_all(self.db.migrator_pool())
+                .await?
+            }
+            Some(cid) => {
+                sqlx::query_as(
+                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
+                 WHERE tenant_id = $1 AND (company_id IS NULL OR company_id = $2) \
+                 ORDER BY is_builtin DESC, company_id NULLS FIRST, name",
+                )
+                .bind(*tenant_id)
+                .bind(cid)
+                .fetch_all(self.db.migrator_pool())
+                .await?
+            }
+        };
         Ok(rows
             .into_iter()
-            .map(|(id, name, capabilities, is_builtin)| PortalRoleSummary {
-                id,
-                name,
-                capabilities,
-                is_builtin,
-            })
+            .map(
+                |(id, name, capabilities, is_builtin, company_id)| PortalRoleSummary {
+                    id,
+                    name,
+                    capabilities,
+                    is_builtin,
+                    company_id,
+                },
+            )
             .collect())
     }
 
@@ -51,24 +96,26 @@ impl PortalRoleService {
         let row: Option<(
             Uuid,
             Uuid,
+            Option<Uuid>,
             String,
             Vec<String>,
             bool,
             chrono::DateTime<chrono::Utc>,
             chrono::DateTime<chrono::Utc>,
         )> = sqlx::query_as(
-            "SELECT id, tenant_id, name, capabilities, is_builtin, created_at, updated_at \
+            "SELECT id, tenant_id, company_id, name, capabilities, is_builtin, created_at, updated_at \
              FROM portal_roles WHERE tenant_id = $1 AND id = $2",
         )
         .bind(*tenant_id)
         .bind(role_id)
         .fetch_optional(self.db.migrator_pool())
         .await?;
-        let (id, tid, name, capabilities, is_builtin, created_at, updated_at) =
+        let (id, tid, company_id, name, capabilities, is_builtin, created_at, updated_at) =
             row.ok_or_else(|| AppError::NotFound("Portal role".to_string()))?;
         Ok(PortalRole {
             id,
             tenant_id: tid,
+            company_id,
             name,
             capabilities,
             is_builtin,
@@ -77,9 +124,19 @@ impl PortalRoleService {
         })
     }
 
+    /// mokosh-contact-login prompt 012 (PMS-929): create a portal role.
+    /// `company_id = None` mints a tenant-wide role (Settings > Contact
+    /// Roles surface, existing shape); `company_id = Some(cid)` mints a
+    /// role scoped to that Company (Company detail page). A scoped
+    /// create verifies the Company belongs to this tenant first so a
+    /// foreign or fabricated id returns 404 rather than 500 on the FK
+    /// insert. Uniqueness collision (case-insensitive, within the same
+    /// scope) surfaces as 409 with a scope-agnostic message so the
+    /// caller cannot infer whether a same-name tenant-wide role exists.
     pub async fn create_role(
         &self,
         tenant_id: TenantId,
+        company_id: Option<Uuid>,
         name: String,
         capabilities: Vec<String>,
         ctx: &AuditCtx,
@@ -94,31 +151,69 @@ impl PortalRoleService {
             return Err(AppError::BadRequest(format!("Unknown capability: {bad}")));
         }
 
+        // Company-scoped: verify the Company belongs to this tenant
+        // BEFORE opening the tenant-bound tx so a foreign or fabricated
+        // company_id returns a clear 404 instead of a FK 500. Read runs
+        // on the migrator pool with an explicit tenant filter (belt +
+        // braces vs the fail-closed RLS policy).
+        if let Some(cid) = company_id {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM companies WHERE id = $1 AND tenant_id = $2)",
+            )
+            .bind(cid)
+            .bind(*tenant_id)
+            .fetch_one(self.db.migrator_pool())
+            .await?;
+            if !exists {
+                return Err(AppError::NotFound("Company".to_string()));
+            }
+        }
+
         // Case-insensitive uniqueness check + INSERT in one transaction
         // so a concurrent create loses the race on the 23505 backstop
-        // instead of both landing.
+        // instead of both landing. Query shape matches the pair of
+        // partial indexes migration 148 carries: a tenant-wide check
+        // when company_id IS NULL, a per-Company check otherwise.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let taken: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM portal_roles \
-             WHERE tenant_id = $1 AND LOWER(name) = LOWER($2))",
-        )
-        .bind(*tenant_id)
-        .bind(&name)
-        .fetch_one(&mut *tx)
-        .await?;
+        let taken: bool = match company_id {
+            None => {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM portal_roles \
+                 WHERE tenant_id = $1 AND company_id IS NULL \
+                 AND LOWER(name) = LOWER($2))",
+                )
+                .bind(*tenant_id)
+                .bind(&name)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            Some(cid) => {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM portal_roles \
+                 WHERE tenant_id = $1 AND company_id = $2 \
+                 AND LOWER(name) = LOWER($3))",
+                )
+                .bind(*tenant_id)
+                .bind(cid)
+                .bind(&name)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
         if taken {
             return Err(AppError::Conflict(
-                "A role with that name already exists".to_string(),
+                "A role with that name already exists in this scope".to_string(),
             ));
         }
 
         let role_id = Uuid::new_v4();
         if let Err(e) = sqlx::query(
-            "INSERT INTO portal_roles (id, tenant_id, name, capabilities, is_builtin) \
-             VALUES ($1, $2, $3, $4, FALSE)",
+            "INSERT INTO portal_roles (id, tenant_id, company_id, name, capabilities, is_builtin) \
+             VALUES ($1, $2, $3, $4, $5, FALSE)",
         )
         .bind(role_id)
         .bind(*tenant_id)
+        .bind(company_id)
         .bind(&name)
         .bind(&capabilities)
         .execute(&mut *tx)
@@ -126,7 +221,7 @@ impl PortalRoleService {
         {
             if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
                 return Err(AppError::Conflict(
-                    "A role with that name already exists".to_string(),
+                    "A role with that name already exists in this scope".to_string(),
                 ));
             }
             return Err(e.into());
@@ -155,6 +250,12 @@ impl PortalRoleService {
         self.get_role(tenant_id, role_id).await
     }
 
+    /// mokosh-contact-login prompt 012 (PMS-929): update a portal role.
+    /// Never touches `company_id` (scope is immutable; recreate to
+    /// switch scope). A request body carrying `company_id` at the DTO
+    /// layer is silently dropped there; this method never accepts a
+    /// scope input, so a defensive caller reaching for it cannot rewire
+    /// scope through the service either.
     pub async fn update_role(
         &self,
         tenant_id: TenantId,
@@ -194,18 +295,40 @@ impl PortalRoleService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         if let Some(ref n) = new_name {
-            let taken: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM portal_roles \
-                 WHERE tenant_id = $1 AND id <> $2 AND LOWER(name) = LOWER($3))",
-            )
-            .bind(*tenant_id)
-            .bind(role_id)
-            .bind(n)
-            .fetch_one(&mut *tx)
-            .await?;
+            // Scope-aware uniqueness probe: a rename inside the same
+            // scope collides against sibling rows in the same scope
+            // only. `existing.company_id` determines which partial
+            // index the rename lands in.
+            let taken: bool = match existing.company_id {
+                None => {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM portal_roles \
+                     WHERE tenant_id = $1 AND id <> $2 AND company_id IS NULL \
+                     AND LOWER(name) = LOWER($3))",
+                    )
+                    .bind(*tenant_id)
+                    .bind(role_id)
+                    .bind(n)
+                    .fetch_one(&mut *tx)
+                    .await?
+                }
+                Some(cid) => {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM portal_roles \
+                     WHERE tenant_id = $1 AND id <> $2 AND company_id = $3 \
+                     AND LOWER(name) = LOWER($4))",
+                    )
+                    .bind(*tenant_id)
+                    .bind(role_id)
+                    .bind(cid)
+                    .bind(n)
+                    .fetch_one(&mut *tx)
+                    .await?
+                }
+            };
             if taken {
                 return Err(AppError::Conflict(
-                    "A role with that name already exists".to_string(),
+                    "A role with that name already exists in this scope".to_string(),
                 ));
             }
         }
@@ -231,7 +354,7 @@ impl PortalRoleService {
             {
                 if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
                     return Err(AppError::Conflict(
-                        "A role with that name already exists".to_string(),
+                        "A role with that name already exists in this scope".to_string(),
                     ));
                 }
                 return Err(e.into());

@@ -189,14 +189,13 @@ async fn create_contact_with_is_portal_user_true_dispatches_portal_grant_email_w
         "regression: create_contact must not emit the slug-less URL that the SPA router 404s on, got: {body}"
     );
     // It MUST contain the well-formed `/portal/{slug}/set-password?token=` URL.
-    let slug: String = sqlx::query_scalar(
-        "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(company_id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("read portal_slug");
+    let slug: String =
+        sqlx::query_scalar("SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2")
+            .bind(company_id)
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_slug");
     let expected_prefix = format!("/portal/{slug}/set-password?token=");
     assert!(
         body.contains(&expected_prefix),
@@ -205,14 +204,13 @@ async fn create_contact_with_is_portal_user_true_dispatches_portal_grant_email_w
 
     // A portal_id must be assigned on the Company (prompt 011) so the
     // recipient can dictate it over the phone.
-    let portal_id: Option<i64> = sqlx::query_scalar(
-        "SELECT portal_id FROM companies WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(company_id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("read portal_id");
+    let portal_id: Option<i64> =
+        sqlx::query_scalar("SELECT portal_id FROM companies WHERE id = $1 AND tenant_id = $2")
+            .bind(company_id)
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_id");
     assert!(
         portal_id.is_some(),
         "create_contact with is_portal_user=true must ensure Company has a portal_id"
@@ -264,14 +262,13 @@ async fn update_contact_flipping_is_portal_user_true_dispatches_portal_grant_ema
         !body.contains("/portal/set-password?token="),
         "regression: update_contact must not emit the slug-less URL, got: {body}"
     );
-    let slug: String = sqlx::query_scalar(
-        "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(company_id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("read portal_slug");
+    let slug: String =
+        sqlx::query_scalar("SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2")
+            .bind(company_id)
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_slug");
     let expected_prefix = format!("/portal/{slug}/set-password?token=");
     assert!(
         body.contains(&expected_prefix),

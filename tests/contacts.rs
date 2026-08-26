@@ -1101,14 +1101,13 @@ async fn granting_portal_access_enqueues_setup_link_email(pool: PgPool) {
     // pin the correct slug-included shape rather than the broken
     // slug-less one.
     let company_uuid: uuid::Uuid = company_id.parse().expect("company_id parses as UUID");
-    let slug: String = sqlx::query_scalar(
-        "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(company_uuid)
-    .bind(common::DEFAULT_TENANT_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("read portal_slug");
+    let slug: String =
+        sqlx::query_scalar("SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2")
+            .bind(company_uuid)
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_slug");
     let expected_prefix = format!("/portal/{slug}/set-password?token=");
     assert!(
         body.contains(&expected_prefix),

@@ -1681,9 +1681,15 @@ impl TenantService {
     /// portal roles for a freshly provisioned tenant.
     ///
     /// Called by `create_tenant` after the tenant + own_company are in
-    /// place. Idempotent via `ON CONFLICT (tenant_id, name) DO NOTHING`
-    /// so a re-run (or a race with migration 142's backfill against
-    /// this tenant) collapses cleanly. Mirrors the capability sets in
+    /// place. Idempotent via the partial-unique index the seed rows
+    /// land in (`portal_roles_tenant_wide_name_uniq`, migration 148:
+    /// `(tenant_id, LOWER(name)) WHERE company_id IS NULL`), so a
+    /// re-run (or a race with migration 142's backfill against this
+    /// tenant) collapses cleanly. PMS-929 (prompt 012) moved from the
+    /// plain `UNIQUE (tenant_id, name)` migration 139 carried to this
+    /// partial-index shape so a Company-scoped role can share a name
+    /// with a tenant-wide one; the ON CONFLICT clause now targets the
+    /// partial index explicitly. Mirrors the capability sets in
     /// migration 142 exactly; the `all_capabilities_match_seed_migration`
     /// test in `contact_portal::capabilities` guards drift.
     ///
@@ -1704,7 +1710,7 @@ impl TenantService {
                 ($1, 'Read-Only',
                  ARRAY['tickets:read', 'invoices:read', 'quotes:read', 'contracts:read',
                        'assets:read', 'projects:read', 'kb:read', 'notifications:read'], TRUE)
-            ON CONFLICT (tenant_id, name) DO NOTHING
+            ON CONFLICT (tenant_id, LOWER(name)) WHERE company_id IS NULL DO NOTHING
             "#,
         )
         .bind(tenant_id)

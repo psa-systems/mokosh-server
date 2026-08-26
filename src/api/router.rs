@@ -364,11 +364,20 @@ pub fn create_api_router(
         // Router::new())` here was dead - it matched nothing, so
         // `/api/v1/companies` returned a misleading 404 with no
         // explanation. Removed and documented (PMS-20).
-        .nest("/contacts", contact_routes(contact_service.clone()))
+        .nest(
+            "/contacts",
+            contact_routes(contact_service.clone(), PortalRoleService::new(db.clone())),
+        )
         // mokosh-contact-login prompt 007: MSP-admin portal-role CRUD.
         // Distinct top-level nest so the SPA hits `/api/v1/portal-roles`
         // and the routes inside stay uncluttered by the double-nest
         // `/contacts/portal-roles` shape the older read-only surface uses.
+        //
+        // PMS-929 (prompt 012): the nested Company-scoped role surface
+        // under `/api/v1/contacts/companies/{id}/portal-roles` also
+        // takes a `PortalRoleService`, built as a sibling instance
+        // above; both instances share the same `db` handle and are
+        // otherwise stateless.
         .nest(
             "/portal-roles",
             portal_role_routes(PortalRoleService::new(db.clone())),

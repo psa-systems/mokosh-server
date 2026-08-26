@@ -491,7 +491,11 @@ async fn put_contact_portal_roles_rejects_cross_tenant_role(pool: PgPool) {
         .send()
         .await
         .expect("put foreign");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // PMS-929 (prompt 012): the endpoint now returns 400 with a
+    // scope-mismatch message for any role that isn't visible to the
+    // target contact (foreign tenant, foreign Company, or nonexistent
+    // id), so the shape does not leak whether the role exists.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[sqlx::test]

@@ -911,11 +911,7 @@ impl ContactService {
     /// runs its own inline slug-mint inside the grant tx so the assignment is
     /// atomic with the role writes; this helper covers the create + update
     /// paths where the enclosing tx is not the grant tx.
-    async fn ensure_portal_slug(
-        &self,
-        company_id: Uuid,
-        tenant_id: Uuid,
-    ) -> AppResult<String> {
+    async fn ensure_portal_slug(&self, company_id: Uuid, tenant_id: Uuid) -> AppResult<String> {
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
         )
@@ -957,9 +953,7 @@ impl ContactService {
                     }
                     continue;
                 }
-                Err(sqlx::Error::Database(dbe))
-                    if dbe.code().as_deref() == Some("23505") =>
-                {
+                Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => {
                     continue;
                 }
                 Err(other) => return Err(other.into()),
@@ -975,26 +969,54 @@ impl ContactService {
     /// Returns every row in `portal_roles` for the caller's tenant
     /// (including the three built-ins seeded by migration 142 +
     /// `TenantService::seed_builtin_portal_roles`).
+    ///
+    /// PMS-929 (prompt 012): `company_id = None` returns tenant-wide
+    /// roles only (the historical shape; every existing caller still
+    /// passes `None`). `company_id = Some(cid)` returns the union of
+    /// tenant-wide roles plus that Company's own scoped roles, ordered
+    /// built-in first, then tenant-wide customs, then Company-scoped,
+    /// name-alphabetical inside each band. Same-name across scopes is
+    /// intentionally allowed so both rows appear in the list.
     pub async fn list_portal_roles(
         &self,
         tenant_id: TenantId,
+        company_id: Option<Uuid>,
     ) -> AppResult<Vec<PortalRoleSummary>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(Uuid, String, Vec<String>, bool)> = sqlx::query_as(
-            "SELECT id, name, capabilities, is_builtin FROM portal_roles \
-             WHERE tenant_id = $1 ORDER BY is_builtin DESC, name",
-        )
-        .bind(*tenant_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>)> = match company_id {
+            None => {
+                sqlx::query_as(
+                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
+                 WHERE tenant_id = $1 AND company_id IS NULL \
+                 ORDER BY is_builtin DESC, name",
+                )
+                .bind(*tenant_id)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            Some(cid) => {
+                sqlx::query_as(
+                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
+                 WHERE tenant_id = $1 AND (company_id IS NULL OR company_id = $2) \
+                 ORDER BY is_builtin DESC, company_id NULLS FIRST, name",
+                )
+                .bind(*tenant_id)
+                .bind(cid)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+        };
         Ok(rows
             .into_iter()
-            .map(|(id, name, capabilities, is_builtin)| PortalRoleSummary {
-                id,
-                name,
-                capabilities,
-                is_builtin,
-            })
+            .map(
+                |(id, name, capabilities, is_builtin, company_id)| PortalRoleSummary {
+                    id,
+                    name,
+                    capabilities,
+                    is_builtin,
+                    company_id,
+                },
+            )
             .collect())
     }
 
@@ -1090,22 +1112,44 @@ impl ContactService {
             ));
         }
 
-        // Every submitted role must belong to this tenant. One SELECT
-        // returns the matching count so a mismatched-id request fails
-        // closed rather than silently landing a foreign role_id (the
-        // FK would reject the insert anyway, but a clearer error is
-        // worth the round trip).
-        let matched_role_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM portal_roles WHERE tenant_id = $1 AND id = ANY($2)",
+        // Every submitted role must belong to this tenant AND be
+        // scope-compatible with the target contact (tenant-wide, or
+        // scoped to the SAME Company as the contact).
+        //
+        // PMS-929 (prompt 012): parallel to the scope check in
+        // `replace_portal_role_assignments`. A wrong-Company role
+        // would let the contact hold a capability scoped to a Company
+        // they don't belong to. Read the (id, company_id) pairs in
+        // one shot; a role missing from the result is either a foreign
+        // tenant id or a scoped-to-other-Company id (invisible under
+        // this query), both mapped to the same 400 shape so the
+        // response never leaks scope existence.
+        let role_rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, company_id FROM portal_roles WHERE tenant_id = $1 AND id = ANY($2)",
         )
         .bind(*tenant_id)
         .bind(role_ids)
-        .fetch_one(self.db.pool())
+        .fetch_all(self.db.pool())
         .await?;
-        if (matched_role_count as usize) != role_ids.len() {
-            return Err(AppError::BadRequest(
-                "one or more role_ids do not belong to this tenant".to_string(),
-            ));
+        let role_map: std::collections::HashMap<Uuid, Option<Uuid>> =
+            role_rows.into_iter().collect();
+        for role_id in role_ids {
+            match role_map.get(role_id) {
+                Some(role_company) => {
+                    if let Some(rcid) = role_company {
+                        if *rcid != company_id {
+                            return Err(AppError::BadRequest(format!(
+                                "Role {role_id} is scoped to a different Company than the target contact"
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    return Err(AppError::BadRequest(format!(
+                        "Role {role_id} is scoped to a different Company than the target contact"
+                    )));
+                }
+            }
         }
 
         // mokosh-contact-login prompt 011 (PMS-928): ensure the Company
@@ -1524,7 +1568,7 @@ impl ContactService {
         role_ids: &[Uuid],
         ctx: &AuditCtx,
     ) -> AppResult<()> {
-        let _contact = self.get_contact(tenant_id, contact_id).await?;
+        let contact = self.get_contact(tenant_id, contact_id).await?;
 
         // Dedup the caller's list so a repeated id doesn't fight the
         // (contact_id, role_id) primary key.
@@ -1532,16 +1576,48 @@ impl ContactService {
         unique.sort();
         unique.dedup();
 
+        // PMS-929 (prompt 012): every role must both exist in this
+        // tenant AND (be tenant-wide OR be scoped to the SAME Company
+        // as the contact). Wrong-Company assignments would let a
+        // contact hold a capability scoped to a Company they don't
+        // belong to; the picker filters on read, this is the write-side
+        // enforcement. Read the (tenant_id, company_id) pair of every
+        // role in one shot; a role missing from the result means
+        // either the id doesn't exist under this tenant OR it's
+        // scoped to a different Company, both of which we surface as
+        // the same 400 (not 404) so the response never leaks which
+        // Company a foreign role belongs to.
+        let role_rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, company_id FROM portal_roles WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(*tenant_id)
+        .bind(&unique)
+        .fetch_all(self.db.pool())
+        .await?;
+        let role_map: std::collections::HashMap<Uuid, Option<Uuid>> =
+            role_rows.into_iter().collect();
         for role_id in &unique {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM portal_roles WHERE tenant_id = $1 AND id = $2)",
-            )
-            .bind(*tenant_id)
-            .bind(role_id)
-            .fetch_one(self.db.pool())
-            .await?;
-            if !exists {
-                return Err(AppError::NotFound(format!("Portal role {role_id}")));
+            match role_map.get(role_id) {
+                Some(role_company) => {
+                    if let Some(rcid) = role_company {
+                        if Some(*rcid) != contact.company_id {
+                            return Err(AppError::BadRequest(format!(
+                                "Role {role_id} is scoped to a different Company than the target contact"
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    // Role missing from this tenant OR scoped to a
+                    // different Company (invisible under this query).
+                    // Return the same 400 shape as the scope-mismatch
+                    // branch above so the response never distinguishes
+                    // "does not exist" from "exists under a different
+                    // Company".
+                    return Err(AppError::BadRequest(format!(
+                        "Role {role_id} is scoped to a different Company than the target contact"
+                    )));
+                }
             }
         }
 

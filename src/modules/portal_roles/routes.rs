@@ -5,12 +5,21 @@
 //! registered BEFORE `/{id}` so the literal segment wins the path
 //! match; a bare `/{id}` would swallow it as a Uuid deserialisation
 //! attempt and 400.
+//!
+//! PMS-929 (prompt 012): list accepts an optional `?company_id={uuid}`
+//! query param so the Settings > Contact Roles UI (omitted, tenant-wide
+//! only) and the Company detail page (supplied, tenant-wide union
+//! Company-scoped) share this endpoint. The nested Company-scoped
+//! surface lives under `/api/v1/contacts/companies/{id}/portal-roles`
+//! (see `crate::modules::contacts::routes`); it delegates into the
+//! same `PortalRoleService` methods.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{delete, get, post, put},
     Json, Router,
 };
+use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
@@ -24,6 +33,15 @@ use super::service::PortalRoleService;
 #[derive(Clone)]
 pub struct PortalRoleRouterState {
     pub service: Arc<PortalRoleService>,
+}
+
+/// PMS-929: query params for the tenant-wide list endpoint. `company_id`
+/// switches the response from tenant-wide-only to the tenant-wide plus
+/// this Company's scoped-roles union. Omitted keeps the prompt-007 wire.
+#[derive(Debug, Deserialize)]
+pub struct ListPortalRolesQuery {
+    #[serde(default)]
+    pub company_id: Option<Uuid>,
 }
 
 pub fn portal_role_routes(service: PortalRoleService) -> Router {
@@ -44,8 +62,12 @@ async fn list_roles(
     State(state): State<PortalRoleRouterState>,
     _admin: RequireAdmin,
     RequireAuth(user): RequireAuth,
+    Query(query): Query<ListPortalRolesQuery>,
 ) -> AppResult<Json<Vec<PortalRoleSummary>>> {
-    let roles = state.service.list_roles(user.tenant()).await?;
+    let roles = state
+        .service
+        .list_roles(user.tenant(), query.company_id)
+        .await?;
     Ok(Json(roles))
 }
 
@@ -76,7 +98,13 @@ async fn create_role(
     request.validate()?;
     let role = state
         .service
-        .create_role(user.tenant(), request.name, request.capabilities, &ctx)
+        .create_role(
+            user.tenant(),
+            request.company_id,
+            request.name,
+            request.capabilities,
+            &ctx,
+        )
         .await?;
     Ok(Json(role))
 }
