@@ -1,5 +1,8 @@
 //! Settings module: tenant settings + per-module config.
 
+// PMS-789: the deployment-wide product name, a system setting on the default
+// tenant like the email config next door.
+pub mod app_name;
 pub mod email;
 pub mod models;
 pub mod routes;

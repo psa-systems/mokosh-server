@@ -38,6 +38,18 @@ Two things in this repo answer to the word "billing". They are different domains
 
 **The three `tenants.subscription_*` columns are inert.** `TenantService::create` writes them once at tenant creation (`src/modules/tenants/service.rs:175`, with a 14-day `trial_ends_at`) and the read DTOs echo them back; nothing in `src/` reads them for a decision. They are display fields with no ongoing writer and no subscription system behind them, so do not gate access, module enablement or billing logic on them. Tenant-level access control is `tenants.status` plus `ensure_principal_usable`; feature access is `RequireModuleEnabled` over `module_config`.
 
+## Three name-shaped values that are not each other
+
+A change that "unifies the name" will hit all three of these. They answer different questions and none is derivable from another.
+
+| Value | Owner | Scope | Answers |
+| --- | --- | --- | --- |
+| App name | `tenant_settings` `('system', 'app_name')` on the default tenant, cached by `src/utils/app_name.rs` | one per deployment | "which product is this" - psa.systems vs staging. Renders in invitation and test mail, the TOTP issuer, the workflow-automation fallback subject, and the catch-all 404 page (PMS-789) |
+| `branding.company_name` | `tenants.branding` / `tenant_settings` `('branding', ...)`, validated by `src/modules/tenants/branding.rs` | one per tenant | "which MSP is this" - the customer-facing name one tenant puts on its own portal |
+| SMTP `from` display name | the `from` field of the system email setting, `src/modules/settings/email.rs` (PMS-638) | one per deployment | which mailbox outbound mail is sent AS. A `lettre` Mailbox, so it carries an address and must stay parseable; it is not a free-text label |
+
+The app name is cached in-process rather than queried per read because two of its consumers cannot make a query: the 404 fallback handler takes no `State` and must render when the database is down, and the invitation mail builds its subject inside an already-open tenant transaction. `settings::app_name::resolve_and_cache` is the only writer of that cache, called at boot and after each admin write.
+
 ## Retired seams
 
 Recorded so a reader does not go hunting for a subsystem that was deleted, and so the next audit does not re-derive it.
