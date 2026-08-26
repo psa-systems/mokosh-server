@@ -1053,12 +1053,13 @@ async fn granting_portal_access_mints_setup_token(pool: PgPool) {
     );
 }
 
-/// PMS-729 finalize: `send_setup_email` context shape. Granting portal
-/// access enqueues an `auth.welcome` notification whose rendered body
-/// carries the actual `/portal/set-password?token=...` link the
-/// customer clicks. Pins the wire: without this test a future context
-/// rename (e.g. `setup_link` -> `set_password_url`) would render an
-/// empty link and no test would flag it.
+/// Granting portal access at contact-create time enqueues the
+/// `auth.portal_grant` email (prompt 011) whose rendered body carries a
+/// well-formed `/portal/{slug}/set-password?token=...` link the customer
+/// can actually click. Pins the wire so a future context / template
+/// rename does not render an empty link, AND so the slug-less URL bug
+/// (dispatched an `auth.welcome` template with `/portal/set-password?...`
+/// missing the slug segment, SPA 404'd) does not regress.
 #[sqlx::test]
 async fn granting_portal_access_enqueues_setup_link_email(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -1092,19 +1093,33 @@ async fn granting_portal_access_enqueues_setup_link_email(pool: PgPool) {
     .await
     .expect("query notification");
 
-    let (channel, recipient, body) = row.expect("an auth.welcome email was enqueued for the grant");
+    let (channel, recipient, body) =
+        row.expect("an auth.portal_grant email was enqueued for the grant");
     assert_eq!(channel, "email");
     assert_eq!(recipient.as_deref(), Some("wire-check@acme.example"));
+    // Read the Company's portal_slug so the URL assertion below can
+    // pin the correct slug-included shape rather than the broken
+    // slug-less one.
+    let company_uuid: uuid::Uuid = company_id.parse().expect("company_id parses as UUID");
+    let slug: String = sqlx::query_scalar(
+        "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(company_uuid)
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("read portal_slug");
+    let expected_prefix = format!("/portal/{slug}/set-password?token=");
     assert!(
-        body.contains("/portal/set-password?token="),
-        "body must carry the /portal/set-password?token=... link so the customer can complete signup, got: {body}"
+        body.contains(&expected_prefix),
+        "body must carry the /portal/{{slug}}/set-password?token=... link so the customer can complete signup, got: {body}"
     );
-    // The token has the {contact_id}.{secret} shape (mirrors
-    // parse_contact_bound_token). If the format ever changes the SPA
-    // URL parser and this assertion both need to move together.
+    // Regression guard: the pre-011 body carried /portal/set-password?token= with
+    // no slug segment, which the SPA router 404s on. If the fix is reverted this
+    // assertion trips before anyone hits the bug in dev.
     assert!(
-        body.contains("token="),
-        "body must carry a token= query parameter, got: {body}"
+        !body.contains("/portal/set-password?token="),
+        "regression: body must not carry the slug-less URL the SPA router 404s on, got: {body}"
     );
 }
 

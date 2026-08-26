@@ -854,52 +854,120 @@ impl ContactService {
     /// be resent later. A contact with no email address is skipped (the
     /// agent owns following up out of band). PMS-136.
     ///
-    /// PMS-700: queued through the `auth.welcome` dispatch rather than sent
-    /// inline, so the contact gets the same rendered template (and the same
-    /// worker retries) as the staff welcome mail.
+    /// Portal-setup email dispatched at contact create + update time when
+    /// `is_portal_user` flips true. Delegates to `send_grant_email` (prompt
+    /// 011) so the URL carries the Company's portal_slug segment
+    /// (`/portal/{slug}/set-password?token=...`), the Portal ID is surfaced,
+    /// and the correct `auth.portal_grant` template renders. The prior
+    /// implementation dispatched `auth.welcome` with a slug-less
+    /// `/portal/set-password?token=...` URL that the SPA router 404'd on,
+    /// stranding every fresh contact.
     async fn send_setup_email(&self, contact: &Contact, token: &str) {
-        let Some(ref email) = contact.email else {
+        if contact.email.is_none() {
             tracing::warn!(
                 contact_id = %contact.id,
                 "portal access granted but contact has no email; setup link not delivered",
             );
             return;
-        };
-        let setup_link = format!(
-            "{}/portal/set-password?token={}",
-            self.app_url.trim_end_matches('/'),
-            token,
-        );
-        let Some(notify) = self.notifications.as_ref() else {
+        }
+        let Some(company_id) = contact.company_id else {
             tracing::warn!(
                 contact_id = %contact.id,
-                "no notifications dispatcher wired; portal setup token persisted but no message queued",
+                "portal setup token minted but contact has no company_id; no Company portal to sign into, setup email not delivered",
             );
             return;
         };
-        let context = serde_json::json!({
-            "recipient_email": email,
-            "display_name": contact.first_name,
-            "setup_link": setup_link,
-        });
-        // SAFETY (PMS-261): `contact.tenant_id` is read off the contact row
-        // this method was handed, not from caller input; `dispatch` re-derives
-        // the RLS GUC per query via `begin_with_tenant`.
-        match notify
-            .dispatch(
-                TenantId::from_trusted(contact.tenant_id),
-                "auth.welcome",
-                &context,
-            )
-            .await
-        {
-            Ok(_) => tracing::info!(contact_id = %contact.id, "portal setup-link email queued"),
-            Err(e) => tracing::warn!(
-                contact_id = %contact.id,
-                error = ?e,
-                "portal setup email dispatch failed; token persisted but link unreachable",
-            ),
+        let portal_id = match self.ensure_portal_id(company_id, contact.tenant_id).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    contact_id = %contact.id,
+                    company_id = %company_id,
+                    error = ?e,
+                    "failed to ensure portal_id for grant email; setup email not delivered (token still redeemable via /portal/login finder)",
+                );
+                return;
+            }
+        };
+        let portal_slug = match self.ensure_portal_slug(company_id, contact.tenant_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    contact_id = %contact.id,
+                    company_id = %company_id,
+                    error = ?e,
+                    "failed to ensure portal_slug for grant email; setup email not delivered (token still redeemable via /portal/login finder)",
+                );
+                return;
+            }
+        };
+        self.send_grant_email(contact, &portal_slug, portal_id, token)
+            .await;
+    }
+
+    /// Assign (or read) a Company's portal_slug. Mirrors `ensure_portal_id`'s
+    /// shape: fast-path returns the existing value, retry-loop on UNIQUE
+    /// collisions when minting a fresh candidate. `grant_portal_access` still
+    /// runs its own inline slug-mint inside the grant tx so the assignment is
+    /// atomic with the role writes; this helper covers the create + update
+    /// paths where the enclosing tx is not the grant tx.
+    async fn ensure_portal_slug(
+        &self,
+        company_id: Uuid,
+        tenant_id: Uuid,
+    ) -> AppResult<String> {
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(company_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?
+        .flatten();
+        if let Some(s) = existing {
+            return Ok(s);
         }
+
+        for _ in 0..5 {
+            let candidate = crate::utils::crypto::generate_portal_slug();
+            let update_result = sqlx::query(
+                "UPDATE companies SET portal_slug = $1, updated_at = NOW() \
+                 WHERE id = $2 AND tenant_id = $3 AND portal_slug IS NULL",
+            )
+            .bind(&candidate)
+            .bind(company_id)
+            .bind(tenant_id)
+            .execute(self.db.migrator_pool())
+            .await;
+
+            match update_result {
+                Ok(res) if res.rows_affected() == 1 => return Ok(candidate),
+                Ok(_) => {
+                    let now: Option<String> = sqlx::query_scalar(
+                        "SELECT portal_slug FROM companies \
+                         WHERE id = $1 AND tenant_id = $2",
+                    )
+                    .bind(company_id)
+                    .bind(tenant_id)
+                    .fetch_optional(self.db.migrator_pool())
+                    .await?
+                    .flatten();
+                    if let Some(s) = now {
+                        return Ok(s);
+                    }
+                    continue;
+                }
+                Err(sqlx::Error::Database(dbe))
+                    if dbe.code().as_deref() == Some("23505") =>
+                {
+                    continue;
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+        Err(AppError::Internal(
+            "could not assign a unique portal_slug after 5 attempts".to_string(),
+        ))
     }
 
     /// mokosh-contact-login prompt 003: list the portal roles the MSP
