@@ -11,13 +11,22 @@
 //! open), settle (one transaction, at most two statements). This test proves
 //! it two ways at once:
 //!
-//!   * the mailer samples `pg_stat_activity` on every send and asserts that no
-//!     other backend of this database has a transaction open, which is the
-//!     issue's own `max(now() - xact_start)` validation reduced to a
-//!     deterministic assertion;
+//!   * the mailer samples `pg_stat_activity` on every send and asserts that
+//!     nothing has been in a transaction longer than the issue's own
+//!     `max(now() - xact_start)` threshold. PMS-932: the AGE is the verdict and
+//!     the COUNT is only context. Asserting the count was zero failed CI on a
+//!     transaction 8 ms old belonging to a backend this test does not own, and
+//!     failed it before the criterion the issue specifies was evaluated. The
+//!     probe sees every backend on `current_database()`, and the test controls
+//!     none of them beyond its own pool, so a count of zero is not something it
+//!     can require. Do not re-add it as a tightening;
 //!   * a `tracing` subscriber records every statement (the in-process
 //!     equivalent of `log_statement=all`, per `tests/contract_sweep_query_budget.rs`)
-//!     so the settle budget can be counted.
+//!     so the settle budget can be counted, and so that NOTHING but the probe
+//!     itself runs between two sends. That second assertion is the flake-free
+//!     half of the proof and catches strictly more than the count ever did: a
+//!     brief statement mid-send is a database round trip across an SMTP one,
+//!     and it is over long before the probe would sample it.
 //!
 //! This file holds exactly ONE test on purpose: the subscriber is
 //! process-global, so a second test running concurrently would count its
@@ -225,13 +234,25 @@ async fn a_tick_sends_with_no_transaction_open(pool: PgPool) {
         "the probe must have run once per send",
     );
     for (age_ms, open) in &observations {
-        assert_eq!(
-            *open, 0,
-            "a transaction was open during an SMTP send (oldest {age_ms} ms)",
-        );
+        // PMS-932: the AGE is the verdict, and the count is context.
+        //
+        // This assertion used to be `open == 0` first, which failed CI on a
+        // transaction 8 ms old belonging to a backend this test does not own,
+        // and failed it BEFORE the criterion the issue actually specifies was
+        // ever evaluated. The probe counts every backend on `current_database()`
+        // other than its own, and the test controls none of them beyond its own
+        // pool.
+        //
+        // `oldest_ms` is a MAX over every open transaction and the probe runs
+        // 500 ms into the send, so a transaction genuinely held across the round
+        // trip is well past the threshold; when nothing is open the query
+        // returns NULL and this reads 0.0, which is the right answer. The
+        // deterministic half of the proof is the statement log below, which is
+        // where a SHORT transaction opened mid-send gets caught.
         assert!(
             *age_ms < MAX_XACT_AGE_MS,
-            "oldest open transaction during a send was {age_ms} ms",
+            "oldest open transaction during a send was {age_ms} ms \
+             ({open} backend(s) in a transaction)",
         );
     }
 
@@ -256,6 +277,29 @@ async fn a_tick_sends_with_no_transaction_open(pool: PgPool) {
     assert!(
         settle[1].contains("UNNEST"),
         "the non-sent outcomes must be written in one batched statement: {settle:#?}"
+    );
+
+    // PMS-932: the flake-free half. Sampling `pg_stat_activity` is inherently
+    // racy; the statement log is not. If this process issues no statement
+    // between the first send and the last, it cannot have had a transaction
+    // open across one, and no timing is involved.
+    //
+    // The probe's own `pg_stat_activity` query is the one statement that
+    // legitimately lands there: the mailer pushes its marker, sleeps, then
+    // probes. Anything else is the worker talking to the database mid-send,
+    // which is the defect whether or not it lives long enough to trip the age
+    // threshold above.
+    let first_send = log
+        .iter()
+        .position(|e| e == SEND_MARKER)
+        .expect("the tick must have sent something");
+    let between: Vec<&String> = log[first_send..last_send]
+        .iter()
+        .filter(|s| *s != SEND_MARKER && !s.contains("pg_stat_activity"))
+        .collect();
+    assert!(
+        between.is_empty(),
+        "no statement may run between two sends, got: {between:#?}"
     );
 
     // The claim is one statement too, and it runs before any send.
