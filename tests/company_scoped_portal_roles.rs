@@ -767,3 +767,86 @@ async fn nested_post_body_company_id_must_equal_path_400(pool: PgPool) {
         .expect("nested post");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+/// Regression: prompt 012's scope-check SELECT used self.db.pool() (the
+/// NOBYPASSRLS app pool) without opening a begin_with_tenant tx, so RLS
+/// fail-closed to zero rows and EVERY role_id read as "missing" from the
+/// tenant - which then 400'd with the scope-mismatch message even for
+/// tenant-wide built-in roles. Fixed by switching to migrator_pool() with
+/// the explicit `WHERE tenant_id = $1` guard (the same pattern
+/// ensure_portal_id uses).
+///
+/// Without this pin, the scope-check would silently start rejecting
+/// EVERY role assignment the moment the RLS gotcha comes back.
+#[sqlx::test]
+async fn replace_role_assignments_with_tenant_wide_role_succeeds(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = seed_company_row(&pool, "Tenant-Wide OK Co").await;
+    let contact_id = seed_contact_row(&pool, company_id, "tw-ok@mcl.example").await;
+
+    // Grant the contact portal access first so replace_portal_role_assignments
+    // has a live is_portal_user row to rewrite. Pick a built-in tenant-wide
+    // role by name so the id is whatever migration 142 seeded.
+    let support_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM portal_roles WHERE tenant_id = $1 AND name = 'Support Contact'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("Support role");
+
+    let grant = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/grant-portal-access"
+        )))
+        .bearer_auth(&token)
+        .json(&json!({ "role_ids": [support_id] }))
+        .send()
+        .await
+        .expect("grant");
+    assert!(
+        grant.status().is_success(),
+        "grant with a tenant-wide role must succeed (200/201), got {} - if this returns 400 with a scope-mismatch message the RLS gotcha is back",
+        grant.status()
+    );
+
+    // Second rewire via the PUT endpoint: still tenant-wide, still must land 200.
+    let billing_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM portal_roles WHERE tenant_id = $1 AND name = 'Billing Contact'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("Billing role");
+
+    let rewire = app
+        .client
+        .put(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/portal-roles"
+        )))
+        .bearer_auth(&token)
+        .json(&json!({ "role_ids": [billing_id, support_id] }))
+        .send()
+        .await
+        .expect("rewire");
+    assert!(
+        rewire.status().is_success(),
+        "rewire with two tenant-wide roles must succeed, got {} - RLS regression",
+        rewire.status()
+    );
+
+    let assignments: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contact_role_assignments WHERE contact_id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(
+        assignments, 2,
+        "both tenant-wide role assignments must have landed after rewire"
+    );
+}

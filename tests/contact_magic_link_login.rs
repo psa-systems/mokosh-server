@@ -198,10 +198,12 @@ async fn login_link_returns_204_for_unknown_email(pool: PgPool) {
 }
 
 /// mokosh-contact-login prompt 010: known email + slug -> 204, one
-/// intent row minted. (Notification queue would fire against the
-/// `auth.login_link` template; because no template is seeded for that
-/// event, the dispatcher silently no-ops. The row is the observable
-/// side-effect this test pins.)
+/// intent row minted, AND (post-migration 149) one auth.login_link
+/// email queued to the recipient. Before migration 149 seeded the
+/// template + rule, the dispatcher silently no-op'd on this event and
+/// operators saw every finder click quietly drop the email on the floor.
+/// This test pins both the row + the queued notification so the
+/// silent-drop regression cannot come back.
 #[sqlx::test]
 async fn login_link_returns_204_for_known_email_and_mints_intent(pool: PgPool) {
     let (_contact_id, _company_id, slug) = seed_portal_contact(&pool, "hit@mcl.example").await;
@@ -229,6 +231,25 @@ async fn login_link_returns_204_for_known_email_and_mints_intent(pool: PgPool) {
     assert_eq!(
         intent_count, 1,
         "prompt 010: known email must mint exactly one intent row"
+    );
+
+    // Migration 149: the auth.login_link template + rule are now seeded
+    // so the finder actually queues an email. A zero here means either
+    // the template is missing (migration 149 didn't run / was reverted)
+    // OR the finder is dispatching under the wrong event type.
+    let email_body: String = sqlx::query_scalar(
+        "SELECT body FROM notifications \
+         WHERE tenant_id = $1 AND recipient = $2 AND channel_type = 'email' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("hit@mcl.example")
+    .fetch_one(&pool)
+    .await
+    .expect("read email body; if RowNotFound the auth.login_link template + rule are not seeded");
+    assert!(
+        email_body.contains("/portal/pick?token="),
+        "prompt 010 finder email must carry the /portal/pick?token=... magic link, got: {email_body}"
     );
 }
 

@@ -1124,12 +1124,18 @@ impl ContactService {
         // tenant id or a scoped-to-other-Company id (invisible under
         // this query), both mapped to the same 400 shape so the
         // response never leaks scope existence.
+        // Uses migrator_pool() (RLS-bypass) with the explicit `WHERE
+        // tenant_id = $1` filter. Reading through self.db.pool() without a
+        // begin_with_tenant() to set app.current_tenant makes RLS fail-close
+        // to zero rows, which turned every submitted role_id into "role
+        // missing" and 400'd every grant with the scope-mismatch message.
+        // The explicit tenant_id in the WHERE clause is the tenant guard.
         let role_rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
             "SELECT id, company_id FROM portal_roles WHERE tenant_id = $1 AND id = ANY($2)",
         )
         .bind(*tenant_id)
         .bind(role_ids)
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.migrator_pool())
         .await?;
         let role_map: std::collections::HashMap<Uuid, Option<Uuid>> =
             role_rows.into_iter().collect();
@@ -1587,12 +1593,16 @@ impl ContactService {
         // scoped to a different Company, both of which we surface as
         // the same 400 (not 404) so the response never leaks which
         // Company a foreign role belongs to.
+        // Uses migrator_pool() for the same reason as grant_portal_access
+        // above: self.db.pool() without begin_with_tenant collapses under
+        // RLS to zero rows, so every role_id read as "missing" and 400'd.
+        // Explicit `WHERE tenant_id = $1` is the tenant guard.
         let role_rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
             "SELECT id, company_id FROM portal_roles WHERE tenant_id = $1 AND id = ANY($2)",
         )
         .bind(*tenant_id)
         .bind(&unique)
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.migrator_pool())
         .await?;
         let role_map: std::collections::HashMap<Uuid, Option<Uuid>> =
             role_rows.into_iter().collect();

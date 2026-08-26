@@ -2159,7 +2159,16 @@ impl TenantService {
                                  -- for the default tenant by migration 144;
                                  -- copied here so a tenant created after 010
                                  -- can dispatch a grant email at all.
-                                 'auth.portal_grant')
+                                 'auth.portal_grant',
+                                 -- PMS-918 followup: the recurring-sign-in
+                                 -- magic-link email fired by
+                                 -- ContactAuthService::request_login_link
+                                 -- (the /portal/login finder page). Seeded
+                                 -- for the default tenant by migration 149;
+                                 -- copied here so a new tenant's contacts can
+                                 -- request a sign-in link and actually receive
+                                 -- one instead of a silent no-op.
+                                 'auth.login_link')
             "#,
         )
         .bind(new_tenant_id)
@@ -2195,7 +2204,12 @@ impl TenantService {
                                    -- PMS-918 (mokosh-contact-login prompt 010):
                                    -- pair the auth.portal_grant template above
                                    -- with its rule so grant dispatch fans out.
-                                   'auth.portal_grant')
+                                   'auth.portal_grant',
+                                   -- PMS-918 followup: pair auth.login_link so
+                                   -- the recurring-sign-in magic-link email
+                                   -- actually fans out. A template with no rule
+                                   -- is a message that is never sent.
+                                   'auth.login_link')
             "#,
         )
         .bind(new_tenant_id)
