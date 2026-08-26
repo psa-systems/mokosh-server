@@ -12,8 +12,9 @@ use validator::Validate;
 use super::{
     CreateNoteRequest, CreateTicketRequest, TicketCategoryResponse, TicketFilter,
     TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService, TicketStatus,
-    TicketType, UpdateTicketRequest, UpsertTicketCategoryRequest, UpsertTicketPriorityRequest,
-    UpsertTicketQueueRequest, UpsertTicketStatusRequest, UpsertTicketTypeRequest,
+    TicketType, UpdateNoteRequest, UpdateTicketRequest, UpsertTicketCategoryRequest,
+    UpsertTicketPriorityRequest, UpsertTicketQueueRequest, UpsertTicketStatusRequest,
+    UpsertTicketTypeRequest,
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
@@ -55,6 +56,8 @@ pub fn ticket_routes(ticket_service: TicketService) -> Router {
         .route("/{ticket_id}/assign", post(assign_ticket))
         .route("/{ticket_id}/notes", get(get_ticket_notes))
         .route("/{ticket_id}/notes", post(add_note))
+        // PMS-931: a note was append-only for everyone, its author included.
+        .route("/{ticket_id}/notes/{note_id}", put(update_note))
         // Configuration / lookup CRUD (PMS-321). GET handlers unchanged;
         // mutations are admin-gated inside each handler.
         .route("/statuses", get(get_statuses).post(create_status))
@@ -200,6 +203,7 @@ async fn get_ticket_notes(
             created_by_name: n.created_by_name.unwrap_or_default(),
             created_by_contact_id: n.created_by_contact_id,
             created_at: n.created_at,
+            updated_at: n.updated_at,
         })
         .collect();
 
@@ -238,6 +242,7 @@ async fn list_contact_notes(
             created_by_name: n.created_by_name.unwrap_or_default(),
             created_by_contact_id: n.created_by_contact_id,
             created_at: n.created_at,
+            updated_at: n.updated_at,
         })
         .collect();
     Ok(Json(PaginatedResponse::from_params(
@@ -270,6 +275,37 @@ async fn add_note(
         created_by_name: note.created_by_name.unwrap_or_else(|| user.full_name()),
         created_by_contact_id: note.created_by_contact_id,
         created_at: note.created_at,
+        updated_at: note.updated_at,
+    }))
+}
+
+/// PMS-931. Content only; see `UpdateNoteRequest` for why `note_type` and
+/// `send_email` are not editable, and `TicketService::update_note` for who may
+/// edit and which rows refuse regardless.
+async fn update_note(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path((ticket_id, note_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateNoteRequest>,
+) -> AppResult<Json<TicketNoteResponse>> {
+    request.validate()?;
+
+    let note = state
+        .ticket_service
+        .update_note(user.tenant(), ticket_id, note_id, &user, &request, &ctx)
+        .await?;
+
+    Ok(Json(TicketNoteResponse {
+        id: note.id,
+        note_type: note.note_type,
+        content: note.content,
+        is_email_sent: note.is_email_sent,
+        created_by_id: note.created_by_id,
+        created_by_name: note.created_by_name.unwrap_or_else(|| user.full_name()),
+        created_by_contact_id: note.created_by_contact_id,
+        created_at: note.created_at,
+        updated_at: note.updated_at,
     }))
 }
 
