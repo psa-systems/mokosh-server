@@ -146,6 +146,20 @@ pub fn generate_portal_slug() -> String {
         .collect()
 }
 
+/// mokosh-contact-login prompt 011 (PMS-928): random 9-digit numeric
+/// Portal ID used as `companies.portal_id`. Range `[100_000_000,
+/// 1_000_000_000)` (inclusive lower, exclusive upper) so the value is
+/// always renderable as exactly nine digits ("dictable over the phone")
+/// and never overflows into 10-digit territory.
+///
+/// 10^9 = 1B ids; at 10M Companies birthday-paradox collision is under
+/// 1%. `ContactService::grant_portal_access` retries UNIQUE-constraint
+/// bounces up to 5 times, so a collision is quietly recovered rather
+/// than surfacing as a create-Company failure.
+pub fn generate_portal_id() -> i64 {
+    rand::rng().random_range(100_000_000..1_000_000_000)
+}
+
 /// Generate a short numeric code (for MFA, etc.)
 pub fn generate_numeric_code(length: usize) -> String {
     let mut rng = rand::rng();
@@ -275,6 +289,41 @@ mod tests {
             let s = generate_portal_slug();
             assert!(seen.insert(s), "portal slug collision in 10k samples");
         }
+    }
+
+    #[test]
+    fn portal_id_stays_in_9_digit_range() {
+        // mokosh-contact-login prompt 011 (PMS-928): every generated
+        // Portal ID sits inside the [100_000_000, 1_000_000_000)
+        // window so it always renders as exactly 9 digits. 10k
+        // samples is the same shape the slug generator's test uses;
+        // a stray value here flags a broken RNG or an off-by-one
+        // range change.
+        for _ in 0..10_000 {
+            let id = generate_portal_id();
+            assert!(
+                (100_000_000..1_000_000_000).contains(&id),
+                "portal_id out of range: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn portal_id_shows_reasonable_uniqueness() {
+        // mokosh-contact-login prompt 011 (PMS-928): birthday-paradox
+        // sanity check. 5k samples over a 900M-value space expect
+        // <=~14 collisions on average; assert we stay above 4990
+        // uniques so a collapsed RNG (constant, tiny range) trips
+        // the test but a healthy RNG never flakes.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5_000 {
+            seen.insert(generate_portal_id());
+        }
+        assert!(
+            seen.len() >= 4990,
+            "portal_id uniqueness collapsed: only {} unique in 5k samples",
+            seen.len()
+        );
     }
 
     #[cfg(feature = "server")]

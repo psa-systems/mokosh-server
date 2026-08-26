@@ -11,9 +11,15 @@ use uuid::Uuid;
 /// Company's portal slug + the freshly minted setup link so the SPA
 /// can display + copy-to-clipboard the URL (useful when the email
 /// dispatch is delayed or the operator wants to hand-relay via chat).
+///
+/// mokosh-contact-login prompt 011 (PMS-928): also carries the
+/// Company's 9-digit `portal_id` so the SPA can render "Portal ID:
+/// 555556666" alongside the URL and the operator can dictate it over
+/// the phone. Pinned to i64 to match `companies.portal_id BIGINT`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortalGrantOutcome {
     pub portal_slug: String,
+    pub portal_id: i64,
     pub setup_link: String,
 }
 

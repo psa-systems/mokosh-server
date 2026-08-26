@@ -100,33 +100,50 @@ impl ContactAuthService {
 
     /// mokosh-contact-login prompt 004: happy-path login.
     ///
-    /// Resolves the slug to `(tenant_id, company_id)`, verifies the
-    /// contact's `portal_password_hash`, computes the effective
+    /// Resolves the caller-supplied portal_id (preferred) or legacy
+    /// slug (compat fallback) to `(tenant_id, company_id)`, verifies
+    /// the contact's `portal_password_hash`, computes the effective
     /// capability set, mints an access + refresh pair, records the
     /// refresh in `contact_sessions`.
+    ///
+    /// mokosh-contact-login prompt 011 (PMS-928): body now dual-accepts
+    /// `portal_id: Option<i64>` alongside `slug: Option<&str>`. Portal
+    /// ID wins if both are supplied so a mixed body cannot be steered
+    /// into a different Company via slug injection. `None` for both
+    /// (or both supplied but unresolvable to a Company) folds to the
+    /// generic 401 shape so the endpoint stays enumeration-resistant.
     ///
     /// Every credential failure returns `AppError::Unauthorized` with
     /// the same message so the endpoint stays enumeration-resistant.
     #[tracing::instrument(skip_all)]
     pub async fn login(
         &self,
-        slug: &str,
+        portal_id: Option<i64>,
+        slug: Option<&str>,
         email: &str,
         password: &str,
         _mfa_code: Option<&str>,
         user_agent: Option<&str>,
         ip: Option<IpAddr>,
     ) -> AppResult<ContactLoginResponse> {
-        // Slug -> (tenant_id, company_id). Fail-closed on unknown +
-        // suspended tenant.
+        // (portal_id, slug) -> (tenant_id, company_id). Fail-closed on
+        // unknown + suspended tenant. Portal_id wins when both are
+        // supplied via the `$1 IS NOT NULL` branch on the OR; slug
+        // is only consulted when portal_id is absent, mirroring the
+        // "portal_id > slug" resolution the ticket calls for.
         let company_row: Option<(Uuid, Uuid)> = sqlx::query_as(
             r#"
             SELECT c.tenant_id, c.id
             FROM companies c
             INNER JOIN tenants t ON t.id = c.tenant_id
-            WHERE c.portal_slug = $1 AND t.status = 'active'
+            WHERE t.status = 'active'
+              AND (
+                ($1::BIGINT IS NOT NULL AND c.portal_id = $1)
+                OR ($1::BIGINT IS NULL AND $2::TEXT IS NOT NULL AND c.portal_slug = $2)
+              )
             "#,
         )
+        .bind(portal_id)
         .bind(slug)
         .fetch_optional(self.db.migrator_pool())
         .await?;
@@ -603,6 +620,62 @@ impl ContactAuthService {
         )
     }
 
+    /// mokosh-contact-login prompt 011 (PMS-928): sibling of
+    /// `resolve_host` keyed on the Company's numeric `portal_id`. Same
+    /// wire shape (`ContactPortalHostHint`) so the SPA renders the same
+    /// suspended-tenant splash + branding regardless of which URL
+    /// (Portal ID or legacy slug) the visitor followed. Unknown ids
+    /// return `Ok(None)` (routed to 404 upstream, enum-resistant).
+    ///
+    /// The row's `portal_slug` may be NULL for a Company created after
+    /// the slug column starts being deprecated; the returned hint
+    /// carries the (possibly empty) slug value for backward compat with
+    /// SPA code that still reads it.
+    pub async fn resolve_host_by_portal_id(
+        &self,
+        portal_id: i64,
+    ) -> AppResult<Option<ContactPortalHostHint>> {
+        let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
+            r#"
+            SELECT co.name, co.portal_slug, t.name, t.status
+            FROM companies co
+            INNER JOIN tenants t ON t.id = co.tenant_id
+            WHERE co.portal_id = $1
+            "#,
+        )
+        .bind(portal_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        Ok(
+            row.map(|(company_name, slug, tenant_display_name, tenant_status)| {
+                ContactPortalHostHint {
+                    company_name,
+                    portal_slug: slug.unwrap_or_default(),
+                    tenant_display_name,
+                    tenant_status,
+                }
+            }),
+        )
+    }
+
+    /// mokosh-contact-login prompt 011 (PMS-928): resolve a legacy
+    /// `portal_slug` to the Company's numeric `portal_id`. Powers the
+    /// client-side compat redirect: a visitor who follows an older
+    /// `/portal/{slug}/login` URL hits `GET
+    /// /api/v1/contact/portal/{slug}/resolve-to-portal-id`, the SPA
+    /// swaps the URL for `/portal/{portal_id}/login` and re-routes.
+    /// Returns `Ok(None)` when the slug is unknown OR when the
+    /// matching Company has not been assigned a portal_id yet
+    /// (upstream 404 either way, enum-resistant).
+    pub async fn resolve_slug_to_portal_id(&self, slug: &str) -> AppResult<Option<i64>> {
+        let row: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT portal_id FROM companies WHERE portal_slug = $1")
+                .bind(slug)
+                .fetch_optional(self.db.migrator_pool())
+                .await?;
+        Ok(row.flatten())
+    }
+
     /// mokosh-contact-login prompt 010 (PMS-918): request a magic-link
     /// sign-in for `email` on the tenant carrying `slug` (a Company
     /// `portal_slug`) or, when no slug is supplied, drop silently. Always
@@ -629,30 +702,60 @@ impl ContactAuthService {
         &self,
         email: &str,
         slug: Option<&str>,
+        portal_id: Option<i64>,
         ip: Option<IpAddr>,
         user_agent: Option<&str>,
     ) -> AppResult<()> {
-        // Slug -> tenant. When slug is missing, silently drop.
+        // (portal_id, slug) -> tenant. When neither is supplied, or
+        // neither resolves, silently drop (still 204 upstream so an
+        // attacker cannot use the shape to enumerate).
         // SAFETY (PMS-285): pre-auth path with no `app.current_tenant`
         // GUC set; runs on the BYPASSRLS migrator pool. Data returned
         // is only the tenant id (used to write a subsequent row under
         // that tenant).
-        let Some(slug) = slug.map(str::trim).filter(|s| !s.is_empty()) else {
+        //
+        // mokosh-contact-login prompt 011 (PMS-928): portal_id wins
+        // when both are supplied. When portal_id resolves to a
+        // Company that also carries a slug, the finder additionally
+        // scopes the eventual contact-match query to that Company so
+        // the redeem step is auto-mint (single Company, no picker)
+        // even if the same email is on file under another Company in
+        // the same tenant. The scoping is captured in `scope_company_id`
+        // below.
+        let slug = slug.map(str::trim).filter(|s| !s.is_empty());
+        if portal_id.is_none() && slug.is_none() {
             return Ok(());
-        };
-        let tenant_row: Option<(Uuid,)> = sqlx::query_as(
+        }
+        let resolved: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
             r#"
-            SELECT co.tenant_id
+            SELECT co.tenant_id, co.id
             FROM companies co
             INNER JOIN tenants t ON t.id = co.tenant_id
-            WHERE co.portal_slug = $1 AND t.status = 'active'
+            WHERE t.status = 'active'
+              AND (
+                ($1::BIGINT IS NOT NULL AND co.portal_id = $1)
+                OR ($1::BIGINT IS NULL AND $2::TEXT IS NOT NULL AND co.portal_slug = $2)
+              )
             "#,
         )
+        .bind(portal_id)
         .bind(slug)
         .fetch_optional(self.db.migrator_pool())
-        .await?;
-        let Some((tenant_id,)) = tenant_row else {
+        .await?
+        .map(|(tid, cid): (Uuid, Uuid)| (tid, Some(cid)));
+        let Some((tenant_id, scope_company_id)) = resolved else {
             return Ok(());
+        };
+        // Only scope the contact lookup to a specific Company when
+        // portal_id (or the slug on the compat path) explicitly
+        // pinned one. `None` here means "any Company under this
+        // tenant" (never fires today; kept as a safety valve should a
+        // future caller resolve a tenant without a Company).
+        let _ = scope_company_id;
+        let company_scope_id: Option<Uuid> = if portal_id.is_some() {
+            scope_company_id
+        } else {
+            None
         };
 
         // Per-IP rate limit. Silent drop shape.
@@ -698,7 +801,8 @@ impl ContactAuthService {
         }
 
         // Match check. If no active portal contact under this tenant
-        // has this email, no intent + no email.
+        // (and inside the scoped Company, when a portal_id was
+        // supplied) has this email, no intent + no email.
         let contact_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
@@ -708,10 +812,12 @@ impl ContactAuthService {
               AND LOWER(c.email) = LOWER($2)
               AND c.is_portal_user = TRUE
               AND co.portal_slug IS NOT NULL
+              AND ($3::UUID IS NULL OR c.company_id = $3)
             "#,
         )
         .bind(tenant_id)
         .bind(email)
+        .bind(company_scope_id)
         .fetch_one(self.db.migrator_pool())
         .await?;
         if contact_count == 0 {
@@ -732,8 +838,8 @@ impl ContactAuthService {
         sqlx::query(
             r#"
             INSERT INTO portal_login_intents
-                (id, tenant_id, email, secret_hash, expires_at, ip, user_agent)
-            VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::inet, $7)
+                (id, tenant_id, email, secret_hash, expires_at, ip, user_agent, company_id)
+            VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::inet, $7, $8)
             "#,
         )
         .bind(intent_id)
@@ -743,6 +849,7 @@ impl ContactAuthService {
         .bind(expires_at)
         .bind(&ip_text)
         .bind(user_agent)
+        .bind(company_scope_id)
         .execute(self.db.migrator_pool())
         .await?;
 
@@ -817,9 +924,10 @@ impl ContactAuthService {
             String,
             Option<DateTime<Utc>>,
             DateTime<Utc>,
+            Option<Uuid>,
         )> = sqlx::query_as(
             r#"
-                SELECT id, tenant_id, email, secret_hash, used_at, expires_at
+                SELECT id, tenant_id, email, secret_hash, used_at, expires_at, company_id
                 FROM portal_login_intents
                 WHERE id = $1
                 FOR UPDATE
@@ -828,7 +936,9 @@ impl ContactAuthService {
         .bind(intent_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((_, tenant_id, intent_email, secret_hash, used_at, expires_at)) = intent else {
+        let Some((_, tenant_id, intent_email, secret_hash, used_at, expires_at, scope_company_id)) =
+            intent
+        else {
             return Err(invalid());
         };
         if used_at.is_some() || expires_at <= Utc::now() {
@@ -863,11 +973,13 @@ impl ContactAuthService {
                   AND c.is_portal_user = TRUE
                   AND t.status = 'active'
                   AND co.portal_slug IS NOT NULL
+                  AND ($3::UUID IS NULL OR c.company_id = $3)
                 ORDER BY co.name
                 "#,
             )
             .bind(tenant_id)
             .bind(&intent_email)
+            .bind(scope_company_id)
             .fetch_all(self.db.migrator_pool())
             .await?;
         if candidates.is_empty() {

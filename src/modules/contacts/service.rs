@@ -1040,6 +1040,16 @@ impl ContactService {
             ));
         }
 
+        // mokosh-contact-login prompt 011 (PMS-928): ensure the Company
+        // has a numeric portal_id. Runs BEFORE the tenant-bound
+        // transaction opens because it does its own UPDATE (with
+        // UNIQUE-constraint retries) against `companies`; running it
+        // inside the grant tx would race the slug-assignment UPDATE
+        // that follows and deadlock on the same row. Idempotent + safe
+        // to run first: on grant failure the assigned portal_id stays,
+        // which is harmless (a follow-up grant reuses it).
+        let portal_id = self.ensure_portal_id(company_id, *tenant_id).await?;
+
         // Mint or reuse the Company's slug. Uses a small retry loop
         // in case `generate_portal_slug` returns a value already taken
         // by another Company (astronomically unlikely at 80 bits of
@@ -1186,12 +1196,99 @@ impl ContactService {
             portal_slug,
             token,
         );
-        self.send_grant_email(&contact, &portal_slug, &token).await;
+        self.send_grant_email(&contact, &portal_slug, portal_id, &token)
+            .await;
 
         Ok(PortalGrantOutcome {
             portal_slug,
+            portal_id,
             setup_link,
         })
+    }
+
+    /// mokosh-contact-login prompt 011 (PMS-928): assign a 9-digit
+    /// numeric Portal ID to the Company if one is not set. Fast-path
+    /// returns the existing value; otherwise loops up to 5 attempts
+    /// against `generate_portal_id`, UPDATE'ing only when
+    /// `portal_id IS NULL` (so a concurrent grant that already won
+    /// doesn't get overwritten). On a UNIQUE-constraint bounce (astro-
+    /// nomically unlikely at 10M Companies over a 900M space, but
+    /// cheap to guard) we retry with a fresh value; on 0 rows affected
+    /// we re-read the row (someone else raced us and won), returning
+    /// the value they installed. On 5 failed retries we surface an
+    /// `Internal` so the grant fails loud rather than sitting on a
+    /// slug-only Company.
+    ///
+    /// Not tenant-scoped inside the query (`WHERE id = $2 AND
+    /// tenant_id = $3`) because the caller already validated the
+    /// Company belongs to this tenant, but the `AND tenant_id = $3`
+    /// keeps a stray cross-tenant call from silently touching another
+    /// tenant's row.
+    async fn ensure_portal_id(&self, company_id: Uuid, tenant_id: Uuid) -> AppResult<i64> {
+        // Fast path: already assigned.
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT portal_id FROM companies WHERE id = $1 AND tenant_id = $2")
+                .bind(company_id)
+                .bind(tenant_id)
+                .fetch_optional(self.db.migrator_pool())
+                .await?
+                .flatten();
+        if let Some(v) = existing {
+            return Ok(v);
+        }
+
+        for _ in 0..5 {
+            let candidate = crate::utils::crypto::generate_portal_id();
+            let update_result = sqlx::query(
+                "UPDATE companies SET portal_id = $1, updated_at = NOW() \
+                 WHERE id = $2 AND tenant_id = $3 AND portal_id IS NULL",
+            )
+            .bind(candidate)
+            .bind(company_id)
+            .bind(tenant_id)
+            .execute(self.db.migrator_pool())
+            .await;
+
+            match update_result {
+                Ok(res) if res.rows_affected() == 1 => return Ok(candidate),
+                Ok(_) => {
+                    // 0 rows affected: another writer beat us and
+                    // populated the row. Re-read and return their
+                    // value. If somehow still NULL, fall through to
+                    // the retry loop (the guard we just lost was
+                    // rolled back by the same writer, which is
+                    // impossible given `SET portal_id = ...` cannot
+                    // set back to NULL, so a NULL here means the row
+                    // was deleted mid-flight and the caller should
+                    // fail).
+                    let now: Option<i64> = sqlx::query_scalar(
+                        "SELECT portal_id FROM companies \
+                         WHERE id = $1 AND tenant_id = $2",
+                    )
+                    .bind(company_id)
+                    .bind(tenant_id)
+                    .fetch_optional(self.db.migrator_pool())
+                    .await?
+                    .flatten();
+                    if let Some(v) = now {
+                        return Ok(v);
+                    }
+                    // Row missing or still NULL: continue the retry
+                    // loop; on the last iteration we surface Internal.
+                    continue;
+                }
+                Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => {
+                    // Value collided with another Company's portal_id.
+                    // Retry with a fresh candidate.
+                    continue;
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+
+        Err(AppError::Internal(
+            "could not assign a unique Portal ID after 5 attempts".to_string(),
+        ))
     }
 
     /// mokosh-contact-login prompt 003: resend the setup link to an
@@ -1230,6 +1327,17 @@ impl ContactService {
                 "portal access is on but company has no portal_slug; re-grant".to_string(),
             ));
         };
+        // mokosh-contact-login prompt 011 (PMS-928): a resend on an
+        // older Company (granted before the portal_id migration
+        // landed) may still hold a NULL portal_id. Ensure one is
+        // present so the resent email carries the Portal ID header
+        // and the new IAM-style login flow can use it.
+        let Some(company_id) = contact.company_id else {
+            return Err(AppError::Internal(
+                "portal access is on but contact has no company_id; re-grant".to_string(),
+            ));
+        };
+        let portal_id = self.ensure_portal_id(company_id, *tenant_id).await?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -1256,7 +1364,8 @@ impl ContactService {
         .await?;
         tx.commit().await?;
 
-        self.send_grant_email(&contact, &slug, &token).await;
+        self.send_grant_email(&contact, &slug, portal_id, &token)
+            .await;
         Ok(())
     }
 
@@ -1423,7 +1532,13 @@ impl ContactService {
     ///
     /// Best-effort dispatch: a failed send never rolls back the grant
     /// transaction (both tokens are already persisted).
-    async fn send_grant_email(&self, contact: &Contact, portal_slug: &str, token: &str) {
+    async fn send_grant_email(
+        &self,
+        contact: &Contact,
+        portal_slug: &str,
+        portal_id: i64,
+        token: &str,
+    ) {
         let Some(ref email) = contact.email else {
             tracing::warn!(
                 contact_id = %contact.id,
@@ -1471,6 +1586,12 @@ impl ContactService {
             "recipient_email": email,
             "display_name": contact.first_name,
             "password_setup_link": password_setup_link,
+            // mokosh-contact-login prompt 011 (PMS-928): the grant
+            // email now surfaces the 9-digit Portal ID prominently so
+            // the recipient can dictate it over the phone and future
+            // logins (which take Portal ID + email + password) already
+            // know the value.
+            "portal_id": portal_id.to_string(),
         });
         if let (Some(url), Some(obj)) = (magic_link_url.as_ref(), context.as_object_mut()) {
             obj.insert(

@@ -51,10 +51,25 @@ pub struct ContactJwtClaims {
 }
 
 /// Request body for `POST /api/v1/contact/auth/login`.
+///
+/// mokosh-contact-login prompt 011 (PMS-928): the body now dual-accepts
+/// `portal_id` (9-digit numeric, preferred) alongside `slug` (legacy
+/// 16-char Crockford, kept for one release cycle so live invitation
+/// emails from prompts 003-010 keep working). At least one of the two
+/// must be present; if both are, `portal_id` wins.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ContactLoginRequest {
-    #[validate(length(min = 1, max = 64, message = "portal slug is required"))]
-    pub slug: String,
+    /// Company's 9-digit numeric Portal ID. Preferred over `slug`.
+    /// Optional to preserve the pre-prompt-011 wire shape for callers
+    /// that still send only `slug`.
+    #[serde(default)]
+    pub portal_id: Option<i64>,
+    /// Legacy Company `portal_slug`. Optional as of prompt 011; when
+    /// omitted, `portal_id` must be present. Kept in place while the
+    /// compat redirect drains the last portal_slug-shape invitation
+    /// URLs.
+    #[serde(default)]
+    pub slug: Option<String>,
     #[validate(email)]
     pub email: String,
     #[validate(length(min = 1, message = "password is required"))]
@@ -181,6 +196,15 @@ pub struct ContactRequestLoginLinkRequest {
     /// fresh install.
     #[serde(default)]
     pub slug: Option<String>,
+    /// mokosh-contact-login prompt 011 (PMS-928): optional Company
+    /// `portal_id` (9-digit numeric). Preferred over `slug` when both
+    /// are supplied. When present, the finder scopes the eventual
+    /// redeem-time contact lookup to this Company so a duplicated
+    /// email across two Companies inside the same MSP tenant auto-
+    /// mints for the Portal ID's Company instead of showing the
+    /// picker.
+    #[serde(default)]
+    pub portal_id: Option<i64>,
 }
 
 /// mokosh-contact-login prompt 010: response body of the redeem

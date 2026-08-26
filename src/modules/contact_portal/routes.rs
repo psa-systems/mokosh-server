@@ -52,7 +52,20 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         .route("/auth/login-link/redeem", post(redeem_login_link))
         .route("/auth/login-link/select", post(select_login_candidate))
         .route("/auth/me", get(me))
-        .route("/portal/{slug}/host", get(portal_host))
+        // mokosh-contact-login prompt 011 (PMS-928): one host route
+        // that dispatches on the path segment's shape. All-digits
+        // parses as a numeric Portal ID; anything else is treated as
+        // a legacy Crockford slug. Same URL pattern the spec calls
+        // for, no axum route-conflict.
+        .route("/portal/{handle}/host", get(portal_host))
+        // mokosh-contact-login prompt 011 (PMS-928): client-side
+        // compat redirect. The SPA GETs this on mount for the legacy
+        // `/portal/{slug}/login` URL, swaps to `/portal/{portal_id}/login`
+        // on success, or falls back to the slug-based form on 404.
+        .route(
+            "/portal/{slug}/resolve-to-portal-id",
+            get(resolve_slug_to_portal_id),
+        )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             mw,
@@ -75,10 +88,26 @@ async fn login(
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // mokosh-contact-login prompt 011 (PMS-928): body must carry at
+    // least one of portal_id / slug. Missing both folds to the same
+    // generic 401 the service returns on any unresolved handle so
+    // the endpoint stays enumeration-resistant (no distinguishable
+    // "you forgot to send a Portal ID" response).
+    if request.portal_id.is_none()
+        && request
+            .slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(AppError::Unauthorized);
+    }
     let resp = state
         .service
         .login(
-            &request.slug,
+            request.portal_id,
+            request.slug.as_deref(),
             &request.email,
             &request.password,
             request.mfa_code.as_deref(),
@@ -179,6 +208,7 @@ async fn request_login_link(
         .request_login_link(
             &request.email,
             request.slug.as_deref(),
+            request.portal_id,
             Some(addr.ip()),
             ua.as_deref(),
         )
@@ -258,14 +288,43 @@ async fn me(
 
 async fn portal_host(
     State(state): State<ContactRouterState>,
-    Path(slug): Path<String>,
+    Path(handle): Path<String>,
 ) -> AppResult<Json<ContactPortalHostHint>> {
-    let hint = state
-        .service
-        .resolve_host(&slug)
-        .await?
-        .ok_or_else(|| AppError::not_found("portal host"))?;
+    // mokosh-contact-login prompt 011 (PMS-928): dispatch on the
+    // shape of the path segment. All-ASCII-digits parses as a
+    // numeric Portal ID; anything else (a legacy Crockford slug, a
+    // typo) falls through to the slug lookup. `parse::<i64>` is
+    // the discriminator; the range CHECK on `companies.portal_id`
+    // is what guarantees a valid Portal ID sits inside 9 digits, so
+    // an integer outside that range simply misses the row and 404s.
+    let hint = if handle.chars().all(|c| c.is_ascii_digit()) {
+        match handle.parse::<i64>() {
+            Ok(portal_id) => state.service.resolve_host_by_portal_id(portal_id).await?,
+            Err(_) => None,
+        }
+    } else {
+        state.service.resolve_host(&handle).await?
+    };
+    let hint = hint.ok_or_else(|| AppError::not_found("portal host"))?;
     Ok(Json(hint))
+}
+
+/// mokosh-contact-login prompt 011 (PMS-928): the client-side compat
+/// redirect endpoint. Returns `{ portal_id }` for a known legacy
+/// slug whose Company has been assigned a Portal ID, else 404.
+///
+/// Enumeration-resistant by construction: an unknown slug and a
+/// known-slug-without-a-portal_id both return the same 404 shape.
+async fn resolve_slug_to_portal_id(
+    State(state): State<ContactRouterState>,
+    Path(slug): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let portal_id = state
+        .service
+        .resolve_slug_to_portal_id(&slug)
+        .await?
+        .ok_or_else(|| AppError::not_found("portal id"))?;
+    Ok(Json(serde_json::json!({ "portal_id": portal_id })))
 }
 
 // ============================================================================
