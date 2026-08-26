@@ -1382,30 +1382,26 @@ impl ContactService {
                 "contact has no email on file; add one before resending",
             ));
         }
-        let portal_slug: Option<String> = sqlx::query_scalar(
-            "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(contact.company_id)
-        .bind(*tenant_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
-        let Some(slug) = portal_slug else {
-            return Err(AppError::Internal(
-                "portal access is on but company has no portal_slug; re-grant".to_string(),
-            ));
-        };
         // mokosh-contact-login prompt 011 (PMS-928): a resend on an
         // older Company (granted before the portal_id migration
         // landed) may still hold a NULL portal_id. Ensure one is
         // present so the resent email carries the Portal ID header
         // and the new IAM-style login flow can use it.
+        //
+        // Self-heals a Company still missing portal_slug too - the
+        // prior fail-hard branch left operators stuck ("portal access
+        // is on but company has no portal_slug; re-grant") on any
+        // Company granted before the ensure-slug landed in
+        // create/update. Both ensure_ helpers are fast-path + retry
+        // shaped so the happy path (slug already assigned) is a
+        // single SELECT.
         let Some(company_id) = contact.company_id else {
-            return Err(AppError::Internal(
-                "portal access is on but contact has no company_id; re-grant".to_string(),
+            return Err(AppError::conflict(
+                "contact has no company; attach one before resending the portal invite",
             ));
         };
         let portal_id = self.ensure_portal_id(company_id, *tenant_id).await?;
+        let slug = self.ensure_portal_slug(company_id, *tenant_id).await?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
