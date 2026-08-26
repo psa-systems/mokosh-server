@@ -71,6 +71,26 @@ async fn seed_portal_contact(pool: &PgPool, email: &str) -> (Uuid, Uuid, String)
     seed_portal_contact_in_tenant(pool, common::DEFAULT_TENANT_ID, "MCL P010 Co", email).await
 }
 
+/// Option-1 first-login gate: the redeem/select paths now refuse to
+/// mint a session when the target contact's `portal_password_hash` is
+/// NULL, so tests that assert an auto-minted session on redeem must
+/// stamp a dummy hash on the seeded contact first. Any non-empty
+/// string is fine: the tests don't verify the hash, only that the
+/// gate fires ("row has SOMETHING here, don't bounce me to
+/// set-password"). Use a real argon2id shape (hash_password on a fixed
+/// throwaway) so a future gate that validates the hash format keeps
+/// passing.
+async fn stamp_password_hash(pool: &PgPool, contact_id: Uuid) {
+    let hash = mokosh_server::utils::crypto::hash_password("test-fixture-password-x9")
+        .expect("hash test-fixture password");
+    sqlx::query("UPDATE contacts SET portal_password_hash = $1 WHERE id = $2")
+        .bind(hash)
+        .bind(contact_id)
+        .execute(pool)
+        .await
+        .expect("stamp password hash");
+}
+
 /// The grant-portal-access path mints one login-link intent as a
 /// side-effect (that is prompt 010's whole point). Tests that pin
 /// the intent counter for a downstream finder call need a clean
@@ -365,7 +385,10 @@ async fn login_link_respects_per_ip_rate_limit(pool: PgPool) {
 /// refresh token is usable on POST /contact/auth/refresh.
 #[sqlx::test]
 async fn redeem_single_match_auto_mints_session(pool: PgPool) {
-    let (_contact_id, _company_id, _slug) = seed_portal_contact(&pool, "one@mcl.example").await;
+    let (contact_id, _company_id, _slug) = seed_portal_contact(&pool, "one@mcl.example").await;
+    // Option-1 gate: stamp a password so the redeem path mints a
+    // session instead of bouncing to /set-password.
+    stamp_password_hash(&pool, contact_id).await;
     let token = mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "one@mcl.example", None).await;
     let app = common::boot(pool.clone()).await;
 
@@ -604,6 +627,10 @@ async fn select_mints_session_for_chosen_contact(pool: PgPool) {
         "sel@mcl.example",
     )
     .await;
+    // Option-1 gate: both contacts already carry a password so the
+    // select mints a session rather than bouncing to set-password.
+    stamp_password_hash(&pool, a_id).await;
+    stamp_password_hash(&pool, _b_id).await;
     let token = mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "sel@mcl.example", None).await;
     let app = common::boot(pool.clone()).await;
 
@@ -788,7 +815,7 @@ async fn cross_tenant_email_never_leaks_across_msps(pool: PgPool) {
         .expect("seed builtin roles for tenant B");
 
     // Same email in both tenants.
-    let (_a_id, _a_co, a_slug) = seed_portal_contact_in_tenant(
+    let (a_id, _a_co, a_slug) = seed_portal_contact_in_tenant(
         &pool,
         common::DEFAULT_TENANT_ID,
         "Alpha Co (T-A)",
@@ -797,6 +824,11 @@ async fn cross_tenant_email_never_leaks_across_msps(pool: PgPool) {
     .await;
     let (_b_id, _b_co, _b_slug) =
         seed_portal_contact_in_tenant(&pool, tenant_b, "Beta Co (T-B)", "cross@mcl.example").await;
+    // Option-1 gate: stamp a password on the tenant-A contact so the
+    // redeem below mints a real session (the test's cross-tenant
+    // assertion reads contact.tenant_id off the session). Tenant-B's
+    // contact stays password-less; irrelevant to this test.
+    stamp_password_hash(&pool, a_id).await;
     // Clear the intents both grants minted so the finder call below
     // observes only its own write.
     clear_intents(&pool).await;
@@ -865,4 +897,124 @@ async fn cross_tenant_email_never_leaks_across_msps(pool: PgPool) {
         "prompt 010: cross-tenant leak - session pinned to wrong tenant"
     );
     let _ = tenant_b;
+}
+
+/// mokosh-contact-login option-1 first-login gate: a magic-link redeem
+/// for a contact whose `portal_password_hash IS NULL` returns
+/// `password_setup_url` and NO session tokens. The SPA MUST navigate to
+/// the URL and force the recipient to set a password before landing on
+/// `/dashboard`. Every future login for that contact then has both
+/// paths (magic-link OR password) available.
+///
+/// Without this pin a regression that skips the check would silently
+/// re-open the "clicked the magic-link, now I'm password-less and
+/// don't realise it" trap.
+#[sqlx::test]
+async fn redeem_single_match_with_no_password_returns_setup_url(pool: PgPool) {
+    let (_contact_id, _company_id, slug) =
+        seed_portal_contact(&pool, "nopass@mcl.example").await;
+    // Deliberately do NOT call stamp_password_hash: the seed helper
+    // leaves portal_password_hash NULL, which is exactly the state
+    // this test pins.
+    let token =
+        mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "nopass@mcl.example", None).await;
+    let app = common::boot(pool.clone()).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .expect("redeem");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("redeem JSON");
+    let auto = &body["auto"];
+    assert!(
+        !auto.is_null(),
+        "option-1: single-match must still set auto (with the setup URL, not tokens)"
+    );
+    assert_eq!(
+        auto["access_token"].as_str(),
+        Some(""),
+        "option-1: session must NOT be minted before password is set"
+    );
+    assert_eq!(
+        auto["refresh_token"].as_str(),
+        Some(""),
+        "option-1: session must NOT be minted before password is set"
+    );
+    let setup_url = auto["password_setup_url"]
+        .as_str()
+        .expect("password_setup_url present on the auto branch");
+    let expected_prefix = format!("/portal/{slug}/set-password?token=");
+    assert!(
+        setup_url.contains(&expected_prefix),
+        "option-1: password_setup_url must point at /portal/{{slug}}/set-password, got: {setup_url}"
+    );
+}
+
+/// Same option-1 gate on the multi-Company select path: the picker
+/// hands back a session ONLY when the chosen contact already has a
+/// password; else it returns `password_setup_url` scoped to that
+/// specific contact's Company.
+#[sqlx::test]
+async fn select_with_no_password_returns_setup_url(pool: PgPool) {
+    let (a_id, _a_co, a_slug) = seed_portal_contact_in_tenant(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "Alpha Co",
+        "selnopw@mcl.example",
+    )
+    .await;
+    let (_b_id, _b_co, _b_slug) = seed_portal_contact_in_tenant(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "Beta Co",
+        "selnopw@mcl.example",
+    )
+    .await;
+    // Neither contact has a password: both should bounce on select.
+    let token =
+        mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "selnopw@mcl.example", None).await;
+    let app = common::boot(pool.clone()).await;
+
+    let redeem = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .expect("redeem multi");
+    let redeem_body: serde_json::Value = redeem.json().await.expect("redeem JSON");
+    let selection_token = redeem_body["candidates"]["selection_token"]
+        .as_str()
+        .expect("selection_token")
+        .to_string();
+
+    let select = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/select"))
+        .json(&serde_json::json!({
+            "selection_token": selection_token,
+            "contact_id": a_id,
+        }))
+        .send()
+        .await
+        .expect("select");
+    assert_eq!(select.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = select.json().await.expect("select JSON");
+    assert_eq!(
+        body["access_token"].as_str(),
+        Some(""),
+        "option-1: select must NOT mint a session for a password-less contact"
+    );
+    let setup_url = body["password_setup_url"]
+        .as_str()
+        .expect("password_setup_url present on the select response");
+    let expected_prefix = format!("/portal/{a_slug}/set-password?token=");
+    assert!(
+        setup_url.contains(&expected_prefix),
+        "option-1: select's setup URL must be scoped to the picked contact's Company, got: {setup_url}"
+    );
 }

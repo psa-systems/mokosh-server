@@ -96,6 +96,16 @@ pub struct ContactLoginResponse {
     pub contact: Option<ContactMe>,
     #[serde(default)]
     pub mfa_required: bool,
+    /// mokosh-contact-login option-1 first-login gate: when a
+    /// magic-link redeem resolves to a contact whose
+    /// `portal_password_hash` is NULL, the server refuses to mint the
+    /// session and returns this URL instead. The SPA MUST navigate to
+    /// it so the recipient sets a password before landing on
+    /// `/dashboard`. Every future login for that contact then has both
+    /// paths (magic-link OR password) available. `None` on the happy
+    /// path (contact already has a password set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_setup_url: Option<String>,
 }
 
 /// Response body for `GET /api/v1/contact/auth/me`.

@@ -223,6 +223,7 @@ impl ContactAuthService {
             expires_at,
             contact: Some(me),
             mfa_required: false,
+            password_setup_url: None,
         })
     }
 
@@ -325,6 +326,7 @@ impl ContactAuthService {
             expires_at,
             contact: Some(me),
             mfa_required: false,
+            password_setup_url: None,
         })
     }
 
@@ -959,12 +961,12 @@ impl ContactAuthService {
         // render its `/portal/{slug}/*` URLs anyway). Zero rows =
         // same generic invalid error above; do NOT leak revocation.
         #[allow(clippy::type_complexity)]
-        let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String, Option<String>)> =
+        let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String, Option<String>, Option<String>)> =
             sqlx::query_as(
                 r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email,
                        co.name AS company_name, co.portal_slug,
-                       c.portal_mfa_secret
+                       c.portal_mfa_secret, c.portal_password_hash
                 FROM contacts c
                 INNER JOIN companies co ON co.id = c.company_id
                 INNER JOIN tenants t ON t.id = c.tenant_id
@@ -992,7 +994,7 @@ impl ContactAuthService {
         // the code (out of scope for this ticket; contact MFA is
         // off by default).
         if candidates.len() == 1 {
-            let (contact_id, tid, company_id, email_row, _company_name, _slug, mfa_secret) =
+            let (contact_id, tid, company_id, email_row, _company_name, slug, mfa_secret, pwd_hash) =
                 candidates.into_iter().next().unwrap();
             if mfa_secret.is_some() {
                 return Ok(LoginLinkRedeemOutcome {
@@ -1002,6 +1004,26 @@ impl ContactAuthService {
                         expires_at: Utc::now(),
                         contact: None,
                         mfa_required: true,
+                        password_setup_url: None,
+                    }),
+                    candidates: None,
+                });
+            }
+            // Option-1 first-login gate: contact without a password
+            // must set one before landing on /dashboard. Do NOT mint
+            // the session yet; hand the SPA the set-password URL so
+            // the recipient completes the password step. Post-set,
+            // the standard login flow takes over.
+            if pwd_hash.is_none() {
+                let url = self.mint_password_setup_url(tid, contact_id, &slug).await?;
+                return Ok(LoginLinkRedeemOutcome {
+                    auto: Some(ContactLoginResponse {
+                        access_token: String::new(),
+                        refresh_token: String::new(),
+                        expires_at: Utc::now(),
+                        contact: None,
+                        mfa_required: false,
+                        password_setup_url: Some(url),
                     }),
                     candidates: None,
                 });
@@ -1021,7 +1043,7 @@ impl ContactAuthService {
         let companies: Vec<LoginLinkCandidate> = candidates
             .iter()
             .map(
-                |(contact_id, _, _, _, company_name, portal_slug, _)| LoginLinkCandidate {
+                |(contact_id, _, _, _, company_name, portal_slug, _, _)| LoginLinkCandidate {
                     contact_id: *contact_id,
                     company_name: company_name.clone(),
                     portal_slug: portal_slug.clone(),
@@ -1066,9 +1088,11 @@ impl ContactAuthService {
         // contact must still be a portal user + its Company still has
         // a portal_slug. Any change between redeem and select folds
         // to the same generic invalid error.
-        let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+        #[allow(clippy::type_complexity)]
+        let row: Option<(Uuid, String, Option<String>, String, Option<String>)> = sqlx::query_as(
             r#"
-            SELECT c.company_id, c.email, c.portal_mfa_secret
+            SELECT c.company_id, c.email, c.portal_mfa_secret,
+                   co.portal_slug, c.portal_password_hash
             FROM contacts c
             INNER JOIN companies co ON co.id = c.company_id
             INNER JOIN tenants t ON t.id = c.tenant_id
@@ -1083,7 +1107,7 @@ impl ContactAuthService {
         .bind(claims.tid)
         .fetch_optional(self.db.migrator_pool())
         .await?;
-        let Some((company_id, email, mfa_secret)) = row else {
+        let Some((company_id, email, mfa_secret, portal_slug, pwd_hash)) = row else {
             return Err(invalid());
         };
         if mfa_secret.is_some() {
@@ -1093,10 +1117,74 @@ impl ContactAuthService {
                 expires_at: Utc::now(),
                 contact: None,
                 mfa_required: true,
+                password_setup_url: None,
+            });
+        }
+        // Option-1 first-login gate: same shape as redeem_login_link's
+        // single-match branch. A contact reached via the multi-Company
+        // picker who has never set a password gets bounced to the
+        // set-password page before the session is minted.
+        if pwd_hash.is_none() {
+            let url = self
+                .mint_password_setup_url(claims.tid, contact_id, &portal_slug)
+                .await?;
+            return Ok(ContactLoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: Utc::now(),
+                contact: None,
+                mfa_required: false,
+                password_setup_url: Some(url),
             });
         }
         self.mint_session_for_contact(claims.tid, contact_id, company_id, &email, user_agent, ip)
             .await
+    }
+
+    /// mokosh-contact-login option-1 first-login gate: mint a fresh
+    /// portal_setup_tokens row for `contact_id` and return the
+    /// `/portal/{slug}/set-password?token=...` URL the SPA must redirect
+    /// to. Called from the magic-link paths (redeem + select) when the
+    /// target contact has never set a password: forces the "set a
+    /// password to remember it" step before minting the session. On any
+    /// pre-existing pending token this deletes it first so only the
+    /// freshest link redeems.
+    async fn mint_password_setup_url(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        portal_slug: &str,
+    ) -> AppResult<String> {
+        let secret = generate_token(64);
+        let token_hash = hash_password(&secret)?;
+        let token = format!("{contact_id}.{secret}");
+        let expires_at = Utc::now() + Duration::hours(72);
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE portal_setup_tokens SET used_at = NOW() \
+             WHERE contact_id = $1 AND tenant_id = $2 AND used_at IS NULL",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(format!(
+            "{}/portal/{}/set-password?token={}",
+            self.spa_base_url.trim_end_matches('/'),
+            portal_slug,
+            token,
+        ))
     }
 
     /// Shared session-minting used by `redeem_login_link` (single
@@ -1135,6 +1223,7 @@ impl ContactAuthService {
             expires_at,
             contact: Some(me),
             mfa_required: false,
+            password_setup_url: None,
         })
     }
 
