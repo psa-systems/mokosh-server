@@ -1,5 +1,9 @@
 //! Utility modules for Mokosh Server
 
+// PMS-789: the deployment's product name, cached in-process so the DB-free
+// paths (the catch-all 404 page, mail built inside an open transaction) can
+// read it synchronously.
+pub mod app_name;
 pub mod client_ip;
 pub mod crypto;
 pub mod datetime;

@@ -23,7 +23,8 @@ So a fresh instance with no SMTP configured still lets the platform admin sign i
 1. Spin up the instance (see `docs/quickstart.md` for the dev stack; production is the same server behind bunyip-as-OP with `OIDC_ISSUER` + `OIDC_AUDIENCE` set to bunyip).
 2. Sign in through the SPA with the bunyip account that holds the platform-admin role. You land as `super_admin` with no email configured and no verification step.
 3. Configure email as that admin: `PUT /api/v1/settings/email` (admin-only, `RequireAdmin`; PMS-638). The SMTP password is stored AES-256-GCM-encrypted and the live mailer is hot-swapped on write, so email starts working with no restart. Any field left unset falls back to the matching `SMTP_*` env var.
-4. From here, invite the rest of the team. Later users go through normal verification: an invite to address X is only consumed by a bunyip login with a verified X (`place_bunyip_user`'s invite gate, PMS-248). Turning email on does not change or downgrade the bootstrap admin.
+4. Name the deployment as that admin: `PUT /api/v1/settings/app-name` (admin-only, `RequireAdmin`; PMS-789), body `{"app_name": "PSA Systems"}`. This is the product name recipients see in outbound mail, in the authenticator app when they enrol in MFA, and on the API's own landing page. It is one value for the whole deployment, not per tenant, and it takes effect immediately with no restart. Leave it unset and everything reads `Mokosh`; send an empty string to clear it back to that. It is deliberately not an environment variable, so changing it never needs a redeploy.
+5. From here, invite the rest of the team. Later users go through normal verification: an invite to address X is only consumed by a bunyip login with a verified X (`place_bunyip_user`'s invite gate, PMS-248). Turning email on does not change or downgrade the bootstrap admin.
 
 ## Local development: the ADMIN_EMAIL / ADMIN_PASSWORD seed
 

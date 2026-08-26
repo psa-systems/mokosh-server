@@ -873,6 +873,11 @@ impl NotificationsService {
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<Vec<RenderedNotification>> {
+        // PMS-789: the deployment's name is supplied here rather than by each
+        // of the dispatch call sites, so no template can name the product and
+        // find `{{app_name}}` unresolved because one caller forgot it.
+        let merged = with_app_name(context);
+        let context = &merged;
         let rules = sqlx::query_as::<_, RuleRow>(
             r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
                FROM notification_rules
@@ -1127,6 +1132,30 @@ fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) ->
 /// [`render_template`]. Exported so a test can count renders without
 /// hardcoding a module path.
 pub const RENDER_TRACE_TARGET: &str = "mokosh::notifications::render";
+
+/// Add `app_name` to a render context, overwriting any value the caller
+/// supplied (PMS-789).
+///
+/// Overwriting rather than defaulting: the product name is a property of the
+/// deployment, so a caller-supplied one would let context data rename the
+/// product in an outbound email. A context that is not an object carries no
+/// top-level keys for `render_template` to resolve anyway, so replacing it
+/// loses nothing.
+fn with_app_name(context: &serde_json::Value) -> serde_json::Value {
+    let name = serde_json::Value::String(crate::utils::app_name::app_name().to_string());
+    let mut merged = context.clone();
+    match merged.as_object_mut() {
+        Some(obj) => {
+            obj.insert("app_name".to_string(), name);
+        }
+        None => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("app_name".to_string(), name);
+            merged = serde_json::Value::Object(obj);
+        }
+    }
+    merged
+}
 
 /// Minimal `{{key}}` substitution. Keys are resolved against the
 /// top-level fields of `context`; missing keys leave the placeholder

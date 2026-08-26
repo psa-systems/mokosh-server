@@ -331,11 +331,15 @@ impl AutomationEngine {
                     // without a dispatcher. `params.to` is still
                     // required either way.
                     let to = action.params.get("to").and_then(|v| v.as_str());
+                    // PMS-789: the fallback subject names the deployment, so
+                    // it is the configured name rather than a literal.
+                    let default_subject =
+                        format!("{} ticket update", crate::utils::app_name::app_name());
                     let subject = action
                         .params
                         .get("subject")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("Mokosh ticket update");
+                        .unwrap_or(&default_subject);
                     let body = action
                         .params
                         .get("body")

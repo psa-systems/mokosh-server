@@ -94,9 +94,13 @@ impl InvitationsService {
                 .bind(tenant_id)
                 .fetch_one(&mut *tx)
                 .await?;
-            let subject = format!("You have been invited to {tenant_name} on Mokosh");
+            // PMS-789: the product name is the deployment's, read from the
+            // in-process cache rather than queried - this is inside an open
+            // tenant transaction, and the value lives on the system tenant.
+            let app = crate::utils::app_name::app_name();
+            let subject = format!("You have been invited to {tenant_name} on {app}");
             let body = format!(
-                "You have been invited to join {tenant_name} on Mokosh as a {role}.\n\n\
+                "You have been invited to join {tenant_name} on {app} as a {role}.\n\n\
                  Sign in to accept the invitation:\n{app_url}\n\n\
                  The invitation expires in {ttl} days. If you did not expect this, you can ignore this email.",
                 role = request.role,

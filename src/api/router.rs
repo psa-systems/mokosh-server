@@ -701,6 +701,10 @@ async fn not_a_frontend(
         .strip_prefix("api.msp.")
         .map(|tld| format!("https://{tld}"))
         .unwrap_or(fallback_origin);
+    // PMS-789: read the cached name. This handler has no `State` and must
+    // render when the database is down, which is when it is most looked at.
+    // Escaped: `sanitize` bars control characters, not `<` or `&`.
+    let app = crate::utils::html::html_escape(&crate::utils::app_name::app_name());
     let body = format!(
         "<!doctype html>\n\
          <html lang=\"en\">\n\
@@ -712,7 +716,7 @@ async fn not_a_frontend(
          </head>\n\
          <body>\n\
          <h1>This is an API endpoint.</h1>\n\
-         <p>You're looking at the Mokosh backend API. There is no user interface here.</p>\n\
+         <p>You're looking at the {app} backend API. There is no user interface here.</p>\n\
          <p>Visit <a href=\"{hub_link}\">{hub_link}</a> to reach the application.</p>\n\
          </body>\n\
          </html>\n"

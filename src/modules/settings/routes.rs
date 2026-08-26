@@ -67,6 +67,10 @@ pub fn settings_routes(
         // /settings/{category}/{key} matcher). Lets an operator exercise email
         // without a password reset.
         .route("/settings/email/test-send", post(post_email_test_send))
+        // PMS-789: the deployment-wide product name. Literal, so it is matched
+        // before the generic `/settings/{category}` below - which writes the
+        // CALLER's tenant and is therefore not a way to set a system value.
+        .route("/settings/app-name", get(get_app_name).put(put_app_name))
         // PMS-113 AC1: category- and per-key tenant_settings endpoints.
         // Placed AFTER /settings/modules so the literal "modules"
         // segment matches the module routes first and only a non-
@@ -112,14 +116,38 @@ async fn post_email_test_send(
     Json(req): Json<super::email::TestEmailRequest>,
 ) -> AppResult<axum::http::StatusCode> {
     use crate::utils::email::Mailer;
+    let app = crate::utils::app_name::app_name();
     s.shared_mailer
         .send_text(
             &req.to,
-            "Mokosh test email",
-            "This is a test email from Mokosh. If you received it, outbound email is working.",
+            &format!("{app} test email"),
+            &format!(
+                "This is a test email from {app}. If you received it, outbound email is working."
+            ),
         )
         .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// PMS-789: read the deployment-wide product name (admin only).
+async fn get_app_name(
+    State(s): State<SettingsRouterState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<super::app_name::AppNameView>> {
+    Ok(Json(super::app_name::get_app_name_settings(&s.db).await?))
+}
+
+/// PMS-789: write the deployment-wide product name (admin only). The write
+/// refreshes the process cache, so the next mail sent and the next 404 page
+/// rendered carry the new name with no restart.
+async fn put_app_name(
+    State(s): State<SettingsRouterState>,
+    _admin: RequireAdmin,
+    Json(input): Json<super::app_name::AppNameInput>,
+) -> AppResult<Json<super::app_name::AppNameView>> {
+    Ok(Json(
+        super::app_name::put_app_name_settings(&s.db, input).await?,
+    ))
 }
 
 async fn list_settings(

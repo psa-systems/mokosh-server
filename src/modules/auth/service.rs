@@ -1803,8 +1803,13 @@ impl AuthService {
         .await?;
         tx.commit().await?;
 
-        let label = format!("Mokosh:{}", user.email);
-        let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, "Mokosh");
+        // PMS-789: the issuer an authenticator app shows next to the code.
+        // The colon is the otpauth label separator, so one inside the operator's
+        // name would split the label in the wrong place once the app decodes
+        // the percent-encoding.
+        let app = crate::utils::app_name::app_name().replace(':', " ");
+        let label = format!("{app}:{}", user.email);
+        let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, &app);
 
         Ok(crate::modules::auth::models::MfaSetupResponse {
             secret: secret_b32,
