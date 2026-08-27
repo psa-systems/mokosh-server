@@ -693,7 +693,7 @@ async fn complete_onboarding_stamps_the_profile_once(pool: PgPool) {
     );
 
     let user = auth
-        .mark_profile_completed(tenant, sub)
+        .mark_profile_completed(tenant, sub, None, None)
         .await
         .expect("complete onboarding");
     assert!(
@@ -705,10 +705,91 @@ async fn complete_onboarding_stamps_the_profile_once(pool: PgPool) {
     // when it was last re-submitted.
     let stamped = user.profile_completed_at;
     let again = auth
-        .mark_profile_completed(tenant, sub)
+        .mark_profile_completed(tenant, sub, None, None)
         .await
         .expect("second call");
     assert_eq!(again.profile_completed_at, stamped);
+}
+
+/// Regression: the onboarding screen collects a first + last name for a
+/// user whose bunyip claims did not carry them. Pre-fix the screen
+/// PUT /auth/me those two fields and the server dropped them silently
+/// (PMS-512 removed name fields from UpdateUserRequest so bunyip stays
+/// authoritative on the OIDC path). The correct plumbing is a
+/// name-carrying body on `POST /auth/me/complete-onboarding` that
+/// writes ONLY on first completion (guarded by
+/// `WHERE profile_completed_at IS NULL`) so a later bunyip-refreshed
+/// name is not clobbered by a replay of the endpoint.
+#[sqlx::test]
+async fn complete_onboarding_persists_names_on_first_call_and_locks_thereafter(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("nameless2@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
+
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("nameless2@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("placed");
+
+    let (tenant, _) = user_tenant_role(&pool, sub).await;
+    // First submit: names carried from the SPA land on the row + the
+    // profile stamps. This is the ONLY moment the endpoint can write
+    // names; the guard clause locks them after.
+    let user = auth
+        .mark_profile_completed(tenant, sub, Some("Wanda"), Some("Vasquez"))
+        .await
+        .expect("first complete");
+    assert!(
+        user.profile_completed_at.is_some(),
+        "must stamp the profile"
+    );
+    assert_eq!(user.first_name, "Wanda", "first submit persists first_name");
+    assert_eq!(user.last_name, "Vasquez", "first submit persists last_name");
+
+    // Replay with a DIFFERENT name payload: the guard clause blocks the
+    // write. Names stay at their original values; timestamp stays
+    // COALESCE-frozen too. This is what prevents a stolen access token
+    // from silently renaming a user through the onboarding endpoint.
+    let stamped = user.profile_completed_at;
+    let again = auth
+        .mark_profile_completed(tenant, sub, Some("Attacker"), Some("Impersonator"))
+        .await
+        .expect("replay");
+    assert_eq!(
+        again.first_name, "Wanda",
+        "post-onboarding replay must not overwrite the first_name (bunyip stays authoritative)"
+    );
+    assert_eq!(
+        again.last_name, "Vasquez",
+        "post-onboarding replay must not overwrite the last_name (bunyip stays authoritative)"
+    );
+    assert_eq!(
+        again.profile_completed_at, stamped,
+        "timestamp still frozen"
+    );
 }
 
 /// PMS-512: bunyip owns the profile names, so the local columns are a

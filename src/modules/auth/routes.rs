@@ -15,10 +15,10 @@ use validator::Validate;
 
 use super::{
     google_login, rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest,
-    CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest,
-    ListUsersFilter, LoginRequest, LoginResponse, MfaDisableRequest, MfaEnableRequest,
-    MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse,
-    ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
+    CompleteOnboardingRequest, CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest,
+    ForgotPasswordRequest, ListUsersFilter, LoginRequest, LoginResponse, MfaDisableRequest,
+    MfaEnableRequest, MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest,
+    RefreshTokenResponse, ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::{RequireAuth, RequireAuthState, RequireManager};
 use crate::utils::error::{AppError, AppResult};
@@ -494,10 +494,27 @@ async fn update_current_user(
 async fn complete_onboarding(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    body: Option<Json<CompleteOnboardingRequest>>,
 ) -> AppResult<Json<UserResponse>> {
+    // Body is optional so a client that only needs to stamp the
+    // timestamp can POST with no body (empty payload rejected by
+    // Axum's Json extractor would 415 the caller; falling through to
+    // an Option lets the empty case be graceful).
+    let (first_name, last_name) = match body {
+        Some(Json(req)) => {
+            req.validate()?;
+            (req.first_name, req.last_name)
+        }
+        None => (None, None),
+    };
     let updated = state
         .auth_service
-        .mark_profile_completed(user.tenant_id, user.id)
+        .mark_profile_completed(
+            user.tenant_id,
+            user.id,
+            first_name.as_deref(),
+            last_name.as_deref(),
+        )
         .await?;
     Ok(Json(updated.into()))
 }

@@ -2512,9 +2512,48 @@ impl AuthService {
     /// `COALESCE` keeps the first timestamp, so this is idempotent: a double
     /// submit records when onboarding was actually finished, not when it was
     /// last re-submitted.
+    ///
+    /// The optional `first_name` / `last_name` args are the standalone
+    /// bootstrap fallback: the onboarding screen collects them for users whose
+    /// bunyip claims did not carry names. Names are written ONLY on first
+    /// completion (guarded by `WHERE profile_completed_at IS NULL` on the
+    /// name UPDATE) so a replay after a subsequent bunyip login refreshed the
+    /// row cannot overwrite the authoritative name from the IdP. Bunyip
+    /// remains the identity source of truth on the OIDC path (PMS-512); this
+    /// path fills the gap only when it is genuinely empty.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn mark_profile_completed(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<User> {
+    pub async fn mark_profile_completed(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        first_name: Option<&str>,
+        last_name: Option<&str>,
+    ) -> AppResult<User> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Names first (under the write-once guard) so the timestamp
+        // stamp below decides idempotency, not the name write. The
+        // UPDATE's `WHERE profile_completed_at IS NULL` clause is
+        // what turns a replay into a no-op even if a different name
+        // shows up in the body: an already-onboarded user cannot
+        // rewrite their name through this endpoint.
+        let first_trim = first_name.map(str::trim).filter(|s| !s.is_empty());
+        let last_trim = last_name.map(str::trim).filter(|s| !s.is_empty());
+        if first_trim.is_some() || last_trim.is_some() {
+            sqlx::query(
+                "UPDATE users \
+                 SET first_name = COALESCE($1, first_name), \
+                     last_name  = COALESCE($2, last_name), \
+                     updated_at = NOW() \
+                 WHERE id = $3 AND tenant_id = $4 \
+                   AND profile_completed_at IS NULL",
+            )
+            .bind(first_trim)
+            .bind(last_trim)
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE users SET profile_completed_at = COALESCE(profile_completed_at, NOW()), \
                               updated_at = NOW() \

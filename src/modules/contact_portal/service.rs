@@ -837,9 +837,7 @@ impl ContactAuthService {
         .fetch_one(self.db.migrator_pool())
         .await?;
         if per_email >= LOGIN_INTENT_MAX_PER_EMAIL_PER_15_MIN {
-            tracing::info!(
-                "login-link request silently dropped: per-email rate limit reached"
-            );
+            tracing::info!("login-link request silently dropped: per-email rate limit reached");
             return Ok(());
         }
 
@@ -996,9 +994,17 @@ impl ContactAuthService {
         // render its `/portal/{slug}/*` URLs anyway). Zero rows =
         // same generic invalid error above; do NOT leak revocation.
         #[allow(clippy::type_complexity)]
-        let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                r#"
+        let candidates: Vec<(
+            Uuid,
+            Uuid,
+            Uuid,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email,
                        co.name AS company_name, co.portal_slug,
                        c.portal_mfa_secret, c.portal_password_hash
@@ -1013,12 +1019,12 @@ impl ContactAuthService {
                   AND ($3::UUID IS NULL OR c.company_id = $3)
                 ORDER BY co.name
                 "#,
-            )
-            .bind(tenant_id)
-            .bind(&intent_email)
-            .bind(scope_company_id)
-            .fetch_all(self.db.migrator_pool())
-            .await?;
+        )
+        .bind(tenant_id)
+        .bind(&intent_email)
+        .bind(scope_company_id)
+        .fetch_all(self.db.migrator_pool())
+        .await?;
         if candidates.is_empty() {
             return Err(invalid());
         }

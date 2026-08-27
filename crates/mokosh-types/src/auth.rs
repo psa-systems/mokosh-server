@@ -757,6 +757,28 @@ pub struct UpdateUserRequest {
     pub login_location_alerts: Option<bool>,
 }
 
+/// Request body for `POST /api/v1/auth/me/complete-onboarding`.
+///
+/// The forced-onboarding screen collects `first_name` + `last_name` for a
+/// user whose bunyip claims did not carry them (the JIT insert stamps
+/// synthetic names derived from the email local-part when the claims are
+/// absent). Both fields are optional here so a caller that only needs to
+/// flip `profile_completed_at` (e.g. a user whose names were already set
+/// on a subsequent bunyip login) can POST an empty body.
+///
+/// Names are written ONLY on first completion (server guards with a
+/// `WHERE profile_completed_at IS NULL` clause): a replay after the row
+/// already carries a real bunyip-refreshed name must not overwrite it.
+/// PMS-512 keeps bunyip as the identity source of truth for names on
+/// the OIDC path; this endpoint is the standalone bootstrap fallback.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct CompleteOnboardingRequest {
+    #[validate(length(min = 1, max = 100, message = "First name must be 1-100 characters"))]
+    pub first_name: Option<String>,
+    #[validate(length(min = 1, max = 100, message = "Last name must be 1-100 characters"))]
+    pub last_name: Option<String>,
+}
+
 /// User list filter parameters. Parsed from the query string on
 /// `GET /api/v1/auth/users`. `q` matches `email`, `first_name`,
 /// and `last_name` via case-insensitive substring; capped at 200

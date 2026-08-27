@@ -911,8 +911,7 @@ async fn cross_tenant_email_never_leaks_across_msps(pool: PgPool) {
 /// don't realise it" trap.
 #[sqlx::test]
 async fn redeem_single_match_with_no_password_returns_setup_url(pool: PgPool) {
-    let (_contact_id, _company_id, slug) =
-        seed_portal_contact(&pool, "nopass@mcl.example").await;
+    let (_contact_id, _company_id, slug) = seed_portal_contact(&pool, "nopass@mcl.example").await;
     // Deliberately do NOT call stamp_password_hash: the seed helper
     // leaves portal_password_hash NULL, which is exactly the state
     // this test pins.
@@ -975,8 +974,13 @@ async fn select_with_no_password_returns_setup_url(pool: PgPool) {
     )
     .await;
     // Neither contact has a password: both should bounce on select.
-    let token =
-        mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "selnopw@mcl.example", None).await;
+    let token = mint_intent_direct(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "selnopw@mcl.example",
+        None,
+    )
+    .await;
     let app = common::boot(pool.clone()).await;
 
     let redeem = app
@@ -1031,8 +1035,7 @@ async fn select_with_no_password_returns_setup_url(pool: PgPool) {
 /// gets a link.
 #[sqlx::test]
 async fn login_link_without_slug_falls_back_to_cross_tenant_email_match(pool: PgPool) {
-    let (_contact_id, _company_id, _slug) =
-        seed_portal_contact(&pool, "nosslug@mcl.example").await;
+    let (_contact_id, _company_id, _slug) = seed_portal_contact(&pool, "nosslug@mcl.example").await;
     // Nuke the intent grant_portal_access minted so the assertion
     // below reflects only the finder call.
     clear_intents(&pool).await;
@@ -1090,8 +1093,7 @@ async fn login_link_without_slug_falls_back_to_cross_tenant_email_match(pool: Pg
 /// under the new fallback shape.
 #[sqlx::test]
 async fn login_link_without_slug_unknown_email_stays_enum_resistant(pool: PgPool) {
-    let (_contact_id, _company_id, _slug) =
-        seed_portal_contact(&pool, "someone@mcl.example").await;
+    let (_contact_id, _company_id, _slug) = seed_portal_contact(&pool, "someone@mcl.example").await;
     clear_intents(&pool).await;
     let app = common::boot(pool.clone()).await;
 
@@ -1104,11 +1106,10 @@ async fn login_link_without_slug_unknown_email_stays_enum_resistant(pool: PgPool
         .expect("login-link unknown");
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
 
-    let intent_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM portal_login_intents")
-            .fetch_one(&pool)
-            .await
-            .expect("count intents");
+    let intent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM portal_login_intents")
+        .fetch_one(&pool)
+        .await
+        .expect("count intents");
     assert_eq!(
         intent_count, 0,
         "unknown email must NOT mint an intent even under the no-slug fallback"
