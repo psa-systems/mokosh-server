@@ -23,6 +23,8 @@ struct ApprovalRow {
     target: String,
     entity_id: Uuid,
     ticket_id: Option<Uuid>,
+    entity_reference: Option<String>,
+    entity_label: Option<String>,
     requested_by_id: Uuid,
     requested_by_name: Option<String>,
     approver_user_id: Option<Uuid>,
@@ -44,6 +46,8 @@ impl From<ApprovalRow> for ApprovalResponse {
             target: r.target,
             entity_id: r.entity_id,
             ticket_id: r.ticket_id,
+            entity_reference: r.entity_reference,
+            entity_label: r.entity_label,
             requested_by_id: r.requested_by_id,
             requested_by_name: r.requested_by_name,
             approver_user_id: r.approver_user_id,
@@ -70,13 +74,43 @@ const SELECT_FIELDS: &str = "
     a.approver_role, a.status, a.notes, a.decision_notes,
     a.decided_by_id,
     NULLIF(TRIM(CONCAT(db.first_name, ' ', db.last_name)), '') AS decided_by_name,
+    CASE a.target
+        WHEN 'ticket' THEN t.ticket_number
+        WHEN 'quote' THEN q.quote_number
+    END AS entity_reference,
+    CASE a.target
+        WHEN 'ticket' THEN t.title
+        WHEN 'change_request' THEN cr.title
+        WHEN 'quote' THEN q.title
+        -- `||`, not CONCAT: CONCAT renders a NULL operand as the empty
+        -- string, so a deleted time entry would resolve to ' min on '
+        -- instead of NULL and the client would print that instead of
+        -- falling back. `||` propagates the NULL.
+        WHEN 'time_entry' THEN
+            te.duration_minutes || ' min on ' || TO_CHAR(te.date, 'YYYY-MM-DD')
+    END AS entity_label,
     a.requested_at, a.decided_at
 ";
 
+/// PMS-940: the four parent joins resolve the approval's subject the
+/// same way the three `users` joins resolve its people. Each carries
+/// its own `a.target` predicate so exactly one can match a row, and an
+/// explicit `tenant_id = a.tenant_id` so the parent stays tenant-scoped
+/// whether or not the connecting role is subject to RLS. LEFT, so an
+/// approval whose parent has since been deleted still reads (both
+/// resolved columns land NULL) instead of vanishing from the queue.
 const SELECT_JOINS: &str = "
     LEFT JOIN users rb ON rb.id = a.requested_by_id
     LEFT JOIN users au ON au.id = a.approver_user_id
     LEFT JOIN users db ON db.id = a.decided_by_id
+    LEFT JOIN tickets t
+           ON a.target = 'ticket' AND t.id = a.entity_id AND t.tenant_id = a.tenant_id
+    LEFT JOIN change_requests cr
+           ON a.target = 'change_request' AND cr.id = a.entity_id AND cr.tenant_id = a.tenant_id
+    LEFT JOIN quotes q
+           ON a.target = 'quote' AND q.id = a.entity_id AND q.tenant_id = a.tenant_id
+    LEFT JOIN time_entries te
+           ON a.target = 'time_entry' AND te.id = a.entity_id AND te.tenant_id = a.tenant_id
 ";
 
 /// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
