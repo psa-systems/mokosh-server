@@ -58,6 +58,12 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         // caller's Company (foreign quote 404s, not 403s).
         .route("/quotes/{quote_id}/accept", post(accept_quote))
         .route("/quotes/{quote_id}/decline", post(decline_quote))
+        // PMS-936: contact- and staff-callable quote PDF surface.
+        // Contact plane gates on `quotes:download_pdf`; server-side
+        // PDF generation is deferred to a follow-up ticket so the
+        // handler currently returns 501 with a helpful message. The
+        // capability gate is the load-bearing piece of the ticket.
+        .route("/quotes/{quote_id}/pdf", get(get_quote_pdf))
         .route("/quotes/{quote_id}/lines", post(add_line))
         .route(
             "/quotes/{quote_id}/lines/{line_id}",
@@ -129,6 +135,41 @@ fn assert_staff_billing_finance(auth: &crate::modules::auth::AuthState) -> AppRe
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
     Ok(())
+}
+
+/// PMS-936: dual-plane quote PDF endpoint. Contact caller gates on
+/// `quotes:download_pdf` + Company scope; staff caller keeps the
+/// RequireBilling + RequireFinance inline check. Actual PDF rendering
+/// is deferred to a follow-up ticket - the response is 501 with a
+/// helpful message once every authz gate passes. The cap gate is what
+/// matters for this ticket.
+async fn get_quote_pdf(
+    State(state): State<QuotesRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(quote_id): Path<Uuid>,
+) -> AppResult<axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_billing_finance(auth)?,
+        CallerContext::Contact(_) => {
+            caller
+                .require_capability(caps::QUOTES_DOWNLOAD_PDF, &db)
+                .await?;
+        }
+    }
+    let quote = state.service.get_quote(caller.tenant(), quote_id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if quote.company_id != session.company_id {
+            return Err(AppError::NotFound("Quote".to_string()));
+        }
+    }
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        "quote PDF download is not yet wired; see PMS-936 follow-up",
+    )
+        .into_response())
 }
 
 /// mokosh-contact-login prompt 008: contact-plane accept endpoint.

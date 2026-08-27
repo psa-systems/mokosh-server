@@ -162,7 +162,11 @@ impl AttachmentService {
     /// Verify the ticket exists in the tenant; for portal callers,
     /// also require the ticket's company matches the contact's
     /// company. Returns NotFound on any mismatch.
-    async fn assert_ticket_visible_to_company(
+    ///
+    /// PMS-936: made `pub` so the dual-plane portal attach-file route
+    /// (which lives on the tickets router, not this attachments
+    /// router) can reuse the same leak-free scope check.
+    pub async fn assert_ticket_visible_to_company(
         &self,
         tenant_id: Uuid,
         ticket_id: Uuid,
@@ -257,6 +261,36 @@ impl AttachmentService {
             bytes,
             None,
             Some(contact_id),
+        )
+        .await
+    }
+
+    /// PMS-936: persist a ticket-level attachment uploaded via the
+    /// portal contact plane (or staff, when the same endpoint is
+    /// reached with a staff bearer). Takes an `Option<Uuid>` for each
+    /// of the two attribution columns so the caller can stamp
+    /// exactly one and leave the other NULL. Reuses the same on-disk
+    /// layout + size cap as the agent / email paths.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_ticket_level_attachment(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        uploaded_by_id: Option<Uuid>,
+        created_by_contact_id: Option<Uuid>,
+        file_name: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+    ) -> AppResult<AttachmentResponse> {
+        self.insert_blob(
+            tenant_id,
+            ticket_id,
+            None,
+            file_name,
+            mime_type,
+            bytes,
+            uploaded_by_id,
+            created_by_contact_id,
         )
         .await
     }

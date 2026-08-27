@@ -2328,12 +2328,20 @@ impl TicketService {
     /// `note_type = 'public'` audit trail so the agent sees WHY the
     /// ticket came back. A ticket already in an open status stays
     /// unchanged (idempotent) so a double-click does not thrash.
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, ticket_id = %ticket_id, contact_id = %contact_id))]
+    ///
+    /// PMS-936: `contact_id` is now `Option<Uuid>` so the same reopen
+    /// implementation covers both the portal contact plane and the
+    /// staff plane. `Some(id)` stamps the audit note's
+    /// `created_by_contact_id` (portal); `None` leaves it NULL and the
+    /// note's authorship falls back to the caller-supplied
+    /// `staff_created_by_id`, matching how staff-authored public
+    /// notes attribute in the ticket_notes table.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, ticket_id = %ticket_id, contact_id = ?contact_id))]
     pub async fn reopen_portal_ticket(
         &self,
         tenant_id: TenantId,
         company_id: Uuid,
-        contact_id: Uuid,
+        contact_id: Option<Uuid>,
         ticket_id: Uuid,
         reason: Option<&str>,
     ) -> AppResult<TicketResponse> {

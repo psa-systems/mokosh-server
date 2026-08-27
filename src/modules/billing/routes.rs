@@ -41,6 +41,15 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
+        // PMS-936: contact- and staff-callable invoice PDF surface.
+        // Contact plane gates on `invoices:download_pdf`; server-side
+        // PDF generation is deferred to a follow-up ticket so the
+        // handler currently returns 501 with a helpful message. The
+        // capability gate is the load-bearing piece of the ticket.
+        .route(
+            "/invoices/{invoice_id}/pdf",
+            axum::routing::get(get_invoice_pdf),
+        )
         .route("/payments", get(list_payments).post(create_payment))
         .route("/payments/{payment_id}", delete(delete_payment))
         .route(
@@ -421,4 +430,47 @@ fn assert_staff_billing_finance(auth: &crate::modules::auth::AuthState) -> AppRe
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
     Ok(())
+}
+
+/// PMS-936: dual-plane invoice PDF endpoint. Contact caller gates on
+/// `invoices:download_pdf` + Company scope (foreign row 404s to stay
+/// enumeration-resistant); staff caller keeps the RequireBilling +
+/// RequireFinance inline check.
+///
+/// Server-side PDF rendering is deferred to a follow-up ticket; the
+/// endpoint returns 501 with a helpful message once every authz gate
+/// passes. The cap gate is what matters for this ticket - a
+/// downstream implementation can hang the actual `render_invoice_pdf`
+/// call inside the same handler without disturbing any of the
+/// authorization surface.
+async fn get_invoice_pdf(
+    State(state): State<BillingRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller
+                .require_capability(caps::INVOICES_DOWNLOAD_PDF, &db)
+                .await?;
+        }
+    }
+    let inv = state.service.get_invoice(tenant, invoice_id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if inv.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        "invoice PDF download is not yet wired; see PMS-936 follow-up",
+    )
+        .into_response())
 }

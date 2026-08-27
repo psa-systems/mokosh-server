@@ -17,6 +17,47 @@
 //! `manage_sub_user` - the surface of things a contact can request
 //! from the mokosh workspace. Never grants `companies:*` or
 //! `contacts:create`: those stay staff-only by construction.
+//!
+//! PMS-936 (foundation pass): the following five per-tab granular
+//! capabilities land in this migration slice as the highest-value
+//! subset of the full ~26 proposed catalog. The remaining ~21 caps are
+//! deferred to per-tab follow-up tickets and MUST land in NEW
+//! migrations rather than editing the seeds already on `main`:
+//!
+//! Deferred follow-up capabilities (each becomes its own PMS ticket):
+//! - `tickets:attach_download` (download attachments on tickets scoped
+//!   to the Company)
+//! - `tickets:request_service` (submit a service-request form; overlaps
+//!   `forms:submit` if the request is form-driven)
+//! - `tickets:mark_all_read` (bulk-clear notification badges on tickets)
+//! - `invoices:view_payments` (see payment history against invoices)
+//! - `invoices:pay_partial` (split pay flow; today `invoices:pay` covers
+//!   the full-amount checkout only)
+//! - `quotes:comment` (post a public comment on a quote thread)
+//! - `quotes:request_revision` (kick a revise cycle back to the MSP)
+//! - `contracts:comment` (post a public comment on a contract thread)
+//! - `contracts:download_pdf` (download the contract PDF)
+//! - `contracts:request_change` (open a change-request ticket linked to
+//!   the contract)
+//! - `projects:comment` (post a public comment on a project thread)
+//! - `projects:approve_milestone` (accept a milestone on behalf of the
+//!   Company)
+//! - `assets:comment` (post a public comment on an asset)
+//! - `assets:download_docs` (download asset-attached documentation)
+//! - `kb:comment` (leave feedback on a KB article)
+//! - `forms:list_own` (list request forms this contact submitted)
+//! - `notifications:manage_own_prefs` (edit per-channel notification
+//!   preferences)
+//! - `notifications:mark_all_read` (bulk-clear the notification tray)
+//! - `settings:manage_own_mfa` (split off from `settings:manage_own` to
+//!   let a role edit profile without touching MFA)
+//! - `settings:manage_own_sessions` (split off from `settings:manage_own`
+//!   to let a role revoke sessions without touching profile)
+//! - `contacts:list_sub_users` (read-only view of colleagues at the
+//!   same Company; today folded into `contacts:manage_sub_user`)
+//!
+//! Each of the above stays a follow-up ticket so this pass ships fast
+//! and the five foundation caps do not block on the other twenty-one.
 
 /// See tickets in the mokosh workspace scoped to the contact's own Company.
 pub const TICKETS_READ: &str = "tickets:read";
@@ -24,21 +65,39 @@ pub const TICKETS_READ: &str = "tickets:read";
 pub const TICKETS_WRITE: &str = "tickets:write";
 /// Post a public comment on an existing ticket. Cannot post internal notes.
 pub const TICKETS_COMMENT: &str = "tickets:comment";
+/// PMS-936: reopen a resolved or closed ticket so the MSP works on it again.
+/// The server clears `closed_at` / `resolved_at`, flips the status back to
+/// the tenant's default, and appends a public audit note.
+pub const TICKETS_REOPEN: &str = "tickets:reopen";
+/// PMS-936: attach a file (JSON base64 body) to an existing ticket the
+/// caller's Company owns. Row is stamped with `created_by_contact_id`.
+pub const TICKETS_ATTACH_FILE: &str = "tickets:attach_file";
 
 /// View invoices scoped to the contact's own Company.
 pub const INVOICES_READ: &str = "invoices:read";
 /// Trigger a payment checkout (Stripe / Paddle) for an outstanding invoice.
 pub const INVOICES_PAY: &str = "invoices:pay";
+/// PMS-936: download the rendered PDF of an invoice scoped to the
+/// caller's Company. Gated separately from `invoices:read` so a
+/// role can see invoice totals in the SPA without pulling the PDF.
+pub const INVOICES_DOWNLOAD_PDF: &str = "invoices:download_pdf";
 
 /// View quotes scoped to the contact's own Company.
 pub const QUOTES_READ: &str = "quotes:read";
 /// Accept or decline a quote on behalf of the Company.
 pub const QUOTES_ACCEPT: &str = "quotes:accept";
+/// PMS-936: download the rendered PDF of a quote scoped to the caller's
+/// Company. Same rationale as `invoices:download_pdf`.
+pub const QUOTES_DOWNLOAD_PDF: &str = "quotes:download_pdf";
 
 /// View contracts scoped to the contact's own Company.
 pub const CONTRACTS_READ: &str = "contracts:read";
 /// View assets (CIs) scoped to the contact's own Company.
 pub const ASSETS_READ: &str = "assets:read";
+/// PMS-936: file a new ticket linked to a specific asset the caller's
+/// Company owns. Creates the ticket via the standard ticket-create path
+/// with `asset_id` set and `source = 'portal'`.
+pub const ASSETS_REPORT_ISSUE: &str = "assets:report_issue";
 /// View projects scoped to the contact's own Company.
 pub const PROJECTS_READ: &str = "projects:read";
 /// Read published Knowledge Base articles visible to the Company.
@@ -72,12 +131,17 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     TICKETS_READ,
     TICKETS_WRITE,
     TICKETS_COMMENT,
+    TICKETS_REOPEN,
+    TICKETS_ATTACH_FILE,
     INVOICES_READ,
     INVOICES_PAY,
+    INVOICES_DOWNLOAD_PDF,
     QUOTES_READ,
     QUOTES_ACCEPT,
+    QUOTES_DOWNLOAD_PDF,
     CONTRACTS_READ,
     ASSETS_READ,
+    ASSETS_REPORT_ISSUE,
     PROJECTS_READ,
     KB_READ,
     FORMS_SUBMIT,
@@ -109,12 +173,17 @@ mod tests {
             TICKETS_READ,
             TICKETS_WRITE,
             TICKETS_COMMENT,
+            TICKETS_REOPEN,
+            TICKETS_ATTACH_FILE,
             INVOICES_READ,
             INVOICES_PAY,
+            INVOICES_DOWNLOAD_PDF,
             QUOTES_READ,
             QUOTES_ACCEPT,
+            QUOTES_DOWNLOAD_PDF,
             CONTRACTS_READ,
             ASSETS_READ,
+            ASSETS_REPORT_ISSUE,
             PROJECTS_READ,
             KB_READ,
             FORMS_SUBMIT,
@@ -160,7 +229,16 @@ mod tests {
         // it and this test does not catch that specific mistake - but
         // a mismatch in the other direction (Rust drops one the seed
         // still references) shows up as an unrenderable role in the UI.
-        let seed_billing = &[
+        //
+        // PMS-936 (migration 150) extends the built-in role capability
+        // sets - Billing Contact gains the PDF-download caps; Support
+        // Contact gains reopen + attach + report_issue - so those
+        // strings ALSO have to appear in `ALL_CAPABILITIES`. Both
+        // migrations are pinned by the same canary because migrations
+        // are immutable: extending the seed happens in a NEW file, and
+        // this test must know about every seed file that ships a cap
+        // string.
+        let seed_billing_142 = &[
             "invoices:read",
             "invoices:pay",
             "quotes:read",
@@ -168,7 +246,7 @@ mod tests {
             "notifications:read",
             "settings:manage_own",
         ];
-        let seed_support = &[
+        let seed_support_142 = &[
             "tickets:read",
             "tickets:write",
             "tickets:comment",
@@ -176,7 +254,7 @@ mod tests {
             "notifications:read",
             "settings:manage_own",
         ];
-        let seed_readonly = &[
+        let seed_readonly_142 = &[
             "tickets:read",
             "invoices:read",
             "quotes:read",
@@ -186,12 +264,27 @@ mod tests {
             "kb:read",
             "notifications:read",
         ];
-        let all_seeds: &[&[&str]] = &[seed_billing, seed_support, seed_readonly];
+        // Migration 150 (PMS-936) APPENDs to the two role rows already
+        // present. Only the additions are listed here; the base set is
+        // still validated above via the 142 arrays.
+        let seed_billing_150_add = &["invoices:download_pdf", "quotes:download_pdf"];
+        let seed_support_150_add = &[
+            "tickets:reopen",
+            "tickets:attach_file",
+            "assets:report_issue",
+        ];
+        let all_seeds: &[&[&str]] = &[
+            seed_billing_142,
+            seed_support_142,
+            seed_readonly_142,
+            seed_billing_150_add,
+            seed_support_150_add,
+        ];
         for seed in all_seeds {
             for cap in *seed {
                 assert!(
                     ALL_CAPABILITIES.iter().any(|k| k == cap),
-                    "seed migration 142 references `{cap}` but it is missing from ALL_CAPABILITIES"
+                    "seed migration references `{cap}` but it is missing from ALL_CAPABILITIES"
                 );
             }
         }

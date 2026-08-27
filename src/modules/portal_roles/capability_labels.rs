@@ -28,6 +28,21 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
             description: "Post a public comment on an existing ticket.".to_string(),
         },
         CapabilityDescriptor {
+            key: caps::TICKETS_REOPEN.to_string(),
+            label: "Reopen closed tickets".to_string(),
+            group: "Tickets".to_string(),
+            description: "Reopen a resolved or closed ticket so the MSP works on it again."
+                .to_string(),
+        },
+        CapabilityDescriptor {
+            key: caps::TICKETS_ATTACH_FILE.to_string(),
+            label: "Attach files to tickets".to_string(),
+            group: "Tickets".to_string(),
+            description:
+                "Upload attachments to open tickets so the MSP can see screenshots and logs."
+                    .to_string(),
+        },
+        CapabilityDescriptor {
             key: caps::INVOICES_READ.to_string(),
             label: "View invoices".to_string(),
             group: "Invoices".to_string(),
@@ -38,6 +53,13 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
             label: "Pay invoices".to_string(),
             group: "Invoices".to_string(),
             description: "Start a payment checkout for an outstanding invoice.".to_string(),
+        },
+        CapabilityDescriptor {
+            key: caps::INVOICES_DOWNLOAD_PDF.to_string(),
+            label: "Download invoice PDFs".to_string(),
+            group: "Invoices".to_string(),
+            description: "Download the PDF version of any invoice for the Company's records."
+                .to_string(),
         },
         CapabilityDescriptor {
             key: caps::QUOTES_READ.to_string(),
@@ -52,6 +74,12 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
             description: "Sign off a quote on behalf of the Company.".to_string(),
         },
         CapabilityDescriptor {
+            key: caps::QUOTES_DOWNLOAD_PDF.to_string(),
+            label: "Download quote PDFs".to_string(),
+            group: "Quotes".to_string(),
+            description: "Download the PDF version of any quote for internal review.".to_string(),
+        },
+        CapabilityDescriptor {
             key: caps::CONTRACTS_READ.to_string(),
             label: "View contracts".to_string(),
             group: "Contracts".to_string(),
@@ -62,6 +90,13 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
             label: "View assets".to_string(),
             group: "Assets".to_string(),
             description: "See configuration items scoped to the contact's own Company.".to_string(),
+        },
+        CapabilityDescriptor {
+            key: caps::ASSETS_REPORT_ISSUE.to_string(),
+            label: "Report an asset issue".to_string(),
+            group: "Assets".to_string(),
+            description: "File a new ticket linked to a specific asset for troubleshooting."
+                .to_string(),
         },
         CapabilityDescriptor {
             key: caps::PROJECTS_READ.to_string(),

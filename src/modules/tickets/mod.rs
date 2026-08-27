@@ -13,7 +13,9 @@ mod routes;
 mod service;
 
 #[cfg(feature = "server")]
-pub use attachments::{agent_attachment_routes, AttachmentConfig, AttachmentService};
+pub use attachments::{
+    agent_attachment_routes, AttachmentConfig, AttachmentResponse, AttachmentService,
+};
 #[cfg(feature = "server")]
 pub use automation::AutomationEngine;
 pub use models::*;

@@ -382,8 +382,19 @@ pub fn create_api_router(
             "/portal-roles",
             portal_role_routes(PortalRoleService::new(db.clone())),
         )
-        // Ticketing
-        .nest("/tickets", ticket_routes(ticket_service.clone()))
+        // Ticketing.
+        //
+        // PMS-936: the ticket router now also carries the shared
+        // `AttachmentService` so the portal `POST /tickets/{id}/attachments`
+        // route can reuse the on-disk blob pipeline (same env-driven
+        // dir + size cap as the agent surface).
+        .nest(
+            "/tickets",
+            ticket_routes(
+                ticket_service.clone(),
+                AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+            ),
+        )
         // PMS-483: ticket-note attachment upload / download / delete.
         // Merged at the top level so its `/tickets/{id}/notes/...`
         // path nests cleanly under the existing ticket tree.
@@ -395,7 +406,7 @@ pub fn create_api_router(
         // route lives on the tickets module (TicketService owns the
         // notes surface) but mounts at the top level so its path
         // matches the SPA's `/contacts/{id}/notes` URL.
-        .merge(contact_notes_routes(ticket_service))
+        .merge(contact_notes_routes(ticket_service.clone()))
         // Time tracking: time-entries, timesheets, timers, rounding,
         // work-types. PMS-43.
         .merge(time_tracking_routes(time_tracking_service))
@@ -429,7 +440,11 @@ pub fn create_api_router(
         .merge(quotes_routes(quotes_service))
         // Assets / CMDB: types, assets, relationships, config items,
         // credential vault, audit log. PMS-72.
-        .merge(assets_routes(assets_service))
+        //
+        // PMS-936: also carries a `TicketService` clone so the
+        // `POST /assets/{id}/report-issue` endpoint can create the
+        // linked ticket through the shared portal-ticket path.
+        .merge(assets_routes(assets_service, ticket_service.clone()))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
         // Org membership invitations (PMS-244): admin-only, tenant-scoped.

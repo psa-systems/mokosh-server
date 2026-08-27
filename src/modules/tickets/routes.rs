@@ -10,10 +10,11 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    CreateNoteRequest, CreateTicketRequest, NoteType, TicketCategoryResponse, TicketFilter,
-    TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService, TicketStatus,
-    TicketType, UpdateTicketRequest, UpsertTicketCategoryRequest, UpsertTicketPriorityRequest,
-    UpsertTicketQueueRequest, UpsertTicketStatusRequest, UpsertTicketTypeRequest,
+    AttachmentService, CreateNoteRequest, CreateTicketRequest, NoteType, TicketCategoryResponse,
+    TicketFilter, TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService,
+    TicketStatus, TicketType, UpdateTicketRequest, UpsertTicketCategoryRequest,
+    UpsertTicketPriorityRequest, UpsertTicketQueueRequest, UpsertTicketStatusRequest,
+    UpsertTicketTypeRequest,
 };
 use crate::db::Database;
 use crate::modules::auth::{
@@ -26,6 +27,11 @@ use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 #[derive(Clone)]
 pub struct TicketRouterState {
     pub ticket_service: Arc<TicketService>,
+    /// PMS-936: the portal attach-file endpoint needs the shared
+    /// attachment blob pipeline. Optional so unit tests and helper
+    /// routers (e.g. `contact_notes_routes`) can construct the state
+    /// without wiring an attachment store.
+    pub attachment_service: Option<Arc<AttachmentService>>,
 }
 
 /// PMS-468: build a sibling router for the agent "all comments
@@ -37,16 +43,28 @@ pub struct TicketRouterState {
 pub fn contact_notes_routes(ticket_service: TicketService) -> Router {
     let state = TicketRouterState {
         ticket_service: Arc::new(ticket_service),
+        attachment_service: None,
     };
     Router::new()
         .route("/contacts/{contact_id}/notes", get(list_contact_notes))
         .with_state(state)
 }
 
-/// Create the ticket router
-pub fn ticket_routes(ticket_service: TicketService) -> Router {
+/// Create the ticket router.
+///
+/// PMS-936 (foundation pass): also takes an `AttachmentService` so the
+/// portal `POST /tickets/{id}/attachments` endpoint can reuse the
+/// shared blob pipeline (same on-disk layout + sanitisation + size cap
+/// as the per-note attachment surface). Kept behind an `Option` on the
+/// router state so helper routers (e.g. `contact_notes_routes`) can
+/// still construct a state without an attachment store.
+pub fn ticket_routes(
+    ticket_service: TicketService,
+    attachment_service: AttachmentService,
+) -> Router {
     let state = TicketRouterState {
         ticket_service: Arc::new(ticket_service),
+        attachment_service: Some(Arc::new(attachment_service)),
     };
 
     Router::new()
@@ -57,6 +75,17 @@ pub fn ticket_routes(ticket_service: TicketService) -> Router {
         .route("/{ticket_id}", put(update_ticket))
         .route("/{ticket_id}", delete(delete_ticket))
         .route("/{ticket_id}/assign", post(assign_ticket))
+        // PMS-936: portal contact reopens a closed ticket (gated on
+        // `tickets:reopen`) via the shared `reopen_portal_ticket`
+        // service path. Staff callers also reach it and bypass the cap
+        // gate; a foreign-Company ticket surfaces as 404.
+        .route("/{ticket_id}/reopen", post(reopen_ticket))
+        // PMS-936: portal contact attaches a file to a ticket
+        // (gated on `tickets:attach_file`) via the shared attachments
+        // blob pipeline. JSON body carries base64 bytes so we skip the
+        // multipart parsing rathole; row is stamped with
+        // `created_by_contact_id`.
+        .route("/{ticket_id}/attachments", post(portal_attach_file))
         .route("/{ticket_id}/notes", get(get_ticket_notes))
         .route("/{ticket_id}/notes", post(add_note))
         // Configuration / lookup CRUD (PMS-321). GET handlers unchanged;
@@ -381,6 +410,150 @@ async fn add_note(
         created_by_contact_id: note.created_by_contact_id,
         created_at: note.created_at,
     }))
+}
+
+/// PMS-936: body for `POST /tickets/{id}/reopen`. Optional reason is
+/// folded into the public audit note the service appends so the agent
+/// sees WHY the ticket came back.
+#[derive(serde::Deserialize, Default)]
+struct ReopenBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// PMS-936: reopen a ticket. Contact-plane callers gate on
+/// `tickets:reopen` and get the Company-scope check via the service's
+/// `assert_portal_ticket_visible`; staff callers bypass the cap gate
+/// and reopen through the same shared code path.
+async fn reopen_ticket(
+    State(state): State<TicketRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(ticket_id): Path<Uuid>,
+    body: Option<Json<ReopenBody>>,
+) -> AppResult<Json<TicketResponse>> {
+    let tenant = caller.tenant();
+    let reason = body.and_then(|Json(b)| b.reason);
+    let resp = match &caller {
+        CallerContext::Staff(auth) => {
+            auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            // Staff reopen shares the portal reopen implementation so
+            // the audit-note posture is identical. Look up the ticket's
+            // own company_id first so the Company-scope check inside
+            // `reopen_portal_ticket` still succeeds (staff are
+            // unbounded, so any company is acceptable). `contact_id =
+            // None` leaves the audit note's `created_by_contact_id`
+            // NULL; the note's authorship stamps the fallback
+            // staff-admin id the service's audit-note path resolves.
+            let existing = state
+                .ticket_service
+                .get_ticket_response(tenant, ticket_id)
+                .await?;
+            state
+                .ticket_service
+                .reopen_portal_ticket(
+                    tenant,
+                    existing.company_id,
+                    None,
+                    ticket_id,
+                    reason.as_deref(),
+                )
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::TICKETS_REOPEN, &db).await?;
+            state
+                .ticket_service
+                .reopen_portal_ticket(
+                    tenant,
+                    session.company_id,
+                    Some(session.id),
+                    ticket_id,
+                    reason.as_deref(),
+                )
+                .await?
+        }
+    };
+    Ok(Json(resp))
+}
+
+/// PMS-936: JSON body for `POST /tickets/{id}/attachments`. Base64
+/// bytes keep the wire format simple (no multipart parsing needed for
+/// the portal-side upload; the shared blob pipeline enforces the same
+/// size cap and stores the row identically).
+#[derive(serde::Deserialize)]
+struct PortalAttachBody {
+    filename: String,
+    #[serde(default)]
+    content_type: Option<String>,
+    data_base64: String,
+}
+
+/// PMS-936: attach a file to a ticket via the portal contact plane.
+/// Uses the shared `AttachmentService` blob pipeline so the row lands
+/// alongside inbound-email + agent uploads and the on-disk layout is
+/// identical; `created_by_contact_id` attribution flags it as
+/// contact-uploaded so the agent UI can render it distinctly.
+async fn portal_attach_file(
+    State(state): State<TicketRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(ticket_id): Path<Uuid>,
+    Json(body): Json<PortalAttachBody>,
+) -> AppResult<Json<super::AttachmentResponse>> {
+    let attachment_service = state
+        .attachment_service
+        .as_ref()
+        .ok_or_else(|| AppError::Configuration("Attachment service not configured".to_string()))?;
+    let tenant = caller.tenant();
+    let tenant_uuid = tenant.get();
+
+    // Cap gate first: a contact without `tickets:attach_file` must not
+    // learn whether the ticket exists.
+    let (uploaded_by_id, created_by_contact_id) = match &caller {
+        CallerContext::Staff(auth) => {
+            let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            (Some(user.id), None)
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::TICKETS_ATTACH_FILE, &db)
+                .await?;
+            // Verify the ticket lives on the caller's Company; leak-free
+            // 404 on a foreign ticket.
+            attachment_service
+                .assert_ticket_visible_to_company(tenant_uuid, ticket_id, session.company_id)
+                .await?;
+            (None, Some(session.id))
+        }
+    };
+
+    // Decode the base64 payload. Reject an empty body up front so the
+    // shared pipeline's size cap never sees zero bytes.
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.data_base64.as_bytes())
+        .map_err(|e| AppError::BadRequest(format!("data_base64 decode: {e}")))?;
+    if bytes.is_empty() {
+        return Err(AppError::BadRequest(
+            "data_base64 decoded to zero bytes".to_string(),
+        ));
+    }
+    let mime = body
+        .content_type
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let resp = attachment_service
+        .store_ticket_level_attachment(
+            tenant_uuid,
+            ticket_id,
+            uploaded_by_id,
+            created_by_contact_id,
+            body.filename,
+            mime,
+            bytes,
+        )
+        .await?;
+    Ok(Json(resp))
 }
 
 async fn get_statuses(
