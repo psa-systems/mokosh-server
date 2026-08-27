@@ -4,12 +4,13 @@
 # real database. Split out of check.yml (PMS-267) so the fast fmt/clippy/compile
 # gate is not blocked on a Postgres spin-up. Mirrored locally by
 # `just test-integration`.
+#
+# DEV-612: pull_request only. The `push: main` run landed after the merge, so it
+# gated nothing, and re-ran a 440s suite against a tree the pull-request run had
+# usually already tested. scripts/check-single-build.nu fails if it comes back.
 name: Integration
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main

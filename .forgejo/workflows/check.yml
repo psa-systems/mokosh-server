@@ -1,8 +1,16 @@
 ---
 
-# Fast, database-free gate on every push and pull request. The Postgres-backed
+# Fast, database-free gate on every pull request into main. The Postgres-backed
 # integration suite lives in a separate workflow (integration.yml) so this one
 # stays fast (PMS-267).
+#
+# DEV-612: `main` is deliberately NOT in the push filter. That run fired after
+# the merge had already landed, so it gated nothing, and on 28 of the last 50
+# merges it recompiled a tree byte-identical to the one the pull-request run had
+# just compiled: 189s of runner time per merge for a known answer. The
+# pull-request run is the merge gate and is untouched, and build-oci-image.yml
+# still compiles the merge commit itself. scripts/check-single-build.nu fails
+# the build if a compiling workflow declares both triggers again.
 #
 # The steps below are spelled out rather than delegated to `just`, so they drift
 # from the local recipes silently. `just check` covers every step here except
@@ -15,7 +23,6 @@ name: Check
 on:
   push:
     branches:
-      - main
       # PMS-825: mokosh-client-login publishes its own image tag (PMS-733) and
       # is long-lived, so no pull_request into main ever covers it. Without this
       # entry staging pulls an image whose commit never ran fmt/clippy/tests.
@@ -149,6 +156,15 @@ jobs:
         shell: nu {0}
         run: |
           nu scripts/check-oci-publish-tags.nu
+
+      - name: Single build per commit
+        # DEV-612: a workflow that compiles must gate the merge on
+        # `pull_request` into main and must not repeat that build on
+        # `push: main`, which runs after the merge has landed and so gates
+        # nothing. That repeat cost 189s + 440s of runner time per merge.
+        shell: nu {0}
+        run: |
+          nu scripts/check-single-build.nu
 
       - name: Workspace dependency table
         # PMS-785: `[workspace.dependencies]` only reaches the build graph

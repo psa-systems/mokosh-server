@@ -28,6 +28,7 @@ one alone and you have not.
 | Runner labels | `nu scripts/check-runner-labels.nu` | `check-runner-labels` | no |
 | OCI build cache | `nu scripts/check-oci-build-cache.nu` | `check-oci-cache` | no |
 | OCI publish tags | `nu scripts/check-oci-publish-tags.nu` | `check-oci-publish-tags` | no |
+| Single build per commit | `nu scripts/check-single-build.nu` | `check-single-build` | no |
 | Workspace dependency table | `nu scripts/check-workspace-deps.nu` | `check-workspace-deps` | no |
 | Environment-variable parity | `nu scripts/check-env-example.nu` | `check-env-example` | no |
 | Documented just recipes | `nu scripts/check-doc-recipes.nu` | `check-doc-recipes` | no |
