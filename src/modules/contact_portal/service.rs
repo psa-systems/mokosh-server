@@ -1354,7 +1354,15 @@ impl ContactAuthService {
 
     /// Compute the effective capability set for `contact_id`. Called on
     /// every login + refresh so a role revoke lands within one tick.
-    async fn load_capabilities(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<Vec<String>> {
+    ///
+    /// PMS-935: `pub(crate)` so the contact-plane routes (which do
+    /// not go through `CallerContext::require_capability`) can gate
+    /// on `settings:manage_own` for the profile self-edit path.
+    pub(crate) async fn load_capabilities(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             r#"
             SELECT DISTINCT cap
@@ -1482,6 +1490,171 @@ impl ContactAuthService {
             hints.push(e);
         }
         Ok(hints.into_iter().filter(|s| !s.trim().is_empty()).collect())
+    }
+
+    /// PMS-935: aggregate Company-scoped counters + the last 10
+    /// events for the contact dashboard. Every counter is scoped by
+    /// `company_id = $2` so a Contact can never see another
+    /// Company's tickets even if this endpoint is later exposed to a
+    /// broader capability set. Runs four small scalar queries + one
+    /// UNION ALL for the activity feed; the whole call is under a
+    /// dozen rows in the current data volume, so a materialised view
+    /// is deferred.
+    ///
+    /// The counters use each entity's own "still-open" definition:
+    /// - Tickets: `ticket_statuses.is_closed = FALSE` (matches the
+    ///   staff Tickets tab default filter).
+    /// - Invoices: `balance_due > 0 AND status NOT IN ('paid',
+    ///   'void', 'written_off')` (mirrors the "unpaid" pill on the
+    ///   billing detail view).
+    /// - Quotes: `status = 'sent'` (open for the Contact's decision).
+    /// - Contracts: `status = 'active'`.
+    pub async fn dashboard_summary(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<super::models::ContactDashboardSummary> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let open_tickets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM tickets t \
+             INNER JOIN ticket_statuses s ON s.id = t.status_id \
+             WHERE t.tenant_id = $1 AND t.company_id = $2 AND s.is_closed = FALSE",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let unpaid_invoices: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM invoices \
+             WHERE tenant_id = $1 AND company_id = $2 \
+               AND balance_due > 0 \
+               AND status NOT IN ('paid', 'void', 'written_off')",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let active_quotes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM quotes \
+             WHERE tenant_id = $1 AND company_id = $2 AND status = 'sent'",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let active_contracts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM contracts \
+             WHERE tenant_id = $1 AND company_id = $2 AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        // Recent-activity feed: one UNION ALL across the four
+        // Company-scoped entities so the top-10 slice is a single
+        // round-trip. The `kind` column doubles as the SPA's routing
+        // discriminator (ticket vs invoice vs quote vs contract).
+        let activity_rows: Vec<(String, Uuid, String, chrono::DateTime<chrono::Utc>)> =
+            sqlx::query_as(
+                r#"
+                SELECT kind, id, summary, occurred_at FROM (
+                    SELECT 'ticket'::TEXT AS kind, t.id AS id, t.title AS summary,
+                           GREATEST(t.updated_at, t.created_at) AS occurred_at
+                    FROM tickets t
+                    WHERE t.tenant_id = $1 AND t.company_id = $2
+                    UNION ALL
+                    SELECT 'invoice'::TEXT, i.id, i.invoice_number,
+                           GREATEST(i.updated_at, i.created_at)
+                    FROM invoices i
+                    WHERE i.tenant_id = $1 AND i.company_id = $2
+                    UNION ALL
+                    SELECT 'quote'::TEXT, q.id, COALESCE(q.title, q.quote_number),
+                           GREATEST(q.updated_at, q.created_at)
+                    FROM quotes q
+                    WHERE q.tenant_id = $1 AND q.company_id = $2
+                    UNION ALL
+                    SELECT 'contract'::TEXT, c.id, c.name,
+                           GREATEST(c.updated_at, c.created_at)
+                    FROM contracts c
+                    WHERE c.tenant_id = $1 AND c.company_id = $2
+                ) feed
+                ORDER BY occurred_at DESC
+                LIMIT 10
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        drop(tx);
+        let recent_activity = activity_rows
+            .into_iter()
+            .map(
+                |(kind, id, summary, occurred_at)| super::models::ActivityItem {
+                    kind,
+                    id,
+                    summary,
+                    occurred_at,
+                },
+            )
+            .collect();
+        Ok(super::models::ContactDashboardSummary {
+            open_tickets,
+            unpaid_invoices,
+            active_quotes,
+            active_contracts,
+            recent_activity,
+        })
+    }
+
+    /// PMS-935: `PUT /api/v1/contact/auth/me`. Persists the contact's
+    /// own profile edits (names, phone, mobile, timezone).
+    /// Notification preferences live on `contact_notification_preferences`
+    /// (per-event-type rows, migration 120), not directly on the
+    /// contacts row; wiring those through is deferred and the field
+    /// is accepted but not persisted here.
+    ///
+    /// Email is NOT accepted: staff CRM owns portal identity via
+    /// `contacts.email`, so a portal contact cannot change their own
+    /// login email through this endpoint.
+    ///
+    /// COALESCE-style UPDATE: `NULL` inputs leave the underlying
+    /// column unchanged so the SPA can PATCH a single field without
+    /// having to round-trip the entire contact row.
+    pub async fn update_self(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        request: &super::models::ContactSelfUpdateRequest,
+    ) -> AppResult<ContactMe> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query(
+            r#"
+            UPDATE contacts SET
+                first_name = COALESCE($3, first_name),
+                last_name = COALESCE($4, last_name),
+                phone = COALESCE($5, phone),
+                mobile = COALESCE($6, mobile),
+                timezone = COALESCE($7, timezone),
+                updated_at = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(&request.first_name)
+        .bind(&request.last_name)
+        .bind(&request.phone)
+        .bind(&request.mobile)
+        .bind(&request.timezone)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            return Err(AppError::NotFound("Contact".to_string()));
+        }
+        tx.commit().await?;
+        self.me(tenant_id.get(), contact_id).await
     }
 }
 

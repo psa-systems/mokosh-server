@@ -14,7 +14,11 @@ use serde::Deserialize;
 
 use super::models::*;
 use super::service::{AssetsService, ImpactDirection};
-use crate::modules::auth::{RequireAdmin, RequireAssets, TenantScoped};
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireAdmin, RequireAssets, RequireCallerContext, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -129,12 +133,28 @@ async fn delete_asset_type(
 
 async fn list_assets(
     State(s): State<AssetsRouterState>,
-    RequireAssets { user: u, .. }: RequireAssets,
-    Query(f): Query<AssetFilter>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Query(mut f): Query<AssetFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetResponse>>> {
     f.validate()?;
-    let (items, total) = s.service.list_assets(u.tenant(), &f, &pagination).await?;
+    // PMS-935: dual-plane sweep. Contact callers must hold
+    // `assets:read` (DB-loaded per request; JWT `caps` is UI-only)
+    // and get their listing scoped to their own Company so a spoofed
+    // `company_id` query param cannot widen visibility. Staff callers
+    // keep the pre-sweep RequireAssets module-gate + auth surface via
+    // `assert_staff_authenticated` (staff role beyond auth is not
+    // required for asset reads).
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::ASSETS_READ, &db).await?;
+            f.company_id = Some(session.company_id);
+        }
+    }
+    let (items, total) = s.service.list_assets(tenant, &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -156,10 +176,41 @@ async fn create_asset(
 
 async fn get_asset(
     State(s): State<AssetsRouterState>,
-    RequireAssets { user: u, .. }: RequireAssets,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<AssetResponse>> {
-    Ok(Json(s.service.get_asset(u.tenant(), id).await?))
+    // PMS-935: contact-plane callers 404 (not 403) on a foreign
+    // Company's asset so a probe cannot confirm existence.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::ASSETS_READ, &db).await?;
+        }
+    }
+    let asset = s.service.get_asset(tenant, id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if asset.company_id != session.company_id {
+            return Err(AppError::NotFound("Asset".to_string()));
+        }
+    }
+    Ok(Json(asset))
+}
+
+/// PMS-935: baseline "must be authenticated staff" check inlined
+/// alongside the dual-plane read handlers. Reads used to sit behind
+/// `RequireAssets` (module gate + auth) with no additional role
+/// requirement; the sweep drops the module-gate piece so contact
+/// callers with `assets:read` reach the endpoint regardless of the
+/// tenant's staff-side module toggle. All child endpoints
+/// (relationships, configuration items, credentials, impact graph,
+/// audit log) stay behind `RequireAssets` and are therefore
+/// implicitly staff-only: a contact bearer never populates
+/// `AuthState`, so those extractors 401.
+fn assert_staff_authenticated(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+    auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    Ok(())
 }
 
 async fn update_asset(

@@ -19,6 +19,8 @@ use validator::Validate;
 use super::middleware::{portal_contact_middleware, ContactAuthMiddleware, RequireContactAuth};
 use super::models::*;
 use super::service::ContactAuthService;
+use crate::modules::auth::TenantId;
+use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::{AppError, AppResult};
 
 const REFRESH_COOKIE_NAME: &str = "mokosh:contact_token";
@@ -51,7 +53,11 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         .route("/auth/login-link", post(request_login_link))
         .route("/auth/login-link/redeem", post(redeem_login_link))
         .route("/auth/login-link/select", post(select_login_candidate))
-        .route("/auth/me", get(me))
+        .route("/auth/me", get(me).put(update_me))
+        // PMS-935: contact-only dashboard aggregate. Staff have their
+        // own workspace dashboards; this endpoint is deliberately
+        // scoped to `RequireContactAuth`.
+        .route("/dashboard/summary", get(dashboard_summary))
         // mokosh-contact-login prompt 011 (PMS-928): one host route
         // that dispatches on the path segment's shape. All-digits
         // parses as a numeric Portal ID; anything else is treated as
@@ -284,6 +290,61 @@ async fn me(
 ) -> AppResult<Json<ContactMe>> {
     let me = state.service.me(session.tenant_id, session.id).await?;
     Ok(Json(me))
+}
+
+/// PMS-935: contact profile self-edit. Gated on
+/// `settings:manage_own` (DB-loaded per request; JWT `caps` is
+/// UI-only so a role revoke lands within one tick, not after the
+/// 15-min access-token TTL). Email is NOT accepted here - the staff
+/// CRM owns portal identity and portals cannot self-serve an email
+/// change. Fields left as `None` are unchanged on the underlying
+/// contact row.
+async fn update_me(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(request): Json<ContactSelfUpdateRequest>,
+) -> AppResult<Json<ContactMe>> {
+    request.validate()?;
+    // Belt-and-braces: reload the effective cap set from
+    // `portal_roles` (mirrors what CallerContext::require_capability
+    // does on the dual-plane routes) so a role revoke lands within
+    // one tick instead of after the JWT TTL. RequireContactAuth
+    // does not go through CallerContext, so the check is inlined
+    // through the service's DB handle here.
+    let capabilities = state
+        .service
+        .load_capabilities(session.tenant_id, session.id)
+        .await?;
+    if !capabilities.iter().any(|c| c == caps::SETTINGS_MANAGE_OWN) {
+        return Err(AppError::Forbidden(format!(
+            "Missing required capability: {}",
+            caps::SETTINGS_MANAGE_OWN
+        )));
+    }
+    let tenant = TenantId::from_trusted(session.tenant_id);
+    let me = state
+        .service
+        .update_self(tenant, session.id, &request)
+        .await?;
+    Ok(Json(me))
+}
+
+/// PMS-935: aggregate dashboard tile grid. Scoped to the signed-in
+/// contact's Company; no capability check because the visibility
+/// signal here is aggregate counts, not row data - if a Contact
+/// can see the underlying tickets / invoices / quotes / contracts
+/// via their own list endpoints, they can already count them
+/// themselves.
+async fn dashboard_summary(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+) -> AppResult<Json<ContactDashboardSummary>> {
+    let tenant = TenantId::from_trusted(session.tenant_id);
+    let summary = state
+        .service
+        .dashboard_summary(tenant, session.company_id)
+        .await?;
+    Ok(Json(summary))
 }
 
 async fn portal_host(

@@ -237,14 +237,34 @@ async fn assign_ticket(
 
 async fn get_ticket_notes(
     State(state): State<TicketRouterState>,
-    RequireAuth(user): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(ticket_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
-    let (notes, total) = state
-        .ticket_service
-        .get_ticket_notes(user.tenant(), ticket_id, &pagination)
-        .await?;
+    // PMS-935: staff branch keeps the full note stream (public,
+    // internal, resolution, time_entry) - agent back-channel
+    // discussion belongs on the internal notes. Contact branch must
+    // hold `tickets:read` AND own the parent ticket's Company; the
+    // service scopes the query to `note_type = 'public'` so internal
+    // notes never reach the wire.
+    let tenant = caller.tenant();
+    let (notes, total) = match &caller {
+        CallerContext::Staff(auth) => {
+            let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            state
+                .ticket_service
+                .get_ticket_notes(user.tenant(), ticket_id, &pagination)
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::TICKETS_READ, &db).await?;
+            state
+                .ticket_service
+                .list_portal_ticket_notes(tenant, session.company_id, ticket_id, &pagination)
+                .await?
+        }
+    };
 
     let responses: Vec<TicketNoteResponse> = notes
         .into_iter()

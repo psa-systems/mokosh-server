@@ -299,6 +299,55 @@ pub struct ContactLoginSelectClaims {
     pub exp: i64,
 }
 
+/// PMS-935: response body for `GET /api/v1/contact/dashboard/summary`.
+/// Every counter is scoped to the signed-in contact's Company; the
+/// `recent_activity` feed is capped at 10 items and sorted DESC on
+/// `occurred_at`. Reads the same source-of-truth tables the staff
+/// workspace uses so there is no denormalisation to drift.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactDashboardSummary {
+    pub open_tickets: i64,
+    pub unpaid_invoices: i64,
+    pub active_quotes: i64,
+    pub active_contracts: i64,
+    pub recent_activity: Vec<ActivityItem>,
+}
+
+/// PMS-935: one row of `ContactDashboardSummary.recent_activity`.
+/// Distinct from the internal audit-log row shape (which carries
+/// actor / entity / diff): this is a customer-facing snippet the
+/// SPA renders in a widget alongside the tile grid.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityItem {
+    /// Discriminator so the SPA can render an icon / route: one of
+    /// `"ticket" | "invoice" | "quote" | "contract"`.
+    pub kind: String,
+    pub id: Uuid,
+    /// Human-short label (e.g. the ticket title or invoice number).
+    pub summary: String,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// PMS-935: request body for `PUT /api/v1/contact/auth/me`. Every
+/// field is `Option`: a `None` (or an unsupplied JSON key) is treated
+/// as "leave unchanged" so the SPA can PATCH a single attribute
+/// without needing to round-trip the full contact row. Email is NOT
+/// accepted here - the staff CRM owns portal identity, so contacts
+/// cannot self-serve their own email address change via the portal.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactSelfUpdateRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub first_name: Option<String>,
+    #[validate(length(min = 1, max = 100))]
+    pub last_name: Option<String>,
+    #[validate(length(max = 32))]
+    pub phone: Option<String>,
+    #[validate(length(max = 32))]
+    pub mobile: Option<String>,
+    pub timezone: Option<String>,
+    pub notification_preferences: Option<serde_json::Value>,
+}
+
 /// Response body for `GET /api/v1/contact/portal/{slug}/host`. Public
 /// endpoint used by the SPA to render branding + a "This portal is
 /// not available" splash for suspended tenants (mirrors the pre-pivot
