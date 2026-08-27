@@ -17,7 +17,8 @@
 # A fourth place has to agree since PMS-825: check.yml's push filter. An
 # allow-listed branch is long-lived and has no pull request into main, so
 # without that entry its commits publish an image that never ran fmt, clippy or
-# the tests.
+# the tests. `main` is the opposite case and must NOT be there (DEV-612): every
+# main commit arrives through a pull request, which check.yml already gates.
 
 use ../oci-build/get-tags.nu
 use ../oci-build/get-tags.nu BRANCH_ALLOW_LIST
@@ -63,12 +64,16 @@ def check-workflow [] {
 # PMS-825: every commit that can publish an image has had the check suite run
 # against it. Containment, not equality: check.yml running on an extra branch
 # costs a CI minute, while a publishing branch missing from it ships unchecked.
+# main is covered by the pull_request trigger rather than the push filter
+# (DEV-612); scripts/check-single-build.nu is what keeps it out of the latter.
 def check-gate [] {
-    let branches = (open $CHECK_WORKFLOW | get on.push.branches)
+    let on = (open $CHECK_WORKFLOW | get on)
+    let branches = (($on | get --optional push.branches) | default [])
+    let pr_branches = (($on | get --optional pull_request.branches) | default [])
     mut errors = []
 
-    if "main" not-in $branches {
-        $errors = ($errors | append $"($CHECK_WORKFLOW): push trigger must include `main`, found ($branches | str join ', ')")
+    if "main" not-in $pr_branches {
+        $errors = ($errors | append $"($CHECK_WORKFLOW): pull_request trigger must include `main`, found ($pr_branches | str join ', ')")
     }
     let missing = ($BRANCH_ALLOW_LIST | where {|b| $b not-in $branches })
     if ($missing | is-not-empty) {
