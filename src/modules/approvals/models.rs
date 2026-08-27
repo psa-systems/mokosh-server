@@ -20,6 +20,18 @@ pub struct ApprovalResponse {
     /// consumers. `None` on non-ticket rows; consumers that need to
     /// be polymorphic should read `(target, entity_id)` instead.
     pub ticket_id: Option<Uuid>,
+    /// PMS-940: the parent's human handle - `tickets.ticket_number`
+    /// (`T000123`) or `quotes.quote_number`. `None` for the two
+    /// targets that have no number column (change_request,
+    /// time_entry) and for a parent that has been deleted.
+    pub entity_reference: Option<String>,
+    /// PMS-940: the parent's title, so the approvals queue can name
+    /// what it is asking about instead of printing `entity_id`. The
+    /// three titled targets return their title; a `time_entry` has
+    /// no title, so it returns the duration and the date it covers.
+    /// LEFT JOIN'd, so a deleted parent surfaces as `None` rather
+    /// than dropping the approval from the queue.
+    pub entity_label: Option<String>,
     pub requested_by_id: Uuid,
     /// Resolved display name (first_name + last_name) of the
     /// requester. LEFT JOIN'd so a deleted user surfaces as `None`
