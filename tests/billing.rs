@@ -501,7 +501,8 @@ async fn term_id(app: &common::TestApp, token: &str, name: &str) -> String {
         .to_string()
 }
 
-/// Migration 050 seeds net30 as the single default per tenant; setting a new
+/// Migration 050 seeds Net 30 (PMS-934 renamed it from `net30`) as the single
+/// default per tenant; setting a new
 /// default clears the prior one.
 #[sqlx::test]
 async fn payment_terms_seeded_and_single_default(pool: PgPool) {
@@ -520,10 +521,13 @@ async fn payment_terms_seeded_and_single_default(pool: PgPool) {
         .await
         .expect("JSON");
     let rows = list["data"].as_array().expect("data");
+    // PMS-934: the seeded names are readable now. `name` is the display field
+    // and the invoice dropdown renders it verbatim, so the seed no longer puts
+    // an identifier there.
     let net30 = rows
         .iter()
-        .find(|t| t["name"].as_str() == Some("net30"))
-        .expect("net30 seeded");
+        .find(|t| t["name"].as_str() == Some("Net 30"))
+        .expect("Net 30 seeded");
     assert_eq!(
         net30["is_default"].as_bool(),
         Some(true),
@@ -566,8 +570,8 @@ async fn payment_terms_seeded_and_single_default(pool: PgPool) {
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["name"].as_str() == Some("net30"))
-        .expect("net30 row");
+        .find(|t| t["name"].as_str() == Some("Net 30"))
+        .expect("Net 30 row");
     assert_eq!(
         n30["is_default"].as_bool(),
         Some(false),
@@ -595,7 +599,7 @@ async fn invoice_payment_term_link_rename_and_delete_guard(pool: PgPool) {
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
 
-    let net30 = term_id(&app, &token, "net30").await;
+    let net30 = term_id(&app, &token, "Net 30").await;
 
     let invoice: serde_json::Value = app
         .client
@@ -616,7 +620,7 @@ async fn invoice_payment_term_link_rename_and_delete_guard(pool: PgPool) {
         .expect("invoice JSON");
     let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
     assert_eq!(invoice["payment_term_id"].as_str(), Some(net30.as_str()));
-    assert_eq!(invoice["payment_term_name"].as_str(), Some("net30"));
+    assert_eq!(invoice["payment_term_name"].as_str(), Some("Net 30"));
 
     // Rename the term; the invoice's joined name follows (FK, not a copy).
     let put = app
