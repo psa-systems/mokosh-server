@@ -43,6 +43,18 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
                     .to_string(),
         },
         CapabilityDescriptor {
+            key: caps::TICKETS_EDIT_OWN.to_string(),
+            label: "Edit own tickets".to_string(),
+            group: "Tickets".to_string(),
+            description: "Correct the title or description on a ticket you opened. Cannot change status, priority, or assignee (staff owns those).".to_string(),
+        },
+        CapabilityDescriptor {
+            key: caps::TICKETS_REQUEST_APPROVAL.to_string(),
+            label: "Request approval".to_string(),
+            group: "Tickets".to_string(),
+            description: "Ask your MSP for formal approval on a ticket (e.g. approve out-of-scope work, sign off on a resolution).".to_string(),
+        },
+        CapabilityDescriptor {
             key: caps::INVOICES_READ.to_string(),
             label: "View invoices".to_string(),
             group: "Invoices".to_string(),

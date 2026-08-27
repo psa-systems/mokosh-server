@@ -2437,6 +2437,69 @@ impl TicketService {
         self.get_ticket_response(tenant_id, ticket_id).await
     }
 
+    /// PMS-937: contact-owned ticket edit. The route layer has
+    /// already gated on `tickets:edit_own`, verified the ticket's
+    /// Company scope + reporter contact id, and stripped every field
+    /// but title / description from the request body. This method
+    /// runs the same `update_ticket` pipeline the staff PUT uses so
+    /// the audit-log trail is identical; `last_updated_by_id` is
+    /// attributed to the tenant's fallback admin user because the
+    /// portal plane has no `users` identity of its own.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_portal_ticket(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        _contact_id: Uuid,
+        ticket_id: Uuid,
+        request: UpdateTicketRequest,
+    ) -> AppResult<Ticket> {
+        // Belt-and-braces Company-scope check even though the route
+        // layer already ran one; a future caller wiring update_portal_ticket
+        // directly must not be able to bypass the scope check.
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let fallback_creator: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
+             AND role IN ('super_admin', 'admin', 'manager') \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        drop(tx);
+        let creator = fallback_creator.ok_or_else(|| {
+            AppError::Configuration(
+                "Cannot edit portal ticket: tenant has no admin/manager user to attribute the change to"
+                    .to_string(),
+            )
+        })?;
+        self.update_ticket(
+            tenant_id,
+            ticket_id,
+            creator,
+            &request,
+            &AuditCtx::system(tenant_id.get()),
+        )
+        .await
+    }
+
+    /// PMS-937: public wrapper around
+    /// [`Self::assert_portal_ticket_visible`] so route handlers in
+    /// other modules (e.g. the ticket approvals-request surface) can
+    /// enforce Company-scope + 404-leak-free existence without
+    /// duplicating the SQL.
+    pub async fn assert_ticket_visible_to_company(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        company_id: Uuid,
+    ) -> AppResult<()> {
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await
+    }
+
     /// Verify the ticket belongs to the portal contact's company within the
     /// caller's tenant. Surfaces 404 on miss to avoid confirming the existence
     /// of another company's ticket.

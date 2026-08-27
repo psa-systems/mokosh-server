@@ -393,6 +393,11 @@ pub fn create_api_router(
             ticket_routes(
                 ticket_service.clone(),
                 AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+                // PMS-937: the tickets router now also owns
+                // `POST /tickets/{id}/approvals/request`, which needs
+                // the shared ApprovalsService instance (used for both
+                // contact-plane inserts and the staff-plane shortcut).
+                approvals_service.clone(),
             ),
         )
         // PMS-483: ticket-note attachment upload / download / delete.

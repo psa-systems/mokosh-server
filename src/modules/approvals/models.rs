@@ -20,11 +20,23 @@ pub struct ApprovalResponse {
     /// consumers. `None` on non-ticket rows; consumers that need to
     /// be polymorphic should read `(target, entity_id)` instead.
     pub ticket_id: Option<Uuid>,
-    pub requested_by_id: Uuid,
+    /// PMS-937: nullable now that the contact-plane approval-request
+    /// surface (`POST /tickets/{id}/approvals/request`) files rows
+    /// with `requested_by_contact_id` set instead. Every legacy
+    /// staff-originated row still populates this; a contact-filed row
+    /// carries `None` here and the contact id in
+    /// [`Self::requested_by_contact_id`].
+    pub requested_by_id: Option<Uuid>,
     /// Resolved display name (first_name + last_name) of the
     /// requester. LEFT JOIN'd so a deleted user surfaces as `None`
     /// instead of breaking the read.
     pub requested_by_name: Option<String>,
+    /// PMS-937: the portal contact who filed a contact-plane approval
+    /// request. NULL on every staff-originated row.
+    pub requested_by_contact_id: Option<Uuid>,
+    /// Resolved display name of the requester contact. Present only
+    /// on rows filed via the contact-plane surface.
+    pub requested_by_contact_name: Option<String>,
     pub approver_user_id: Option<Uuid>,
     pub approver_user_name: Option<String>,
     pub approver_role: Option<String>,

@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use super::{
     UpsertTicketTypeRequest,
 };
 use crate::db::Database;
+use crate::modules::approvals::{ApprovalResponse, ApprovalsService};
 use crate::modules::auth::{
     CallerContext, RequireAdmin, RequireAuth, RequireCallerContext, TenantScoped,
 };
@@ -32,6 +33,12 @@ pub struct TicketRouterState {
     /// routers (e.g. `contact_notes_routes`) can construct the state
     /// without wiring an attachment store.
     pub attachment_service: Option<Arc<AttachmentService>>,
+    /// PMS-937: `POST /tickets/{id}/approvals/request` (contact-plane
+    /// approval-request surface) delegates into the approvals
+    /// service. Optional so helper routers that only expose the
+    /// notes-feed surface (e.g. `contact_notes_routes`) can construct
+    /// the state without wiring an approvals service.
+    pub approvals_service: Option<Arc<ApprovalsService>>,
 }
 
 /// PMS-468: build a sibling router for the agent "all comments
@@ -44,6 +51,7 @@ pub fn contact_notes_routes(ticket_service: TicketService) -> Router {
     let state = TicketRouterState {
         ticket_service: Arc::new(ticket_service),
         attachment_service: None,
+        approvals_service: None,
     };
     Router::new()
         .route("/contacts/{contact_id}/notes", get(list_contact_notes))
@@ -58,13 +66,20 @@ pub fn contact_notes_routes(ticket_service: TicketService) -> Router {
 /// as the per-note attachment surface). Kept behind an `Option` on the
 /// router state so helper routers (e.g. `contact_notes_routes`) can
 /// still construct a state without an attachment store.
+///
+/// PMS-937: also takes an `ApprovalsService` so
+/// `POST /tickets/{id}/approvals/request` (contact-plane
+/// approval-request surface) can delegate into the shared approvals
+/// service without duplicating the row-insert SQL.
 pub fn ticket_routes(
     ticket_service: TicketService,
     attachment_service: AttachmentService,
+    approvals_service: ApprovalsService,
 ) -> Router {
     let state = TicketRouterState {
         ticket_service: Arc::new(ticket_service),
         attachment_service: Some(Arc::new(attachment_service)),
+        approvals_service: Some(Arc::new(approvals_service)),
     };
 
     Router::new()
@@ -73,8 +88,24 @@ pub fn ticket_routes(
         .route("/", post(create_ticket))
         .route("/{ticket_id}", get(get_ticket))
         .route("/{ticket_id}", put(update_ticket))
+        // PMS-937: dual-plane PATCH. Contact callers gate on
+        // `tickets:edit_own` and may only edit the title / description
+        // of a ticket they themselves opened; every other field is
+        // silently stripped from the body. Staff callers accept every
+        // editable field (delegates to the same underlying
+        // `update_ticket` service the PUT route uses).
+        .route("/{ticket_id}", patch(patch_ticket))
         .route("/{ticket_id}", delete(delete_ticket))
         .route("/{ticket_id}/assign", post(assign_ticket))
+        // PMS-937: contact-initiated approval-request surface. Gated
+        // on `tickets:request_approval` for the contact plane; staff
+        // callers reuse the existing approvals service through the
+        // same handler so the endpoint is a single URL for both
+        // planes.
+        .route(
+            "/{ticket_id}/approvals/request",
+            post(request_approval_on_ticket),
+        )
         // PMS-936: portal contact reopens a closed ticket (gated on
         // `tickets:reopen`) via the shared `reopen_portal_ticket`
         // service path. Staff callers also reach it and bypass the cap
@@ -227,6 +258,158 @@ async fn update_ticket(
         .ticket_service
         .get_ticket_response(user.tenant(), ticket_id)
         .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-937: PATCH body for the contact-owned ticket-edit surface.
+/// The full staff-plane editable set lives on
+/// [`UpdateTicketRequest`], which is what the PATCH handler
+/// deserialises for the staff branch. Contact callers hit the same
+/// endpoint and body shape, but only `title` and `description` are
+/// honoured (every other field the JSON might carry is silently
+/// stripped so the same body works for both planes without a
+/// separate contact-only route).
+async fn patch_ticket(
+    State(state): State<TicketRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(ticket_id): Path<Uuid>,
+    Json(request): Json<UpdateTicketRequest>,
+) -> AppResult<Json<TicketResponse>> {
+    request.validate()?;
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            state
+                .ticket_service
+                .update_ticket(user.tenant(), ticket_id, user.id, &request, &ctx)
+                .await?;
+        }
+        CallerContext::Contact(session) => {
+            // Cap gate first so a contact without `tickets:edit_own`
+            // cannot learn whether the ticket exists.
+            caller
+                .require_capability(caps::TICKETS_EDIT_OWN, &db)
+                .await?;
+
+            // Load the row to check Company scope + reporter-contact
+            // ownership. Same 404-leak-free posture as `get_ticket`:
+            // a foreign Company OR a same-Company-but-different-contact
+            // ticket both surface as 404 so the contact plane never
+            // discloses which case they hit.
+            let ticket = state.ticket_service.get_ticket(tenant, ticket_id).await?;
+            if ticket.company_id != session.company_id {
+                return Err(AppError::NotFound("Ticket".to_string()));
+            }
+            if ticket.contact_id != Some(session.id) {
+                return Err(AppError::NotFound("Ticket".to_string()));
+            }
+
+            // Strip every field but title / description. Rebuild a
+            // fresh UpdateTicketRequest so a spoofed `status_id`,
+            // `priority_id`, `assignee_id`, `company_id`, etc. cannot
+            // reach the service layer. Reject an all-empty PATCH
+            // (nothing to update) as a 400 so the contact does not
+            // silently hit the audit-only path.
+            if request.title.is_none() && request.description.is_none() {
+                return Err(AppError::BadRequest(
+                    "PATCH body must set at least one of title, description".to_string(),
+                ));
+            }
+            let stripped = UpdateTicketRequest {
+                title: request.title,
+                description: request.description,
+                status_id: None,
+                priority_id: None,
+                type_id: None,
+                category_id: None,
+                queue_id: None,
+                contact_id: None,
+                site_id: None,
+                assigned_to_id: None,
+                team_id: None,
+                contract_id: None,
+                sla_id: None,
+                scheduled_start: None,
+                scheduled_end: None,
+                estimated_hours: None,
+                is_billable: None,
+                billing_status: None,
+                asset_id: None,
+                custom_fields: None,
+                tags: None,
+            };
+            // Attribute the mutation to the tenant's first
+            // admin/manager user for `last_updated_by_id`; the portal
+            // flow has no `users` identity of its own. Same fallback
+            // shape `create_portal_ticket` uses.
+            state
+                .ticket_service
+                .update_portal_ticket(tenant, session.company_id, session.id, ticket_id, stripped)
+                .await?;
+        }
+    }
+    let resp = state
+        .ticket_service
+        .get_ticket_response(tenant, ticket_id)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-937: body for `POST /tickets/{id}/approvals/request`.
+/// Contact plane accepts `{ note }`; staff plane uses the same body
+/// so the SPA can drive both planes through one call.
+#[derive(serde::Deserialize, validator::Validate)]
+struct RequestApprovalBody {
+    #[validate(length(min = 1, max = 2000))]
+    note: String,
+}
+
+/// PMS-937: contact-initiated approval-request surface. Contact
+/// callers gate on `tickets:request_approval` and Company-scope; the
+/// approver defaults to the tenant's `admin` role so any MSP admin
+/// can decide. Staff callers reuse the existing phase-1 approvals
+/// flow so the endpoint is backwards-compatible - staff who need to
+/// target a specific approver keep using `POST /tickets/{id}/approvals`
+/// with the full `CreateApprovalRequest` body.
+async fn request_approval_on_ticket(
+    State(state): State<TicketRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(ticket_id): Path<Uuid>,
+    Json(body): Json<RequestApprovalBody>,
+) -> AppResult<Json<ApprovalResponse>> {
+    body.validate()?;
+    let approvals = state
+        .approvals_service
+        .as_ref()
+        .ok_or_else(|| AppError::Configuration("Approvals service not configured".to_string()))?;
+    let tenant = caller.tenant();
+    let tenant_uuid = tenant.get();
+    let resp = match &caller {
+        CallerContext::Staff(auth) => {
+            let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            approvals
+                .create_staff_request(tenant_uuid, ticket_id, user.id, body.note)
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::TICKETS_REQUEST_APPROVAL, &db)
+                .await?;
+            // Company-scope + existence check via the ticket service so
+            // a foreign-Company ticket surfaces as 404 before we insert.
+            state
+                .ticket_service
+                .assert_ticket_visible_to_company(tenant, ticket_id, session.company_id)
+                .await?;
+            approvals
+                .create_contact_request(tenant_uuid, ticket_id, session.id, body.note)
+                .await?
+        }
+    };
     Ok(Json(resp))
 }
 

@@ -72,6 +72,17 @@ pub const TICKETS_REOPEN: &str = "tickets:reopen";
 /// PMS-936: attach a file (JSON base64 body) to an existing ticket the
 /// caller's Company owns. Row is stamped with `created_by_contact_id`.
 pub const TICKETS_ATTACH_FILE: &str = "tickets:attach_file";
+/// PMS-937: correct the title or description on a ticket the calling
+/// contact opened themselves. Cannot change status, priority, or
+/// assignee (staff owns those); the route silently strips any
+/// non-editable field from the body.
+pub const TICKETS_EDIT_OWN: &str = "tickets:edit_own";
+/// PMS-937: ask the MSP for formal approval on a ticket (approve
+/// out-of-scope work, sign off on a resolution). Inserts a
+/// `ticket_approvals` row with `requested_by_contact_id` set so the
+/// SPA can render the requester as a portal contact rather than an
+/// agent.
+pub const TICKETS_REQUEST_APPROVAL: &str = "tickets:request_approval";
 
 /// View invoices scoped to the contact's own Company.
 pub const INVOICES_READ: &str = "invoices:read";
@@ -133,6 +144,8 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     TICKETS_COMMENT,
     TICKETS_REOPEN,
     TICKETS_ATTACH_FILE,
+    TICKETS_EDIT_OWN,
+    TICKETS_REQUEST_APPROVAL,
     INVOICES_READ,
     INVOICES_PAY,
     INVOICES_DOWNLOAD_PDF,
@@ -175,6 +188,8 @@ mod tests {
             TICKETS_COMMENT,
             TICKETS_REOPEN,
             TICKETS_ATTACH_FILE,
+            TICKETS_EDIT_OWN,
+            TICKETS_REQUEST_APPROVAL,
             INVOICES_READ,
             INVOICES_PAY,
             INVOICES_DOWNLOAD_PDF,
@@ -273,12 +288,19 @@ mod tests {
             "tickets:attach_file",
             "assets:report_issue",
         ];
+        // Migration 151 (PMS-937) APPENDs the contact-owned ticket edit
+        // and contact-initiated approval-request caps to the Support
+        // Contact row. Same immutable-migration + append-with-dedupe
+        // shape as 150. Read-Only + Billing Contact are unchanged (both
+        // caps mutate state and are irrelevant to the billing surface).
+        let seed_support_151_add = &["tickets:edit_own", "tickets:request_approval"];
         let all_seeds: &[&[&str]] = &[
             seed_billing_142,
             seed_support_142,
             seed_readonly_142,
             seed_billing_150_add,
             seed_support_150_add,
+            seed_support_151_add,
         ];
         for seed in all_seeds {
             for cap in *seed {
