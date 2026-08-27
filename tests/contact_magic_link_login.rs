@@ -1018,3 +1018,99 @@ async fn select_with_no_password_returns_setup_url(pool: PgPool) {
         "option-1: select's setup URL must be scoped to the picked contact's Company, got: {setup_url}"
     );
 }
+
+/// Regression: a fresh browser hitting /portal/find has no
+/// `mokosh:contact_last_slug` in localStorage, so the client posts
+/// `{ email, slug: null }` to /contact/auth/login-link. The
+/// pre-fix server dropped that shape silently (both slug + portal_id
+/// missing) and no email was sent. The fix falls back to a
+/// cross-tenant email match: look up every active-tenant Company
+/// with a portal contact carrying that email, mint one intent per
+/// matching tenant, dispatch one email per intent. Zero matches still
+/// = zero intents (enum-resistant), but a known email now actually
+/// gets a link.
+#[sqlx::test]
+async fn login_link_without_slug_falls_back_to_cross_tenant_email_match(pool: PgPool) {
+    let (_contact_id, _company_id, _slug) =
+        seed_portal_contact(&pool, "nosslug@mcl.example").await;
+    // Nuke the intent grant_portal_access minted so the assertion
+    // below reflects only the finder call.
+    clear_intents(&pool).await;
+    let app = common::boot(pool.clone()).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link"))
+        .json(&serde_json::json!({ "email": "nosslug@mcl.example" }))
+        .send()
+        .await
+        .expect("login-link");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "finder must 204 regardless of the slug being present"
+    );
+
+    let intent_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_login_intents \
+         WHERE tenant_id = $1 AND LOWER(email) = LOWER($2)",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("nosslug@mcl.example")
+    .fetch_one(&pool)
+    .await
+    .expect("count intents");
+    assert_eq!(
+        intent_count, 1,
+        "cross-tenant fallback must mint exactly one intent for the matched tenant"
+    );
+
+    // And the auth.login_link email must actually queue (composed with
+    // migration 149's template seed from the earlier fix).
+    let body: String = sqlx::query_scalar(
+        "SELECT body FROM notifications \
+         WHERE tenant_id = $1 AND recipient = $2 AND channel_type = 'email' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("nosslug@mcl.example")
+    .fetch_one(&pool)
+    .await
+    .expect(
+        "finder without slug must still queue the login-link email; if this returns RowNotFound the fallback path is broken",
+    );
+    assert!(
+        body.contains("/portal/pick?token="),
+        "cross-tenant fallback email must carry the magic-link URL, got: {body}"
+    );
+}
+
+/// Regression companion: an unknown email on the no-slug path returns
+/// 204 with zero intents + zero notifications. Enum-resistant even
+/// under the new fallback shape.
+#[sqlx::test]
+async fn login_link_without_slug_unknown_email_stays_enum_resistant(pool: PgPool) {
+    let (_contact_id, _company_id, _slug) =
+        seed_portal_contact(&pool, "someone@mcl.example").await;
+    clear_intents(&pool).await;
+    let app = common::boot(pool.clone()).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link"))
+        .json(&serde_json::json!({ "email": "unknown-nobody@mcl.example" }))
+        .send()
+        .await
+        .expect("login-link unknown");
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let intent_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM portal_login_intents")
+            .fetch_one(&pool)
+            .await
+            .expect("count intents");
+    assert_eq!(
+        intent_count, 0,
+        "unknown email must NOT mint an intent even under the no-slug fallback"
+    );
+}

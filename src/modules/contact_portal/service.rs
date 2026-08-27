@@ -725,42 +725,49 @@ impl ContactAuthService {
         // the same tenant. The scoping is captured in `scope_company_id`
         // below.
         let slug = slug.map(str::trim).filter(|s| !s.is_empty());
-        if portal_id.is_none() && slug.is_none() {
-            return Ok(());
-        }
-        let resolved: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
-            r#"
-            SELECT co.tenant_id, co.id
-            FROM companies co
-            INNER JOIN tenants t ON t.id = co.tenant_id
-            WHERE t.status = 'active'
-              AND (
-                ($1::BIGINT IS NOT NULL AND co.portal_id = $1)
-                OR ($1::BIGINT IS NULL AND $2::TEXT IS NOT NULL AND co.portal_slug = $2)
-              )
-            "#,
-        )
-        .bind(portal_id)
-        .bind(slug)
-        .fetch_optional(self.db.migrator_pool())
-        .await?
-        .map(|(tid, cid): (Uuid, Uuid)| (tid, Some(cid)));
-        let Some((tenant_id, scope_company_id)) = resolved else {
-            return Ok(());
-        };
-        // Only scope the contact lookup to a specific Company when
-        // portal_id (or the slug on the compat path) explicitly
-        // pinned one. `None` here means "any Company under this
-        // tenant" (never fires today; kept as a safety valve should a
-        // future caller resolve a tenant without a Company).
-        let _ = scope_company_id;
-        let company_scope_id: Option<Uuid> = if portal_id.is_some() {
-            scope_company_id
+        // Two entry shapes:
+        //   1. Caller supplies portal_id or slug -> scope to that one
+        //      Company + tenant (the recurring-user flow: they know
+        //      which portal they belong to).
+        //   2. Caller supplies neither -> the "find my portal" flow: a
+        //      fresh visitor at /portal/find has no prior slug in
+        //      localStorage. Match the email across every active-tenant
+        //      Company on the mokosh instance and mint one intent per
+        //      resulting (tenant, contact.email) pair. Enum-resistant:
+        //      zero matches produce zero intents + zero emails, same
+        //      shape a hit produces (204 upstream either way).
+        let scoped_target: Option<(Uuid, Option<Uuid>)> = if portal_id.is_some() || slug.is_some() {
+            let resolved: Option<(Uuid, Uuid)> = sqlx::query_as(
+                r#"
+                SELECT co.tenant_id, co.id
+                FROM companies co
+                INNER JOIN tenants t ON t.id = co.tenant_id
+                WHERE t.status = 'active'
+                  AND (
+                    ($1::BIGINT IS NOT NULL AND co.portal_id = $1)
+                    OR ($1::BIGINT IS NULL AND $2::TEXT IS NOT NULL AND co.portal_slug = $2)
+                  )
+                "#,
+            )
+            .bind(portal_id)
+            .bind(slug)
+            .fetch_optional(self.db.migrator_pool())
+            .await?;
+            let Some((tid, cid)) = resolved else {
+                return Ok(());
+            };
+            // Only scope the contact lookup to a specific Company when
+            // portal_id (or the slug on the compat path) explicitly
+            // pinned one.
+            let company_scope: Option<Uuid> = if portal_id.is_some() { Some(cid) } else { None };
+            Some((tid, company_scope))
         } else {
             None
         };
 
-        // Per-IP rate limit. Silent drop shape.
+        // Per-IP rate limit. Silent drop shape. Fires before either
+        // targeting branch so a runaway caller cannot fan out extra
+        // "cross-tenant discovery" writes to sidestep the ceiling.
         // SAFETY (PMS-285): the counters are pre-auth and cross-tenant
         // by design (an attacker's IP can fan out across tenants);
         // running on the migrator pool bypasses RLS so the count
@@ -783,101 +790,129 @@ impl ContactAuthService {
                 return Ok(());
             }
         }
-        // Per-email rate limit (scoped to the resolved tenant + the
-        // lowercased email; a real match is still gated below).
+
+        // Resolve which tenants + optional Company scopes this request
+        // should fan out over. Explicit slug/portal_id -> the one
+        // resolved tenant. Neither supplied -> cross-tenant email
+        // discovery: match any active-tenant Company that has a portal
+        // contact with this email, mint one intent per tenant. Zero
+        // matches on either branch = zero intents = still 204 upstream
+        // (enum-resistant).
+        let targets: Vec<(Uuid, Option<Uuid>)> = if let Some((tid, cid)) = scoped_target {
+            vec![(tid, cid)]
+        } else {
+            let rows: Vec<(Uuid,)> = sqlx::query_as(
+                r#"
+                SELECT DISTINCT c.tenant_id
+                FROM contacts c
+                INNER JOIN companies co ON co.id = c.company_id
+                INNER JOIN tenants t ON t.id = c.tenant_id
+                WHERE t.status = 'active'
+                  AND LOWER(c.email) = LOWER($1)
+                  AND c.is_portal_user = TRUE
+                  AND co.portal_slug IS NOT NULL
+                "#,
+            )
+            .bind(email)
+            .fetch_all(self.db.migrator_pool())
+            .await?;
+            rows.into_iter().map(|(tid,)| (tid, None)).collect()
+        };
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        // Per-email rate limit: same counter shape as before, but now
+        // summed across every matching tenant so an attacker cannot
+        // use the cross-tenant fan-out to escape the ceiling. Counted
+        // by the email alone (not per-tenant) because a single visitor
+        // requesting a link legitimately covers every portal they hold
+        // in one submit.
         let per_email: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM portal_login_intents \
-             WHERE tenant_id = $1 AND LOWER(email) = LOWER($2) \
+             WHERE LOWER(email) = LOWER($1) \
              AND created_at > NOW() - INTERVAL '15 minutes'",
         )
-        .bind(tenant_id)
         .bind(email)
         .fetch_one(self.db.migrator_pool())
         .await?;
         if per_email >= LOGIN_INTENT_MAX_PER_EMAIL_PER_15_MIN {
             tracing::info!(
-                tenant_id = %tenant_id,
                 "login-link request silently dropped: per-email rate limit reached"
             );
             return Ok(());
         }
 
-        // Match check. If no active portal contact under this tenant
-        // (and inside the scoped Company, when a portal_id was
-        // supplied) has this email, no intent + no email.
-        let contact_count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM contacts c
-            INNER JOIN companies co ON co.id = c.company_id
-            WHERE c.tenant_id = $1
-              AND LOWER(c.email) = LOWER($2)
-              AND c.is_portal_user = TRUE
-              AND co.portal_slug IS NOT NULL
-              AND ($3::UUID IS NULL OR c.company_id = $3)
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(email)
-        .bind(company_scope_id)
-        .fetch_one(self.db.migrator_pool())
-        .await?;
-        if contact_count == 0 {
-            return Ok(());
-        }
+        // Fan out. Per-tenant match check + intent + notification.
+        for (tenant_id, company_scope_id) in targets {
+            let contact_count: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)
+                FROM contacts c
+                INNER JOIN companies co ON co.id = c.company_id
+                WHERE c.tenant_id = $1
+                  AND LOWER(c.email) = LOWER($2)
+                  AND c.is_portal_user = TRUE
+                  AND co.portal_slug IS NOT NULL
+                  AND ($3::UUID IS NULL OR c.company_id = $3)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(email)
+            .bind(company_scope_id)
+            .fetch_one(self.db.migrator_pool())
+            .await?;
+            if contact_count == 0 {
+                continue;
+            }
 
-        // Mint intent + dispatch. Best-effort dispatch (failed send
-        // leaves the intent row; the customer can request another).
-        let intent_id = Uuid::new_v4();
-        let secret = generate_token(32);
-        let secret_hash = hash_password(&secret)?;
-        let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
-        let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
-        // SAFETY (PMS-285): unauthenticated finder path; the tenant
-        // was resolved above, so the write lands under the correct
-        // tenant. Runs on the migrator pool because there is no
-        // session GUC to key RLS off.
-        sqlx::query(
-            r#"
-            INSERT INTO portal_login_intents
-                (id, tenant_id, email, secret_hash, expires_at, ip, user_agent, company_id)
-            VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::inet, $7, $8)
-            "#,
-        )
-        .bind(intent_id)
-        .bind(tenant_id)
-        .bind(email)
-        .bind(&secret_hash)
-        .bind(expires_at)
-        .bind(&ip_text)
-        .bind(user_agent)
-        .bind(company_scope_id)
-        .execute(self.db.migrator_pool())
-        .await?;
+            let intent_id = Uuid::new_v4();
+            let secret = generate_token(32);
+            let secret_hash = hash_password(&secret)?;
+            let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
+            let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
+            sqlx::query(
+                r#"
+                INSERT INTO portal_login_intents
+                    (id, tenant_id, email, secret_hash, expires_at, ip, user_agent, company_id)
+                VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::inet, $7, $8)
+                "#,
+            )
+            .bind(intent_id)
+            .bind(tenant_id)
+            .bind(email)
+            .bind(&secret_hash)
+            .bind(expires_at)
+            .bind(&ip_text)
+            .bind(user_agent)
+            .bind(company_scope_id)
+            .execute(self.db.migrator_pool())
+            .await?;
 
-        let magic_link_url = format!(
-            "{}/portal/pick?token={}.{}",
-            self.spa_base_url.trim_end_matches('/'),
-            intent_id,
-            secret,
-        );
-        if let Some(notify) = self.notifications.as_ref() {
-            let context = serde_json::json!({
-                "recipient_email": email,
-                "magic_link_url": magic_link_url,
-            });
-            let _ = notify
-                .dispatch(
-                    TenantId::from_trusted(tenant_id),
-                    "auth.login_link",
-                    &context,
-                )
-                .await;
-        } else {
-            tracing::warn!(
-                magic_link_url = %magic_link_url,
-                "no notifications dispatcher wired; login-link intent persisted but no message queued (link logged for manual relay)"
+            let magic_link_url = format!(
+                "{}/portal/pick?token={}.{}",
+                self.spa_base_url.trim_end_matches('/'),
+                intent_id,
+                secret,
             );
+            if let Some(notify) = self.notifications.as_ref() {
+                let context = serde_json::json!({
+                    "recipient_email": email,
+                    "magic_link_url": magic_link_url,
+                });
+                let _ = notify
+                    .dispatch(
+                        TenantId::from_trusted(tenant_id),
+                        "auth.login_link",
+                        &context,
+                    )
+                    .await;
+            } else {
+                tracing::warn!(
+                    magic_link_url = %magic_link_url,
+                    "no notifications dispatcher wired; login-link intent persisted but no message queued (link logged for manual relay)"
+                );
+            }
         }
         Ok(())
     }
