@@ -40,13 +40,9 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
 use crate::utils::error::{AppError, AppResult};
-
-/// Image types an article may embed.
-///
-/// SVG is deliberately absent, for the same reason it is absent from the tenant
-/// logo list: it is a script-capable document, and this one is served from the
-/// API origin to unauthenticated clients.
-const ALLOWED_MIME: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+// PMS-941: one allowlist for every publicly-readable image route. SVG is
+// refused there, for the reason the module header of `inline_image` states.
+use crate::utils::inline_image::check_inline_image_mime;
 
 /// Default cap when `KB_ATTACHMENT_MAX_BYTES` is unset. 5 MiB: generous for a
 /// screenshot or a diagram, well under the 25 MiB a ticket attachment allows,
@@ -103,19 +99,6 @@ pub fn attachment_path(id: Uuid) -> String {
     format!("/api/v1/public/kb/attachments/{id}")
 }
 
-fn check_mime(mime: &str) -> AppResult<&str> {
-    ALLOWED_MIME
-        .iter()
-        .find(|m| **m == mime)
-        .copied()
-        .ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "Unsupported image type '{mime}'. Allowed: {}",
-                ALLOWED_MIME.join(", ")
-            ))
-        })
-}
-
 #[derive(Clone)]
 pub struct KbAttachmentService {
     db: Database,
@@ -137,7 +120,11 @@ impl KbAttachmentService {
         bytes: Vec<u8>,
         uploaded_by: Uuid,
     ) -> AppResult<KbAttachmentResponse> {
-        let mime = check_mime(&mime_type)?;
+        // SVG is refused here, not sanitised: the read path below is
+        // unauthenticated and serves from the API origin. The list and the
+        // reasoning live in `utils::inline_image`, shared with the tenant logo
+        // and the ticket inline image (PMS-941).
+        let mime = check_inline_image_mime(&mime_type)?;
         if bytes.is_empty() {
             return Err(AppError::BadRequest("The uploaded file is empty".into()));
         }
@@ -427,19 +414,6 @@ async fn get_public_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// SVG is script-capable and this route serves from the API origin to
-    /// unauthenticated clients, so it must never be allowed. Same rule the
-    /// tenant logo carries.
-    #[test]
-    fn svg_is_not_an_allowed_image_type() {
-        assert!(check_mime("image/svg+xml").is_err());
-        assert!(check_mime("text/html").is_err());
-        assert!(check_mime("application/octet-stream").is_err());
-        for ok in ALLOWED_MIME {
-            assert!(check_mime(ok).is_ok(), "{ok} should be allowed");
-        }
-    }
 
     /// The stored path is derived from the id alone, so a `file_name` carrying
     /// `../` cannot reach outside the upload directory.

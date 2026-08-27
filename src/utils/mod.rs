@@ -14,6 +14,9 @@ pub mod email;
 pub mod error;
 pub mod geoip;
 pub mod html;
+// PMS-941: the one image allowlist every publicly-readable image route shares
+// (tenant logo, KB article image, ticket inline image). SVG is refused there.
+pub mod inline_image;
 // Shared IP classification (PMS-805): one `is_non_public_ip`, used by the
 // login-location check and by the website probe's SSRF guard.
 pub mod net;

@@ -25,12 +25,12 @@ use uuid::Uuid;
 use super::branding::PUBLIC_TENANT_PATH_PREFIX;
 use crate::utils::error::{AppError, AppResult};
 
-/// Formats a browser and a mail client both render without a plugin. Anything
-/// else is refused rather than stored and served back as `octet-stream`.
-///
-/// SVG is deliberately absent: it is a script-capable document, and this route
-/// serves it from the API origin to unauthenticated clients.
-const ALLOWED_MIME: &[(&str, &str)] = &[
+/// The on-disk suffix each allowed type is stored under. This table names
+/// extensions only: what is *allowed* is `utils::inline_image`, shared with the
+/// other two publicly-readable image routes (PMS-941), and a test below keeps
+/// the two in step so a type can never be accepted with no extension to store
+/// it under.
+const EXTENSIONS: &[(&str, &str)] = &[
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
     ("image/webp", "webp"),
@@ -95,7 +95,7 @@ impl Default for TenantLogoConfig {
 /// The extension a stored logo takes, or `bin` for a mime that never passed
 /// [`check_mime`] (unreachable through the routes; kept total for callers).
 fn extension_for(mime: &str) -> &'static str {
-    ALLOWED_MIME
+    EXTENSIONS
         .iter()
         .find(|(m, _)| *m == mime)
         .map(|(_, ext)| *ext)
@@ -104,25 +104,13 @@ fn extension_for(mime: &str) -> &'static str {
 
 /// Normalise and validate an uploaded content type.
 ///
-/// Browsers append parameters (`image/png; charset=binary`), so the type is cut
-/// at the first `;` before matching, and matching is case-insensitive because
-/// the header is.
+/// PMS-941: the decision itself lives in `utils::inline_image`, because the
+/// logo, the KB article image and the ticket inline image are the same bargain
+/// (an `<img>` that cannot authenticate, served from the API origin) and must
+/// answer this question identically. Kept as a named function here so the call
+/// sites in this module read the same as before.
 pub fn check_mime(raw: &str) -> AppResult<&'static str> {
-    let base = raw
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    ALLOWED_MIME
-        .iter()
-        .find(|(m, _)| *m == base)
-        .map(|(m, _)| *m)
-        .ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "Unsupported image type `{base}`; use PNG, JPEG, WebP or GIF"
-            ))
-        })
+    crate::utils::inline_image::check_inline_image_mime(raw)
 }
 
 #[derive(Clone, Debug)]
@@ -188,7 +176,7 @@ impl TenantLogoStore {
     /// branding no longer points at is invisible, so a failed unlink must not
     /// fail the request that cleared it.
     pub async fn remove(&self, tenant_id: Uuid) {
-        for (mime, _) in ALLOWED_MIME {
+        for (mime, _) in EXTENSIONS {
             let _ = tokio::fs::remove_file(self.config.path_for(tenant_id, mime)).await;
         }
     }
@@ -221,6 +209,19 @@ mod tests {
         );
     }
 
+    /// A type the shared allowlist accepts but this table has no row for would
+    /// be stored as `{tenant}.bin`, so the two lists have to move together.
+    #[test]
+    fn every_allowed_type_has_an_extension_to_store_it_under() {
+        for mime in crate::utils::inline_image::ALLOWED_INLINE_IMAGE_MIME {
+            assert_ne!(
+                extension_for(mime),
+                "bin",
+                "{mime} is allowed but has no row in EXTENSIONS"
+            );
+        }
+    }
+
     #[test]
     fn a_logo_path_is_relative_so_both_callers_can_join_it() {
         let id = Uuid::nil();
@@ -240,7 +241,7 @@ mod tests {
         // Two types sharing an extension would let a format change orphan the
         // previous file under a path `remove` still visits, but `store` would
         // then overwrite a file it believes is a different format.
-        let mut seen: Vec<&str> = ALLOWED_MIME.iter().map(|(_, ext)| *ext).collect();
+        let mut seen: Vec<&str> = EXTENSIONS.iter().map(|(_, ext)| *ext).collect();
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
