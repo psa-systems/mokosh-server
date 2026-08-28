@@ -551,6 +551,13 @@ pub struct CompanyResponse {
     pub open_ticket_count: Option<i64>,
     pub tags: Vec<String>,
     pub portal_enabled: bool,
+    /// MAPPS-618 read-side fix: the per-Company branding overrides
+    /// need to round-trip on both GET and the PUT-response so the
+    /// SPA's editor initialises with the current values (instead of
+    /// re-showing an empty form after every save). Previously the DB
+    /// persisted the block but the wire response dropped it,
+    /// leaving the editor looking like nothing had saved.
+    pub branding: CompanyBranding,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -576,6 +583,7 @@ impl From<Company> for CompanyResponse {
             open_ticket_count: None,
             tags: c.tags,
             portal_enabled: c.portal_enabled,
+            branding: c.branding,
             created_at: c.created_at,
             updated_at: c.updated_at,
         }

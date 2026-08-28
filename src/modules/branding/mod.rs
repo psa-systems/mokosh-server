@@ -5,4 +5,6 @@
 //! (logo / favicon / background at tenant + Company scope) and the
 //! Company-scoped multipart handlers; prompts 003/004 are client-side.
 
+pub mod assets;
 pub mod effective;
+pub mod routes;

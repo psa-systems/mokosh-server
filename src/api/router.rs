@@ -368,6 +368,11 @@ pub fn create_api_router(
             "/contacts",
             contact_routes(contact_service.clone(), PortalRoleService::new(db.clone())),
         )
+        // MAPPS-618 phase B: Company-scoped branding asset uploads
+        // (logo / favicon / background). Staff-gated on
+        // `role.is_admin()`; the contact-plane siblings are wired
+        // separately below under `/api/v1/contact`.
+        .merge(crate::modules::branding::routes::staff_routes(db.clone()))
         // mokosh-contact-login prompt 007: MSP-admin portal-role CRUD.
         // Distinct top-level nest so the SPA hits `/api/v1/portal-roles`
         // and the routes inside stay uncluttered by the double-nest
@@ -673,6 +678,9 @@ pub fn create_api_router(
         // mail client renders it straight out of the request-form email and
         // will never authenticate.
         .merge(public_tenant_routes(TenantService::new(db.clone())))
+        // MAPPS-618 phase B: same shape for the Company-scoped
+        // assets (logo / favicon / background).
+        .merge(crate::modules::branding::routes::public_routes(db.clone()))
         .merge(public_form_routes(
             FormsService::with_request_links(
                 db.clone(),
@@ -694,9 +702,19 @@ pub fn create_api_router(
         crate::modules::contact_portal::ContactAuthService::new(db.clone(), jwt_secret.clone())
             .with_notifications(notifications_service.clone())
             .with_spa_base_url(spa_base_url.clone());
-    let contact_api = crate::modules::contact_portal::contact_routes(contact_service).layer(
-        middleware::from_fn(crate::utils::error::normalize_error_envelope),
-    );
+    // MAPPS-618 phase B: share the ContactAuthService with the
+    // branding router so it can `load_capabilities` for the
+    // `settings:manage_company_branding` gate without a duplicate
+    // instance.
+    let contact_service_arc = std::sync::Arc::new(contact_service.clone());
+    let contact_api = crate::modules::contact_portal::contact_routes(contact_service)
+        .merge(crate::modules::branding::routes::contact_routes(
+            db.clone(),
+            contact_service_arc,
+        ))
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
 
     Router::new()
         .nest("/api/v1", api_v1)
