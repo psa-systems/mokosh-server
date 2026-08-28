@@ -305,6 +305,7 @@ impl ContactService {
                    default_technical_contact_id, account_manager_id, sla_id,
                    default_contract_id, payment_terms, tax_exempt,
                    custom_fields, tags, notes, logo_url, portal_enabled,
+                   branding,
                    created_at, updated_at
             FROM companies
             WHERE tenant_id = $1 AND id = $2
@@ -386,6 +387,7 @@ impl ContactService {
                    default_technical_contact_id, account_manager_id, sla_id,
                    default_contract_id, payment_terms, tax_exempt,
                    custom_fields, tags, notes, logo_url, portal_enabled,
+                   branding,
                    created_at, updated_at
             FROM companies
             WHERE {data_where}
@@ -2969,6 +2971,13 @@ struct CompanyRow {
     notes: Option<String>,
     logo_url: Option<String>,
     portal_enabled: bool,
+    // MAPPS-617: per-Company branding overrides. `serde_json::Value` on
+    // the row so sqlx picks up whatever the JSONB column carries, then
+    // deserialized into the typed `CompanyBranding` shape below. An
+    // empty JSONB object (the migration default) deserializes cleanly
+    // to `CompanyBranding::default()` via `serde(default)` on every
+    // field.
+    branding: serde_json::Value,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -3016,6 +3025,12 @@ impl From<CompanyRow> for Company {
             notes: row.notes,
             logo_url: row.logo_url,
             portal_enabled: row.portal_enabled,
+            // MAPPS-617: branding column on a fresh Company row is `{}`
+            // (migration default); older code paths that hand in a
+            // legacy row without the column will fail sqlx-decode
+            // before we get here, so unwrap_or_default matches the
+            // "empty JSONB" case only.
+            branding: serde_json::from_value(row.branding).unwrap_or_default(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }

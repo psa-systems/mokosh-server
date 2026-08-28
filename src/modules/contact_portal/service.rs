@@ -537,6 +537,9 @@ impl ContactAuthService {
     /// render the top-bar + sidebar + capability gates without a
     /// second round-trip.
     pub async fn me(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<ContactMe> {
+        // MAPPS-617: pull both branding JSONBs alongside the existing
+        // top-bar / sidebar fields so `effective_branding` folds into
+        // this same round-trip.
         let row: (
             Uuid,
             Uuid,
@@ -547,12 +550,16 @@ impl ContactAuthService {
             String,
             Option<String>,
             bool,
+            serde_json::Value,
+            serde_json::Value,
         ) = sqlx::query_as(
             r#"
             SELECT c.id, c.tenant_id, c.email, c.first_name, c.last_name,
-                   c.company_id, co.name, co.portal_slug, c.portal_mfa_enabled
+                   c.company_id, co.name, co.portal_slug, c.portal_mfa_enabled,
+                   t.branding, co.branding
             FROM contacts c
             INNER JOIN companies co ON co.id = c.company_id
+            INNER JOIN tenants t ON t.id = c.tenant_id
             WHERE c.id = $1 AND c.tenant_id = $2
             "#,
         )
@@ -560,8 +567,19 @@ impl ContactAuthService {
         .bind(tenant_id)
         .fetch_one(self.db.migrator_pool())
         .await?;
-        let (id, tid, email, first_name, last_name, cid, company_name, portal_slug, mfa_enabled) =
-            row;
+        let (
+            id,
+            tid,
+            email,
+            first_name,
+            last_name,
+            cid,
+            company_name,
+            portal_slug,
+            mfa_enabled,
+            tenant_branding,
+            company_branding,
+        ) = row;
         let email = email.unwrap_or_default();
         let portal_slug = portal_slug.unwrap_or_default();
         let roles: Vec<(Uuid, String)> = sqlx::query_as(
@@ -576,6 +594,12 @@ impl ContactAuthService {
         .fetch_all(self.db.migrator_pool())
         .await?;
         let caps = self.load_capabilities(tenant_id, contact_id).await?;
+        let tenant_b: mokosh_types::tenants::TenantBranding =
+            serde_json::from_value(tenant_branding).unwrap_or_default();
+        let company_b: mokosh_types::contacts::CompanyBranding =
+            serde_json::from_value(company_branding).unwrap_or_default();
+        let effective_branding =
+            crate::modules::branding::effective::effective_branding(&tenant_b, &company_b);
         Ok(ContactMe {
             id,
             tenant_id: tid,
@@ -591,6 +615,7 @@ impl ContactAuthService {
                 .collect(),
             caps,
             mfa_enabled,
+            effective_branding,
         })
     }
 
@@ -599,9 +624,19 @@ impl ContactAuthService {
     /// of the tenant's active state so the SPA can render a suspended
     /// splash. Unknown slugs 404 (enumeration-resistant).
     pub async fn resolve_host(&self, slug: &str) -> AppResult<Option<ContactPortalHostHint>> {
-        let row: Option<(String, String, String, String)> = sqlx::query_as(
+        // MAPPS-617: pull both branding JSONBs so `effective_branding`
+        // can resolve on this single round-trip; the SPA reads the
+        // merged block to paint step-2 login without a second fetch.
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+        )> = sqlx::query_as(
             r#"
-            SELECT co.name, co.portal_slug, t.name, t.status
+            SELECT co.name, co.portal_slug, t.name, t.status, t.branding, co.branding
             FROM companies co
             INNER JOIN tenants t ON t.id = co.tenant_id
             WHERE co.portal_slug = $1
@@ -610,16 +645,30 @@ impl ContactAuthService {
         .bind(slug)
         .fetch_optional(self.db.migrator_pool())
         .await?;
-        Ok(
-            row.map(|(company_name, slug, tenant_display_name, tenant_status)| {
+        Ok(row.map(
+            |(
+                company_name,
+                slug,
+                tenant_display_name,
+                tenant_status,
+                tenant_branding,
+                company_branding,
+            )| {
+                let tenant_b: mokosh_types::tenants::TenantBranding =
+                    serde_json::from_value(tenant_branding).unwrap_or_default();
+                let company_b: mokosh_types::contacts::CompanyBranding =
+                    serde_json::from_value(company_branding).unwrap_or_default();
                 ContactPortalHostHint {
                     company_name,
                     portal_slug: slug,
                     tenant_display_name,
                     tenant_status,
+                    effective_branding: crate::modules::branding::effective::effective_branding(
+                        &tenant_b, &company_b,
+                    ),
                 }
-            }),
-        )
+            },
+        ))
     }
 
     /// mokosh-contact-login prompt 011 (PMS-928): sibling of
@@ -637,9 +686,17 @@ impl ContactAuthService {
         &self,
         portal_id: i64,
     ) -> AppResult<Option<ContactPortalHostHint>> {
-        let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
+        // MAPPS-617: same effective-branding wire-up as `resolve_host`.
+        let row: Option<(
+            String,
+            Option<String>,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+        )> = sqlx::query_as(
             r#"
-            SELECT co.name, co.portal_slug, t.name, t.status
+            SELECT co.name, co.portal_slug, t.name, t.status, t.branding, co.branding
             FROM companies co
             INNER JOIN tenants t ON t.id = co.tenant_id
             WHERE co.portal_id = $1
@@ -648,16 +705,30 @@ impl ContactAuthService {
         .bind(portal_id)
         .fetch_optional(self.db.migrator_pool())
         .await?;
-        Ok(
-            row.map(|(company_name, slug, tenant_display_name, tenant_status)| {
+        Ok(row.map(
+            |(
+                company_name,
+                slug,
+                tenant_display_name,
+                tenant_status,
+                tenant_branding,
+                company_branding,
+            )| {
+                let tenant_b: mokosh_types::tenants::TenantBranding =
+                    serde_json::from_value(tenant_branding).unwrap_or_default();
+                let company_b: mokosh_types::contacts::CompanyBranding =
+                    serde_json::from_value(company_branding).unwrap_or_default();
                 ContactPortalHostHint {
                     company_name,
                     portal_slug: slug.unwrap_or_default(),
                     tenant_display_name,
                     tenant_status,
+                    effective_branding: crate::modules::branding::effective::effective_branding(
+                        &tenant_b, &company_b,
+                    ),
                 }
-            }),
-        )
+            },
+        ))
     }
 
     /// mokosh-contact-login prompt 011 (PMS-928): resolve a legacy

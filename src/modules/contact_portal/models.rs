@@ -126,6 +126,16 @@ pub struct ContactMe {
     pub caps: Vec<String>,
     #[serde(default)]
     pub mfa_enabled: bool,
+    /// MAPPS-617: resolved brand for this contact's tenant + Company
+    /// so the SPA can paint the in-app surfaces (sidebar, dashboard,
+    /// ticket detail) without an extra `/host` round-trip after
+    /// sign-in. On the login mfa-required path this field is omitted
+    /// (no contact object is returned then, so the SPA falls back to
+    /// the branding it already fetched via `/portal/{id}/host` at
+    /// step 2). Legacy responses that pre-date this field deserialize
+    /// to `EffectiveBranding::default()` (all `None`).
+    #[serde(default)]
+    pub effective_branding: mokosh_types::tenants::EffectiveBranding,
 }
 
 /// One row inside `ContactMe.roles`. Distinct from the staff-plane
@@ -361,4 +371,10 @@ pub struct ContactPortalHostHint {
     /// SPA gates the login form on `status == "active"` and renders
     /// a suspended splash otherwise.
     pub tenant_status: String,
+    /// MAPPS-617: fully resolved brand for the (tenant, Company) tuple
+    /// so the SPA paints logo + colors + background + wordmark on the
+    /// step-2 login without a second round-trip. Every field is
+    /// `Option<String>`; both sides falling through leaves `None` and
+    /// the SPA supplies the coded default.
+    pub effective_branding: mokosh_types::tenants::EffectiveBranding,
 }

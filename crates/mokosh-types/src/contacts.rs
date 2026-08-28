@@ -398,8 +398,40 @@ pub struct Company {
     pub notes: Option<String>,
     pub logo_url: Option<String>,
     pub portal_enabled: bool,
+    /// MAPPS-617: per-Company branding overrides. See
+    /// [`crate::tenants::TenantBranding`] and
+    /// [`crate::tenants::EffectiveBranding`]: the resolver merges the
+    /// tenant's brand with these overrides field-by-field, Company keys
+    /// winning where set. Empty on rows created before the branding
+    /// feature landed (migration ships `NOT NULL DEFAULT '{}'`).
+    #[serde(default)]
+    pub branding: CompanyBranding,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Per-Company branding overrides. Same field shape as
+/// [`crate::tenants::TenantBranding`] so the two merge cleanly through
+/// [`crate::tenants::EffectiveBranding`]; every non-`None` field on the
+/// Company wins over the tenant default. Missing on both sides stays
+/// `None`; the SPA supplies the coded fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CompanyBranding {
+    pub logo_url: Option<String>,
+    pub logo_mime: Option<String>,
+    pub favicon_url: Option<String>,
+    pub favicon_mime: Option<String>,
+    pub primary_color: Option<String>,
+    pub secondary_color: Option<String>,
+    pub background_color: Option<String>,
+    pub background_url: Option<String>,
+    pub background_mime: Option<String>,
+    pub display_name: Option<String>,
+    pub company_name: Option<String>,
+    pub support_email: Option<String>,
+    pub support_phone: Option<String>,
+    pub support_contact_name: Option<String>,
+    pub portal_domain: Option<String>,
 }
 
 /// Create company request
