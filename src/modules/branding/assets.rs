@@ -1,17 +1,23 @@
-//! MAPPS-618 phase B (mokosh-branding prompt 002): parameterized asset
-//! store for Company-scoped branding uploads (logo, favicon,
-//! background). Mirrors [`crate::modules::tenants::logo`] one-for-one
-//! at Company scope; the tenant module stays untouched so an
-//! in-flight tenant-logo upload does not risk regressing.
+//! MAPPS-618/622 (mokosh-branding prompt 002): parameterized asset
+//! store for branding uploads at both tenant + Company scope. Handles
+//! the three asset kinds (logo, favicon, background) uniformly per
+//! scope.
 //!
 //! Storage layout under `$ATTACHMENT_DIR`:
 //!
 //! ```text
 //! attachments/
+//!   tenant-favicons/{tenant_id}.{ext}
+//!   tenant-backgrounds/{tenant_id}.{ext}
 //!   company-logos/{company_id}.{ext}
 //!   company-favicons/{company_id}.{ext}
 //!   company-backgrounds/{company_id}.{ext}
 //! ```
+//!
+//! The tenant logo (`tenant-logos/`) is served by the legacy MAPPS-429
+//! path (`src/modules/tenants/logo.rs`) so the in-flight tenant logo
+//! upload flow keeps working unchanged; this module owns the two new
+//! tenant kinds (favicon + background) plus every Company kind.
 //!
 //! Same MIME allowlist as the tenant logo (`image/png|jpeg|webp|gif`);
 //! SVG stays refused. Per-kind size caps default to sensible values
@@ -34,29 +40,60 @@ const DEFAULT_LOGO_MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
 const DEFAULT_FAVICON_MAX_BYTES: u64 = 512 * 1024; // 512 KiB
 const DEFAULT_BACKGROUND_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 
-/// The three brand asset kinds a Company can upload. Each maps to a
-/// distinct subdirectory + its own size cap.
+/// The three brand asset kinds. Each maps to a distinct subdirectory
+/// per scope + its own size cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompanyAssetKind {
+pub enum BrandAssetKind {
     Logo,
     Favicon,
     Background,
 }
 
-impl CompanyAssetKind {
-    fn subdir(self) -> &'static str {
+/// Type alias kept during the phase-B rollout so existing callers
+/// still compile; new code uses [`BrandAssetKind`] directly.
+pub type CompanyAssetKind = BrandAssetKind;
+
+/// Which scope an asset belongs to. Tenant scope maps to the MSP-
+/// level defaults every Company inherits; Company scope maps to the
+/// per-Company override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetScope {
+    Tenant(Uuid),
+    Company(Uuid),
+}
+
+impl AssetScope {
+    fn subdir_prefix(self) -> &'static str {
         match self {
-            Self::Logo => "company-logos",
-            Self::Favicon => "company-favicons",
-            Self::Background => "company-backgrounds",
+            Self::Tenant(_) => "tenant",
+            Self::Company(_) => "company",
         }
     }
 
-    fn env_var(self) -> &'static str {
+    fn id(self) -> Uuid {
         match self {
-            Self::Logo => "BRANDING_COMPANY_LOGO_MAX_BYTES",
-            Self::Favicon => "BRANDING_COMPANY_FAVICON_MAX_BYTES",
-            Self::Background => "BRANDING_COMPANY_BACKGROUND_MAX_BYTES",
+            Self::Tenant(id) | Self::Company(id) => id,
+        }
+    }
+}
+
+impl BrandAssetKind {
+    fn kind_dir(self) -> &'static str {
+        match self {
+            Self::Logo => "logos",
+            Self::Favicon => "favicons",
+            Self::Background => "backgrounds",
+        }
+    }
+
+    fn env_var(self, scope: AssetScope) -> &'static str {
+        match (scope, self) {
+            (AssetScope::Tenant(_), Self::Logo) => "TENANT_LOGO_MAX_BYTES",
+            (AssetScope::Tenant(_), Self::Favicon) => "BRANDING_TENANT_FAVICON_MAX_BYTES",
+            (AssetScope::Tenant(_), Self::Background) => "BRANDING_TENANT_BACKGROUND_MAX_BYTES",
+            (AssetScope::Company(_), Self::Logo) => "BRANDING_COMPANY_LOGO_MAX_BYTES",
+            (AssetScope::Company(_), Self::Favicon) => "BRANDING_COMPANY_FAVICON_MAX_BYTES",
+            (AssetScope::Company(_), Self::Background) => "BRANDING_COMPANY_BACKGROUND_MAX_BYTES",
         }
     }
 
@@ -130,11 +167,15 @@ pub fn check_mime(raw: &str) -> AppResult<&'static str> {
 }
 
 #[derive(Clone, Debug)]
-pub struct CompanyAssetStore {
+pub struct BrandingAssetStore {
     root: PathBuf,
 }
 
-impl CompanyAssetStore {
+/// Type alias kept during the phase-B rollout so existing callers
+/// still compile; new code uses [`BrandingAssetStore`] directly.
+pub type CompanyAssetStore = BrandingAssetStore;
+
+impl BrandingAssetStore {
     pub fn from_env() -> Self {
         let root = std::env::var("ATTACHMENT_DIR")
             .ok()
@@ -144,30 +185,31 @@ impl CompanyAssetStore {
         Self { root }
     }
 
-    pub fn max_bytes(&self, kind: CompanyAssetKind) -> u64 {
-        std::env::var(kind.env_var())
+    pub fn max_bytes(&self, kind: BrandAssetKind, scope: AssetScope) -> u64 {
+        std::env::var(kind.env_var(scope))
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or_else(|| kind.default_max_bytes())
     }
 
-    fn dir_for(&self, kind: CompanyAssetKind) -> PathBuf {
-        self.root.join(kind.subdir())
+    fn dir_for(&self, scope: AssetScope, kind: BrandAssetKind) -> PathBuf {
+        self.root
+            .join(format!("{}-{}", scope.subdir_prefix(), kind.kind_dir()))
     }
 
-    fn path_for(&self, kind: CompanyAssetKind, company_id: Uuid, mime: &str) -> PathBuf {
-        self.dir_for(kind)
-            .join(format!("{company_id}.{}", extension_for(mime)))
+    fn path_for(&self, scope: AssetScope, kind: BrandAssetKind, mime: &str) -> PathBuf {
+        self.dir_for(scope, kind)
+            .join(format!("{}.{}", scope.id(), extension_for(mime)))
     }
 
-    /// Store the asset, overwriting whatever the Company had for this
-    /// kind. Returns the normalized MIME the caller records in the
+    /// Store the asset, overwriting whatever this (scope, kind) pair
+    /// had. Returns the normalized MIME the caller records in the
     /// branding JSONB.
     pub async fn store(
         &self,
-        kind: CompanyAssetKind,
-        company_id: Uuid,
+        scope: AssetScope,
+        kind: BrandAssetKind,
         mime: &str,
         bytes: &[u8],
     ) -> AppResult<&'static str> {
@@ -175,18 +217,18 @@ impl CompanyAssetStore {
         if bytes.is_empty() {
             return Err(AppError::BadRequest("the uploaded file is empty".into()));
         }
-        let cap = self.max_bytes(kind);
+        let cap = self.max_bytes(kind, scope);
         if bytes.len() as u64 > cap {
             return Err(AppError::BadRequest(format!(
                 "image is larger than the {} KiB limit",
                 cap / 1024
             )));
         }
-        self.remove(kind, company_id).await;
-        tokio::fs::create_dir_all(self.dir_for(kind))
+        self.remove(scope, kind).await;
+        tokio::fs::create_dir_all(self.dir_for(scope, kind))
             .await
             .map_err(|e| AppError::Internal(format!("create asset dir: {e}")))?;
-        tokio::fs::write(self.path_for(kind, company_id, mime), bytes)
+        tokio::fs::write(self.path_for(scope, kind, mime), bytes)
             .await
             .map_err(|e| AppError::Internal(format!("write asset: {e}")))?;
         Ok(mime)
@@ -194,22 +236,22 @@ impl CompanyAssetStore {
 
     pub async fn read(
         &self,
-        kind: CompanyAssetKind,
-        company_id: Uuid,
+        scope: AssetScope,
+        kind: BrandAssetKind,
         mime: &str,
     ) -> AppResult<Vec<u8>> {
         let mime = check_mime(mime)?;
-        tokio::fs::read(self.path_for(kind, company_id, mime))
+        tokio::fs::read(self.path_for(scope, kind, mime))
             .await
             .map_err(|_| AppError::NotFound("Asset".to_string()))
     }
 
-    /// Remove every stored format for a (kind, Company) pair. Best-
+    /// Remove every stored format for a (scope, kind) pair. Best-
     /// effort: an unreachable file the branding row no longer points
     /// at cannot fail the request that cleared the row.
-    pub async fn remove(&self, kind: CompanyAssetKind, company_id: Uuid) {
+    pub async fn remove(&self, scope: AssetScope, kind: BrandAssetKind) {
         for (mime, _) in ALLOWED_MIME {
-            let _ = tokio::fs::remove_file(self.path_for(kind, company_id, mime)).await;
+            let _ = tokio::fs::remove_file(self.path_for(scope, kind, mime)).await;
         }
     }
 }
@@ -217,15 +259,16 @@ impl CompanyAssetStore {
 /// Public-URL path a client fetches this asset from. Relative on
 /// purpose: SPA joins with `API_BASE`; the email composer joins with
 /// the configured public base.
-pub fn asset_path(kind: CompanyAssetKind, company_id: Uuid) -> String {
-    format!(
-        "/api/v1/public/companies/{company_id}/{}",
-        match kind {
-            CompanyAssetKind::Logo => "logo",
-            CompanyAssetKind::Favicon => "favicon",
-            CompanyAssetKind::Background => "background",
-        }
-    )
+pub fn asset_path(scope: AssetScope, kind: BrandAssetKind) -> String {
+    let segment = match kind {
+        BrandAssetKind::Logo => "logo",
+        BrandAssetKind::Favicon => "favicon",
+        BrandAssetKind::Background => "background",
+    };
+    match scope {
+        AssetScope::Tenant(id) => format!("/api/v1/public/tenants/{id}/{segment}"),
+        AssetScope::Company(id) => format!("/api/v1/public/companies/{id}/{segment}"),
+    }
 }
 
 #[cfg(test)]
@@ -258,8 +301,16 @@ mod tests {
     #[test]
     fn asset_path_stays_relative() {
         let id = Uuid::nil();
-        let p = asset_path(CompanyAssetKind::Logo, id);
+        let p = asset_path(AssetScope::Company(id), BrandAssetKind::Logo);
         assert!(p.starts_with("/api/v1/public/companies/"));
         assert!(p.ends_with("/logo"));
+    }
+
+    #[test]
+    fn tenant_asset_path_shape() {
+        let id = Uuid::nil();
+        let p = asset_path(AssetScope::Tenant(id), BrandAssetKind::Favicon);
+        assert!(p.starts_with("/api/v1/public/tenants/"));
+        assert!(p.ends_with("/favicon"));
     }
 }
