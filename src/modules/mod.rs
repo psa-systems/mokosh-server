@@ -8,6 +8,11 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod billing;
+/// MAPPS-617 (mokosh-branding prompt 001): shared branding helpers.
+/// Owns the tenant + Company brand merge (`effective::effective_branding`).
+/// Prompt 002 extends this with the parameterized asset store + Company-
+/// scoped multipart handlers; prompts 003/004 are client-side.
+pub mod branding;
 pub mod calendar;
 pub mod contact_portal;
 pub mod contacts;

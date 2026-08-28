@@ -754,15 +754,9 @@ async fn create_tenant_persists_optional_branding(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let branding = mokosh_types::tenants::TenantBranding {
         logo_url: Some("https://cdn.example/logo.svg".to_string()),
-        logo_mime: None,
-        favicon_url: None,
         primary_color: Some("#2563eb".to_string()),
-        secondary_color: None,
-        company_name: None,
         support_email: Some("help@acme-mapps396.example".to_string()),
-        support_phone: None,
-        support_contact_name: None,
-        portal_domain: None,
+        ..Default::default()
     };
     let req = CreateTenantRequest {
         name: "MAPPS-396 Branded".into(),
