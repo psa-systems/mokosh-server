@@ -142,6 +142,12 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
             description: "Edit own profile, password, MFA, and active sessions.".to_string(),
         },
         CapabilityDescriptor {
+            key: caps::SETTINGS_MANAGE_COMPANY_BRANDING.to_string(),
+            label: "Manage portal branding".to_string(),
+            group: "Settings".to_string(),
+            description: "Edit the portal's logo, colors, background, display name, and support contact block for this Company. MSP defaults still show through wherever a field is not overridden.".to_string(),
+        },
+        CapabilityDescriptor {
             key: caps::CONTACTS_INVITE_SUB_USER.to_string(),
             label: "Invite sub-users".to_string(),
             group: "Sub-users".to_string(),

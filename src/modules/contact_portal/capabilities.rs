@@ -119,6 +119,16 @@ pub const FORMS_SUBMIT: &str = "forms:submit";
 pub const NOTIFICATIONS_READ: &str = "notifications:read";
 /// Edit own profile + password + MFA + own sessions.
 pub const SETTINGS_MANAGE_OWN: &str = "settings:manage_own";
+/// MAPPS-618 (mokosh-branding prompt 002): edit the caller's own
+/// Company branding overrides (logo, favicon, background, colors,
+/// display name, support contact block). Scope-checked server-side:
+/// the endpoint derives the target Company from `caller.company_id`,
+/// so a holder can only ever paint their own Company. Distinct from
+/// [`SETTINGS_MANAGE_OWN`] (personal profile / password / MFA) so a
+/// role can be granted profile edit without brand edit, and vice
+/// versa. MSP staff never need this cap: the staff plane edits every
+/// Company under their tenant via `role.is_admin()`.
+pub const SETTINGS_MANAGE_COMPANY_BRANDING: &str = "settings:manage_company_branding";
 
 /// Invite a colleague at the same Company (creates a contact + fires
 /// the portal setup email). Contact-plane only; never grants
@@ -160,6 +170,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     FORMS_SUBMIT,
     NOTIFICATIONS_READ,
     SETTINGS_MANAGE_OWN,
+    SETTINGS_MANAGE_COMPANY_BRANDING,
     CONTACTS_INVITE_SUB_USER,
     CONTACTS_MANAGE_SUB_USER,
 ];

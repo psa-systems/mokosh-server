@@ -519,6 +519,15 @@ pub struct UpdateCompanyRequest {
     #[validate(custom(function = "validate_text_no_nul"))]
     pub notes: Option<String>,
     pub portal_enabled: Option<bool>,
+    /// MAPPS-618: per-Company branding overrides. Same wire shape as
+    /// `UpdateTenantRequest.branding` (PMS-758): a JSONB object of the
+    /// subset the caller owns. `None` leaves the row's branding
+    /// untouched; a present object is JSONB-merged into the existing
+    /// row via `||`, so a caller clears a specific key by sending it
+    /// as an explicit `null` and leaves other keys alone by omitting
+    /// them. Type-checked at the read side by
+    /// [`CompanyBranding`]'s serde derives.
+    pub branding: Option<serde_json::Value>,
 }
 
 /// Company response for API

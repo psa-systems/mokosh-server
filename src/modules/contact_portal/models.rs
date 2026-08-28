@@ -138,6 +138,19 @@ pub struct ContactMe {
     pub effective_branding: mokosh_types::tenants::EffectiveBranding,
 }
 
+/// MAPPS-618 (mokosh-branding prompt 002): response body for
+/// `GET /api/v1/contact/companies/self/branding`. Powers the
+/// contact-plane branding editor's "Inherits from MSP default: X"
+/// hints: the SPA holds the raw tenant + Company sides so a per-field
+/// reset (`Match MSP default`) can show what the fall-back looks
+/// like without recomputing the merge client-side.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactOwnCompanyBranding {
+    pub tenant: mokosh_types::tenants::TenantBranding,
+    pub company: mokosh_types::contacts::CompanyBranding,
+    pub effective: mokosh_types::tenants::EffectiveBranding,
+}
+
 /// One row inside `ContactMe.roles`. Distinct from the staff-plane
 /// `PortalRoleSummary` shape which carries `capabilities` and
 /// `is_builtin`; contacts only need the display name.

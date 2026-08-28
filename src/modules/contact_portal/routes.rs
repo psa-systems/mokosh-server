@@ -54,6 +54,21 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         .route("/auth/login-link/redeem", post(redeem_login_link))
         .route("/auth/login-link/select", post(select_login_candidate))
         .route("/auth/me", get(me).put(update_me))
+        // MAPPS-618 (mokosh-branding prompt 002): contact-plane brand
+        // editor. Gated on `settings:manage_company_branding`; server
+        // derives the target Company from the caller's session, so a
+        // holder can only ever paint their own Company's brand.
+        //
+        // GET returns the raw tenant + Company branding blocks plus
+        // the resolved effective set so the SPA renders the
+        // "Inherits from MSP default" hints on each field. PATCH
+        // JSONB-merges the request into the row (subset the caller
+        // owns, explicit null clears; same PMS-758 pattern the tenant
+        // side uses).
+        .route(
+            "/companies/self/branding",
+            get(get_own_company_branding).patch(update_own_company_branding),
+        )
         // PMS-935: contact-only dashboard aggregate. Staff have their
         // own workspace dashboards; this endpoint is deliberately
         // scoped to `RequireContactAuth`.
@@ -327,6 +342,73 @@ async fn update_me(
         .update_self(tenant, session.id, &request)
         .await?;
     Ok(Json(me))
+}
+
+/// MAPPS-618 (mokosh-branding prompt 002): read the caller's own
+/// Company branding for the contact-plane editor. Returns the raw
+/// tenant + Company blocks plus the resolved effective set. Gated on
+/// `settings:manage_company_branding` (a contact who cannot edit
+/// brand also does not need the raw tenant side; the merged
+/// `effective_branding` is already on `ContactMe` for painting).
+async fn get_own_company_branding(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+) -> AppResult<Json<ContactOwnCompanyBranding>> {
+    let capabilities = state
+        .service
+        .load_capabilities(session.tenant_id, session.id)
+        .await?;
+    if !capabilities
+        .iter()
+        .any(|c| c == caps::SETTINGS_MANAGE_COMPANY_BRANDING)
+    {
+        return Err(AppError::Forbidden(format!(
+            "Missing required capability: {}",
+            caps::SETTINGS_MANAGE_COMPANY_BRANDING
+        )));
+    }
+    let out = state
+        .service
+        .load_own_company_branding(session.tenant_id, session.company_id)
+        .await?;
+    Ok(Json(out))
+}
+
+/// MAPPS-618 (mokosh-branding prompt 002): PATCH the caller's own
+/// Company branding. Same wire shape (JSONB subset + explicit nulls
+/// to clear) as `PUT /tenants/{id}` uses for the tenant side
+/// (PMS-758). Server derives the target Company from the session
+/// (`companies/self`) so the caller can only ever paint their own
+/// Company. Gated on `settings:manage_company_branding`.
+async fn update_own_company_branding(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(branding): Json<serde_json::Value>,
+) -> AppResult<Json<ContactOwnCompanyBranding>> {
+    let capabilities = state
+        .service
+        .load_capabilities(session.tenant_id, session.id)
+        .await?;
+    if !capabilities
+        .iter()
+        .any(|c| c == caps::SETTINGS_MANAGE_COMPANY_BRANDING)
+    {
+        return Err(AppError::Forbidden(format!(
+            "Missing required capability: {}",
+            caps::SETTINGS_MANAGE_COMPANY_BRANDING
+        )));
+    }
+    if !branding.is_object() {
+        return Err(AppError::validation_field(
+            "branding",
+            "must be an object of branding keys",
+        ));
+    }
+    let out = state
+        .service
+        .update_own_company_branding(session.tenant_id, session.company_id, &branding)
+        .await?;
+    Ok(Json(out))
 }
 
 /// PMS-935: aggregate dashboard tile grid. Scoped to the signed-in
