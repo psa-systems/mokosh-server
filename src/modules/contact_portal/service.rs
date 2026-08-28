@@ -1580,6 +1580,75 @@ impl ContactAuthService {
     ///   billing detail view).
     /// - Quotes: `status = 'sent'` (open for the Contact's decision).
     /// - Contracts: `status = 'active'`.
+    /// MAPPS-618 (mokosh-branding prompt 002): load the raw tenant +
+    /// Company branding blocks plus the resolved effective set, for
+    /// the contact-plane branding editor. Handler has already
+    /// verified `settings:manage_company_branding`.
+    pub async fn load_own_company_branding(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+    ) -> AppResult<super::models::ContactOwnCompanyBranding> {
+        let row: (serde_json::Value, serde_json::Value) = sqlx::query_as(
+            r#"
+            SELECT t.branding, co.branding
+            FROM companies co
+            INNER JOIN tenants t ON t.id = co.tenant_id
+            WHERE co.tenant_id = $1 AND co.id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?
+        .ok_or_else(|| AppError::not_found("company"))?;
+        let (tenant_json, company_json) = row;
+        let tenant: mokosh_types::tenants::TenantBranding =
+            serde_json::from_value(tenant_json).unwrap_or_default();
+        let company: mokosh_types::contacts::CompanyBranding =
+            serde_json::from_value(company_json).unwrap_or_default();
+        let effective = crate::modules::branding::effective::effective_branding(&tenant, &company);
+        Ok(super::models::ContactOwnCompanyBranding {
+            tenant,
+            company,
+            effective,
+        })
+    }
+
+    /// MAPPS-618 (mokosh-branding prompt 002): JSONB-merge the
+    /// caller's branding patch into the Company row. Matches the
+    /// tenant-side PMS-758 pattern: a caller sends the subset they
+    /// own, an explicit `null` clears a key. Handler has already
+    /// verified the payload is an object and the caller holds
+    /// `settings:manage_company_branding`.
+    pub async fn update_own_company_branding(
+        &self,
+        tenant_id: Uuid,
+        company_id: Uuid,
+        patch: &serde_json::Value,
+    ) -> AppResult<super::models::ContactOwnCompanyBranding> {
+        let mut tx = self
+            .db
+            .begin_with_tenant(TenantId::from_trusted(tenant_id))
+            .await?;
+        let affected = sqlx::query(
+            "UPDATE companies \
+             SET branding = branding || $3::jsonb, updated_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(patch)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(AppError::not_found("company"));
+        }
+        tx.commit().await?;
+        self.load_own_company_branding(tenant_id, company_id).await
+    }
+
     pub async fn dashboard_summary(
         &self,
         tenant_id: TenantId,

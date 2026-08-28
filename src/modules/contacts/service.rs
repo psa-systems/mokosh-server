@@ -577,7 +577,30 @@ impl ContactService {
         }
         if request.portal_enabled.is_some() {
             updates.push(format!("portal_enabled = ${param_idx}"));
-            // param_idx += 1;
+            param_idx += 1;
+        }
+        // MAPPS-618: JSONB merge, matching the tenant branding pattern
+        // (PMS-758). A caller sends only the subset they own; an
+        // explicit `null` clears that key so the resolver falls back
+        // to the tenant default on the next fetch.
+        if let Some(branding) = request.branding.as_ref() {
+            if !branding.is_object() {
+                return Err(AppError::validation_field(
+                    "branding",
+                    "must be an object of branding keys",
+                ));
+            }
+        }
+        if request.branding.is_some() {
+            updates.push(format!("branding = branding || ${param_idx}::jsonb"));
+            // Invariant: every conditional SET advances `param_idx` so
+            // the next field is numbered correctly. `branding` is the
+            // last field today; keep the increment so the pattern
+            // stays copy-paste safe (PMS-197 mirror of PMS-758).
+            #[allow(unused_assignments)]
+            {
+                param_idx += 1;
+            }
         }
 
         let query = format!(
@@ -667,6 +690,9 @@ impl ContactService {
         }
         if let Some(portal_enabled) = request.portal_enabled {
             q = q.bind(portal_enabled);
+        }
+        if let Some(ref branding) = request.branding {
+            q = q.bind(branding);
         }
 
         // Mutation + audit row in one transaction: snapshot the row
