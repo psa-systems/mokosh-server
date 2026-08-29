@@ -118,13 +118,16 @@ impl ProjectsService {
                    contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
+                   -- PMS-944: see the note on the task query. Approval is no
+                   -- longer the gate on anything, so a project's actuals count
+                   -- every live entry rather than only countersigned ones.
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                               AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                        AS actual_hours,
                    COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0) AS actual_amount,
+                               AND te.approval_status <> 'rejected'), 0) AS actual_amount,
                    billing_method, hourly_rate, is_billable, default_due_business_days,
                    created_at, updated_at
             FROM projects WHERE {where_clause}
@@ -241,13 +244,16 @@ impl ProjectsService {
                    contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
+                   -- PMS-944: see the note on the task query. Approval is no
+                   -- longer the gate on anything, so a project's actuals count
+                   -- every live entry rather than only countersigned ones.
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                               AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                        AS actual_hours,
                    COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0) AS actual_amount,
+                               AND te.approval_status <> 'rejected'), 0) AS actual_amount,
                    billing_method, hourly_rate, is_billable, default_due_business_days,
                    created_at, updated_at
             FROM projects WHERE tenant_id = $1 AND id = $2
@@ -854,9 +860,15 @@ impl ProjectsService {
         let rows = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
                       priority, assigned_to_id, estimated_hours,
+                      -- PMS-944: actual hours are the hours worked. They used
+                      -- to count only `approved` time, which reads zero on a
+                      -- tenant with timesheets off, because nothing there ever
+                      -- reaches that state. `logged_hours` beside it always
+                      -- used this predicate; the two now agree, which is the
+                      -- point: approval is no longer a fact about the work.
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
-                                  AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                                  AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                           AS actual_hours,
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
@@ -977,9 +989,15 @@ impl ProjectsService {
         let row = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
                       priority, assigned_to_id, estimated_hours,
+                      -- PMS-944: actual hours are the hours worked. They used
+                      -- to count only `approved` time, which reads zero on a
+                      -- tenant with timesheets off, because nothing there ever
+                      -- reaches that state. `logged_hours` beside it always
+                      -- used this predicate; the two now agree, which is the
+                      -- point: approval is no longer a fact about the work.
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
-                                  AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                                  AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                           AS actual_hours,
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
