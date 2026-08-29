@@ -121,29 +121,34 @@ impl BillingService {
     /// produce an invoice, for the message on the empty path.
     ///
     /// PMS-933 answered "held by approval", because PMS-144 made timesheet
-    /// approval the gate. PMS-944 removed that gate, so a billable, uninvoiced
-    /// client entry is now always `ready_to_bill` and nothing can be held: the
-    /// old sentence would name a state that can no longer occur. What survives
-    /// is the requirement it was defending, which is that "no billable time
-    /// found" is a claim about the user's data and must not be made when the
-    /// data is there.
+    /// approval the gate. PMS-944 removed that gate, so the old sentence would
+    /// name a state that can no longer occur. What survives is the requirement
+    /// it was defending, which is that "no billable time found" is a claim
+    /// about the user's data and must not be made when the data is there.
     ///
     /// Deliberately the SAME predicate as the eligibility select minus the
     /// `is_billable`, `invoice_id` and `billing_status` clauses, so this can
-    /// only ever describe rows those clauses excluded. If the two drift, this
-    /// starts explaining the absence of rows that were never eligible for
+    /// only ever describe rows those three excluded, and it counts each of them
+    /// separately so no excluded row goes unaccounted for. If the two drift,
+    /// this starts explaining the absence of rows that were never eligible for
     /// another reason, which is worse than the message it replaced.
     async fn uninvoiceable_time_for_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
     ) -> AppResult<UninvoiceableTime> {
-        let row: Option<(i64, i64, i64)> = sqlx::query_as(
+        let row: Option<(i64, i64, i64, i64, i64)> = sqlx::query_as(
             r#"
             SELECT
-                COUNT(*) FILTER (WHERE is_billable = FALSE),
-                COALESCE(SUM(duration_minutes) FILTER (WHERE is_billable = FALSE), 0),
-                COUNT(*) FILTER (WHERE is_billable = TRUE AND invoice_id IS NOT NULL)
+                COUNT(*) FILTER (
+                    WHERE is_billable IS TRUE AND invoice_id IS NULL
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'),
+                COALESCE(SUM(duration_minutes) FILTER (
+                    WHERE is_billable IS TRUE AND invoice_id IS NULL
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'), 0),
+                COUNT(*) FILTER (WHERE is_billable IS NOT TRUE),
+                COALESCE(SUM(duration_minutes) FILTER (WHERE is_billable IS NOT TRUE), 0),
+                COUNT(*) FILTER (WHERE is_billable IS TRUE AND invoice_id IS NOT NULL)
             FROM time_entries
             WHERE tenant_id = $1
               AND company_id = $2
@@ -159,8 +164,11 @@ impl BillingService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let (non_billable, non_billable_minutes, already_invoiced) = row.unwrap_or((0, 0, 0));
+        let (not_ready, not_ready_minutes, non_billable, non_billable_minutes, already_invoiced) =
+            row.unwrap_or((0, 0, 0, 0, 0));
         Ok(UninvoiceableTime {
+            not_ready,
+            not_ready_minutes,
             non_billable,
             non_billable_minutes,
             already_invoiced,
@@ -2849,13 +2857,21 @@ fn current_billing_period(
 /// Counted only when the eligible set came back empty, to turn "none found"
 /// into a statement that is true and that names somebody's next action.
 ///
-/// The two states are split because they are two different answers to the same
-/// question. Time logged as non-billable is a decision somebody made when they
-/// logged it, and the fix is to change that decision. Time already on an
-/// invoice is not missing at all, and telling that user to go and log hours
-/// would have them bill the same work twice.
+/// The three states are split because they are three different answers to the
+/// same question, and the same sentence would be wrong for two of them. Time
+/// logged as non-billable is a decision somebody made, and the fix is to change
+/// it. Time already on an invoice is not missing at all, and telling that user
+/// to go and log hours would have them bill the same work twice. Time that is
+/// billable and uninvoiced but not armed should not exist since PMS-944 arms an
+/// entry at creation and migration 121 armed the rest, so it is reported rather
+/// than denied: the one thing PMS-933 forbids is answering "there is none" when
+/// there is some.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct UninvoiceableTime {
+    /// Client entries that are billable and uninvoiced but not `ready_to_bill`.
+    pub not_ready: i64,
+    /// Minutes across those.
+    pub not_ready_minutes: i64,
     /// Client entries logged as non-billable.
     pub non_billable: i64,
     /// Minutes across those, so the message can state the size of what was
@@ -2866,55 +2882,103 @@ pub(crate) struct UninvoiceableTime {
 }
 
 impl UninvoiceableTime {
+    /// Hours as somebody would say them: 120 minutes is "2 hours", not "2.00",
+    /// and 60 minutes is "1 hour", not "1 hours". The plural is on the number
+    /// being exactly one, so 1.5 and 0.75 both stay plural.
+    fn hours(minutes: i64) -> String {
+        let hours = (Decimal::from(minutes) / Decimal::from(60))
+            .round_dp(2)
+            .normalize();
+        if hours == Decimal::ONE {
+            "1 hour".to_string()
+        } else {
+            format!("{hours} hours")
+        }
+    }
+
+    /// `n` of `noun`, pluralised. "1 time entries" in an error the user is
+    /// already suspicious of reads as a second bug.
+    fn count_of(n: i64, singular: &str, plural: &str) -> String {
+        if n == 1 {
+            format!("1 {singular}")
+        } else {
+            format!("{n} {plural}")
+        }
+    }
+
     /// The sentence the caller returns as a 400.
     ///
     /// Nothing logged at all means the original message, which is the one case
     /// it was ever true in.
     fn into_message(self) -> String {
-        if self.non_billable == 0 && self.already_invoiced == 0 {
-            return "No billable time or mileage entries found for this company".to_string();
+        // Ordered by how much the reader needs it. An unarmed entry is the
+        // surprising one and comes first; already-invoiced is the reassuring
+        // one and comes last.
+        let mut parts: Vec<String> = Vec::new();
+        if self.not_ready > 0 {
+            let hours = Self::hours(self.not_ready_minutes);
+            // Verb agreement as well as noun agreement: "1 entry that are not
+            // marked" reads as a second bug in a message the reader is already
+            // suspicious of, having just been told something was missing.
+            let is_are = if self.not_ready == 1 { "is" } else { "are" };
+            parts.push(format!(
+                "{} ({hours}) that {is_are} not marked ready to bill",
+                Self::count_of(
+                    self.not_ready,
+                    "billable time entry",
+                    "billable time entries"
+                )
+            ));
+        }
+        if self.non_billable > 0 {
+            let hours = Self::hours(self.non_billable_minutes);
+            parts.push(format!(
+                "{} ({hours}) logged as non-billable",
+                Self::count_of(self.non_billable, "time entry", "time entries")
+            ));
+        }
+        if self.already_invoiced > 0 {
+            parts.push(format!(
+                "{} already on an invoice",
+                Self::count_of(
+                    self.already_invoiced,
+                    "billable time entry",
+                    "billable time entries"
+                )
+            ));
         }
 
-        // Singular and plural, because "1 time entries" in an error the user is
-        // already suspicious of reads as a second bug.
-        let hours = Decimal::from(self.non_billable_minutes) / Decimal::from(60);
-        let hours = hours.round_dp(2).normalize();
-        let write_off = match self.non_billable {
-            0 => None,
-            1 => Some(format!(
-                "1 time entry ({hours} hours) logged as non-billable"
-            )),
-            n => Some(format!(
-                "{n} time entries ({hours} hours) logged as non-billable"
-            )),
-        };
-        let invoiced = match self.already_invoiced {
-            0 => None,
-            1 => Some("1 billable time entry already on an invoice".to_string()),
-            n => Some(format!("{n} billable time entries already on an invoice")),
+        let Some(next) = self.next_step() else {
+            return "No billable time or mileage entries found for this company".to_string();
         };
 
-        // The next action, named for whoever has to take it. Both at once is a
-        // real case (part of a job written off, the rest already billed), and
-        // naming only one of them sends the user looking for the other.
-        let (what, next) = match (write_off, invoiced) {
-            (Some(w), Some(i)) => (
-                format!("{w} and {i}"),
-                "Mark the non-billable entries billable if they should be charged; the rest has already been invoiced.",
-            ),
-            (Some(w), None) => (
-                w,
-                "Mark them billable if they should be charged, then generate the invoice again.",
-            ),
-            (None, Some(i)) => (
-                i,
-                "There is nothing new to bill for this company.",
-            ),
-            // Unreachable: the all-zero case returned above.
-            (None, None) => return "No billable time or mileage entries found for this company".to_string(),
+        // "a, b and c" rather than "a, b, c", because this is a sentence.
+        let what = match parts.len() {
+            1 => parts.remove(0),
+            _ => {
+                let last = parts.pop().unwrap_or_default();
+                format!("{} and {last}", parts.join(", "))
+            }
         };
-
         format!("This company has no time to invoice right now. It has {what}. {next}")
+    }
+
+    /// The action to name, chosen by the same priority the parts are listed in,
+    /// so the sentence ends by telling one person to do one thing. `None` means
+    /// the company genuinely has nothing logged.
+    fn next_step(&self) -> Option<&'static str> {
+        if self.not_ready > 0 {
+            return Some("Re-save them and they become invoiceable.");
+        }
+        if self.non_billable > 0 {
+            return Some(
+                "Mark them billable if they should be charged, then generate the invoice again.",
+            );
+        }
+        if self.already_invoiced > 0 {
+            return Some("There is nothing new to bill for this company.");
+        }
+        None
     }
 }
 
@@ -3130,9 +3194,19 @@ mod pms944_uninvoiceable_time_tests {
         already_invoiced: i64,
     ) -> UninvoiceableTime {
         UninvoiceableTime {
+            not_ready: 0,
+            not_ready_minutes: 0,
             non_billable,
             non_billable_minutes,
             already_invoiced,
+        }
+    }
+
+    fn not_ready(count: i64, minutes: i64) -> UninvoiceableTime {
+        UninvoiceableTime {
+            not_ready: count,
+            not_ready_minutes: minutes,
+            ..UninvoiceableTime::default()
         }
     }
 
@@ -3155,6 +3229,7 @@ mod pms944_uninvoiceable_time_tests {
             why(1, 60, 0).into_message(),
             why(0, 0, 1).into_message(),
             why(2, 120, 3).into_message(),
+            not_ready(1, 60).into_message(),
         ] {
             assert!(
                 !msg.contains("No billable time"),
@@ -3212,6 +3287,8 @@ mod pms944_uninvoiceable_time_tests {
         assert!(why(1, 120, 0).into_message().contains("2 hours"));
         assert!(why(1, 90, 0).into_message().contains("1.5 hours"));
         assert!(why(1, 45, 0).into_message().contains("0.75 hours"));
+        // Exactly one is the only singular; a fraction near it is not.
+        assert!(why(1, 60, 0).into_message().contains("(1 hour)"));
         // Not exactly representable in quarters; rounded rather than printed to
         // fifteen decimal places.
         assert!(why(1, 50, 0).into_message().contains("0.83 hours"));
@@ -3231,6 +3308,40 @@ mod pms944_uninvoiceable_time_tests {
             .contains("2 billable time entries already"));
     }
 
+    /// The state that should not exist. PMS-944 arms an entry at creation and
+    /// migration 121 armed the rest, so a billable uninvoiced entry that is not
+    /// `ready_to_bill` means something wrote the row directly. Reporting it is
+    /// the whole point: the one answer PMS-933 forbids is "there is none" when
+    /// there is some.
+    #[test]
+    fn an_unarmed_entry_is_reported_rather_than_denied() {
+        let msg = not_ready(2, 180).into_message();
+        assert!(
+            msg.contains("2 billable time entries (3 hours) that are not marked ready to bill"),
+            "{msg}"
+        );
+        assert!(!msg.contains("No billable time"), "{msg}");
+    }
+
+    /// Three at once still reads as a sentence, and the action named is the one
+    /// for the state that comes first.
+    #[test]
+    fn every_state_at_once_reads_as_one_sentence() {
+        let msg = UninvoiceableTime {
+            not_ready: 1,
+            not_ready_minutes: 60,
+            non_billable: 2,
+            non_billable_minutes: 120,
+            already_invoiced: 3,
+        }
+        .into_message();
+        assert!(msg.contains("1 billable time entry (1 hour) that is not marked ready to bill, 2 time entries (2 hours) logged as non-billable and 3 billable time entries already on an invoice"), "{msg}");
+        assert!(
+            msg.ends_with("Re-save them and they become invoiceable."),
+            "{msg}"
+        );
+    }
+
     /// The message must not mention approval. Approval no longer gates billing,
     /// so naming it would send the user to a screen that cannot help - which is
     /// the exact failure MAPPS-598 reported, pointing the other way.
@@ -3240,6 +3351,7 @@ mod pms944_uninvoiceable_time_tests {
             why(1, 60, 0).into_message(),
             why(0, 0, 1).into_message(),
             why(2, 120, 3).into_message(),
+            not_ready(1, 60).into_message(),
         ] {
             assert!(!msg.contains("approv"), "{msg}");
             assert!(!msg.contains("timesheet"), "{msg}");
