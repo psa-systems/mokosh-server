@@ -5,6 +5,16 @@
 //! remaining two prefixes - `/change-requests/...` and `/quotes/...` -
 //! now that migration 078 ships the minimal `change_requests` and
 //! `quotes` parent tables `assert_parent_exists` needs.
+//!
+//! PMS-944 draws a line through the four targets. A `change_request` and a
+//! `quote` approve a DECISION, and a client asking for sign-off on a quote has
+//! nothing to do with employment, so those are untouched. A `time_entry`
+//! approves a unit of WORK, which is the employee-facing control David asked to
+//! confine to timesheets, so both of its routes sit behind `RequireTimesheets`.
+//! A `ticket` needed no change: nothing about a ticket is blocked by an
+//! approval - `tickets` has no approval column, and `ApprovalsService::decide`
+//! writes only its own table - so the sign-off is offered, never required, and
+//! removing it would delete a working feature rather than a gate.
 
 use std::sync::Arc;
 
@@ -20,7 +30,7 @@ use super::models::{
     ApprovalResponse, ApprovalTarget, CreateApprovalRequest, DecideApprovalRequest,
 };
 use super::service::ApprovalsService;
-use crate::modules::auth::RequireAuth;
+use crate::modules::auth::{RequireAuth, RequireTimesheets};
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -91,9 +101,16 @@ async fn create_for_ticket(
 /// PMS-470: list approvals on a time_entry. Tenant-scoped via the
 /// `time_entries` lookup so a guessed UUID returns 404 instead of an
 /// empty 200 (mirrors the ticket-route posture).
+///
+/// PMS-944: behind `RequireTimesheets`. Approving a unit of work is an
+/// employee-facing control, so it exists where timesheets do and nowhere else.
+/// A one-person MSP has the flag off (PMS-943) and gets a 404 here, which is
+/// what "no approval step exists at all" has to mean for a route: not an empty
+/// list, which would read as a feature that is present and unused.
 async fn list_for_time_entry(
     State(s): State<ApprovalsRouterState>,
     RequireAuth(u): RequireAuth,
+    _timesheets: RequireTimesheets,
     Path(entity_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<ApprovalResponse>>> {
     assert_parent_exists(&s, "time_entries", "Time entry", u.tenant_id, entity_id).await?;
@@ -104,9 +121,13 @@ async fn list_for_time_entry(
     Ok(Json(rows))
 }
 
+/// PMS-944: behind `RequireTimesheets`, for the reason on `list_for_time_entry`.
+/// This is the one that matters, because it is the only way a time-entry
+/// approval can come into existence.
 async fn create_for_time_entry(
     State(s): State<ApprovalsRouterState>,
     RequireAuth(u): RequireAuth,
+    _timesheets: RequireTimesheets,
     Path(entity_id): Path<Uuid>,
     Json(req): Json<CreateApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {

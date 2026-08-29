@@ -362,10 +362,14 @@ async fn create_accepts_status_dates_and_manager(pool: PgPool) {
     assert_eq!(fetched["actual_end_date"].as_str(), Some("2026-06-28"));
 }
 
-// AC5: a time entry linked to a task/project rolls into actual hours and
-// amount once approved (and not before).
+// AC5, as rewritten by PMS-944: a time entry linked to a task or project rolls
+// into actual hours and amount as soon as it is logged. It used to pin the
+// opposite ("and not before"), because PMS-144 made approval the gate on
+// everything. With approval confined to timesheets, a tenant with the flag off
+// never reaches 'approved', so the old rule would have shown every project on
+// such a tenant running at zero actuals for ever.
 #[sqlx::test]
-async fn approved_time_rolls_into_actuals(pool: PgPool) {
+async fn logged_time_rolls_into_actuals(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
     let app = common::boot(pool).await;
@@ -426,14 +430,17 @@ async fn approved_time_rolls_into_actuals(pool: PgPool) {
         entry.status()
     );
 
-    // Pending time must NOT count toward actuals yet.
+    // The hours count the moment they are logged. Nothing has been submitted
+    // and nobody has approved anything.
     let task_before = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
-    assert_eq!(
-        dec(&task_before["actual_hours"]),
-        0.0,
-        "pending (unapproved) time does not roll into actual hours"
+    assert!(
+        (dec(&task_before["actual_hours"]) - 2.0).abs() < 0.01,
+        "logged time rolls into actual hours with no approval step (got {})",
+        dec(&task_before["actual_hours"])
     );
 
+    // Approval still exists for the timesheet, and running it must leave the
+    // actuals exactly where they were: it is no longer what makes time count.
     // Submit the week first (PMS-183: entries start as draft and must be
     // submitted before a manager can approve them).
     let submit = post(
@@ -463,31 +470,32 @@ async fn approved_time_rolls_into_actuals(pool: PgPool) {
         approve.status()
     );
 
-    // Now the task and project reflect the approved 2h / $100.
+    // Same 2h / $100 as before the approval, on the task and on the project.
     let task_after = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
     assert!(
         (dec(&task_after["actual_hours"]) - 2.0).abs() < 0.01,
-        "approved time rolls into task actual_hours (expected 2.0, got {})",
+        "approving does not change task actual_hours (expected 2.0, got {})",
         dec(&task_after["actual_hours"])
     );
 
     let project_after = get_json(&app, &token, &format!("/api/v1/projects/{project_id}")).await;
     assert!(
         (dec(&project_after["actual_hours"]) - 2.0).abs() < 0.01,
-        "approved time rolls into project actual_hours"
+        "approving does not change project actual_hours"
     );
     assert!(
         (dec(&project_after["actual_amount"]) - 100.0).abs() < 0.01,
-        "approved billable time rolls into project actual_amount (expected 100.0, got {})",
+        "billable logged time rolls into project actual_amount (expected 100.0, got {})",
         dec(&project_after["actual_amount"])
     );
 }
 
-/// PMS-329: a task exposes `logged_hours` (every non-rejected entry) next to
-/// `actual_hours` (approved-only). Draft time shows in logged but not actual;
-/// approving makes both reflect it; rejecting drops it from both. The approval
-/// transitions are driven directly in SQL so the test pins the rollup SELECT,
-/// not the timesheet state machine.
+/// PMS-329, narrowed by PMS-944: a task exposes `logged_hours` next to
+/// `actual_hours`, and both now count every non-rejected entry. PMS-329 had
+/// `actual_hours` count approved time only, which is the rule PMS-944 removed;
+/// what is left of the distinction is that rejecting still drops an entry from
+/// both. The approval transitions are driven directly in SQL so the test pins
+/// the rollup SELECT, not the timesheet state machine.
 #[sqlx::test]
 async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
     let probe = pool.clone();
@@ -550,17 +558,18 @@ async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
         .unwrap()
         .to_string();
 
-    // Draft: logged counts it, actual does not.
+    // Draft: both count it. A tenant with timesheets off logs nothing else,
+    // so an actual_hours that waited for approval would never move at all.
     let t = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
     assert!(
         (dec(&t["logged_hours"]) - 2.0).abs() < 0.01,
         "draft time counts toward logged_hours (got {})",
         dec(&t["logged_hours"])
     );
-    assert_eq!(
-        dec(&t["actual_hours"]),
-        0.0,
-        "draft time does not count toward actual_hours"
+    assert!(
+        (dec(&t["actual_hours"]) - 2.0).abs() < 0.01,
+        "draft time counts toward actual_hours (got {})",
+        dec(&t["actual_hours"])
     );
 
     // The list read path carries logged_hours too.
@@ -575,7 +584,7 @@ async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
         "list_tasks exposes logged_hours"
     );
 
-    // Approve -> both reflect it.
+    // Approve -> nothing moves, because neither column was waiting on it.
     set_entry_approval(&probe, &entry_id, "approved").await;
     let t = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
     assert!(
@@ -584,7 +593,7 @@ async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
     );
     assert!(
         (dec(&t["actual_hours"]) - 2.0).abs() < 0.01,
-        "approved time rolls into actual_hours"
+        "approved time stays in actual_hours"
     );
 
     // Reject -> neither reflects it.

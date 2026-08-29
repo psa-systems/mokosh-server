@@ -147,10 +147,12 @@ impl MileageTrackingService {
         } else {
             None
         };
-        // Mileage has no timesheet-approval gate (unlike time entries, whose
-        // weekly approval flips them to ready_to_bill). A billable mileage
-        // entry is therefore ready to bill on creation; the invoice builder
-        // uses the same `ready_to_bill` predicate for both kinds.
+        // A billable mileage entry is ready to bill on creation; the invoice
+        // builder uses the same `ready_to_bill` predicate for both kinds. This
+        // used to be the exception, mileage having never had the PMS-144
+        // timesheet-approval gate that time entries did. PMS-944 removed that
+        // gate, so it is now simply the rule, shared with
+        // TimeTrackingService::resolve_billing_status.
         let billing_status = if request.is_billable {
             "ready_to_bill"
         } else {

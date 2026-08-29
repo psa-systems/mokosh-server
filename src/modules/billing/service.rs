@@ -117,29 +117,38 @@ impl BillingService {
     /// invoice-creating path (`create_invoice`,
     /// `create_invoice_from_time_entries`, and the recurring-billing run)
     /// so the seed-or-bump logic lives in one place.
-    /// PMS-933: count the company's billable, unbilled time by what is holding
-    /// it, for the message on the empty path.
+    /// PMS-933, rewritten for PMS-944: describe why a company's time did not
+    /// produce an invoice, for the message on the empty path.
+    ///
+    /// PMS-933 answered "held by approval", because PMS-144 made timesheet
+    /// approval the gate. PMS-944 removed that gate, so the old sentence would
+    /// name a state that can no longer occur. What survives is the requirement
+    /// it was defending, which is that "no billable time found" is a claim
+    /// about the user's data and must not be made when the data is there.
     ///
     /// Deliberately the SAME predicate as the eligibility select minus the
-    /// `billing_status` clause, so this can only ever describe rows that clause
-    /// excluded. If the two drift, this starts explaining the absence of rows
-    /// that were never eligible for another reason, which is worse than the
-    /// message it replaced.
-    ///
-    /// `rejected` is counted as unsubmitted: a rejected entry is back with the
-    /// person who logged it and has to be resubmitted, which is the same next
-    /// action.
-    async fn billable_time_held_by_approval(
+    /// `is_billable`, `invoice_id` and `billing_status` clauses, so this can
+    /// only ever describe rows those three excluded, and it counts each of them
+    /// separately so no excluded row goes unaccounted for. If the two drift,
+    /// this starts explaining the absence of rows that were never eligible for
+    /// another reason, which is worse than the message it replaced.
+    async fn uninvoiceable_time_for_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
-    ) -> AppResult<HeldBillableTime> {
-        let row: Option<(i64, i64, i64)> = sqlx::query_as(
+    ) -> AppResult<UninvoiceableTime> {
+        let row: Option<(i64, i64, i64, i64, i64)> = sqlx::query_as(
             r#"
             SELECT
-                COUNT(*) FILTER (WHERE approval_status IN ('draft', 'rejected')),
-                COUNT(*) FILTER (WHERE approval_status = 'pending'),
-                COALESCE(SUM(duration_minutes), 0)
+                COUNT(*) FILTER (
+                    WHERE is_billable IS TRUE AND invoice_id IS NULL
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'),
+                COALESCE(SUM(duration_minutes) FILTER (
+                    WHERE is_billable IS TRUE AND invoice_id IS NULL
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'), 0),
+                COUNT(*) FILTER (WHERE is_billable IS NOT TRUE),
+                COALESCE(SUM(duration_minutes) FILTER (WHERE is_billable IS NOT TRUE), 0),
+                COUNT(*) FILTER (WHERE is_billable IS TRUE AND invoice_id IS NOT NULL)
             FROM time_entries
             WHERE tenant_id = $1
               AND company_id = $2
@@ -148,9 +157,6 @@ impl BillingService {
               -- `companies`, so nothing here stopped a caller naming it and
               -- getting the MSP's own overhead time counted as a client's.
               AND entry_kind = 'client'
-              AND is_billable = TRUE
-              AND invoice_id IS NULL
-              AND approval_status <> 'approved'
             "#,
         )
         .bind(tenant_id)
@@ -158,11 +164,14 @@ impl BillingService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let (unsubmitted, awaiting_approval, minutes) = row.unwrap_or((0, 0, 0));
-        Ok(HeldBillableTime {
-            unsubmitted,
-            awaiting_approval,
-            minutes,
+        let (not_ready, not_ready_minutes, non_billable, non_billable_minutes, already_invoiced) =
+            row.unwrap_or((0, 0, 0, 0, 0));
+        Ok(UninvoiceableTime {
+            not_ready,
+            not_ready_minutes,
+            non_billable,
+            non_billable_minutes,
+            already_invoiced,
         })
     }
 
@@ -610,10 +619,11 @@ impl BillingService {
     /// time entries in one transaction.
     ///
     /// Eligible entries are `is_billable = TRUE`, `invoice_id IS NULL`,
-    /// and `billing_status = 'ready_to_bill'` (PMS-144: approval is the
-    /// billing gate - timesheet approval flips billable entries from
-    /// `not_billed` to `ready_to_bill`, so pending/rejected time is never
-    /// invoiceable), tenant-scoped and company-scoped. When `time_entry_ids` is
+    /// and `billing_status = 'ready_to_bill'` (PMS-944: an entry is armed at
+    /// creation by `resolve_billing_status`, so being logged and billable is
+    /// what makes it invoiceable; PMS-144 used to route that status through
+    /// weekly timesheet approval instead), tenant-scoped and company-scoped.
+    /// When `time_entry_ids` is
     /// `Some`, the set is further restricted to those ids; `None` sweeps
     /// every eligible entry. The selected rows are `SELECT ... FOR
     /// UPDATE` so a concurrent generate cannot double-bill them.
@@ -673,9 +683,11 @@ impl BillingService {
         .await?;
 
         // 1b. PMS-315: lock the company's eligible mileage entries with the
-        //     SAME predicate (billable, unbilled, ready_to_bill). Mileage has
-        //     no timesheet gate, so a billable mileage entry is ready_to_bill
-        //     on creation (see MileageTrackingService). The `time_entry_ids`
+        //     SAME predicate (billable, unbilled, ready_to_bill). Mileage
+        //     never had the timesheet gate, so a billable mileage entry has
+        //     always been ready_to_bill on creation (see
+        //     MileageTrackingService); PMS-944 put time on the same footing.
+        //     The `time_entry_ids`
         //     id filter never restricts mileage; it names time entries only.
         let mileage: Vec<MileageBillingRow> = sqlx::query_as(
             r#"
@@ -697,17 +709,17 @@ impl BillingService {
         .await?;
 
         if entries.is_empty() && mileage.is_empty() {
-            // PMS-933: say which of the two it is. "No billable time found" is a
-            // claim about EXISTENCE, and it is false whenever the company has
-            // billable time that is merely unapproved, which is the common case
-            // and the one that gets reported. A user told their data is not
-            // there goes looking for it, closes the ticket, re-logs the hours,
-            // and none of that helps; the entries were waiting on a timesheet.
+            // PMS-933: "No billable time found" is a claim about EXISTENCE, and
+            // a user told their data is not there goes looking for it, closes
+            // the ticket, re-logs the hours, and none of that helps. Since
+            // PMS-944 the reason is never approval, but it can still be that
+            // the time was logged non-billable or is already on an invoice, and
+            // both of those deserve to be said rather than denied.
             //
             // Only on the empty path, so a successful generate pays nothing.
-            let held = Self::billable_time_held_by_approval(&mut tx, tenant_id, request.company_id)
+            let why = Self::uninvoiceable_time_for_company(&mut tx, tenant_id, request.company_id)
                 .await?;
-            return Err(AppError::BadRequest(held.into_message()));
+            return Err(AppError::BadRequest(why.into_message()));
         }
 
         // 2. Allocate a gapless invoice number (same row-lock as
@@ -2839,67 +2851,134 @@ fn current_billing_period(
     }
 }
 
-/// PMS-933: what is holding a company's billable time back from an invoice.
+/// PMS-933, rewritten for PMS-944: why a company's time did not produce an
+/// invoice.
 ///
 /// Counted only when the eligible set came back empty, to turn "none found"
 /// into a statement that is true and that names somebody's next action.
 ///
-/// The two states are split because they are two different people's jobs. An
-/// entry still in `draft` is waiting on the person who logged it to submit
-/// their timesheet; an entry at `pending` is waiting on an approver. Telling a
-/// manager to "approve the timesheet" when nobody has submitted one sends them
-/// looking at an empty approvals queue.
+/// The three states are split because they are three different answers to the
+/// same question, and the same sentence would be wrong for two of them. Time
+/// logged as non-billable is a decision somebody made, and the fix is to change
+/// it. Time already on an invoice is not missing at all, and telling that user
+/// to go and log hours would have them bill the same work twice. Time that is
+/// billable and uninvoiced but not armed should not exist since PMS-944 arms an
+/// entry at creation and migration 121 armed the rest, so it is reported rather
+/// than denied: the one thing PMS-933 forbids is answering "there is none" when
+/// there is some.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct HeldBillableTime {
-    /// Billable, unbilled entries whose timesheet has not been submitted.
-    pub unsubmitted: i64,
-    /// Billable, unbilled entries submitted and awaiting approval.
-    pub awaiting_approval: i64,
-    /// Minutes across both, so the message can state the size of what is stuck.
-    pub minutes: i64,
+pub(crate) struct UninvoiceableTime {
+    /// Client entries that are billable and uninvoiced but not `ready_to_bill`.
+    pub not_ready: i64,
+    /// Minutes across those.
+    pub not_ready_minutes: i64,
+    /// Client entries logged as non-billable.
+    pub non_billable: i64,
+    /// Minutes across those, so the message can state the size of what was
+    /// written off.
+    pub non_billable_minutes: i64,
+    /// Client entries that were billable and are already on an invoice.
+    pub already_invoiced: i64,
 }
 
-impl HeldBillableTime {
-    fn total(&self) -> i64 {
-        self.unsubmitted + self.awaiting_approval
+impl UninvoiceableTime {
+    /// Hours as somebody would say them: 120 minutes is "2 hours", not "2.00",
+    /// and 60 minutes is "1 hour", not "1 hours". The plural is on the number
+    /// being exactly one, so 1.5 and 0.75 both stay plural.
+    fn hours(minutes: i64) -> String {
+        let hours = (Decimal::from(minutes) / Decimal::from(60))
+            .round_dp(2)
+            .normalize();
+        if hours == Decimal::ONE {
+            "1 hour".to_string()
+        } else {
+            format!("{hours} hours")
+        }
+    }
+
+    /// `n` of `noun`, pluralised. "1 time entries" in an error the user is
+    /// already suspicious of reads as a second bug.
+    fn count_of(n: i64, singular: &str, plural: &str) -> String {
+        if n == 1 {
+            format!("1 {singular}")
+        } else {
+            format!("{n} {plural}")
+        }
     }
 
     /// The sentence the caller returns as a 400.
     ///
-    /// Nothing held means the original message, which is the one case it was
-    /// ever true in.
+    /// Nothing logged at all means the original message, which is the one case
+    /// it was ever true in.
     fn into_message(self) -> String {
-        if self.total() == 0 {
-            return "No billable time or mileage entries found for this company".to_string();
+        // Ordered by how much the reader needs it. An unarmed entry is the
+        // surprising one and comes first; already-invoiced is the reassuring
+        // one and comes last.
+        let mut parts: Vec<String> = Vec::new();
+        if self.not_ready > 0 {
+            let hours = Self::hours(self.not_ready_minutes);
+            // Verb agreement as well as noun agreement: "1 entry that are not
+            // marked" reads as a second bug in a message the reader is already
+            // suspicious of, having just been told something was missing.
+            let is_are = if self.not_ready == 1 { "is" } else { "are" };
+            parts.push(format!(
+                "{} ({hours}) that {is_are} not marked ready to bill",
+                Self::count_of(
+                    self.not_ready,
+                    "billable time entry",
+                    "billable time entries"
+                )
+            ));
+        }
+        if self.non_billable > 0 {
+            let hours = Self::hours(self.non_billable_minutes);
+            parts.push(format!(
+                "{} ({hours}) logged as non-billable",
+                Self::count_of(self.non_billable, "time entry", "time entries")
+            ));
+        }
+        if self.already_invoiced > 0 {
+            parts.push(format!(
+                "{} already on an invoice",
+                Self::count_of(
+                    self.already_invoiced,
+                    "billable time entry",
+                    "billable time entries"
+                )
+            ));
         }
 
-        let hours = Decimal::from(self.minutes) / Decimal::from(60);
-        let hours = hours.round_dp(2).normalize();
-        let one = self.total() == 1;
-        let entries = if one { "entry" } else { "entries" };
-        // Pronoun agreement, because "1 billable time entry ... the timesheet
-        // covering them" reads as a second bug in an error the user is already
-        // suspicious of.
-        let them = if one { "it" } else { "them" };
-        let becomes = if one { "it becomes" } else { "they become" };
-
-        // The next action, named for whoever has to take it. Both states at
-        // once is the realistic case on a team, and saying only one of them
-        // sends half the work to the wrong person.
-        let next = match (self.unsubmitted, self.awaiting_approval) {
-            (0, _) => format!("Approve the timesheet covering {them} and {becomes} invoiceable."),
-            (_, 0) => format!(
-                "Submit the timesheet covering {them}, then approve it, and {becomes} invoiceable."
-            ),
-            (u, a) => format!(
-                "{u} of them are not on a submitted timesheet yet and {a} are waiting for approval. Submit and approve the timesheets covering them and they become invoiceable."
-            ),
+        let Some(next) = self.next_step() else {
+            return "No billable time or mileage entries found for this company".to_string();
         };
 
-        format!(
-            "This company has {} billable time {entries} ({hours} hours) that cannot be invoiced yet, because timesheet approval is what makes billable time invoiceable. {next}",
-            self.total()
-        )
+        // "a, b and c" rather than "a, b, c", because this is a sentence.
+        let what = match parts.len() {
+            1 => parts.remove(0),
+            _ => {
+                let last = parts.pop().unwrap_or_default();
+                format!("{} and {last}", parts.join(", "))
+            }
+        };
+        format!("This company has no time to invoice right now. It has {what}. {next}")
+    }
+
+    /// The action to name, chosen by the same priority the parts are listed in,
+    /// so the sentence ends by telling one person to do one thing. `None` means
+    /// the company genuinely has nothing logged.
+    fn next_step(&self) -> Option<&'static str> {
+        if self.not_ready > 0 {
+            return Some("Re-save them and they become invoiceable.");
+        }
+        if self.non_billable > 0 {
+            return Some(
+                "Mark them billable if they should be charged, then generate the invoice again.",
+            );
+        }
+        if self.already_invoiced > 0 {
+            return Some("There is nothing new to bill for this company.");
+        }
+        None
     }
 }
 
@@ -3106,110 +3185,176 @@ impl From<PaymentTermRow> for PaymentTermResponse {
 }
 
 #[cfg(test)]
-mod pms933_held_time_tests {
-    use super::HeldBillableTime;
+mod pms944_uninvoiceable_time_tests {
+    use super::UninvoiceableTime;
 
-    fn held(unsubmitted: i64, awaiting_approval: i64, minutes: i64) -> HeldBillableTime {
-        HeldBillableTime {
-            unsubmitted,
-            awaiting_approval,
-            minutes,
+    fn why(
+        non_billable: i64,
+        non_billable_minutes: i64,
+        already_invoiced: i64,
+    ) -> UninvoiceableTime {
+        UninvoiceableTime {
+            not_ready: 0,
+            not_ready_minutes: 0,
+            non_billable,
+            non_billable_minutes,
+            already_invoiced,
         }
     }
 
-    /// The one case the original sentence was ever true in.
+    fn not_ready(count: i64, minutes: i64) -> UninvoiceableTime {
+        UninvoiceableTime {
+            not_ready: count,
+            not_ready_minutes: minutes,
+            ..UninvoiceableTime::default()
+        }
+    }
+
+    /// The one case the original sentence was ever true in. PMS-933 kept it for
+    /// the same reason: a company that really has logged nothing should be told
+    /// exactly that.
     #[test]
-    fn nothing_held_keeps_the_original_message() {
+    fn nothing_logged_keeps_the_original_message() {
         assert_eq!(
-            held(0, 0, 0).into_message(),
+            why(0, 0, 0).into_message(),
             "No billable time or mileage entries found for this company"
         );
     }
 
-    /// The reported case: time logged and never submitted. The message has to
-    /// contradict the old one head-on, because the user has just been told the
-    /// opposite and acted on it.
+    /// PMS-933's requirement, restated against the rule PMS-944 leaves behind:
+    /// the message must never deny the existence of data that is there.
     #[test]
-    fn unsubmitted_time_says_so_and_names_the_step() {
-        let msg = held(1, 0, 90).into_message();
-        assert!(msg.contains("has 1 billable time entry"), "{msg}");
-        assert!(msg.contains("1.5 hours"), "{msg}");
-        assert!(msg.contains("Submit the timesheet"), "{msg}");
-        assert!(
-            !msg.contains("No billable time"),
-            "it must not still claim there is none: {msg}"
-        );
+    fn time_that_exists_is_never_reported_as_missing() {
+        for msg in [
+            why(1, 60, 0).into_message(),
+            why(0, 0, 1).into_message(),
+            why(2, 120, 3).into_message(),
+            not_ready(1, 60).into_message(),
+        ] {
+            assert!(
+                !msg.contains("No billable time"),
+                "it must not claim there is none: {msg}"
+            );
+        }
     }
 
-    /// Submitted but unapproved is somebody else's action, so it gets a
-    /// different sentence. Telling an approver to submit a timesheet, or a
-    /// technician to approve one, sends them to the wrong screen.
+    /// Written-off time is a decision somebody made when logging it, so the
+    /// message names that decision and how to change it.
     #[test]
-    fn awaiting_approval_names_the_other_step() {
-        let msg = held(0, 2, 120).into_message();
-        assert!(msg.contains("2 billable time entries"), "{msg}");
-        assert!(msg.contains("Approve the timesheet"), "{msg}");
-        assert!(!msg.contains("Submit the timesheet"), "{msg}");
-    }
-
-    /// Both at once is the realistic case on a team, and saying only one of
-    /// them sends half the work to the wrong person.
-    #[test]
-    fn a_mix_names_both_and_splits_the_counts() {
-        let msg = held(2, 3, 300).into_message();
-        assert!(msg.contains("5 billable time entries"), "{msg}");
+    fn non_billable_time_says_so_and_names_the_step() {
+        let msg = why(1, 90, 0).into_message();
         assert!(
-            msg.contains("2 of them are not on a submitted timesheet"),
+            msg.contains("1 time entry (1.5 hours) logged as non-billable"),
             "{msg}"
         );
-        assert!(msg.contains("3 are waiting for approval"), "{msg}");
+        assert!(msg.contains("Mark them billable"), "{msg}");
+    }
+
+    /// Already invoiced is the opposite problem. Telling this user to go and
+    /// log hours would have them bill the same work twice, so it gets its own
+    /// sentence and no call to action.
+    #[test]
+    fn already_invoiced_time_does_not_ask_for_more_hours() {
+        let msg = why(0, 0, 2).into_message();
+        assert!(
+            msg.contains("2 billable time entries already on an invoice"),
+            "{msg}"
+        );
+        assert!(msg.contains("nothing new to bill"), "{msg}");
+        assert!(!msg.contains("Mark them billable"), "{msg}");
+    }
+
+    /// Both at once is a real case - part of a job written off, the rest
+    /// already billed - and naming only one sends the user looking for the
+    /// other.
+    #[test]
+    fn a_mix_names_both() {
+        let msg = why(2, 120, 3).into_message();
+        assert!(
+            msg.contains("2 time entries (2 hours) logged as non-billable"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("3 billable time entries already on an invoice"),
+            "{msg}"
+        );
     }
 
     /// Hours are what a person bills in, not minutes, and a whole number should
     /// not arrive as "2.00 hours".
     #[test]
     fn hours_read_the_way_somebody_would_say_them() {
-        assert!(held(1, 0, 120).into_message().contains("2 hours"));
-        assert!(held(1, 0, 90).into_message().contains("1.5 hours"));
-        assert!(held(1, 0, 45).into_message().contains("0.75 hours"));
+        assert!(why(1, 120, 0).into_message().contains("2 hours"));
+        assert!(why(1, 90, 0).into_message().contains("1.5 hours"));
+        assert!(why(1, 45, 0).into_message().contains("0.75 hours"));
+        // Exactly one is the only singular; a fraction near it is not.
+        assert!(why(1, 60, 0).into_message().contains("(1 hour)"));
         // Not exactly representable in quarters; rounded rather than printed to
         // fifteen decimal places.
-        assert!(held(1, 0, 50).into_message().contains("0.83 hours"));
+        assert!(why(1, 50, 0).into_message().contains("0.83 hours"));
     }
 
-    /// Singular and plural, because "1 billable time entries" in an error the
-    /// user is already suspicious of reads as a second bug.
+    /// Singular and plural, because "1 time entries" in an error the user is
+    /// already suspicious of reads as a second bug.
     #[test]
     fn one_entry_is_singular() {
-        assert!(held(1, 0, 60)
+        assert!(why(1, 60, 0).into_message().contains("1 time entry ("));
+        assert!(why(2, 60, 0).into_message().contains("2 time entries ("));
+        assert!(why(0, 0, 1)
             .into_message()
-            .contains("1 billable time entry ("));
-        assert!(held(2, 0, 60)
+            .contains("1 billable time entry already"));
+        assert!(why(0, 0, 2)
             .into_message()
-            .contains("2 billable time entries ("));
+            .contains("2 billable time entries already"));
     }
 
-    /// Pronoun agreement. "1 billable time entry ... the timesheet covering
-    /// them" reads as a second bug in a message the user is already suspicious
-    /// of, having just been told something false.
+    /// The state that should not exist. PMS-944 arms an entry at creation and
+    /// migration 121 armed the rest, so a billable uninvoiced entry that is not
+    /// `ready_to_bill` means something wrote the row directly. Reporting it is
+    /// the whole point: the one answer PMS-933 forbids is "there is none" when
+    /// there is some.
     #[test]
-    fn one_entry_reads_as_one_thing_throughout() {
-        let msg = held(1, 0, 60).into_message();
-        assert!(msg.contains("covering it"), "{msg}");
-        assert!(msg.contains("it becomes invoiceable"), "{msg}");
-        let msg = held(2, 0, 120).into_message();
-        assert!(msg.contains("covering them"), "{msg}");
-        assert!(msg.contains("they become invoiceable"), "{msg}");
-    }
-
-    /// The rule itself is stated, because the user's next question after "why
-    /// not?" is "why is that the rule?", and PMS-144 decided it deliberately.
-    #[test]
-    fn the_message_says_what_the_gate_is() {
-        let msg = held(1, 0, 60).into_message();
+    fn an_unarmed_entry_is_reported_rather_than_denied() {
+        let msg = not_ready(2, 180).into_message();
         assert!(
-            msg.contains("timesheet approval is what makes billable time invoiceable"),
+            msg.contains("2 billable time entries (3 hours) that are not marked ready to bill"),
             "{msg}"
         );
+        assert!(!msg.contains("No billable time"), "{msg}");
+    }
+
+    /// Three at once still reads as a sentence, and the action named is the one
+    /// for the state that comes first.
+    #[test]
+    fn every_state_at_once_reads_as_one_sentence() {
+        let msg = UninvoiceableTime {
+            not_ready: 1,
+            not_ready_minutes: 60,
+            non_billable: 2,
+            non_billable_minutes: 120,
+            already_invoiced: 3,
+        }
+        .into_message();
+        assert!(msg.contains("1 billable time entry (1 hour) that is not marked ready to bill, 2 time entries (2 hours) logged as non-billable and 3 billable time entries already on an invoice"), "{msg}");
+        assert!(
+            msg.ends_with("Re-save them and they become invoiceable."),
+            "{msg}"
+        );
+    }
+
+    /// The message must not mention approval. Approval no longer gates billing,
+    /// so naming it would send the user to a screen that cannot help - which is
+    /// the exact failure MAPPS-598 reported, pointing the other way.
+    #[test]
+    fn the_message_never_blames_approval() {
+        for msg in [
+            why(1, 60, 0).into_message(),
+            why(0, 0, 1).into_message(),
+            why(2, 120, 3).into_message(),
+            not_ready(1, 60).into_message(),
+        ] {
+            assert!(!msg.contains("approv"), "{msg}");
+            assert!(!msg.contains("timesheet"), "{msg}");
+        }
     }
 }
