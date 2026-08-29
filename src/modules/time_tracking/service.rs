@@ -378,8 +378,8 @@ impl TimeTrackingService {
                 duration_minutes, worked_minutes, billable_minutes,
                 work_type_id, ticket_id, project_id,
                 company_id, notes, is_billable, hourly_rate, total_amount, task_id,
-                work_category, entry_kind
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                work_category, entry_kind, billing_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
             "#,
         )
         .bind(id)
@@ -402,6 +402,11 @@ impl TimeTrackingService {
         .bind(request.task_id)
         .bind(&work_category)
         .bind(kind.kind)
+        // PMS-944: invoiceable on the strength of having been logged. Before
+        // this the column took its `not_billed` DEFAULT and only weekly
+        // timesheet approval ever moved it, so nothing logged on a tenant with
+        // timesheets off could reach an invoice at all.
+        .bind(resolve_billing_status(kind.billable, None))
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -573,6 +578,7 @@ impl TimeTrackingService {
                 total_amount      = $13,
                 task_id           = COALESCE($14, task_id),
                 work_category     = $15,
+                billing_status    = $18,
                 updated_at        = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -594,6 +600,15 @@ impl TimeTrackingService {
         .bind(&work_category)
         .bind(worked)
         .bind(billable)
+        // PMS-944: keep invoiceability in step with billability. Turning an
+        // entry non-billable has to take it back out of the invoiceable set,
+        // or the row keeps the `ready_to_bill` it was created with and is
+        // billed anyway. Passing the current status is what protects an
+        // already-`billed` entry from being re-armed.
+        .bind(resolve_billing_status(
+            is_billable,
+            Some(current.billing_status),
+        ))
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -854,8 +869,8 @@ impl TimeTrackingService {
     /// Withdraw a submitted timesheet: move every still-pending entry in the
     /// week back to 'draft' so the owner can edit and resubmit. Refuses once
     /// any entry in the week has been approved (PMS-183) - an approved week is
-    /// past the point of withdrawal (it has flipped billable entries to
-    /// ready_to_bill). Owner-only is enforced at the route.
+    /// past the point of withdrawal, because a manager has signed it off.
+    /// Owner-only is enforced at the route.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn withdraw_timesheet(
         &self,
@@ -934,14 +949,11 @@ impl TimeTrackingService {
             SET approval_status = 'approved',
                 approved_by_id  = $5,
                 approved_at     = NOW(),
-                -- PMS-144: approval is the billing gate. Flip billable,
-                -- not-yet-billed entries to ready_to_bill so PMS-33's
-                -- create_invoice_from_time_entries (which now consumes only
-                -- ready_to_bill) can pick them up; leave non-billable and
-                -- already-invoiced rows untouched.
-                billing_status  = CASE
-                    WHEN is_billable AND billing_status = 'not_billed'
-                    THEN 'ready_to_bill' ELSE billing_status END,
+                -- PMS-944: approval no longer touches `billing_status`. PMS-144
+                -- had it flip billable entries to `ready_to_bill` here, which
+                -- made countersigning a timesheet the only route to an invoice;
+                -- an entry is now armed at creation instead. Approval keeps its
+                -- own lifecycle for the timesheet and is not a billing fact.
                 updated_at      = NOW()
             WHERE tenant_id = $1
               AND user_id   = $2
@@ -1323,9 +1335,9 @@ impl TimeTrackingService {
                 id, tenant_id, user_id, date, start_time, end_time,
                 duration_minutes, work_type_id, ticket_id, project_id,
                 company_id, notes, is_billable, hourly_rate, total_amount,
-                entry_kind
+                entry_kind, billing_status
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
             )
             "#,
         )
@@ -1345,6 +1357,9 @@ impl TimeTrackingService {
         .bind(hourly_rate)
         .bind(total)
         .bind(kind.kind)
+        // PMS-944: same rule as the manual path. A stopped timer is time that
+        // was worked, so it is invoiceable on the same terms as time typed in.
+        .bind(resolve_billing_status(kind.billable, None))
         .execute(&mut *tx)
         .await?;
 
@@ -1700,6 +1715,28 @@ pub(crate) fn resolve_entry_kind(input: EntryKindInput<'_>) -> AppResult<Resolve
         // covering it would have aborted that migration.
         billable: kind == ENTRY_KIND_CLIENT && is_billable,
     })
+}
+
+/// PMS-944: whether a time entry is invoiceable, decided by the entry itself.
+///
+/// A billable entry is ready to bill because the work was logged, not because
+/// somebody countersigned it. This is what `MileageTrackingService::create` has
+/// always done; PMS-144 made time the exception by routing `ready_to_bill`
+/// through weekly timesheet approval, which is the gate this issue removes. An
+/// entry that is already `billed` keeps that status whatever else changes,
+/// because its invoice line exists and re-arming the row would bill it twice.
+pub(crate) fn resolve_billing_status(
+    is_billable: bool,
+    current: Option<BillingStatus>,
+) -> &'static str {
+    if current == Some(BillingStatus::Billed) {
+        return "billed";
+    }
+    if is_billable {
+        "ready_to_bill"
+    } else {
+        "not_billed"
+    }
 }
 
 /// The tenant's own internal company (PMS-413), or `None` on a tenant that has
