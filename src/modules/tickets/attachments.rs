@@ -476,7 +476,7 @@ impl AttachmentService {
     ) -> AppResult<AttachmentResponse> {
         let mime = check_inline_image_mime(&mime_type)?;
         if bytes.is_empty() {
-            return Err(AppError::BadRequest("the uploaded file is empty".into()));
+            return Err(AppError::BadRequest("The uploaded file is empty".into()));
         }
         let cap = inline_cap(self.config.max_bytes);
         if bytes.len() as u64 > cap {
