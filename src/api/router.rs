@@ -50,8 +50,9 @@ use crate::modules::sla::{sla_routes, SlaService};
 use crate::modules::tenants::{public_tenant_routes, tenant_routes, TenantService};
 use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
-    agent_attachment_routes, contact_notes_routes, portal_attachment_routes, ticket_routes,
-    AttachmentConfig, AttachmentService, TicketService,
+    agent_attachment_routes, contact_notes_routes, portal_attachment_routes,
+    public_ticket_attachment_routes, ticket_routes, AttachmentConfig, AttachmentService,
+    TicketService,
 };
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::modules::workflows::{workflow_routes, WorkflowsService};
@@ -637,6 +638,15 @@ pub fn create_api_router(
         .merge(public_kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
             KbAttachmentConfig::from_env(),
+        )))
+        // PMS-941: an image embedded in a ticket description or note, for the
+        // same reason as the KB image above and with one extra guard: this
+        // table also holds portal uploads and inbound-email attachments, so
+        // the read serves only rows the inline-image upload path flagged with
+        // `is_inline`. Anything else 404s here exactly as an unknown id does.
+        .merge(public_ticket_attachment_routes(AttachmentService::new(
+            db.clone(),
+            AttachmentConfig::from_env(),
         )))
         .merge(public_form_routes(
             FormsService::with_request_links(
