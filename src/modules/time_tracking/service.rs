@@ -327,16 +327,16 @@ impl TimeTrackingService {
         // decides whether the entry can be billed at all, so resolving it after
         // `resolve_billing` would mean pricing employee time and then throwing
         // the figure away.
-        let kind = resolve_entry_kind(
-            request.entry_kind.as_deref(),
-            request.company_id,
-            own_company_id(&mut *tx, tenant_id).await?,
-            request.ticket_id,
-            request.project_id,
-            request.task_id,
-            None,
-            request.is_billable,
-        )?;
+        let kind = resolve_entry_kind(EntryKindInput {
+            requested: request.entry_kind.as_deref(),
+            company_id: request.company_id,
+            own_company_id: own_company_id(&mut *tx, tenant_id).await?,
+            ticket_id: request.ticket_id,
+            project_id: request.project_id,
+            task_id: request.task_id,
+            contract_id: None,
+            is_billable: request.is_billable,
+        })?;
         let work_category = derive_work_category(
             request.work_category.as_deref(),
             request.ticket_id,
@@ -511,16 +511,16 @@ impl TimeTrackingService {
         // editing it. What an update CAN do is attach a ticket to what was
         // employee time, which is the same contradiction stated the other way
         // round, so it is refused here rather than by the constraint.
-        let kind = resolve_entry_kind(
-            Some(&current.entry_kind),
-            current.company_id,
-            None,
-            request.ticket_id,
-            request.project_id,
-            request.task_id,
-            None,
+        let kind = resolve_entry_kind(EntryKindInput {
+            requested: Some(&current.entry_kind),
+            company_id: current.company_id,
+            own_company_id: None,
+            ticket_id: request.ticket_id,
+            project_id: request.project_id,
+            task_id: request.task_id,
+            contract_id: None,
             is_billable,
-        )?;
+        })?;
         let is_billable = kind.billable;
         // PMS-395: resolve billable minutes. An explicit value wins; otherwise
         // preserve any previously-stored value so a partial edit does not wipe
@@ -1300,16 +1300,16 @@ impl TimeTrackingService {
         // the tenant default rounding rule to the elapsed minutes, so a
         // stopped timer is priced consistently with a manual entry.
         let defaults = fetch_work_type_defaults(&mut *tx, tenant_id, work_type_id).await?;
-        let kind = resolve_entry_kind(
-            None,
+        let kind = resolve_entry_kind(EntryKindInput {
+            requested: None,
             company_id,
-            own_company_id(&mut *tx, tenant_id).await?,
-            timer.ticket_id,
-            timer.project_id,
-            None,
-            None,
-            defaults.default_billable,
-        )?;
+            own_company_id: own_company_id(&mut *tx, tenant_id).await?,
+            ticket_id: timer.ticket_id,
+            project_id: timer.project_id,
+            task_id: None,
+            contract_id: None,
+            is_billable: defaults.default_billable,
+        })?;
         let duration = match default_rounding_rule(&mut *tx, tenant_id).await? {
             Some(rule) => apply_rounding(raw, &rule),
             None => raw,
@@ -1637,16 +1637,31 @@ pub(crate) struct ResolvedKind {
 /// Anything else, meaning a real customer company with no work item, stays
 /// client work: a billable phone call logged without a ticket is the client's
 /// time, and `work_category = 'general'` does not say otherwise.
-pub(crate) fn resolve_entry_kind(
-    requested: Option<&str>,
-    company_id: Option<Uuid>,
-    own_company_id: Option<Uuid>,
-    ticket_id: Option<Uuid>,
-    project_id: Option<Uuid>,
-    task_id: Option<Uuid>,
-    contract_id: Option<Uuid>,
-    is_billable: bool,
-) -> AppResult<ResolvedKind> {
+pub(crate) struct EntryKindInput<'a> {
+    /// What the caller asked for, if anything.
+    pub requested: Option<&'a str>,
+    pub company_id: Option<Uuid>,
+    /// The tenant's own internal company (PMS-413), or `None` on a tenant that
+    /// has none. Compared against `company_id`, never assumed.
+    pub own_company_id: Option<Uuid>,
+    pub ticket_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub contract_id: Option<Uuid>,
+    pub is_billable: bool,
+}
+
+pub(crate) fn resolve_entry_kind(input: EntryKindInput<'_>) -> AppResult<ResolvedKind> {
+    let EntryKindInput {
+        requested,
+        company_id,
+        own_company_id,
+        ticket_id,
+        project_id,
+        task_id,
+        contract_id,
+        is_billable,
+    } = input;
     let has_client_work =
         ticket_id.is_some() || project_id.is_some() || task_id.is_some() || contract_id.is_some();
     let derived = if has_client_work {
@@ -2193,6 +2208,100 @@ mod tests {
         let (rate, total) = resolve_billing(None, false, &defaults, 60);
         assert_eq!(rate, Some(Decimal::from(100)));
         assert_eq!(total, None);
+    }
+
+    // PMS-942: whose time is this.
+    fn kind(
+        requested: Option<&str>,
+        company: Option<Uuid>,
+        own: Option<Uuid>,
+        ticket: Option<Uuid>,
+    ) -> AppResult<ResolvedKind> {
+        resolve_entry_kind(EntryKindInput {
+            requested,
+            company_id: company,
+            own_company_id: own,
+            ticket_id: ticket,
+            project_id: None,
+            task_id: None,
+            contract_id: None,
+            is_billable: true,
+        })
+    }
+
+    fn billable_kind(company: Option<Uuid>, own: Option<Uuid>) -> ResolvedKind {
+        resolve_entry_kind(EntryKindInput {
+            requested: None,
+            company_id: company,
+            own_company_id: own,
+            ticket_id: None,
+            project_id: None,
+            task_id: None,
+            contract_id: None,
+            is_billable: true,
+        })
+        .expect("a resolvable entry")
+    }
+
+    /// The rule, read off what the entry is attached to. The third case is the
+    /// one the issue originally proposed to get wrong: a customer's company
+    /// with no ticket is still the customer's time, and inferring "internal"
+    /// from the missing ticket would take those hours off the invoice.
+    #[test]
+    fn the_kind_is_read_from_what_the_entry_is_attached_to() {
+        let own = Uuid::new_v4();
+        let client = Uuid::new_v4();
+        assert_eq!(kind(None, None, Some(own), None).unwrap().kind, "employee");
+        assert_eq!(
+            kind(None, Some(own), Some(own), None).unwrap().kind,
+            "employee",
+            "the tenant's own internal company is what MAPPS-243 already sends"
+        );
+        assert_eq!(
+            kind(None, Some(client), Some(own), None).unwrap().kind,
+            "client",
+            "a customer with no ticket is still a customer"
+        );
+        assert_eq!(
+            kind(None, Some(own), Some(own), Some(Uuid::new_v4()))
+                .unwrap()
+                .kind,
+            "client",
+            "a ticket is client work whatever company the row names"
+        );
+    }
+
+    /// A tenant with no internal company yet. Nothing may be compared against
+    /// `None`, or every entry naming no company AND every entry naming one
+    /// would collapse to the same answer.
+    #[test]
+    fn a_tenant_without_an_internal_company_still_classifies() {
+        let client = Uuid::new_v4();
+        assert_eq!(kind(None, None, None, None).unwrap().kind, "employee");
+        assert_eq!(kind(None, Some(client), None, None).unwrap().kind, "client");
+    }
+
+    /// Both contradictions are refused, so the constraint in migration 119 is
+    /// never the thing that reports them.
+    #[test]
+    fn the_contradictions_are_refused_before_the_database_sees_them() {
+        let own = Uuid::new_v4();
+        assert!(kind(Some("employee"), None, Some(own), Some(Uuid::new_v4())).is_err());
+        assert!(kind(Some("client"), None, Some(own), None).is_err());
+        assert!(kind(Some("overhead"), None, Some(own), None).is_err());
+    }
+
+    /// Employee time bills nobody, whatever the request asked for. Enforced
+    /// here rather than in the database CHECK, because `is_billable` DEFAULTs
+    /// TRUE and an overhead entry logged before migration 119 may carry it.
+    #[test]
+    fn employee_time_is_never_billable() {
+        let own = Uuid::new_v4();
+        let resolved = billable_kind(Some(own), Some(own));
+        assert_eq!(resolved.kind, "employee");
+        assert!(!resolved.billable);
+        let resolved = billable_kind(Some(Uuid::new_v4()), Some(own));
+        assert!(resolved.billable, "client work keeps what it asked for");
     }
 
     // PMS-394: work_category derivation.
