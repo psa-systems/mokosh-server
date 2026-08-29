@@ -110,7 +110,12 @@ pub struct TimeEntryResponse {
     /// an entry can read and re-send the current task link; a partial PUT that
     /// omits `task_id` preserves it server-side (PMS-328).
     pub task_id: Option<Uuid>,
-    pub company_id: Uuid,
+    /// PMS-942: `client` or `employee`. The axis every billing and approval
+    /// rule that differs between a customer's work and the MSP's own time
+    /// keys on, rather than each one re-deriving it from the company.
+    pub entry_kind: String,
+    /// PMS-942: null on employee time recorded with no company at all.
+    pub company_id: Option<Uuid>,
     pub notes: Option<String>,
     pub is_billable: bool,
     pub billing_status: BillingStatus,
@@ -175,7 +180,21 @@ pub struct CreateTimeEntryRequest {
     /// Optional link to a project task (PMS-51). Approved time against a
     /// task rolls up into the task's and project's actual hours.
     pub task_id: Option<Uuid>,
-    pub company_id: Uuid,
+    /// PMS-942: whose time this is. `client` is work booked against a customer
+    /// and eligible for invoicing; `employee` is the MSP's own time and never
+    /// reaches a client invoice.
+    ///
+    /// Omitted lets the service derive it, which is what keeps an existing
+    /// client working: a company plus a ticket or a project is client work,
+    /// the tenant's own internal company (PMS-413) is employee time, and no
+    /// company at all is employee time.
+    #[serde(default)]
+    pub entry_kind: Option<String>,
+    /// PMS-942: optional, because employee time has no client to name. A
+    /// `client` entry without one is a 400. Employee time may still name the
+    /// tenant's own internal company, which is what MAPPS-243 sends today.
+    #[serde(default)]
+    pub company_id: Option<Uuid>,
     pub notes: Option<String>,
     #[serde(default = "crate::default_true")]
     pub is_billable: bool,
