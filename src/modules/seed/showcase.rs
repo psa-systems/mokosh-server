@@ -798,7 +798,10 @@ fn showcase_time_entries(
                 ticket_id: None,
                 project_id: project_ids.get(n % project_ids.len().max(1)).copied(),
                 task_id: None,
-                company_id: company_ids[n % company_ids.len()],
+                // PMS-942: the seed logs client work, so the kind is left to
+                // the service to derive from the company and the work item.
+                entry_kind: None,
+                company_id: Some(company_ids[n % company_ids.len()]),
                 notes: Some("Showcase seed: project work.".to_string()),
                 work_category: None,
                 is_billable: true,
@@ -818,7 +821,10 @@ fn showcase_time_entries(
                 ticket_id: None,
                 project_id: None,
                 task_id: None,
-                company_id: company_ids[n % company_ids.len()],
+                // PMS-942: the seed logs client work, so the kind is left to
+                // the service to derive from the company and the work item.
+                entry_kind: None,
+                company_id: Some(company_ids[n % company_ids.len()]),
                 notes: Some("Showcase seed: client support.".to_string()),
                 work_category: None,
                 is_billable: true,
