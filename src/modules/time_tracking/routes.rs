@@ -13,7 +13,9 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::TimeTrackingService;
-use crate::modules::auth::{RequireAdmin, RequireManager, RequireTimeTracking, TenantScoped};
+use crate::modules::auth::{
+    RequireAdmin, RequireManager, RequireTimeTracking, RequireTimesheets, TenantScoped,
+};
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -232,6 +234,10 @@ async fn delete_time_entry(
 async fn list_timesheets(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
+    // PMS-943: the feature gate, on top of the module gate above. A tenant
+    // with timesheets off gets 404 here, which is what the extractor returns
+    // so a disabled feature reads exactly like a route that does not exist.
+    _timesheets: RequireTimesheets,
     Query(filter): Query<TimesheetFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimesheetSummaryResponse>>> {
@@ -250,6 +256,10 @@ async fn list_timesheets(
 async fn submit_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
+    // PMS-943: the feature gate, on top of the module gate above. A tenant
+    // with timesheets off gets 404 here, which is what the extractor returns
+    // so a disabled feature reads exactly like a route that does not exist.
+    _timesheets: RequireTimesheets,
     Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
 ) -> AppResult<Json<TimesheetSummaryResponse>> {
     if !user.role.is_admin() && user_id != user.id {
@@ -268,6 +278,10 @@ async fn submit_timesheet(
 async fn withdraw_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
+    // PMS-943: the feature gate, on top of the module gate above. A tenant
+    // with timesheets off gets 404 here, which is what the extractor returns
+    // so a disabled feature reads exactly like a route that does not exist.
+    _timesheets: RequireTimesheets,
     Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
 ) -> AppResult<Json<TimesheetSummaryResponse>> {
     if !user.role.is_admin() && user_id != user.id {
@@ -286,6 +300,10 @@ async fn withdraw_timesheet(
 async fn approve_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
+    // PMS-943: the feature gate, on top of the module gate above. A tenant
+    // with timesheets off gets 404 here, which is what the extractor returns
+    // so a disabled feature reads exactly like a route that does not exist.
+    _timesheets: RequireTimesheets,
     _mgr: RequireManager,
     Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
 ) -> AppResult<Json<TimesheetSummaryResponse>> {
@@ -300,6 +318,10 @@ async fn approve_timesheet(
 async fn reject_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
+    // PMS-943: the feature gate, on top of the module gate above. A tenant
+    // with timesheets off gets 404 here, which is what the extractor returns
+    // so a disabled feature reads exactly like a route that does not exist.
+    _timesheets: RequireTimesheets,
     _mgr: RequireManager,
     Path((user_id, week_start)): Path<(Uuid, NaiveDate)>,
     Json(request): Json<RejectTimesheetRequest>,
