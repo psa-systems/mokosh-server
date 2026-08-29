@@ -143,6 +143,11 @@ impl BillingService {
             FROM time_entries
             WHERE tenant_id = $1
               AND company_id = $2
+              -- PMS-942: by kind, not by which company id the caller passed.
+              -- The tenant's own internal company (PMS-413) is a real row in
+              -- `companies`, so nothing here stopped a caller naming it and
+              -- getting the MSP's own overhead time counted as a client's.
+              AND entry_kind = 'client'
               AND is_billable = TRUE
               AND invoice_id IS NULL
               AND approval_status <> 'approved'
@@ -647,6 +652,12 @@ impl BillingService {
             FROM time_entries
             WHERE tenant_id = $1
               AND company_id = $2
+              -- PMS-942: employee time never reaches a client invoice, and it
+              -- is excluded by what it IS rather than by which company id the
+              -- caller happened to pass. The tenant's own internal company
+              -- (PMS-413) is a real `companies` row, so before this its
+              -- overhead time was invoiceable by naming it.
+              AND entry_kind = 'client'
               AND is_billable = TRUE
               AND invoice_id IS NULL
               AND billing_status = 'ready_to_bill'

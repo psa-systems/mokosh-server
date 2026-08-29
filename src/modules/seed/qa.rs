@@ -1025,7 +1025,10 @@ fn qa_time_entries(
                     None
                 },
                 task_id: None,
-                company_id: company_ids[i % company_ids.len()],
+                // PMS-942: the seed logs client work, so the kind is left to
+                // the service to derive from the company and the work item.
+                entry_kind: None,
+                company_id: Some(company_ids[i % company_ids.len()]),
                 notes: Some("QA seed time entry.".to_string()),
                 work_category: None,
                 is_billable: i % 3 != 0,

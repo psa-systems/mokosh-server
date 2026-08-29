@@ -259,7 +259,7 @@ impl TimeTrackingService {
             r#"
             SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
                    te.worked_minutes, te.billable_minutes,
-                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
+                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.entry_kind, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
                    te.approval_status, te.work_category, te.created_at, te.updated_at,
                    tk.ticket_number, tk.title AS ticket_title,
@@ -317,10 +317,26 @@ impl TimeTrackingService {
         // so a request body could otherwise attach time to another tenant's
         // work type / ticket / company.
         let defaults = fetch_work_type_defaults(&mut *tx, tenant_id, request.work_type_id).await?;
-        assert_company_in_tenant(&mut *tx, tenant_id, request.company_id).await?;
+        if let Some(company_id) = request.company_id {
+            assert_company_in_tenant(&mut *tx, tenant_id, company_id).await?;
+        }
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
+        // PMS-942: whose time this is, settled before anything is priced. It
+        // decides whether the entry can be billed at all, so resolving it after
+        // `resolve_billing` would mean pricing employee time and then throwing
+        // the figure away.
+        let kind = resolve_entry_kind(
+            request.entry_kind.as_deref(),
+            request.company_id,
+            own_company_id(&mut *tx, tenant_id).await?,
+            request.ticket_id,
+            request.project_id,
+            request.task_id,
+            None,
+            request.is_billable,
+        )?;
         let work_category = derive_work_category(
             request.work_category.as_deref(),
             request.ticket_id,
@@ -333,9 +349,15 @@ impl TimeTrackingService {
         // mutated to fit the billing increment.
         let worked = Self::compute_minutes(request)?;
         let rounding = default_rounding_rule(&mut *tx, tenant_id).await?;
-        let billable = match request.billable_minutes {
-            Some(b) => b,
-            None => derive_billable_minutes(worked, request.is_billable, rounding.as_ref()),
+        // PMS-942: employee time bills nobody, so an explicit billable figure on
+        // it is discarded rather than stored and then filtered out downstream.
+        let billable = if kind.billable {
+            match request.billable_minutes {
+                Some(b) => b,
+                None => derive_billable_minutes(worked, true, rounding.as_ref()),
+            }
+        } else {
+            0
         };
         // PMS-396: reject when this entry would push the user's worked total
         // for the date over the tenant's per-day cap. The SUM runs inside `tx`
@@ -346,12 +368,8 @@ impl TimeTrackingService {
             day_minutes_excluding(&mut *tx, tenant_id, request.user_id, request.date, None).await?;
         enforce_day_cap(existing, worked, cap_minutes)?;
         // total_amount is priced on billable minutes, not worked minutes.
-        let (hourly_rate, total) = resolve_billing(
-            request.hourly_rate,
-            request.is_billable,
-            &defaults,
-            billable,
-        );
+        let (hourly_rate, total) =
+            resolve_billing(request.hourly_rate, kind.billable, &defaults, billable);
         let id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -360,8 +378,8 @@ impl TimeTrackingService {
                 duration_minutes, worked_minutes, billable_minutes,
                 work_type_id, ticket_id, project_id,
                 company_id, notes, is_billable, hourly_rate, total_amount, task_id,
-                work_category
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                work_category, entry_kind
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             "#,
         )
         .bind(id)
@@ -378,11 +396,12 @@ impl TimeTrackingService {
         .bind(request.project_id)
         .bind(request.company_id)
         .bind(&request.notes)
-        .bind(request.is_billable)
+        .bind(kind.billable)
         .bind(hourly_rate)
         .bind(total)
         .bind(request.task_id)
         .bind(&work_category)
+        .bind(kind.kind)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -418,7 +437,7 @@ impl TimeTrackingService {
             r#"
             SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
                    te.worked_minutes, te.billable_minutes,
-                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.notes,
+                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.entry_kind, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
                    te.approval_status, te.work_category, te.created_at, te.updated_at,
                    tk.ticket_number, tk.title AS ticket_title,
@@ -486,15 +505,36 @@ impl TimeTrackingService {
             request.ticket_id,
             request.project_id,
         )?;
+        // PMS-942: the kind is set once, at create, and an update cannot change
+        // it - there is no `entry_kind` or `company_id` on the update request,
+        // so an entry cannot be moved between the MSP's books and a client's by
+        // editing it. What an update CAN do is attach a ticket to what was
+        // employee time, which is the same contradiction stated the other way
+        // round, so it is refused here rather than by the constraint.
+        let kind = resolve_entry_kind(
+            Some(&current.entry_kind),
+            current.company_id,
+            None,
+            request.ticket_id,
+            request.project_id,
+            request.task_id,
+            None,
+            is_billable,
+        )?;
+        let is_billable = kind.billable;
         // PMS-395: resolve billable minutes. An explicit value wins; otherwise
         // preserve any previously-stored value so a partial edit does not wipe
         // a hand-set billable figure; failing both, default to the rounded
         // worked time for billable entries (0 for non-billable).
-        let billable = match request.billable_minutes.or(current.billable_minutes) {
-            Some(b) => b,
-            None => {
-                let rounding = default_rounding_rule(&mut *tx, tenant_id).await?;
-                derive_billable_minutes(worked, is_billable, rounding.as_ref())
+        let billable = if !kind.billable {
+            0
+        } else {
+            match request.billable_minutes.or(current.billable_minutes) {
+                Some(b) => b,
+                None => {
+                    let rounding = default_rounding_rule(&mut *tx, tenant_id).await?;
+                    derive_billable_minutes(worked, true, rounding.as_ref())
+                }
             }
         };
         // total_amount is priced on billable minutes, only when billable.
@@ -528,7 +568,7 @@ impl TimeTrackingService {
                 ticket_id         = $8,
                 project_id        = $9,
                 notes             = COALESCE($10, notes),
-                is_billable       = COALESCE($11, is_billable),
+                is_billable       = $11,
                 hourly_rate       = $12,
                 total_amount      = $13,
                 task_id           = COALESCE($14, task_id),
@@ -547,7 +587,7 @@ impl TimeTrackingService {
         .bind(request.ticket_id)
         .bind(request.project_id)
         .bind(&request.notes)
-        .bind(request.is_billable)
+        .bind(is_billable)
         .bind(hourly_rate)
         .bind(total)
         .bind(request.task_id)
@@ -1229,43 +1269,52 @@ impl TimeTrackingService {
                 )
             })?,
         };
+        // PMS-942: a company if one can be found, and no company if not.
+        //
+        // This used to 400 with "Cannot stop timer without an inferable
+        // company_id" when the timer named neither a company nor a ticket,
+        // which meant a timer started for admin work could not be stopped at
+        // all: the only way out was to discard the elapsed time. That was the
+        // NOT NULL on `company_id` speaking through the service. The entry is
+        // employee time, and employee time names no client.
         let company_id = match timer.company_id {
-            Some(v) => v,
-            None => {
-                // With no company on the timer we can only infer one from
-                // an associated ticket. Short-circuit when there is no
-                // ticket either, rather than querying `tickets` by
-                // Uuid::nil() (which never matches and is wasted work).
-                let ticket_id = timer.ticket_id.ok_or_else(|| {
-                    AppError::BadRequest(
-                        "Cannot stop timer without an inferable company_id".to_string(),
+            Some(v) => Some(v),
+            None => match timer.ticket_id {
+                // Short-circuit when there is no ticket either, rather than
+                // querying `tickets` by Uuid::nil() (which never matches and is
+                // wasted work).
+                None => None,
+                Some(ticket_id) => {
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
                     )
-                })?;
-                sqlx::query_scalar::<_, Uuid>(
-                    "SELECT company_id FROM tickets WHERE tenant_id = $1 AND id = $2",
-                )
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| {
-                    AppError::BadRequest(
-                        "Cannot stop timer without an inferable company_id".to_string(),
-                    )
-                })?
-            }
+                    .bind(tenant_id)
+                    .bind(ticket_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
+            },
         };
 
         // Derive billing from the resolved, tenant-scoped work type and apply
         // the tenant default rounding rule to the elapsed minutes, so a
         // stopped timer is priced consistently with a manual entry.
         let defaults = fetch_work_type_defaults(&mut *tx, tenant_id, work_type_id).await?;
+        let kind = resolve_entry_kind(
+            None,
+            company_id,
+            own_company_id(&mut *tx, tenant_id).await?,
+            timer.ticket_id,
+            timer.project_id,
+            None,
+            None,
+            defaults.default_billable,
+        )?;
         let duration = match default_rounding_rule(&mut *tx, tenant_id).await? {
             Some(rule) => apply_rounding(raw, &rule),
             None => raw,
         };
-        let (hourly_rate, total) =
-            resolve_billing(None, defaults.default_billable, &defaults, duration);
+        let (hourly_rate, total) = resolve_billing(None, kind.billable, &defaults, duration);
 
         let entry_id = Uuid::new_v4();
         sqlx::query(
@@ -1273,9 +1322,10 @@ impl TimeTrackingService {
             INSERT INTO time_entries (
                 id, tenant_id, user_id, date, start_time, end_time,
                 duration_minutes, work_type_id, ticket_id, project_id,
-                company_id, notes, is_billable, hourly_rate, total_amount
+                company_id, notes, is_billable, hourly_rate, total_amount,
+                entry_kind
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
             )
             "#,
         )
@@ -1291,9 +1341,10 @@ impl TimeTrackingService {
         .bind(timer.project_id)
         .bind(company_id)
         .bind(&timer.notes)
-        .bind(defaults.default_billable)
+        .bind(kind.billable)
         .bind(hourly_rate)
         .bind(total)
+        .bind(kind.kind)
         .execute(&mut *tx)
         .await?;
 
@@ -1556,6 +1607,101 @@ where
         .ok_or_else(|| AppError::NotFound("Company".to_string()))
 }
 
+/// PMS-942: the two values of `time_entries.entry_kind`.
+pub(crate) const ENTRY_KIND_CLIENT: &str = "client";
+pub(crate) const ENTRY_KIND_EMPLOYEE: &str = "employee";
+
+/// What a resolved entry kind implies for the rest of the row.
+///
+/// Employee time is the MSP's own: it names no client work and can never reach
+/// a client invoice, so the billing fields are settled here rather than being
+/// taken from the request and filtered out again at every read.
+pub(crate) struct ResolvedKind {
+    pub kind: &'static str,
+    pub billable: bool,
+}
+
+/// Decide whether an entry is a client's work or the employee's own.
+///
+/// An explicit `entry_kind` wins, and is then checked against the rest of the
+/// request rather than trusted: `employee` with a ticket on it is a
+/// contradiction the database constraint would reject anyway, and a 400 naming
+/// the field is a better answer than a 500 naming the constraint.
+///
+/// Derived, the rule reads off what the entry is attached to. A ticket, a
+/// project, a task or a contract is client work whatever else is set. Failing
+/// those, the tenant's own internal company (PMS-413) is the signal MAPPS-243
+/// already sends for a General entry, so it means employee time - which is what
+/// lets today's client get the new behaviour without changing a line. No
+/// company at all is employee time, because there is no client to bill.
+/// Anything else, meaning a real customer company with no work item, stays
+/// client work: a billable phone call logged without a ticket is the client's
+/// time, and `work_category = 'general'` does not say otherwise.
+pub(crate) fn resolve_entry_kind(
+    requested: Option<&str>,
+    company_id: Option<Uuid>,
+    own_company_id: Option<Uuid>,
+    ticket_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+    contract_id: Option<Uuid>,
+    is_billable: bool,
+) -> AppResult<ResolvedKind> {
+    let has_client_work =
+        ticket_id.is_some() || project_id.is_some() || task_id.is_some() || contract_id.is_some();
+    let derived = if has_client_work {
+        ENTRY_KIND_CLIENT
+    } else if company_id.is_none() || (own_company_id.is_some() && company_id == own_company_id) {
+        ENTRY_KIND_EMPLOYEE
+    } else {
+        ENTRY_KIND_CLIENT
+    };
+    let kind = match requested.map(str::trim) {
+        None | Some("") => derived,
+        Some(ENTRY_KIND_CLIENT) => ENTRY_KIND_CLIENT,
+        Some(ENTRY_KIND_EMPLOYEE) => ENTRY_KIND_EMPLOYEE,
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "entry_kind must be one of client, employee (got {other:?})"
+            )));
+        }
+    };
+    if kind == ENTRY_KIND_EMPLOYEE && has_client_work {
+        return Err(AppError::BadRequest(
+            "Employee time carries no ticket, project, task or contract; it is the MSP's own time, not a client's".to_string(),
+        ));
+    }
+    if kind == ENTRY_KIND_CLIENT && company_id.is_none() {
+        return Err(AppError::BadRequest(
+            "Client work needs a company_id; log it as employee time if it belongs to no client"
+                .to_string(),
+        ));
+    }
+    Ok(ResolvedKind {
+        kind,
+        // Employee time is never billable. Refused here rather than in the
+        // database CHECK, because `is_billable` DEFAULTs TRUE and an overhead
+        // entry logged before migration 119 may well carry it; a constraint
+        // covering it would have aborted that migration.
+        billable: kind == ENTRY_KIND_CLIENT && is_billable,
+    })
+}
+
+/// The tenant's own internal company (PMS-413), or `None` on a tenant that has
+/// none. Read through the caller's tenant-scoped executor.
+async fn own_company_id<'e, E>(exec: E, tenant_id: TenantId) -> AppResult<Option<Uuid>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT own_company_id FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(exec)
+            .await?
+            .flatten(),
+    )
+}
+
 /// Derive the persisted `work_category` (PMS-394) from an optional
 /// client-supplied value and the presence of a ticket / project link.
 ///
@@ -1811,7 +1957,8 @@ struct TimeEntryRow {
     ticket_id: Option<Uuid>,
     project_id: Option<Uuid>,
     task_id: Option<Uuid>,
-    company_id: Uuid,
+    company_id: Option<Uuid>,
+    entry_kind: Option<String>,
     notes: Option<String>,
     is_billable: Option<bool>,
     billing_status: Option<String>,
@@ -1846,6 +1993,12 @@ impl From<TimeEntryRow> for TimeEntryResponse {
             project_id: r.project_id,
             task_id: r.task_id,
             company_id: r.company_id,
+            // PMS-942: a row written before migration 119 cannot exist without
+            // the column's DEFAULT, so this only ever falls back for a row read
+            // through a query that forgot to select it.
+            entry_kind: r
+                .entry_kind
+                .unwrap_or_else(|| ENTRY_KIND_CLIENT.to_string()),
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
             billing_status: r
