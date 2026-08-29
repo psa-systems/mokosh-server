@@ -1109,6 +1109,30 @@ impl TenantService {
         .execute(&mut *tx)
         .await?;
 
+        // PMS-943: timesheets are the one module whose starting value is not the
+        // default tenant's. Copying it would give every self-signed-up personal
+        // tenant the default tenant's `org` answer, which is the submit-a-week-
+        // to-yourself flow this feature exists to remove. It is read off the new
+        // tenant's own `kind` instead, and written after the copy so it wins.
+        //
+        // An UPDATE, not an upsert: the copy above supplies the row, because
+        // migration 120 gives the default tenant one. Should that ever stop
+        // being true, no row means the module is off, which is the safe answer
+        // for a tenant whose kind could not be consulted.
+        sqlx::query(
+            r#"
+            UPDATE module_config mc
+            SET is_enabled = (t.kind = 'org'), updated_at = NOW()
+            FROM tenants t
+            WHERE t.id = mc.tenant_id
+              AND mc.tenant_id = $1
+              AND mc.module_name = 'timesheets'
+            "#,
+        )
+        .bind(new_tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
         // Copy the in-app notification templates + rules the background
         // workers need so a freshly created tenant fires SLA at-risk/breach
         // alerts (PMS-106) and appointment reminders (PMS-58) out of the

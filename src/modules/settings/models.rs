@@ -89,7 +89,12 @@ pub fn validate_setting_value(
     }
 
     match (category, key) {
-        ("notifications", "channel_email_enabled")
+        // PMS-943: whether a break is a thing this employer tracks. Tenant-level
+        // and not per company, because the employee taking the break is the
+        // MSP's, and a client company has none of the MSP's staff. Default off,
+        // which is the absence of a row; PMS-950 reads it.
+        ("timesheets", "track_breaks")
+        | ("notifications", "channel_email_enabled")
         | ("notifications", "channel_in_app_enabled") => match value {
             Value::Bool(_) => Ok(()),
             _ => Err(bad("value", "expected a boolean")),

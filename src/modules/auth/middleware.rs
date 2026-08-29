@@ -575,7 +575,8 @@ pub trait ModuleGate: Send + Sync + 'static {
 /// `notifications`, and portal authentication keep working regardless
 /// of `module_config.is_enabled`. The gateable taxonomy is
 /// `billing`, `projects`, `calendar`, `contracts`, `assets`,
-/// `knowledge_base`, `rmm_integration`, `reports`, `time_tracking`.
+/// `knowledge_base`, `rmm_integration`, `reports`, `time_tracking`,
+/// `timesheets`.
 ///
 /// The extractor reads an `Arc<SettingsService>` from the request's
 /// extensions; `create_api_router` adds it via `.layer(Extension(...))`.
@@ -666,6 +667,17 @@ gated_module!(
     "time_tracking",
     "Time tracking",
     RequireTimeTracking
+);
+// PMS-943: timesheets are separate from `time_tracking` on purpose. Logging
+// time is not the same feature as submitting a week of it for approval: a
+// one-person MSP still logs and still bills, it just has nobody to submit to.
+// The timesheet routes carry BOTH gates, so turning time tracking off still
+// takes the timesheets with it.
+gated_module!(
+    TimesheetsModule,
+    "timesheets",
+    "Timesheets",
+    RequireTimesheets
 );
 
 // ── Bunyip RS helper ─────────────────────────────────────────────────────────
