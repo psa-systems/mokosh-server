@@ -1,5 +1,11 @@
 //! Contracts DTOs.
 
+// `BillingRule` exposes `from_str(&str) -> Option<Self>` as a deliberate
+// infallible-style parser API, matching every other domain enum in this
+// codebase; it intentionally does not implement `std::str::FromStr` (which
+// requires a `Result`).
+#![allow(clippy::should_implement_trait)]
+
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
