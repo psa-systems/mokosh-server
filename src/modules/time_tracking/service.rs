@@ -375,7 +375,7 @@ impl TimeTrackingService {
         // company, and putting a picker in front of the person logging time
         // invites picking the wrong one.
         let contract_id = block_hours_contract_for(
-            &mut *tx,
+            &mut tx,
             tenant_id,
             request.company_id,
             request.date,
@@ -1438,7 +1438,7 @@ impl TimeTrackingService {
         let (hourly_rate, total) = resolve_billing(None, kind.billable, &defaults, duration);
         // PMS-951: a stopped timer draws on the same terms as time typed in.
         let contract_id = block_hours_contract_for(
-            &mut *tx,
+            &mut tx,
             tenant_id,
             company_id,
             now.date_naive(),
