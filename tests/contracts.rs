@@ -831,3 +831,135 @@ async fn get_rate_card_other_tenant_is_not_found(pool: PgPool) {
         .expect_err("cross-tenant id is 404");
     assert!(matches!(err, AppError::NotFound(_)));
 }
+
+// ---- PMS-956: an item states whether it bills ------------------------------
+
+/// Omitting `billing_rule` must reproduce exactly what each type does today,
+/// because every existing API client omits it. Stating it is how a product on a
+/// contract becomes a licence that bills every period.
+#[sqlx::test]
+async fn an_items_billing_rule_is_derived_when_the_caller_omits_it(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::contracts::{BillingRule, UpsertContractItemRequest};
+
+    let company = common::seed_company(&pool).await;
+    let contract =
+        seed_block_contract(&pool, company, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let item = |item_type: &str, rule: Option<BillingRule>| UpsertContractItemRequest {
+        name: format!("{item_type} item"),
+        description: None,
+        item_type: item_type.to_string(),
+        quantity: Decimal::ONE,
+        unit_price: Decimal::from(100),
+        billing_frequency: "monthly".to_string(),
+        work_type_id: None,
+        included_hours: None,
+        overage_rate: None,
+        rollover_enabled: false,
+        max_rollover_hours: None,
+        sort_order: 0,
+        product_id: None,
+        billing_rule: rule,
+    };
+
+    for (item_type, expected) in [
+        ("recurring_service", BillingRule::EveryPeriod),
+        ("retainer", BillingRule::EveryPeriod),
+        ("one_time", BillingRule::Once),
+        ("product", BillingRule::Manual),
+        ("block_hours", BillingRule::Manual),
+    ] {
+        let created = svc
+            .create_contract_item(tenant, contract, &item(item_type, None), &ctx)
+            .await
+            .expect("create item");
+        assert_eq!(
+            created.billing_rule, expected,
+            "{item_type} with no rule stated"
+        );
+        assert!(created.billed_at.is_none(), "nothing is billed on creation");
+    }
+
+    // And stating it wins, which is the whole point: a product that is a
+    // monthly licence rather than a box sold once.
+    let licences = svc
+        .create_contract_item(
+            tenant,
+            contract,
+            &UpsertContractItemRequest {
+                name: "M365 licences".to_string(),
+                ..item("product", Some(BillingRule::EveryPeriod))
+            },
+            &ctx,
+        )
+        .await
+        .expect("create licences");
+    assert_eq!(licences.billing_rule, BillingRule::EveryPeriod);
+}
+
+/// Editing a `once` item that has already billed must not report it as
+/// unbilled: the response reads `billed_at` back from the write rather than
+/// assuming it, or the record would say the client still owes the charge.
+#[sqlx::test]
+async fn editing_a_spent_one_time_item_keeps_it_spent(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::contracts::{BillingRule, UpsertContractItemRequest};
+
+    let company = common::seed_company(&pool).await;
+    let contract =
+        seed_block_contract(&pool, company, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let request = UpsertContractItemRequest {
+        name: "Onboarding".to_string(),
+        description: None,
+        item_type: "one_time".to_string(),
+        quantity: Decimal::ONE,
+        unit_price: Decimal::from(2000),
+        billing_frequency: "monthly".to_string(),
+        work_type_id: None,
+        included_hours: None,
+        overage_rate: None,
+        rollover_enabled: false,
+        max_rollover_hours: None,
+        sort_order: 0,
+        product_id: None,
+        billing_rule: None,
+    };
+    let created = svc
+        .create_contract_item(tenant, contract, &request, &ctx)
+        .await
+        .expect("create");
+    assert_eq!(created.billing_rule, BillingRule::Once);
+
+    // The generator's claim, as it would leave it.
+    sqlx::query("UPDATE contract_items SET billed_at = NOW() WHERE id = $1")
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("mark billed");
+
+    let edited = svc
+        .update_contract_item(
+            tenant,
+            created.id,
+            &UpsertContractItemRequest {
+                name: "Onboarding (revised)".to_string(),
+                ..request
+            },
+            &ctx,
+        )
+        .await
+        .expect("update");
+    assert_eq!(edited.name, "Onboarding (revised)");
+    assert!(
+        edited.billed_at.is_some(),
+        "an edit does not un-bill a charge that has already gone out"
+    );
+}

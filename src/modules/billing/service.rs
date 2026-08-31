@@ -1148,10 +1148,11 @@ impl BillingService {
         // retainer), but runs inside this transaction.
         let items = sqlx::query_as::<_, RecurringItemRow>(
             r#"
-            SELECT name, quantity, unit_price, product_id
+            SELECT id, name, quantity, unit_price, product_id, billing_rule
             FROM contract_items
             WHERE tenant_id = $1 AND contract_id = $2
-              AND item_type IN ('recurring_service', 'retainer')
+              AND (billing_rule = 'every_period'
+                   OR (billing_rule = 'once' AND billed_at IS NULL))
             ORDER BY sort_order, name
             "#,
         )
@@ -1250,8 +1251,29 @@ impl BillingService {
             return Ok(None);
         }
 
-        // --- 3. One invoice line per recurring item (line_type 'service'). ---
+        // --- 3. One invoice line per billable item (line_type 'service'). ---
+        //
+        // PMS-956: a `once` item is claimed here, in this transaction, with an
+        // UPDATE that only matches while it is still unbilled. That is the
+        // per-item idempotency the period ledger cannot give: it is keyed on
+        // (tenant, contract, period_start), so it knows a PERIOD was billed and
+        // a setup fee added in March would bill again in April under a new
+        // period key. If the claim matches nothing another run took it, and the
+        // whole transaction rolls back rather than billing it twice.
         for (idx, item) in items.iter().enumerate() {
+            if item.billing_rule == "once" {
+                let claimed: Option<Uuid> = sqlx::query_scalar(
+                    "UPDATE contract_items SET billed_at = NOW(), updated_at = NOW() \
+                     WHERE id = $1 AND tenant_id = $2 AND billed_at IS NULL RETURNING id",
+                )
+                .bind(item.id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if claimed.is_none() {
+                    return Ok(None);
+                }
+            }
             sqlx::query(
                 r#"
                 INSERT INTO invoice_lines (
@@ -3740,12 +3762,16 @@ struct RecurringContractRow {
 /// Recurring contract-item row -> one invoice line.
 #[derive(sqlx::FromRow)]
 struct RecurringItemRow {
+    id: Uuid,
     name: String,
     quantity: Decimal,
     unit_price: Decimal,
     /// PMS-955: the catalog link, carried onto the invoice line this item
     /// becomes. `None` for every item written before the catalog existed.
     product_id: Option<Uuid>,
+    /// PMS-956: `every_period` or `once`; the SELECT excludes everything else,
+    /// and a `once` item is claimed before its line is written.
+    billing_rule: String,
 }
 
 /// Compute the current billing period `[period_start, period_end]` for a
