@@ -69,10 +69,16 @@ async fn seed_recurring_item(
     sort_order: i32,
 ) {
     sqlx::query(
+        // PMS-956: `billing_rule` is stated, not left to the column default.
+        // The default is `manual`, deliberately: a row written by a path that
+        // forgot must not start charging a client, and a missing charge is
+        // recoverable where a wrong one is a conversation. That makes stating
+        // it the writer's job, and this fixture is a writer.
         r#"INSERT INTO contract_items
            (id, tenant_id, contract_id, name, item_type, quantity, unit_price,
-            total_price, sort_order)
-           VALUES ($1, $2, $3, $4, 'recurring_service', $5, $6, $7, $8)"#,
+            total_price, sort_order, billing_rule)
+           VALUES ($1, $2, $3, $4, 'recurring_service', $5, $6, $7, $8,
+                   'every_period')"#,
     )
     .bind(Uuid::new_v4())
     .bind(common::DEFAULT_TENANT_ID)
@@ -389,5 +395,271 @@ async fn next_period_generates_a_new_invoice(pool: PgPool) {
             NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
         ]
+    );
+}
+
+// ---- PMS-956: a product or one-time item is billed by something -------------
+
+/// Seed a contract item of any type with an explicit billing rule.
+async fn seed_item(
+    pool: &PgPool,
+    contract_id: Uuid,
+    name: &str,
+    item_type: &str,
+    billing_rule: &str,
+    unit_price: Decimal,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO contract_items
+           (id, tenant_id, contract_id, name, item_type, quantity, unit_price,
+            total_price, sort_order, billing_rule)
+           VALUES ($1, $2, $3, $4, $5, 1, $6, $6, 0, $7)"#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contract_id)
+    .bind(name)
+    .bind(item_type)
+    .bind(unit_price)
+    .bind(billing_rule)
+    .execute(pool)
+    .await
+    .expect("seed item");
+    id
+}
+
+async fn line_descriptions(pool: &PgPool, invoice_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT description FROM invoice_lines WHERE invoice_id = $1 ORDER BY sort_order",
+    )
+    .bind(invoice_id)
+    .fetch_all(pool)
+    .await
+    .expect("read invoice lines")
+}
+
+/// The defect, from the other side. A `product` item marked `every_period`
+/// bills like any other recurring line, which is what "30 licences at 22.00 a
+/// user" needs and what `item_type` alone could never express.
+#[sqlx::test]
+async fn a_product_item_bills_when_it_says_it_should(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_contract(&pool, company, "monthly", start, None).await;
+
+    seed_item(
+        &pool,
+        contract,
+        "M365 licences",
+        "product",
+        "every_period",
+        Decimal::from(660),
+    )
+    .await;
+    // A second product left on the default: visible, settable, and not billed.
+    seed_item(
+        &pool,
+        contract,
+        "A switch we sold once",
+        "product",
+        "manual",
+        Decimal::from(249),
+    )
+    .await;
+
+    let svc = BillingService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(tenant);
+    let now = Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap();
+    let created = svc
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), now, &ctx)
+        .await
+        .expect("generate");
+    assert_eq!(created.len(), 1, "one invoice for the due period");
+
+    let lines = line_descriptions(&pool, created[0]).await;
+    assert_eq!(
+        lines,
+        vec!["M365 licences".to_string()],
+        "the every_period product bills and the manual one does not"
+    );
+}
+
+/// `once` means once, and the period ledger cannot enforce it: that ledger is
+/// keyed on the period, so a setup fee added in March would bill again in April
+/// under a new period key. Two consecutive periods is the test that would have
+/// caught a naive fix.
+#[sqlx::test]
+async fn a_one_time_item_bills_exactly_once(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_contract(&pool, company, "monthly", start, None).await;
+
+    seed_item(
+        &pool,
+        contract,
+        "Onboarding",
+        "one_time",
+        "once",
+        Decimal::from(2000),
+    )
+    .await;
+    seed_item(
+        &pool,
+        contract,
+        "Managed services",
+        "recurring_service",
+        "every_period",
+        Decimal::from(500),
+    )
+    .await;
+
+    let svc = BillingService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(tenant);
+
+    let january = svc
+        .generate_due_recurring_invoices(
+            TenantId::from_trusted(tenant),
+            Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap(),
+            &ctx,
+        )
+        .await
+        .expect("january");
+    assert_eq!(january.len(), 1);
+    let mut lines = line_descriptions(&pool, january[0]).await;
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec!["Managed services".to_string(), "Onboarding".to_string()],
+        "the setup fee is on the first invoice"
+    );
+
+    let february = svc
+        .generate_due_recurring_invoices(
+            TenantId::from_trusted(tenant),
+            Utc.with_ymd_and_hms(2026, 2, 15, 0, 0, 0).unwrap(),
+            &ctx,
+        )
+        .await
+        .expect("february");
+    assert_eq!(
+        february.len(),
+        1,
+        "a new period still bills the recurring item"
+    );
+    assert_eq!(
+        line_descriptions(&pool, february[0]).await,
+        vec!["Managed services".to_string()],
+        "and never the setup fee again"
+    );
+
+    let billed_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT billed_at FROM contract_items WHERE name = 'Onboarding'")
+            .fetch_one(&pool)
+            .await
+            .expect("read billed_at");
+    assert!(billed_at.is_some(), "the claim is recorded on the item");
+}
+
+/// A contract whose only item is a spent one-time charge has nothing left to
+/// bill, and must not produce an empty invoice or a ledger row that would block
+/// a later item.
+#[sqlx::test]
+async fn a_spent_one_time_item_leaves_nothing_to_bill(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_contract(&pool, company, "monthly", start, None).await;
+    seed_item(
+        &pool,
+        contract,
+        "Onboarding",
+        "one_time",
+        "once",
+        Decimal::from(2000),
+    )
+    .await;
+
+    let svc = BillingService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(tenant);
+
+    assert_eq!(
+        svc.generate_due_recurring_invoices(
+            TenantId::from_trusted(tenant),
+            Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap(),
+            &ctx,
+        )
+        .await
+        .expect("january")
+        .len(),
+        1
+    );
+
+    let february = svc
+        .generate_due_recurring_invoices(
+            TenantId::from_trusted(tenant),
+            Utc.with_ymd_and_hms(2026, 2, 15, 0, 0, 0).unwrap(),
+            &ctx,
+        )
+        .await
+        .expect("february");
+    assert!(february.is_empty(), "nothing left, so no invoice at all");
+
+    let invoices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(&pool)
+        .await
+        .expect("count invoices");
+    assert_eq!(invoices, 1, "and no empty second invoice was written");
+}
+
+/// The safety property of the whole change. Every existing row was written by
+/// somebody who has not been charging for it, so the backfill marks only the
+/// two types that already billed, and a row left on the column default bills
+/// nothing rather than starting to charge a client for something recorded
+/// months ago.
+#[sqlx::test]
+async fn an_item_that_never_billed_does_not_start(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_contract(&pool, company, "monthly", start, None).await;
+
+    // Written the way a pre-PMS-956 row was: no billing_rule at all.
+    for (name, item_type) in [
+        ("A switch", "product"),
+        ("Onboarding", "one_time"),
+        ("Block", "block_hours"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO contract_items
+               (id, tenant_id, contract_id, name, item_type, quantity, unit_price, total_price)
+               VALUES ($1, $2, $3, $4, $5, 1, 100, 100)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant)
+        .bind(contract)
+        .bind(name)
+        .bind(item_type)
+        .execute(&pool)
+        .await
+        .expect("seed legacy item");
+    }
+
+    let svc = BillingService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(tenant);
+    let created = svc
+        .generate_due_recurring_invoices(
+            TenantId::from_trusted(tenant),
+            Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap(),
+            &ctx,
+        )
+        .await
+        .expect("generate");
+    assert!(
+        created.is_empty(),
+        "none of these was billing before and none of them starts"
     );
 }

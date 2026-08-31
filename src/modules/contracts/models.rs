@@ -427,3 +427,54 @@ pub struct ConsumeOutcome {
     /// The balance row id that was debited (current period).
     pub balance_id: Uuid,
 }
+
+#[cfg(test)]
+mod pms956_billing_rule_tests {
+    use super::*;
+
+    /// The compatibility rule, and the reason `derive` is one function rather
+    /// than a match repeated at each call site.
+    ///
+    /// The two types that bill today must keep billing identically, or this
+    /// change stops an MSP's recurring revenue the day it deploys. `one_time`
+    /// gets the meaning its name has always claimed. Everything else is
+    /// `Manual`, which bills nothing: a row written by a path that forgot must
+    /// not start charging a client, because a missing charge is recoverable
+    /// where a wrong one is a conversation.
+    #[test]
+    fn an_omitted_rule_reproduces_todays_behaviour() {
+        assert_eq!(
+            BillingRule::derive("recurring_service"),
+            BillingRule::EveryPeriod
+        );
+        assert_eq!(BillingRule::derive("retainer"), BillingRule::EveryPeriod);
+        assert_eq!(BillingRule::derive("one_time"), BillingRule::Once);
+        // Not billed by the generator before this change, and not after it.
+        assert_eq!(BillingRule::derive("product"), BillingRule::Manual);
+        assert_eq!(BillingRule::derive("block_hours"), BillingRule::Manual);
+        // A type this build does not know bills nothing rather than guessing.
+        assert_eq!(BillingRule::derive("something_new"), BillingRule::Manual);
+    }
+
+    /// The default is the safe one, in the enum as well as in the column, so a
+    /// value that arrives from neither the API nor the database still bills
+    /// nothing.
+    #[test]
+    fn the_default_bills_nothing() {
+        assert_eq!(BillingRule::default(), BillingRule::Manual);
+        assert_eq!(BillingRule::from_str("nonsense"), None);
+    }
+
+    /// The wire form round-trips, so a stored value and a request body mean the
+    /// same thing.
+    #[test]
+    fn every_value_round_trips_through_its_wire_form() {
+        for rule in [
+            BillingRule::EveryPeriod,
+            BillingRule::Once,
+            BillingRule::Manual,
+        ] {
+            assert_eq!(BillingRule::from_str(rule.as_str()), Some(rule));
+        }
+    }
+}
