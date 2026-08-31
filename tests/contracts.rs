@@ -422,116 +422,27 @@ async fn seed_time_entry(
     .expect("seed time entry");
 }
 
-/// PMS-405: approving billable time logged against a block-hours contract
-/// decrements the contract hour balance, and hours past `included_hours`
-/// split into a persisted overage.
+/// PMS-951: approving a timesheet does NOT draw on a contract's hours.
+///
+/// PMS-405 made approval the consumption point and these two tests pinned it
+/// there. It is not any more: PMS-944 made an entry invoiceable because it was
+/// logged, and PMS-943 gated approval behind the timesheets module, so a tenant
+/// with timesheets off would never have drawn an hour. Consumption moved to the
+/// moment the work is recorded.
+///
+/// What replaces the pair is this inversion, kept here because this is the file
+/// a reader of PMS-405 opens. The positive cases - a draw, an overage split, an
+/// edit, a delete - live in `tests/block_hours_consumption.rs`, driven through
+/// the real write paths rather than through direct SQL, which is what let the
+/// original pair pass while the write path could not reach `contract_id` at all.
 #[sqlx::test]
-async fn approving_time_consumes_contract_hours_with_overage(pool: PgPool) {
-    let tenant = common::DEFAULT_TENANT_ID;
-    let company = common::seed_company(&pool).await;
-    // 2026-01-12 is a Monday; the timesheet week is anchored on it.
-    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-    let monday = NaiveDate::from_ymd_opt(2026, 1, 12).unwrap();
-    let contract = seed_block_contract(&pool, company, start).await;
-    let item = seed_block_item(
-        &pool,
-        contract,
-        common::dec("10"),
-        common::dec("150"),
-        false,
-        None,
-    )
-    .await;
-
-    let work_type = seed_work_type(&pool).await;
-    let (user, _, _) = common::seed_user(&pool, tenant, "tt-405@example.com", "technician").await;
-
-    // Two billable entries (8h + 5h = 13h) against the contract, plus one
-    // non-billable entry that must NOT consume, all in the same week.
-    seed_time_entry(
-        &pool,
-        user,
-        company,
-        work_type,
-        Some(contract),
-        monday,
-        480,
-        true,
-    )
-    .await;
-    seed_time_entry(
-        &pool,
-        user,
-        company,
-        work_type,
-        Some(contract),
-        monday + chrono::Duration::days(1),
-        300,
-        true,
-    )
-    .await;
-    seed_time_entry(
-        &pool,
-        user,
-        company,
-        work_type,
-        Some(contract),
-        monday + chrono::Duration::days(2),
-        120,
-        false,
-    )
-    .await;
-
-    let tt = TimeTrackingService::new(Database::from_pool(pool.clone()));
-    tt.approve_timesheet(TenantId::from_trusted(tenant), user, user, monday)
-        .await
-        .expect("approve week");
-
-    // 13 billable hours against a 10h allotment: 10 used, 0 remaining,
-    // 3h overage persisted (only the two billable entries count).
-    let (used, remaining, included): (Decimal, Decimal, Decimal) = sqlx::query_as(
-        r#"SELECT hours_used, hours_remaining, hours_included
-           FROM contract_hour_balances
-           WHERE contract_id = $1 AND contract_item_id = $2"#,
-    )
-    .bind(contract)
-    .bind(item)
-    .fetch_one(&pool)
-    .await
-    .expect("balance row exists after approval");
-    assert_eq!(included, common::dec("10"));
-    assert_eq!(used, common::dec("10"), "hours_used capped at allotment");
-    assert_eq!(remaining, common::dec("0"), "remaining fully drawn down");
-
-    // Re-approving the (now approved) week is a no-op: no double-counting.
-    tt.approve_timesheet(TenantId::from_trusted(tenant), user, user, monday)
-        .await
-        .expect("re-approve week");
-    let used_again: Decimal = sqlx::query_scalar(
-        r#"SELECT hours_used FROM contract_hour_balances
-           WHERE contract_id = $1 AND contract_item_id = $2"#,
-    )
-    .bind(contract)
-    .bind(item)
-    .fetch_one(&pool)
-    .await
-    .expect("balance row");
-    assert_eq!(
-        used_again,
-        common::dec("10"),
-        "re-approval must not consume hours twice"
-    );
-}
-
-/// PMS-405: a within-allotment week decrements without overage.
-#[sqlx::test]
-async fn approving_time_within_allotment_decrements_balance(pool: PgPool) {
+async fn approving_a_timesheet_does_not_consume_contract_hours(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
     let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let monday = NaiveDate::from_ymd_opt(2026, 1, 12).unwrap();
     let contract = seed_block_contract(&pool, company, start).await;
-    let item = seed_block_item(
+    seed_block_item(
         &pool,
         contract,
         common::dec("10"),
@@ -543,7 +454,8 @@ async fn approving_time_within_allotment_decrements_balance(pool: PgPool) {
     let work_type = seed_work_type(&pool).await;
     let (user, _, _) = common::seed_user(&pool, tenant, "tt-405b@example.com", "technician").await;
 
-    // 4 billable hours against a 10h allotment.
+    // Seeded the way the original pair did: straight into the table, so the
+    // creation-time draw never ran and only approval could move the balance.
     seed_time_entry(
         &pool,
         user,
@@ -561,18 +473,17 @@ async fn approving_time_within_allotment_decrements_balance(pool: PgPool) {
         .await
         .expect("approve week");
 
-    let (used, remaining): (Decimal, Decimal) = sqlx::query_as(
-        r#"SELECT hours_used, hours_remaining
-           FROM contract_hour_balances
-           WHERE contract_id = $1 AND contract_item_id = $2"#,
-    )
-    .bind(contract)
-    .bind(item)
-    .fetch_one(&pool)
-    .await
-    .expect("balance row");
-    assert_eq!(used, common::dec("4"));
-    assert_eq!(remaining, common::dec("6"));
+    let balances: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contract_hour_balances WHERE contract_id = $1")
+            .bind(contract)
+            .fetch_one(&pool)
+            .await
+            .expect("count balances");
+    assert_eq!(
+        balances, 0,
+        "approval draws nothing; drawing twice is what this guards against, \
+         since a logged entry has already taken its hours"
+    );
 }
 
 #[sqlx::test]

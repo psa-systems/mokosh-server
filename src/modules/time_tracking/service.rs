@@ -1035,6 +1035,7 @@ impl TimeTrackingService {
     /// which is most entries: only client work against a company holding a
     /// block-hours contract draws anything.
     async fn consume_for_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConsumeCandidateRow> = sqlx::query_as(
             r#"SELECT contract_id, duration_minutes, date, is_billable, entry_kind
                FROM time_entries
@@ -1042,8 +1043,9 @@ impl TimeTrackingService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
+        .fetch_optional(&mut *tx)
         .await?;
+        drop(tx);
         let Some(row) = row else { return Ok(()) };
         let Some(contract_id) = row.contract_id else {
             return Ok(());
