@@ -21,7 +21,7 @@
 use uuid::Uuid;
 
 use super::branding::PUBLIC_TENANT_PATH_PREFIX;
-use crate::storage::{LocalStore, ObjectKey, ObjectStore};
+use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 
 /// The on-disk suffix each allowed type is stored under. This table names
@@ -98,6 +98,10 @@ pub struct TenantLogoStore {
     config: TenantLogoConfig,
     /// PMS-910: where the bytes go. This module no longer knows.
     store: LocalStore,
+    /// PMS-957: one row per stored file. A logo is the one object written to
+    /// the same key over and over, so its row is upserted rather than added to,
+    /// and a tenant's usage counts one logo however many times it is replaced.
+    ledger: Option<FileLedger>,
 }
 
 impl TenantLogoStore {
@@ -105,7 +109,18 @@ impl TenantLogoStore {
         Self {
             config,
             store: LocalStore::from_env(),
+            ledger: None,
         }
+    }
+
+    /// PMS-957: give this store a database to record uploads in.
+    ///
+    /// Optional because the public read router builds one from configuration
+    /// alone and has no pool, and recording is a property of STORING a logo
+    /// rather than of serving one.
+    pub fn with_ledger(mut self, db: crate::db::Database) -> Self {
+        self.ledger = Some(FileLedger::new(db));
+        self
     }
 
     pub fn max_bytes(&self) -> u64 {
@@ -140,12 +155,27 @@ impl TenantLogoStore {
         }
 
         self.remove(tenant_id).await;
-        self.store
-            .put(
-                &ObjectKey::tenant_logo(tenant_id, extension_for(mime)),
-                bytes,
-            )
-            .await?;
+        let key = ObjectKey::tenant_logo(tenant_id, extension_for(mime));
+        self.store.put(&key, bytes).await?;
+        if let Some(ledger) = &self.ledger {
+            // Keyed on the TENANT, not a fresh id: there is one logo per tenant
+            // and replacing it must not add a second row to the rollup.
+            ledger
+                .record(
+                    tenant_id,
+                    &key,
+                    tenant_id,
+                    FileRecord {
+                        original_name: "logo",
+                        mime_type: mime,
+                        file_size: bytes.len() as i64,
+                        uploaded_by_id: None,
+                        entity_type: "tenant_logo",
+                        entity_id: Some(tenant_id),
+                    },
+                )
+                .await?;
+        }
         Ok(mime)
     }
 

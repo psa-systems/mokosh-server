@@ -111,7 +111,7 @@ const SEEDED_TENANT_CAPACITY: u64 = 10_000;
 /// Tenant management service
 #[derive(Clone)]
 pub struct TenantService {
-    db: Database,
+    pub(crate) db: Database,
     /// PMS-777: tenants this process has already seen `ensure_default_config`
     /// succeed for. `ensure_default_config` runs on the per-request bunyip auth
     /// path, where its three `SELECT EXISTS` guards cost round trips forever to

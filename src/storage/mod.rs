@@ -26,6 +26,10 @@
 //! pins the paths so a future change to any of them is a deliberate edit rather
 //! than an accident that orphans a customer's attachments.
 
+mod ledger;
+
+pub use ledger::{FileLedger, FileRecord};
+
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
@@ -202,25 +206,37 @@ impl LocalStore {
     /// visible edit to a pinned expectation rather than a line in a module that
     /// silently orphans everything already stored under the old shape.
     pub fn path_for(&self, key: &ObjectKey) -> AppResult<PathBuf> {
-        let path = match &key.kind {
-            ObjectKind::TicketAttachment { id } => self
-                .config
-                .root
-                .join(key.tenant_id.to_string())
-                .join(id.to_string()),
+        Ok(self.config.root.join(key.relative_path()?))
+    }
+}
+
+impl ObjectKey {
+    /// Where this object lives BELOW the root, which is the half of a path that
+    /// is a property of the object rather than of the deployment.
+    ///
+    /// PMS-957 needs it separately from [`LocalStore::path_for`], because the
+    /// file ledger records where a file is and the root is not part of that: it
+    /// is runtime configuration that differs between a dev container and a
+    /// production volume, and an absolute path baked into a row goes stale the
+    /// first time it moves. That is the same lesson `ticket_attachments`
+    /// learned, whose absolute `storage_path` PMS-910 stopped reading.
+    ///
+    /// It is also what makes a backfill possible: a relative path is derivable
+    /// in SQL from the ids a feature table already holds, where an absolute one
+    /// would need the running process's configuration.
+    pub fn relative_path(&self) -> AppResult<PathBuf> {
+        let path = match &self.kind {
+            ObjectKind::TicketAttachment { id } => {
+                PathBuf::from(self.tenant_id.to_string()).join(id.to_string())
+            }
             ObjectKind::TenantLogo { extension } => {
                 // The only caller-supplied string that reaches a path anywhere
                 // in this module. Everything else is a UUID, which cannot
                 // contain a separator or a dot-dot by construction.
                 validate_segment(extension)?;
-                self.config
-                    .root
-                    .join("tenant-logos")
-                    .join(format!("{}.{extension}", key.tenant_id))
+                PathBuf::from("tenant-logos").join(format!("{}.{extension}", self.tenant_id))
             }
-            ObjectKind::KbAttachment { id } => {
-                self.config.root.join("kb-articles").join(id.to_string())
-            }
+            ObjectKind::KbAttachment { id } => PathBuf::from("kb-articles").join(id.to_string()),
         };
         Ok(path)
     }
