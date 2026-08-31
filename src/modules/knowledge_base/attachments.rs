@@ -20,11 +20,13 @@
 //!
 //! ## Storage
 //!
-//! Bytes live on disk under `ATTACHMENT_DIR`, in a `kb-articles/` subdirectory
-//! so an article image can never collide with the `{tenant_id}/{attachment_id}`
-//! path ticket attachments use, exactly as `tenant-logos/` does.
+//! Bytes go through `crate::storage`, which owns the root and the layout since
+//! PMS-910. These land in a `kb-articles/` subdirectory so an article image can
+//! never collide with the `{tenant_id}/{attachment_id}` path ticket attachments
+//! use, exactly as `tenant-logos/` does. That subdirectory is flat: it is the
+//! one kind whose path carries no tenant, which the storage module states and
+//! PMS-960 changes.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Multipart, Path, State};
@@ -39,6 +41,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
+use crate::storage::{LocalStore, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 // PMS-941: one allowlist for every publicly-readable image route. SVG is
 // refused there, for the reason the module header of `inline_image` states.
@@ -49,35 +52,19 @@ use crate::utils::inline_image::check_inline_image_mime;
 /// because these are embedded in a page rather than downloaded on purpose.
 const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
-/// Subdirectory under the shared upload root, so an article image cannot
-/// collide with a ticket attachment's `{tenant_id}/{attachment_id}` path.
-const SUBDIR: &str = "kb-articles";
-
 #[derive(Clone, Debug)]
 pub struct KbAttachmentConfig {
-    pub dir: PathBuf,
     pub max_bytes: u64,
 }
 
 impl KbAttachmentConfig {
     pub fn from_env() -> Self {
-        let root = std::env::var("ATTACHMENT_DIR")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "/data/attachments".to_string());
         let max_bytes = std::env::var("KB_ATTACHMENT_MAX_BYTES")
             .ok()
             .filter(|v| !v.trim().is_empty())
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MAX_BYTES);
-        Self {
-            dir: PathBuf::from(root).join(SUBDIR),
-            max_bytes,
-        }
-    }
-
-    fn path_for(&self, id: Uuid) -> PathBuf {
-        self.dir.join(id.to_string())
+        Self { max_bytes }
     }
 }
 
@@ -103,11 +90,17 @@ pub fn attachment_path(id: Uuid) -> String {
 pub struct KbAttachmentService {
     db: Database,
     config: KbAttachmentConfig,
+    /// PMS-910: where the bytes go. This module no longer knows.
+    store: LocalStore,
 }
 
 impl KbAttachmentService {
     pub fn new(db: Database, config: KbAttachmentConfig) -> Self {
-        Self { db, config }
+        Self {
+            db,
+            config,
+            store: LocalStore::from_env(),
+        }
     }
 
     /// Store an image against an article the caller can reach.
@@ -170,12 +163,9 @@ impl KbAttachmentService {
         // Bytes AFTER the row, and the commit after the bytes: a file with no
         // row is invisible litter, whereas a row with no file is a broken image
         // in a published article.
-        tokio::fs::create_dir_all(&self.config.dir)
-            .await
-            .map_err(|e| AppError::Internal(format!("create kb attachment dir: {e}")))?;
-        tokio::fs::write(self.config.path_for(row.0), &bytes)
-            .await
-            .map_err(|e| AppError::Internal(format!("write kb attachment: {e}")))?;
+        self.store
+            .put(&ObjectKey::kb_attachment(tenant_id.get(), row.0), &bytes)
+            .await?;
 
         tx.commit().await?;
 
@@ -248,7 +238,10 @@ impl KbAttachmentService {
         tx.commit().await?;
         // Best effort: a file with no row is unreachable, so a failed unlink
         // must not fail the request that already removed the reference.
-        let _ = tokio::fs::remove_file(self.config.path_for(attachment_id)).await;
+        let _ = self
+            .store
+            .delete(&ObjectKey::kb_attachment(tenant_id.get(), attachment_id))
+            .await;
         Ok(())
     }
 
@@ -265,15 +258,21 @@ impl KbAttachmentService {
     /// table is tenant-scoped through `begin_with_tenant` above.
     async fn read_public(&self, id: Uuid) -> AppResult<(String, Vec<u8>)> {
         let pool: &PgPool = self.db.migrator_pool();
-        let mime: Option<String> =
-            sqlx::query_scalar("SELECT mime_type FROM kb_article_attachments WHERE id = $1")
+        // PMS-910: the tenant comes off the row rather than off the request,
+        // because this path has none. The stored layout ignores it today, but
+        // the key carries it so PMS-960 can move these files under a tenant
+        // prefix without touching this call site.
+        let row: Option<(String, Uuid)> =
+            sqlx::query_as("SELECT mime_type, tenant_id FROM kb_article_attachments WHERE id = $1")
                 .bind(id)
                 .fetch_optional(pool)
                 .await?;
         // An unknown id and a deleted attachment answer identically, so this is
         // not an existence oracle for ids somebody is guessing at.
-        let mime = mime.ok_or_else(|| AppError::NotFound("Attachment".to_string()))?;
-        let bytes = tokio::fs::read(self.config.path_for(id))
+        let (mime, tenant_id) = row.ok_or_else(|| AppError::NotFound("Attachment".to_string()))?;
+        let bytes = self
+            .store
+            .read(&ObjectKey::kb_attachment(tenant_id, id))
             .await
             .map_err(|_| AppError::NotFound("Attachment".to_string()))?;
         Ok((mime, bytes))
@@ -417,20 +416,27 @@ mod tests {
 
     /// The stored path is derived from the id alone, so a `file_name` carrying
     /// `../` cannot reach outside the upload directory.
+    ///
+    /// PMS-910: the path itself is now built and pinned in `crate::storage`.
+    /// What is still this module's to prove is that the uploaded NAME never
+    /// reaches the key, which is why the key is constructed from the id here.
     #[test]
-    fn the_stored_path_comes_from_the_id_not_the_file_name() {
-        let config = KbAttachmentConfig {
-            dir: PathBuf::from("/data/attachments/kb-articles"),
-            max_bytes: 1024,
-        };
+    fn the_stored_key_comes_from_the_id_not_the_file_name() {
+        let tenant = Uuid::new_v4();
         let id = Uuid::new_v4();
-        let path = config.path_for(id);
         assert_eq!(
-            path,
-            PathBuf::from("/data/attachments/kb-articles").join(id.to_string()),
-            "a traversal in the uploaded name has nothing to traverse, because \
-             the name never reaches the path"
+            ObjectKey::kb_attachment(tenant, id),
+            ObjectKey::kb_attachment(tenant, id),
+            "the key is the id, so a traversal in the uploaded name has \
+             nothing to traverse"
         );
+        let store = crate::storage::LocalStore::new(crate::storage::StorageConfig {
+            root: std::path::PathBuf::from("/data/attachments"),
+        });
+        let path = store
+            .path_for(&ObjectKey::kb_attachment(tenant, id))
+            .expect("path");
+        assert!(path.ends_with(id.to_string()));
     }
 
     #[test]
