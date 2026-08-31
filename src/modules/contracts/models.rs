@@ -131,6 +131,14 @@ pub struct ContractItemResponse {
     /// from the catalog, so editing the price list cannot re-price a signed
     /// contract.
     pub product_id: Option<Uuid>,
+    /// PMS-956: what the recurring generator does with this item. `item_type`
+    /// says what the item IS; this says whether it bills, and the two used to
+    /// be one field, which is how a `product` item came to bill never.
+    pub billing_rule: BillingRule,
+    /// PMS-956: when a `once` item was billed, and `None` until it is. This is
+    /// the per-item idempotency the period ledger cannot provide, since that is
+    /// keyed on the period rather than the item.
+    pub billed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -154,6 +162,70 @@ pub struct UpsertContractItemRequest {
     /// PMS-955: optional link to the catalog. It does not fill in the price.
     #[serde(default)]
     pub product_id: Option<Uuid>,
+    /// PMS-956: omitted, it is derived from `item_type` by
+    /// [`BillingRule::derive`], which reproduces today's behaviour for the two
+    /// types that already bill. State it to say something else: a licence sold
+    /// on a contract is a `product` that should bill `every_period`.
+    #[serde(default)]
+    pub billing_rule: Option<BillingRule>,
+}
+
+/// PMS-956: what the recurring generator does with a contract item.
+///
+/// Three values, and none of them is a frequency. The period comes from the
+/// contract's `billing_cycle`; this says only whether an item takes part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingRule {
+    /// Billed on every one of the contract's periods. What `recurring_service`
+    /// and `retainer` have always done.
+    EveryPeriod,
+    /// Billed on the next period that runs, and never again. A setup fee.
+    Once,
+    /// The generator never touches it; invoice it by hand if at all. The
+    /// default, and the backfill target for every existing row that was not
+    /// already billing, so nothing starts charging a client retroactively.
+    #[default]
+    Manual,
+}
+
+impl BillingRule {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::EveryPeriod => "every_period",
+            Self::Once => "once",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "every_period" => Some(Self::EveryPeriod),
+            "once" => Some(Self::Once),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
+    /// What an item bills when the caller does not say.
+    ///
+    /// One function rather than a rule spread across call sites, and it
+    /// reproduces today's behaviour exactly for the two types that already
+    /// bill, so an existing API client sees no change at all.
+    ///
+    /// `one_time` derives to `Once` because its name says so. `product` and
+    /// `block_hours` derive to `Manual`: a product on a contract may be a
+    /// monthly licence or a one-off box and the type cannot tell them apart,
+    /// so the operator says which. That is still a change worth having, because
+    /// `manual` is visible on the record and settable, where billing nothing
+    /// was neither.
+    pub fn derive(item_type: &str) -> Self {
+        match item_type {
+            "recurring_service" | "retainer" => Self::EveryPeriod,
+            "one_time" => Self::Once,
+            _ => Self::Manual,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

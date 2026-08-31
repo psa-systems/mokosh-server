@@ -345,7 +345,7 @@ impl ContractsService {
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
                       overage_rate, rollover_enabled, max_rollover_hours, sort_order,
-                      product_id
+                      product_id, billing_rule, billed_at
                FROM contract_items WHERE tenant_id = $1 AND contract_id = $2
                ORDER BY sort_order
                LIMIT $3 OFFSET $4"#,
@@ -368,6 +368,12 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
+        // PMS-956: omitted means "what this type has always done", so an
+        // existing client sees no change; stating it is how a product on a
+        // contract becomes a licence that bills every period.
+        let billing_rule = request
+            .billing_rule
+            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
         let id = Uuid::new_v4();
         // Mutation + audit row in one transaction. CREATE: old = None,
         // after captured by the new item id. PMS-117.
@@ -376,8 +382,9 @@ impl ContractsService {
             r#"INSERT INTO contract_items (id, tenant_id, contract_id, name, description, item_type,
                                             quantity, unit_price, total_price, billing_frequency, work_type_id,
                                             included_hours, overage_rate, rollover_enabled,
-                                            max_rollover_hours, sort_order, product_id)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
+                                            max_rollover_hours, sort_order, product_id,
+                                            billing_rule)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
         )
         .bind(id).bind(tenant_id).bind(contract_id)
         .bind(&request.name).bind(&request.description).bind(&request.item_type)
@@ -386,6 +393,7 @@ impl ContractsService {
         .bind(request.included_hours).bind(request.overage_rate)
         .bind(request.rollover_enabled).bind(request.max_rollover_hours).bind(request.sort_order)
         .bind(request.product_id)
+        .bind(billing_rule.as_str())
         .execute(&mut *tx).await?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -424,6 +432,8 @@ impl ContractsService {
             max_rollover_hours: request.max_rollover_hours,
             sort_order: request.sort_order,
             product_id: request.product_id,
+            billing_rule,
+            billed_at: None,
         })
     }
 
@@ -436,6 +446,9 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
+        let billing_rule = request
+            .billing_rule
+            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -446,13 +459,16 @@ impl ContractsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
-        let contract_id: Option<Uuid> = sqlx::query_scalar(
+        // PMS-956: `billed_at` comes back from the UPDATE rather than being
+        // assumed. An edit to a `once` item that has already billed must not
+        // report it as unbilled, or the record would say it is still owed.
+        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
             r#"UPDATE contract_items SET
                 name=$3, description=$4, item_type=$5, quantity=$6, unit_price=$7,
                 total_price=$8, billing_frequency=$9, work_type_id=$10, included_hours=$11,
                 overage_rate=$12, rollover_enabled=$13, max_rollover_hours=$14,
-                sort_order=$15, product_id=$16, updated_at = NOW()
-               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id"#,
+                sort_order=$15, product_id=$16, billing_rule=$17, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -470,9 +486,10 @@ impl ContractsService {
         .bind(request.max_rollover_hours)
         .bind(request.sort_order)
         .bind(request.product_id)
+        .bind(billing_rule.as_str())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(cid) = contract_id else {
+        let Some((cid, billed_at)) = updated else {
             return Err(AppError::NotFound("Contract item".to_string()));
         };
 
@@ -512,6 +529,8 @@ impl ContractsService {
             max_rollover_hours: request.max_rollover_hours,
             sort_order: request.sort_order,
             product_id: request.product_id,
+            billing_rule,
+            billed_at,
         })
     }
 
@@ -1489,7 +1508,7 @@ impl ContractsService {
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
                       overage_rate, rollover_enabled, max_rollover_hours, sort_order,
-                      product_id
+                      product_id, billing_rule, billed_at
                FROM contract_items
                WHERE tenant_id = $1 AND contract_id = $2
                  AND item_type IN ('recurring_service', 'retainer')
@@ -1574,6 +1593,8 @@ struct ContractItemRow {
     max_rollover_hours: Option<Decimal>,
     sort_order: Option<i32>,
     product_id: Option<Uuid>,
+    billing_rule: String,
+    billed_at: Option<chrono::DateTime<Utc>>,
 }
 
 impl From<ContractItemRow> for ContractItemResponse {
@@ -1595,6 +1616,10 @@ impl From<ContractItemRow> for ContractItemResponse {
             max_rollover_hours: r.max_rollover_hours,
             sort_order: r.sort_order.unwrap_or(0),
             product_id: r.product_id,
+            // An unrecognised value can only come from a row this build did
+            // not write. `Manual` is the reading that cannot bill somebody.
+            billing_rule: BillingRule::from_str(&r.billing_rule).unwrap_or(BillingRule::Manual),
+            billed_at: r.billed_at,
         }
     }
 }
