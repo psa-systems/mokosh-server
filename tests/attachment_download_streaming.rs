@@ -97,8 +97,17 @@ async fn a_large_download_never_allocates_the_whole_blob(pool: PgPool) {
     let (ticket_id, note_id) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
 
     let attachment_id = Uuid::new_v4();
-    let blob_path = dir.join(format!("big-{attachment_id}"));
-    tokio::fs::create_dir_all(&dir).await.expect("blob dir");
+    // PMS-910: the blob goes where the store looks for it, which is
+    // `{root}/{tenant_id}/{attachment_id}`. The download no longer opens
+    // whatever path the row happens to carry - it derives one from the tenant
+    // and the id - so a fixture that invents a path is testing a contract that
+    // no longer exists. `storage_path` is still written below because the
+    // column is NOT NULL.
+    let tenant_dir = dir.join(common::DEFAULT_TENANT_ID.to_string());
+    let blob_path = tenant_dir.join(attachment_id.to_string());
+    tokio::fs::create_dir_all(&tenant_dir)
+        .await
+        .expect("blob dir");
     tokio::fs::write(&blob_path, vec![7u8; BLOB_BYTES])
         .await
         .expect("write blob");

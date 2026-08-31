@@ -1,8 +1,9 @@
 //! PMS-483: ticket-note attachment upload / download / delete.
 //!
-//! Storage: local disk under the configured `ATTACHMENT_DIR` (default
-//! `./attachments`). Each blob lives at `{dir}/{tenant_id}/{attachment_id}`;
-//! the on-disk name is just the attachment uuid so a hostile
+//! Storage: PMS-910 moved that decision to `crate::storage`, which owns the
+//! root and the layout for every kind of stored object. A blob is addressed by
+//! `(tenant_id, attachment_id)` and this module never builds a path; the
+//! on-disk name is still just the attachment uuid so a hostile
 //! `file_name` cannot escape the per-tenant directory or shadow a
 //! sibling tenant's blob. The original filename is stored verbatim in
 //! the DB row and only used to set the `Content-Disposition` header on
@@ -64,16 +65,13 @@ use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 use crate::modules::portal::{
     portal_auth_middleware, PortalAuthMiddleware, PortalAuthService, RequirePortalAuth,
 };
+use crate::storage::{LocalStore, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::inline_image::check_inline_image_mime;
 
 /// Default size cap when `ATTACHMENT_MAX_BYTES` is unset. 25 MiB
 /// matches what the ticket spec cites as the v1 default.
 const DEFAULT_MAX_BYTES: u64 = 25 * 1024 * 1024;
-/// Default storage directory when `ATTACHMENT_DIR` is unset. Resolves
-/// relative to the server's CWD; production should set the env to an
-/// absolute path on a mounted volume.
-const DEFAULT_DIR: &str = "./attachments";
 /// PMS-783: an attachment blob is addressed by a v4 uuid and is never rewritten
 /// in place (a replacement is a new row under a new uuid, and `delete_one`
 /// removes it), so the bytes behind one URL are immutable and a year is safe.
@@ -111,23 +109,17 @@ pub fn inline_attachment_path(id: Uuid) -> String {
 
 #[derive(Clone, Debug)]
 pub struct AttachmentConfig {
-    pub dir: PathBuf,
     pub max_bytes: u64,
 }
 
 impl AttachmentConfig {
     pub fn from_env() -> Self {
-        let dir = std::env::var("ATTACHMENT_DIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
         let max_bytes = std::env::var("ATTACHMENT_MAX_BYTES")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_BYTES);
-        Self { dir, max_bytes }
+        Self { max_bytes }
     }
 }
 
@@ -160,7 +152,13 @@ struct AttachmentRow {
     file_name: String,
     file_size: i32,
     mime_type: String,
+    /// PMS-910: still written, because the column is `NOT NULL` and every
+    /// existing row holds one, but no longer READ: a blob is opened through the
+    /// store from `(tenant_id, id)` instead, so a path in this row cannot send
+    /// a read anywhere the store would not.
+    #[allow(dead_code)]
     storage_path: String,
+    tenant_id: Uuid,
     uploaded_by_id: Option<Uuid>,
     created_by_contact_id: Option<Uuid>,
     created_at: DateTime<Utc>,
@@ -189,18 +187,26 @@ impl From<AttachmentRow> for AttachmentResponse {
 pub struct AttachmentService {
     db: Database,
     config: AttachmentConfig,
+    /// PMS-910: where the bytes go. This module no longer knows.
+    pub(crate) store: LocalStore,
 }
 
 impl AttachmentService {
     pub fn new(db: Database, config: AttachmentConfig) -> Self {
-        Self { db, config }
+        Self {
+            db,
+            config,
+            store: LocalStore::from_env(),
+        }
     }
 
-    fn storage_path_for(&self, tenant_id: Uuid, attachment_id: Uuid) -> PathBuf {
-        self.config
-            .dir
-            .join(tenant_id.to_string())
-            .join(attachment_id.to_string())
+    /// PMS-910: the layout lives in `crate::storage` now. This still resolves a
+    /// path because `ticket_attachments.storage_path` is `NOT NULL` and every
+    /// existing row holds one; the value it produces is byte-identical to what
+    /// this method built before.
+    fn storage_path_for(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<PathBuf> {
+        self.store
+            .path_for(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
     }
 
     /// Verify the note belongs to the ticket and the ticket belongs to
@@ -282,7 +288,7 @@ impl AttachmentService {
     ) -> AppResult<Vec<AttachmentResponse>> {
         let rows: Vec<AttachmentRow> = sqlx::query_as(
             "SELECT id, ticket_id, note_id, file_name, file_size, mime_type, \
-                    storage_path, uploaded_by_id, created_by_contact_id, created_at, \
+                    storage_path, tenant_id, uploaded_by_id, created_by_contact_id, created_at, \
                     is_inline \
              FROM ticket_attachments \
              WHERE tenant_id = $1 AND ticket_id = $2 AND note_id = $3 \
@@ -385,16 +391,12 @@ impl AttachmentService {
             )));
         }
         let id = Uuid::new_v4();
-        let path = self.storage_path_for(tenant_id, id);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| AppError::Internal(format!("could not create attachment dir: {e}")))?;
-        }
-        tokio::fs::write(&path, &bytes)
-            .await
-            .map_err(|e| AppError::Internal(format!("could not write attachment: {e}")))?;
-        let storage_path = path.to_string_lossy().to_string();
+        let key = ObjectKey::ticket_attachment(tenant_id, id);
+        self.store.put(&key, &bytes).await?;
+        let storage_path = self
+            .storage_path_for(tenant_id, id)?
+            .to_string_lossy()
+            .to_string();
 
         let safe_name = sanitize_filename(&file_name);
         let safe_mime = sanitize_mime_type(&mime_type);
@@ -411,7 +413,7 @@ impl AttachmentService {
                  is_inline) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              RETURNING id, ticket_id, note_id, file_name, file_size, mime_type, \
-                       storage_path, uploaded_by_id, created_by_contact_id, created_at, \
+                       storage_path, tenant_id, uploaded_by_id, created_by_contact_id, created_at, \
                        is_inline",
         )
         .bind(id)
@@ -441,7 +443,7 @@ impl AttachmentService {
     async fn get_row(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<AttachmentRow> {
         sqlx::query_as(
             "SELECT id, ticket_id, note_id, file_name, file_size, mime_type, \
-                    storage_path, uploaded_by_id, created_by_contact_id, created_at, \
+                    storage_path, tenant_id, uploaded_by_id, created_by_contact_id, created_at, \
                     is_inline \
              FROM ticket_attachments \
              WHERE tenant_id = $1 AND id = $2",
@@ -519,7 +521,7 @@ impl AttachmentService {
         let pool: &PgPool = self.db.migrator_pool();
         sqlx::query_as(
             "SELECT id, ticket_id, note_id, file_name, file_size, mime_type, \
-                    storage_path, uploaded_by_id, created_by_contact_id, created_at, \
+                    storage_path, tenant_id, uploaded_by_id, created_by_contact_id, created_at, \
                     is_inline \
              FROM ticket_attachments \
              WHERE id = $1 AND is_inline",
@@ -549,8 +551,14 @@ impl AttachmentService {
         };
         // Best-effort blob removal: a missing file is not a hard
         // error since the DB row is already gone (mirrors the soft-
-        // delete posture of other modules).
-        let _ = tokio::fs::remove_file(&path).await;
+        // delete posture of other modules). PMS-910: addressed by tenant and
+        // id rather than by the path the row carried, so a stale or hostile
+        // value in that column cannot unlink something else.
+        let _ = path;
+        let _ = self
+            .store
+            .delete(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
+            .await;
         Ok(())
     }
 }
@@ -782,7 +790,7 @@ async fn download_agent(
     if row.ticket_id != ticket_id || row.note_id != Some(note_id) {
         return Err(AppError::NotFound("attachment not on this note".into()));
     }
-    attachment_response(row, &headers).await
+    attachment_response(&s.service.store, row, &headers).await
 }
 
 async fn delete_agent(
@@ -862,7 +870,7 @@ async fn download_portal(
     if row.ticket_id != ticket_id || row.note_id != Some(note_id) {
         return Err(AppError::NotFound("attachment not on this note".into()));
     }
-    attachment_response(row, &headers).await
+    attachment_response(&s.service.store, row, &headers).await
 }
 
 async fn delete_portal(
@@ -900,7 +908,7 @@ async fn get_public_inline_attachment(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let row = s.service.read_public_inline(attachment_id).await?;
-    inline_image_response(row, &headers).await
+    inline_image_response(&s.service.store, row, &headers).await
 }
 
 /// Strong validator for an immutable blob: the uuid that addresses it plus the
@@ -934,7 +942,11 @@ fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// chunk at a time instead of the whole attachment; `content-length` comes from
 /// the row rather than from a buffer. A conditional request that already has
 /// the bytes gets a 304 without the file ever being opened.
-async fn attachment_response(row: AttachmentRow, headers: &HeaderMap) -> AppResult<Response> {
+async fn attachment_response(
+    store: &LocalStore,
+    row: AttachmentRow,
+    headers: &HeaderMap,
+) -> AppResult<Response> {
     let etag = attachment_etag(row.id, row.file_size);
     if if_none_match_matches(headers, &etag) {
         return Ok((
@@ -948,7 +960,8 @@ async fn attachment_response(row: AttachmentRow, headers: &HeaderMap) -> AppResu
     }
 
     let attachment_id = row.id;
-    let file = tokio::fs::File::open(&row.storage_path)
+    let file = store
+        .open(&ObjectKey::ticket_attachment(row.tenant_id, row.id))
         .await
         .map_err(|e| AppError::Internal(format!("attachment blob missing: {e}")))?;
     // A read that fails mid-body aborts the response (the declared
@@ -988,7 +1001,11 @@ async fn attachment_response(row: AttachmentRow, headers: &HeaderMap) -> AppResu
 /// browser must render them as the declared type rather than sniffing its way
 /// to something scriptable - the upload allowlist and this header are two
 /// halves of one guarantee.
-async fn inline_image_response(row: AttachmentRow, headers: &HeaderMap) -> AppResult<Response> {
+async fn inline_image_response(
+    store: &LocalStore,
+    row: AttachmentRow,
+    headers: &HeaderMap,
+) -> AppResult<Response> {
     let etag = attachment_etag(row.id, row.file_size);
     if if_none_match_matches(headers, &etag) {
         return Ok((
@@ -1008,7 +1025,8 @@ async fn inline_image_response(row: AttachmentRow, headers: &HeaderMap) -> AppRe
     // A row whose blob is gone must not become a 500 on a route the whole
     // internet can reach: it is the same "no such image" the caller would get
     // for an unknown id, so answer it the same way.
-    let file = tokio::fs::File::open(&row.storage_path)
+    let file = store
+        .open(&ObjectKey::ticket_attachment(row.tenant_id, row.id))
         .await
         .map_err(|e| {
             tracing::warn!(%attachment_id, "inline attachment blob missing: {e}");
@@ -1090,6 +1108,7 @@ mod tests {
             file_size: 12,
             mime_type: "image/png".into(),
             storage_path: "/data/attachments/x".into(),
+            tenant_id: Uuid::nil(),
             uploaded_by_id: None,
             created_by_contact_id: None,
             created_at: Utc::now(),

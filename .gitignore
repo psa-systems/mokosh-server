@@ -471,3 +471,7 @@ $RECYCLE.BIN/
 
 # Local-only AI scratch context (never tracked)
 For AI/
+
+# PMS-910: the storage root when ATTACHMENT_DIR is unset, which is what a test
+# or a bare `cargo run` uses. Uploads written there are never repository content.
+/attachments/
