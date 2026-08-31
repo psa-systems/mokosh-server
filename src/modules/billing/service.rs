@@ -561,7 +561,7 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 payment_term_id,
-                subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
+                subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
@@ -814,7 +814,7 @@ impl BillingService {
             INSERT INTO invoices (
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
-                subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
+                subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
@@ -1188,7 +1188,7 @@ impl BillingService {
             INSERT INTO invoices (
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
-                subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
+                subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number
             )
             VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
