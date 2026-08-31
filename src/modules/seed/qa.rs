@@ -1146,6 +1146,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-1".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Managed services - June".to_string(),
                         quantity: Decimal::new(100, 2),
@@ -1155,6 +1156,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::TimeEntry,
                         description: "QA-Onsite support hours".to_string(),
                         quantity: Decimal::new(400, 2),
@@ -1183,6 +1185,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-2".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::Product,
                         description: "QA-Firewall appliance".to_string(),
                         quantity: Decimal::new(200, 2),
@@ -1192,6 +1195,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Installation".to_string(),
                         quantity: Decimal::new(100, 2),
@@ -1357,6 +1361,7 @@ fn qa_credited_invoice_spec(company_ids: &[Uuid]) -> CreateInvoiceRequest {
         notes: Some("QA seed invoice (sent, then partly credited).".to_string()),
         po_number: Some("QA-PO-3".to_string()),
         lines: vec![CreateInvoiceLineRequest {
+            product_id: None,
             line_type: InvoiceLineType::Service,
             description: "QA-Managed services - May".to_string(),
             quantity: Decimal::ONE,

@@ -111,6 +111,10 @@ impl InvoiceLineType {
 pub struct InvoiceLineResponse {
     pub id: Uuid,
     pub line_type: InvoiceLineType,
+    /// PMS-955: the catalog product this line sells, when it names one. The
+    /// price is NOT read through this: `unit_price` below is what was charged,
+    /// and it stays what was charged when the catalog changes.
+    pub product_id: Option<Uuid>,
     pub description: String,
     pub quantity: Decimal,
     pub unit_price: Decimal,
@@ -178,6 +182,12 @@ pub struct InvoiceFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct CreateInvoiceLineRequest {
     pub line_type: InvoiceLineType,
+    /// PMS-955: optional link to the catalog. Validated against the caller's
+    /// tenant and refused if the product is retired; it does not fill in the
+    /// price, which the caller still states, so the line records what was
+    /// actually charged.
+    #[serde(default)]
+    pub product_id: Option<Uuid>,
     #[validate(length(min = 1, max = 1000))]
     pub description: String,
     /// `quantity` and `unit_price` are intentionally signed (PMS-306): a
@@ -501,6 +511,7 @@ mod tests {
     fn one_line() -> CreateInvoiceLineRequest {
         CreateInvoiceLineRequest {
             line_type: InvoiceLineType::Service,
+            product_id: None,
             description: "Work".into(),
             quantity: Decimal::from(1),
             unit_price: Decimal::from(100),

@@ -588,14 +588,24 @@ impl BillingService {
         .execute(&mut *tx)
         .await?;
 
+        // PMS-955: every catalog link on this invoice is checked before any
+        // line is written, so a bad id on the third line does not leave the
+        // first two behind. RLS does not cover this: an FK check bypasses it,
+        // so a foreign-tenant product would link silently (PMS-333's lesson).
+        for line in &request.lines {
+            if let Some(product_id) = line.product_id {
+                Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+            }
+        }
+
         for line in &request.lines {
             sqlx::query(
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
-                    total, ticket_id, project_id, sort_order
+                    total, ticket_id, project_id, sort_order, product_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 "#,
             )
             .bind(Uuid::new_v4())
@@ -608,6 +618,7 @@ impl BillingService {
             .bind(line.ticket_id)
             .bind(line.project_id)
             .bind(line.sort_order)
+            .bind(line.product_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -1137,7 +1148,7 @@ impl BillingService {
         // retainer), but runs inside this transaction.
         let items = sqlx::query_as::<_, RecurringItemRow>(
             r#"
-            SELECT name, quantity, unit_price
+            SELECT name, quantity, unit_price, product_id
             FROM contract_items
             WHERE tenant_id = $1 AND contract_id = $2
               AND item_type IN ('recurring_service', 'retainer')
@@ -1245,9 +1256,9 @@ impl BillingService {
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
-                    total, sort_order
+                    total, sort_order, product_id
                 )
-                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7)
+                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7, $8)
                 "#,
             )
             .bind(Uuid::new_v4())
@@ -1257,6 +1268,11 @@ impl BillingService {
             .bind(item.unit_price)
             .bind(item.quantity * item.unit_price)
             .bind(idx as i32)
+            // PMS-955: the item's catalog link travels onto the line it
+            // becomes. The PRICE does not: `item.unit_price` is what the
+            // contract agreed, and re-reading the catalog here would re-price
+            // a signed contract every time somebody edited the price list.
+            .bind(item.product_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -2400,6 +2416,13 @@ impl BillingService {
         // Replace lines first (if requested) so the recomputed
         // subtotal reflects the new set when we write the header.
         let subtotal = if let Some(lines) = &request.lines {
+            // PMS-955: same check as the create path, and before the DELETE
+            // below, so a rejected link cannot take the existing lines with it.
+            for line in lines {
+                if let Some(product_id) = line.product_id {
+                    Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+                }
+            }
             sqlx::query("DELETE FROM invoice_lines WHERE invoice_id = $1")
                 .bind(invoice_id)
                 .execute(&mut *tx)
@@ -2412,7 +2435,8 @@ impl BillingService {
                     r#"
                     INSERT INTO invoice_lines (
                         id, invoice_id, line_type, description, quantity,
-                        unit_price, total, ticket_id, project_id, sort_order
+                        unit_price, total, ticket_id, project_id, sort_order,
+                        product_id
                     )
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     "#,
@@ -2427,6 +2451,7 @@ impl BillingService {
                 .bind(line.ticket_id)
                 .bind(line.project_id)
                 .bind(line.sort_order)
+                .bind(line.product_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -2638,7 +2663,7 @@ impl BillingService {
         let line_rows = sqlx::query_as::<_, InvoiceLineRow>(
             r#"
             SELECT id, line_type, description, quantity, unit_price, total,
-                   ticket_id, project_id, sort_order
+                   ticket_id, project_id, sort_order, product_id
             FROM invoice_lines
             WHERE invoice_id = $1
             ORDER BY sort_order, created_at
@@ -3399,6 +3424,36 @@ impl BillingService {
     // PMS-955: product catalog
     // ========================================================================
 
+    /// Validate that `product_id` names a product in the caller's tenant, and
+    /// that it is still on sale.
+    ///
+    /// Tenant-checked for the reason `assert_payment_term_in_tenant` is
+    /// (PMS-333): an FK check bypasses RLS, so a foreign-tenant id would pass
+    /// the constraint and link across tenants silently. Active-checked because
+    /// that is what deactivating a product is FOR; a document already written
+    /// against it is untouched, since nothing re-validates history.
+    async fn assert_product_sellable(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        product_id: Uuid,
+    ) -> AppResult<()> {
+        let found: Option<bool> =
+            sqlx::query_scalar("SELECT is_active FROM products WHERE id = $1 AND tenant_id = $2")
+                .bind(product_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match found {
+            None => Err(AppError::BadRequest(
+                "product_id does not name a product in this tenant".to_string(),
+            )),
+            Some(false) => Err(AppError::BadRequest(
+                "That product has been retired and cannot be put on a new document".to_string(),
+            )),
+            Some(true) => Ok(()),
+        }
+    }
+
     pub async fn list_products(
         &self,
         tenant_id: TenantId,
@@ -3688,6 +3743,9 @@ struct RecurringItemRow {
     name: String,
     quantity: Decimal,
     unit_price: Decimal,
+    /// PMS-955: the catalog link, carried onto the invoice line this item
+    /// becomes. `None` for every item written before the catalog existed.
+    product_id: Option<Uuid>,
 }
 
 /// Compute the current billing period `[period_start, period_end]` for a
@@ -3972,6 +4030,7 @@ struct InvoiceLineRow {
     ticket_id: Option<Uuid>,
     project_id: Option<Uuid>,
     sort_order: i32,
+    product_id: Option<Uuid>,
 }
 
 impl From<InvoiceLineRow> for InvoiceLineResponse {
@@ -3986,6 +4045,7 @@ impl From<InvoiceLineRow> for InvoiceLineResponse {
             ticket_id: r.ticket_id,
             project_id: r.project_id,
             sort_order: r.sort_order,
+            product_id: r.product_id,
         }
     }
 }
