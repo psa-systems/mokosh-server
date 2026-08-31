@@ -37,11 +37,26 @@ use crate::utils::error::{AppError, AppResult};
 
 /// Storage root when `ATTACHMENT_DIR` is unset.
 ///
-/// One value, where there were two. `/data/attachments` is what the containers
-/// mount and what `compose.dev.yml` and the production image both set, so it is
-/// the honest default; `./attachments` was the older one and picking it would
-/// have made an unset variable write beside the binary.
-const DEFAULT_ROOT: &str = "/data/attachments";
+/// One value, where there were two: tickets and the logo used this, KB used
+/// `/data/attachments`.
+///
+/// This one survives, and not because it is the prettier of the pair. A
+/// compiled-in default is reached ONLY by something that configured nothing -
+/// a test, a bare `cargo run`, a bare `docker run` - because every real
+/// deployment sets the variable (`compose.dev.yml` line 328, and PMS-836 makes
+/// a compose line mandatory for anything the code reads). And
+/// `oci-build/Dockerfile` is built around this exact value: it says
+/// "`ATTACHMENT_DIR` defaults to `./attachments` against WORKDIR /app, so this
+/// path is also what a bare `docker run` uses", and it `mkdir -p
+/// /app/attachments` so a fresh named volume is seeded with the right
+/// ownership for a container that runs as uid 1001.
+///
+/// So an absolute default is not a tidier choice, it is a broken one: it points
+/// at a directory the image never creates and the non-root user cannot make,
+/// and the failure is a 500 on the first upload. PMS-910 picked the wrong
+/// survivor of the two and CI caught it on the tenant-logo upload, which
+/// configures no root at all.
+const DEFAULT_ROOT: &str = "./attachments";
 
 /// Where a stored object lives, relative to the root.
 ///
@@ -390,5 +405,23 @@ mod tests {
             1,
             "and it reads it exactly once"
         );
+    }
+
+    /// And it is relative, which is a contract rather than a preference.
+    ///
+    /// `oci-build/Dockerfile` `mkdir -p /app/attachments` precisely because the
+    /// default resolves against its WORKDIR, so a bare `docker run` writes
+    /// somewhere the non-root user owns. An absolute default points at a
+    /// directory the image never creates, and the symptom is a 500 on the first
+    /// upload from anything that configured no root: a test, a bare run, CI.
+    /// This assertion exists because that is exactly the change PMS-910 made
+    /// and had to take back.
+    #[test]
+    fn the_default_root_is_relative_because_the_image_depends_on_it() {
+        assert!(
+            !PathBuf::from(DEFAULT_ROOT).is_absolute(),
+            "an absolute default writes where nothing prepared a directory"
+        );
+        assert_eq!(DEFAULT_ROOT, "./attachments");
     }
 }
