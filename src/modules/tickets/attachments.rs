@@ -65,7 +65,7 @@ use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 use crate::modules::portal::{
     portal_auth_middleware, PortalAuthMiddleware, PortalAuthService, RequirePortalAuth,
 };
-use crate::storage::{LocalStore, ObjectKey, ObjectStore};
+use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::inline_image::check_inline_image_mime;
 
@@ -189,11 +189,14 @@ pub struct AttachmentService {
     config: AttachmentConfig,
     /// PMS-910: where the bytes go. This module no longer knows.
     pub(crate) store: LocalStore,
+    /// PMS-957: one row per stored file, so the tenant rollup is a fact.
+    ledger: FileLedger,
 }
 
 impl AttachmentService {
     pub fn new(db: Database, config: AttachmentConfig) -> Self {
         Self {
+            ledger: FileLedger::new(db.clone()),
             db,
             config,
             store: LocalStore::from_env(),
@@ -430,6 +433,26 @@ impl AttachmentService {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
+        // PMS-957: after the feature row, and under the same id, so the ledger
+        // row and the attachment are one object rather than two that can
+        // disagree. `uploaded_by_id` is None for a portal upload (the actor is
+        // a `contacts` row) and for inbound email (there is no actor), which is
+        // why migration 126 drops that column's NOT NULL.
+        self.ledger
+            .record(
+                tenant_id,
+                &key,
+                id,
+                FileRecord {
+                    original_name: &safe_name,
+                    mime_type: &safe_mime,
+                    file_size: size as i64,
+                    uploaded_by_id,
+                    entity_type: "ticket_attachment",
+                    entity_id: Some(id),
+                },
+            )
+            .await?;
         Ok(row.into())
     }
 
@@ -559,6 +582,7 @@ impl AttachmentService {
             .store
             .delete(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
             .await;
+        let _ = self.ledger.forget(tenant_id, attachment_id).await;
         Ok(())
     }
 }

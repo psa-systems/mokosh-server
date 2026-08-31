@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
-use crate::storage::{LocalStore, ObjectKey, ObjectStore};
+use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 // PMS-941: one allowlist for every publicly-readable image route. SVG is
 // refused there, for the reason the module header of `inline_image` states.
@@ -92,11 +92,14 @@ pub struct KbAttachmentService {
     config: KbAttachmentConfig,
     /// PMS-910: where the bytes go. This module no longer knows.
     store: LocalStore,
+    /// PMS-957: one row per stored file, so the tenant rollup is a fact.
+    ledger: FileLedger,
 }
 
 impl KbAttachmentService {
     pub fn new(db: Database, config: KbAttachmentConfig) -> Self {
         Self {
+            ledger: FileLedger::new(db.clone()),
             db,
             config,
             store: LocalStore::from_env(),
@@ -163,8 +166,23 @@ impl KbAttachmentService {
         // Bytes AFTER the row, and the commit after the bytes: a file with no
         // row is invisible litter, whereas a row with no file is a broken image
         // in a published article.
-        self.store
-            .put(&ObjectKey::kb_attachment(tenant_id.get(), row.0), &bytes)
+        let key = ObjectKey::kb_attachment(tenant_id.get(), row.0);
+        self.store.put(&key, &bytes).await?;
+        // PMS-957: under the attachment's own id, so one object is one row.
+        self.ledger
+            .record(
+                tenant_id.get(),
+                &key,
+                row.0,
+                FileRecord {
+                    original_name: &file_name,
+                    mime_type: mime,
+                    file_size: bytes.len() as i64,
+                    uploaded_by_id: Some(uploaded_by),
+                    entity_type: "kb_attachment",
+                    entity_id: Some(row.0),
+                },
+            )
             .await?;
 
         tx.commit().await?;
@@ -242,6 +260,7 @@ impl KbAttachmentService {
             .store
             .delete(&ObjectKey::kb_attachment(tenant_id.get(), attachment_id))
             .await;
+        let _ = self.ledger.forget(tenant_id.get(), attachment_id).await;
         Ok(())
     }
 
