@@ -825,3 +825,65 @@ pub struct StatementResponse {
     /// the sentence.
     pub closing_balance: Decimal,
 }
+
+// ============================================================================
+// PMS-955: product catalog
+// ============================================================================
+
+/// A sellable thing, priced per unit.
+///
+/// This is a price list, not an inventory system: there is no quantity on hand,
+/// no purchasing and no vendor (PMS-821). It is also not a second home for
+/// labour pricing, which is what `rate_cards` is: those are keyed on work type
+/// and priced by the hour, and a product is priced by the unit.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductResponse {
+    pub id: Uuid,
+    pub sku: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub unit_price: Decimal,
+    /// What one of it is: `each`, `hour`, `month`, `user`. Free text, because
+    /// the list an MSP needs is theirs.
+    pub unit: String,
+    pub is_taxable: bool,
+    /// Retirement is deactivation, never deletion: the documents that sold it
+    /// still name it, and the database refuses to drop a referenced row.
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertProductRequest {
+    /// Optional, and unique within the tenant when present.
+    #[validate(length(min = 1, max = 64))]
+    pub sku: Option<String>,
+    /// Unique within the tenant, case-insensitively. Two catalog rows reading
+    /// the same name with different prices is the confusion this table exists
+    /// to remove, and it is invisible on screen.
+    #[validate(length(min = 1, max = 255))]
+    pub name: String,
+    pub description: Option<String>,
+    pub unit_price: Decimal,
+    #[validate(length(min = 1, max = 30))]
+    #[serde(default = "default_unit")]
+    pub unit: String,
+    #[serde(default = "default_true")]
+    pub is_taxable: bool,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+fn default_unit() -> String {
+    "each".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct ProductFilter {
+    /// Omitted returns the whole catalog, active and retired, so an admin can
+    /// see history; a picker passes `is_active=true`.
+    pub is_active: Option<bool>,
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
+}

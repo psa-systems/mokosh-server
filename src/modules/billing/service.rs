@@ -3394,6 +3394,282 @@ impl BillingService {
                 - total_credited,
         })
     }
+
+    // ========================================================================
+    // PMS-955: product catalog
+    // ========================================================================
+
+    pub async fn list_products(
+        &self,
+        tenant_id: TenantId,
+        filter: &ProductFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<ProductResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let pattern = filter.q.as_ref().map(|q| format!("%{}%", q.trim()));
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM products
+            WHERE tenant_id = $1
+              AND ($2::bool IS NULL OR is_active = $2)
+              AND ($3::text IS NULL OR name ILIKE $3 OR sku ILIKE $3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filter.is_active)
+        .bind(pattern.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let rows: Vec<ProductRow> = sqlx::query_as(
+            r#"
+            SELECT id, sku, name, description, unit_price, unit, is_taxable,
+                   is_active, created_at, updated_at
+            FROM products
+            WHERE tenant_id = $1
+              AND ($2::bool IS NULL OR is_active = $2)
+              AND ($3::text IS NULL OR name ILIKE $3 OR sku ILIKE $3)
+            ORDER BY name
+            LIMIT $4 OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filter.is_active)
+        .bind(pattern.as_deref())
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        Ok((
+            rows.into_iter().map(ProductResponse::from).collect(),
+            total.max(0) as u64,
+        ))
+    }
+
+    pub async fn get_product(
+        &self,
+        tenant_id: TenantId,
+        product_id: Uuid,
+    ) -> AppResult<ProductResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<ProductRow> = sqlx::query_as(
+            r#"
+            SELECT id, sku, name, description, unit_price, unit, is_taxable,
+                   is_active, created_at, updated_at
+            FROM products WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(product_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.map(ProductResponse::from)
+            .ok_or_else(|| AppError::NotFound("Product".to_string()))
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_product(
+        &self,
+        tenant_id: TenantId,
+        request: &UpsertProductRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<ProductResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let id = Uuid::new_v4();
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+            r#"
+            INSERT INTO products (id, tenant_id, sku, name, description,
+                                  unit_price, unit, is_taxable, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
+                      is_active, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(
+            request
+                .sku
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        )
+        .bind(request.name.trim())
+        .bind(&request.description)
+        .bind(request.unit_price)
+        .bind(request.unit.trim())
+        .bind(request.is_taxable)
+        .bind(request.is_active)
+        .fetch_one(&mut *tx)
+        .await;
+        let row = row.map_err(Self::product_conflict)?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM products t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "products",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ProductResponse::from(row))
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_product(
+        &self,
+        tenant_id: TenantId,
+        product_id: Uuid,
+        request: &UpsertProductRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<ProductResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM products t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(product_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if before.is_none() {
+            return Err(AppError::NotFound("Product".to_string()));
+        }
+
+        // Editing the catalog price is legal and changes nothing already
+        // written: `invoice_lines.unit_price` is the price at the moment the
+        // line was written, and nothing reads through to here at render time.
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+            r#"
+            UPDATE products SET sku = $3, name = $4, description = $5,
+                                unit_price = $6, unit = $7, is_taxable = $8,
+                                is_active = $9, updated_at = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
+                      is_active, created_at, updated_at
+            "#,
+        )
+        .bind(product_id)
+        .bind(tenant_id)
+        .bind(
+            request
+                .sku
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        )
+        .bind(request.name.trim())
+        .bind(&request.description)
+        .bind(request.unit_price)
+        .bind(request.unit.trim())
+        .bind(request.is_taxable)
+        .bind(request.is_active)
+        .fetch_one(&mut *tx)
+        .await;
+        let row = row.map_err(Self::product_conflict)?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM products t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(product_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "products",
+            Some(product_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ProductResponse::from(row))
+    }
+
+    /// Delete a product that nothing has sold.
+    ///
+    /// A referenced product is refused by the database, and that refusal is
+    /// turned into a 409 naming the alternative rather than a 500: retiring a
+    /// product an MSP has sold is `is_active = false`, because the documents
+    /// that sold it still name it.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_product(
+        &self,
+        tenant_id: TenantId,
+        product_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM products t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(product_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if before.is_none() {
+            return Err(AppError::NotFound("Product".to_string()));
+        }
+
+        let deleted = sqlx::query("DELETE FROM products WHERE id = $1 AND tenant_id = $2")
+            .bind(product_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await;
+        if let Err(sqlx::Error::Database(e)) = &deleted {
+            if e.code().as_deref() == Some("23503") {
+                return Err(AppError::Conflict(
+                    "This product is on an invoice or a contract and cannot be deleted.                      Retire it instead by marking it inactive."
+                        .to_string(),
+                ));
+            }
+        }
+        deleted?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "products",
+            Some(product_id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Turn the two catalog uniqueness violations into a 409 that names which
+    /// one was hit, rather than a 500 quoting an index name.
+    fn product_conflict(e: sqlx::Error) -> AppError {
+        if let sqlx::Error::Database(db) = &e {
+            if db.code().as_deref() == Some("23505") {
+                let constraint = db.constraint().unwrap_or_default();
+                if constraint.contains("sku") {
+                    return AppError::Conflict("Another product already uses that SKU".to_string());
+                }
+                return AppError::Conflict("Another product already uses that name".to_string());
+            }
+        }
+        e.into()
+    }
 }
 
 /// Candidate-contract row for [`BillingService::generate_due_recurring_invoices`].
@@ -4141,6 +4417,39 @@ impl From<StatementCreditRow> for StatementCreditLine {
             total: r.total,
             reason: r.reason,
             invoice_number: r.invoice_number,
+        }
+    }
+}
+
+// ---- PMS-955: product catalog row type -------------------------------------
+
+#[derive(sqlx::FromRow)]
+struct ProductRow {
+    id: Uuid,
+    sku: Option<String>,
+    name: String,
+    description: Option<String>,
+    unit_price: Decimal,
+    unit: String,
+    is_taxable: bool,
+    is_active: bool,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+}
+
+impl From<ProductRow> for ProductResponse {
+    fn from(r: ProductRow) -> Self {
+        Self {
+            id: r.id,
+            sku: r.sku,
+            name: r.name,
+            description: r.description,
+            unit_price: r.unit_price,
+            unit: r.unit,
+            is_taxable: r.is_taxable,
+            is_active: r.is_active,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         }
     }
 }
