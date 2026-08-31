@@ -18,11 +18,10 @@
 //! by a v4 tenant uuid, so this exposes branding to whoever already holds the
 //! tenant id.
 
-use std::path::PathBuf;
-
 use uuid::Uuid;
 
 use super::branding::PUBLIC_TENANT_PATH_PREFIX;
+use crate::storage::{LocalStore, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 
 /// The on-disk suffix each allowed type is stored under. This table names
@@ -51,38 +50,19 @@ const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 pub const LOGO_BOX_WIDTH: u32 = 220;
 pub const LOGO_BOX_HEIGHT: u32 = 56;
 
-/// Subdirectory under the shared upload root. Sharing the root with attachments
-/// keeps deployments to one mounted volume; the subdirectory keeps a logo from
-/// ever colliding with a `{tenant_id}/{attachment_id}` path.
-const SUBDIR: &str = "tenant-logos";
-
 #[derive(Clone, Debug)]
 pub struct TenantLogoConfig {
-    pub dir: PathBuf,
     pub max_bytes: u64,
 }
 
 impl TenantLogoConfig {
     pub fn from_env() -> Self {
-        let root = std::env::var("ATTACHMENT_DIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("./attachments"));
         let max_bytes = std::env::var("TENANT_LOGO_MAX_BYTES")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_BYTES);
-        Self {
-            dir: root.join(SUBDIR),
-            max_bytes,
-        }
-    }
-
-    fn path_for(&self, tenant_id: Uuid, mime: &str) -> PathBuf {
-        self.dir
-            .join(format!("{tenant_id}.{}", extension_for(mime)))
+        Self { max_bytes }
     }
 }
 
@@ -116,11 +96,16 @@ pub fn check_mime(raw: &str) -> AppResult<&'static str> {
 #[derive(Clone, Debug)]
 pub struct TenantLogoStore {
     config: TenantLogoConfig,
+    /// PMS-910: where the bytes go. This module no longer knows.
+    store: LocalStore,
 }
 
 impl TenantLogoStore {
     pub fn new(config: TenantLogoConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            store: LocalStore::from_env(),
+        }
     }
 
     pub fn max_bytes(&self) -> u64 {
@@ -155,19 +140,20 @@ impl TenantLogoStore {
         }
 
         self.remove(tenant_id).await;
-        tokio::fs::create_dir_all(&self.config.dir)
-            .await
-            .map_err(|e| AppError::Internal(format!("create logo dir: {e}")))?;
-        tokio::fs::write(self.config.path_for(tenant_id, mime), bytes)
-            .await
-            .map_err(|e| AppError::Internal(format!("write logo: {e}")))?;
+        self.store
+            .put(
+                &ObjectKey::tenant_logo(tenant_id, extension_for(mime)),
+                bytes,
+            )
+            .await?;
         Ok(mime)
     }
 
     /// Read the stored bytes for a tenant whose branding says it has a logo.
     pub async fn read(&self, tenant_id: Uuid, mime: &str) -> AppResult<Vec<u8>> {
         let mime = check_mime(mime)?;
-        tokio::fs::read(self.config.path_for(tenant_id, mime))
+        self.store
+            .read(&ObjectKey::tenant_logo(tenant_id, extension_for(mime)))
             .await
             .map_err(|_| AppError::NotFound("Logo".to_string()))
     }
@@ -176,8 +162,11 @@ impl TenantLogoStore {
     /// branding no longer points at is invisible, so a failed unlink must not
     /// fail the request that cleared it.
     pub async fn remove(&self, tenant_id: Uuid) {
-        for (mime, _) in EXTENSIONS {
-            let _ = tokio::fs::remove_file(self.config.path_for(tenant_id, mime)).await;
+        for (_, extension) in EXTENSIONS {
+            let _ = self
+                .store
+                .delete(&ObjectKey::tenant_logo(tenant_id, *extension))
+                .await;
         }
     }
 }
