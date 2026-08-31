@@ -1103,11 +1103,24 @@ impl TimeTrackingService {
     /// to be re-derived from a duration that has since changed.
     async fn release_for_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let claimed: Option<(Decimal, Option<Uuid>)> = sqlx::query_as(
-            r#"UPDATE time_entries
+        // The old values come from a sub-select, not from `RETURNING`: in
+        // Postgres `RETURNING` yields the row AFTER the update, so returning
+        // `hours_consumed` here would hand back the NULL this statement just
+        // wrote and release nothing at all. The `FOR UPDATE` sub-select reads
+        // and locks the row in the same statement, so only the call that
+        // actually clears the stamp gets a row and two of them cannot both
+        // credit the same hours back.
+        let claimed: Option<(Option<Decimal>, Option<Uuid>)> = sqlx::query_as(
+            r#"UPDATE time_entries te
                SET hours_consumed = NULL, hours_balance_id = NULL, updated_at = NOW()
-               WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NOT NULL
-               RETURNING hours_consumed, hours_balance_id"#,
+               FROM (
+                   SELECT id, hours_consumed AS prev_hours, hours_balance_id AS prev_balance
+                   FROM time_entries
+                   WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NOT NULL
+                   FOR UPDATE
+               ) prev
+               WHERE te.id = prev.id
+               RETURNING prev.prev_hours, prev.prev_balance"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -1115,10 +1128,7 @@ impl TimeTrackingService {
         .await?;
         tx.commit().await?;
 
-        // RETURNING the pre-UPDATE values is what makes this safe to race: only
-        // the call that actually cleared the stamp gets a row, so two of them
-        // cannot both credit the same hours back.
-        let Some((applied, Some(balance_id))) = claimed else {
+        let Some((Some(applied), Some(balance_id))) = claimed else {
             return Ok(());
         };
         let contracts = crate::modules::contracts::ContractsService::new(self.db.clone());
