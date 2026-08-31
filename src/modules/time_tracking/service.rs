@@ -370,6 +370,19 @@ impl TimeTrackingService {
         // total_amount is priced on billable minutes, not worked minutes.
         let (hourly_rate, total) =
             resolve_billing(request.hourly_rate, kind.billable, &defaults, billable);
+        // PMS-951: which contract this time draws against, derived rather than
+        // asked for. The contract covering a piece of work follows from the
+        // company, and putting a picker in front of the person logging time
+        // invites picking the wrong one.
+        let contract_id = block_hours_contract_for(
+            &mut *tx,
+            tenant_id,
+            request.company_id,
+            request.date,
+            kind.kind,
+            kind.billable,
+        )
+        .await?;
         let id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -378,8 +391,8 @@ impl TimeTrackingService {
                 duration_minutes, worked_minutes, billable_minutes,
                 work_type_id, ticket_id, project_id,
                 company_id, notes, is_billable, hourly_rate, total_amount, task_id,
-                work_category, entry_kind, billing_status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                work_category, entry_kind, billing_status, contract_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             "#,
         )
         .bind(id)
@@ -407,6 +420,7 @@ impl TimeTrackingService {
         // timesheet approval ever moved it, so nothing logged on a tenant with
         // timesheets off could reach an invoice at all.
         .bind(resolve_billing_status(kind.billable, None))
+        .bind(contract_id)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -428,6 +442,18 @@ impl TimeTrackingService {
         )
         .await?;
         tx.commit().await?;
+        // PMS-951: the hours come off the contract because the work was logged,
+        // which is where PMS-944 put every other consequence of logging it.
+        // Approval cannot be the consumption point any more: it is gated behind
+        // the timesheets module (PMS-943), so a tenant with timesheets off would
+        // never draw a single hour.
+        //
+        // After the commit, like the approval path it replaces, because
+        // `consume_hours` manages its own transaction. A failure between the two
+        // leaves the entry unconsumed rather than consumed twice, which is the
+        // recoverable direction: an operator can see hours that have not been
+        // drawn, where a double draw is a client's allotment silently short.
+        self.consume_for_entry(tenant_id, id).await?;
         self.get_time_entry(tenant_id, id).await
     }
 
@@ -616,11 +642,25 @@ impl TimeTrackingService {
             return Err(AppError::NotFound("Time entry".to_string()));
         }
         tx.commit().await?;
+        // PMS-951: an edit re-draws from scratch rather than adjusting. Give
+        // back exactly what this entry took, from the period it took it from,
+        // and then draw again on the new figures. That is correct for every
+        // edit without a case for each: a duration change, a flip to
+        // non-billable, and a date that moves into another billing period all
+        // fall out of it. Adjusting by a delta instead would need the split
+        // between applied and overage recomputed against a balance that has
+        // moved since, which is the arithmetic that gets one case wrong.
+        self.release_for_entry(tenant_id, id).await?;
+        self.consume_for_entry(tenant_id, id).await?;
         self.get_time_entry(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_time_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        // PMS-951: before the row goes, because the row is where the record of
+        // what it drew lives. Deleting first would leave the contract short by
+        // hours nothing can account for any more.
+        self.release_for_entry(tenant_id, id).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let affected = sqlx::query("DELETE FROM time_entries WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -943,7 +983,7 @@ impl TimeTrackingService {
         // 'pending') gives us exactly the set to consume hours for, and the
         // `pending` guard makes re-approval idempotent: a second call returns
         // no rows, so consume_hours is not double-counted (PMS-405).
-        let approved = sqlx::query_as::<_, ConsumeRow>(
+        let approved: Vec<(Uuid,)> = sqlx::query_as(
             r#"
             UPDATE time_entries
             SET approval_status = 'approved',
@@ -960,7 +1000,7 @@ impl TimeTrackingService {
               AND date     >= $3
               AND date      < $4
               AND approval_status = 'pending'
-            RETURNING contract_id, duration_minutes, date, is_billable
+            RETURNING id
             "#,
         )
         .bind(tenant_id)
@@ -972,62 +1012,119 @@ impl TimeTrackingService {
         .await?;
         tx.commit().await?;
 
-        // PMS-405: approval is the consumption point. For every entry that
-        // just flipped to approved and is billable against a contract, draw
-        // its hours from the contract's block-hours balance for the period
-        // covering the entry date. Hours past the included allotment become
-        // a non-zero overage on the returned ConsumeOutcome (persisted via
-        // the debited contract_hour_balances row).
-        self.consume_approved_hours(tenant_id, &approved).await?;
+        let _ = approved.len();
+        // PMS-951: approval is NOT the consumption point any more, and must not
+        // draw a second time. PMS-405 put it here because approval was then the
+        // moment an entry became real; PMS-944 moved that to creation, and
+        // PMS-943 gated approval behind the timesheets module, so leaving it
+        // here meant a tenant with timesheets off never drew an hour and a
+        // tenant with them on drew every hour twice - once at creation, once at
+        // approval - the moment `contract_id` started being set.
 
         self.week_summary(tenant_id, user_id, anchor).await
     }
 
-    /// Draw approved billable hours against their contracts' block-hours
-    /// balances (PMS-405). Runs after the approval commit so each
-    /// [`ContractsService::consume_hours`] manages its own transaction.
-    /// Non-billable entries and entries without a `contract_id` are skipped.
-    async fn consume_approved_hours(
-        &self,
-        tenant_id: TenantId,
-        approved: &[ConsumeRow],
-    ) -> AppResult<()> {
+    /// PMS-951: draw this entry's hours against its contract, once.
+    ///
+    /// `hours_consumed IS NULL` is the claim, so a retry, an edit or a second
+    /// call cannot draw the same hours twice. Recording the APPLIED hours and
+    /// the balance row they came out of is what lets [`Self::release_for_entry`]
+    /// give back exactly what was taken, from exactly the period that gave it.
+    ///
+    /// An entry with no contract, no billable flag, or no duration is a no-op,
+    /// which is most entries: only client work against a company holding a
+    /// block-hours contract draws anything.
+    async fn consume_for_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let row: Option<ConsumeCandidateRow> = sqlx::query_as(
+            r#"SELECT contract_id, duration_minutes, date, is_billable, entry_kind
+               FROM time_entries
+               WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NULL"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
+        .await?;
+        let Some(row) = row else { return Ok(()) };
+        let Some(contract_id) = row.contract_id else {
+            return Ok(());
+        };
+        if !row.is_billable.unwrap_or(false) || row.entry_kind != ENTRY_KIND_CLIENT {
+            return Ok(());
+        }
+        let hours = Decimal::from(row.duration_minutes) / Decimal::from(60);
+        if hours <= Decimal::ZERO {
+            return Ok(());
+        }
+        let when = row
+            .date
+            .and_hms_opt(0, 0, 0)
+            .map(|naive| naive.and_utc())
+            .unwrap_or_else(Utc::now);
+
         let contracts = crate::modules::contracts::ContractsService::new(self.db.clone());
-        for entry in approved {
-            let Some(contract_id) = entry.contract_id else {
-                continue;
-            };
-            if !entry.is_billable.unwrap_or(false) {
-                continue;
-            }
-            // duration_minutes -> Decimal hours (minutes / 60).
-            let hours = Decimal::from(entry.duration_minutes) / Decimal::from(60);
-            if hours <= Decimal::ZERO {
-                continue;
-            }
-            // Period is anchored on the entry's date (midnight UTC).
-            let when = entry
-                .date
-                .and_hms_opt(0, 0, 0)
-                .map(|naive| naive.and_utc())
-                .unwrap_or_else(Utc::now);
-            let outcome = contracts
-                .consume_hours(tenant_id, contract_id, hours, when)
-                .await?;
-            if outcome.overage_hours > Decimal::ZERO {
-                // The overage is persisted in the debited balance row; surface
-                // it here so the recurring-invoice path / a follow-up can bill
-                // it (PMS-405). At minimum it is not silently dropped.
-                tracing::info!(
-                    contract_id = %contract_id,
-                    overage_hours = %outcome.overage_hours,
-                    overage_amount = %outcome.overage_amount,
-                    balance_id = %outcome.balance_id,
-                    "time approval produced contract hour overage"
-                );
-            }
+        let outcome = contracts
+            .consume_hours(tenant_id, contract_id, hours, when)
+            .await?;
+
+        // The stamp is claimed, not written: `hours_consumed IS NULL` again, so
+        // two concurrent creates for one id cannot both record a draw.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            r#"UPDATE time_entries
+               SET hours_consumed = $3, hours_balance_id = $4, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NULL"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(outcome.hours_applied)
+        .bind(outcome.balance_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        if outcome.overage_hours > Decimal::ZERO {
+            tracing::info!(
+                contract_id = %contract_id,
+                overage_hours = %outcome.overage_hours,
+                overage_amount = %outcome.overage_amount,
+                balance_id = %outcome.balance_id,
+                "logged time produced contract hour overage"
+            );
         }
         Ok(())
+    }
+
+    /// PMS-951: give back what this entry drew, and forget that it drew.
+    ///
+    /// Called before an edit re-draws and before a delete removes the row, so
+    /// an entry whose duration, billability or date changed does not leave the
+    /// old figure standing against the contract. Exact, because the entry
+    /// recorded the applied hours and the balance row rather than leaving them
+    /// to be re-derived from a duration that has since changed.
+    async fn release_for_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let claimed: Option<(Decimal, Option<Uuid>)> = sqlx::query_as(
+            r#"UPDATE time_entries
+               SET hours_consumed = NULL, hours_balance_id = NULL, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NOT NULL
+               RETURNING hours_consumed, hours_balance_id"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        // RETURNING the pre-UPDATE values is what makes this safe to race: only
+        // the call that actually cleared the stamp gets a row, so two of them
+        // cannot both credit the same hours back.
+        let Some((applied, Some(balance_id))) = claimed else {
+            return Ok(());
+        };
+        let contracts = crate::modules::contracts::ContractsService::new(self.db.clone());
+        contracts
+            .release_hours(tenant_id, balance_id, applied)
+            .await
     }
 
     /// Reject every pending entry in the user's week with a reason. Manager+
@@ -1327,6 +1424,16 @@ impl TimeTrackingService {
             None => raw,
         };
         let (hourly_rate, total) = resolve_billing(None, kind.billable, &defaults, duration);
+        // PMS-951: a stopped timer draws on the same terms as time typed in.
+        let contract_id = block_hours_contract_for(
+            &mut *tx,
+            tenant_id,
+            company_id,
+            now.date_naive(),
+            kind.kind,
+            kind.billable,
+        )
+        .await?;
 
         let entry_id = Uuid::new_v4();
         sqlx::query(
@@ -1335,9 +1442,9 @@ impl TimeTrackingService {
                 id, tenant_id, user_id, date, start_time, end_time,
                 duration_minutes, work_type_id, ticket_id, project_id,
                 company_id, notes, is_billable, hourly_rate, total_amount,
-                entry_kind, billing_status
+                entry_kind, billing_status, contract_id
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -1360,6 +1467,7 @@ impl TimeTrackingService {
         // PMS-944: same rule as the manual path. A stopped timer is time that
         // was worked, so it is invoiceable on the same terms as time typed in.
         .bind(resolve_billing_status(kind.billable, None))
+        .bind(contract_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1369,6 +1477,7 @@ impl TimeTrackingService {
             .await?;
 
         tx.commit().await?;
+        self.consume_for_entry(tenant_id, entry_id).await?;
         self.get_time_entry(tenant_id, entry_id).await
     }
 
@@ -1717,6 +1826,67 @@ pub(crate) fn resolve_entry_kind(input: EntryKindInput<'_>) -> AppResult<Resolve
     })
 }
 
+/// PMS-951: the contract a piece of work draws its hours from, or `None`.
+///
+/// Derived from the company rather than asked for, because the contract
+/// covering a piece of work follows from who it is for, and a picker in front
+/// of the person logging time invites picking the wrong one.
+///
+/// Only client work draws: employee time has no client to bill and a
+/// non-billable entry is not being charged for, so neither should come out of a
+/// prepaid allotment. A company with no active block-hours contract on that
+/// date gets `None`, which is most companies.
+///
+/// The date matters: an entry logged against last quarter draws from the
+/// contract that was live then, so an expired contract still covers time worked
+/// while it ran.
+async fn block_hours_contract_for(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    company_id: Option<Uuid>,
+    date: chrono::NaiveDate,
+    entry_kind: &str,
+    is_billable: bool,
+) -> AppResult<Option<Uuid>> {
+    if entry_kind != ENTRY_KIND_CLIENT || !is_billable {
+        return Ok(None);
+    }
+    let Some(company_id) = company_id else {
+        return Ok(None);
+    };
+    // Newest first, so a renewal wins over the contract it replaced when both
+    // cover the date. Tie-broken on id so the answer is the same on every run.
+    let found: Option<Uuid> = sqlx::query_scalar(
+        r#"SELECT c.id
+           FROM contracts c
+           INNER JOIN contract_items ci
+                   ON ci.contract_id = c.id AND ci.item_type = 'block_hours'
+           WHERE c.tenant_id = $1
+             AND c.company_id = $2
+             AND c.status = 'active'
+             AND c.start_date <= $3
+             AND (c.end_date IS NULL OR c.end_date >= $3)
+           ORDER BY c.start_date DESC, c.id
+           LIMIT 1"#,
+    )
+    .bind(tenant_id)
+    .bind(company_id)
+    .bind(date)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(found)
+}
+
+/// PMS-951: the fields that decide whether an entry draws, and how much.
+#[derive(sqlx::FromRow)]
+struct ConsumeCandidateRow {
+    contract_id: Option<Uuid>,
+    duration_minutes: i32,
+    date: chrono::NaiveDate,
+    is_billable: Option<bool>,
+    entry_kind: String,
+}
+
 /// PMS-944: whether a time entry is invoiceable, decided by the entry itself.
 ///
 /// A billable entry is ready to bill because the work was logged, not because
@@ -1958,16 +2128,6 @@ fn resolve_billing(
         None
     };
     (rate, total)
-}
-
-/// Minimal projection of a time entry that just transitioned to approved,
-/// used to drive contract hour consumption (PMS-405).
-#[derive(sqlx::FromRow)]
-struct ConsumeRow {
-    contract_id: Option<Uuid>,
-    duration_minutes: i32,
-    date: NaiveDate,
-    is_billable: Option<bool>,
 }
 
 #[derive(sqlx::FromRow)]
