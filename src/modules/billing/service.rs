@@ -233,18 +233,33 @@ impl BillingService {
         .await?)
     }
 
-    /// Recompute an invoice's `amount_paid` / `balance_due` / `status` /
-    /// `paid_at` from its `payments` rows, net of `payment_refunds` (PMS-695,
-    /// refunds added in PMS-711).
+    /// Recompute an invoice's `amount_paid` / `amount_credited` /
+    /// `balance_due` / `status` / `paid_at` from its `payments` rows, net of
+    /// `payment_refunds` (PMS-695, refunds added in PMS-711), and its issued
+    /// `credit_notes` (PMS-953).
     ///
-    /// The single place invoice payment state is derived, mirroring
-    /// `QuotesService::recompute_totals`. Deriving from
-    /// `SUM(payments.amount) - SUM(payment_refunds.amount)` rather than from
-    /// Rust-side arithmetic makes the net-paid figure true by construction, so
-    /// a full refund walks the invoice back to `sent` (unpaid) and a partial
-    /// refund to `partially_paid` without any bespoke transition logic.
-    /// Callers must already hold the row lock from [`Self::lock_invoice_totals`].
-    async fn recompute_invoice_payment_state(
+    /// The single place invoice balance state is derived, mirroring
+    /// `QuotesService::recompute_totals`. Deriving from SQL sums rather than
+    /// from Rust-side arithmetic makes both figures true by construction, so a
+    /// full refund walks the invoice back to `sent` and a voided credit note
+    /// restores the balance it had removed, with no bespoke transition logic
+    /// either way. Callers must already hold the row lock from
+    /// [`Self::lock_invoice_totals`].
+    ///
+    /// PMS-953 added credits here rather than in a second updater on purpose.
+    /// `amount_paid` and `amount_credited` are two halves of one balance, and
+    /// two writers with two rules is how they come to disagree.
+    ///
+    /// The status ladder is unchanged for an invoice with no credits: with
+    /// `credited = 0` the first arm cannot fire and the rest reduce to exactly
+    /// the pre-PMS-953 expression, zero-total invoices included. Crediting away
+    /// the whole outstanding balance moves the invoice to `void`, which is what
+    /// finally gives that status a writer: before this it was a value the model
+    /// knew and no code path could reach.
+    ///
+    /// `paid_at` stays keyed on payments alone. A credited invoice was not
+    /// paid, and stamping it would put a payment date on money nobody sent.
+    async fn recompute_invoice_balance(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         invoice_id: Uuid,
@@ -254,9 +269,12 @@ impl BillingService {
         sqlx::query(
             r#"
             UPDATE invoices i SET
-                amount_paid = p.paid,
-                balance_due = i.total - p.paid,
-                status      = CASE WHEN i.total - p.paid <= 0 THEN 'paid'
+                amount_paid     = p.paid,
+                amount_credited = p.credited,
+                balance_due     = i.total - p.paid - p.credited,
+                status      = CASE WHEN p.credited > 0
+                                    AND p.credited >= i.total - p.paid THEN 'void'
+                                   WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
                                    ELSE 'sent' END,
                 paid_at     = CASE WHEN i.total - p.paid <= 0
@@ -268,7 +286,11 @@ impl BillingService {
                               WHERE invoice_id = $1 AND tenant_id = $2), 0)
                   - COALESCE((SELECT SUM(amount) FROM payment_refunds
                               WHERE invoice_id = $1 AND tenant_id = $2), 0)
-                  AS paid
+                  AS paid,
+                    COALESCE((SELECT SUM(total) FROM credit_notes
+                              WHERE invoice_id = $1 AND tenant_id = $2
+                                AND status = 'issued'), 0)
+                  AS credited
             ) p
             WHERE i.id = $1 AND i.tenant_id = $2
             "#,
@@ -454,7 +476,7 @@ impl BillingService {
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
                    contract_id, status, invoice_date, due_date, payment_terms,
                    payment_term_id,
-                   subtotal, tax_amount, discount_amount, total, amount_paid,
+                   subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at
             FROM invoices
@@ -539,7 +561,7 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 payment_term_id,
-                subtotal, tax_amount, discount_amount, total, amount_paid,
+                subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                 balance_due, currency, notes, po_number
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
@@ -792,7 +814,7 @@ impl BillingService {
             INSERT INTO invoices (
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
-                subtotal, tax_amount, discount_amount, total, amount_paid,
+                subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                 balance_due, currency, notes, po_number
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
@@ -1166,7 +1188,7 @@ impl BillingService {
             INSERT INTO invoices (
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
-                subtotal, tax_amount, discount_amount, total, amount_paid,
+                subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                 balance_due, currency, notes, po_number
             )
             VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
@@ -1952,7 +1974,7 @@ impl BillingService {
             return Ok(false);
         };
 
-        Self::recompute_invoice_payment_state(&mut tx, tenant_id, invoice_id).await?;
+        Self::recompute_invoice_balance(&mut tx, tenant_id, invoice_id).await?;
 
         // Audit row in the same transaction; no user actor (the trigger is
         // Stripe's dispatcher). Secret `gateway_response` blob is subtracted.
@@ -2047,7 +2069,7 @@ impl BillingService {
         }
 
         if let Some(inv) = invoice_id {
-            Self::recompute_invoice_payment_state(&mut tx, tenant_id, inv).await?;
+            Self::recompute_invoice_balance(&mut tx, tenant_id, inv).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -2198,7 +2220,7 @@ impl BillingService {
         .await?;
 
         if let Some(invoice_id) = request.invoice_id {
-            Self::recompute_invoice_payment_state(&mut tx, tenant_id, invoice_id).await?;
+            Self::recompute_invoice_balance(&mut tx, tenant_id, invoice_id).await?;
         }
 
         // Audit row in the same transaction. CREATE: old = None, after
@@ -2298,7 +2320,7 @@ impl BillingService {
             .await?;
 
         if let Some(invoice_id) = invoice_id {
-            Self::recompute_invoice_payment_state(&mut tx, tenant_id, invoice_id).await?;
+            Self::recompute_invoice_balance(&mut tx, tenant_id, invoice_id).await?;
         }
 
         // Audit row in the same transaction. DELETE: old = before,
@@ -2600,7 +2622,7 @@ impl BillingService {
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
                    contract_id, status, invoice_date, due_date, payment_terms,
                    payment_term_id,
-                   subtotal, tax_amount, discount_amount, total, amount_paid,
+                   subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at
             FROM invoices
@@ -2780,6 +2802,418 @@ impl BillingService {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    // ========================================================================
+    // PMS-953: credit notes
+    // ========================================================================
+
+    /// Allocate the next gapless, per-tenant credit-note number inside the
+    /// caller's transaction.
+    ///
+    /// Same seed-or-bump as [`Self::next_invoice_number`] (PMS-194) against a
+    /// separate sequence, because a credit note is a different document and an
+    /// accountant reading `INV-000042` expects an invoice.
+    async fn next_credit_note_number(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+    ) -> AppResult<String> {
+        let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
+            r#"
+            UPDATE credit_note_sequences
+            SET last_number = last_number + 1
+            WHERE tenant_id = $1
+            RETURNING last_number, prefix
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (next_number, prefix) = match seq_row {
+            Some(v) => v,
+            None => {
+                sqlx::query(
+                    "INSERT INTO credit_note_sequences (tenant_id, last_number) VALUES ($1, 1)",
+                )
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await?;
+                (1, Some("CN-".to_string()))
+            }
+        };
+        Ok(format!(
+            "{}{:06}",
+            prefix.unwrap_or_else(|| "CN-".to_string()),
+            next_number
+        ))
+    }
+
+    /// PMS-953: correct an issued invoice by crediting it.
+    ///
+    /// This is the path `update_invoice` and `delete_payment` have deferred to
+    /// since PMS-38 and PMS-39, in comments that both said "out of scope for
+    /// this commit". Until it existed, an issued invoice could not be edited,
+    /// cancelled or written off by any route, and `void` was a status the model
+    /// knew and nothing could write.
+    ///
+    /// The invoice is not touched beyond its derived balance: its lines, totals
+    /// and number stay exactly as the customer received them, because the
+    /// customer holds that copy. Everything about the correction lives on the
+    /// credit note.
+    ///
+    /// The invoice row is locked FIRST and in the same order the payment paths
+    /// take it (PMS-695), so a credit racing a payment on one invoice queues
+    /// rather than losing one of the two writes.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_credit_note(
+        &self,
+        tenant_id: TenantId,
+        request: &CreateCreditNoteRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<CreditNoteResponse> {
+        // Every line is a positive amount to give back. A negative line would
+        // be a charge hidden inside a credit, and checking only the total would
+        // miss one that a larger positive line offsets.
+        let mut subtotal = Decimal::ZERO;
+        for line in &request.lines {
+            if line.quantity <= Decimal::ZERO || line.unit_price <= Decimal::ZERO {
+                return Err(AppError::BadRequest(
+                    "A credit note line must have a positive quantity and unit price; the document \
+                     as a whole is the credit"
+                        .to_string(),
+                ));
+            }
+            subtotal += line.quantity * line.unit_price;
+        }
+        let tax = request.tax_amount.unwrap_or(Decimal::ZERO);
+        if tax < Decimal::ZERO {
+            return Err(AppError::BadRequest(
+                "A credit note's tax amount cannot be negative".to_string(),
+            ));
+        }
+        let total = subtotal + tax;
+        if total <= Decimal::ZERO {
+            return Err(AppError::BadRequest(
+                "A credit note must credit something".to_string(),
+            ));
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let invoice: Option<(Decimal, Decimal, String, Uuid, Option<String>, String)> =
+            sqlx::query_as(
+                "SELECT total, amount_credited, status, company_id, currency, invoice_number \
+                 FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+            )
+            .bind(request.invoice_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some((
+            invoice_total,
+            already_credited,
+            invoice_status,
+            company_id,
+            invoice_currency,
+            _invoice_number,
+        )) = invoice
+        else {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        };
+
+        // A draft or pending invoice has no correction problem: it can still be
+        // edited, and crediting one would leave a document correcting something
+        // the customer was never sent.
+        let status = InvoiceStatus::from_str(&invoice_status).unwrap_or(InvoiceStatus::Draft);
+        if !status.is_frozen() {
+            return Err(AppError::BadRequest(format!(
+                "Invoice in status '{}' can still be edited, so it does not need a credit note",
+                status.as_str()
+            )));
+        }
+
+        // Capped at the invoice's own total, less what is already credited, and
+        // deliberately NOT less what has been paid: an invoice the customer has
+        // already paid can still be credited in full, which is exactly the case
+        // where they are owed money back.
+        let remaining = invoice_total - already_credited;
+        if total > remaining {
+            return Err(AppError::BadRequest(format!(
+                "A credit note for {total} exceeds what is left to credit on this invoice \
+                 ({remaining} of {invoice_total})"
+            )));
+        }
+
+        let credit_note_id = Uuid::new_v4();
+        let number = Self::next_credit_note_number(&mut tx, tenant_id).await?;
+        let issue_date = request
+            .issue_date
+            .unwrap_or_else(|| chrono::Utc::now().date_naive());
+        // The invoice's currency unless the caller names one, so the two
+        // documents cannot silently disagree about what is being credited.
+        let currency = request
+            .currency
+            .clone()
+            .or(invoice_currency)
+            .unwrap_or_else(|| "USD".to_string());
+
+        sqlx::query(
+            r#"
+            INSERT INTO credit_notes (
+                id, tenant_id, credit_note_number, company_id, invoice_id,
+                status, issue_date, reason, subtotal, tax_amount, total,
+                currency, notes, created_by_id
+            )
+            VALUES ($1, $2, $3, $4, $5, 'issued', $6, $7, $8, $9, $10, $11, $12, $13)
+            "#,
+        )
+        .bind(credit_note_id)
+        .bind(tenant_id)
+        .bind(&number)
+        .bind(company_id)
+        .bind(request.invoice_id)
+        .bind(issue_date)
+        .bind(&request.reason)
+        .bind(subtotal)
+        .bind(tax)
+        .bind(total)
+        .bind(&currency)
+        .bind(&request.notes)
+        .bind(ctx.user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        for line in &request.lines {
+            sqlx::query(
+                r#"
+                INSERT INTO credit_note_lines (
+                    id, credit_note_id, line_type, description, quantity,
+                    unit_price, total, sort_order
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(credit_note_id)
+            .bind(line.line_type.as_str())
+            .bind(&line.description)
+            .bind(line.quantity)
+            .bind(line.unit_price)
+            .bind(line.quantity * line.unit_price)
+            .bind(line.sort_order)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        Self::recompute_invoice_balance(&mut tx, tenant_id, request.invoice_id).await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM credit_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(credit_note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "credit_notes",
+            Some(credit_note_id),
+            None,
+            after,
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.get_credit_note(tenant_id, credit_note_id).await
+    }
+
+    /// PMS-953: void a credit note, restoring the balance it removed.
+    ///
+    /// A credit note is never edited, for the reason its invoice is not: the
+    /// customer holds a copy. Voiding changes no amount and no line, it only
+    /// stops the credit counting, and `recompute_invoice_balance` sums issued
+    /// notes alone so the invoice walks back to whatever status it would have
+    /// had. Without this the fix for a wrong invoice would itself be
+    /// uncorrectable, which is the dead end this whole issue removes.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn void_credit_note(
+        &self,
+        tenant_id: TenantId,
+        credit_note_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<CreditNoteResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let row: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT invoice_id, status FROM credit_notes WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(credit_note_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((invoice_id, status)) = row else {
+            return Err(AppError::NotFound("Credit note".to_string()));
+        };
+        if status == "void" {
+            return Err(AppError::Conflict(
+                "This credit note is already void".to_string(),
+            ));
+        }
+
+        // Same lock, same order as every other write to this invoice's balance.
+        Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?;
+
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM credit_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(credit_note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE credit_notes SET status = 'void', voided_at = NOW(), voided_by_id = $3, \
+             updated_at = NOW() WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(credit_note_id)
+        .bind(tenant_id)
+        .bind(ctx.user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        Self::recompute_invoice_balance(&mut tx, tenant_id, invoice_id).await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM credit_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(credit_note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "credit_notes",
+            Some(credit_note_id),
+            before,
+            after,
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.get_credit_note(tenant_id, credit_note_id).await
+    }
+
+    /// PMS-953: one credit note with its lines.
+    pub async fn get_credit_note(
+        &self,
+        tenant_id: TenantId,
+        credit_note_id: Uuid,
+    ) -> AppResult<CreditNoteResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<CreditNoteRow> = sqlx::query_as(
+            r#"
+            SELECT cn.id, cn.tenant_id, cn.credit_note_number, cn.company_id,
+                   c.name AS company_name, cn.invoice_id, i.invoice_number,
+                   cn.status, cn.issue_date, cn.reason, cn.subtotal,
+                   cn.tax_amount, cn.total, cn.currency, cn.notes,
+                   cn.created_by_id, cn.voided_at, cn.created_at, cn.updated_at
+            FROM credit_notes cn
+            LEFT JOIN companies c ON c.id = cn.company_id
+            LEFT JOIN invoices i ON i.id = cn.invoice_id
+            WHERE cn.id = $1 AND cn.tenant_id = $2
+            "#,
+        )
+        .bind(credit_note_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(AppError::NotFound("Credit note".to_string()));
+        };
+
+        let lines: Vec<CreditNoteLineRow> = sqlx::query_as(
+            r#"
+            SELECT id, line_type, description, quantity, unit_price, total, sort_order
+            FROM credit_note_lines
+            WHERE credit_note_id = $1
+            ORDER BY sort_order, id
+            "#,
+        )
+        .bind(credit_note_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut response = CreditNoteResponse::from(row);
+        response.lines = Some(
+            lines
+                .into_iter()
+                .map(CreditNoteLineResponse::from)
+                .collect(),
+        );
+        Ok(response)
+    }
+
+    /// PMS-953: credit notes for the tenant, newest first.
+    pub async fn list_credit_notes(
+        &self,
+        tenant_id: TenantId,
+        filter: &CreditNoteFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<CreditNoteResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM credit_notes
+            WHERE tenant_id = $1
+              AND ($2::uuid IS NULL OR company_id = $2)
+              AND ($3::uuid IS NULL OR invoice_id = $3)
+              AND ($4::text IS NULL OR status = $4)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filter.company_id)
+        .bind(filter.invoice_id)
+        .bind(filter.status.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let rows: Vec<CreditNoteRow> = sqlx::query_as(
+            r#"
+            SELECT cn.id, cn.tenant_id, cn.credit_note_number, cn.company_id,
+                   c.name AS company_name, cn.invoice_id, i.invoice_number,
+                   cn.status, cn.issue_date, cn.reason, cn.subtotal,
+                   cn.tax_amount, cn.total, cn.currency, cn.notes,
+                   cn.created_by_id, cn.voided_at, cn.created_at, cn.updated_at
+            FROM credit_notes cn
+            LEFT JOIN companies c ON c.id = cn.company_id
+            LEFT JOIN invoices i ON i.id = cn.invoice_id
+            WHERE cn.tenant_id = $1
+              AND ($2::uuid IS NULL OR cn.company_id = $2)
+              AND ($3::uuid IS NULL OR cn.invoice_id = $3)
+              AND ($4::text IS NULL OR cn.status = $4)
+            ORDER BY cn.created_at DESC, cn.id DESC
+            LIMIT $5 OFFSET $6
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filter.company_id)
+        .bind(filter.invoice_id)
+        .bind(filter.status.as_deref())
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        Ok((
+            rows.into_iter().map(CreditNoteResponse::from).collect(),
+            total.max(0) as u64,
+        ))
     }
 }
 
@@ -3119,6 +3553,7 @@ struct InvoiceRow {
     discount_amount: Decimal,
     total: Decimal,
     amount_paid: Decimal,
+    amount_credited: Decimal,
     balance_due: Decimal,
     currency: Option<String>,
     notes: Option<String>,
@@ -3150,6 +3585,7 @@ impl From<InvoiceRow> for InvoiceResponse {
             discount_amount: r.discount_amount,
             total: r.total,
             amount_paid: r.amount_paid,
+            amount_credited: r.amount_credited,
             balance_due: r.balance_due,
             currency: r.currency,
             notes: r.notes,
@@ -3355,6 +3791,86 @@ mod pms944_uninvoiceable_time_tests {
         ] {
             assert!(!msg.contains("approv"), "{msg}");
             assert!(!msg.contains("timesheet"), "{msg}");
+        }
+    }
+}
+
+/// PMS-953: one credit-note row, joined to the names a client would otherwise
+/// have to fetch separately.
+#[derive(sqlx::FromRow)]
+struct CreditNoteRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    credit_note_number: String,
+    company_id: Uuid,
+    company_name: Option<String>,
+    invoice_id: Uuid,
+    invoice_number: Option<String>,
+    status: String,
+    issue_date: chrono::NaiveDate,
+    reason: String,
+    subtotal: Decimal,
+    tax_amount: Decimal,
+    total: Decimal,
+    currency: Option<String>,
+    notes: Option<String>,
+    created_by_id: Option<Uuid>,
+    voided_at: Option<chrono::DateTime<Utc>>,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+}
+
+impl From<CreditNoteRow> for CreditNoteResponse {
+    fn from(r: CreditNoteRow) -> Self {
+        Self {
+            id: r.id,
+            tenant_id: r.tenant_id,
+            credit_note_number: r.credit_note_number,
+            company_id: r.company_id,
+            company_name: r.company_name,
+            invoice_id: r.invoice_id,
+            invoice_number: r.invoice_number,
+            // An unrecognised value can only come from a row this build did not
+            // write, and reading it as `Issued` would count it against an
+            // invoice. `Void` is the reading that cannot overstate a credit.
+            status: CreditNoteStatus::from_str(&r.status).unwrap_or(CreditNoteStatus::Void),
+            issue_date: r.issue_date,
+            reason: r.reason,
+            subtotal: r.subtotal,
+            tax_amount: r.tax_amount,
+            total: r.total,
+            currency: r.currency,
+            notes: r.notes,
+            created_by_id: r.created_by_id,
+            voided_at: r.voided_at,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            lines: None,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct CreditNoteLineRow {
+    id: Uuid,
+    line_type: String,
+    description: String,
+    quantity: Decimal,
+    unit_price: Decimal,
+    total: Decimal,
+    sort_order: Option<i32>,
+}
+
+impl From<CreditNoteLineRow> for CreditNoteLineResponse {
+    fn from(r: CreditNoteLineRow) -> Self {
+        Self {
+            id: r.id,
+            line_type: InvoiceLineType::from_str(&r.line_type).unwrap_or(InvoiceLineType::Service),
+            description: r.description,
+            quantity: r.quantity,
+            unit_price: r.unit_price,
+            total: r.total,
+            sort_order: r.sort_order.unwrap_or(0),
         }
     }
 }

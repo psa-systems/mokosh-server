@@ -50,10 +50,13 @@ impl InvoiceStatus {
         }
     }
 
-    /// Statuses that disallow header / line edits. Once an invoice has
-    /// been sent the customer can quote the totals back at you, so we
-    /// freeze writes; correction goes through a credit note (out of
-    /// scope here).
+    /// Statuses that disallow header / line edits. Once an invoice has been
+    /// sent the customer can quote the totals back at you, so we freeze writes.
+    ///
+    /// PMS-953: correction goes through a credit note, and now actually can.
+    /// This comment deferred that for long enough that `void` and
+    /// `written_off` became statuses the model knew and no code path could
+    /// reach; see `BillingService::create_credit_note`.
     pub fn is_frozen(&self) -> bool {
         matches!(
             self,
@@ -146,6 +149,11 @@ pub struct InvoiceResponse {
     pub discount_amount: Decimal,
     pub total: Decimal,
     pub amount_paid: Decimal,
+    /// PMS-953: the part of the total cancelled by issued credit notes.
+    /// Derived alongside `amount_paid` by one recompute, never authored, so
+    /// `balance_due` is `total - amount_paid - amount_credited` by
+    /// construction.
+    pub amount_credited: Decimal,
     pub balance_due: Decimal,
     pub currency: Option<String>,
     pub notes: Option<String>,
@@ -591,4 +599,125 @@ mod tests {
             .validate()
             .is_err());
     }
+}
+
+// ============================================================================
+// PMS-953: credit notes
+// ============================================================================
+
+/// Credit-note status; mirrors the CHECK constraint on `credit_notes.status`.
+///
+/// Two values and no editing. A credit note corrects an invoice that cannot be
+/// edited, for the reason that the customer holds the original; the same
+/// reasoning applies to the credit note itself, which the customer also holds.
+/// Voiding is not an edit: every amount and every line stays exactly as issued,
+/// and the credit simply stops counting against the invoice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditNoteStatus {
+    Issued,
+    Void,
+}
+
+impl CreditNoteStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Issued => "issued",
+            Self::Void => "void",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "issued" => Some(Self::Issued),
+            "void" => Some(Self::Void),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreditNoteLineResponse {
+    pub id: Uuid,
+    pub line_type: InvoiceLineType,
+    pub description: String,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    pub total: Decimal,
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreditNoteResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub credit_note_number: String,
+    pub company_id: Uuid,
+    /// Display name of `company_id`, resolved on read so the client never has
+    /// to show a raw UUID, exactly as `InvoiceResponse` does (PMS-186).
+    pub company_name: Option<String>,
+    pub invoice_id: Uuid,
+    /// The corrected invoice's number, so a credit note reads as a document
+    /// about a document rather than about a UUID.
+    pub invoice_number: Option<String>,
+    pub status: CreditNoteStatus,
+    pub issue_date: NaiveDate,
+    pub reason: String,
+    pub subtotal: Decimal,
+    pub tax_amount: Decimal,
+    pub total: Decimal,
+    pub currency: Option<String>,
+    pub notes: Option<String>,
+    pub created_by_id: Option<Uuid>,
+    pub voided_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// `Some` on `GET /:id`, `None` on list rollups, like `InvoiceResponse`.
+    pub lines: Option<Vec<CreditNoteLineResponse>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct CreateCreditNoteLineRequest {
+    pub line_type: InvoiceLineType,
+    #[validate(length(min = 1, max = 1000))]
+    pub description: String,
+    /// Required to be positive by `create_credit_note`, unlike
+    /// `CreateInvoiceLineRequest`, where a negative line is a legitimate
+    /// discount (PMS-306). The whole document is the negative here, so a
+    /// negative line inside it is a charge hidden in a credit, and a check on
+    /// the total alone would not catch one offset by a larger positive line.
+    /// Enforced in the service rather than by a `validate` attribute because
+    /// `validator`'s range check does not cover `Decimal`.
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    #[serde(default)]
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateCreditNoteRequest {
+    /// The invoice being corrected. Required: see the column comment in
+    /// `migrations/122_credit_notes.sql` for why a standing account credit is
+    /// not this document.
+    pub invoice_id: Uuid,
+    pub issue_date: Option<NaiveDate>,
+    /// Required, and the first thing an auditor reads. A credit with no stated
+    /// reason is the shape that makes an MSP's books unexplainable a year on.
+    #[validate(length(min = 1, max = 2000))]
+    pub reason: String,
+    pub tax_amount: Option<Decimal>,
+    #[validate(length(max = 3))]
+    pub currency: Option<String>,
+    pub notes: Option<String>,
+    #[validate(length(min = 1, message = "At least one line item is required"))]
+    #[validate(nested)]
+    pub lines: Vec<CreateCreditNoteLineRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct CreditNoteFilter {
+    pub company_id: Option<Uuid>,
+    pub invoice_id: Option<Uuid>,
+    #[validate(length(max = 20))]
+    pub status: Option<String>,
 }
