@@ -2438,7 +2438,7 @@ impl BillingService {
                         unit_price, total, ticket_id, project_id, sort_order,
                         product_id
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     "#,
                 )
                 .bind(Uuid::new_v4())

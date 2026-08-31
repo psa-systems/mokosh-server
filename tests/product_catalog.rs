@@ -355,3 +355,115 @@ async fn a_line_with_no_product_is_unaffected(pool: PgPool) {
     assert_eq!(dec(&invoice["total"]), Decimal::from(300));
     assert!(invoice["lines"].as_array().expect("lines")[0]["product_id"].is_null());
 }
+
+/// The update path writes its own INSERT, and this branch shipped it with one
+/// placeholder missing: the column list gained `product_id` and the `VALUES`
+/// list did not, so replacing an invoice's lines 500'd. Every test above went
+/// through `create_invoice` and none of them noticed;
+/// `create_update_validation_parity` did, which is the whole reason that suite
+/// exists. This is the coverage that should have been here.
+#[sqlx::test]
+async fn replacing_the_lines_keeps_the_product_link(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = common::seed_company(&pool).await;
+
+    let first = a_product(&app, &token, "First", "10").await;
+    let second = a_product(&app, &token, "Second", "20").await;
+    let created = invoice_with_product(&app, &token, company_id, &first, "10").await;
+    assert!(created.status().is_success(), "got {}", created.status());
+    let invoice: Value = created.json().await.expect("invoice JSON");
+    let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
+
+    let replaced = app
+        .client
+        .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "lines": [{
+                "line_type": "product",
+                "product_id": second,
+                "description": "Swapped",
+                "quantity": "2",
+                "unit_price": "20",
+            }],
+        }))
+        .send()
+        .await
+        .expect("send line replacement");
+    assert!(
+        replaced.status().is_success(),
+        "replacing lines should 2xx, got {}",
+        replaced.status()
+    );
+
+    let after: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let lines = after["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["product_id"].as_str(), Some(second.as_str()));
+    assert_eq!(dec(&after["total"]), Decimal::from(40));
+
+    // And the same tenant check applies on this path, before the DELETE, so a
+    // rejected link cannot take the existing lines with it.
+    let other_tenant = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name, slug, kind) VALUES ($1, 'Other', $2, 'org')")
+        .bind(other_tenant)
+        .bind(format!("other-{}", &other_tenant.to_string()[..8]))
+        .execute(&pool)
+        .await
+        .expect("seed other tenant");
+    let foreign: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO products (id, tenant_id, name, unit_price) \
+         VALUES ($1, $2, 'Foreign', 10) RETURNING id",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(other_tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("seed foreign product");
+
+    let refused = app
+        .client
+        .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "lines": [{
+                "line_type": "product",
+                "product_id": foreign,
+                "description": "Foreign",
+                "quantity": "1",
+                "unit_price": "10",
+            }],
+        }))
+        .send()
+        .await
+        .expect("send foreign replacement");
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let still: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    assert_eq!(
+        still["lines"].as_array().map(|l| l.len()),
+        Some(1),
+        "the rejected replacement left the existing line alone"
+    );
+    assert_eq!(dec(&still["total"]), Decimal::from(40));
+}
