@@ -667,8 +667,14 @@ impl TenantService {
                 .fetch_one(&mut *tx)
                 .await?;
 
+        // PMS-957: the cast is load-bearing. Postgres `SUM(bigint)` returns
+        // NUMERIC, so decoding it as `i64` fails - and it failed on an EMPTY
+        // table too, because `COALESCE` types its zero to match. This endpoint
+        // therefore 500'd for every tenant since it was written, which is why
+        // nobody noticed the figure it was trying to report was also always
+        // zero: nothing ever got a number back to disbelieve.
         let storage_bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(file_size), 0) FROM files WHERE tenant_id = $1",
+            "SELECT COALESCE(SUM(file_size), 0)::bigint FROM files WHERE tenant_id = $1",
         )
         .bind(tenant_id)
         .fetch_one(&mut *tx)
