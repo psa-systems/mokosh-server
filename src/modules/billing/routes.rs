@@ -37,6 +37,10 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
+        // PMS-954: a company's account over a period. GET, because it reads
+        // and stores nothing: the statement is derived from the invoices,
+        // payments, refunds and credit notes it summarises.
+        .route("/statements", get(get_statement))
         // PMS-953: the correction path for an issued invoice. No PUT and no
         // DELETE: a credit note is issued or voided, never edited, for the
         // reason the invoice it corrects is not.
@@ -453,4 +457,23 @@ async fn void_credit_note(
         .void_credit_note(user.tenant(), credit_note_id, &ctx)
         .await?;
     Ok(Json(note))
+}
+
+// ============================================================================
+// PMS-954: statements
+// ============================================================================
+
+/// `GET /statements?company_id=&period_start=&period_end=`.
+///
+/// Not paginated, and deliberately so: a statement that dropped rows past a
+/// page boundary would not reconcile, which is the one thing a statement has to
+/// do. A caller who wants less asks for a shorter period.
+async fn get_statement(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    Query(query): Query<StatementQuery>,
+) -> AppResult<Json<StatementResponse>> {
+    query.validate()?;
+    let statement = state.service.build_statement(user.tenant(), &query).await?;
+    Ok(Json(statement))
 }

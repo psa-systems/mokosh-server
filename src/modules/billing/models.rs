@@ -721,3 +721,107 @@ pub struct CreditNoteFilter {
     #[validate(length(max = 20))]
     pub status: Option<String>,
 }
+
+// ============================================================================
+// PMS-954: statements
+// ============================================================================
+
+/// What the caller asks for. There is no `status` filter and no free-text
+/// search: a statement is an account, so leaving rows out on the caller's say-so
+/// would produce a document that does not reconcile.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct StatementQuery {
+    pub company_id: Uuid,
+    /// Inclusive. Everything dated before this is folded into the opening
+    /// balance rather than dropped.
+    pub period_start: NaiveDate,
+    /// Inclusive.
+    pub period_end: NaiveDate,
+}
+
+/// One invoice on a statement. Deliberately not `InvoiceResponse`: a statement
+/// shows what was charged and what is outstanding, and carrying the whole
+/// invoice (lines included) would make a year-long statement enormous for
+/// nothing.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementInvoiceLine {
+    pub invoice_id: Uuid,
+    pub invoice_number: String,
+    pub invoice_date: NaiveDate,
+    pub due_date: NaiveDate,
+    pub status: InvoiceStatus,
+    /// What was charged. The statement's arithmetic is in these figures, not
+    /// in `invoices.balance_due`, which is a CURRENT number and would be wrong
+    /// for any period that ended before the last payment landed.
+    pub total: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementPaymentLine {
+    pub payment_id: Uuid,
+    pub payment_date: NaiveDate,
+    pub amount: Decimal,
+    pub payment_method: PaymentMethod,
+    pub reference_number: Option<String>,
+    /// The invoice it was applied to, when it was applied to one.
+    pub invoice_number: Option<String>,
+}
+
+/// A refund is a payment running backwards: the client owes the money again.
+/// Dated by `created_at`, because a provider refund carries no separate
+/// business date the way a `payments` row does.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementRefundLine {
+    pub refund_id: Uuid,
+    pub refund_date: NaiveDate,
+    pub amount: Decimal,
+    pub invoice_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementCreditLine {
+    pub credit_note_id: Uuid,
+    pub credit_note_number: String,
+    pub issue_date: NaiveDate,
+    pub total: Decimal,
+    pub reason: String,
+    pub invoice_number: Option<String>,
+}
+
+/// PMS-954: a client's account over a period.
+///
+/// Derived at read time and stored nowhere. A stored statement row would be a
+/// second source of truth for numbers that already have one, and the two would
+/// part company the first time a payment was backdated.
+///
+/// The consequence, worth stating rather than discovering: a statement is
+/// reproducible but not immutable. Re-running the same period after a backdated
+/// payment yields a different document, correctly. A statement that was SENT is
+/// a different artefact, and it is the stored PDF (PMS-910), not a row here.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementResponse {
+    pub company_id: Uuid,
+    pub company_name: Option<String>,
+    pub period_start: NaiveDate,
+    pub period_end: NaiveDate,
+    /// Everything before `period_start`, netted. Computed from the rows, never
+    /// from a stored running total: a running total is a third place for the
+    /// same number to live and the only one that can silently be wrong.
+    pub opening_balance: Decimal,
+    pub invoices: Vec<StatementInvoiceLine>,
+    pub payments: Vec<StatementPaymentLine>,
+    pub refunds: Vec<StatementRefundLine>,
+    pub credit_notes: Vec<StatementCreditLine>,
+    /// Sum of `invoices` above.
+    pub total_invoiced: Decimal,
+    /// Sum of `payments` above.
+    pub total_paid: Decimal,
+    /// Sum of `refunds` above.
+    pub total_refunded: Decimal,
+    /// Sum of `credit_notes` above.
+    pub total_credited: Decimal,
+    /// `opening_balance + total_invoiced + total_refunded - total_paid -
+    /// total_credited`, and the tests assert exactly that rather than trusting
+    /// the sentence.
+    pub closing_balance: Decimal,
+}

@@ -3215,6 +3215,185 @@ impl BillingService {
             total.max(0) as u64,
         ))
     }
+
+    // ========================================================================
+    // PMS-954: statements
+    // ========================================================================
+
+    /// A statement is an account, and an account is what the client owes.
+    /// A draft or pending invoice has not been issued, so it is not owed and
+    /// does not appear; every other status does, `void` included, because the
+    /// credit note that voided it appears too and dropping both would remove
+    /// the correction from the record along with the charge.
+    const STATEMENT_ISSUED_INVOICE: &'static str = "status NOT IN ('draft', 'pending')";
+
+    /// PMS-954: a company's account over a period.
+    ///
+    /// Derived at read time from the invoices, payments, refunds and credit
+    /// notes it summarises, and stored nowhere: a stored statement would be a
+    /// second source of truth for numbers that already have one, and the two
+    /// would part company the first time a payment was backdated.
+    ///
+    /// Every figure comes from a DATED row. Nothing reads `invoices.balance_due`
+    /// or `amount_paid`, which are current values: a statement for a period that
+    /// closed last month must show what was outstanding then, and those columns
+    /// have moved since. That is also why `closing_balance` is arithmetic over
+    /// the four buckets rather than a sum of today's balances.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn build_statement(
+        &self,
+        tenant_id: TenantId,
+        query: &StatementQuery,
+    ) -> AppResult<StatementResponse> {
+        if query.period_end < query.period_start {
+            return Err(AppError::BadRequest(
+                "A statement's period cannot end before it starts".to_string(),
+            ));
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let company: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM companies WHERE id = $1 AND tenant_id = $2")
+                .bind(query.company_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((company_name,)) = company else {
+            return Err(AppError::NotFound("Company".to_string()));
+        };
+
+        // The opening balance is everything before the period, netted. It is
+        // computed here rather than carried on the company, because a stored
+        // running total is a third home for a number that already has one and
+        // the only one that can be silently wrong.
+        let opening: (Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                COALESCE((SELECT SUM(total) FROM invoices
+                          WHERE tenant_id = $1 AND company_id = $2
+                            AND invoice_date < $3 AND {issued}), 0),
+                COALESCE((SELECT SUM(amount) FROM payments
+                          WHERE tenant_id = $1 AND company_id = $2
+                            AND payment_date < $3), 0),
+                COALESCE((SELECT SUM(r.amount) FROM payment_refunds r
+                          JOIN payments p ON p.id = r.payment_id
+                          WHERE r.tenant_id = $1 AND p.company_id = $2
+                            AND r.created_at::date < $3), 0),
+                COALESCE((SELECT SUM(total) FROM credit_notes
+                          WHERE tenant_id = $1 AND company_id = $2
+                            AND status = 'issued' AND issue_date < $3), 0)
+            "#,
+            issued = Self::STATEMENT_ISSUED_INVOICE,
+        ))
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .fetch_one(&mut *tx)
+        .await?;
+        let (open_invoiced, open_paid, open_refunded, open_credited) = opening;
+        let opening_balance = open_invoiced + open_refunded - open_paid - open_credited;
+
+        let invoices: Vec<StatementInvoiceRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT id, invoice_number, invoice_date, due_date, status, total
+            FROM invoices
+            WHERE tenant_id = $1 AND company_id = $2
+              AND invoice_date BETWEEN $3 AND $4
+              AND {issued}
+            ORDER BY invoice_date, invoice_number
+            "#,
+            issued = Self::STATEMENT_ISSUED_INVOICE,
+        ))
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .bind(query.period_end)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let payments: Vec<StatementPaymentRow> = sqlx::query_as(
+            r#"
+            SELECT p.id, p.payment_date, p.amount, p.payment_method,
+                   p.reference_number, i.invoice_number
+            FROM payments p
+            LEFT JOIN invoices i ON i.id = p.invoice_id
+            WHERE p.tenant_id = $1 AND p.company_id = $2
+              AND p.payment_date BETWEEN $3 AND $4
+            ORDER BY p.payment_date, p.id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .bind(query.period_end)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Joined through `payments` rather than `payment_refunds.invoice_id`,
+        // which is nullable: a refund of an unapplied payment still belongs to
+        // the company that made it.
+        let refunds: Vec<StatementRefundRow> = sqlx::query_as(
+            r#"
+            SELECT r.id, r.created_at::date AS refund_date, r.amount, i.invoice_number
+            FROM payment_refunds r
+            JOIN payments p ON p.id = r.payment_id
+            LEFT JOIN invoices i ON i.id = r.invoice_id
+            WHERE r.tenant_id = $1 AND p.company_id = $2
+              AND r.created_at::date BETWEEN $3 AND $4
+            ORDER BY r.created_at, r.id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .bind(query.period_end)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let credit_notes: Vec<StatementCreditRow> = sqlx::query_as(
+            r#"
+            SELECT cn.id, cn.credit_note_number, cn.issue_date, cn.total,
+                   cn.reason, i.invoice_number
+            FROM credit_notes cn
+            LEFT JOIN invoices i ON i.id = cn.invoice_id
+            WHERE cn.tenant_id = $1 AND cn.company_id = $2
+              AND cn.status = 'issued'
+              AND cn.issue_date BETWEEN $3 AND $4
+            ORDER BY cn.issue_date, cn.credit_note_number
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .bind(query.period_end)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let total_invoiced: Decimal = invoices.iter().map(|i| i.total).sum();
+        let total_paid: Decimal = payments.iter().map(|p| p.amount).sum();
+        let total_refunded: Decimal = refunds.iter().map(|r| r.amount).sum();
+        let total_credited: Decimal = credit_notes.iter().map(|c| c.total).sum();
+
+        Ok(StatementResponse {
+            company_id: query.company_id,
+            company_name: Some(company_name),
+            period_start: query.period_start,
+            period_end: query.period_end,
+            opening_balance,
+            invoices: invoices.into_iter().map(Into::into).collect(),
+            payments: payments.into_iter().map(Into::into).collect(),
+            refunds: refunds.into_iter().map(Into::into).collect(),
+            credit_notes: credit_notes.into_iter().map(Into::into).collect(),
+            total_invoiced,
+            total_paid,
+            total_refunded,
+            total_credited,
+            closing_balance: opening_balance + total_invoiced + total_refunded
+                - total_paid
+                - total_credited,
+        })
+    }
 }
 
 /// Candidate-contract row for [`BillingService::generate_due_recurring_invoices`].
@@ -3871,6 +4050,97 @@ impl From<CreditNoteLineRow> for CreditNoteLineResponse {
             unit_price: r.unit_price,
             total: r.total,
             sort_order: r.sort_order.unwrap_or(0),
+        }
+    }
+}
+
+// ---- PMS-954: statement row types ------------------------------------------
+
+#[derive(sqlx::FromRow)]
+struct StatementInvoiceRow {
+    id: Uuid,
+    invoice_number: String,
+    invoice_date: chrono::NaiveDate,
+    due_date: chrono::NaiveDate,
+    status: String,
+    total: Decimal,
+}
+
+impl From<StatementInvoiceRow> for StatementInvoiceLine {
+    fn from(r: StatementInvoiceRow) -> Self {
+        Self {
+            invoice_id: r.id,
+            invoice_number: r.invoice_number,
+            invoice_date: r.invoice_date,
+            due_date: r.due_date,
+            status: InvoiceStatus::from_str(&r.status).unwrap_or(InvoiceStatus::Draft),
+            total: r.total,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StatementPaymentRow {
+    id: Uuid,
+    payment_date: chrono::NaiveDate,
+    amount: Decimal,
+    payment_method: String,
+    reference_number: Option<String>,
+    invoice_number: Option<String>,
+}
+
+impl From<StatementPaymentRow> for StatementPaymentLine {
+    fn from(r: StatementPaymentRow) -> Self {
+        Self {
+            payment_id: r.id,
+            payment_date: r.payment_date,
+            amount: r.amount,
+            payment_method: PaymentMethod::from_str(&r.payment_method)
+                .unwrap_or(PaymentMethod::Other),
+            reference_number: r.reference_number,
+            invoice_number: r.invoice_number,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StatementRefundRow {
+    id: Uuid,
+    refund_date: chrono::NaiveDate,
+    amount: Decimal,
+    invoice_number: Option<String>,
+}
+
+impl From<StatementRefundRow> for StatementRefundLine {
+    fn from(r: StatementRefundRow) -> Self {
+        Self {
+            refund_id: r.id,
+            refund_date: r.refund_date,
+            amount: r.amount,
+            invoice_number: r.invoice_number,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StatementCreditRow {
+    id: Uuid,
+    credit_note_number: String,
+    issue_date: chrono::NaiveDate,
+    total: Decimal,
+    reason: String,
+    invoice_number: Option<String>,
+}
+
+impl From<StatementCreditRow> for StatementCreditLine {
+    fn from(r: StatementCreditRow) -> Self {
+        Self {
+            credit_note_id: r.id,
+            credit_note_number: r.credit_note_number,
+            issue_date: r.issue_date,
+            total: r.total,
+            reason: r.reason,
+            invoice_number: r.invoice_number,
         }
     }
 }
