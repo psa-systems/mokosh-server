@@ -37,6 +37,18 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
+        // PMS-953: the correction path for an issued invoice. No PUT and no
+        // DELETE: a credit note is issued or voided, never edited, for the
+        // reason the invoice it corrects is not.
+        .route(
+            "/credit-notes",
+            get(list_credit_notes).post(create_credit_note),
+        )
+        .route("/credit-notes/{credit_note_id}", get(get_credit_note))
+        .route(
+            "/credit-notes/{credit_note_id}/void",
+            axum::routing::post(void_credit_note),
+        )
         .route("/payments", get(list_payments).post(create_payment))
         .route("/payments/{payment_id}", delete(delete_payment))
         .route(
@@ -374,4 +386,71 @@ async fn list_invoices(
         &pagination,
         total,
     )))
+}
+
+// ============================================================================
+// PMS-953: credit notes
+// ============================================================================
+
+async fn list_credit_notes(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    Query(filter): Query<CreditNoteFilter>,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<CreditNoteResponse>>> {
+    filter.validate()?;
+    let (notes, total) = state
+        .service
+        .list_credit_notes(user.tenant(), &filter, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        notes,
+        &pagination,
+        total,
+    )))
+}
+
+async fn get_credit_note(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    Path(credit_note_id): Path<Uuid>,
+) -> AppResult<Json<CreditNoteResponse>> {
+    let note = state
+        .service
+        .get_credit_note(user.tenant(), credit_note_id)
+        .await?;
+    Ok(Json(note))
+}
+
+/// Finance-gated, like every other write that moves money: raising a credit
+/// note reduces what a client owes.
+async fn create_credit_note(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<CreateCreditNoteRequest>,
+) -> AppResult<Json<CreditNoteResponse>> {
+    request.validate()?;
+    let note = state
+        .service
+        .create_credit_note(user.tenant(), &request, &ctx)
+        .await?;
+    Ok(Json(note))
+}
+
+/// POST rather than DELETE: the row is not removed and the document still
+/// exists. It stops counting against the invoice, and that is a state change.
+async fn void_credit_note(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(credit_note_id): Path<Uuid>,
+) -> AppResult<Json<CreditNoteResponse>> {
+    let note = state
+        .service
+        .void_credit_note(user.tenant(), credit_note_id, &ctx)
+        .await?;
+    Ok(Json(note))
 }
