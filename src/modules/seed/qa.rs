@@ -1337,6 +1337,58 @@ fn qa_appointment_specs(
         .collect()
 }
 
+/// PMS-953: one invoice that goes out, is sent, and is then partly credited.
+///
+/// Separate from `qa_invoice_specs` because those two stay drafts, and a credit
+/// note is only legal against a document the customer already holds.
+fn qa_credited_invoice_spec(company_ids: &[Uuid]) -> CreateInvoiceRequest {
+    let company = company_ids.first().copied().unwrap_or_default();
+    CreateInvoiceRequest {
+        company_id: company,
+        billing_contact_id: None,
+        contract_id: None,
+        invoice_date: today() - Duration::days(30),
+        due_date: today(),
+        payment_terms: Some("net30".to_string()),
+        payment_term_id: None,
+        tax_amount: None,
+        discount_amount: None,
+        currency: Some("USD".to_string()),
+        notes: Some("QA seed invoice (sent, then partly credited).".to_string()),
+        po_number: Some("QA-PO-3".to_string()),
+        lines: vec![CreateInvoiceLineRequest {
+            line_type: InvoiceLineType::Service,
+            description: "QA-Managed services - May".to_string(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::new(200000, 2),
+            ticket_id: None,
+            project_id: None,
+            sort_order: 1,
+        }],
+    }
+}
+
+/// The correcting document for the invoice above: a partial credit, so the QA
+/// dataset shows an invoice with a reduced balance rather than only the
+/// all-or-nothing `void` case.
+fn qa_credit_note_spec(invoice_id: Uuid) -> CreateCreditNoteRequest {
+    CreateCreditNoteRequest {
+        invoice_id,
+        issue_date: Some(today() - Duration::days(5)),
+        reason: "QA seed: billed for a site that had already been decommissioned".to_string(),
+        tax_amount: None,
+        currency: Some("USD".to_string()),
+        notes: Some("QA seed credit note.".to_string()),
+        lines: vec![CreateCreditNoteLineRequest {
+            line_type: InvoiceLineType::Adjustment,
+            description: "QA-Decommissioned site, May".to_string(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::new(50000, 2),
+            sort_order: 1,
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,57 +1463,5 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.duration_minutes.unwrap_or(0) % 60 != 0));
-    }
-}
-
-/// PMS-953: one invoice that goes out, is sent, and is then partly credited.
-///
-/// Separate from `qa_invoice_specs` because those two stay drafts, and a credit
-/// note is only legal against a document the customer already holds.
-fn qa_credited_invoice_spec(company_ids: &[Uuid]) -> CreateInvoiceRequest {
-    let company = company_ids.first().copied().unwrap_or_default();
-    CreateInvoiceRequest {
-        company_id: company,
-        billing_contact_id: None,
-        contract_id: None,
-        invoice_date: today() - Duration::days(30),
-        due_date: today(),
-        payment_terms: Some("net30".to_string()),
-        payment_term_id: None,
-        tax_amount: None,
-        discount_amount: None,
-        currency: Some("USD".to_string()),
-        notes: Some("QA seed invoice (sent, then partly credited).".to_string()),
-        po_number: Some("QA-PO-3".to_string()),
-        lines: vec![CreateInvoiceLineRequest {
-            line_type: InvoiceLineType::Service,
-            description: "QA-Managed services - May".to_string(),
-            quantity: Decimal::ONE,
-            unit_price: Decimal::new(200000, 2),
-            ticket_id: None,
-            project_id: None,
-            sort_order: 1,
-        }],
-    }
-}
-
-/// The correcting document for the invoice above: a partial credit, so the QA
-/// dataset shows an invoice with a reduced balance rather than only the
-/// all-or-nothing `void` case.
-fn qa_credit_note_spec(invoice_id: Uuid) -> CreateCreditNoteRequest {
-    CreateCreditNoteRequest {
-        invoice_id,
-        issue_date: Some(today() - Duration::days(5)),
-        reason: "QA seed: billed for a site that had already been decommissioned".to_string(),
-        tax_amount: None,
-        currency: Some("USD".to_string()),
-        notes: Some("QA seed credit note.".to_string()),
-        lines: vec![CreateCreditNoteLineRequest {
-            line_type: InvoiceLineType::Adjustment,
-            description: "QA-Decommissioned site, May".to_string(),
-            quantity: Decimal::ONE,
-            unit_price: Decimal::new(50000, 2),
-            sort_order: 1,
-        }],
     }
 }
