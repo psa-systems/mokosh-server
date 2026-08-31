@@ -59,8 +59,9 @@ use crate::modules::assets::{AssetsService, CreateAssetRequest, UpsertAssetTypeR
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::TenantId;
 use crate::modules::billing::{
-    BillingService, CreateInvoiceLineRequest, CreateInvoiceRequest, CreatePaymentRequest,
-    InvoiceLineType, PaymentMethod,
+    BillingService, CreateCreditNoteLineRequest, CreateCreditNoteRequest, CreateInvoiceLineRequest,
+    CreateInvoiceRequest, CreatePaymentRequest, InvoiceLineType, InvoiceStatus, PaymentMethod,
+    UpdateInvoiceRequest,
 };
 use crate::modules::calendar::{CalendarService, CreateAppointmentRequest};
 use crate::modules::contacts::{
@@ -103,6 +104,9 @@ pub struct QaReport {
     pub contracts: usize,
     pub invoices: usize,
     pub payments: usize,
+    /// PMS-953: credited invoices, so the QA dataset carries the correction
+    /// path and not only the happy one.
+    pub credit_notes: usize,
     pub assets: usize,
     pub kb_articles: usize,
     pub sla_policies: usize,
@@ -120,8 +124,8 @@ impl fmt::Display for QaReport {
         write!(
             f,
             "companies={} contacts={} tickets={} projects={} phases={} tasks={} \
-             time_entries={} contracts={} invoices={} payments={} assets={} \
-             kb_articles={} sla_policies={} appointments={}",
+             time_entries={} contracts={} invoices={} payments={} credit_notes={} \
+             assets={} kb_articles={} sla_policies={} appointments={}",
             self.companies,
             self.contacts,
             self.tickets,
@@ -132,6 +136,7 @@ impl fmt::Display for QaReport {
             self.contracts,
             self.invoices,
             self.payments,
+            self.credit_notes,
             self.assets,
             self.kb_articles,
             self.sla_policies,
@@ -400,6 +405,46 @@ impl QaSeeder {
             }
         }
 
+        // --- A sent invoice, partly credited (PMS-953) ---
+        //
+        // The two invoices above are drafts, and a credit note is only legal
+        // against a document the customer already holds, so this one is sent
+        // first. It exists so the QA dataset carries a corrected invoice and
+        // not only invoices that went out right the first time: a `void`
+        // status and a non-zero `amount_credited` are states no other seeded
+        // row reaches.
+        let credited_spec = qa_credited_invoice_spec(&company_ids);
+        let credited = self
+            .billing
+            .create_invoice(tenant, &credited_spec, &ctx)
+            .await?;
+        report.invoices += 1;
+        self.billing
+            .update_invoice(
+                tenant,
+                credited.id,
+                &UpdateInvoiceRequest {
+                    billing_contact_id: None,
+                    contract_id: None,
+                    invoice_date: None,
+                    due_date: None,
+                    payment_terms: None,
+                    payment_term_id: None,
+                    tax_amount: None,
+                    discount_amount: None,
+                    notes: None,
+                    po_number: None,
+                    lines: None,
+                    status: Some(InvoiceStatus::Sent),
+                },
+                &ctx,
+            )
+            .await?;
+        self.billing
+            .create_credit_note(tenant, &qa_credit_note_spec(credited.id), &ctx)
+            .await?;
+        report.credit_notes += 1;
+
         // --- Assets (one asset type + a handful spread across companies) ---
         let asset_type = self
             .assets
@@ -626,6 +671,13 @@ async fn teardown(db: &Database, tid: Uuid) -> AppResult<QaReport> {
     // on company delete; see scripts/wipe_demo_seed.sql).
     report.payments = del!(&format!(
         "DELETE FROM payments WHERE tenant_id = $1 AND company_id IN ({qa_companies})"
+    ));
+    // PMS-953: credit notes reference invoices, so they go before them. Their
+    // lines cascade on the note, but the note does not cascade on the invoice
+    // (the FK is a plain reference, so an invoice with a credit note cannot be
+    // deleted out from under it), which is why this is its own statement.
+    report.credit_notes = del!(&format!(
+        "DELETE FROM credit_notes WHERE tenant_id = $1 AND company_id IN ({qa_companies})"
     ));
     del!(&format!(
         "DELETE FROM invoice_lines WHERE invoice_id IN \
@@ -1359,5 +1411,57 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.duration_minutes.unwrap_or(0) % 60 != 0));
+    }
+}
+
+/// PMS-953: one invoice that goes out, is sent, and is then partly credited.
+///
+/// Separate from `qa_invoice_specs` because those two stay drafts, and a credit
+/// note is only legal against a document the customer already holds.
+fn qa_credited_invoice_spec(company_ids: &[Uuid]) -> CreateInvoiceRequest {
+    let company = company_ids.first().copied().unwrap_or_default();
+    CreateInvoiceRequest {
+        company_id: company,
+        billing_contact_id: None,
+        contract_id: None,
+        invoice_date: today() - Duration::days(30),
+        due_date: today(),
+        payment_terms: Some("net30".to_string()),
+        payment_term_id: None,
+        tax_amount: None,
+        discount_amount: None,
+        currency: Some("USD".to_string()),
+        notes: Some("QA seed invoice (sent, then partly credited).".to_string()),
+        po_number: Some("QA-PO-3".to_string()),
+        lines: vec![CreateInvoiceLineRequest {
+            line_type: InvoiceLineType::Service,
+            description: "QA-Managed services - May".to_string(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::new(200000, 2),
+            ticket_id: None,
+            project_id: None,
+            sort_order: 1,
+        }],
+    }
+}
+
+/// The correcting document for the invoice above: a partial credit, so the QA
+/// dataset shows an invoice with a reduced balance rather than only the
+/// all-or-nothing `void` case.
+fn qa_credit_note_spec(invoice_id: Uuid) -> CreateCreditNoteRequest {
+    CreateCreditNoteRequest {
+        invoice_id,
+        issue_date: Some(today() - Duration::days(5)),
+        reason: "QA seed: billed for a site that had already been decommissioned".to_string(),
+        tax_amount: None,
+        currency: Some("USD".to_string()),
+        notes: Some("QA seed credit note.".to_string()),
+        lines: vec![CreateCreditNoteLineRequest {
+            line_type: InvoiceLineType::Adjustment,
+            description: "QA-Decommissioned site, May".to_string(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::new(50000, 2),
+            sort_order: 1,
+        }],
     }
 }

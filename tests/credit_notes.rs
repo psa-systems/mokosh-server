@@ -431,3 +431,69 @@ async fn an_invoice_with_no_credits_behaves_exactly_as_before(pool: PgPool) {
         "a genuinely paid invoice still gets its payment date"
     );
 }
+
+/// The QA dataset now carries a corrected invoice, not only invoices that went
+/// out right the first time. A `void` status and a non-zero `amount_credited`
+/// are states no other seeded row reaches, so without this the seed exercises
+/// every billing path except the one PMS-953 added.
+///
+/// It also runs the seed, which nothing else in the suite does: the credited
+/// invoice has to be created, sent and credited in sequence through three
+/// services, and a compile is not evidence that sequence works.
+#[sqlx::test]
+async fn the_qa_seed_carries_a_credited_invoice(pool: PgPool) {
+    // The seed attributes every record to a user, and fails closed when the
+    // tenant has none.
+    let (_admin_id, _email, _password) = common::seed_admin(&pool).await;
+    // It also fails closed on any tenant not explicitly marked QA, so mark it.
+    sqlx::query(
+        "UPDATE tenants SET settings = COALESCE(settings, '{}'::jsonb) || '{\"is_qa\": true}'::jsonb \
+         WHERE id = $1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("mark the tenant as QA");
+
+    let db = mokosh_server::db::Database::from_pool(pool.clone());
+    let report = mokosh_server::modules::seed::qa_seed(&db, common::DEFAULT_TENANT_ID)
+        .await
+        .expect("qa seed");
+    assert_eq!(report.credit_notes, 1, "one credited invoice, {report}");
+
+    let row: (String, Decimal, Decimal) = sqlx::query_as(
+        r#"
+        SELECT i.status, i.amount_credited, i.balance_due
+        FROM credit_notes cn
+        JOIN invoices i ON i.id = cn.invoice_id
+        WHERE cn.tenant_id = $1
+        "#,
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("the seeded credit note's invoice");
+
+    let (status, credited, balance) = row;
+    assert_eq!(status, "sent", "a partial credit leaves the invoice sent");
+    assert_eq!(credited, Decimal::from(500));
+    assert_eq!(
+        balance,
+        Decimal::from(1500),
+        "2000 invoiced less 500 credited"
+    );
+
+    // Teardown removes the note as well as the invoice; a credit note holds a
+    // plain reference to its invoice, so leaving one behind would make the
+    // invoice undeletable and the teardown non-idempotent.
+    let torn = mokosh_server::modules::seed::qa_teardown(&db, common::DEFAULT_TENANT_ID)
+        .await
+        .expect("qa teardown");
+    assert_eq!(torn.credit_notes, 1, "{torn}");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credit_notes WHERE tenant_id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count credit notes");
+    assert_eq!(left, 0);
+}
