@@ -37,6 +37,13 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
+        // PMS-955: the product catalog. A price list, not an inventory
+        // system, and not a second home for labour pricing (`/rate-cards`).
+        .route("/products", get(list_products).post(create_product))
+        .route(
+            "/products/{product_id}",
+            get(get_product).put(update_product).delete(delete_product),
+        )
         // PMS-954: a company's account over a period. GET, because it reads
         // and stores nothing: the statement is derived from the invoices,
         // payments, refunds and credit notes it summarises.
@@ -476,4 +483,86 @@ async fn get_statement(
     query.validate()?;
     let statement = state.service.build_statement(user.tenant(), &query).await?;
     Ok(Json(statement))
+}
+
+// ============================================================================
+// PMS-955: product catalog
+// ============================================================================
+
+async fn list_products(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    Query(filter): Query<ProductFilter>,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<ProductResponse>>> {
+    filter.validate()?;
+    let (products, total) = state
+        .service
+        .list_products(user.tenant(), &filter, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        products,
+        &pagination,
+        total,
+    )))
+}
+
+async fn get_product(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    Path(product_id): Path<Uuid>,
+) -> AppResult<Json<ProductResponse>> {
+    Ok(Json(
+        state.service.get_product(user.tenant(), product_id).await?,
+    ))
+}
+
+async fn create_product(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<UpsertProductRequest>,
+) -> AppResult<Json<ProductResponse>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .service
+            .create_product(user.tenant(), &request, &ctx)
+            .await?,
+    ))
+}
+
+async fn update_product(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(product_id): Path<Uuid>,
+    Json(request): Json<UpsertProductRequest>,
+) -> AppResult<Json<ProductResponse>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .service
+            .update_product(user.tenant(), product_id, &request, &ctx)
+            .await?,
+    ))
+}
+
+/// Deleting is for a product nothing has sold. One that has is refused with a
+/// 409 naming the alternative, because retiring a sold product is
+/// `is_active = false`: the documents that sold it still name it.
+async fn delete_product(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(product_id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .service
+        .delete_product(user.tenant(), product_id, &ctx)
+        .await?;
+    Ok(())
 }

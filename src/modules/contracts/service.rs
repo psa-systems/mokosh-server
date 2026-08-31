@@ -344,7 +344,8 @@ impl ContractsService {
         let rows = sqlx::query_as::<_, ContractItemRow>(
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
-                      overage_rate, rollover_enabled, max_rollover_hours, sort_order
+                      overage_rate, rollover_enabled, max_rollover_hours, sort_order,
+                      product_id
                FROM contract_items WHERE tenant_id = $1 AND contract_id = $2
                ORDER BY sort_order
                LIMIT $3 OFFSET $4"#,
@@ -375,8 +376,8 @@ impl ContractsService {
             r#"INSERT INTO contract_items (id, tenant_id, contract_id, name, description, item_type,
                                             quantity, unit_price, total_price, billing_frequency, work_type_id,
                                             included_hours, overage_rate, rollover_enabled,
-                                            max_rollover_hours, sort_order)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+                                            max_rollover_hours, sort_order, product_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
         )
         .bind(id).bind(tenant_id).bind(contract_id)
         .bind(&request.name).bind(&request.description).bind(&request.item_type)
@@ -384,6 +385,7 @@ impl ContractsService {
         .bind(&request.billing_frequency).bind(request.work_type_id)
         .bind(request.included_hours).bind(request.overage_rate)
         .bind(request.rollover_enabled).bind(request.max_rollover_hours).bind(request.sort_order)
+        .bind(request.product_id)
         .execute(&mut *tx).await?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -421,6 +423,7 @@ impl ContractsService {
             rollover_enabled: request.rollover_enabled,
             max_rollover_hours: request.max_rollover_hours,
             sort_order: request.sort_order,
+            product_id: request.product_id,
         })
     }
 
@@ -448,7 +451,7 @@ impl ContractsService {
                 name=$3, description=$4, item_type=$5, quantity=$6, unit_price=$7,
                 total_price=$8, billing_frequency=$9, work_type_id=$10, included_hours=$11,
                 overage_rate=$12, rollover_enabled=$13, max_rollover_hours=$14,
-                sort_order=$15, updated_at = NOW()
+                sort_order=$15, product_id=$16, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2 RETURNING contract_id"#,
         )
         .bind(tenant_id)
@@ -466,6 +469,7 @@ impl ContractsService {
         .bind(request.rollover_enabled)
         .bind(request.max_rollover_hours)
         .bind(request.sort_order)
+        .bind(request.product_id)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(cid) = contract_id else {
@@ -507,6 +511,7 @@ impl ContractsService {
             rollover_enabled: request.rollover_enabled,
             max_rollover_hours: request.max_rollover_hours,
             sort_order: request.sort_order,
+            product_id: request.product_id,
         })
     }
 
@@ -1483,7 +1488,8 @@ impl ContractsService {
         let rows = sqlx::query_as::<_, ContractItemRow>(
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
-                      overage_rate, rollover_enabled, max_rollover_hours, sort_order
+                      overage_rate, rollover_enabled, max_rollover_hours, sort_order,
+                      product_id
                FROM contract_items
                WHERE tenant_id = $1 AND contract_id = $2
                  AND item_type IN ('recurring_service', 'retainer')
@@ -1567,6 +1573,7 @@ struct ContractItemRow {
     rollover_enabled: Option<bool>,
     max_rollover_hours: Option<Decimal>,
     sort_order: Option<i32>,
+    product_id: Option<Uuid>,
 }
 
 impl From<ContractItemRow> for ContractItemResponse {
@@ -1587,6 +1594,7 @@ impl From<ContractItemRow> for ContractItemResponse {
             rollover_enabled: r.rollover_enabled.unwrap_or(false),
             max_rollover_hours: r.max_rollover_hours,
             sort_order: r.sort_order.unwrap_or(0),
+            product_id: r.product_id,
         }
     }
 }

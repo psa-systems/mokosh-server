@@ -111,6 +111,10 @@ impl InvoiceLineType {
 pub struct InvoiceLineResponse {
     pub id: Uuid,
     pub line_type: InvoiceLineType,
+    /// PMS-955: the catalog product this line sells, when it names one. The
+    /// price is NOT read through this: `unit_price` below is what was charged,
+    /// and it stays what was charged when the catalog changes.
+    pub product_id: Option<Uuid>,
     pub description: String,
     pub quantity: Decimal,
     pub unit_price: Decimal,
@@ -178,6 +182,12 @@ pub struct InvoiceFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct CreateInvoiceLineRequest {
     pub line_type: InvoiceLineType,
+    /// PMS-955: optional link to the catalog. Validated against the caller's
+    /// tenant and refused if the product is retired; it does not fill in the
+    /// price, which the caller still states, so the line records what was
+    /// actually charged.
+    #[serde(default)]
+    pub product_id: Option<Uuid>,
     #[validate(length(min = 1, max = 1000))]
     pub description: String,
     /// `quantity` and `unit_price` are intentionally signed (PMS-306): a
@@ -501,6 +511,7 @@ mod tests {
     fn one_line() -> CreateInvoiceLineRequest {
         CreateInvoiceLineRequest {
             line_type: InvoiceLineType::Service,
+            product_id: None,
             description: "Work".into(),
             quantity: Decimal::from(1),
             unit_price: Decimal::from(100),
@@ -824,4 +835,66 @@ pub struct StatementResponse {
     /// total_credited`, and the tests assert exactly that rather than trusting
     /// the sentence.
     pub closing_balance: Decimal,
+}
+
+// ============================================================================
+// PMS-955: product catalog
+// ============================================================================
+
+/// A sellable thing, priced per unit.
+///
+/// This is a price list, not an inventory system: there is no quantity on hand,
+/// no purchasing and no vendor (PMS-821). It is also not a second home for
+/// labour pricing, which is what `rate_cards` is: those are keyed on work type
+/// and priced by the hour, and a product is priced by the unit.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductResponse {
+    pub id: Uuid,
+    pub sku: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub unit_price: Decimal,
+    /// What one of it is: `each`, `hour`, `month`, `user`. Free text, because
+    /// the list an MSP needs is theirs.
+    pub unit: String,
+    pub is_taxable: bool,
+    /// Retirement is deactivation, never deletion: the documents that sold it
+    /// still name it, and the database refuses to drop a referenced row.
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertProductRequest {
+    /// Optional, and unique within the tenant when present.
+    #[validate(length(min = 1, max = 64))]
+    pub sku: Option<String>,
+    /// Unique within the tenant, case-insensitively. Two catalog rows reading
+    /// the same name with different prices is the confusion this table exists
+    /// to remove, and it is invisible on screen.
+    #[validate(length(min = 1, max = 255))]
+    pub name: String,
+    pub description: Option<String>,
+    pub unit_price: Decimal,
+    #[validate(length(min = 1, max = 30))]
+    #[serde(default = "default_unit")]
+    pub unit: String,
+    #[serde(default = "default_true")]
+    pub is_taxable: bool,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+fn default_unit() -> String {
+    "each".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct ProductFilter {
+    /// Omitted returns the whole catalog, active and retired, so an admin can
+    /// see history; a picker passes `is_active=true`.
+    pub is_active: Option<bool>,
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
 }

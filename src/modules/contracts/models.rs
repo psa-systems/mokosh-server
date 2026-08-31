@@ -125,6 +125,12 @@ pub struct ContractItemResponse {
     pub rollover_enabled: bool,
     pub max_rollover_hours: Option<Decimal>,
     pub sort_order: i32,
+    /// PMS-955: the catalog product this item sells, when it names one. The
+    /// PRICE stays on the item: `unit_price` is what the contract agreed, and
+    /// the invoice line the recurring worker writes copies it from here, not
+    /// from the catalog, so editing the price list cannot re-price a signed
+    /// contract.
+    pub product_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -145,6 +151,9 @@ pub struct UpsertContractItemRequest {
     pub max_rollover_hours: Option<Decimal>,
     #[serde(default)]
     pub sort_order: i32,
+    /// PMS-955: optional link to the catalog. It does not fill in the price.
+    #[serde(default)]
+    pub product_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]

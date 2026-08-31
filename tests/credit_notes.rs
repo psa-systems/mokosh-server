@@ -460,6 +460,9 @@ async fn the_qa_seed_carries_a_credited_invoice(pool: PgPool) {
         .await
         .expect("qa seed");
     assert_eq!(report.credit_notes, 1, "one credited invoice, {report}");
+    // PMS-955: the catalog is seeded before the invoices, and the credited
+    // invoice's line sells the first product in it.
+    assert_eq!(report.products, 3, "{report}");
 
     let row: (String, Decimal, Decimal) = sqlx::query_as(
         r#"
