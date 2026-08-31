@@ -1138,6 +1138,66 @@ impl ContractsService {
         })
     }
 
+    /// PMS-951: give back hours a time entry had drawn.
+    ///
+    /// The counterpart to [`Self::consume_hours`], and the reason an edit to a
+    /// consumed entry can be correct. `applied` is the APPLIED hours the entry
+    /// recorded when it drew, never its duration: consuming ten against an
+    /// eight-hour allotment applies eight and leaves two as overage, and only
+    /// the applied part came out of the balance. Crediting the duration back
+    /// would hand the contract two hours it never gave.
+    ///
+    /// Because the caller says which balance row and how much, this is exact
+    /// and order-independent. Re-deriving the period here would credit the
+    /// wrong one for an entry whose date has since moved.
+    ///
+    /// `hours_used` and `hours_remaining` are two halves of one figure and are
+    /// moved together, so `used + remaining` stays `included` exactly as
+    /// `consume_hours` leaves it.
+    pub async fn release_hours(
+        &self,
+        tenant_id: TenantId,
+        balance_id: Uuid,
+        applied: Decimal,
+    ) -> AppResult<()> {
+        if applied <= Decimal::ZERO {
+            return Ok(());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<BalanceMutRow> = sqlx::query_as(
+            r#"SELECT id, hours_used, hours_remaining
+               FROM contract_hour_balances
+               WHERE tenant_id = $1 AND id = $2
+               FOR UPDATE"#,
+        )
+        .bind(tenant_id)
+        .bind(balance_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // A balance the contract took with it is not an error: the entry has
+        // nothing to give back to, which is the right answer.
+        let Some(row) = row else {
+            return Ok(());
+        };
+        // Never credit back more than was taken, whatever the caller says.
+        let used = row.hours_used.unwrap_or(Decimal::ZERO);
+        let give_back = applied.min(used);
+        sqlx::query(
+            r#"UPDATE contract_hour_balances
+               SET hours_used = $2,
+                   hours_remaining = $3,
+                   updated_at = NOW()
+               WHERE id = $1"#,
+        )
+        .bind(row.id)
+        .bind(used - give_back)
+        .bind(row.hours_remaining + give_back)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Roll the unused hours of the period ending `closing_period_end`
     /// into the next period's balance row, capped at the item's
     /// `max_rollover_hours`. No-op (returns `Decimal::ZERO`) when the
