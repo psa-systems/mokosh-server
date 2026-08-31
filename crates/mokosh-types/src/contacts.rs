@@ -655,6 +655,10 @@ pub struct CompanyResponse {
     pub site_count: Option<i64>,
     pub open_ticket_count: Option<i64>,
     pub tags: Vec<String>,
+    /// PMS-952: the staff-authored note on the record. Present on the write
+    /// requests since the table was created, and on no response until now, so
+    /// a value could be stored and never read back.
+    pub notes: Option<String>,
     pub portal_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -680,6 +684,7 @@ impl From<Company> for CompanyResponse {
             site_count: None,
             open_ticket_count: None,
             tags: c.tags,
+            notes: c.notes,
             portal_enabled: c.portal_enabled,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -1077,6 +1082,11 @@ pub struct ContactResponse {
     pub preferred_contact_method: PreferredContactMethod,
     pub timezone: String,
     pub tags: Vec<String>,
+    /// PMS-952: see `CompanyResponse::notes`. Staff-authored and staff-only:
+    /// this DTO is served from `/api/v1/contacts/*` and from nowhere in the
+    /// portal, which is what keeps a note ABOUT a contact away from that
+    /// contact.
+    pub notes: Option<String>,
     pub avatar_url: Option<String>,
     pub status: ContactStatus,
     /// PMS-806: the full typed phone list and every company link, alongside
@@ -1105,6 +1115,7 @@ impl From<Contact> for ContactResponse {
             preferred_contact_method: c.preferred_contact_method,
             timezone: c.timezone,
             tags: c.tags,
+            notes: c.notes,
             avatar_url: c.avatar_url,
             status: c.status,
             phones: c.phones,

@@ -638,3 +638,60 @@ async fn decide(
         .await?;
     Ok(Json(quote).into_response())
 }
+
+#[cfg(test)]
+mod pms952_staff_notes_stay_staff_only {
+    /// The staff-facing contact and company response DTOs carry `notes` since
+    /// PMS-952, and a note is written BY staff ABOUT a customer: "chases
+    /// invoices", "wants escalating to the account manager". The only thing
+    /// keeping it away from the person it describes is that neither of those
+    /// two DTOs is served from this module, which is a fact about the code and
+    /// not a rule anybody wrote down.
+    ///
+    /// So write it down here, where somebody reaching for a ready-made contact
+    /// type to answer a portal request will trip over it. Serving one is not
+    /// forbidden outright: it needs a shape that omits the note, which is a
+    /// decision to make deliberately rather than inherit.
+    ///
+    /// The whole directory is scanned rather than a list of files, so a new
+    /// portal module is covered the day it is added. The two names are
+    /// assembled at runtime, so this file is not itself a hit and the prose
+    /// above can stay readable.
+    #[test]
+    fn no_portal_route_serves_a_staff_contact_or_company_dto() {
+        let needles = [
+            format!("Contact{}", "Response"),
+            format!("Company{}", "Response"),
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("modules")
+            .join("portal");
+
+        let mut hits: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read the portal module directory") {
+            let entry = entry.expect("read a portal directory entry");
+            if !entry.file_type().expect("read entry type").is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let source = std::fs::read_to_string(&path).expect("read a portal source file");
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for needle in &needles {
+                if source.contains(needle.as_str()) {
+                    hits.push(format!("{name} names {needle}"));
+                }
+            }
+        }
+
+        hits.sort();
+        assert!(
+            hits.is_empty(),
+            "a staff-authored `notes` field would reach the contact it is about: {hits:?}. \
+             Serve a portal-shaped DTO without the note instead."
+        );
+    }
+}
