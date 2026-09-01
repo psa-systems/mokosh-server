@@ -56,13 +56,14 @@ unsafe impl GlobalAlloc for MaxAllocTracker {
 #[global_allocator]
 static ALLOCATOR: MaxAllocTracker = MaxAllocTracker;
 
-/// Same attachment dir and tight 1 KiB cap as `tests/ticket_note_attachments.rs`.
-/// Blob filenames are unique uuids, so sharing the dir across binaries is safe.
+/// A storage root private to this run, plus the same tight 1 KiB cap
+/// `tests/ticket_note_attachments.rs` uses. The two used to name one directory
+/// under `/tmp` on the argument that unique uuid filenames made sharing safe;
+/// they no longer share one, because the collision that mattered was never
+/// between two blobs but between two OS users over the directory itself.
 fn install_test_attachment_env() -> PathBuf {
-    let dir = PathBuf::from("/tmp/mokosh-pms483-test");
-    std::env::set_var("ATTACHMENT_DIR", &dir);
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1024");
-    dir
+    common::storage_root().to_path_buf()
 }
 
 /// PMS-783 F6: ten concurrent 25 MiB downloads used to mean 250 MiB of
