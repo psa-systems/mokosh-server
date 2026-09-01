@@ -503,6 +503,7 @@ async fn get_statement(
 async fn get_invoice_pdf(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Response> {
     let tenant = user.tenant();
@@ -519,9 +520,20 @@ async fn get_invoice_pdf(
 }
 
 /// PMS-911: `GET /statements/pdf`, taking the same query as `GET /statements`.
+///
+/// Finance-gated, unlike the JSON `GET /statements` beside it. That is not an
+/// inconsistency introduced here, it is the correct half of one that already
+/// exists: a statement is a company's whole financial account, and every
+/// sibling that carries the same class of data (`/invoices`, `/payments`,
+/// `/tax-rates`) is finance-gated. The JSON route and five others in this file
+/// are not, which is a pre-existing gap of the kind PMS-350 closed elsewhere
+/// and is tracked as PMS-962. Re-permissioning six existing endpoints does not
+/// belong in a branding change; shipping a seventh that repeats the mistake
+/// does not either.
 async fn get_statement_pdf(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Query(query): Query<StatementQuery>,
 ) -> AppResult<Response> {
     query.validate()?;
