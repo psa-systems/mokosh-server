@@ -55,12 +55,20 @@ impl PortalRoleService {
         tenant_id: TenantId,
         company_id: Option<Uuid>,
     ) -> AppResult<Vec<PortalRoleSummary>> {
-        let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>)> = match company_id {
+        // MAPPS-635 E: mirror the LATERAL subquery that `contacts`
+        // service uses so this alternate listing path (the
+        // `portal_role_routes` at `/api/v1/portal-roles`) also carries
+        // the per-role contacts_count for the Settings > Contact
+        // Roles table.
+        let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>, i64)> = match company_id {
             None => {
                 sqlx::query_as(
-                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
-                 WHERE tenant_id = $1 AND company_id IS NULL \
-                 ORDER BY is_builtin DESC, name",
+                    "SELECT pr.id, pr.name, pr.capabilities, pr.is_builtin, pr.company_id, \
+                            COALESCE((SELECT COUNT(*) FROM contact_role_assignments cra \
+                                      WHERE cra.tenant_id = pr.tenant_id AND cra.role_id = pr.id), 0) \
+                     FROM portal_roles pr \
+                     WHERE pr.tenant_id = $1 AND pr.company_id IS NULL \
+                     ORDER BY pr.is_builtin DESC, pr.name",
                 )
                 .bind(*tenant_id)
                 .fetch_all(self.db.migrator_pool())
@@ -68,9 +76,12 @@ impl PortalRoleService {
             }
             Some(cid) => {
                 sqlx::query_as(
-                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
-                 WHERE tenant_id = $1 AND (company_id IS NULL OR company_id = $2) \
-                 ORDER BY is_builtin DESC, company_id NULLS FIRST, name",
+                    "SELECT pr.id, pr.name, pr.capabilities, pr.is_builtin, pr.company_id, \
+                            COALESCE((SELECT COUNT(*) FROM contact_role_assignments cra \
+                                      WHERE cra.tenant_id = pr.tenant_id AND cra.role_id = pr.id), 0) \
+                     FROM portal_roles pr \
+                     WHERE pr.tenant_id = $1 AND (pr.company_id IS NULL OR pr.company_id = $2) \
+                     ORDER BY pr.is_builtin DESC, pr.company_id NULLS FIRST, pr.name",
                 )
                 .bind(*tenant_id)
                 .bind(cid)
@@ -81,12 +92,13 @@ impl PortalRoleService {
         Ok(rows
             .into_iter()
             .map(
-                |(id, name, capabilities, is_builtin, company_id)| PortalRoleSummary {
+                |(id, name, capabilities, is_builtin, company_id, contacts_count)| PortalRoleSummary {
                     id,
                     name,
                     capabilities,
                     is_builtin,
                     company_id,
+                    contacts_count,
                 },
             )
             .collect())

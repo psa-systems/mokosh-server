@@ -1013,12 +1013,23 @@ impl ContactService {
         company_id: Option<Uuid>,
     ) -> AppResult<Vec<PortalRoleSummary>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>)> = match company_id {
+        // MAPPS-635 E: the client's Settings > Contact Roles table has
+        // a CONTACTS column that read "-" on every row because the
+        // SELECT projected only id/name/caps/is_builtin/company_id.
+        // A per-role LATERAL subquery over `contact_role_assignments`
+        // is the cheapest way to fill the count without a second
+        // round-trip; the assignments table already carries the
+        // (tenant_id, role_id) pair, so this stays inside the same
+        // tenant slice.
+        let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>, i64)> = match company_id {
             None => {
                 sqlx::query_as(
-                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
-                 WHERE tenant_id = $1 AND company_id IS NULL \
-                 ORDER BY is_builtin DESC, name",
+                    "SELECT pr.id, pr.name, pr.capabilities, pr.is_builtin, pr.company_id, \
+                            COALESCE((SELECT COUNT(*) FROM contact_role_assignments cra \
+                                      WHERE cra.tenant_id = pr.tenant_id AND cra.role_id = pr.id), 0) \
+                     FROM portal_roles pr \
+                     WHERE pr.tenant_id = $1 AND pr.company_id IS NULL \
+                     ORDER BY pr.is_builtin DESC, pr.name",
                 )
                 .bind(*tenant_id)
                 .fetch_all(&mut *tx)
@@ -1026,9 +1037,12 @@ impl ContactService {
             }
             Some(cid) => {
                 sqlx::query_as(
-                    "SELECT id, name, capabilities, is_builtin, company_id FROM portal_roles \
-                 WHERE tenant_id = $1 AND (company_id IS NULL OR company_id = $2) \
-                 ORDER BY is_builtin DESC, company_id NULLS FIRST, name",
+                    "SELECT pr.id, pr.name, pr.capabilities, pr.is_builtin, pr.company_id, \
+                            COALESCE((SELECT COUNT(*) FROM contact_role_assignments cra \
+                                      WHERE cra.tenant_id = pr.tenant_id AND cra.role_id = pr.id), 0) \
+                     FROM portal_roles pr \
+                     WHERE pr.tenant_id = $1 AND (pr.company_id IS NULL OR pr.company_id = $2) \
+                     ORDER BY pr.is_builtin DESC, pr.company_id NULLS FIRST, pr.name",
                 )
                 .bind(*tenant_id)
                 .bind(cid)
@@ -1039,12 +1053,13 @@ impl ContactService {
         Ok(rows
             .into_iter()
             .map(
-                |(id, name, capabilities, is_builtin, company_id)| PortalRoleSummary {
+                |(id, name, capabilities, is_builtin, company_id, contacts_count)| PortalRoleSummary {
                     id,
                     name,
                     capabilities,
                     is_builtin,
                     company_id,
+                    contacts_count,
                 },
             )
             .collect())
@@ -1308,44 +1323,90 @@ impl ContactService {
         .execute(&mut *tx)
         .await?;
 
-        // Invalidate every prior unredeemed setup token for this
-        // contact so only the freshly minted link works.
-        sqlx::query(
-            "DELETE FROM portal_setup_tokens \
-             WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+        // MAPPS-635 C: a role-only edit on an ALREADY granted contact
+        // (is_portal_user = TRUE, portal_password_hash set) must NOT
+        // invalidate their existing password + mint a fresh setup
+        // token + fire another portal-setup email. The pre-fix
+        // behaviour ran the full grant flow on every "Update roles"
+        // click, which read (correctly) to the client as "I just
+        // sent that person a new account-setup email for no reason".
+        // Detect the "already granted, has a password" state and
+        // skip the token/email work; a role edit becomes just the
+        // role-assignment rewrite above + the audit line.
+        let already_credentialled: bool = sqlx::query_scalar(
+            "SELECT is_portal_user AND portal_password_hash IS NOT NULL \
+             FROM contacts WHERE id = $1 AND tenant_id = $2",
         )
-        .bind(*tenant_id)
         .bind(contact_id)
-        .execute(&mut *tx)
-        .await?;
-        let token = self
-            .insert_setup_token(&mut tx, tenant_id, contact_id)
+        .bind(*tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+
+        let (setup_link, token_for_email) = if already_credentialled {
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Update,
+                "contacts",
+                Some(contact_id),
+                None,
+                Some(serde_json::json!({
+                    "portal_roles_updated": true,
+                    "role_ids": role_ids,
+                })),
+            )
             .await?;
+            tx.commit().await?;
+            (String::new(), None)
+        } else {
+            // Fresh grant OR re-grant of a previously revoked account
+            // whose password was cleared: mint a token + queue the
+            // setup email. Invalidate any prior unredeemed setup
+            // token so only the freshly minted link works.
+            sqlx::query(
+                "DELETE FROM portal_setup_tokens \
+                 WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+            )
+            .bind(*tenant_id)
+            .bind(contact_id)
+            .execute(&mut *tx)
+            .await?;
+            let token = self
+                .insert_setup_token(&mut tx, tenant_id, contact_id)
+                .await?;
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Update,
+                "contacts",
+                Some(contact_id),
+                None,
+                Some(serde_json::json!({
+                    "portal_access_granted": true,
+                    "role_ids": role_ids,
+                })),
+            )
+            .await?;
+            tx.commit().await?;
 
-        audit_write(
-            &mut *tx,
-            tenant_id,
-            ctx,
-            AuditAction::Update,
-            "contacts",
-            Some(contact_id),
-            None,
-            Some(serde_json::json!({
-                "portal_access_granted": true,
-                "role_ids": role_ids,
-            })),
-        )
-        .await?;
-        tx.commit().await?;
+            let link = format!(
+                "{}/portal/{}/set-password?token={}",
+                self.app_url.trim_end_matches('/'),
+                portal_slug,
+                token,
+            );
+            (link, Some(token))
+        };
 
-        let setup_link = format!(
-            "{}/portal/{}/set-password?token={}",
-            self.app_url.trim_end_matches('/'),
-            portal_slug,
-            token,
-        );
-        self.send_grant_email(&contact, &portal_slug, portal_id, &token)
-            .await;
+        // Fire the setup email ONLY on the fresh-grant branch. A
+        // role edit stays silent as promised in the client toast.
+        if let Some(t) = token_for_email.as_ref() {
+            self.send_grant_email(&contact, &portal_slug, portal_id, t)
+                .await;
+        }
 
         Ok(PortalGrantOutcome {
             portal_slug,
@@ -1887,6 +1948,43 @@ impl ContactService {
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // MAPPS-637: when the create request also grants portal
+        // access, refuse a duplicate portal email under the same
+        // Company BEFORE the INSERT so the caller gets a
+        // field-level validation error on `email` instead of a raw
+        // UNIQUE_VIOLATION on the migration-154 index. Runs only
+        // when every field the index cares about is set (email +
+        // company_id + will-be-portal-user). Non-portal freeform /
+        // stub contacts stay unaffected.
+        if request.create_portal_access {
+            if let (Some(cid), Some(email)) = (
+                request.company_id,
+                request
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            ) {
+                let clash: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM contacts \
+                     WHERE tenant_id = $1 AND company_id = $2 \
+                       AND LOWER(email) = LOWER($3) AND is_portal_user = TRUE)",
+                )
+                .bind(tenant_id)
+                .bind(cid)
+                .bind(email)
+                .fetch_one(&mut *tx)
+                .await?;
+                if clash {
+                    return Err(AppError::validation_field(
+                        "email",
+                        "another portal contact at this Company already uses this email; each portal account needs a unique email per Company",
+                    ));
+                }
+            }
+        }
+
         sqlx::query(
             r#"
             INSERT INTO contacts (

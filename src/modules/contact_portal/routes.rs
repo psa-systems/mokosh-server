@@ -52,7 +52,11 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         .route("/auth/forgot-password", post(forgot_password))
         .route("/auth/login-link", post(request_login_link))
         .route("/auth/login-link/redeem", post(redeem_login_link))
-        .route("/auth/login-link/select", post(select_login_candidate))
+        // MAPPS-637: `/auth/login-link/select` retired. The
+        // multi-candidate picker + its "one selection token → any of
+        // N contacts" primitive was the "aggregate by email" hazard
+        // MAPPS-636 removed the picker for. A caller who hits this
+        // URL now 404s.
         .route("/auth/me", get(me).put(update_me))
         // MAPPS-618 (mokosh-branding prompt 002): contact-plane brand
         // editor. Gated on `settings:manage_company_branding`; server
@@ -270,34 +274,10 @@ async fn redeem_login_link(
     Ok(resp)
 }
 
-/// mokosh-contact-login prompt 010: POST /auth/login-link/select.
-/// Multi-match completion path. Returns the same `ContactLoginResponse`
-/// shape the password login uses + Set-Cookie on the happy path.
-async fn select_login_candidate(
-    State(state): State<ContactRouterState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(request): Json<ContactSelectLoginCandidateRequest>,
-) -> Result<Response, AppError> {
-    request.validate()?;
-    let ua = headers
-        .get("User-Agent")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let resp = state
-        .service
-        .select_login_candidate(
-            &request.selection_token,
-            request.contact_id,
-            ua.as_deref(),
-            Some(addr.ip()),
-        )
-        .await?;
-    Ok(with_refresh_cookie(
-        &resp,
-        Json(resp.clone()).into_response(),
-    ))
-}
+// MAPPS-637: `select_login_candidate` handler retired alongside the
+// route (see the routes builder above). The service method +
+// selection-token machinery are gone; a caller who probes the URL
+// gets 404 from axum's route matcher.
 
 async fn me(
     State(state): State<ContactRouterState>,
