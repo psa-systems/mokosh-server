@@ -27,6 +27,10 @@ pub mod bootstrap;
 pub mod bunyip_webhook;
 #[cfg(feature = "server")]
 pub mod middleware;
+// PMS-871: at-rest encryption of `users.mfa_secret`, plus the classification
+// that lets a pre-PMS-871 plaintext row upgrade itself on next use.
+#[cfg(feature = "server")]
+mod mfa_secret;
 mod models;
 // Resource-Server OIDC verifier for the bunyip-as-OP cutover. Wired into
 // AuthMiddleware via `with_bunyip` in `create_api_router`.

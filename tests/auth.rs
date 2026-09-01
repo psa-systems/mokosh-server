@@ -628,6 +628,192 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-871: users.mfa_secret is AES-256-GCM at rest
+// ============================================================================
+
+/// The key `common::boot` hands `create_api_router`, and therefore the one the
+/// booted `AuthService` seals `users.mfa_secret` with.
+const TEST_ENCRYPTION_KEY: [u8; 32] = [0u8; 32];
+
+async fn stored_mfa_secret(pool: &PgPool, user_id: Uuid) -> String {
+    sqlx::query_scalar::<_, Option<String>>("SELECT mfa_secret FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("read mfa_secret")
+        .expect("mfa_secret is set")
+}
+
+/// PMS-871: enrolment persists ciphertext, not the base32 shared secret, and
+/// the whole enrol -> enable -> login round trip still works over it. Before
+/// this, anyone who could read `users` (a `pg_dump`, a replica, a SQL read
+/// primitive) could mint valid second factors for every user in every tenant.
+#[sqlx::test]
+async fn mfa_enrolment_persists_ciphertext(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send mfa setup")
+        .json()
+        .await
+        .expect("mfa setup JSON");
+    let secret_b32 = setup["secret"]
+        .as_str()
+        .expect("secret in mfa setup")
+        .to_string();
+    let secret = mokosh_server::utils::totp::base32_decode(&secret_b32).expect("decode mfa secret");
+
+    let stored = stored_mfa_secret(&app.pool, uid).await;
+    assert_ne!(
+        stored, secret_b32,
+        "the column must not hold the base32 secret"
+    );
+    assert!(
+        !stored.contains(&secret_b32),
+        "the column must not embed the base32 secret either"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(&stored, &TEST_ENCRYPTION_KEY)
+            .expect("stored value is AES-256-GCM ciphertext under ENCRYPTION_KEY"),
+        secret_b32,
+        "and it must decrypt back to exactly that secret"
+    );
+
+    // The staged ciphertext is what `enable_mfa` verifies against.
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let enable = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code_now }))
+        .send()
+        .await
+        .expect("send mfa enable");
+    assert!(
+        enable.status().is_success(),
+        "enable mfa should succeed, got {}",
+        enable.status()
+    );
+
+    // And so is the login challenge.
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": code_now,
+        }))
+        .send()
+        .await
+        .expect("send login with mfa_code");
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = login.json().await.expect("login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "TOTP against the encrypted secret must still authenticate"
+    );
+    assert_eq!(
+        stored_mfa_secret(&app.pool, uid).await,
+        stored,
+        "a verification against an already-encrypted row rewrites nothing"
+    );
+}
+
+/// PMS-871: a user enrolled BEFORE the column was encrypted keeps working with
+/// the authenticator they already have, and the row upgrades itself to
+/// ciphertext on that first successful verification. No SQL migration can do
+/// this (a migration has no `ENCRYPTION_KEY`), so an in-place upgrade on use is
+/// what saves every enrolled user a forced re-enrolment.
+#[sqlx::test]
+async fn legacy_plaintext_mfa_secret_logs_in_and_upgrades(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    // Writes the raw base32 secret straight onto the row: exactly the shape
+    // every pre-PMS-871 enrolment left behind.
+    let secret = seed_mfa_enabled(&pool, uid).await;
+    let plaintext = stored_mfa_secret(&pool, uid).await;
+    assert_eq!(
+        mokosh_server::utils::totp::base32_decode(&plaintext).expect("plaintext is base32"),
+        secret,
+        "the fixture really did leave a plaintext secret at rest"
+    );
+    let app = common::boot(pool).await;
+
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": code_now,
+        }))
+        .send()
+        .await
+        .expect("send login with mfa_code");
+    assert_eq!(
+        login.status(),
+        reqwest::StatusCode::OK,
+        "a pre-encryption enrolment must still be able to log in"
+    );
+    let body: serde_json::Value = login.json().await.expect("login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "the legacy secret verified, so tokens are issued"
+    );
+
+    let upgraded = stored_mfa_secret(&app.pool, uid).await;
+    assert_ne!(
+        upgraded, plaintext,
+        "the successful verification must have rewritten the row as ciphertext"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(&upgraded, &TEST_ENCRYPTION_KEY)
+            .expect("the upgraded value is ciphertext"),
+        plaintext,
+        "and it must still be the same shared secret"
+    );
+
+    // The upgraded row is what the next login verifies against, on the same
+    // authenticator. A different step than above, so PMS-502 anti-replay does
+    // not reject it for reasons unrelated to this test.
+    let next_step_code = mokosh_server::utils::totp::code_at(
+        &secret,
+        Utc::now() + Duration::seconds(mokosh_server::utils::totp::TOTP_STEP_SECS),
+    );
+    let again = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": next_step_code,
+        }))
+        .send()
+        .await
+        .expect("send second login with mfa_code");
+    assert_eq!(again.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = again.json().await.expect("second login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "the same authenticator still works once the row is encrypted"
+    );
+    assert_eq!(
+        stored_mfa_secret(&app.pool, uid).await,
+        upgraded,
+        "and the upgrade happens once, not on every login"
+    );
+}
+
+// ============================================================================
 // PMS-502: second-factor anti-replay + per-account attempt lockout
 // ============================================================================
 

@@ -39,6 +39,8 @@ use crate::utils::net::is_non_public_ip;
 use std::net::IpAddr;
 
 #[cfg(feature = "server")]
+use super::mfa_secret;
+#[cfg(feature = "server")]
 use super::models::*;
 
 /// Authentication service
@@ -84,6 +86,12 @@ pub struct AuthService {
     /// Set from `bunyip_verifier.is_some()` in `create_api_router`; false in
     /// fixtures. See [`Self::local_password_auth_disabled`].
     sso_mounted: bool,
+    /// PMS-871: 32-byte AES-256-GCM key protecting `users.mfa_secret` at rest.
+    /// Sourced from `AppConfig::encryption_key` exactly as the payment-gateway
+    /// configs are; falls back to a zero key for the fixture constructors so
+    /// non-production callers stay compilable (the `BillingService` pattern).
+    /// Wired via [`Self::with_encryption_key`].
+    encryption_key: [u8; 32],
 }
 
 /// PMS-658: outcome of screening a login for suspicious signals. `country` and
@@ -136,6 +144,7 @@ impl AuthService {
             login_approval_enabled: false,
             deployment_mode: DeploymentMode::SelfHosted,
             sso_mounted: false,
+            encryption_key: [0u8; 32],
         }
     }
 
@@ -166,6 +175,7 @@ impl AuthService {
             login_approval_enabled: false,
             deployment_mode: DeploymentMode::SelfHosted,
             sso_mounted: false,
+            encryption_key: [0u8; 32],
         }
     }
 
@@ -203,6 +213,15 @@ impl AuthService {
     #[must_use]
     pub fn with_sso_mounted(mut self, mounted: bool) -> Self {
         self.sso_mounted = mounted;
+        self
+    }
+
+    /// PMS-871: attach the `ENCRYPTION_KEY` that protects `users.mfa_secret`
+    /// at rest. Set once at server startup (see `create_api_router`), from the
+    /// same `AppConfig::encryption_key` the payment-gateway configs use.
+    #[must_use]
+    pub fn with_encryption_key(mut self, encryption_key: [u8; 32]) -> Self {
+        self.encryption_key = encryption_key;
         self
     }
 
@@ -808,11 +827,16 @@ impl AuthService {
                 // TOTP step, so the anti-replay watermark must not advance.
                 self.clear_mfa_lockout(user.tenant_id, user.id).await?;
             } else if let Some(code) = request.mfa_code.as_deref() {
-                let secret_b32 = user
+                let stored = user
                     .mfa_secret
                     .as_ref()
                     .ok_or_else(|| AppError::Internal("MFA enabled without secret".to_string()))?;
-                let secret = crate::utils::totp::base32_decode(secret_b32)
+                // PMS-871: the column is AES-256-GCM ciphertext, except on a
+                // row enrolled before that change. `open` classifies it; a
+                // legacy plaintext row is rewritten encrypted below, once the
+                // code it presented has actually verified.
+                let stored = mfa_secret::open(stored, &self.encryption_key)?;
+                let secret = crate::utils::totp::base32_decode(stored.secret_b32())
                     .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
                 // +-1 step (30s) tolerance handles modest clock skew. The
                 // verifier returns the matched step so we can enforce
@@ -835,6 +859,14 @@ impl AuthService {
                 if !accepted {
                     self.register_failed_mfa(user.tenant_id, user.id).await?;
                     return Err(AppError::Unauthorized);
+                }
+                // PMS-871: the code verified against a pre-encryption row, so
+                // rewrite it as ciphertext now. Gated on success so a guess
+                // cannot drive the write, and idempotent (the UPDATE matches
+                // the plaintext it read), so a concurrent re-enrolment wins.
+                if stored.needs_upgrade() {
+                    self.upgrade_legacy_mfa_secret(user.tenant_id, user.id, stored.secret_b32())
+                        .await?;
                 }
             } else {
                 return Ok(LoginResponse {
@@ -1786,6 +1818,35 @@ impl AuthService {
         self.get_user_by_id(tenant_id, user_id).await
     }
 
+    /// PMS-871: rewrite a pre-encryption `users.mfa_secret` as ciphertext.
+    ///
+    /// Called only after the presented code has verified against that very
+    /// plaintext, so a wrong guess never triggers a write. `AND mfa_secret =
+    /// $4` makes it idempotent and keeps it from clobbering a secret that a
+    /// concurrent re-enrolment staged between the read and this update: the
+    /// row is left alone rather than pinned back to a secret nobody holds.
+    async fn upgrade_legacy_mfa_secret(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        secret_b32: &str,
+    ) -> AppResult<()> {
+        let sealed = mfa_secret::seal(secret_b32, &self.encryption_key)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3 AND mfa_secret = $4",
+        )
+        .bind(&sealed)
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(secret_b32)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Begin MFA enrollment. Generates a fresh TOTP secret, persists it
     /// on `users.mfa_secret`, and returns the base32 secret plus the
     /// `otpauth://` provisioning URI. `mfa_enabled` is NOT flipped here
@@ -1806,13 +1867,17 @@ impl AuthService {
 
         let secret = crate::utils::totp::generate_secret();
         let secret_b32 = crate::utils::totp::base32_encode(&secret);
+        // PMS-871: the column stores ciphertext. The base32 secret leaves this
+        // method only in the response the enrolling user's own authenticator
+        // needs; it is never at rest in the clear.
+        let stored = mfa_secret::seal(&secret_b32, &self.encryption_key)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
         )
-        .bind(&secret_b32)
+        .bind(&stored)
         .bind(user_id)
         .bind(tenant_id)
         .execute(&mut *tx)
@@ -1849,13 +1914,21 @@ impl AuthService {
         // PMS-4 AC6: `get_user_by_id` binds `AND tenant_id = $2`, so
         // any user_id from another tenant comes back as NotFound here.
         let user = self.get_user_by_id(tenant_id, user_id).await?;
-        let secret_b32 = user.mfa_secret.as_ref().ok_or_else(|| {
+        let stored = user.mfa_secret.as_ref().ok_or_else(|| {
             AppError::BadRequest("MFA enrollment has not been started".to_string())
         })?;
-        let secret = crate::utils::totp::base32_decode(secret_b32)
+        // PMS-871: normally ciphertext staged by `start_mfa_enrollment`. It can
+        // still be plaintext for an enrolment that was started before the
+        // upgrade and is being completed after it.
+        let stored = mfa_secret::open(stored, &self.encryption_key)?;
+        let secret = crate::utils::totp::base32_decode(stored.secret_b32())
             .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
         if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
             return Err(AppError::BadRequest("Invalid MFA code".to_string()));
+        }
+        if stored.needs_upgrade() {
+            self.upgrade_legacy_mfa_secret(tenant_id, user_id, stored.secret_b32())
+                .await?;
         }
 
         let recovery_codes = crate::utils::recovery::generate_set();
