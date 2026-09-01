@@ -74,8 +74,8 @@ async fn staff_upload_company_asset(
     if !user.role.is_admin() {
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     verify_company_in_tenant(&state.db, user.tenant().get(), company_id).await?;
     upload_asset(
         &state.store,
@@ -96,8 +96,8 @@ async fn staff_delete_company_asset(
     if !user.role.is_admin() {
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     verify_company_in_tenant(&state.db, user.tenant().get(), company_id).await?;
     delete_asset(
         &state.store,
@@ -122,8 +122,8 @@ async fn staff_upload_tenant_asset(
     if !user.role.is_admin() {
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     let tenant_id = user.tenant().get();
     upload_asset(
         &state.store,
@@ -144,8 +144,8 @@ async fn staff_delete_tenant_asset(
     if !user.role.is_admin() {
         return Err(AppError::Forbidden("Access denied".to_string()));
     }
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     let tenant_id = user.tenant().get();
     delete_asset(
         &state.store,
@@ -194,8 +194,8 @@ async fn contact_upload_asset(
     Path(asset): Path<String>,
     multipart: Multipart,
 ) -> AppResult<Response> {
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     require_branding_cap(&state.contact_service, session.tenant_id, session.id).await?;
     upload_asset(
         &state.store,
@@ -213,8 +213,8 @@ async fn contact_delete_asset(
     crate::modules::contact_portal::RequireContactAuth(session): crate::modules::contact_portal::RequireContactAuth,
     Path(asset): Path<String>,
 ) -> AppResult<Response> {
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     require_branding_cap(&state.contact_service, session.tenant_id, session.id).await?;
     delete_asset(
         &state.store,
@@ -259,8 +259,8 @@ async fn serve_company_asset(
     State(state): State<PublicBrandingState>,
     Path((company_id, asset)): Path<(Uuid, String)>,
 ) -> AppResult<Response> {
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     let mime: Option<String> = sqlx::query_scalar(&format!(
         "SELECT branding->>'{}' FROM companies WHERE id = $1",
         kind.mime_field()
@@ -281,8 +281,8 @@ async fn serve_tenant_asset(
     State(state): State<PublicBrandingState>,
     Path((tenant_id, asset)): Path<(Uuid, String)>,
 ) -> AppResult<Response> {
-    let kind = BrandAssetKind::from_segment(&asset)
-        .ok_or_else(|| AppError::not_found("asset kind"))?;
+    let kind =
+        BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     let mime: Option<String> = sqlx::query_scalar(&format!(
         "SELECT branding->>'{}' FROM tenants WHERE id = $1",
         kind.mime_field()
