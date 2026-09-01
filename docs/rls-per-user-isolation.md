@@ -102,10 +102,12 @@ PMS-259 (see below).
 Classes: `business` (user-created records), `lookup` (user-editable config, isolated + seeded
 per user), `auth` (identity/session), `seq` (per-tenant counters).
 
-### Tables WITHOUT tenant_id (6) - covered by migration 041 (PMS-258)
+### Tables WITHOUT tenant_id - covered by migrations 041 (PMS-258) and 128 (PMS-874)
 
-The `024`/`038` loops select `WHERE column_name = 'tenant_id'`, so these six were skipped.
-`migrations/041_rls_cover_tenantless_tables.sql` covers the five that are not the root table.
+The `024`/`038` loops select `WHERE column_name = 'tenant_id'`, so these tables were skipped.
+`migrations/041_rls_cover_tenantless_tables.sql` covers the five known then;
+`migrations/128_rls_tenantless_child_tables.sql` covers the two added afterwards. `tenants` is
+the only table here with no policy.
 
 | table | pk | user cols | how it is isolated |
 | --- | --- | --- | --- |
@@ -115,17 +117,21 @@ The `024`/`038` loops select `WHERE column_name = 'tenant_id'`, so these six wer
 | `invoice_lines` | id | - | fail-closed parent-join policy (parent `invoices`) |
 | `rate_card_items` | id | - | fail-closed parent-join policy (parent `rate_cards`) |
 | `sla_targets` | id | - | fail-closed parent-join policy (parent `sla_policies`) |
+| `quote_lines` | id | - | fail-closed parent-join policy (parent `quotes`), migration `128` |
+| `credit_note_lines` | id | - | fail-closed parent-join policy (parent `credit_notes`), migration `128` |
 
 The parent-join form was chosen over a denormalized column: no backfill, and no `NOT NULL`
 column to keep populated on every INSERT, so no drift risk. `tests/tenantless_table_rls.rs`
-pins both properties (per-tenant uniqueness on `user_oauth_identities`, and the parent-join
-policy fail-closing on `kb_article_versions`).
+pins the behaviour (per-tenant uniqueness on `user_oauth_identities`, and the parent-join
+policy fail-closing on `kb_article_versions` and on `quote_lines`).
 
-**Known gap:** a table in this shape is invisible to `tests/rls_coverage.rs`, whose sweep
-requires a `tenant_id` column, and `tenantless_table_rls.rs` names two tables rather than
-sweeping. `quote_lines` (migration `092`) was added after `041` in exactly this shape and has
-no policy at all. Closing that, and extending the sweep so the next one cannot slip through,
-is tracked in PMS-874.
+The gap this closed was not the missing policies but the missing sweep. A table in this shape
+was invisible to `tests/rls_coverage.rs`, whose query required a `tenant_id` column, and
+`tenantless_table_rls.rs` names tables rather than sweeping, so `quote_lines` (`092`) and
+`credit_note_lines` (`122`) were both added after `041` in exactly this shape and neither made
+a test go red. `every_tenantless_table_has_rls_or_is_exempt` (PMS-874) now sweeps the other
+half of the schema and requires the policy on every tenantless table except the two entries in
+its `TENANTLESS_WITHOUT_RLS` list, `tenants` and `_sqlx_migrations`, each carrying its reason.
 
 ### Tables WITH tenant_id (70)
 
@@ -175,8 +181,10 @@ plan. Status belongs in YouTrack, not here; follow the issue ids.
    the tables added after the `038` loop ran. The role split is `Database`'s two pools, and
    the roles themselves are a deployment step (`docs/postgres-security.md`), because roles are
    cluster-global and a migration cannot safely create them.
-3. **Cover the 6 no-`tenant_id` tables.** `migrations/041_rls_cover_tenantless_tables.sql`
-   (PMS-258); see the table above, including the `quote_lines` gap tracked in PMS-874.
+3. **Cover the no-`tenant_id` tables.** `migrations/041_rls_cover_tenantless_tables.sql`
+   (PMS-258) and `migrations/128_rls_tenantless_child_tables.sql` (PMS-874), which also added
+   the sweep that makes the next such table fail a test rather than be found by audit; see the
+   table above.
 4. **Per-user lookup seeding + system-shared class (PMS-259).** `TenantService::copy_default_config`
    (`src/modules/tenants/service.rs`) and `migrations/039_system_shared_class.sql`. Detailed in
    the two sections below.
