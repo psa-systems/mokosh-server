@@ -7,6 +7,7 @@ pub mod cli;
 pub mod db;
 pub mod infisical;
 pub mod modules;
+pub mod pdf;
 pub mod scheduler;
 pub mod storage;
 pub mod utils;
