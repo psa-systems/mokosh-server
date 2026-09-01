@@ -39,6 +39,13 @@ pub struct AuthRouterState {
     /// Checked inline in the `forgot_password` handler for the same reason as
     /// login (the email lives in the request body).
     pub forgot_password_limiter: Arc<rate_limit::AuthRateLimiter>,
+    /// Failure-counted (per-IP + per-user-id) limiter for the password re-auth
+    /// on `/me/password` and `/me/mfa/disable` (PMS-881, audit F6). ONE
+    /// instance shared by both routes: they re-check the same credential, so
+    /// grinding it through one after exhausting the other must not hand the
+    /// attacker a fresh budget. Checked inline in each handler, before the
+    /// service call that compares the password.
+    pub reauth_limiter: Arc<rate_limit::ReauthRateLimiter>,
 }
 
 /// Create the auth router
@@ -51,6 +58,10 @@ pub fn auth_routes(auth_service: AuthService) -> Router {
         // 3/min per email - enough for a fumbling user, caps reset-email
         // bombing of a known address (PMS-680).
         forgot_password_limiter: rate_limit::AuthRateLimiter::new(10, 3),
+        // Re-auth: 10/min per IP, 5/min per user. Only FAILED re-auths are
+        // counted, and these are interactive settings screens, so a legitimate
+        // user mistyping their password twice never comes near it.
+        reauth_limiter: rate_limit::ReauthRateLimiter::new(10, 5),
     };
 
     Router::new()
@@ -315,18 +326,61 @@ async fn complete_onboarding(
     Ok(Json(updated.into()))
 }
 
-/// Change password endpoint
+/// Source IP for the re-auth buckets (PMS-881). The socket peer behind Traefik
+/// is the proxy on every request, so keying on it alone would make one global
+/// bucket in which any user's failures throttle everybody; `extract_client_ip`
+/// walks the forwarded chain and falls back to the peer for a direct client,
+/// which cannot spoof it (PMS-587).
+fn reauth_client_ip(addr: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
+    crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        headers,
+        crate::utils::client_ip::trusted_proxies(),
+    )
+}
+
+/// True when this error is `change_password`'s rejection of the submitted
+/// current password, rather than a mistyped new password or a failing
+/// database. Only a rejected re-auth spends rate-limit budget (PMS-881), so a
+/// user who fumbles the confirmation field is never throttled.
+fn is_wrong_current_password(err: &AppError) -> bool {
+    matches!(err, AppError::Validation { errors, .. }
+        if errors.iter().any(|e| e.field == "current_password"))
+}
+
+/// Change password endpoint. The current-password re-auth is rate limited per
+/// IP and per user (PMS-881, audit F6), sharing one budget with
+/// `disable_mfa`, so a stolen session cannot grind the password at full rate.
 async fn change_password(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
-) -> AppResult<()> {
+) -> Result<Response, AppError> {
     request.validate()?;
-    state
+
+    let ip = reauth_client_ip(addr, &headers);
+    if let Err(retry_after) = state.reauth_limiter.check(ip, user.id) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many failed password attempts, please try again later",
+        ));
+    }
+
+    match state
         .auth_service
         .change_password(user.tenant_id, user.id, &request)
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(()) => Ok(StatusCode::OK.into_response()),
+        Err(err) => {
+            if is_wrong_current_password(&err) {
+                state.reauth_limiter.record_failure(ip, user.id);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Get user sessions
@@ -413,18 +467,41 @@ async fn enable_mfa(
 
 /// Disable MFA. Requires re-auth with the current password so a stolen
 /// session cannot weaken the account quietly. Zeroes the user's
-/// recovery-code set.
+/// recovery-code set. The re-auth is rate limited per IP and per user out of
+/// the same budget as `change_password` (PMS-881, audit F6): the two check the
+/// same credential, so failures on one count against the other.
 async fn disable_mfa(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<MfaDisableRequest>,
-) -> AppResult<()> {
+) -> Result<Response, AppError> {
     request.validate()?;
-    state
+
+    let ip = reauth_client_ip(addr, &headers);
+    if let Err(retry_after) = state.reauth_limiter.check(ip, user.id) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many failed password attempts, please try again later",
+        ));
+    }
+
+    match state
         .auth_service
         .disable_mfa(user.tenant_id, user.id, &request.password)
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(()) => Ok(StatusCode::OK.into_response()),
+        Err(err) => {
+            // `disable_mfa` reports only the password check as `Unauthorized`;
+            // a missing user or a passwordless account is a different variant.
+            if matches!(err, AppError::Unauthorized) {
+                state.reauth_limiter.record_failure(ip, user.id);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// List the caller's personal API keys. Never includes secret material.
