@@ -1948,6 +1948,43 @@ impl ContactService {
         // both. CREATE: old = None, after captured by the new row id.
         // PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // MAPPS-637: when the create request also grants portal
+        // access, refuse a duplicate portal email under the same
+        // Company BEFORE the INSERT so the caller gets a
+        // field-level validation error on `email` instead of a raw
+        // UNIQUE_VIOLATION on the migration-154 index. Runs only
+        // when every field the index cares about is set (email +
+        // company_id + will-be-portal-user). Non-portal freeform /
+        // stub contacts stay unaffected.
+        if request.create_portal_access {
+            if let (Some(cid), Some(email)) = (
+                request.company_id,
+                request
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            ) {
+                let clash: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM contacts \
+                     WHERE tenant_id = $1 AND company_id = $2 \
+                       AND LOWER(email) = LOWER($3) AND is_portal_user = TRUE)",
+                )
+                .bind(tenant_id)
+                .bind(cid)
+                .bind(email)
+                .fetch_one(&mut *tx)
+                .await?;
+                if clash {
+                    return Err(AppError::validation_field(
+                        "email",
+                        "another portal contact at this Company already uses this email; each portal account needs a unique email per Company",
+                    ));
+                }
+            }
+        }
+
         sqlx::query(
             r#"
             INSERT INTO contacts (

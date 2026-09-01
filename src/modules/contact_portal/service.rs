@@ -807,7 +807,21 @@ impl ContactAuthService {
         //      resulting (tenant, contact.email) pair. Enum-resistant:
         //      zero matches produce zero intents + zero emails, same
         //      shape a hit produces (204 upstream either way).
-        let scoped_target: Option<(Uuid, Option<Uuid>)> = if portal_id.is_some() || slug.is_some() {
+        // MAPPS-637: a bare-email finder submission (no portal_id, no
+        // slug) is the aggregation entry point retired here. Any hit
+        // used to fan out one email per matched tenant, then let the
+        // redeem step present the receiver with a picker across
+        // Companies. Silent drop stays the response shape so the
+        // endpoint keeps its enum-resistance posture; the aggregate
+        // side-effects (cross-tenant intent rows, multi-email
+        // fanout) do not fire.
+        if portal_id.is_none() && slug.is_none() {
+            tracing::info!(
+                "login-link request without portal_id/slug silently dropped (MAPPS-637)"
+            );
+            return Ok(());
+        }
+        let scoped_target: Option<(Uuid, Option<Uuid>)> = {
             let resolved: Option<(Uuid, Uuid)> = sqlx::query_as(
                 r#"
                 SELECT co.tenant_id, co.id
@@ -827,13 +841,10 @@ impl ContactAuthService {
             let Some((tid, cid)) = resolved else {
                 return Ok(());
             };
-            // Only scope the contact lookup to a specific Company when
-            // portal_id (or the slug on the compat path) explicitly
-            // pinned one.
-            let company_scope: Option<Uuid> = if portal_id.is_some() { Some(cid) } else { None };
-            Some((tid, company_scope))
-        } else {
-            None
+            // MAPPS-637: always scope to the one resolved Company so
+            // the redeem step is auto-mint (single Company, no
+            // picker) even for the legacy slug entry.
+            Some((tid, Some(cid)))
         };
 
         // Per-IP rate limit. Silent drop shape. Fires before either
@@ -862,36 +873,15 @@ impl ContactAuthService {
             }
         }
 
-        // Resolve which tenants + optional Company scopes this request
-        // should fan out over. Explicit slug/portal_id -> the one
-        // resolved tenant. Neither supplied -> cross-tenant email
-        // discovery: match any active-tenant Company that has a portal
-        // contact with this email, mint one intent per tenant. Zero
-        // matches on either branch = zero intents = still 204 upstream
-        // (enum-resistant).
-        let targets: Vec<(Uuid, Option<Uuid>)> = if let Some((tid, cid)) = scoped_target {
-            vec![(tid, cid)]
-        } else {
-            let rows: Vec<(Uuid,)> = sqlx::query_as(
-                r#"
-                SELECT DISTINCT c.tenant_id
-                FROM contacts c
-                INNER JOIN companies co ON co.id = c.company_id
-                INNER JOIN tenants t ON t.id = c.tenant_id
-                WHERE t.status = 'active'
-                  AND LOWER(c.email) = LOWER($1)
-                  AND c.is_portal_user = TRUE
-                  AND co.portal_slug IS NOT NULL
-                "#,
-            )
-            .bind(email)
-            .fetch_all(self.db.migrator_pool())
-            .await?;
-            rows.into_iter().map(|(tid,)| (tid, None)).collect()
+        // MAPPS-637: post-fix this is always exactly one target -
+        // the (tenant, Company) the caller's portal_id / slug
+        // resolved to. Kept as a Vec of one so the downstream loop
+        // shape stays unchanged (single site vs. many, no forking
+        // per call site).
+        let targets: Vec<(Uuid, Option<Uuid>)> = match scoped_target {
+            Some(t) => vec![t],
+            None => return Ok(()),
         };
-        if targets.is_empty() {
-            return Ok(());
-        }
 
         // Per-email rate limit: same counter shape as before, but now
         // summed across every matching tenant so an attacker cannot
@@ -1149,109 +1139,23 @@ impl ContactAuthService {
             });
         }
 
-        // Multi-match: mint the selection JWT + return the picker
-        // payload.
-        let candidate_contact_ids: Vec<Uuid> = candidates.iter().map(|c| c.0).collect();
-        let companies: Vec<LoginLinkCandidate> = candidates
-            .iter()
-            .map(
-                |(contact_id, _, _, _, company_name, portal_slug, _, _)| LoginLinkCandidate {
-                    contact_id: *contact_id,
-                    company_name: company_name.clone(),
-                    portal_slug: portal_slug.clone(),
-                },
-            )
-            .collect();
-        let selection_token =
-            self.mint_selection_token(intent_id, tenant_id, &candidate_contact_ids)?;
-        Ok(LoginLinkRedeemOutcome {
-            auto: None,
-            candidates: Some(LoginLinkCandidates {
-                selection_token,
-                companies,
-            }),
-        })
+        // MAPPS-637: multi-match is now an invalid-link outcome. The
+        // aggregate-by-email picker retired; a token that would have
+        // fed the picker is treated the same as an expired / unknown
+        // one. The caller must reach for their Portal ID and use the
+        // Portal-ID + password login path instead. Enum-resistant:
+        // returns the SAME "invalid" AppError the empty-candidates
+        // branch above produces, so a probe cannot distinguish
+        // "multi-match" from "expired".
+        Err(invalid())
     }
 
-    /// mokosh-contact-login prompt 010 (PMS-918): finish the multi-match
-    /// magic-link flow. Decodes the selection JWT, verifies that
-    /// `contact_id` is one of the ids that matched at redeem time
-    /// (prevents swapping to an unrelated contact), then mints a
-    /// contact session for that specific `contact_id`. MFA gate
-    /// mirrors the redeem path.
-    #[tracing::instrument(skip_all)]
-    pub async fn select_login_candidate(
-        &self,
-        selection_token: &str,
-        contact_id: Uuid,
-        user_agent: Option<&str>,
-        ip: Option<IpAddr>,
-    ) -> AppResult<ContactLoginResponse> {
-        let invalid = || AppError::BadRequest("This link is invalid or has expired".to_string());
-
-        let claims = self
-            .decode_selection_token(selection_token)
-            .map_err(|_| invalid())?;
-        if !claims.candidate_contact_ids.contains(&contact_id) {
-            return Err(invalid());
-        }
-
-        // Belt-and-braces re-check: tenant must still be active + the
-        // contact must still be a portal user + its Company still has
-        // a portal_slug. Any change between redeem and select folds
-        // to the same generic invalid error.
-        #[allow(clippy::type_complexity)]
-        let row: Option<(Uuid, String, Option<String>, String, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT c.company_id, c.email, c.portal_mfa_secret,
-                   co.portal_slug, c.portal_password_hash
-            FROM contacts c
-            INNER JOIN companies co ON co.id = c.company_id
-            INNER JOIN tenants t ON t.id = c.tenant_id
-            WHERE c.id = $1
-              AND c.tenant_id = $2
-              AND c.is_portal_user = TRUE
-              AND t.status = 'active'
-              AND co.portal_slug IS NOT NULL
-            "#,
-        )
-        .bind(contact_id)
-        .bind(claims.tid)
-        .fetch_optional(self.db.migrator_pool())
-        .await?;
-        let Some((company_id, email, mfa_secret, portal_slug, pwd_hash)) = row else {
-            return Err(invalid());
-        };
-        if mfa_secret.is_some() {
-            return Ok(ContactLoginResponse {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expires_at: Utc::now(),
-                contact: None,
-                mfa_required: true,
-                password_setup_url: None,
-            });
-        }
-        // Option-1 first-login gate: same shape as redeem_login_link's
-        // single-match branch. A contact reached via the multi-Company
-        // picker who has never set a password gets bounced to the
-        // set-password page before the session is minted.
-        if pwd_hash.is_none() {
-            let url = self
-                .mint_password_setup_url(claims.tid, contact_id, &portal_slug)
-                .await?;
-            return Ok(ContactLoginResponse {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expires_at: Utc::now(),
-                contact: None,
-                mfa_required: false,
-                password_setup_url: Some(url),
-            });
-        }
-        self.mint_session_for_contact(claims.tid, contact_id, company_id, &email, user_agent, ip)
-            .await
-    }
+    // MAPPS-637: `select_login_candidate` retired. The multi-match
+    // magic-link picker + its "one selection token → any of N
+    // contacts" primitive were the aggregate-by-email hazard
+    // MAPPS-636 removed on the client. Retiring the server method
+    // + the selection-token machinery closes the wire path a
+    // non-SPA client could still hit.
 
     /// mokosh-contact-login option-1 first-login gate: mint a fresh
     /// portal_setup_tokens row for `contact_id` and return the
@@ -1339,45 +1243,9 @@ impl ContactAuthService {
         })
     }
 
-    fn mint_selection_token(
-        &self,
-        intent_id: Uuid,
-        tenant_id: Uuid,
-        candidate_contact_ids: &[Uuid],
-    ) -> AppResult<String> {
-        let now = Utc::now();
-        let claims = ContactLoginSelectClaims {
-            intent_id,
-            tid: tenant_id,
-            candidate_contact_ids: candidate_contact_ids.to_vec(),
-            token_type: LOGIN_LINK_TOKEN_TYP.to_string(),
-            iat: now.timestamp(),
-            exp: (now + Duration::minutes(LOGIN_SELECTION_TOKEN_TTL_MIN)).timestamp(),
-        };
-        encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
-        )
-        .map_err(|e| AppError::Internal(format!("jwt encode: {e}")))
-    }
-
-    fn decode_selection_token(&self, token: &str) -> AppResult<ContactLoginSelectClaims> {
-        let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-        validation.validate_exp = true;
-        validation.required_spec_claims.clear();
-        validation.required_spec_claims.insert("exp".to_string());
-        let data = decode::<ContactLoginSelectClaims>(
-            token,
-            &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
-            &validation,
-        )
-        .map_err(|_| AppError::Unauthorized)?;
-        if data.claims.token_type != LOGIN_LINK_TOKEN_TYP {
-            return Err(AppError::Unauthorized);
-        }
-        Ok(data.claims)
-    }
+    // MAPPS-637: selection-token mint + decode helpers retired
+    // alongside `select_login_candidate` above. Nothing on the wire
+    // reads or writes `ContactLoginSelectClaims` any more.
 
     /// mokosh-contact-login prompt 004: fail-closed check that the
     /// contact-portal's owning tenant is `status = 'active'`. Called
