@@ -159,6 +159,48 @@ pub fn dec(s: &str) -> Decimal {
     s.parse().expect("parse Decimal literal")
 }
 
+/// A storage root private to this test binary's run, exported as
+/// `ATTACHMENT_DIR`.
+///
+/// Nine suites used to name a fixed path under `/tmp` (`/tmp/mokosh-pms923-test`
+/// and friends). `/tmp` is world-writable with the sticky bit, so whichever OS
+/// user ran the suite FIRST on a host owned that directory, and `LocalStore`
+/// created it with that process's umask. A second user on the same host then
+/// could not write into it, `StorageConfig` failed with `Permission denied`,
+/// and the API surfaced a 500 - which reads as a defect in the storage seam and
+/// costs a triage cycle before anyone thinks to `ls -ld /tmp`. CI never saw it,
+/// because each job gets a fresh container, so it only ever bit the place it
+/// was most expensive to diagnose.
+///
+/// One root per binary rather than one per test case, because `ATTACHMENT_DIR`
+/// is process-global env and `#[sqlx::test]` cases within a binary run
+/// concurrently: a case that gave itself a private root would change the root
+/// under its neighbours mid-run. Every case in a binary therefore shares this
+/// one, which is safe for the same reason the old shared path was safe within a
+/// suite - stored objects are named by uuid, so two cases cannot collide.
+///
+/// The `TempDir` is parked in a `OnceLock` to keep it alive for the whole run.
+/// A static is never dropped, so the directory outlives the process rather than
+/// being cleaned up; that is the deliberate trade. `tempfile` gives it a random
+/// name, so the property that actually matters - no two runs and no two users
+/// ever address the same directory - holds, and what is left behind is an empty
+/// tree under `/tmp` that the OS reclaims.
+#[allow(dead_code)]
+pub fn storage_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+    let dir = ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("mokosh-test-storage-")
+            .tempdir()
+            .expect("create a private storage root for this test run")
+    });
+    // Re-exported on every call, not only on the first: a suite may set other
+    // storage env beside this one, and the cost of being sure is one setenv.
+    std::env::set_var("ATTACHMENT_DIR", dir.path());
+    dir.path()
+}
+
 /// Bring up the API against `pool` on a random localhost port.
 ///
 /// `#[allow(dead_code)]` because each integration-test binary compiles its
