@@ -16,8 +16,6 @@
 
 mod common;
 
-use std::path::PathBuf;
-
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -191,7 +189,7 @@ async fn a_password_reaches_the_hasher_byte_identical(pool: PgPool) {
 #[sqlx::test]
 async fn a_multipart_body_reaches_the_handler_byte_identical(pool: PgPool) {
     // Own directory + generous cap: this suite only cares about the bytes.
-    std::env::set_var("ATTACHMENT_DIR", PathBuf::from("/tmp/mokosh-pms924-test"));
+    common::storage_root();
     std::env::set_var("ATTACHMENT_MAX_BYTES", "65536");
 
     let (admin_id, email, password) = common::seed_admin(&pool).await;

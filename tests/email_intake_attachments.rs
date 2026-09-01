@@ -41,11 +41,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Per-suite attachment dir + a cap generous enough for the tiny test
+/// Per-run attachment dir + a cap generous enough for the tiny test
 /// blobs. Blob filenames on disk are unique uuids so parallel tests do
 /// not collide.
 fn install_test_attachment_env() {
-    std::env::set_var("ATTACHMENT_DIR", "/tmp/mokosh-pms450-test");
+    common::storage_root();
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1048576");
 }
 

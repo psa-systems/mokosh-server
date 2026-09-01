@@ -30,7 +30,7 @@ use uuid::Uuid;
 /// 5 MiB: the oversize case below is refused at 4 KiB, well under 5 MiB,
 /// because lowering `ATTACHMENT_MAX_BYTES` lowers the inline cap with it.
 fn install_test_attachment_env() {
-    std::env::set_var("ATTACHMENT_DIR", "/tmp/mokosh-pms941-test");
+    common::storage_root();
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1024");
 }
 

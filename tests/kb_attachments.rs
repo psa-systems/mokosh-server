@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// Set before `common::boot`, because `KbAttachmentConfig::from_env` is read
 /// when the router is built.
 fn install_test_attachment_env() {
-    std::env::set_var("ATTACHMENT_DIR", "/tmp/mokosh-pms923-test");
+    common::storage_root();
 }
 
 /// A one-pixel PNG, so the fixture is a real image of the allowed type.
