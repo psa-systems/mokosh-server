@@ -682,6 +682,73 @@ mod tests {
         );
     }
 
+    /// And one place picks the root on the test side, for the same reason.
+    ///
+    /// Nine Postgres-backed suites each named a fixed path under `/tmp`. `/tmp`
+    /// is world-writable with the sticky bit, so the first OS user to run a
+    /// suite on a host owned the directory and the second got `Permission
+    /// denied`, surfaced through the API as a 500 that reads as a defect in
+    /// this module. Each of those nine was written by copying the suite beside
+    /// it, and three of them landed after the defect was already filed, so the
+    /// rule is enforced here rather than left to the next person to notice.
+    ///
+    /// `tests/common/mod.rs` is the exception because it is the helper: it
+    /// hands out a `tempfile` root unique to the run and exports the variable.
+    /// A suite that needs the path calls it rather than composing one.
+    ///
+    /// The needle carries its quotes so this reads as "no suite names the
+    /// variable in code". `set_var` takes the key as a string literal and so
+    /// does a `const` holding it, while a doc comment naming the variable in
+    /// backticks is ordinary prose and stays allowed: two suites explain when
+    /// the store reads it, which is worth keeping.
+    #[test]
+    fn only_the_test_harness_picks_a_storage_root() {
+        let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        // The crate compiles without its integration suites (the release image
+        // never copies them), so an absent directory is nothing to report.
+        if !tests.is_dir() {
+            return;
+        }
+
+        let needle = concat!("\"ATTACHMENT", "_DIR\"");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut pending = vec![tests.clone()];
+
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read the tests directory") {
+                let entry = entry.expect("read a tests directory entry");
+                let path = entry.path();
+                if entry.file_type().expect("read entry type").is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&tests)
+                    .expect("path came from this walk")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if relative == "common/mod.rs" {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("read a test source file");
+                if body.contains(needle) {
+                    offenders.push(relative);
+                }
+            }
+        }
+
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these suites name ATTACHMENT_DIR in code instead of calling \
+             common::storage_root(), which is how a fixed path under a \
+             world-writable directory keeps coming back: {offenders:?}"
+        );
+    }
+
     /// A move is one operation, so nothing can observe a half-moved object.
     ///
     /// This is the property the PMS-960 mover depends on and the reason
