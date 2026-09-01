@@ -149,6 +149,22 @@ pub trait ObjectStore: Send + Sync {
     /// the same thing as a deleted one.
     async fn delete(&self, key: &ObjectKey) -> AppResult<()>;
     async fn exists(&self, key: &ObjectKey) -> AppResult<bool>;
+    /// Move an object from one key to another, atomically.
+    ///
+    /// Exists for the PMS-960 mover, and is a primitive rather than a
+    /// `read` + `put` + `delete` at the call site for one reason: a crash
+    /// part-way through the `put` leaves a truncated object at the
+    /// destination, and nothing afterwards can tell that from a completed
+    /// move, so a corrupt image would be served forever. A rename cannot
+    /// half-happen. The S3 backend (PMS-958) has its own atomic answer
+    /// (server-side copy, then delete), which is exactly why the choice
+    /// belongs to the backend and not to the caller.
+    ///
+    /// Unlike [`delete`](Self::delete) this is NOT best-effort: a missing
+    /// source is an error, because the only caller is moving something it
+    /// has just established is there and a silent success would mark the
+    /// object migrated when nothing moved.
+    async fn rename(&self, from: &ObjectKey, to: &ObjectKey) -> AppResult<()>;
 }
 
 /// Where the local backend keeps things.
@@ -302,6 +318,21 @@ impl ObjectStore for LocalStore {
         let path = self.path_for(key)?;
         Ok(tokio::fs::metadata(&path).await.is_ok())
     }
+
+    async fn rename(&self, from: &ObjectKey, to: &ObjectKey) -> AppResult<()> {
+        let from_path = self.path_for(from)?;
+        let to_path = self.path_for(to)?;
+        if let Some(parent) = to_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::Internal(format!("could not create storage dir: {e}")))?;
+        }
+        // Same root, so same filesystem, so this is the kernel's atomic
+        // rename rather than a copy that can be interrupted.
+        tokio::fs::rename(&from_path, &to_path)
+            .await
+            .map_err(|e| AppError::Internal(format!("could not move object: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +452,48 @@ mod tests {
             1,
             "and it reads it exactly once"
         );
+    }
+
+    /// A move is one operation, so nothing can observe a half-moved object.
+    ///
+    /// This is the property the PMS-960 mover depends on and the reason
+    /// `rename` is on the trait at all: a `read` + `put` + `delete` at the call
+    /// site can be interrupted between the write and the unlink, and what it
+    /// leaves behind at the destination is indistinguishable from a finished
+    /// move.
+    #[tokio::test]
+    async fn a_move_carries_the_bytes_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = LocalStore::new(StorageConfig {
+            root: dir.path().to_path_buf(),
+        });
+        let from = ObjectKey::ticket_attachment(TENANT, OBJECT);
+        let to = ObjectKey::ticket_attachment(OTHER, OBJECT);
+        s.put(&from, b"bytes").await.expect("put");
+
+        s.rename(&from, &to).await.expect("rename");
+
+        assert!(!s.exists(&from).await.expect("exists"), "source is gone");
+        assert_eq!(s.read(&to).await.expect("read"), b"bytes".to_vec());
+    }
+
+    /// And a source that is not there is an error, unlike a delete.
+    ///
+    /// The caller is moving something it has just established exists; a silent
+    /// success would let it record the object as migrated when nothing moved.
+    #[tokio::test]
+    async fn moving_something_that_is_not_there_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = LocalStore::new(StorageConfig {
+            root: dir.path().to_path_buf(),
+        });
+        assert!(s
+            .rename(
+                &ObjectKey::ticket_attachment(TENANT, OBJECT),
+                &ObjectKey::ticket_attachment(OTHER, OBJECT),
+            )
+            .await
+            .is_err());
     }
 
     /// And it is relative, which is a contract rather than a preference.
