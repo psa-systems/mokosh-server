@@ -79,7 +79,8 @@ pub fn create_api_router(
     // `settings_routes` so the admin email-settings endpoint can hot-swap it.
     shared_mailer: Arc<crate::utils::email::SharedMailer>,
     // 32-byte AES-256-GCM key. Used for at-rest encryption of any
-    // per-tenant secret material (today: payment-gateway configs).
+    // per-tenant secret material (payment-gateway configs, and the legacy
+    // TOTP shared secret on `users.mfa_secret` since PMS-871).
     encryption_key: [u8; 32],
     // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
     // Verified as `hex(hmac_sha256(body, secret))` against the
@@ -162,7 +163,10 @@ pub fn create_api_router(
     // exists. `bunyip_verifier` is `Some` exactly when OIDC_ISSUER and
     // OIDC_AUDIENCE are configured, so it is the signal for "SSO is set up
     // here" rather than a guess from the mode alone.
-    .with_sso_mounted(sso_mounted);
+    .with_sso_mounted(sso_mounted)
+    // PMS-871: `users.mfa_secret` is AES-256-GCM at rest under the same key
+    // the payment-gateway configs use, so the auth service holds it too.
+    .with_encryption_key(encryption_key);
     #[cfg(feature = "multi-tenant")]
     let tenant_service = TenantService::new(db.clone());
     // PMS-136: ContactService emails a `/portal/set-password` setup link when
