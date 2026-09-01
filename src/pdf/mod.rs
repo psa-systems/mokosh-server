@@ -45,8 +45,10 @@
 
 use printpdf::{
     BuiltinFont, Color, Line, LinePoint, Mm, Op, PdfDocument, PdfFontHandle, PdfPage,
-    PdfSaveOptions, Point, Pt, Rgb, TextItem,
+    PdfSaveOptions, Point, Pt, RawImage, Rgb, TextItem, XObjectId, XObjectTransform,
 };
+
+use sha2::{Digest, Sha256};
 
 use crate::utils::error::AppResult;
 
@@ -83,6 +85,9 @@ const MIN_COLUMN_MM: f32 = 16.0;
 pub enum Body {
     /// Label / value pairs, for the header block a report opens with.
     Fields(Vec<(String, String)>),
+    /// Plain lines, for an address block: the issuer's, or the one an invoice
+    /// is billed to (PMS-911). Not `Fields`, because an address has no labels.
+    Lines(Vec<String>),
     /// A grid. The header row repeats when the table crosses a page.
     Table {
         headers: Vec<String>,
@@ -96,11 +101,26 @@ pub struct Section {
     pub body: Body,
 }
 
+/// An image placed in the top-right of the first page (PMS-911).
+///
+/// Bytes rather than a path, because the caller is the one that knows where an
+/// object lives and this module deliberately never touches storage. For an
+/// invoice those bytes come out of the branding snapshot, so they are the logo
+/// as it was when the invoice was sent rather than whatever is current.
+pub struct Logo {
+    pub bytes: Vec<u8>,
+    /// The box it is fitted inside, preserving aspect ratio.
+    pub max_width_mm: f32,
+    pub max_height_mm: f32,
+}
+
 /// What to render. Built by a caller that knows the data, never by this module.
 pub struct Document {
     pub title: String,
     /// A period, a scope, whatever names this particular run.
     pub subtitle: Option<String>,
+    /// PMS-911: the issuer's mark, top right of the first page.
+    pub logo: Option<Logo>,
     pub sections: Vec<Section>,
 }
 
@@ -109,8 +129,25 @@ impl Document {
         Self {
             title: title.into(),
             subtitle: None,
+            logo: None,
             sections: Vec::new(),
         }
+    }
+
+    /// PMS-911: an optional mark. `None` is the ordinary case, not a fallback:
+    /// an MSP that never uploaded one still gets a valid document with its name
+    /// as text.
+    pub fn logo(mut self, logo: Option<Logo>) -> Self {
+        self.logo = logo;
+        self
+    }
+
+    pub fn lines(mut self, heading: impl Into<String>, lines: Vec<String>) -> Self {
+        self.sections.push(Section {
+            heading: Some(heading.into()),
+            body: Body::Lines(lines),
+        });
+        self
     }
 
     pub fn subtitle(mut self, subtitle: impl Into<String>) -> Self {
@@ -169,12 +206,32 @@ pub fn to_win_ansi(s: &str) -> String {
 /// `AppResult` so a backend that can fail (an embedded font that will not
 /// parse, once PMS-959 wants one) does not change every call site.
 pub fn render(document: &Document) -> AppResult<Vec<u8>> {
+    let mut doc = PdfDocument::new(&to_win_ansi(&document.title));
     let mut layout = Layout::new();
 
+    // The logo is placed before the title so the title block can start below
+    // it if it is the taller of the two. A logo that will not decode is
+    // dropped rather than fatal: an invoice with no mark is a valid invoice,
+    // and refusing to render one because an image is corrupt would withhold
+    // the document over its decoration.
+    let logo_height = match &document.logo {
+        Some(logo) => match place_logo(&mut doc, &mut layout, logo) {
+            Ok(height) => height,
+            Err(reason) => {
+                tracing::warn!(reason = %reason, "pdf: could not place the logo; rendering without it");
+                0.0
+            }
+        },
+        None => 0.0,
+    };
+
+    let title_top = layout.y_mm;
     layout.line(&document.title, BuiltinFont::HelveticaBold, TITLE_PT);
     if let Some(subtitle) = &document.subtitle {
         layout.line(subtitle, BuiltinFont::Helvetica, BODY_PT);
     }
+    // Whichever of the two blocks is taller decides where the body starts.
+    layout.y_mm = layout.y_mm.min(title_top - logo_height);
     layout.gap(4.0);
 
     for section in &document.sections {
@@ -186,14 +243,127 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
         }
         match &section.body {
             Body::Fields(pairs) => layout.fields(pairs),
+            Body::Lines(lines) => layout.text_block(lines),
             Body::Table { headers, rows } => layout.table(headers, rows),
         }
     }
 
-    let mut doc = PdfDocument::new(&to_win_ansi(&document.title));
-    Ok(doc
+    let mut bytes = doc
         .with_pages(layout.finish())
-        .save(&PdfSaveOptions::default(), &mut Vec::new()))
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    stamp_deterministic_id(&mut bytes);
+    Ok(bytes)
+}
+
+/// Replace the random `/ID` printpdf writes with one derived from the file.
+///
+/// PMS-911 requires that a rebrand leaves an already-sent invoice unchanged,
+/// which is only checkable if rendering the same document twice gives the same
+/// bytes. Everything printpdf emits is deterministic already - the document
+/// dates default to the unix epoch rather than `now()`, and deflate is
+/// reproducible - except the trailer's file identifier, which is two
+/// unconditionally random 32-character strings with no option to seed or
+/// suppress them (`serialize.rs` calls `random_character_string_32` twice).
+///
+/// So it is rewritten afterwards, from a digest of the file with the two
+/// identifier slots blanked. Both halves get the same value, which is what the
+/// PDF specification says a newly created file should carry anyway: the pair is
+/// "original" and "current", and for a document that has never been updated
+/// they are equal.
+///
+/// The replacement is the same length as what it replaces, so no byte offset
+/// moves and the cross-reference table stays valid. A change in printpdf that
+/// altered the identifier's length or literal syntax would stop this matching,
+/// and the function would leave the file untouched rather than corrupt it -
+/// caught by `rendering_is_deterministic` rather than shipped.
+fn stamp_deterministic_id(bytes: &mut [u8]) {
+    const ID_LEN: usize = 32;
+    let Some(open) = find(bytes, b"/ID[(") else {
+        return;
+    };
+    let first = open + b"/ID[(".len();
+    let second = first + ID_LEN + b")(".len();
+    let end = second + ID_LEN;
+    if end + b")]".len() > bytes.len()
+        || &bytes[first + ID_LEN..second] != b")("
+        || &bytes[end..end + 2] != b")]"
+    {
+        return;
+    }
+
+    // Blank both slots first so the digest is over a file that does not
+    // contain the value being computed.
+    for slot in [first, second] {
+        bytes[slot..slot + ID_LEN].fill(b'A');
+    }
+    let digest = <Sha256 as Digest>::digest(&bytes[..]);
+    let hex: String = digest
+        .iter()
+        .take(ID_LEN / 2)
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    for slot in [first, second] {
+        bytes[slot..slot + ID_LEN].copy_from_slice(hex.as_bytes());
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Decode a logo, register it, and draw it in the top-right corner.
+///
+/// Returns the height it occupied, so the caller can start the body below
+/// whichever of the logo and the title block reaches lower.
+///
+/// The image is scaled by DPI rather than by `scale_x` / `scale_y`, because
+/// printpdf derives an image's physical size from its pixel count and its DPI:
+/// asking for a width in millimetres is the same as asking for the DPI at which
+/// that many pixels measure that many millimetres.
+fn place_logo(doc: &mut PdfDocument, layout: &mut Layout, logo: &Logo) -> Result<f32, String> {
+    let image = RawImage::decode_from_bytes(&logo.bytes, &mut Vec::new())?;
+    let (px_w, px_h) = (image.width as f32, image.height as f32);
+    if px_w <= 0.0 || px_h <= 0.0 {
+        return Err("the image has no pixels".to_string());
+    }
+    // Fit inside the box, preserving aspect ratio.
+    let scale = (logo.max_width_mm / px_w).min(logo.max_height_mm / px_h);
+    let width_mm = px_w * scale;
+    let height_mm = px_h * scale;
+    let dpi = px_w * 25.4 / width_mm;
+
+    // NOT `doc.add_image`, which mints a random `XObjectId`. That id becomes
+    // the resource NAME in the page's dictionary and in its content stream, so
+    // a random one makes two renders of the same document differ in a
+    // compressed stream that cannot be patched afterwards - which is what
+    // `rendering_is_deterministic` caught. A digest of the image is
+    // deterministic AND collision-free, so two documents carrying the same
+    // logo agree and two carrying different ones do not.
+    let digest = <Sha256 as Digest>::digest(&logo.bytes);
+    let name: String = digest.iter().take(12).map(|b| format!("{b:02X}")).collect();
+    let id = XObjectId(format!("IMG{name}"));
+    doc.resources
+        .xobjects
+        .map
+        .insert(id.clone(), printpdf::XObject::Image(image));
+    let left = PAGE_WIDTH_MM - MARGIN_MM - width_mm;
+    layout.ops.push(Op::UseXobject {
+        id,
+        transform: XObjectTransform {
+            translate_x: Some(Mm(left).into()),
+            // The origin is the bottom-left of the image, so subtract its
+            // height from the top of the content area.
+            translate_y: Some(Mm(layout.y_mm - height_mm).into()),
+            rotate: None,
+            scale_x: None,
+            scale_y: None,
+            dpi: Some(dpi),
+            no_auto_scale: false,
+        },
+    });
+    Ok(height_mm)
 }
 
 fn row_height(size_pt: f32) -> f32 {
@@ -334,6 +504,15 @@ impl Layout {
                 BuiltinFont::HelveticaBold,
                 BODY_PT,
             );
+            self.advance(row_height(BODY_PT));
+        }
+    }
+
+    /// PMS-911: plain lines at the left margin, for an address block.
+    fn text_block(&mut self, lines: &[String]) {
+        for line in lines {
+            self.keep_together(row_height(BODY_PT));
+            self.text_at(MARGIN_MM, line, BuiltinFont::Helvetica, BODY_PT);
             self.advance(row_height(BODY_PT));
         }
     }
@@ -486,6 +665,90 @@ mod tests {
             "not an empty shell: {} bytes",
             bytes.len()
         );
+    }
+
+    /// A one-pixel PNG: a real image of a type `utils::inline_image` accepts,
+    /// so the codec that decodes it here is one an upload can actually produce.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn logo() -> Logo {
+        Logo {
+            bytes: PNG.to_vec(),
+            max_width_mm: 40.0,
+            max_height_mm: 20.0,
+        }
+    }
+
+    /// Rendering the same document twice produces the same bytes.
+    ///
+    /// PMS-911 rests on this: "a later rebrand leaves the rendered invoice
+    /// byte-identical" is only checkable if rendering is deterministic in the
+    /// first place. It is, because printpdf's `PdfDocumentInfo::default()` sets
+    /// the creation, modification and metadata dates to the unix epoch rather
+    /// than to `now()`. That is a property of a dependency rather than of this
+    /// code, which is exactly why it is pinned: an upgrade that started
+    /// stamping the real time would break the acceptance criterion silently,
+    /// and every test of it would keep passing while comparing two documents
+    /// rendered in the same second.
+    #[test]
+    fn rendering_is_deterministic() {
+        let first = render(&sample()).expect("render");
+        let second = render(&sample()).expect("render");
+        assert_eq!(first, second, "two renders of one document must agree");
+
+        let with_logo = render(&sample().logo(Some(logo()))).expect("render");
+        assert_eq!(
+            with_logo,
+            render(&sample().logo(Some(logo()))).expect("render"),
+            "and so must two renders carrying an image"
+        );
+        assert_ne!(
+            first, with_logo,
+            "a logo has to actually reach the document, or the test above proves nothing"
+        );
+    }
+
+    /// An unreadable logo costs the mark, not the document.
+    ///
+    /// Refusing to render an invoice because its decoration will not decode
+    /// would withhold a commercial document over an image.
+    #[test]
+    fn a_logo_that_will_not_decode_is_dropped_rather_than_fatal() {
+        let broken = Logo {
+            bytes: b"this is not an image".to_vec(),
+            max_width_mm: 40.0,
+            max_height_mm: 20.0,
+        };
+        let rendered = render(&sample().logo(Some(broken))).expect("still renders");
+        assert!(rendered.starts_with(b"%PDF-"));
+        assert_eq!(
+            rendered,
+            render(&sample()).expect("render"),
+            "and what comes out is exactly the document with no logo"
+        );
+    }
+
+    /// A block of lines, for an address, which has no labels to hang on
+    /// `Fields`.
+    #[test]
+    fn an_address_block_renders_as_lines() {
+        let doc = Document::new("Invoice").lines(
+            "From",
+            vec![
+                "Acme IT Services Pty Ltd".into(),
+                "12 Example Street".into(),
+                "Sydney NSW 2000".into(),
+            ],
+        );
+        let bytes = render(&doc).expect("render");
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(bytes.len() > render(&Document::new("Invoice")).expect("render").len());
     }
 
     /// An empty document still renders one page. A zero-page PDF parses in some

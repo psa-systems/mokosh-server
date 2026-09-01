@@ -2499,6 +2499,18 @@ impl BillingService {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
 
+        // PMS-911: the MSP's identity as it stands right now, frozen onto the
+        // invoice on the transition that freezes the invoice. In this
+        // transaction and not in the `just_sent` hook below it, because that
+        // hook is post-commit and best-effort: an invoice must never freeze
+        // carrying no identity.
+        let issuer_snapshot = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none()
+        {
+            Some(Self::freeze_issuer(&mut tx, tenant_id).await?)
+        } else {
+            None
+        };
+
         sqlx::query(
             r#"
             UPDATE invoices SET
@@ -2517,6 +2529,10 @@ impl BillingService {
                 balance_due        = $14,
                 sent_at            = $15,
                 payment_term_id    = COALESCE($16, payment_term_id),
+                -- PMS-911: COALESCE so it is written once, on the send that
+                -- freezes the invoice, and never overwritten by a later update.
+                -- A snapshot that could be rewritten would be no snapshot.
+                issuer_snapshot    = COALESCE(issuer_snapshot, $17),
                 updated_at         = NOW()
             WHERE id = $1
             "#,
@@ -2537,6 +2553,13 @@ impl BillingService {
         .bind(balance_due)
         .bind(sent_at)
         .bind(request.payment_term_id)
+        .bind(
+            issuer_snapshot
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| AppError::Internal(format!("issuer snapshot: {e}")))?,
+        )
         .execute(&mut *tx)
         .await?;
 
@@ -2573,6 +2596,93 @@ impl BillingService {
         }
 
         self.get_invoice(tenant_id, invoice_id).await
+    }
+
+    /// PMS-911: read the tenant's live branding and freeze it.
+    ///
+    /// `tenants` is the isolation root and is RLS-exempt (migration 038), so
+    /// this reads it through the caller's own transaction with the tenant id in
+    /// the predicate rather than needing a privileged pool.
+    ///
+    /// The logo store is built from the environment here rather than injected,
+    /// the way every other consumer of `crate::storage` does it, so this does
+    /// not widen a constructor that four call sites already use.
+    async fn freeze_issuer(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+    ) -> AppResult<crate::modules::billing::issuer::Issuer> {
+        let row: Option<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
+        // A branding document that will not destructure is an empty one, not a
+        // failure: an unreadable logo colour must not stop an invoice being
+        // sent.
+        let branding: mokosh_types::tenants::TenantBranding =
+            serde_json::from_value(branding).unwrap_or_default();
+        let logos = crate::modules::tenants::logo::TenantLogoStore::new(
+            crate::modules::tenants::logo::TenantLogoConfig::from_env(),
+        );
+        Ok(
+            crate::modules::billing::issuer::freeze(tenant_id.get(), &name, &branding, &logos)
+                .await,
+        )
+    }
+
+    /// PMS-911: the identity a rendered invoice should show.
+    ///
+    /// The frozen snapshot when there is one, and the tenant's live branding
+    /// when there is not - which is every invoice sent before PMS-911, and
+    /// every draft. A draft resolving live is right: it has not been sent, so
+    /// there is nothing to preserve yet.
+    pub async fn invoice_issuer(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<crate::modules::billing::issuer::Issuer> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let snapshot: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT issuer_snapshot FROM invoices WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        if let Some(value) = snapshot {
+            if let Ok(issuer) = serde_json::from_value(value) {
+                return Ok(issuer);
+            }
+        }
+        let row: Option<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
+        let branding: mokosh_types::tenants::TenantBranding =
+            serde_json::from_value(branding).unwrap_or_default();
+        Ok(crate::modules::billing::issuer::resolve(&name, &branding))
+    }
+
+    /// PMS-911: the tenant's identity as it stands now, for a document that is
+    /// not snapshotted (the statement).
+    pub async fn tenant_issuer(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<crate::modules::billing::issuer::Issuer> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
+        let branding: mokosh_types::tenants::TenantBranding =
+            serde_json::from_value(branding).unwrap_or_default();
+        Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
     /// PMS-711: best-effort outbound invoice "Pay Now" email. Short-circuits

@@ -43,6 +43,12 @@ const MAX_PHONE: usize = 40;
 const MAX_EMAIL: usize = 254;
 const MAX_PATH: usize = 200;
 const MAX_DOMAIN: usize = 253;
+/// PMS-911: long enough for a VAT number with spaces or a registration line,
+/// short enough that it cannot become a paragraph on an invoice.
+const MAX_TAX_ID: usize = 60;
+/// PMS-911: an address block on an invoice, bounded by both measures.
+const MAX_ADDRESS: usize = 300;
+const MAX_ADDRESS_LINES: usize = 6;
 /// PMS-896: same cap as `companies.website`, so the organisation's own web
 /// address and a client's are bounded alike.
 const MAX_URL: usize = 255;
@@ -117,7 +123,18 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
                 ))
             }
         }
-        "support_contact_name" | "company_name" => text(label, value, MAX_NAME).map(|_| ()),
+        "support_contact_name" | "company_name" | "legal_name" => {
+            text(label, value, MAX_NAME).map(|_| ())
+        }
+        // PMS-911: whatever identifier the MSP's jurisdiction requires on an
+        // invoice. Nothing parses it, so nothing validates its shape beyond
+        // being one printable line: a rule that accepted a VAT number and
+        // refused an ABN would be worse than no rule.
+        "tax_id" => text(label, value, MAX_TAX_ID).map(|_| ()),
+        // PMS-911: the one branding value that is legitimately multi-line,
+        // because an address is. Held to a line count as well as a length, so
+        // it stays an address block on an invoice rather than a paragraph.
+        "postal_address" => multiline(label, value, MAX_ADDRESS, MAX_ADDRESS_LINES).map(|_| ()),
         // PMS-896: the organisation's own web address. Held to the same rule as
         // a company's (`mokosh_types::contacts::validate_website`) rather than a
         // second copy of it: the SPA renders both as a link, so `javascript:`
@@ -171,15 +188,18 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
 const KNOWN_KEYS: &[&str] = &[
     "company_name",
     "favicon_url",
+    "legal_name",
     "logo_mime",
     "logo_url",
     "portal_domain",
+    "postal_address",
     "primary_color",
     "secondary_color",
     "accent_color",
     "support_contact_name",
     "support_email",
     "support_phone",
+    "tax_id",
     "website",
 ];
 
@@ -199,6 +219,34 @@ fn text<'a>(key: &str, value: &'a Value, max: usize) -> Result<&'a str, String> 
     }
     if s.chars().any(char::is_control) {
         return Err(format!("`{key}` must be a single line"));
+    }
+    Ok(s)
+}
+
+/// PMS-911: a string value rendered as several lines, for the one branding key
+/// that is an address. Bounded by line count as well as length, so it stays a
+/// block on an invoice; `\r` is folded away so a Windows paste does not become
+/// blank lines, and every other control character is still refused.
+fn multiline<'a>(
+    key: &str,
+    value: &'a Value,
+    max: usize,
+    max_lines: usize,
+) -> Result<&'a str, String> {
+    let Some(s) = value.as_str() else {
+        return Err(format!("`{key}` must be a string"));
+    };
+    if s.trim().is_empty() {
+        return Err(format!("`{key}` must not be blank; send null to clear it"));
+    }
+    if s.chars().count() > max {
+        return Err(format!("`{key}` must be at most {max} characters"));
+    }
+    if s.chars().any(|c| c.is_control() && c != '\n' && c != '\r') {
+        return Err(format!("`{key}` must not contain control characters"));
+    }
+    if s.replace('\r', "").lines().count() > max_lines {
+        return Err(format!("`{key}` must be at most {max_lines} lines"));
     }
     Ok(s)
 }
@@ -282,6 +330,9 @@ mod tests {
             "support_contact_name": "Dana",
             "website": "https://acme.example",
             "portal_domain": "portal.acme.example",
+            "legal_name": "Acme IT Services Pty Ltd",
+            "tax_id": "ABN 12 345 678 901",
+            "postal_address": "12 Example Street\nSuite 4\nSydney NSW 2000",
         });
         assert!(patch(full.clone()).is_ok());
         let fields: Vec<String> = full
@@ -356,6 +407,48 @@ mod tests {
         assert!(!err.contains("support_phone"), "unexpected: {err}");
         let err = validate_branding_value_as("support_email", "email", &json!("   ")).unwrap_err();
         assert!(err.contains("`email`"), "unexpected: {err}");
+    }
+
+    /// PMS-911: what an invoice has to show beyond a trading name.
+    ///
+    /// `tax_id` gets a length and nothing else on purpose: a rule that accepted
+    /// a VAT number and refused an ABN would be worse than no rule, because it
+    /// would block a real MSP from invoicing.
+    #[test]
+    fn an_invoice_identity_is_writable() {
+        assert!(patch(json!({ "legal_name": "Acme IT Services Pty Ltd" })).is_ok());
+        assert!(patch(json!({ "tax_id": "GB123456789" })).is_ok());
+        assert!(patch(json!({ "tax_id": "ABN 12 345 678 901" })).is_ok());
+        assert!(patch(json!({ "tax_id": "1234-5678" })).is_ok());
+        assert!(patch(json!({ "tax_id": "   " })).is_err());
+        assert!(patch(json!({ "tax_id": "x".repeat(MAX_TAX_ID + 1) })).is_err());
+        assert!(
+            patch(json!({ "legal_name": null })).is_ok(),
+            "an MSP trading under its own name clears it"
+        );
+    }
+
+    /// The one branding value that is several lines, because an address is.
+    #[test]
+    fn a_postal_address_is_the_one_multi_line_value() {
+        assert!(patch(json!({ "postal_address": "12 Example St\nSydney NSW 2000" })).is_ok());
+        assert!(
+            patch(json!({ "postal_address": "12 Example St\r\nSydney NSW 2000" })).is_ok(),
+            "a paste from Windows must not be refused for its line endings"
+        );
+        assert!(
+            patch(json!({ "postal_address": "a\nb\nc\nd\ne\nf\ng" })).is_err(),
+            "an address block is bounded by lines as well as characters"
+        );
+        assert!(
+            patch(json!({ "postal_address": "12 Example St\tSydney" })).is_err(),
+            "every control character except the newline is still refused"
+        );
+        assert!(patch(json!({ "postal_address": "x".repeat(MAX_ADDRESS + 1) })).is_err());
+        assert!(
+            patch(json!({ "support_contact_name": "Dana\nX" })).is_err(),
+            "and no other key gained a newline"
+        );
     }
 
     #[test]

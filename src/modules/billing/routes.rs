@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    response::{IntoResponse, Response},
     routing::{delete, get, put},
     Json, Router,
 };
@@ -37,6 +38,10 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
+        // PMS-911: the invoice as a client receives it. Rendered from the
+        // issuer snapshot frozen when it was sent, so a later rebrand cannot
+        // change a document somebody already holds.
+        .route("/invoices/{invoice_id}/pdf", get(get_invoice_pdf))
         // PMS-955: the product catalog. A price list, not an inventory
         // system, and not a second home for labour pricing (`/rate-cards`).
         .route("/products", get(list_products).post(create_product))
@@ -48,6 +53,10 @@ pub fn billing_routes(service: BillingService) -> Router {
         // and stores nothing: the statement is derived from the invoices,
         // payments, refunds and credit notes it summarises.
         .route("/statements", get(get_statement))
+        // PMS-911: the same read model as a document. Rendered from CURRENT
+        // branding, because PMS-954 made a statement reproducible rather than
+        // immutable and there is no statement row for a snapshot to hang off.
+        .route("/statements/pdf", get(get_statement_pdf))
         // PMS-953: the correction path for an issued invoice. No PUT and no
         // DELETE: a credit note is issued or voided, never edited, for the
         // reason the invoice it corrects is not.
@@ -483,6 +492,87 @@ async fn get_statement(
     query.validate()?;
     let statement = state.service.build_statement(user.tenant(), &query).await?;
     Ok(Json(statement))
+}
+
+/// PMS-911: `GET /invoices/{id}/pdf`.
+///
+/// Behind the same `RequireBilling` gate as the JSON it renders. A rendered
+/// invoice is the same financial data in another format, and a new output
+/// format must not become a side door around a permission (the PMS-350 lesson,
+/// applied again in PMS-876 for the report export).
+async fn get_invoice_pdf(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Response> {
+    let tenant = user.tenant();
+    let invoice = state.service.get_invoice(tenant, invoice_id).await?;
+    let issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
+    let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
+    let bytes = crate::pdf::render(&crate::modules::billing::documents::invoice(
+        &invoice, &issuer, logo,
+    ))?;
+    Ok(pdf_response(
+        bytes,
+        &format!("{}.pdf", invoice.invoice_number),
+    ))
+}
+
+/// PMS-911: `GET /statements/pdf`, taking the same query as `GET /statements`.
+///
+/// Finance-gated, unlike the JSON `GET /statements` beside it. That is not an
+/// inconsistency introduced here, it is the correct half of one that already
+/// exists: a statement is a company's whole financial account, and every
+/// sibling that carries the same class of data (`/invoices`, `/payments`,
+/// `/tax-rates`) is finance-gated. The JSON route and five others in this file
+/// are not, which is a pre-existing gap of the kind PMS-350 closed elsewhere
+/// and is tracked as PMS-962. Re-permissioning six existing endpoints does not
+/// belong in a branding change; shipping a seventh that repeats the mistake
+/// does not either.
+async fn get_statement_pdf(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Query(query): Query<StatementQuery>,
+) -> AppResult<Response> {
+    query.validate()?;
+    let tenant = user.tenant();
+    let statement = state.service.build_statement(tenant, &query).await?;
+    // Current branding, deliberately: see the module header of
+    // `billing::documents` for why a statement is not snapshotted.
+    let issuer = state.service.tenant_issuer(tenant).await?;
+    let logo = crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
+    let bytes = crate::pdf::render(&crate::modules::billing::documents::statement(
+        &statement, &issuer, logo,
+    ))?;
+    Ok(pdf_response(
+        bytes,
+        &format!(
+            "statement-{}-{}.pdf",
+            statement.period_start, statement.period_end
+        ),
+    ))
+}
+
+/// One place that says what a PDF response looks like, so the two routes above
+/// cannot drift. `attachment`, because a browser handed a PDF with no
+/// disposition renders it in place under an API URL.
+fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/pdf".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 // ============================================================================

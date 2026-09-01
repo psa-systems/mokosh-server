@@ -93,6 +93,18 @@ pub enum ObjectKind {
     /// B's object, which is true of every other kind and is now true of this
     /// one.
     KbAttachment { id: Uuid },
+    /// PMS-911: a copy of a logo, frozen at the moment an invoice was sent.
+    ///
+    /// Content-addressed by a digest of its own bytes, for a reason particular
+    /// to what it is for. The live tenant logo is written to ONE key per tenant
+    /// and overwritten on replace (`TenantLogoStore` says so outright), so an
+    /// invoice snapshot that held its ADDRESS would re-render with whatever
+    /// logo is current: replacing a logo would silently change every invoice
+    /// already sent, which is the thing PMS-911 exists to prevent. Holding the
+    /// bytes instead makes the snapshot immutable, and addressing them by
+    /// digest means one object is shared by every invoice sent while that logo
+    /// was current rather than a megabyte copied per invoice.
+    BrandingLogo { digest: String },
     /// Where a KB attachment used to live: flat, with no tenant anywhere in the
     /// path.
     ///
@@ -139,6 +151,16 @@ impl ObjectKey {
         Self {
             tenant_id,
             kind: ObjectKind::KbAttachment { id },
+        }
+    }
+
+    /// PMS-911: a frozen copy of a logo, named by a digest of its bytes.
+    pub fn branding_logo(tenant_id: Uuid, digest: impl Into<String>) -> Self {
+        Self {
+            tenant_id,
+            kind: ObjectKind::BrandingLogo {
+                digest: digest.into(),
+            },
         }
     }
 
@@ -286,6 +308,16 @@ impl ObjectKey {
             ObjectKind::KbAttachment { id } => PathBuf::from(self.tenant_id.to_string())
                 .join("kb-articles")
                 .join(id.to_string()),
+            ObjectKind::BrandingLogo { digest } => {
+                // The second caller-supplied string this module accepts, and
+                // held tighter than the logo extension: a digest is
+                // machine-generated, so anything that is not one is a bug or an
+                // attack rather than an unusual filename.
+                validate_digest(digest)?;
+                PathBuf::from(self.tenant_id.to_string())
+                    .join("branding")
+                    .join(digest)
+            }
             ObjectKind::LegacyKbAttachment { id } => {
                 PathBuf::from("kb-articles").join(id.to_string())
             }
@@ -310,6 +342,21 @@ fn validate_segment(segment: &str) -> AppResult<()> {
     {
         return Err(AppError::BadRequest(format!(
             "{segment:?} is not a usable file extension"
+        )));
+    }
+    Ok(())
+}
+
+/// Exactly a lowercase hex SHA-256, and nothing else.
+///
+/// An allowlist like [`validate_segment`], but narrower, because the only
+/// caller computes this value rather than receiving it: a digest that is not 64
+/// hex characters did not come from `Sha256`, so refusing it is refusing a bug
+/// rather than inconveniencing a user.
+fn validate_digest(digest: &str) -> AppResult<()> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::Internal(format!(
+            "{digest:?} is not a content digest"
         )));
     }
     Ok(())
@@ -384,6 +431,8 @@ mod tests {
     const TENANT: Uuid = Uuid::from_u128(0x1111_1111_1111_4111_8111_1111_1111_1111);
     const OTHER: Uuid = Uuid::from_u128(0x2222_2222_2222_4222_8222_2222_2222_2222);
     const OBJECT: Uuid = Uuid::from_u128(0x3333_3333_3333_4333_8333_3333_3333_3333);
+    /// A SHA-256 shaped string: 64 hex characters.
+    const DIGEST: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 
     /// Every layout this store knows, pinned.
     ///
@@ -417,6 +466,38 @@ mod tests {
                 .unwrap(),
             PathBuf::from(format!("/data/attachments/kb-articles/{OBJECT}"))
         );
+        assert_eq!(
+            s.path_for(&ObjectKey::branding_logo(TENANT, DIGEST))
+                .unwrap(),
+            PathBuf::from(format!("/data/attachments/{TENANT}/branding/{DIGEST}"))
+        );
+    }
+
+    /// A digest is machine-generated, so anything that is not one is refused
+    /// rather than sanitised. The traversal cases matter for the same reason
+    /// the logo extension's do: this is the only other caller-supplied string
+    /// that reaches a path.
+    #[test]
+    fn only_a_real_digest_names_a_branding_logo() {
+        let s = store();
+        for hostile in [
+            "../../etc/passwd",
+            "..",
+            "",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &format!("{}/x", "a".repeat(62)),
+            &"g".repeat(64),
+        ] {
+            assert!(
+                s.path_for(&ObjectKey::branding_logo(TENANT, hostile))
+                    .is_err(),
+                "{hostile:?} must be refused"
+            );
+        }
+        assert!(s
+            .path_for(&ObjectKey::branding_logo(TENANT, DIGEST.to_uppercase()))
+            .is_ok());
     }
 
     /// A KB attachment cannot land on a ticket attachment, which shares its
@@ -457,6 +538,14 @@ mod tests {
             s.path_for(&ObjectKey::kb_attachment(TENANT, OBJECT))
                 .unwrap(),
             s.path_for(&ObjectKey::kb_attachment(OTHER, OBJECT))
+                .unwrap()
+        );
+        // Two tenants can hold identical logo bytes; the digest is the same and
+        // the object still must not be.
+        assert_ne!(
+            s.path_for(&ObjectKey::branding_logo(TENANT, DIGEST))
+                .unwrap(),
+            s.path_for(&ObjectKey::branding_logo(OTHER, DIGEST))
                 .unwrap()
         );
     }
