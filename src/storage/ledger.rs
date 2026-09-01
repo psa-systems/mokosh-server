@@ -80,8 +80,28 @@ impl FileLedger {
         id: Uuid,
         file: FileRecord<'_>,
     ) -> AppResult<()> {
-        let path = key.relative_path()?.to_string_lossy().to_string();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::record_in_tx(&mut tx, tenant_id, key, id, file).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The same write, in a transaction the caller owns (PMS-959).
+    ///
+    /// The invoice document is stored inside the transaction that sends the
+    /// invoice, so its ledger row belongs there too: a row written from a
+    /// second connection would survive a rollback of the send and would claim
+    /// storage for a document that was never issued. It also avoids taking a
+    /// second pool connection while one is already held, which is a deadlock
+    /// waiting for a busy pool.
+    pub async fn record_in_tx(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: Uuid,
+        key: &ObjectKey,
+        id: Uuid,
+        file: FileRecord<'_>,
+    ) -> AppResult<()> {
+        let path = key.relative_path()?.to_string_lossy().to_string();
         sqlx::query(
             r#"
             INSERT INTO files (
@@ -105,9 +125,8 @@ impl FileLedger {
         .bind(file.uploaded_by_id)
         .bind(file.entity_type)
         .bind(file.entity_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(())
     }
 

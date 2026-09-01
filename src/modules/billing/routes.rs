@@ -65,6 +65,12 @@ pub fn billing_routes(service: BillingService) -> Router {
             get(list_credit_notes).post(create_credit_note),
         )
         .route("/credit-notes/{credit_note_id}", get(get_credit_note))
+        // PMS-959: the credit note as it was issued. Stored at creation, like
+        // the invoice document, because a credit note is never edited.
+        .route(
+            "/credit-notes/{credit_note_id}/pdf",
+            get(get_credit_note_pdf),
+        )
         .route(
             "/credit-notes/{credit_note_id}/void",
             axum::routing::post(void_credit_note),
@@ -512,14 +518,58 @@ async fn get_invoice_pdf(
 ) -> AppResult<Response> {
     let tenant = user.tenant();
     let invoice = state.service.get_invoice(tenant, invoice_id).await?;
-    let issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
-    let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
-    let bytes = crate::pdf::render(&crate::modules::billing::documents::invoice(
-        &invoice, &issuer, logo,
-    ))?;
+    // PMS-959: the bytes that were sent, when there are any. A live render is
+    // the fallback for a draft, which has not been sent and has nothing to
+    // preserve, and for an invoice sent before PMS-959, which is how those
+    // documents always rendered.
+    let bytes =
+        match crate::modules::billing::documents::read_issued(tenant.get(), invoice_id).await {
+            Some(stored) => stored,
+            None => {
+                let issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
+                let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
+                crate::pdf::render(&crate::modules::billing::documents::invoice(
+                    &invoice, &issuer, logo,
+                ))?
+            }
+        };
     Ok(pdf_response(
         bytes,
         &format!("{}.pdf", invoice.invoice_number),
+    ))
+}
+
+/// PMS-959: `GET /credit-notes/{id}/pdf`.
+///
+/// Always the stored bytes in practice: a credit note is issued at creation, so
+/// unlike an invoice there is no draft state and no document without one. The
+/// live render covers a credit note created before PMS-959 and nothing else.
+async fn get_credit_note_pdf(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(credit_note_id): Path<Uuid>,
+) -> AppResult<Response> {
+    let tenant = user.tenant();
+    let note = state
+        .service
+        .get_credit_note(tenant, credit_note_id)
+        .await?;
+    let bytes =
+        match crate::modules::billing::documents::read_issued(tenant.get(), credit_note_id).await {
+            Some(stored) => stored,
+            None => {
+                let issuer = state.service.tenant_issuer(tenant).await?;
+                let logo =
+                    crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
+                crate::pdf::render(&crate::modules::billing::documents::credit_note(
+                    &note, &issuer, logo,
+                ))?
+            }
+        };
+    Ok(pdf_response(
+        bytes,
+        &format!("{}.pdf", note.credit_note_number),
     ))
 }
 

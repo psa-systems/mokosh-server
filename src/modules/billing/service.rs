@@ -2563,6 +2563,38 @@ impl BillingService {
         .execute(&mut *tx)
         .await?;
 
+        // PMS-959: the document the client receives, kept as it was sent.
+        //
+        // Inside this transaction and after the UPDATE, so it renders the
+        // invoice that is about to commit rather than what a second connection
+        // could see, and so an invoice cannot reach `sent` without one. Storing
+        // it afterwards would leave exactly that gap; storing it before the row
+        // lock would let a concurrent edit make the document disagree with the
+        // invoice.
+        //
+        // Regenerating later would ALMOST work - branding is frozen (PMS-911)
+        // and `pdf::render` is deterministic - which is precisely the trap.
+        // What a re-render cannot survive is an edit to the renderer or the
+        // document layout, at which point every past invoice quietly reprints
+        // differently. These bytes are insurance against this codebase
+        // changing.
+        if let Some(issuer) = &issuer_snapshot {
+            let document = Self::load_invoice(&mut tx, tenant_id, invoice_id).await?;
+            let logo = crate::modules::billing::issuer::logo_bytes(tenant_id.get(), issuer).await;
+            let bytes = crate::pdf::render(&crate::modules::billing::documents::invoice(
+                &document, issuer, logo,
+            ))?;
+            crate::modules::billing::documents::store_issued(
+                &mut tx,
+                tenant_id.get(),
+                invoice_id,
+                &document.invoice_number,
+                "invoice_document",
+                &bytes,
+            )
+            .await?;
+        }
+
         // Audit row in the same transaction. PMS-117.
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
@@ -2674,10 +2706,19 @@ impl BillingService {
         tenant_id: TenantId,
     ) -> AppResult<crate::modules::billing::issuer::Issuer> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::tenant_issuer_in_tx(&mut tx, tenant_id).await
+    }
+
+    /// The same read, in a transaction the caller owns (PMS-959), for the
+    /// credit-note document rendered inside its creating transaction.
+    async fn tenant_issuer_in_tx(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+    ) -> AppResult<crate::modules::billing::issuer::Issuer> {
         let row: Option<(String, serde_json::Value)> =
             sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
                 .bind(tenant_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?;
         let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
         let branding: mokosh_types::tenants::TenantBranding =
@@ -2774,6 +2815,28 @@ impl BillingService {
         invoice_id: Uuid,
     ) -> AppResult<InvoiceResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::load_invoice(&mut tx, tenant_id, invoice_id).await
+    }
+
+    /// Assemble one invoice, in a transaction the caller owns (PMS-959).
+    ///
+    /// The whole of what an invoice response is, in one place with two entry
+    /// points: [`Self::get_invoice`] opens a transaction and calls this, and
+    /// the send path calls it on the transaction it is already holding, so the
+    /// document it renders is the invoice that is about to commit rather than
+    /// whatever a second connection can see. The alternative was a second
+    /// assembly beside this one, which is a second definition of what a
+    /// document contains and the first thing to drift.
+    ///
+    /// It resolves `company_name` and `payment_term_name` itself rather than
+    /// calling `enrich_invoices`, which opens its own transactions and cannot
+    /// be reached from inside one. `enrich_invoices` stays for the list paths,
+    /// where batching one query for many rows is the point.
+    async fn load_invoice(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<InvoiceResponse> {
         let row = sqlx::query_as::<_, InvoiceRow>(
             r#"
             SELECT id, tenant_id, invoice_number, company_id, billing_contact_id,
@@ -2788,7 +2851,7 @@ impl BillingService {
         )
         .bind(tenant_id)
         .bind(invoice_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Invoice".to_string()))?;
 
@@ -2802,14 +2865,26 @@ impl BillingService {
             "#,
         )
         .bind(invoice_id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
-        drop(tx);
 
         let mut resp: InvoiceResponse = row.into();
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
-        self.enrich_invoices(tenant_id, std::slice::from_mut(&mut resp))
+        resp.company_name =
+            sqlx::query_scalar("SELECT name FROM companies WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(resp.company_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some(term_id) = resp.payment_term_id {
+            resp.payment_term_name = sqlx::query_scalar(
+                "SELECT name FROM payment_terms WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(term_id)
+            .fetch_optional(&mut **tx)
             .await?;
+        }
         Ok(resp)
     }
 
@@ -3164,6 +3239,31 @@ impl BillingService {
 
         Self::recompute_invoice_balance(&mut tx, tenant_id, request.invoice_id).await?;
 
+        // PMS-959: a credit note is issued at creation and never edited
+        // (PMS-953), so this is its moment. Voiding one later does not replace
+        // the document: the customer holds what was issued, and a void is a
+        // status the credit note carries rather than a different document.
+        //
+        // The issuer is resolved live rather than snapshotted, because unlike
+        // an invoice a credit note has no separate freeze point to snapshot AT
+        // - it is frozen the instant it exists, and these bytes are the
+        // snapshot.
+        let note = Self::load_credit_note(&mut tx, tenant_id, credit_note_id).await?;
+        let issuer = Self::tenant_issuer_in_tx(&mut tx, tenant_id).await?;
+        let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
+        let bytes = crate::pdf::render(&crate::modules::billing::documents::credit_note(
+            &note, &issuer, logo,
+        ))?;
+        crate::modules::billing::documents::store_issued(
+            &mut tx,
+            tenant_id.get(),
+            credit_note_id,
+            &note.credit_note_number,
+            "credit_note_document",
+            &bytes,
+        )
+        .await?;
+
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM credit_notes t WHERE tenant_id = $1 AND id = $2",
         )
@@ -3273,6 +3373,20 @@ impl BillingService {
         credit_note_id: Uuid,
     ) -> AppResult<CreditNoteResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::load_credit_note(&mut tx, tenant_id, credit_note_id).await
+    }
+
+    /// Assemble one credit note, in a transaction the caller owns (PMS-959).
+    ///
+    /// Same shape and same reason as [`Self::load_invoice`]: the creating
+    /// transaction renders the document from what is about to commit, and there
+    /// is one assembly rather than two definitions of what a credit note
+    /// contains.
+    async fn load_credit_note(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        credit_note_id: Uuid,
+    ) -> AppResult<CreditNoteResponse> {
         let row: Option<CreditNoteRow> = sqlx::query_as(
             r#"
             SELECT cn.id, cn.tenant_id, cn.credit_note_number, cn.company_id,
@@ -3288,7 +3402,7 @@ impl BillingService {
         )
         .bind(credit_note_id)
         .bind(tenant_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let Some(row) = row else {
             return Err(AppError::NotFound("Credit note".to_string()));
@@ -3303,7 +3417,7 @@ impl BillingService {
             "#,
         )
         .bind(credit_note_id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         let mut response = CreditNoteResponse::from(row);
