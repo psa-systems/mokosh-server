@@ -159,6 +159,17 @@ pub async fn logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// PMS-911: the CURRENT logo, for a document that is not snapshotted.
+///
+/// A statement renders live (see `billing::documents`), so it reads the tenant
+/// logo where it lives rather than a frozen copy. `None` when there is no logo
+/// and when the file has gone, for the same reason as [`logo_bytes`].
+pub async fn live_logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
+    let mime = issuer.logo_mime.as_deref()?;
+    let logos = TenantLogoStore::new(crate::modules::tenants::logo::TenantLogoConfig::from_env());
+    logos.read(tenant_id, mime).await.ok()
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
