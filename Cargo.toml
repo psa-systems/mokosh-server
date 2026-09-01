@@ -180,6 +180,7 @@ dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc
 # ip2location), so it is pinned to the dunite rev that introduced it independently
 # of dunite-stripe-core above.
 dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c276ab187852578daad1c4b9c823579b194a" }
+printpdf = { version = "0.12.7", default-features = false }
 
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
