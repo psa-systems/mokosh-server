@@ -398,6 +398,14 @@ pub struct Company {
     pub notes: Option<String>,
     pub logo_url: Option<String>,
     pub portal_enabled: bool,
+    /// MAPPS-635 B: the 9-digit numeric Portal ID (`companies.portal_id`,
+    /// MAPPS-589 / PMS-928) if one has been assigned. `None` until a
+    /// portal-access grant lands.
+    pub portal_id: Option<i64>,
+    /// MAPPS-635 B: the legacy 16-char Crockford portal slug. Kept
+    /// during the Portal-ID transition (see prompt 011). `None` until
+    /// a grant assigns one.
+    pub portal_slug: Option<String>,
     /// MAPPS-617: per-Company branding overrides. See
     /// [`crate::tenants::TenantBranding`] and
     /// [`crate::tenants::EffectiveBranding`]: the resolver merges the
@@ -551,6 +559,18 @@ pub struct CompanyResponse {
     pub open_ticket_count: Option<i64>,
     pub tags: Vec<String>,
     pub portal_enabled: bool,
+    /// MAPPS-635 B: the Company's 9-digit numeric Portal ID (PMS-928)
+    /// and its legacy Crockford slug. Both sit on the `companies` row
+    /// but were dropped from this DTO, so staff had no way to look up
+    /// a Company's portal URL after the original grant email was
+    /// filed away. Surfacing them here lets the Portal Access card
+    /// render "Portal ID: X" + a "Copy portal link" affordance in
+    /// every state (not only in the response to a fresh grant).
+    /// `None` when portal access has never been enabled for the
+    /// Company: the CHECK constraint on `portal_id` fires when we
+    /// write it and the slug is written from the same code path.
+    pub portal_id: Option<i64>,
+    pub portal_slug: Option<String>,
     /// MAPPS-618 read-side fix: the per-Company branding overrides
     /// need to round-trip on both GET and the PUT-response so the
     /// SPA's editor initialises with the current values (instead of
@@ -583,6 +603,8 @@ impl From<Company> for CompanyResponse {
             open_ticket_count: None,
             tags: c.tags,
             portal_enabled: c.portal_enabled,
+            portal_id: c.portal_id,
+            portal_slug: c.portal_slug,
             branding: c.branding,
             created_at: c.created_at,
             updated_at: c.updated_at,
