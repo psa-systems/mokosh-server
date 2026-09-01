@@ -16,11 +16,14 @@
 //! statement is a report, and reports render from today.
 
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use crate::pdf::{Document, Logo};
+use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
+use crate::utils::error::AppResult;
 
 use super::issuer::Issuer;
-use super::models::{InvoiceResponse, StatementResponse};
+use super::models::{CreditNoteResponse, InvoiceResponse, StatementResponse};
 
 /// The box a logo is fitted into, top right of the first page. Generous enough
 /// for a wordmark, small enough that a square logo cannot push the body down
@@ -166,6 +169,148 @@ pub fn invoice(
         document = document.lines("Notes", vec![notes.clone()]);
     }
     document
+}
+
+/// Build the credit-note document.
+///
+/// A credit note is a document about a document, so it names the invoice it
+/// corrects on its face: a client filing it away has to be able to see what it
+/// cancels without opening anything else.
+pub fn credit_note(
+    note: &CreditNoteResponse,
+    issuer: &Issuer,
+    logo_bytes: Option<Vec<u8>>,
+) -> Document {
+    let currency = note.currency.as_deref();
+    let mut details = vec![
+        (
+            "Credit note number".to_string(),
+            note.credit_note_number.clone(),
+        ),
+        ("Issue date".to_string(), note.issue_date.to_string()),
+        ("Status".to_string(), note.status.as_str().to_string()),
+        ("Reason".to_string(), note.reason.clone()),
+    ];
+    if let Some(number) = &note.invoice_number {
+        details.push(("Against invoice".to_string(), number.clone()));
+    }
+
+    let mut document = Document::new("Credit Note")
+        .subtitle(note.credit_note_number.clone())
+        .logo(logo(logo_bytes))
+        .lines("From", issuer_lines(issuer))
+        .lines(
+            "Credit to",
+            vec![note
+                .company_name
+                .clone()
+                .unwrap_or_else(|| "Customer".to_string())],
+        )
+        .fields("Details", details);
+
+    if let Some(lines) = &note.lines {
+        document = document.table(
+            "Items",
+            vec![
+                "Description".into(),
+                "Qty".into(),
+                "Unit price".into(),
+                "Amount".into(),
+            ],
+            lines
+                .iter()
+                .map(|line| {
+                    vec![
+                        line.description.clone(),
+                        format!("{}", line.quantity.normalize()),
+                        money(line.unit_price, currency),
+                        money(line.total, currency),
+                    ]
+                })
+                .collect(),
+        );
+    }
+
+    document = document.fields(
+        "Totals",
+        vec![
+            ("Subtotal".to_string(), money(note.subtotal, currency)),
+            ("Tax".to_string(), money(note.tax_amount, currency)),
+            ("Total credited".to_string(), money(note.total, currency)),
+        ],
+    );
+    if let Some(notes) = &note.notes {
+        document = document.lines("Notes", vec![notes.clone()]);
+    }
+    document
+}
+
+/// PMS-959: keep the document that was issued.
+///
+/// Written inside the transaction that freezes the invoice or creates the
+/// credit note, so a document cannot be issued without one, and the ledger row
+/// goes through the same transaction so a rollback takes both.
+///
+/// The object write itself is not transactional: a rollback after it leaves the
+/// bytes behind. That is litter rather than a problem, because the key is the
+/// document's own id, so the next successful attempt overwrites it and nothing
+/// can reach an object whose row never committed.
+pub async fn store_issued(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: Uuid,
+    document_id: Uuid,
+    number: &str,
+    entity_type: &str,
+    bytes: &[u8],
+) -> AppResult<()> {
+    let key = ObjectKey::financial_document(tenant_id, document_id);
+    LocalStore::from_env().put(&key, bytes).await?;
+    FileLedger::record_in_tx(
+        tx,
+        tenant_id,
+        &key,
+        // A fresh id, NOT the document's: the ledger is keyed on the object and
+        // a `files` row already exists for other objects under a feature's own
+        // id. Deriving it from the document id keeps one row per document
+        // without colliding with anything a feature stored under that id.
+        document_file_id(document_id),
+        FileRecord {
+            original_name: &format!("{number}.pdf"),
+            mime_type: "application/pdf",
+            file_size: bytes.len() as i64,
+            uploaded_by_id: None,
+            entity_type,
+            entity_id: Some(document_id),
+        },
+    )
+    .await
+}
+
+/// The `files` row id for a document's stored PDF.
+///
+/// Version 5-shaped: derived from the document id so it is stable across
+/// re-issues of the same document and cannot collide with a feature row keyed
+/// on the document id itself. Deterministic, so a second store of the same
+/// document upserts one row rather than adding a second.
+fn document_file_id(document_id: Uuid) -> Uuid {
+    let mut bytes = *document_id.as_bytes();
+    // Flip the two bits that make it a distinct value while keeping it a valid
+    // v4-shaped UUID; nothing parses meaning out of this id, it only has to be
+    // stable and distinct.
+    bytes[6] ^= 0x10;
+    bytes[8] ^= 0x20;
+    Uuid::from_bytes(bytes)
+}
+
+/// The stored document, if one was kept.
+///
+/// `None` for a draft, and for anything issued before PMS-959; the caller
+/// renders live in that case, which is what those documents always did.
+pub async fn read_issued(tenant_id: Uuid, document_id: Uuid) -> Option<Vec<u8>> {
+    LocalStore::from_env()
+        .read(&ObjectKey::financial_document(tenant_id, document_id))
+        .await
+        .ok()
 }
 
 /// Build the statement document.
