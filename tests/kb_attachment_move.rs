@@ -17,12 +17,10 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const ROOT: &str = "/tmp/mokosh-pms960-test";
-
 /// Set before `common::boot` and before the mover is built: both read
 /// `ATTACHMENT_DIR` once, at construction.
 fn install_test_attachment_env() {
-    std::env::set_var("ATTACHMENT_DIR", ROOT);
+    common::storage_root();
 }
 
 const PNG: &[u8] = &[
@@ -34,14 +32,16 @@ const PNG: &[u8] = &[
 ];
 
 fn tenant_path(id: Uuid) -> PathBuf {
-    PathBuf::from(ROOT)
+    common::storage_root()
         .join(common::DEFAULT_TENANT_ID.to_string())
         .join("kb-articles")
         .join(id.to_string())
 }
 
 fn legacy_path(id: Uuid) -> PathBuf {
-    PathBuf::from(ROOT).join("kb-articles").join(id.to_string())
+    common::storage_root()
+        .join("kb-articles")
+        .join(id.to_string())
 }
 
 async fn create_article(app: &common::TestApp, token: &str) -> String {
