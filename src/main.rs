@@ -566,6 +566,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduled_dashboards_worker,
         std::time::Duration::from_secs(60),
     );
+
+    // PMS-960: one-shot in effect. A KB attachment used to be stored at a
+    // flat `kb-articles/{id}` with no tenant in the path; it is now under
+    // its tenant like everything else, and this walks the files already on
+    // the volume over to it. The Scheduler fires every job once immediately
+    // at startup, so the work happens at boot without blocking it, and the
+    // hourly interval is what makes a failed rename retry rather than wait
+    // for the next restart. Once every file has moved the tick is one query
+    // that returns no rows.
+    let kb_attachment_mover =
+        mokosh_server::modules::knowledge_base::KbAttachmentMover::new(db.clone());
+    scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
+
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
