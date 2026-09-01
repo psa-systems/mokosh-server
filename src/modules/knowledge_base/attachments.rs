@@ -21,11 +21,20 @@
 //! ## Storage
 //!
 //! Bytes go through `crate::storage`, which owns the root and the layout since
-//! PMS-910. These land in a `kb-articles/` subdirectory so an article image can
-//! never collide with the `{tenant_id}/{attachment_id}` path ticket attachments
-//! use, exactly as `tenant-logos/` does. That subdirectory is flat: it is the
-//! one kind whose path carries no tenant, which the storage module states and
-//! PMS-960 changes.
+//! PMS-910. An image lands at `{tenant_id}/kb-articles/{attachment_id}`
+//! (PMS-960): under its tenant like every other stored object, in a
+//! `kb-articles/` subdirectory so it can never collide with the
+//! `{tenant_id}/{attachment_id}` path ticket attachments use.
+//!
+//! Before PMS-960 the path was the flat `kb-articles/{attachment_id}`, with no
+//! tenant in it at all. Files are still sitting there on deployments the mover
+//! (`crate::modules::knowledge_base::attachment_move`) has not reached, so
+//! [`KbAttachmentService::read_public`] falls back to that path and `delete`
+//! removes both. The fallback is safe here for a reason worth stating rather
+//! than assuming: the tenant on both keys comes off the `kb_article_attachments`
+//! row, never off the request, so it cannot be used to reach another tenant's
+//! file. A blanket fallback inside `LocalStore` would have been reachable from
+//! any key and would have reintroduced exactly what PMS-960 closed.
 
 use std::sync::Arc;
 
@@ -260,6 +269,16 @@ impl KbAttachmentService {
             .store
             .delete(&ObjectKey::kb_attachment(tenant_id.get(), attachment_id))
             .await;
+        // PMS-960: and wherever it was before the move, because the row is
+        // gone either way and a blob nothing can name is litter that still
+        // counts against the volume.
+        let _ = self
+            .store
+            .delete(&ObjectKey::legacy_kb_attachment(
+                tenant_id.get(),
+                attachment_id,
+            ))
+            .await;
         let _ = self.ledger.forget(tenant_id.get(), attachment_id).await;
         Ok(())
     }
@@ -289,11 +308,22 @@ impl KbAttachmentService {
         // An unknown id and a deleted attachment answer identically, so this is
         // not an existence oracle for ids somebody is guessing at.
         let (mime, tenant_id) = row.ok_or_else(|| AppError::NotFound("Attachment".to_string()))?;
-        let bytes = self
+        let bytes = match self
             .store
             .read(&ObjectKey::kb_attachment(tenant_id, id))
             .await
-            .map_err(|_| AppError::NotFound("Attachment".to_string()))?;
+        {
+            Ok(bytes) => bytes,
+            // PMS-960: uploaded before the layout carried a tenant, and the
+            // mover has not reached it yet. The tenant on both keys is the
+            // row's own, so this cannot serve another tenant's file; see the
+            // module header. Costs one extra open, and only on a miss.
+            Err(_) => self
+                .store
+                .read(&ObjectKey::legacy_kb_attachment(tenant_id, id))
+                .await
+                .map_err(|_| AppError::NotFound("Attachment".to_string()))?,
+        };
         Ok((mime, bytes))
     }
 }

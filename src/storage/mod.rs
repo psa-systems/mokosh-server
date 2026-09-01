@@ -19,12 +19,16 @@
 //! A caller cannot assemble one, because it is not the sort of thing any method
 //! here accepts, and the layout is decided in exactly one file.
 //!
-//! **The on-disk layout is unchanged by this module**, deliberately. Every
-//! existing upload stays exactly where it is and keeps being served, because a
-//! storage refactor that moves files is two risky changes wearing one commit.
-//! [`LocalStore::path_for`] reproduces what each module did, and the test below
-//! pins the paths so a future change to any of them is a deliberate edit rather
-//! than an accident that orphans a customer's attachments.
+//! PMS-910 changed no path at all, deliberately: a storage refactor that also
+//! moves files is two risky changes wearing one commit. PMS-960 is the second
+//! of the two, and closes the third bullet above. A KB attachment is now
+//! addressed as `{tenant}/kb-articles/{id}` like everything else, and
+//! [`ObjectKind::LegacyKbAttachment`] is the flat path it came from, kept
+//! addressable so a file the mover has not reached yet is still served.
+//!
+//! [`LocalStore::path_for`] is where every layout decision lives, and the test
+//! below pins each of them, so a future change is a deliberate edit to a stated
+//! expectation rather than an accident that orphans a customer's attachments.
 
 mod ledger;
 
@@ -78,14 +82,32 @@ pub enum ObjectKind {
     TenantLogo { extension: String },
     /// An image embedded in a KB article (PMS-923).
     ///
-    /// Flat, with no tenant in the path, because that is where these files
-    /// already are. It is the one kind this module cannot isolate by layout,
-    /// and saying so here is the point: it was previously invisible, spread
-    /// across a module that looked like the other two. The id is a v4 UUID and
-    /// is the only credential on the public read either way (see the routing
-    /// model in CLAUDE.md), so nothing is weaker than it was. Re-laying it out
-    /// under a tenant prefix is PMS-960, because it means moving files.
+    /// Under its tenant since PMS-960, in a `kb-articles/` subdirectory beside
+    /// the tenant's ticket attachments. No collision with those, which are
+    /// `{tenant}/{id}`, because `kb-articles` is not a UUID.
+    ///
+    /// The public read still presents nothing but the id (an `<img>` carries no
+    /// `Authorization` header), so the v4 UUID remains the credential there and
+    /// this changes nothing about that bargain. What it changes is that the
+    /// STORAGE layer no longer makes it: a key for tenant A cannot name tenant
+    /// B's object, which is true of every other kind and is now true of this
+    /// one.
     KbAttachment { id: Uuid },
+    /// Where a KB attachment used to live: flat, with no tenant anywhere in the
+    /// path.
+    ///
+    /// Every file uploaded before PMS-960 is at one of these, on volumes this
+    /// code cannot reach, so the path has to stay addressable until the mover
+    /// has been everywhere. It is its own variant rather than a flag on the one
+    /// above so that reaching it means saying the word "legacy" at the call
+    /// site: a fallback hidden inside `LocalStore` would apply to every read
+    /// and would be reachable from any tenant's key, which is precisely the
+    /// hole PMS-960 closes.
+    ///
+    /// Two constructors exist and both derive the tenant from a database row
+    /// rather than from a request: the mover, and the public read's fallback.
+    /// Delete this variant once no deployment can still hold a file under it.
+    LegacyKbAttachment { id: Uuid },
 }
 
 /// A tenant and an object. The whole address, and the only thing the store
@@ -117,6 +139,15 @@ impl ObjectKey {
         Self {
             tenant_id,
             kind: ObjectKind::KbAttachment { id },
+        }
+    }
+
+    /// The pre-PMS-960 location of a KB attachment. See
+    /// [`ObjectKind::LegacyKbAttachment`] for who may call this.
+    pub fn legacy_kb_attachment(tenant_id: Uuid, id: Uuid) -> Self {
+        Self {
+            tenant_id,
+            kind: ObjectKind::LegacyKbAttachment { id },
         }
     }
 }
@@ -252,7 +283,12 @@ impl ObjectKey {
                 validate_segment(extension)?;
                 PathBuf::from("tenant-logos").join(format!("{}.{extension}", self.tenant_id))
             }
-            ObjectKind::KbAttachment { id } => PathBuf::from("kb-articles").join(id.to_string()),
+            ObjectKind::KbAttachment { id } => PathBuf::from(self.tenant_id.to_string())
+                .join("kb-articles")
+                .join(id.to_string()),
+            ObjectKind::LegacyKbAttachment { id } => {
+                PathBuf::from("kb-articles").join(id.to_string())
+            }
         };
         Ok(path)
     }
@@ -349,9 +385,9 @@ mod tests {
     const OTHER: Uuid = Uuid::from_u128(0x2222_2222_2222_4222_8222_2222_2222_2222);
     const OBJECT: Uuid = Uuid::from_u128(0x3333_3333_3333_4333_8333_3333_3333_3333);
 
-    /// The layout each of the three modules used before PMS-910, pinned.
+    /// Every layout this store knows, pinned.
     ///
-    /// This is the test that makes the refactor safe to merge: every file
+    /// This is the test that makes a layout change safe to merge: every file
     /// already on a customer's volume is at one of these paths, so a change to
     /// any arm has to come here first and be seen. Getting one wrong does not
     /// fail loudly at runtime, it serves a 404 for an attachment that is still
@@ -368,16 +404,42 @@ mod tests {
             s.path_for(&ObjectKey::tenant_logo(TENANT, "png")).unwrap(),
             PathBuf::from(format!("/data/attachments/tenant-logos/{TENANT}.png"))
         );
+        // PMS-960 moved this one under its tenant. The path it came from is
+        // still addressable, because every KB image uploaded before that
+        // release is sitting at it until the mover reaches it.
         assert_eq!(
             s.path_for(&ObjectKey::kb_attachment(TENANT, OBJECT))
+                .unwrap(),
+            PathBuf::from(format!("/data/attachments/{TENANT}/kb-articles/{OBJECT}"))
+        );
+        assert_eq!(
+            s.path_for(&ObjectKey::legacy_kb_attachment(TENANT, OBJECT))
                 .unwrap(),
             PathBuf::from(format!("/data/attachments/kb-articles/{OBJECT}"))
         );
     }
 
+    /// A KB attachment cannot land on a ticket attachment, which shares its
+    /// tenant's directory.
+    ///
+    /// The two are only kept apart by `kb-articles` not being a UUID, which is
+    /// true but is the sort of thing worth asserting rather than reasoning
+    /// about once and forgetting.
+    #[test]
+    fn a_kb_attachment_cannot_collide_with_a_ticket_attachment() {
+        let s = store();
+        assert_ne!(
+            s.path_for(&ObjectKey::kb_attachment(TENANT, OBJECT))
+                .unwrap(),
+            s.path_for(&ObjectKey::ticket_attachment(TENANT, OBJECT))
+                .unwrap()
+        );
+    }
+
     /// Isolation is a property of the address, not of the caller remembering.
     /// Two tenants asking for "their" object of the same kind cannot land on
-    /// one file, for every kind whose layout carries the tenant.
+    /// one file. Since PMS-960 that is every kind a feature can address, which
+    /// is the whole of what that issue asked for.
     #[test]
     fn two_tenants_cannot_address_the_same_object() {
         let s = store();
@@ -391,20 +453,28 @@ mod tests {
             s.path_for(&ObjectKey::tenant_logo(TENANT, "png")).unwrap(),
             s.path_for(&ObjectKey::tenant_logo(OTHER, "png")).unwrap()
         );
-    }
-
-    /// And the one that is not isolated by layout says so out loud, because the
-    /// alternative is a reader assuming all three behave alike. KB attachments
-    /// are flat today; PMS-960 moves them.
-    #[test]
-    fn a_kb_attachment_is_not_isolated_by_its_path_yet() {
-        let s = store();
-        assert_eq!(
+        assert_ne!(
             s.path_for(&ObjectKey::kb_attachment(TENANT, OBJECT))
                 .unwrap(),
             s.path_for(&ObjectKey::kb_attachment(OTHER, OBJECT))
+                .unwrap()
+        );
+    }
+
+    /// The legacy path is the one exception, and it is an exception on purpose.
+    ///
+    /// It names a file written before there was a tenant in the layout, so it
+    /// cannot suddenly have one. That is exactly why it is a separate variant
+    /// nothing reaches by accident: both callers derive the tenant from a
+    /// database row, and once the mover has been everywhere the variant goes.
+    #[test]
+    fn the_legacy_path_is_the_one_that_ignores_its_tenant() {
+        let s = store();
+        assert_eq!(
+            s.path_for(&ObjectKey::legacy_kb_attachment(TENANT, OBJECT))
                 .unwrap(),
-            "flat by design today; the v4 id is the credential (PMS-923)"
+            s.path_for(&ObjectKey::legacy_kb_attachment(OTHER, OBJECT))
+                .unwrap()
         );
     }
 
