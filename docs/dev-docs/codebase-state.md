@@ -68,9 +68,10 @@ source comments and YouTrack issues cite by number.
 > contract, because one branch serves every unsupported value and
 > `format` is an enumerated query parameter, so a value outside the
 > implemented set is an out-of-range request rather than a
-> server-side gap. Adding PDF is tracked in PMS-876. The remaining
-> 501 references below all describe the retired placeholder router
-> and are historical.
+> server-side gap. PMS-876 has since implemented PDF, so the route
+> serves `csv` and `pdf` and every other value is still a 400 for the
+> reason above. The remaining 501 references below all describe the
+> retired placeholder router and are historical.
 
 ## Counts
 
