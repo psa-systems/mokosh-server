@@ -2292,3 +2292,205 @@ async fn logout_leaves_the_users_other_sessions_alone(pool: PgPool) {
         "the other session is untouched"
     );
 }
+
+// ============================================================================
+// PMS-881 (audit F6): rate limit on the password re-auth
+// ============================================================================
+
+/// PMS-881: `PUT /auth/me/password` re-checks the current password, and that
+/// check is throttled per account (5 failures/min) exactly as `/login` is.
+/// Pre-fix an attacker holding a stolen session could grind the password at
+/// full request rate; the sixth failure now costs a 429 with `Retry-After`.
+#[sqlx::test]
+async fn change_password_reauth_rate_limit_triggers_429(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let wrong = serde_json::json!({
+        "current_password": "not-the-current-password",
+        "new_password": "a-brand-new-password",
+        "confirm_password": "a-brand-new-password",
+    });
+    let attempt = |body: serde_json::Value| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/password");
+        let token = token.clone();
+        async move {
+            client
+                .put(url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("send change-password attempt")
+        }
+    };
+
+    // The first five failures are rejected on their merits, not throttled.
+    for i in 0..5 {
+        let resp = attempt(wrong.clone()).await;
+        assert_ne!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "attempt {i} is within the 5/min account quota"
+        );
+        assert!(
+            resp.status().is_client_error(),
+            "attempt {i} must be rejected, got {}",
+            resp.status()
+        );
+    }
+
+    let resp = attempt(wrong.clone()).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the sixth failed re-auth must trip the limiter"
+    );
+    let secs: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .expect("Retry-After header present on 429")
+        .to_str()
+        .expect("Retry-After is ASCII")
+        .parse()
+        .expect("Retry-After parses as a positive integer");
+    assert!(secs >= 1, "Retry-After must be at least 1 second");
+    let body: serde_json::Value = resp.json().await.expect("rate-limit body is JSON");
+    assert_eq!(body["error"].as_str(), Some("rate_limited"));
+
+    // And the correct password gets the same 429 while the window is open:
+    // the gate runs before the credential check, so an exhausted budget stops
+    // the guessing rather than merely reporting it differently.
+    let resp = attempt(serde_json::json!({
+        "current_password": password,
+        "new_password": "a-brand-new-password",
+        "confirm_password": "a-brand-new-password",
+    }))
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "an exhausted budget blocks the password comparison itself"
+    );
+}
+
+/// PMS-881: the same holds for `POST /auth/me/mfa/disable`, and the two routes
+/// share ONE budget. Three failures on the password route plus two on the MFA
+/// route is five, so the sixth attempt is throttled on either of them: moving
+/// to the other endpoint must not hand the attacker a fresh budget.
+#[sqlx::test]
+async fn mfa_disable_reauth_shares_the_change_password_budget(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let bad_change = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/password");
+        async move {
+            client
+                .put(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "current_password": "not-the-current-password",
+                    "new_password": "a-brand-new-password",
+                    "confirm_password": "a-brand-new-password",
+                }))
+                .send()
+                .await
+                .expect("send change-password attempt")
+        }
+    };
+    let bad_disable = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/mfa/disable");
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "password": "not-the-current-password" }))
+                .send()
+                .await
+                .expect("send mfa-disable attempt")
+        }
+    };
+
+    for i in 0..3 {
+        let status = bad_change(token.clone()).await.status();
+        assert_ne!(
+            status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "change-password failure {i} is within quota"
+        );
+    }
+    for i in 0..2 {
+        let status = bad_disable(token.clone()).await.status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "mfa-disable failure {i} is a rejected re-auth, within quota"
+        );
+    }
+
+    assert_eq!(
+        bad_disable(token.clone()).await.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "five failures across the two routes exhaust the shared budget"
+    );
+    assert_eq!(
+        bad_change(token.clone()).await.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the other route is throttled out of the same budget"
+    );
+}
+
+/// PMS-881: only a FAILED re-auth spends budget. Four failures, then a
+/// successful `disable_mfa`, then a fifth failure - which must still be the
+/// plain 401, because the success in the middle charged nothing. Were success
+/// counted, the fifth would already be over the 5/min account quota.
+#[sqlx::test]
+async fn successful_reauth_does_not_spend_rate_limit_budget(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let disable = |submitted: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/mfa/disable");
+        let token = token.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "password": submitted }))
+                .send()
+                .await
+                .expect("send mfa-disable attempt")
+                .status()
+        }
+    };
+
+    for i in 0..4 {
+        assert_eq!(
+            disable("not-the-current-password".to_string()).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "failure {i} is within quota"
+        );
+    }
+    assert!(
+        disable(password.clone()).await.is_success(),
+        "the correct password still gets through under quota"
+    );
+    assert_eq!(
+        disable("not-the-current-password".to_string()).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the fifth failure is still within quota: the success spent none of it"
+    );
+    assert_eq!(
+        disable("not-the-current-password".to_string()).await,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the sixth failure exhausts it"
+    );
+}
