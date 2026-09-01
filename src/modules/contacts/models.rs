@@ -51,4 +51,12 @@ pub struct PortalRoleSummary {
     pub is_builtin: bool,
     #[serde(default)]
     pub company_id: Option<Uuid>,
+    /// MAPPS-635 E: count of contacts currently holding this role
+    /// (via `contact_role_assignments`). Populated by the list
+    /// handler so the Settings > Contact Roles table can render a
+    /// real number in its CONTACTS column instead of the hard-coded
+    /// "-". `serde(default)` so a wire payload from a pre-fix
+    /// server still deserialises as `0`.
+    #[serde(default)]
+    pub contacts_count: i64,
 }
