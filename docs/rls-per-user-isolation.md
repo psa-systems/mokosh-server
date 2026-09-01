@@ -269,21 +269,24 @@ These resolve the "Lookup classification" open decision for PMS-255.4:
 ## System-shared class (PMS-259, structural)
 
 Reserved for future non-editable global rows (e.g. system statuses, maintenance windows).
-Implemented by `migrations/039_system_shared_class.sql`. **No table opts in yet and no
+Implemented by `migrations/039_system_shared_class.sql` and amended by
+`migrations/127_system_shared_policy_on_optin.sql` (PMS-875). **No table opts in yet and no
 system-shared row exists**; every lookup `tenant_id` column is still `NOT NULL`, so the
 mechanism is a no-op for current data.
 
 Mechanism:
 
 1. **Sentinel**: `tenant_id IS NULL` means "global / system-shared".
-2. **Read (RLS)**: `039`'s loop recreated the `tenant_isolation` policy as
+2. **Read (RLS)**: the `tenant_isolation` policy on a member table reads
    `tenant_id IS NULL OR tenant_id = <current-tenant match>`, so a global row is visible to
    every tenant. (PMS-257 owns the fail-closed tenant match and the WITH CHECK; the `IS NULL`
-   read clause is owned here.) That loop covered the tables that existed when `039` ran.
-   Tables added since (`094`, `095`, `105`, and every new-table migration, which copies the
-   plain `038` block) carry no `IS NULL` disjunct, and `mokosh_enable_system_shared` does not
-   add one, so opting one of them in today would store global rows that no tenant can read.
-   Inert while nothing opts in; tracked in PMS-875.
+   read clause is owned here.) `039` applied that shape with a one-shot loop over the tables
+   that existed when it ran, which left every table created since (`094`, `095`, `105`, and
+   every new-table migration, which copies the plain `038` block) carrying no `IS NULL`
+   disjunct: opting one of them in would have stored global rows no tenant could read.
+   PMS-875 moved the read half into the opt-in function itself, so the disjunct is attached
+   when a table joins the class rather than depending on when the table was created. Tables
+   that never join keep the plain `038` policy, which is correct for them.
 3. **Write guard (DB)**: trigger function `mokosh_guard_system_shared_row()` rejects any
    INSERT / UPDATE / DELETE touching a `tenant_id IS NULL` row unless the session sets
    `app.allow_system_writes = 'on'` (reserved for the migration / super-admin role). Raises
@@ -294,8 +297,13 @@ Mechanism:
    can never produce a global row.
 5. **Opt-in**: a table joins the class later with
    `SELECT mokosh_enable_system_shared('<table>');` which drops the `tenant_id` NOT NULL
-   constraint and attaches the `guard_system_shared_row` trigger. The global rows are then
-   inserted from a privileged (`app.allow_system_writes = 'on'`) session.
+   constraint, recreates `tenant_isolation` in the disjunct read form above (with the
+   WITH CHECK left non-disjunct, so an ordinary session still cannot write a global row), and
+   attaches the `guard_system_shared_row` trigger. It raises `undefined_column` (42703) before
+   touching anything if the target has no `tenant_id` column, which is what the `041`
+   parent-join tables get. The global rows are then inserted from a privileged
+   (`app.allow_system_writes = 'on'`) session. `tests/system_shared_class.rs` proves both
+   halves on `saved_dashboards`, a table created long after `039` ran.
 
 This keeps genuinely global config from being needlessly duplicated per tenant while preserving
 strict per-user isolation for everything editable.
