@@ -305,6 +305,7 @@ impl ContactService {
                    default_technical_contact_id, account_manager_id, sla_id,
                    default_contract_id, payment_terms, tax_exempt,
                    custom_fields, tags, notes, logo_url, portal_enabled,
+                   portal_id, portal_slug,
                    branding,
                    created_at, updated_at
             FROM companies
@@ -387,6 +388,7 @@ impl ContactService {
                    default_technical_contact_id, account_manager_id, sla_id,
                    default_contract_id, payment_terms, tax_exempt,
                    custom_fields, tags, notes, logo_url, portal_enabled,
+                   portal_id, portal_slug,
                    branding,
                    created_at, updated_at
             FROM companies
@@ -2997,6 +2999,12 @@ struct CompanyRow {
     notes: Option<String>,
     logo_url: Option<String>,
     portal_enabled: bool,
+    // MAPPS-635 B: expose the assigned Portal ID + legacy slug so
+    // the Portal Access card can render "Portal ID: X" + a copy-link
+    // affordance without hitting a fresh grant mutation to see them.
+    // Both are `Option` — they land only after a grant is issued.
+    portal_id: Option<i64>,
+    portal_slug: Option<String>,
     // MAPPS-617: per-Company branding overrides. `serde_json::Value` on
     // the row so sqlx picks up whatever the JSONB column carries, then
     // deserialized into the typed `CompanyBranding` shape below. An
@@ -3051,6 +3059,8 @@ impl From<CompanyRow> for Company {
             notes: row.notes,
             logo_url: row.logo_url,
             portal_enabled: row.portal_enabled,
+            portal_id: row.portal_id,
+            portal_slug: row.portal_slug,
             // MAPPS-617: branding column on a fresh Company row is `{}`
             // (migration default); older code paths that hand in a
             // legacy row without the column will fail sqlx-decode
