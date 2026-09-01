@@ -80,6 +80,20 @@ pub struct TenantBranding {
     /// `GET /api/v1/tenants/current`, which is the organisation settings page.
     pub website: Option<String>,
     pub portal_domain: Option<String>,
+    /// PMS-911: the registered company name, where it differs from the trading
+    /// name in [`Self::company_name`]. An invoice is a commercial document and
+    /// carries the legal entity; a portal header carries the trading name. When
+    /// unset the invoice falls back to `company_name` and then to the tenant's
+    /// own name, so an MSP that never fills this in still gets a valid invoice.
+    pub legal_name: Option<String>,
+    /// PMS-911: a VAT number, ABN, EIN or company registration number, whatever
+    /// the MSP's jurisdiction requires an invoice to show. One free-text field
+    /// rather than a set of country-specific ones, because nothing here parses
+    /// it and a wrong parse would be worse than no parse.
+    pub tax_id: Option<String>,
+    /// PMS-911: the postal address an invoice is issued from. The one branding
+    /// value that is deliberately multi-line, because an address is.
+    pub postal_address: Option<String>,
 }
 
 /// PMS-896: the organisation record, as the onboarding flow submits it.
