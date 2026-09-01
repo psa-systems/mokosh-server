@@ -93,6 +93,21 @@ pub enum ObjectKind {
     /// B's object, which is true of every other kind and is now true of this
     /// one.
     KbAttachment { id: Uuid },
+    /// PMS-959: the PDF of a financial document, as it was issued.
+    ///
+    /// One per invoice or credit note, keyed on that document's own id. Written
+    /// once, inside the transaction that freezes the document, and never
+    /// rewritten: what was sent is a fact, and a second write would make it a
+    /// rendering again.
+    ///
+    /// Stored rather than regenerated for one reason, which is narrower than it
+    /// looks. Branding is frozen (PMS-911) and `crate::pdf::render` is a pure
+    /// function of its input, so a re-render from the snapshot agrees with what
+    /// was sent - until somebody edits the renderer or the document layout, at
+    /// which point every past invoice quietly reprints differently. These bytes
+    /// are insurance against this codebase changing, not against the data
+    /// changing.
+    FinancialDocument { id: Uuid },
     /// PMS-911: a copy of a logo, frozen at the moment an invoice was sent.
     ///
     /// Content-addressed by a digest of its own bytes, for a reason particular
@@ -120,6 +135,49 @@ pub enum ObjectKind {
     /// rather than from a request: the mover, and the public read's fallback.
     /// Delete this variant once no deployment can still hold a file under it.
     LegacyKbAttachment { id: Uuid },
+}
+
+/// How long an object has to be kept (PMS-959).
+///
+/// **Declared, not enforced.** Nothing in this codebase deletes a stored object
+/// on a schedule: there is no reaper, and this enum does not add one. What it
+/// does is put the answer where the object's identity already lives, so
+/// whatever eventually sweeps has one place to ask rather than a rule
+/// rediscovered per feature. Writing this as if it were enforced would be worse
+/// than not writing it at all, so it says so here and the test below pins that
+/// no caller treats it as a delete authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retention {
+    /// Keep while something references it. An attachment, a logo: the feature
+    /// row's own lifetime decides, and deleting the row deletes the object.
+    WhileReferenced,
+    /// Keep for a fixed period regardless of what references it, because the
+    /// law rather than the product decides. PMS-910 recorded seven years for
+    /// financial documents, shortened only against a stated legal requirement
+    /// and never by default.
+    Years(u32),
+}
+
+impl ObjectKind {
+    /// What the object's kind says about how long it lives.
+    pub fn retention(&self) -> Retention {
+        match self {
+            // An invoice or a credit note is a financial record. It outlives
+            // the row that points at it and it outlives a tenant deciding to
+            // tidy up, because the obligation to produce it is not this
+            // product's to waive.
+            ObjectKind::FinancialDocument { .. } => Retention::Years(7),
+            ObjectKind::TicketAttachment { .. }
+            | ObjectKind::TenantLogo { .. }
+            | ObjectKind::KbAttachment { .. }
+            | ObjectKind::LegacyKbAttachment { .. }
+            // A frozen logo lives as long as the documents that show it, which
+            // is the financial retention above; it is content-addressed and
+            // shared, so it cannot be reasoned about on its own and no sweep
+            // may remove one while any document still names its digest.
+            | ObjectKind::BrandingLogo { .. } => Retention::WhileReferenced,
+        }
+    }
 }
 
 /// A tenant and an object. The whole address, and the only thing the store
@@ -151,6 +209,14 @@ impl ObjectKey {
         Self {
             tenant_id,
             kind: ObjectKind::KbAttachment { id },
+        }
+    }
+
+    /// PMS-959: the issued PDF of an invoice or a credit note.
+    pub fn financial_document(tenant_id: Uuid, id: Uuid) -> Self {
+        Self {
+            tenant_id,
+            kind: ObjectKind::FinancialDocument { id },
         }
     }
 
@@ -307,6 +373,9 @@ impl ObjectKey {
             }
             ObjectKind::KbAttachment { id } => PathBuf::from(self.tenant_id.to_string())
                 .join("kb-articles")
+                .join(id.to_string()),
+            ObjectKind::FinancialDocument { id } => PathBuf::from(self.tenant_id.to_string())
+                .join("documents")
                 .join(id.to_string()),
             ObjectKind::BrandingLogo { digest } => {
                 // The second caller-supplied string this module accepts, and
@@ -653,6 +722,54 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// A financial document is kept for seven years; everything else lives as
+    /// long as the row that points at it.
+    ///
+    /// The assertion that matters is the second half of the doc comment on
+    /// [`Retention`]: this is a declaration, and nothing here deletes anything.
+    /// If a sweep is ever written, it goes through this and not through a rule
+    /// of its own.
+    #[test]
+    fn a_financial_document_outlives_the_row_that_points_at_it() {
+        assert_eq!(
+            ObjectKind::FinancialDocument { id: OBJECT }.retention(),
+            Retention::Years(7)
+        );
+        for kind in [
+            ObjectKind::TicketAttachment { id: OBJECT },
+            ObjectKind::TenantLogo {
+                extension: "png".into(),
+            },
+            ObjectKind::KbAttachment { id: OBJECT },
+            ObjectKind::BrandingLogo {
+                digest: DIGEST.into(),
+            },
+        ] {
+            assert_eq!(kind.retention(), Retention::WhileReferenced, "{kind:?}");
+        }
+    }
+
+    /// Nothing acts on a retention yet, and that is the honest state.
+    ///
+    /// `Retention` exists so the answer lives with the object's identity rather
+    /// than being rediscovered per feature. The day something sweeps, this test
+    /// is what says the sweep has to be written against this enum; until then
+    /// it stops the declaration from reading as a promise the code does not
+    /// keep.
+    #[test]
+    fn retention_is_declared_and_not_enforced() {
+        const SRC: &str = include_str!("mod.rs");
+        // The needles are assembled rather than written, because a literal
+        // would appear in this file and the test would match itself. Not
+        // hypothetical: the first version did exactly that and failed.
+        for needle in [concat!("fn ", "sweep"), concat!("fn ", "expire")] {
+            assert!(
+                !SRC.contains(needle),
+                "{needle:?} now exists in this module, so retention has become enforceable; replace this test with one proving the sweep deletes the right things"
+            );
+        }
     }
 
     /// And it is relative, which is a contract rather than a preference.
