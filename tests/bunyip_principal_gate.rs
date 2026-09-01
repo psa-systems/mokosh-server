@@ -219,3 +219,52 @@ async fn inactive_user_rejects_both_auth_paths(pool: PgPool) {
         "legacy bearer must be rejected once the user is inactive"
     );
 }
+
+/// PMS-880: the session cutoff is legacy-only, the way PMS-698 records the
+/// `password_changed_at` cutoff is.
+///
+/// `POST /auth/logout-all` deletes every `user_sessions` row for the user, and
+/// the legacy access path refuses any token whose `sid` no longer names a live
+/// row. A bunyip `at+jwt` carries no `sid` and never had a `user_sessions` row
+/// in the first place: bunyip owns that session, so a mokosh-side sign-out is
+/// not a revocation signal for it and must not read as one.
+#[sqlx::test]
+async fn legacy_sign_out_everywhere_leaves_the_bunyip_bearer_alone(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let op = StubOp::spawn(admin_id, &email).await;
+    let app = common::boot_with_bunyip(pool.clone(), op.verifier()).await;
+
+    let bunyip = op.mint(admin_id, "admin");
+    let legacy = common::login(&app, &email, &password).await;
+
+    assert!(
+        tickets_status(&app, &bunyip).await.is_success(),
+        "bunyip bearer works before the sign-out"
+    );
+    assert!(
+        tickets_status(&app, &legacy).await.is_success(),
+        "legacy bearer works before the sign-out"
+    );
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/logout-all"))
+        .bearer_auth(&legacy)
+        .send()
+        .await
+        .expect("POST /auth/logout-all");
+    assert!(
+        resp.status().is_success(),
+        "logout-all returned {}",
+        resp.status()
+    );
+
+    assert!(
+        !tickets_status(&app, &legacy).await.is_success(),
+        "legacy bearer must be rejected after signing out everywhere"
+    );
+    assert!(
+        tickets_status(&app, &bunyip).await.is_success(),
+        "bunyip bearer must be unaffected: bunyip owns that session, not mokosh"
+    );
+}

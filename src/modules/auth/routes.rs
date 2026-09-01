@@ -70,6 +70,10 @@ pub fn auth_routes(auth_service: AuthService) -> Router {
         // `(ip, email)` not just `ip`.
         .route("/login", post(login))
         .route("/logout", post(logout))
+        // PMS-880: sign out everywhere. Authenticated like the protected
+        // routes below (it needs the caller's identity), grouped here with its
+        // single-session sibling because the two are one feature.
+        .route("/logout-all", post(logout_all))
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
         .route("/reset-password", post(reset_password))
@@ -211,6 +215,72 @@ async fn logout(
         )
         .await;
         let _ = tx.commit().await;
+    }
+
+    Ok(())
+}
+
+/// Sign out everywhere (PMS-880). Deletes every `user_sessions` row for the
+/// caller, so the refresh capability of every device is gone AND, via the
+/// MAPPS-531 `sid` check in `ensure_user_and_tenant_active`, every access token
+/// they hold is refused on its next request. This is the compromise-recovery
+/// path: `logout` sheds one device, this sheds all of them.
+///
+/// The caller's own bearer dies with the rest, which is the point.
+async fn logout_all(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> AppResult<()> {
+    state
+        .auth_service
+        .logout_all(user.tenant_id, user.id)
+        .await?;
+
+    // Record it as a logout, exactly as the single-session path does (PMS-117 AC3).
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // Out-of-band on its own tenant-scoped tx so the RLS GUC is set; a
+    // log-write failure must not fail the sign-out (the sessions are already
+    // gone, and refusing here would tell the caller the opposite). PMS-256.
+    // Suppressed, but not silently: the failure is logged with its cause, so a
+    // missing audit row is explainable rather than invisible.
+    let audited = async {
+        let mut tx = state
+            .auth_service
+            .db()
+            .begin_with_tenant(user.tenant_id)
+            .await?;
+        crate::modules::audit::audit_auth_event(
+            &mut *tx,
+            user.tenant_id,
+            Some(user.id),
+            crate::modules::audit::AuditAction::Logout,
+            // PMS-587: real client IP behind Traefik, not the proxy peer.
+            Some(
+                crate::utils::client_ip::extract_client_ip(
+                    addr.ip(),
+                    &headers,
+                    crate::utils::client_ip::trusted_proxies(),
+                )
+                .to_string(),
+            ),
+            ua,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+    if let Err(e) = audited {
+        tracing::warn!(
+            error = %e,
+            user = %user.id,
+            "sign-out everywhere succeeded but its audit row was not written"
+        );
     }
 
     Ok(())
