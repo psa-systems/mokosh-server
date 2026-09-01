@@ -357,11 +357,9 @@ async fn a_statement_renders_from_current_branding(pool: PgPool) {
 /// that: it carried the module gate and not the finance one, which this test
 /// caught.
 ///
-/// The statement PDF is finance-gated too, though the JSON `GET /statements`
-/// beside it is not. That asymmetry is deliberate and tracked as PMS-962: five
-/// other read routes in `billing/routes.rs` are missing the same gate, and
-/// re-permissioning them belongs in its own change rather than in a branding
-/// one.
+/// The statement PDF is finance-gated too. PMS-911 left the JSON route beside
+/// it ungated on purpose, and PMS-962 closed that gap along with five others in
+/// the same file, so the two now answer a given role identically.
 #[sqlx::test]
 async fn the_pdf_routes_are_behind_the_billing_gate(pool: PgPool) {
     install_test_attachment_env();
