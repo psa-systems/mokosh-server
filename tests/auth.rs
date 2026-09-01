@@ -2293,6 +2293,164 @@ async fn logout_leaves_the_users_other_sessions_alone(pool: PgPool) {
     );
 }
 
+/// PMS-880 (audit F3): `POST /api/v1/auth/logout-all` sheds every device, and
+/// an access token minted before the call is refused on its next request.
+///
+/// This is the compromise-recovery half of the finding: `logout` ends the one
+/// session the caller is holding, and until this route existed nothing reached
+/// `AuthService::logout_all` at all, so "sign me out everywhere" was not a
+/// request a client could make. The rejection rides the same MAPPS-531 `sid`
+/// check the single-session test above pins, which is why no per-user stamp was
+/// added: deleting every row for the user fails that check for every token they
+/// hold.
+#[sqlx::test]
+async fn logout_all_refuses_every_access_token_minted_before_it(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    // Two devices, two sessions, two access tokens.
+    let laptop = common::login(&app, &email, &password).await;
+    let phone = common::login(&app, &email, &password).await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    assert_eq!(me(laptop.clone()).await, reqwest::StatusCode::OK);
+    assert_eq!(me(phone.clone()).await, reqwest::StatusCode::OK);
+
+    // The route is authenticated: an anonymous caller cannot sign anyone out.
+    let anonymous = app
+        .client
+        .post(app.url("/api/v1/auth/logout-all"))
+        .send()
+        .await
+        .expect("send anonymous logout-all");
+    assert_eq!(
+        anonymous.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "logout-all must require a bearer"
+    );
+    assert_eq!(
+        me(phone.clone()).await,
+        reqwest::StatusCode::OK,
+        "the refused call must not have revoked anything"
+    );
+
+    let signed_out = app
+        .client
+        .post(app.url("/api/v1/auth/logout-all"))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("send logout-all");
+    assert!(
+        signed_out.status().is_success(),
+        "logout-all expected 2xx, got {}",
+        signed_out.status()
+    );
+
+    assert_ne!(
+        me(laptop).await,
+        reqwest::StatusCode::OK,
+        "the calling device's access token must stop working"
+    );
+    assert_ne!(
+        me(phone).await,
+        reqwest::StatusCode::OK,
+        "an access token minted before logout-all must be refused on its next request"
+    );
+
+    // And the user can sign back in: logout-all revokes, it does not lock out.
+    let _fresh = common::login(&app, &email, &password).await;
+}
+
+/// PMS-880: the third sign-out path, `DELETE /auth/me/sessions/{id}`, revokes
+/// the access token too.
+///
+/// Signing another device out from the sessions screen deletes its
+/// `user_sessions` row, so it fails the same `sid` check `logout` and
+/// `logout-all` fail. Pinned here because "sign out my lost phone" is the one
+/// of the three where a token that outlived the click is most obviously wrong,
+/// and nothing asserted it.
+#[sqlx::test]
+async fn revoking_a_session_refuses_that_devices_access_token(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let laptop = common::login(&app, &email, &password).await;
+    let phone = common::login(&app, &email, &password).await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    // The laptop lists its sessions and picks the one that is not itself.
+    let listed = app
+        .client
+        .get(app.url("/api/v1/auth/me/sessions"))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("GET /auth/me/sessions")
+        .json::<serde_json::Value>()
+        .await
+        .expect("sessions body");
+    let other = listed["data"]
+        .as_array()
+        .expect("sessions array")
+        .iter()
+        .find(|s| s["is_current"] == serde_json::Value::Bool(false))
+        .expect("the other device's session")["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let revoked = app
+        .client
+        .delete(app.url(&format!("/api/v1/auth/me/sessions/{other}")))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("send session delete");
+    assert!(
+        revoked.status().is_success(),
+        "session delete expected 2xx, got {}",
+        revoked.status()
+    );
+
+    assert_ne!(
+        me(phone).await,
+        reqwest::StatusCode::OK,
+        "the revoked device's access token must stop working"
+    );
+    assert_eq!(
+        me(laptop).await,
+        reqwest::StatusCode::OK,
+        "the device that did the revoking is untouched"
+    );
+}
+
 // ============================================================================
 // PMS-881 (audit F6): rate limit on the password re-auth
 // ============================================================================

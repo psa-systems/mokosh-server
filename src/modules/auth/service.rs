@@ -980,6 +980,14 @@ impl AuthService {
         // sessions: signing out of one device would sign the user out of all
         // of them. Refresh reuses the same `sid` rather than rotating it, so a
         // long-lived session stays valid across refreshes.
+        //
+        // PMS-880 (audit F3) considered the cheaper alternative - stamp the user
+        // row on `logout_all` only, and leave single-session sign-out revoking
+        // just the refresh - and settled on this one instead: it is what makes
+        // BOTH sign-out paths immediate, and it costs one indexed primary-key
+        // read per authenticated legacy request. `logout_all` needs nothing of
+        // its own, because deleting every row for the user is the same check
+        // failing for every one of their tokens.
         if !self.session_is_live(tenant_id, session_id).await? {
             return Err(AppError::Forbidden(
                 "Session has been signed out".to_string(),
@@ -1118,6 +1126,11 @@ impl AuthService {
     /// Logout all sessions for a user. PMS-260: scoped to the caller's tenant
     /// as well as the user so logout cannot span tenants when a `user_id`
     /// exists under more than one tenant.
+    ///
+    /// PMS-880: served by `POST /api/v1/auth/logout-all`. Deleting the rows
+    /// revokes the access tokens too, not only the refresh capability, because
+    /// [`Self::ensure_user_and_tenant_active`] fails every legacy request whose
+    /// `sid` no longer names a live row.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn logout_all(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         // Tenant is in scope, so run under the GUC: RLS scopes the delete to the
@@ -1326,8 +1339,11 @@ impl AuthService {
         let new_hash = hash_password(&request.new_password)?;
 
         // Update password. PMS-681: stamp `password_changed_at` so the auth
-        // middleware rejects every access token issued before now (the `logout_all`
-        // below only revokes refresh sessions).
+        // middleware rejects every access token issued before now. Since
+        // MAPPS-531 the session DELETE below independently kills them too (the
+        // access path checks the token's `sid`); the two cutoffs stay separate
+        // because one is keyed on the credential changing and the other on the
+        // session ending.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE users SET password_hash = $1, updated_at = NOW(), \
