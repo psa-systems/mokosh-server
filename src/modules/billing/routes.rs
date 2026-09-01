@@ -223,6 +223,7 @@ struct LookupQuery {
 async fn lookup_tax_rate(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Query(q): Query<LookupQuery>,
 ) -> AppResult<Json<TaxRateResponse>> {
     let r = state
@@ -415,6 +416,7 @@ async fn list_invoices(
 async fn list_credit_notes(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Query(filter): Query<CreditNoteFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CreditNoteResponse>>> {
@@ -433,6 +435,7 @@ async fn list_credit_notes(
 async fn get_credit_note(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Path(credit_note_id): Path<Uuid>,
 ) -> AppResult<Json<CreditNoteResponse>> {
     let note = state
@@ -487,6 +490,7 @@ async fn void_credit_note(
 async fn get_statement(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Query(query): Query<StatementQuery>,
 ) -> AppResult<Json<StatementResponse>> {
     query.validate()?;
@@ -521,15 +525,10 @@ async fn get_invoice_pdf(
 
 /// PMS-911: `GET /statements/pdf`, taking the same query as `GET /statements`.
 ///
-/// Finance-gated, unlike the JSON `GET /statements` beside it. That is not an
-/// inconsistency introduced here, it is the correct half of one that already
-/// exists: a statement is a company's whole financial account, and every
-/// sibling that carries the same class of data (`/invoices`, `/payments`,
-/// `/tax-rates`) is finance-gated. The JSON route and five others in this file
-/// are not, which is a pre-existing gap of the kind PMS-350 closed elsewhere
-/// and is tracked as PMS-962. Re-permissioning six existing endpoints does not
-/// belong in a branding change; shipping a seventh that repeats the mistake
-/// does not either.
+/// Finance-gated like everything else in this file. PMS-911 gated this one and
+/// left the JSON route beside it ungated, because re-permissioning six existing
+/// endpoints did not belong in a branding change; PMS-962 closed that gap, so
+/// the two answer a given role identically again.
 async fn get_statement_pdf(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -582,6 +581,7 @@ fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
 async fn list_products(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Query(filter): Query<ProductFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProductResponse>>> {
@@ -600,6 +600,7 @@ async fn list_products(
 async fn get_product(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
     Path(product_id): Path<Uuid>,
 ) -> AppResult<Json<ProductResponse>> {
     Ok(Json(
@@ -655,4 +656,82 @@ async fn delete_product(
         .delete_product(user.tenant(), product_id, &ctx)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod finance_gate {
+    /// Every handler in this file that takes the module gate takes the role
+    /// gate too (PMS-962).
+    ///
+    /// The gap this closes was not one mistake, it was the same mistake three
+    /// times: PMS-953 added `list_credit_notes` and `get_credit_note`, PMS-954
+    /// added `get_statement`, and PMS-955 added `list_products` and
+    /// `get_product`, each with `RequireBilling` alone. `lookup_tax_rate` had
+    /// been that way since PMS-40. The effect was that a technician refused
+    /// `GET /invoices` was served `GET /statements`, which carries the same
+    /// invoice totals plus the whole payment history, which is the shape of
+    /// defect PMS-350 exists to have closed.
+    ///
+    /// Review had already let it through three times, so the rule is enforced
+    /// rather than remembered. It reads this file's own source, the way
+    /// `storage::tests::there_is_one_default_root` does, so a new route is
+    /// caught by `cargo test --lib` with no script, recipe or CI step to add.
+    ///
+    /// [`UNGATED`] is the deliberate-exception list and is EMPTY. Adding to it
+    /// means writing down why a financial read is open to every role, which is
+    /// the conversation this guard exists to force.
+    const UNGATED: &[&str] = &[];
+
+    #[test]
+    fn every_billing_handler_also_takes_the_finance_gate() {
+        const SRC: &str = include_str!("routes.rs");
+
+        let mut missing: Vec<&str> = Vec::new();
+        let mut seen = 0usize;
+        for chunk in SRC.split("async fn ").skip(1) {
+            let Some((name, rest)) = chunk.split_once('(') else {
+                continue;
+            };
+            // The argument list, which ends at the return arrow.
+            let Some((args, _)) = rest.split_once(") ->") else {
+                continue;
+            };
+            if !args.contains("RequireBilling") {
+                continue;
+            }
+            seen += 1;
+            if !args.contains("RequireFinance") && !UNGATED.contains(&name) {
+                missing.push(name);
+            }
+        }
+
+        assert!(
+            seen > 20,
+            "the scan found only {seen} gated handlers, so it has stopped \
+             matching this file's shape and is no longer proving anything"
+        );
+        assert!(
+            missing.is_empty(),
+            "these handlers read financial data behind the module gate alone: \
+             {missing:?}. Add `_finance: RequireFinance`, or add the name to \
+             UNGATED with a comment saying why every role may read it."
+        );
+    }
+
+    /// And the exception list stays empty until somebody argues otherwise.
+    ///
+    /// Two candidates were considered and gated in PMS-962. `products` is a
+    /// price list, and the case for opening it is a technician quoting work -
+    /// but `/quotes` is itself finance-gated (PMS-672), so that technician
+    /// cannot build the quote either and the exception would buy nothing.
+    /// `tax-rates/lookup` returns a rate by name from the same table whose CRUD
+    /// routes beside it are gated, so leaving it open would have been an
+    /// oversight rather than a decision.
+    #[test]
+    fn the_exception_list_is_empty() {
+        assert!(
+            UNGATED.is_empty(),
+            "an exception was added without this test being revisited: {UNGATED:?}"
+        );
+    }
 }
