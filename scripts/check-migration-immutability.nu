@@ -19,6 +19,37 @@
 # Requires origin/main to be present with history: the workflow checks out with
 # `fetch-depth: 0`. Run from the repo root.
 
+# PMS-965: the one shape of change this gate has to permit.
+#
+# A duplicate version number cannot be resolved without touching a file that is
+# already on main: `_sqlx_migrations` is keyed on the version, so two files
+# numbered the same make every database fail to finish migrating, and one of
+# them has to move. The rename is safe for exactly one reason, and the entry
+# below has to state it: the file being moved has never been applied to any
+# database, so there is no recorded checksum for the rename to invalidate.
+#
+# That is checkable rather than asserted. A file that always loses a version
+# collision never applies anywhere (sqlx aborts on the duplicate key before
+# reaching it), and `BRANCH_ALLOW_LIST` in oci-build/get-tags.nu decides whether
+# its branch ever reached a deployed database at all.
+#
+# An entry is removable once the rename is on main, because from then on the
+# file no longer differs from the base. Leaving one costs nothing; adding one
+# without the reason defeats the gate.
+const RENAME_ALLOWED = [
+    # PMS-965: PMS-911 (#628) and PMS-875 both landed a migration numbered 127.
+    # `127_invoice_issuer_snapshot.sql` sorts first, so it is the one that
+    # applies and the one whose checksum every half-migrated database now
+    # records; this file is the one that always failed, on every database, and
+    # its branch never published an image (BRANCH_ALLOW_LIST holds only
+    # `mokosh-client-login`), so no checksum for it exists anywhere. Renumbered
+    # to 130.
+    #
+    # Named by its DESTINATION, because `git diff --name-only` reports a rename
+    # by where the file ended up rather than where it came from.
+    "migrations/130_system_shared_policy_on_optin.sql",
+]
+
 def main [] {
     let base = "origin/main"
 
@@ -41,7 +72,13 @@ def main [] {
         exit 2
     }
 
-    let changed = ($diff.stdout | lines | where ($it | str trim | is-not-empty))
+    let all_changed = ($diff.stdout | lines | where ($it | str trim | is-not-empty))
+    let changed = ($all_changed | where ($it not-in $RENAME_ALLOWED))
+    let exempt = ($all_changed | where ($it in $RENAME_ALLOWED))
+
+    for f in $exempt {
+        print $"migration immutability: ($f) is on the PMS-965 rename allow-list \(never applied anywhere)"
+    }
 
     if ($changed | is-empty) {
         print "migration immutability OK: no committed migration was modified, renamed, or deleted"
