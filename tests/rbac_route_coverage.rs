@@ -126,6 +126,26 @@ async fn role_route_coverage_matrix(pool: PgPool) {
     )
     .await;
 
+    // PMS-876: and the PDF format of both, because a new output format is
+    // exactly the shape a side-door around a permission takes. The gate sits
+    // above the format switch in `export_report` so it cannot be added to one
+    // branch and forgotten in the other, and these two rows are what would
+    // fail if it ever moved below.
+    assert_matrix(
+        &app,
+        &tokens,
+        "/api/v1/reports/billing/export?format=pdf",
+        FINANCE_ROLES,
+    )
+    .await;
+    assert_matrix(
+        &app,
+        &tokens,
+        "/api/v1/reports/clients/export?format=pdf",
+        FINANCE_ROLES,
+    )
+    .await;
+
     // Admin -> Team (invitations / Send invite) and Admin -> Audit Log.
     assert_matrix(&app, &tokens, "/api/v1/invitations", ADMIN_ROLES).await;
     assert_matrix(&app, &tokens, "/api/v1/audit-log", ADMIN_ROLES).await;

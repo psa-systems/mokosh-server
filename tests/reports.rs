@@ -345,13 +345,18 @@ async fn reports_registry_and_aggregates(pool: PgPool) {
 // PMS-854: an unsupported export format is a 400, never a 501. The docs
 // claimed 501 for three months while the handler returned 400, so pin the
 // status a client branches on rather than leaving it to a comment.
+//
+// PMS-876 moved `pdf` out of this list by implementing it; what the test
+// asserts is unchanged, because adding a format shrinks the rejected set
+// without changing the status of anything still in it. `xlsx` and the empty
+// string stand in for that set now.
 #[sqlx::test]
 async fn unsupported_export_format_is_400_not_501(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
 
-    for format in ["pdf", "PDF", "xlsx"] {
+    for format in ["xlsx", "XLSX", "html", "json", ""] {
         let res = app
             .client
             .get(app.url(&format!("/api/v1/reports/tickets/export?format={format}")))
