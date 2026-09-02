@@ -43,6 +43,12 @@ pub struct BillingService {
     secrets: Arc<dyn crate::secrets::SecretStore>,
 }
 
+/// PMS-990: the due date offset when neither the invoice's term nor the
+/// tenant's default term names a count. Thirty, because that is what the
+/// server-minted paths used before terms carried a number, and a fallback
+/// that changed it would move due dates on tenants that configured nothing.
+const DEFAULT_NET_DAYS: i32 = 30;
+
 impl BillingService {
     /// Zero-key constructor for callers that never touch secret material (the
     /// QA seeder). Its secret store is the database one under the same zero
@@ -326,6 +332,58 @@ impl BillingService {
         Ok(())
     }
 
+    /// PMS-990: the due date, and the term it came from.
+    ///
+    /// A given `due_date` wins, stored as given with whatever term the caller
+    /// named. Otherwise the date is the invoice date plus the net days of the
+    /// named term, or of the tenant's default term when none was named, and
+    /// the term that supplied the count is returned so the invoice records
+    /// it. A term with no count, or a tenant with no default, falls back to
+    /// thirty days: the value the two server-minted paths hardcoded before
+    /// this, so nothing changes for a tenant that never set one.
+    ///
+    /// Only an ACTIVE default is consulted. A retired default is an operator
+    /// forgetting to move the flag, and linking new invoices to a term that
+    /// no longer appears in the picker would be surprising.
+    pub(crate) async fn resolve_due_date(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_date: NaiveDate,
+        payment_term_id: Option<Uuid>,
+        due_date: Option<NaiveDate>,
+    ) -> AppResult<(NaiveDate, Option<Uuid>)> {
+        if let Some(due) = due_date {
+            return Ok((due, payment_term_id));
+        }
+        let term: Option<(Uuid, Option<i32>)> = match payment_term_id {
+            Some(id) => {
+                sqlx::query_as(
+                    "SELECT id, net_days FROM payment_terms WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, net_days FROM payment_terms \
+                 WHERE tenant_id = $1 AND is_default = TRUE AND is_active = TRUE \
+                 ORDER BY sort_order, name LIMIT 1",
+                )
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+        };
+        let (term_id, net_days) = match term {
+            Some((id, days)) => (Some(id), days),
+            None => (payment_term_id, None),
+        };
+        let days = net_days.unwrap_or(DEFAULT_NET_DAYS);
+        Ok((invoice_date + chrono::Duration::days(days as i64), term_id))
+    }
+
     /// Resolve a set of payment-term ids to their names, tenant-scoped
     /// (PMS-333). Lets `enrich_invoices` attach `payment_term_name` without a
     /// per-row round-trip.
@@ -576,6 +634,15 @@ impl BillingService {
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
+        // PMS-990: the due date the caller gave, or the one the term implies.
+        let (due_date, payment_term_id) = Self::resolve_due_date(
+            &mut tx,
+            tenant_id,
+            request.invoice_date,
+            request.payment_term_id,
+            request.due_date,
+        )
+        .await?;
 
         let invoice_id = Uuid::new_v4();
         sqlx::query(
@@ -598,7 +665,7 @@ impl BillingService {
         .bind(request.billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
-        .bind(request.due_date)
+        .bind(due_date)
         .bind(&request.payment_terms)
         .bind(subtotal)
         .bind(tax)
@@ -607,7 +674,7 @@ impl BillingService {
         .bind(request.currency.as_deref().unwrap_or("USD"))
         .bind(&request.notes)
         .bind(&request.po_number)
-        .bind(request.payment_term_id)
+        .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -832,14 +899,14 @@ impl BillingService {
         let discount = Decimal::ZERO;
         let total = subtotal + tax - discount;
 
-        // Default the invoice/due dates when the caller omits them:
-        // invoice today, due in 30 days (matches the `net30` term).
+        // Default the invoice date to today when the caller omits it, and
+        // the due date to what the tenant's default term implies (PMS-990).
         let invoice_date = request
             .invoice_date
             .unwrap_or_else(|| Utc::now().date_naive());
-        let due_date = request
-            .due_date
-            .unwrap_or_else(|| invoice_date + chrono::Duration::days(30));
+        let (due_date, payment_term_id) =
+            Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
+                .await?;
 
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
@@ -849,10 +916,10 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number
+                balance_due, currency, notes, po_number, payment_term_id
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16)
+                    $12, $13, 0, $13, $14, $15, $16, $17)
             "#,
         )
         .bind(invoice_id)
@@ -871,6 +938,7 @@ impl BillingService {
         .bind(request.currency.as_deref().unwrap_or("USD"))
         .bind(&request.notes)
         .bind(&request.po_number)
+        .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1206,10 +1274,11 @@ impl BillingService {
         let discount = Decimal::ZERO;
         let total = subtotal + tax - discount;
 
-        // Invoice today, due in 30 days (matches the `net30` default term
-        // and the time-entry invoice path).
+        // Invoice today, due when the tenant's default term says (PMS-990);
+        // thirty days when it names no count, as this path always did.
         let invoice_date = today;
-        let due_date = invoice_date + chrono::Duration::days(30);
+        let (due_date, payment_term_id) =
+            Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, None).await?;
 
         // Gapless invoice number: same per-tenant row-lock as
         // `create_invoice`. NOTE: this increments the sequence even if the
@@ -1224,10 +1293,10 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number
+                balance_due, currency, notes, po_number, payment_term_id
             )
             VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
-                    $10, $11, 0, $11, 'USD', $12, NULL)
+                    $10, $11, 0, $11, 'USD', $12, NULL, $13)
             "#,
         )
         .bind(invoice_id)
@@ -1244,6 +1313,7 @@ impl BillingService {
         .bind(format!(
             "Recurring billing for {period_start} to {period_end}"
         ))
+        .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -2675,6 +2745,22 @@ impl BillingService {
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
+        // PMS-990: a term change with no due date re-derives the due date
+        // from the (possibly updated) invoice date, because an invoice moved
+        // from Net 30 to Net 15 that kept its old due date would carry a term
+        // its own dates contradict. A given due date always wins, and an
+        // update that leaves the term alone leaves the date alone.
+        let due_date = match (request.payment_term_id, request.due_date) {
+            (Some(term), None) => {
+                let invoice_date = request.invoice_date.unwrap_or(current.invoice_date);
+                Some(
+                    Self::resolve_due_date(&mut tx, tenant_id, invoice_date, Some(term), None)
+                        .await?
+                        .0,
+                )
+            }
+            (_, given) => given,
+        };
 
         // PMS-911: the MSP's identity as it stands right now, frozen onto the
         // invoice on the transition that freezes the invoice. In this
@@ -2718,7 +2804,7 @@ impl BillingService {
         .bind(request.billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
-        .bind(request.due_date)
+        .bind(due_date)
         .bind(request.payment_terms.as_deref())
         .bind(request.notes.as_deref())
         .bind(request.po_number.as_deref())
@@ -3082,7 +3168,7 @@ impl BillingService {
                 .fetch_one(&mut *tx)
                 .await?;
         let rows = sqlx::query_as::<_, PaymentTermRow>(
-            r#"SELECT id, name, is_default, is_active, sort_order
+            r#"SELECT id, name, is_default, is_active, sort_order, net_days
                FROM payment_terms WHERE tenant_id = $1 ORDER BY sort_order, name
                LIMIT $2 OFFSET $3"#,
         )
@@ -3110,8 +3196,8 @@ impl BillingService {
                 .await?;
         }
         sqlx::query(
-            r#"INSERT INTO payment_terms (id, tenant_id, name, is_default, is_active, sort_order)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+            r#"INSERT INTO payment_terms (id, tenant_id, name, is_default, is_active, sort_order, net_days)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -3119,6 +3205,7 @@ impl BillingService {
         .bind(request.is_default)
         .bind(request.is_active)
         .bind(request.sort_order)
+        .bind(request.net_days)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -3146,6 +3233,7 @@ impl BillingService {
             is_default: request.is_default,
             is_active: request.is_active,
             sort_order: request.sort_order,
+            net_days: request.net_days,
         })
     }
 
@@ -3166,9 +3254,10 @@ impl BillingService {
         }
         let row: Option<PaymentTermRow> = sqlx::query_as(
             r#"UPDATE payment_terms
-               SET name = $3, is_default = $4, is_active = $5, sort_order = $6, updated_at = NOW()
+               SET name = $3, is_default = $4, is_active = $5, sort_order = $6, net_days = $7,
+                   updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2
-               RETURNING id, name, is_default, is_active, sort_order"#,
+               RETURNING id, name, is_default, is_active, sort_order, net_days"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -3176,6 +3265,7 @@ impl BillingService {
         .bind(request.is_default)
         .bind(request.is_active)
         .bind(request.sort_order)
+        .bind(request.net_days)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -4548,6 +4638,7 @@ struct PaymentTermRow {
     is_default: Option<bool>,
     is_active: Option<bool>,
     sort_order: Option<i32>,
+    net_days: Option<i32>,
 }
 
 impl From<PaymentTermRow> for PaymentTermResponse {
@@ -4558,6 +4649,7 @@ impl From<PaymentTermRow> for PaymentTermResponse {
             is_default: r.is_default.unwrap_or(false),
             is_active: r.is_active.unwrap_or(true),
             sort_order: r.sort_order.unwrap_or(0),
+            net_days: r.net_days,
         }
     }
 }

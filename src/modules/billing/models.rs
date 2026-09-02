@@ -209,7 +209,11 @@ pub struct CreateInvoiceRequest {
     pub billing_contact_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
     pub invoice_date: NaiveDate,
-    pub due_date: NaiveDate,
+    /// PMS-990: optional. Omitted, the server derives it from the invoice
+    /// date plus the net days of `payment_term_id`, or of the tenant's
+    /// default term when none is named, or thirty days when the term names
+    /// no count. Given, it is stored as given.
+    pub due_date: Option<NaiveDate>,
     #[validate(length(max = 20))]
     pub payment_terms: Option<String>,
     /// Optional FK into the tenant's `payment_terms` lookup (PMS-333). The
@@ -231,7 +235,9 @@ pub struct CreateInvoiceRequest {
 fn validate_invoice_date_range(
     req: &CreateInvoiceRequest,
 ) -> Result<(), validator::ValidationError> {
-    if req.due_date < req.invoice_date {
+    // PMS-990: a derived due date cannot precede the invoice date, so only a
+    // given one is checked.
+    if req.due_date.is_some_and(|due| due < req.invoice_date) {
         // Re-key onto `due_date` so the form shows the message inline
         // rather than as a generic banner (PMS-364).
         return Err(crate::utils::validation::cross_field_error(
@@ -488,6 +494,10 @@ pub struct PaymentTermResponse {
     pub is_default: bool,
     pub is_active: bool,
     pub sort_order: i32,
+    /// PMS-990: the number of days the term means, or `None` for a term that
+    /// names no fixed count. Drives the derived due date; see
+    /// `BillingService::resolve_due_date`.
+    pub net_days: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -500,6 +510,11 @@ pub struct UpsertPaymentTermRequest {
     pub is_active: bool,
     #[serde(default)]
     pub sort_order: i32,
+    /// PMS-990: days from the invoice date to the due date. Optional, because
+    /// "On approval" is a legitimate term with no count; capped at ten years,
+    /// because a larger value is a typo.
+    #[validate(range(min = 0, max = 3650))]
+    pub net_days: Option<i32>,
 }
 
 #[cfg(test)]
@@ -527,7 +542,7 @@ mod tests {
             billing_contact_id: None,
             contract_id: None,
             invoice_date,
-            due_date,
+            due_date: Some(due_date),
             payment_terms: None,
             payment_term_id: None,
             tax_amount: None,
