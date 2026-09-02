@@ -296,6 +296,129 @@ impl InfisicalClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    // ========================================================================
+    // PMS-967: secrets. Until this, the client could speak to Infisical about
+    // anything EXCEPT the thing Infisical is for: `get`/`post`/`patch`/`delete`
+    // were generic verbs used only by the first-run bootstrap, and no server
+    // process ever constructed the client at all. The bootstrap has always
+    // pre-created `/mokosh`, `/mokosh/tenants` and `/mokosh/integrations` and
+    // granted the machine identity secret-write on them, described in its own
+    // comment as "folders the runtime needs to write secrets into". This is the
+    // runtime half that was never written.
+    // ========================================================================
+
+    /// Read one secret's value, or `None` when it does not exist.
+    ///
+    /// A 404 is `None` rather than an error: "this tenant has not configured
+    /// the integration" is the ordinary case. Every other failure stays an
+    /// error, because an unreachable backend must never read as an absent
+    /// secret (see `crate::secrets`).
+    pub async fn get_secret(
+        &self,
+        project_id: &str,
+        environment: &str,
+        path: &str,
+        name: &str,
+    ) -> Result<Option<String>, AppError> {
+        let query = format!(
+            "workspaceId={}&environment={}&secretPath={}",
+            urlencoding::encode(project_id),
+            urlencoding::encode(environment),
+            urlencoding::encode(path),
+        );
+        let route = format!(
+            "/api/v3/secrets/raw/{}?{}",
+            urlencoding::encode(name),
+            query
+        );
+        match self.get(&route).await {
+            Ok(response) => {
+                let body: SecretEnvelope = response.json().await.map_err(|e| {
+                    AppError::external_service(
+                        "Infisical",
+                        format!("Failed to parse secret response: {}", e),
+                    )
+                })?;
+                Ok(Some(body.secret.secret_value))
+            }
+            Err(AppError::NotFound(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Create or replace a secret.
+    ///
+    /// Infisical separates create from update, so this updates and falls back
+    /// to creating when there is nothing to update. That order rather than the
+    /// reverse: replacing an existing secret is the common call once a tenant
+    /// has connected an integration, and it keeps the create path off the hot
+    /// path.
+    pub async fn put_secret(
+        &self,
+        project_id: &str,
+        environment: &str,
+        path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), AppError> {
+        let body = SecretWrite {
+            workspace_id: project_id,
+            environment,
+            secret_path: path,
+            secret_value: Some(value),
+        };
+        let route = format!("/api/v3/secrets/raw/{}", urlencoding::encode(name));
+        match self.patch(&route, &body).await {
+            Ok(_) => Ok(()),
+            Err(AppError::NotFound(_)) => self.post(&route, &body).await.map(|_| ()),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Remove a secret. A secret that is already gone is not an error.
+    pub async fn delete_secret(
+        &self,
+        project_id: &str,
+        environment: &str,
+        path: &str,
+        name: &str,
+    ) -> Result<(), AppError> {
+        let body = SecretWrite {
+            workspace_id: project_id,
+            environment,
+            secret_path: path,
+            secret_value: None,
+        };
+        let route = format!("/api/v3/secrets/raw/{}", urlencoding::encode(name));
+        match self.delete(&route, &body).await {
+            Ok(_) => Ok(()),
+            Err(AppError::NotFound(_)) => Ok(()),
+            Err(other) => Err(other),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretEnvelope {
+    secret: SecretBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretBody {
+    secret_value: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretWrite<'a> {
+    workspace_id: &'a str,
+    environment: &'a str,
+    secret_path: &'a str,
+    /// Absent on delete, where the body carries only the address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_value: Option<&'a str>,
 }
 
 impl std::fmt::Debug for InfisicalClient {
