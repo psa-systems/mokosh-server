@@ -625,6 +625,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // PMS-968: the secret store, built once. A misconfigured backend ends the
+    // process here rather than surfacing when a customer tries to pay.
+    let secrets = mokosh_server::secrets::store_from_env(db.clone(), encryption_key)
+        .expect("secret store configuration");
+
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -641,6 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.abuse_contact_email,
         config.public_api_base_url,
         config.deployment_mode,
+        secrets.clone(),
     );
     let router = psa_router;
 

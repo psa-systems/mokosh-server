@@ -312,6 +312,15 @@ async fn boot_with_db(
     // test LogMailer so the signature matches. Tests never swap it.
     let mailer = Arc::new(SharedMailer::new(Arc::new(LogMailer)));
     let encryption_key = [0u8; 32];
+    // PMS-968: the database backend under the same zero key the router is
+    // given, so a suite that stores a gateway credential can read it back.
+    // Deliberately not `store_from_env`: process env is shared across the cases
+    // in a binary, so reading SECRET_BACKEND here would let one suite's
+    // configuration decide another's.
+    let secrets = std::sync::Arc::new(mokosh_server::secrets::DatabaseSecretStore::new(
+        db.clone(),
+        encryption_key,
+    ));
 
     let router = create_api_router(
         db,
@@ -345,6 +354,7 @@ async fn boot_with_db(
         // shared router here would silently change what every other suite is
         // testing.
         mokosh_server::utils::deployment::DeploymentMode::SelfHosted,
+        secrets,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

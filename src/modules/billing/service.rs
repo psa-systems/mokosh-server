@@ -37,16 +37,29 @@ pub struct BillingService {
     /// PMS-711: SPA/portal origin the "Pay Now" email links point at. `None`
     /// disables the email (no base to build the link from).
     portal_origin: Option<String>,
+    /// PMS-968: where a tenant's gateway credentials live. Injected rather than
+    /// built here, so the backend is chosen once at startup by
+    /// `secrets::store_from_env` and no constructor can pick a different one.
+    secrets: Arc<dyn crate::secrets::SecretStore>,
 }
 
 impl BillingService {
+    /// Zero-key constructor for callers that never touch secret material (the
+    /// QA seeder). Its secret store is the database one under the same zero
+    /// key, so the two halves agree; nothing on that path reads a gateway
+    /// credential.
     pub fn new(db: Database) -> Self {
+        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+            db.clone(),
+            [0u8; 32],
+        ));
         Self {
             db,
             encryption_key: [0u8; 32],
             http: reqwest::Client::new(),
             mailer: None,
             portal_origin: None,
+            secrets,
         }
     }
 
@@ -377,12 +390,32 @@ impl BillingService {
     /// payment-gateway-config write path so secrets never hit the DB
     /// in cleartext.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
+        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+            db.clone(),
+            encryption_key,
+        ));
+        Self::with_secrets(db, encryption_key, secrets)
+    }
+
+    /// PMS-968: the constructor that takes the configured secret store.
+    ///
+    /// `with_encryption_key` keeps the database backend, which is correct for
+    /// the callers that have no configuration to consult (tests, the seeder).
+    /// Every serving instance is built through here from
+    /// `secrets::store_from_env`, so a deployment on Infisical has all of them
+    /// on Infisical rather than whichever ones remembered.
+    pub fn with_secrets(
+        db: Database,
+        encryption_key: [u8; 32],
+        secrets: Arc<dyn crate::secrets::SecretStore>,
+    ) -> Self {
         Self {
             db,
             encryption_key,
             http: reqwest::Client::new(),
             mailer: None,
             portal_origin: None,
+            secrets,
         }
     }
 
@@ -396,6 +429,7 @@ impl BillingService {
         encryption_key: [u8; 32],
         mailer: Arc<dyn Mailer>,
         portal_origin: String,
+        secrets: Arc<dyn crate::secrets::SecretStore>,
     ) -> Self {
         Self {
             db,
@@ -403,6 +437,7 @@ impl BillingService {
             http: reqwest::Client::new(),
             mailer: Some(mailer),
             portal_origin: Some(portal_origin),
+            secrets,
         }
     }
 

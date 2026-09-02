@@ -108,6 +108,12 @@ pub fn create_api_router(
     // to Bunyip SSO), from MOKOSH_DEPLOYMENT_MODE in main.rs. Decides whether
     // the mail that exists only to service a local password is sent at all.
     deployment_mode: crate::utils::deployment::DeploymentMode,
+    // PMS-968: where tenant-supplied secrets live, chosen once at boot by
+    // `secrets::store_from_env`. Injected rather than built here so this
+    // function cannot pick a backend, and so a deployment on Infisical has
+    // every `BillingService` below on Infisical rather than whichever ones
+    // remembered to ask.
+    secrets: Arc<dyn crate::secrets::SecretStore>,
 ) -> Router {
     let cors_origin_values: Vec<HeaderValue> = cors_origins
         .iter()
@@ -194,6 +200,7 @@ pub fn create_api_router(
         // MAPPS-425: the Pay Now link is `/portal/invoices/{id}`, a mokosh-apps
         // route, so it takes the SPA origin.
         spa_base_url.clone(),
+        secrets.clone(),
     );
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
@@ -514,7 +521,8 @@ pub fn create_api_router(
     let portal_attachment_auth_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
     let portal_ticket_service = TicketService::new(db.clone());
     let portal_kb_service = KbService::new(db.clone());
-    let portal_billing_service = BillingService::with_encryption_key(db.clone(), encryption_key);
+    let portal_billing_service =
+        BillingService::with_secrets(db.clone(), encryption_key, secrets.clone());
     let portal_quotes_service = QuotesService::with_delivery(
         db.clone(),
         shared_mailer.clone(),
@@ -607,9 +615,10 @@ pub fn create_api_router(
     // against; it is not itself a credential. Its own `BillingService` instance
     // (the router's `billing_service` is moved into `billing_routes`).
     let stripe_webhook_state = Arc::new(StripeWebhookState {
-        billing: Arc::new(BillingService::with_encryption_key(
+        billing: Arc::new(BillingService::with_secrets(
             db.clone(),
             encryption_key,
+            secrets.clone(),
         )),
     });
     let stripe_webhooks = Router::new()
