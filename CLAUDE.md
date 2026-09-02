@@ -11,7 +11,7 @@ Mokosh Server: PSA (Professional Services Automation) REST API for MSPs. Rust + 
 
 ## Common commands
 
-All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust stable, `sqlx-cli` for migrations, `cargo-machete` for the unused-dependency gate (`cargo install --locked cargo-machete`).
+All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust `1.94.1` (the exact patch `rust-toolchain.toml` pins, so rustfmt and clippy match CI), `sqlx-cli` for migrations, `cargo-machete` for the unused-dependency gate (`cargo install --locked cargo-machete`).
 
 ```
 just                       # list recipes
@@ -25,7 +25,7 @@ just check-validate-parity # fail if a Create*Request and its Update*Request val
 just check-workspace-deps  # [workspace.dependencies] matches what members inherit
 just check-unused-deps     # cargo-machete: fail on a dependency with no call site
 just check-env-example     # every var the code reads has a .env.example key and a compose.dev.yml line
-just check-doc-recipes     # every `just <recipe>` in README.md / docs/quickstart.md exists in the justfile
+just check-doc-recipes     # every `just <recipe>` in a doc listed in scripts/check-doc-recipes.nu exists in the justfile
 just check-config-doc-paths # every docs/ path named in .env.example / compose.dev.yml / justfile exists
 just check-doc-links       # every relative Markdown link resolves to a path that exists
 just check-single-build    # fail if a compiling workflow builds the same tree twice (DEV-612)
@@ -41,7 +41,7 @@ just check-docker          # validate OCI image builder stage (NOT part of `just
 just build-docker          # build production OCI image (oci-build/Dockerfile)
 ```
 
-`just check` and `just pre-commit` are complements: together they cover every step of `.forgejo/workflows/check.yml`, and neither covers it alone. `docs/dev-docs/local-vs-ci-checks.md` maps the workflow onto the recipes step by step and states why `check-docker`, `test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella recipe (PMS-851). Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-commit`) and the row in that file.
+`just check` and `just pre-commit` are complements: together they cover every step of `.forgejo/workflows/check.yml`, and neither covers it alone. `docs/dev-docs/local-vs-ci-checks.md` maps the workflow onto the recipes step by step and states why `check-docker`, `test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella recipe (PMS-851). Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-commit`), the row in that file, and its line in `docs/recipes.md`.
 
 Single test: `cargo test -p <crate> <test_name>` (workspace), e.g. `cargo test -p mokosh-server utils::totp::tests::rfc6238_vector`.
 
@@ -74,12 +74,18 @@ src/
   main.rs               mokosh-server entrypoint: AppConfig::from_env, build router
   lib.rs                library crate root
   api/router.rs         create_api_router: builds every /api/v1 nest (see "Routing model"), wires middleware + CORS
-  bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown
+  bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown, normalize-company-industries
+  cli.rs                Operator subcommands mokosh-server dispatches before binding a port (PMS-494)
   db/                   Database wrapper around sqlx::PgPool
   infisical/            Infisical HTTP client + first-run bootstrap
   modules/<name>/       Feature modules (see "Modules" below)
+  pdf/                  Document model, and the one place it becomes PDF bytes (PMS-876)
+  scheduler/            Registry for the interval background jobs (PMS-135)
+  secrets/              SecretStore: database (default) or Infisical, chosen by SECRET_BACKEND (PMS-967)
+  storage/              File storage seam; the single reader of ATTACHMENT_DIR (PMS-910)
   utils/                error, email (Mailer trait + SmtpMailer/LogMailer), crypto, validation, pagination
   version.rs            VersionInfo (build-time git hash/describe via build.rs)
+  version_check.rs      Opt-in self-hosted update check against MOKOSH_UPDATE_CHECK_URL (PMS-238)
 
 crates/                 Workspace members: mokosh-types, build-metadata
 migrations/             SQLx migrations, embedded at compile time via sqlx::migrate!
