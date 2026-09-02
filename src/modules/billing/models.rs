@@ -407,6 +407,20 @@ pub struct PayInvoiceResponse {
     pub checkout_url: String,
 }
 
+/// PMS-914: body accepted by `POST /invoices/{invoice_id}/pay`. The SPA
+/// picks `success_url` / `cancel_url` because they are per-plane
+/// (contact portal lands back on the invoice detail; staff lands back
+/// on the CRM invoice row) and the server has no view onto which SPA
+/// is calling. Both are validated as URLs so a malformed value is
+/// refused before it reaches the payment provider.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PayInvoiceRequest {
+    #[validate(url)]
+    pub success_url: String,
+    #[validate(url)]
+    pub cancel_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertPaymentGatewayConfigRequest {
     pub provider: GatewayProvider,
