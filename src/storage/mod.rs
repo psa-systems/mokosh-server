@@ -43,6 +43,7 @@
 //! `utils::client_ip` hold their env-derived configuration the same way.
 
 mod ledger;
+pub mod s3;
 
 pub use ledger::{FileLedger, FileRecord};
 
