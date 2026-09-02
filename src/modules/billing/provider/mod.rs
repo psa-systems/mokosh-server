@@ -7,6 +7,15 @@
 //! ([`stripe::StripeProvider`]); adding PayPal is a new `impl PaymentProvider`,
 //! not a change to `BillingService`.
 //!
+//! PMS-966: that last sentence used to be an intention rather than a fact. The
+//! trait existed and was never dispatched through - `BillingService` held a
+//! `StripeProvider` concretely and all three credential lookups carried
+//! `provider = 'stripe'` as a SQL literal, while `GatewayProvider` already
+//! accepted `paypal` and `authorize_net`, so a tenant could store an active
+//! config for a provider nothing could serve and get silence for it. [`build`]
+//! is now the one place a stored discriminator becomes a provider, and
+//! [`is_supported`] is the one place that answers whether it can.
+//!
 //! Credentials are per-tenant and write-only (PMS-342): the tenant's provider
 //! secret lives encrypted in `payment_gateway_configs.config_encrypted` and is
 //! decrypted strictly server-side to build a provider instance. It is never
@@ -17,10 +26,50 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 pub mod stripe;
 pub use stripe::StripeProvider;
+
+/// Every provider discriminator this build can actually serve.
+///
+/// `GatewayProvider` is the wider set: it knows `authorize_net` and `paypal`
+/// too, and the `payment_gateway_configs.provider` CHECK constraint accepts all
+/// three, because the column predates any implementation. This is the narrower,
+/// honest list, and it is what the config write path validates against so a
+/// tenant cannot activate a gateway that will never mint a checkout session.
+pub const SUPPORTED: &[&str] = &["stripe"];
+
+/// Whether [`build`] can produce a provider for this discriminator.
+pub fn is_supported(provider: &str) -> bool {
+    SUPPORTED.contains(&provider)
+}
+
+/// Turn a stored `(provider, decrypted config)` pair into a provider.
+///
+/// The ONE place a discriminator becomes an implementation. Every caller that
+/// used to name `StripeProvider` goes through here instead, which is what makes
+/// a second provider a new arm rather than a change to `BillingService`.
+///
+/// Parsing the credential blob belongs to the provider module, not here: each
+/// provider's config is its own shape, so the alternative is one struct that is
+/// the union of every provider's fields with everything optional.
+pub fn build(
+    provider: &str,
+    plaintext: &str,
+    http: reqwest::Client,
+) -> AppResult<Box<dyn PaymentProvider>> {
+    match provider {
+        "stripe" => Ok(Box::new(stripe::from_config(plaintext, http)?)),
+        // Unreachable for a config written after PMS-966, which refuses to
+        // activate an unsupported provider. Reachable for a row stored before
+        // it, so it is a stated error rather than a panic or a silent skip.
+        other => Err(AppError::Configuration(format!(
+            "payment provider {other:?} is configured but not implemented; supported: {}",
+            SUPPORTED.join(", ")
+        ))),
+    }
+}
 
 /// Inputs for a hosted checkout session covering one invoice's balance.
 pub struct CheckoutParams<'a> {
