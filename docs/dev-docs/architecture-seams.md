@@ -31,7 +31,7 @@ Two things in this repo answer to the word "billing". They are different domains
 
 | Subsystem | Code | Domain |
 | --- | --- | --- |
-| MSP invoicing | `src/modules/billing/` (`BillingService`, `Invoice`, `RecurringInvoicingWorker`, `stripe_webhook.rs`) | what the MSP bills **its own customers** |
+| MSP invoicing | `src/modules/billing/` (`BillingService`, `Invoice`, `RecurringInvoicingWorker`, `webhook.rs`) | what the MSP bills **its own customers** |
 | Platform subscription state | `public.tenants.subscription_plan` / `subscription_status` / `trial_ends_at` (`migrations/002_tenants.sql:24`) | what a tenant would pay **us** |
 
 **Ownership rule.** They share a word, never a type and never a table. Invoices, recurring contract runs, payment-gateway configs and the per-tenant Stripe webhook receiver (`/api/v1/stripe/webhooks/{tenant_id}`, PMS-711) are MSP-side and live in `src/modules/billing/`. Nothing else in the tree implements platform subscription billing: the repository that did (`BillingRepository` / `BillingTier` in `crates/mokosh-auth-http`) left with PMS-295.

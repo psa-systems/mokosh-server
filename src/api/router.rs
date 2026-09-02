@@ -22,7 +22,7 @@ use crate::modules::auth::{
     auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
 };
 use crate::modules::billing::{
-    billing_routes, stripe_webhook_handler, BillingService, StripeWebhookState,
+    billing_routes, provider_webhook_handler, BillingService, ProviderWebhookState,
 };
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
@@ -614,15 +614,16 @@ pub fn create_api_router(
     // secret). The tenant id in the path selects which tenant's secret to verify
     // against; it is not itself a credential. Its own `BillingService` instance
     // (the router's `billing_service` is moved into `billing_routes`).
-    let stripe_webhook_state = Arc::new(StripeWebhookState {
+    let stripe_webhook_state = Arc::new(ProviderWebhookState {
         billing: Arc::new(BillingService::with_secrets(
             db.clone(),
             encryption_key,
             secrets.clone(),
         )),
+        provider_id: "stripe",
     });
     let stripe_webhooks = Router::new()
-        .route("/webhooks/{tenant_id}", post(stripe_webhook_handler))
+        .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
         .with_state(stripe_webhook_state)
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
