@@ -522,17 +522,27 @@ async fn get_invoice_pdf(
     // the fallback for a draft, which has not been sent and has nothing to
     // preserve, and for an invoice sent before PMS-959, which is how those
     // documents always rendered.
-    let bytes =
-        match crate::modules::billing::documents::read_issued(tenant.get(), invoice_id).await {
-            Some(stored) => stored,
-            None => {
-                let issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
-                let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
-                crate::pdf::render(&crate::modules::billing::documents::invoice(
-                    &invoice, &issuer, logo,
-                ))?
-            }
-        };
+    //
+    // PMS-992: only a FROZEN invoice reads the store. The send writes the
+    // document before it emails, and a refused email rolls the transition
+    // back but not the bytes (storage is not transactional), so a draft can
+    // have a stale render sitting at its key. Serving it would show an
+    // operator a document that no longer matches what they are editing.
+    let stored = if invoice.status.is_frozen() {
+        crate::modules::billing::documents::read_issued(tenant.get(), invoice_id).await
+    } else {
+        None
+    };
+    let bytes = match stored {
+        Some(stored) => stored,
+        None => {
+            let issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
+            let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
+            crate::pdf::render(&crate::modules::billing::documents::invoice(
+                &invoice, &issuer, logo,
+            ))?
+        }
+    };
     Ok(pdf_response(
         bytes,
         &format!("{}.pdf", invoice.invoice_number),
