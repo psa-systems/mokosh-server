@@ -1686,19 +1686,31 @@ impl BillingService {
             )));
         }
 
-        // Encrypt only when the caller supplied a new config; `None` means
-        // "keep the existing secret" (write-only update semantics, PMS-342).
-        let encrypted = match request.config.as_ref() {
+        // PMS-968: a supplied credential goes to the configured secret store,
+        // and the row records only that it is there. `None` still means "keep
+        // the existing secret" (write-only update semantics, PMS-342).
+        //
+        // The store write happens BEFORE the row is touched, and that order is
+        // load-bearing. The two are not one transaction, because the store may
+        // be Infisical, so one of them can succeed alone. Store-first fails as
+        // an orphaned secret with the row still holding whatever it held, which
+        // keeps working; row-first fails as a row claiming its credential is in
+        // a store that never received it, which is an integration that cannot
+        // charge and cannot say why. Same rule as PMS-960's mover: the record
+        // follows the thing it describes.
+        let stored_in_secret_store = match request.config.as_ref() {
             Some(config) => {
                 let plaintext = serde_json::to_string(config).map_err(|e| {
                     AppError::BadRequest(format!("Config must serialise to JSON: {e}"))
                 })?;
-                Some(crate::utils::crypto::encrypt(
-                    &plaintext,
-                    &self.encryption_key,
-                )?)
+                let key = crate::secrets::SecretKey::payment_gateway(
+                    tenant_id.get(),
+                    request.provider.as_str(),
+                );
+                self.secrets.put(&key, &plaintext).await?;
+                true
             }
-            None => None,
+            None => false,
         };
 
         // Mutation + audit row in one transaction. PMS-117. The secret
@@ -1722,10 +1734,10 @@ impl BillingService {
             AuditAction::Create
         };
 
-        // A brand-new gateway must carry a config: `config_encrypted` is NOT
-        // NULL, and there is no existing secret to preserve.
-        let id: Uuid = match encrypted.as_ref() {
-            Some(encrypted) => {
+        // A brand-new gateway must carry a config: there is no existing secret
+        // to preserve.
+        let id: Uuid = if stored_in_secret_store {
+            {
                 sqlx::query_scalar(
                     r#"
                     INSERT INTO payment_gateway_configs
@@ -1743,11 +1755,14 @@ impl BillingService {
                 .bind(request.provider.as_str())
                 .bind(request.is_active)
                 .bind(request.is_test_mode)
-                .bind(encrypted)
+                // NULL: the credential is in the secret store now, at the
+                // address this row's own (tenant_id, provider) gives.
+                .bind(Option::<String>::None)
                 .fetch_one(&mut *tx)
                 .await?
             }
-            None => {
+        } else {
+            {
                 if before.is_none() {
                     return Err(AppError::BadRequest(
                         "Config is required when first configuring a gateway".to_string(),
