@@ -251,7 +251,12 @@ impl SecretsConfig {
     /// giving them the database is the silent degrade this module refuses
     /// everywhere else.
     pub fn from_env() -> AppResult<Self> {
-        let raw = std::env::var("SECRET_BACKEND").unwrap_or_default();
+        Self::parse(&std::env::var("SECRET_BACKEND").unwrap_or_default())
+    }
+
+    /// The rule itself, split out so it can be tested without writing to
+    /// process-global env under a concurrent test runner.
+    pub fn parse(raw: &str) -> AppResult<Self> {
         let backend = match raw.trim() {
             "" | "database" => SecretBackend::Database,
             "infisical" => SecretBackend::Infisical,
@@ -262,5 +267,115 @@ impl SecretsConfig {
             }
         };
         Ok(Self { backend })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TENANT: Uuid = Uuid::from_u128(1);
+    const OTHER: Uuid = Uuid::from_u128(2);
+
+    /// The property the whole key type exists for. Infisical is a flat
+    /// namespace with no tenant filter and no RLS, so if two tenants' keys can
+    /// produce one name, the second write silently replaces the first tenant's
+    /// credentials.
+    #[test]
+    fn two_tenants_cannot_address_the_same_secret() {
+        let mine = SecretKey::payment_gateway(TENANT, "stripe");
+        let theirs = SecretKey::payment_gateway(OTHER, "stripe");
+        assert_ne!(
+            mine.name().unwrap(),
+            theirs.name().unwrap(),
+            "the same integration in two tenants must not share a name"
+        );
+    }
+
+    /// The name is the row's identity in one backend and the secret's identity
+    /// in the other, so it is pinned rather than left to drift: changing it
+    /// orphans every secret already written under the old one.
+    #[test]
+    fn the_name_is_exactly_this_shape() {
+        let key = SecretKey::payment_gateway(TENANT, "stripe");
+        assert_eq!(
+            key.name().unwrap(),
+            "PAYMENT_GATEWAY__00000000000000000000000000000001__STRIPE"
+        );
+    }
+
+    /// A crafted discriminator must not walk out of its folder or collide with
+    /// another key's name. `provider` is enum-constrained on the way in today,
+    /// so this guards the next caller rather than the current one.
+    #[test]
+    fn a_discriminator_cannot_escape_its_own_segment() {
+        for hostile in [
+            "../other",
+            "stripe/../../etc",
+            "stripe secret",
+            "STRIPE",
+            "stripe-live",
+            "",
+        ] {
+            let key = SecretKey::payment_gateway(TENANT, hostile);
+            assert!(
+                key.name().is_err(),
+                "{hostile:?} must be refused as a discriminator"
+            );
+        }
+        assert!(SecretKey::payment_gateway(TENANT, "authorize_net")
+            .name()
+            .is_ok());
+    }
+
+    /// Displaying a key must never be a way to log a secret.
+    #[test]
+    fn displaying_a_key_names_it_and_nothing_else() {
+        let shown = SecretKey::payment_gateway(TENANT, "stripe").to_string();
+        assert!(shown.contains("stripe"));
+        assert!(shown.contains(&TENANT.to_string()));
+    }
+
+    /// Unset and blank both mean the default, because a forwarded-but-unset
+    /// compose variable arrives as an empty string (PMS-836).
+    #[test]
+    fn an_unset_backend_is_the_database() {
+        for raw in ["", "   ", "database"] {
+            assert_eq!(
+                SecretsConfig::parse(raw).unwrap().backend,
+                SecretBackend::Database
+            );
+        }
+        assert_eq!(
+            SecretsConfig::parse("infisical").unwrap().backend,
+            SecretBackend::Infisical
+        );
+    }
+
+    /// A typo asked for something. Answering with the default would mean an
+    /// operator who wrote `infisicial` keeps storing secrets in Postgres and is
+    /// never told.
+    #[test]
+    fn an_unrecognised_backend_is_refused_and_not_defaulted() {
+        for raw in ["infisicial", "vault", "DATABASE", "none"] {
+            assert!(
+                SecretsConfig::parse(raw).is_err(),
+                "{raw:?} must not silently become the default"
+            );
+        }
+    }
+
+    /// One reader of the selection variable, the way
+    /// `storage::tests::there_is_one_default_root` pins one reader of
+    /// `ATTACHMENT_DIR`. Two readers is how two parts of one process come to
+    /// disagree about where secrets are.
+    #[test]
+    fn there_is_one_reader_of_the_backend_setting() {
+        const SRC: &str = include_str!("mod.rs");
+        assert_eq!(
+            SRC.matches(concat!("var(\"SECRET", "_BACKEND\")")).count(),
+            1,
+            "SECRET_BACKEND is read in exactly one place"
+        );
     }
 }
