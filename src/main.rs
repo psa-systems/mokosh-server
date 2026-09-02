@@ -513,6 +513,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secrets = mokosh_server::secrets::store_from_env(db.clone(), encryption_key)
         .expect("secret store configuration");
 
+    // PMS-958: the object store, built once for the whole process for the
+    // same reason. Every service that keeps bytes reaches it through
+    // `storage::shared()` rather than a constructor argument (there are
+    // thirteen of those constructions across the router, the tenants routes,
+    // billing and the seeders), so this first touch is what turns a
+    // misconfigured backend into a boot failure instead of a 500 on the first
+    // upload.
+    mokosh_server::storage::init_from_env().expect("storage backend configuration");
+
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw

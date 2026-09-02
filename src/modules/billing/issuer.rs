@@ -47,7 +47,7 @@ use uuid::Uuid;
 use mokosh_types::tenants::TenantBranding;
 
 use crate::modules::tenants::logo::TenantLogoStore;
-use crate::storage::{LocalStore, ObjectKey, ObjectStore};
+use crate::storage::ObjectKey;
 use crate::utils::error::AppResult;
 
 /// The issuing MSP, as a document shows it.
@@ -138,7 +138,7 @@ pub async fn freeze(
 async fn copy_logo(tenant_id: Uuid, mime: &str, logos: &TenantLogoStore) -> AppResult<String> {
     let bytes = logos.read(tenant_id, mime).await?;
     let digest = hex(&<Sha256 as Digest>::digest(&bytes));
-    let store = LocalStore::from_env();
+    let store = crate::storage::shared();
     let key = ObjectKey::branding_logo(tenant_id, &digest);
     // Idempotent by construction: the same bytes give the same key, so a second
     // invoice sent under the same logo rewrites the identical object rather
@@ -152,7 +152,7 @@ async fn copy_logo(tenant_id: Uuid, mime: &str, logos: &TenantLogoStore) -> AppR
 /// is still the document.
 pub async fn logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
     let digest = issuer.logo_digest.as_deref()?;
-    let store = LocalStore::from_env();
+    let store = crate::storage::shared();
     store
         .read(&ObjectKey::branding_logo(tenant_id, digest))
         .await

@@ -295,6 +295,12 @@ async fn boot_with_db(
     app_pool: Option<PgPool>,
     bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
 ) -> TestApp {
+    // PMS-958: the object store is process-wide and built on first use, so
+    // the root has to be chosen before anything in this binary can ask for
+    // it. Every suite that stores bytes already calls this itself; doing it
+    // here as well means a suite that never touches storage cannot pin the
+    // compiled-in `./attachments` root for a neighbour that does.
+    storage_root();
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
     // sqlx error swallowed by `AppError::Database("Database operation

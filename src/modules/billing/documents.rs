@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::pdf::{Document, Logo};
-use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
+use crate::storage::{FileLedger, FileRecord, ObjectKey};
 use crate::utils::error::AppResult;
 
 use super::issuer::Issuer;
@@ -264,7 +264,7 @@ pub async fn store_issued(
     bytes: &[u8],
 ) -> AppResult<()> {
     let key = ObjectKey::financial_document(tenant_id, document_id);
-    LocalStore::from_env().put(&key, bytes).await?;
+    crate::storage::shared().put(&key, bytes).await?;
     FileLedger::record_in_tx(
         tx,
         tenant_id,
@@ -307,7 +307,7 @@ fn document_file_id(document_id: Uuid) -> Uuid {
 /// `None` for a draft, and for anything issued before PMS-959; the caller
 /// renders live in that case, which is what those documents always did.
 pub async fn read_issued(tenant_id: Uuid, document_id: Uuid) -> Option<Vec<u8>> {
-    LocalStore::from_env()
+    crate::storage::shared()
         .read(&ObjectKey::financial_document(tenant_id, document_id))
         .await
         .ok()

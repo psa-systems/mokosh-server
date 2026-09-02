@@ -33,7 +33,7 @@
 //! removes both. The fallback is safe here for a reason worth stating rather
 //! than assuming: the tenant on both keys comes off the `kb_article_attachments`
 //! row, never off the request, so it cannot be used to reach another tenant's
-//! file. A blanket fallback inside `LocalStore` would have been reachable from
+//! file. A blanket fallback inside the store would have been reachable from
 //! any key and would have reintroduced exactly what PMS-960 closed.
 
 use std::sync::Arc;
@@ -50,7 +50,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
-use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
+use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 // PMS-941: one allowlist for every publicly-readable image route. SVG is
 // refused there, for the reason the module header of `inline_image` states.
@@ -100,7 +100,7 @@ pub struct KbAttachmentService {
     db: Database,
     config: KbAttachmentConfig,
     /// PMS-910: where the bytes go. This module no longer knows.
-    store: LocalStore,
+    store: Arc<dyn ObjectStore>,
     /// PMS-957: one row per stored file, so the tenant rollup is a fact.
     ledger: FileLedger,
 }
@@ -111,7 +111,7 @@ impl KbAttachmentService {
             ledger: FileLedger::new(db.clone()),
             db,
             config,
-            store: LocalStore::from_env(),
+            store: crate::storage::shared(),
         }
     }
 
@@ -479,11 +479,8 @@ mod tests {
             "the key is the id, so a traversal in the uploaded name has \
              nothing to traverse"
         );
-        let store = crate::storage::LocalStore::new(crate::storage::StorageConfig {
-            root: std::path::PathBuf::from("/data/attachments"),
-        });
-        let path = store
-            .path_for(&ObjectKey::kb_attachment(tenant, id))
+        let path = ObjectKey::kb_attachment(tenant, id)
+            .relative_path()
             .expect("path");
         assert!(path.ends_with(id.to_string()));
     }

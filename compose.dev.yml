@@ -125,6 +125,35 @@ services:
       retries: 10
       start_period: 30s
 
+  # PMS-958: an S3-compatible object store for the `s3` storage backend and
+  # the `tests/s3_storage.rs` suite. Opt-in behind the `s3` profile
+  # (`just dev-s3`), because no integration is a hard requirement: the server
+  # keeps writing to the `attachments` volume until STORAGE_BACKEND=s3 is set
+  # and it is restarted. The command is spelled out because the image carries
+  # none, which is also why CI runs the MinIO binary directly rather than as a
+  # `services:` entry (a Forgejo service container cannot be handed one).
+  # Ports publish on loopback only, like postgres and mailpit (PMS-496).
+  minio:
+    profiles: ["s3"]
+    container_name: dev-mokosh-minio-${USER:?USER missing - run via just dev}
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER missing - copy the key from .env.example into .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD missing - copy the key from .env.example into .env and set a value}
+    volumes:
+      - minio-data:/data
+    networks:
+      - private
+    ports:
+      - "127.0.0.1:29000:9000"
+      - "127.0.0.1:29001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
   # PostgreSQL database for the Mokosh API server (the app's primary
   # store, separate from Infisical's). Reachable in-network as
   # `postgres:5432` and on the host as `127.0.0.1:${MOKOSH_PG_HOST_PORT}`
@@ -334,6 +363,16 @@ services:
       # PMS-923: KB article images. Default reproduces the code's own 5 MiB.
       KB_ATTACHMENT_MAX_BYTES: ${KB_ATTACHMENT_MAX_BYTES:-}
       TENANT_LOGO_MAX_BYTES: ${TENANT_LOGO_MAX_BYTES:-}
+      # PMS-958: storage backend. Empty resolves to local, so the dev stack
+      # keeps writing to the `attachments` volume unless an operator opts in
+      # to the `s3` profile's MinIO (`just dev-s3`) and sets these.
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_PATH_STYLE: ${S3_PATH_STYLE:-}
 
       # RS verifier knobs beyond the issuer/audience pair above; empty keeps the
       # built-in 600s JWKS cache and 30s clock leeway. OIDC_DEFAULT_TENANT_ID is
@@ -435,6 +474,8 @@ volumes:
     name: dev-mokosh-server-target-${USER:?USER missing - run via just dev}
   attachments:
     name: dev-mokosh-attachments-${USER:?USER missing - run via just dev}
+  minio-data:
+    name: dev-mokosh-minio-data-${USER:?USER missing - run via just dev}
 
 networks:
   private:
