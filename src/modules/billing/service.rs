@@ -4919,16 +4919,18 @@ mod gateway_resolution {
     }
 
     /// The property that makes PMS-966 a refactor rather than a change: a
-    /// tenant with a stored `paypal` row was invisible behind the old
+    /// tenant with a stored `authorize_net` row was invisible behind the old
     /// `provider = 'stripe'` literal, and must stay invisible now that the
-    /// literal is gone.
+    /// literal is gone. (PMS-966 used `paypal` as the example; PMS-969 made
+    /// that one serveable, so the example moved to the provider that still is
+    /// not.)
     #[test]
     fn an_unserveable_row_is_skipped_exactly_as_the_literal_skipped_it() {
-        let picked = BillingService::select_serveable(vec![row("paypal"), row("stripe")])
+        let picked = BillingService::select_serveable(vec![row("authorize_net"), row("stripe")])
             .expect("one serveable row resolves");
         assert_eq!(picked.map(|(id, _)| id), Some("stripe".to_string()));
 
-        let none = BillingService::select_serveable(vec![row("paypal"), row("authorize_net")])
+        let none = BillingService::select_serveable(vec![row("authorize_net")])
             .expect("no serveable row is not an error");
         assert!(
             none.is_none(),

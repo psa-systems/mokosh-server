@@ -29,7 +29,9 @@ use uuid::Uuid;
 
 use crate::utils::error::{AppError, AppResult};
 
+pub mod paypal;
 pub mod stripe;
+pub use paypal::PaypalProvider;
 pub use stripe::StripeProvider;
 
 /// Every provider discriminator this build can actually serve.
@@ -39,7 +41,7 @@ pub use stripe::StripeProvider;
 /// three, because the column predates any implementation. This is the narrower,
 /// honest list, and it is what the config write path validates against so a
 /// tenant cannot activate a gateway that will never mint a checkout session.
-pub const SUPPORTED: &[&str] = &["stripe"];
+pub const SUPPORTED: &[&str] = &["stripe", "paypal"];
 
 /// Whether [`build`] can produce a provider for this discriminator.
 pub fn is_supported(provider: &str) -> bool {
@@ -62,6 +64,7 @@ pub fn build(
 ) -> AppResult<Box<dyn PaymentProvider>> {
     match provider {
         "stripe" => Ok(Box::new(stripe::from_config(plaintext, http)?)),
+        "paypal" => Ok(Box::new(paypal::from_config(plaintext, http)?)),
         // Unreachable for a config written after PMS-966, which refuses to
         // activate an unsupported provider. Reachable for a row stored before
         // it, so it is a stated error rather than a panic or a silent skip.
@@ -195,8 +198,9 @@ mod tests {
         let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
 
         assert!(build("stripe", config, http.clone()).is_ok());
+        assert!(build("paypal", config, http.clone()).is_ok());
 
-        for unsupported in ["paypal", "authorize_net", "", "STRIPE"] {
+        for unsupported in ["authorize_net", "", "STRIPE", "PayPal"] {
             // `Box<dyn PaymentProvider>` is not `Debug`, so this matches rather
             // than calling `expect_err`.
             match build(unsupported, config, http.clone()) {
@@ -231,7 +235,10 @@ mod tests {
             };
             assert!(reached_the_arm, "{id} is listed but has no arm in build");
         }
-        assert!(!is_supported("paypal"), "paypal has no implementation yet");
+        assert!(
+            !is_supported("authorize_net"),
+            "authorize_net has no implementation"
+        );
     }
 
     /// The discriminator is the stored column value, so it must match what a
