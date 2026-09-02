@@ -58,8 +58,10 @@ use uuid::Uuid;
 use crate::utils::error::{AppError, AppResult};
 
 pub mod database;
+pub mod infisical_store;
 
 pub use database::DatabaseSecretStore;
+pub use infisical_store::InfisicalSecretStore;
 
 /// What a stored secret belongs to.
 ///
