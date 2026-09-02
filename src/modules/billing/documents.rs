@@ -96,11 +96,15 @@ pub fn invoice(
                 .unwrap_or_else(|| "Customer".to_string())],
         );
 
+    // No status line (PMS-990). The document is stored at the first send and
+    // served unchanged after, so a status printed on it would read `sent`
+    // forever, whatever the invoice later became; and a draft preview that
+    // printed `draft` would differ from the stored bytes by that one word,
+    // which is exactly the preview-equals-sent guarantee this module makes.
     let mut details = vec![
         ("Invoice number".to_string(), invoice.invoice_number.clone()),
         ("Invoice date".to_string(), invoice.invoice_date.to_string()),
         ("Due date".to_string(), invoice.due_date.to_string()),
-        ("Status".to_string(), invoice.status.as_str().to_string()),
     ];
     // The lookup name if there is one, the legacy free-text terms otherwise
     // (PMS-333), and no line at all when there is neither.
