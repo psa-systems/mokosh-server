@@ -2033,7 +2033,7 @@ impl BillingService {
         .fetch_all(self.db.migrator_pool())
         .await?;
         match Self::select_serveable(rows)? {
-            Some((id, enc)) => Ok(Some(self.build_provider(tenant_id.into(), &id, enc).await?)),
+            Some((id, enc)) => Ok(Some(self.build_provider(tenant_id, &id, enc).await?)),
             None => Ok(None),
         }
     }
