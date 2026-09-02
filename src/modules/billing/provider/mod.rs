@@ -158,3 +158,66 @@ pub trait PaymentProvider: Send + Sync {
     fn verify_and_parse_webhook(&self, raw_body: &[u8], signature: &str)
         -> AppResult<PaymentEvent>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The claim `build` exists to make: one arm per servable provider, and a
+    /// stated refusal for everything else.
+    #[test]
+    fn only_a_supported_provider_builds() {
+        let http = reqwest::Client::new();
+        let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
+
+        assert!(build("stripe", config, http.clone()).is_ok());
+
+        for unsupported in ["paypal", "authorize_net", "", "STRIPE"] {
+            // `Box<dyn PaymentProvider>` is not `Debug`, so this matches rather
+            // than calling `expect_err`.
+            match build(unsupported, config, http.clone()) {
+                Err(AppError::Configuration(message)) => {
+                    assert!(
+                        message.contains("not implemented"),
+                        "{unsupported:?} refused for the wrong reason: {message}"
+                    );
+                }
+                Err(other) => panic!("{unsupported:?} should be a Configuration error: {other:?}"),
+                Ok(_) => panic!("{unsupported:?} must not build"),
+            }
+        }
+    }
+
+    /// `SUPPORTED` and `build` are two statements of the same fact, and a
+    /// provider added to one and not the other is the bug this catches:
+    /// `is_supported` gates activation, `build` runs at payment time, so a
+    /// disagreement means a gateway that switches on and then cannot charge.
+    #[test]
+    fn the_supported_list_and_the_build_arms_agree() {
+        let http = reqwest::Client::new();
+        // Deliberately not a real credential blob: every supported provider
+        // must at least reach its own parser rather than fall to the catch-all.
+        for id in SUPPORTED {
+            assert!(is_supported(id), "{id} is listed but not supported");
+            let err = build(id, "{}", http.clone());
+            let reached_the_arm = match err {
+                Ok(_) => true,
+                Err(AppError::Configuration(ref m)) => !m.contains("not implemented"),
+                Err(_) => true,
+            };
+            assert!(reached_the_arm, "{id} is listed but has no arm in build");
+        }
+        assert!(!is_supported("paypal"), "paypal has no implementation yet");
+    }
+
+    /// The discriminator is the stored column value, so it must match what a
+    /// built provider reports about itself. A mismatch would resolve one
+    /// tenant's row into a provider that signs with another scheme.
+    #[test]
+    fn a_built_provider_reports_the_id_it_was_asked_for() {
+        let http = reqwest::Client::new();
+        let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
+        let p = build("stripe", config, http).expect("stripe builds");
+        assert_eq!(p.id(), "stripe");
+    }
+}

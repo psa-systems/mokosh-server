@@ -4801,3 +4801,63 @@ impl From<ProductRow> for ProductResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod gateway_resolution {
+    use super::*;
+
+    fn row(provider: &str) -> (String, String) {
+        (provider.to_string(), format!("ciphertext-for-{provider}"))
+    }
+
+    /// The property that makes PMS-966 a refactor rather than a change: a
+    /// tenant with a stored `paypal` row was invisible behind the old
+    /// `provider = 'stripe'` literal, and must stay invisible now that the
+    /// literal is gone.
+    #[test]
+    fn an_unserveable_row_is_skipped_exactly_as_the_literal_skipped_it() {
+        let picked = BillingService::select_serveable(vec![row("paypal"), row("stripe")])
+            .expect("one serveable row resolves");
+        assert_eq!(picked.map(|(id, _)| id), Some("stripe".to_string()));
+
+        let none = BillingService::select_serveable(vec![row("paypal"), row("authorize_net")])
+            .expect("no serveable row is not an error");
+        assert!(
+            none.is_none(),
+            "a tenant with only unserveable gateways resolves to None, not an error"
+        );
+    }
+
+    /// No active rows at all is the ordinary unconfigured tenant.
+    #[test]
+    fn no_rows_resolves_to_none() {
+        let none = BillingService::select_serveable(Vec::new()).expect("no rows is fine");
+        assert!(none.is_none());
+    }
+
+    /// Two serveable gateways is a question the database cannot answer, so it
+    /// is refused rather than resolved. `UNIQUE (tenant_id, provider)` permits
+    /// one active row per provider, so this becomes reachable the moment a
+    /// second provider is implemented (PMS-969); picking one would route a
+    /// customer's payment at whichever row the planner happened to return.
+    #[test]
+    fn two_serveable_gateways_is_refused_and_not_picked_between() {
+        // Constructed from `SUPPORTED` rather than from two hard-coded names,
+        // so this keeps testing the ambiguity once a second provider lands
+        // instead of quietly becoming unreachable.
+        let mut rows: Vec<(String, String)> = provider::SUPPORTED.iter().map(|p| row(p)).collect();
+        if rows.len() < 2 {
+            rows.push(row(provider::SUPPORTED[0]));
+        }
+        match BillingService::select_serveable(rows) {
+            Err(AppError::Configuration(message)) => {
+                assert!(
+                    message.contains("exactly one may be active"),
+                    "refused for the wrong reason: {message}"
+                );
+            }
+            Err(other) => panic!("expected a Configuration error, got {other:?}"),
+            Ok(_) => panic!("two serveable gateways must not resolve to one"),
+        }
+    }
+}
