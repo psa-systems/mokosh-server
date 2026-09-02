@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lettre::message::{Mailbox, MessageBuilder, MultiPart};
+use lettre::message::{
+    header::ContentType, Attachment, Mailbox, MessageBuilder, MultiPart, SinglePart,
+};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use secrecy::{ExposeSecret, SecretString};
@@ -53,14 +55,29 @@ pub struct QuoteReady<'a> {
     pub portal_link: &'a str,
 }
 
-/// What the invoice "Pay Now" email renders, beyond who it is from.
-/// Same reasoning as [`QuoteReady`].
+/// What the invoice email renders, beyond who it is from. Same reasoning as
+/// [`QuoteReady`].
+///
+/// PMS-991: the message is the invoice, not the payment link. `portal_link` is
+/// `Some` only when the tenant has a connected payment gateway and the server
+/// knows its portal origin; without it the body still says what is owed and by
+/// when and carries the document. `pdf` is the stored document as issued
+/// (PMS-959) when there is one.
 #[derive(Debug, Clone, Copy)]
-pub struct InvoicePayNow<'a> {
+pub struct InvoiceSent<'a> {
     pub invoice_number: &'a str,
     pub amount_due: &'a str,
     pub due_date: &'a str,
-    pub portal_link: &'a str,
+    pub portal_link: Option<&'a str>,
+    pub pdf: Option<&'a [u8]>,
+}
+
+/// A file carried by a message (PMS-991).
+#[derive(Debug, Clone, Copy)]
+pub struct EmailAttachment<'a> {
+    pub filename: &'a str,
+    pub mime: &'a str,
+    pub bytes: &'a [u8],
 }
 
 /// Anything that can send mokosh's transactional emails.
@@ -82,6 +99,29 @@ pub trait Mailer: Send + Sync {
     /// Plain-text convenience wrapper over [`Mailer::send_multipart`].
     async fn send_text(&self, to: &str, subject: &str, body: &str) -> AppResult<()> {
         self.send_multipart(to, subject, body, None).await
+    }
+
+    /// PMS-991: a plain-text message carrying files. The default sends the
+    /// text alone and says so at `warn`, because a mailer that cannot carry
+    /// an attachment must not silently pretend it did; the SMTP mailer
+    /// overrides it with a `multipart/mixed` message.
+    async fn send_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        attachments: &[EmailAttachment<'_>],
+    ) -> AppResult<()> {
+        if !attachments.is_empty() {
+            tracing::warn!(
+                target: "mokosh_server.mailer",
+                to = %to,
+                subject = %subject,
+                attachments = attachments.len(),
+                "this mailer cannot carry attachments; sending the text alone",
+            );
+        }
+        self.send_multipart(to, subject, text, None).await
     }
 
     /// PMS-673: tell a client contact that a quote is ready for their
@@ -135,46 +175,55 @@ pub trait Mailer: Send + Sync {
         .await
     }
 
-    /// PMS-711: tell a client contact that an invoice is ready to pay, linking
-    /// them to the portal invoice page where the "Pay Now" button opens a
-    /// provider checkout session. The default composes a plain-text body and
-    /// routes it through [`Mailer::send_text`], so every mailer inherits it
-    /// without a per-impl override.
+    /// PMS-711, reshaped by PMS-991: tell a client contact that an invoice has
+    /// been sent, with the document attached and, when the tenant has a
+    /// connected payment gateway, a link to the portal page whose "Pay Now"
+    /// opens a provider checkout. Before PMS-991 the whole message was gated
+    /// on the gateway, so a fresh install with none sent nothing on Send and
+    /// nobody could tell; the invoice is the message and the link is an extra.
+    /// The default composes a plain-text body and routes it through
+    /// [`Mailer::send_with_attachments`], so every mailer inherits it.
     ///
     /// PMS-761: `from` is required, for the same reason as the quote. An email
     /// asking someone to pay, from nobody in particular, is indistinguishable
     /// from the invoice fraud it would be mistaken for.
-    async fn send_invoice_pay_now(
+    async fn send_invoice_sent(
         &self,
         to: &str,
         from: SenderIdentity<'_>,
-        invoice: InvoicePayNow<'_>,
+        invoice: InvoiceSent<'_>,
     ) -> AppResult<()> {
         let SenderIdentity {
             org_name,
             contact_line,
         } = from;
-        let InvoicePayNow {
+        let InvoiceSent {
             invoice_number,
             amount_due,
             due_date,
             portal_link,
+            pdf,
         } = invoice;
-        let body = format!(
-            "{org_name} has sent you an invoice, ready for payment.\n\n\
-             Invoice: {invoice_number}\n\
-             Amount due: {amount_due}\n\
-             Due: {due_date}\n\n\
-             Review the invoice and pay online here:\n\n\
-             {portal_link}\n\n\
-             {contact_line}"
+        let (subject, body) = compose_invoice_sent(
+            org_name,
+            contact_line,
+            invoice_number,
+            amount_due,
+            due_date,
+            portal_link,
+            pdf.is_some(),
         );
-        self.send_text(
-            to,
-            &format!("Invoice {invoice_number} from {org_name} is ready to pay"),
-            &body,
-        )
-        .await
+        let filename = format!("{invoice_number}.pdf");
+        let attachments: Vec<EmailAttachment<'_>> = pdf
+            .map(|bytes| EmailAttachment {
+                filename: &filename,
+                mime: "application/pdf",
+                bytes,
+            })
+            .into_iter()
+            .collect();
+        self.send_with_attachments(to, &subject, &body, &attachments)
+            .await
     }
 
     /// PMS-761: the two methods below take no [`SenderIdentity`], and should
@@ -259,6 +308,24 @@ impl Mailer for LogMailer {
             body_len = text.len(),
             html_len = html.map(str::len),
             "[DEV] would send email",
+        );
+        Ok(())
+    }
+
+    async fn send_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        attachments: &[EmailAttachment<'_>],
+    ) -> AppResult<()> {
+        tracing::info!(
+            target: "mokosh_server.mailer",
+            to = %to,
+            subject = %subject,
+            body_len = text.len(),
+            attachments = attachments.len(),
+            "[DEV] would send email with attachments",
         );
         Ok(())
     }
@@ -395,6 +462,77 @@ fn reject_undeliverable_recipient(to: &Mailbox) -> AppResult<()> {
     Ok(())
 }
 
+/// The invoice email's subject and body (PMS-991). A free function so the
+/// wording is pinned by a test without a mailer: the link paragraph appears
+/// only when there is a link, and the attachment is named only when there is
+/// one, so no recipient is told to click or open something that is not there.
+pub fn compose_invoice_sent(
+    org_name: &str,
+    contact_line: &str,
+    invoice_number: &str,
+    amount_due: &str,
+    due_date: &str,
+    portal_link: Option<&str>,
+    has_pdf: bool,
+) -> (String, String) {
+    let attached = if has_pdf {
+        format!("The invoice is attached as {invoice_number}.pdf.\n\n")
+    } else {
+        String::new()
+    };
+    let pay = match portal_link {
+        Some(link) => format!("Review the invoice and pay online here:\n\n{link}\n\n"),
+        None => String::new(),
+    };
+    let body = format!(
+        "{org_name} has sent you an invoice.\n\n\
+         Invoice: {invoice_number}\n\
+         Amount due: {amount_due}\n\
+         Due: {due_date}\n\n\
+         {attached}\
+         {pay}\
+         {contact_line}"
+    );
+    let subject = if portal_link.is_some() {
+        format!("Invoice {invoice_number} from {org_name} is ready to pay")
+    } else {
+        format!("Invoice {invoice_number} from {org_name}")
+    };
+    (subject, body)
+}
+
+/// Assemble a plain-text message carrying files (PMS-991): `multipart/mixed`
+/// with the text first and each attachment after it. Free, like
+/// [`build_message`], so a unit test can inspect the bytes.
+fn build_message_with_attachments(
+    from: &Mailbox,
+    to: Mailbox,
+    subject: &str,
+    text: &str,
+    attachments: &[EmailAttachment<'_>],
+) -> AppResult<Message> {
+    if attachments.is_empty() {
+        return build_message(from, to, subject, text, None);
+    }
+    let mut mixed = MultiPart::mixed().singlepart(SinglePart::plain(text.to_string()));
+    for attachment in attachments {
+        let content_type = ContentType::parse(attachment.mime).map_err(|e| {
+            AppError::Internal(format!(
+                "attachment {} has an unusable content type {}: {e}",
+                attachment.filename, attachment.mime
+            ))
+        })?;
+        mixed = mixed.singlepart(
+            Attachment::new(attachment.filename.to_string())
+                .body(attachment.bytes.to_vec(), content_type),
+        );
+    }
+    let msg = base_builder(from, to)
+        .subject(subject.to_string())
+        .multipart(mixed)?;
+    Ok(msg)
+}
+
 /// Assemble the outbound message. `html` decides the shape: `Some` yields a
 /// `multipart/alternative` carrying the plain text first and the HTML second,
 /// `None` a single-part plain-text body. Free function so a unit test can
@@ -431,6 +569,23 @@ impl Mailer for SmtpMailer {
             .map_err(|e| AppError::BadRequest(format!("Invalid recipient {to}: {e}")))?;
         reject_undeliverable_recipient(&to_mailbox)?;
         let msg = build_message(&self.from, to_mailbox, subject, text, html)?;
+        self.transport.send(msg).await?;
+        Ok(())
+    }
+
+    async fn send_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        attachments: &[EmailAttachment<'_>],
+    ) -> AppResult<()> {
+        let to_mailbox: Mailbox = to
+            .parse()
+            .map_err(|e| AppError::BadRequest(format!("Invalid recipient {to}: {e}")))?;
+        reject_undeliverable_recipient(&to_mailbox)?;
+        let msg =
+            build_message_with_attachments(&self.from, to_mailbox, subject, text, attachments)?;
         self.transport.send(msg).await?;
         Ok(())
     }
@@ -549,6 +704,18 @@ impl Mailer for SharedMailer {
         html: Option<&str>,
     ) -> AppResult<()> {
         self.current().send_multipart(to, subject, text, html).await
+    }
+
+    async fn send_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        attachments: &[EmailAttachment<'_>],
+    ) -> AppResult<()> {
+        self.current()
+            .send_with_attachments(to, subject, text, attachments)
+            .await
     }
 }
 
@@ -895,14 +1062,15 @@ mod tests {
     async fn the_invoice_email_names_the_organisation_and_how_to_reach_it() {
         let mailer = Capturing::default();
         mailer
-            .send_invoice_pay_now(
+            .send_invoice_sent(
                 "client@recipient.example",
                 contoso(),
-                InvoicePayNow {
+                InvoiceSent {
                     invoice_number: "INV-2050",
                     amount_due: "1200.00 USD",
                     due_date: "2026-09-30",
-                    portal_link: "http://portal.example/portal/invoices/1",
+                    portal_link: Some("http://portal.example/portal/invoices/1"),
+                    pdf: None,
                 },
             )
             .await
@@ -915,6 +1083,74 @@ mod tests {
             "the body opens by naming the sender:\n{body}"
         );
         assert!(body.ends_with(contoso().contact_line), "{body}");
+    }
+
+    /// PMS-991: the invoice is the message and the link is an extra. Without a
+    /// gateway there is no link and no "pay online" sentence to point at
+    /// nothing; without a document there is no "attached" sentence either.
+    #[test]
+    fn the_invoice_email_only_promises_what_it_carries() {
+        let (subject, body) = compose_invoice_sent(
+            "Contoso IT",
+            "Questions? Call us.",
+            "INV-1",
+            "50.00 USD",
+            "2026-09-30",
+            None,
+            false,
+        );
+        assert_eq!(subject, "Invoice INV-1 from Contoso IT");
+        assert!(!body.contains("pay online"), "{body}");
+        assert!(!body.contains("attached"), "{body}");
+        assert!(body.contains("Amount due: 50.00 USD"), "{body}");
+        assert!(body.ends_with("Questions? Call us."), "{body}");
+
+        let (subject, body) = compose_invoice_sent(
+            "Contoso IT",
+            "Questions? Call us.",
+            "INV-1",
+            "50.00 USD",
+            "2026-09-30",
+            Some("http://portal.example/portal/invoices/1"),
+            true,
+        );
+        assert_eq!(subject, "Invoice INV-1 from Contoso IT is ready to pay");
+        assert!(body.contains("attached as INV-1.pdf"), "{body}");
+        assert!(
+            body.contains("pay online here:\n\nhttp://portal.example/portal/invoices/1"),
+            "{body}"
+        );
+    }
+
+    /// PMS-991: the SMTP shape. A message with a file is `multipart/mixed`
+    /// with the text first and the file as a named, typed attachment; one
+    /// without a file is the plain message it always was.
+    #[test]
+    fn a_message_with_a_file_is_multipart_mixed() {
+        let to: Mailbox = "client@recipient.example".parse().unwrap();
+        let bytes = b"%PDF-1.3 not really".to_vec();
+        let msg = build_message_with_attachments(
+            &test_from(),
+            to.clone(),
+            "Invoice INV-1",
+            "Hello",
+            &[EmailAttachment {
+                filename: "INV-1.pdf",
+                mime: "application/pdf",
+                bytes: &bytes,
+            }],
+        )
+        .unwrap();
+        let raw = String::from_utf8(msg.formatted()).unwrap();
+        assert!(raw.contains("multipart/mixed"), "{raw}");
+        assert!(raw.contains("application/pdf"), "{raw}");
+        assert!(raw.contains("INV-1.pdf"), "{raw}");
+        assert!(raw.contains("Hello"), "{raw}");
+
+        let plain = build_message_with_attachments(&test_from(), to, "Invoice INV-1", "Hello", &[])
+            .unwrap();
+        let raw = String::from_utf8(plain.formatted()).unwrap();
+        assert!(!raw.contains("multipart"), "{raw}");
     }
 
     /// PMS-761: the account-security emails are mokosh speaking to its own

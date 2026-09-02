@@ -58,6 +58,11 @@ pub struct TestApp {
     /// rows). `#[allow(dead_code)]` for the same per-binary reason as `pool`.
     #[allow(dead_code)]
     pub app_pool: Option<PgPool>,
+    /// PMS-991: the swappable mailer the router was built with, so a suite
+    /// can `swap` in a capturing one and assert on what the API sent.
+    /// `#[allow(dead_code)]` for the same per-binary reason as `pool`.
+    #[allow(dead_code)]
+    pub mailer: Arc<SharedMailer>,
 }
 
 impl TestApp {
@@ -317,6 +322,7 @@ async fn boot_with_db(
     // create_api_router now takes the swappable handle (PMS-638); wrap the
     // test LogMailer so the signature matches. Tests never swap it.
     let mailer = Arc::new(SharedMailer::new(Arc::new(LogMailer)));
+    let mailer_handle = mailer.clone();
     let encryption_key = [0u8; 32];
     // PMS-968: the database backend under the same zero key the router is
     // given, so a suite that stores a gateway credential can read it back.
@@ -387,6 +393,7 @@ async fn boot_with_db(
         client,
         pool,
         app_pool,
+        mailer: mailer_handle,
     }
 }
 
