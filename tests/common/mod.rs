@@ -75,18 +75,59 @@ impl TestApp {
 /// `common::` and not every one seeds a company.
 #[allow(dead_code)]
 pub async fn seed_company(pool: &PgPool) -> Uuid {
+    seed_company_named(pool, "Acme Co").await
+}
+
+/// `idx_companies_tenant_name_unique` is on `(tenant_id, lower(btrim(name)))`,
+/// so a test needing a second company has to name it.
+#[allow(dead_code)]
+pub async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO companies (id, tenant_id, name)
-        VALUES ($1, $2, 'Acme Co')
+        VALUES ($1, $2, $3)
         "#,
     )
     .bind(id)
     .bind(DEFAULT_TENANT_ID)
+    .bind(name)
     .execute(pool)
     .await
     .expect("seed test company");
+    id
+}
+
+/// PMS-993: seed a contact of `company_id` and make it the company's billing
+/// contact. An invoice cannot reach `sent` without one, so every fixture that
+/// sends has to point its company at somebody. Returns the contact id.
+///
+/// Deliberately NOT folded into `seed_company`: that helper has call sites in
+/// most test binaries and several of them assert a company's contact count.
+#[allow(dead_code)]
+pub async fn seed_billing_contact(pool: &PgPool, company_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO contacts (
+            id, tenant_id, company_id, first_name, last_name, email, contact_type
+        )
+        VALUES ($1, $2, $3, 'Billing', 'Contact', $4, 'billing')
+        "#,
+    )
+    .bind(id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(format!("billing.{id}@example.com"))
+    .execute(pool)
+    .await
+    .expect("seed billing contact");
+    sqlx::query("UPDATE companies SET default_billing_contact_id = $1 WHERE id = $2")
+        .bind(id)
+        .bind(company_id)
+        .execute(pool)
+        .await
+        .expect("point company at its billing contact");
     id
 }
 

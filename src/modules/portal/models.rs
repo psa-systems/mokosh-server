@@ -33,6 +33,12 @@ pub struct CurrentContact {
     pub email: String,
     pub first_name: String,
     pub last_name: String,
+    /// PMS-993: whether this contact is `company_id`'s billing contact, and so
+    /// holds the billing role for this session. Read from the row on every
+    /// request rather than minted into the JWT, so revoking the role takes
+    /// effect on the next request instead of the next login (and so the
+    /// PMS-195 claim-minimisation posture is unchanged).
+    pub is_billing_contact: bool,
 }
 
 impl CurrentContact {
@@ -168,6 +174,10 @@ pub struct PortalContactSnapshot {
     /// column's default, and every row that predates the migration) means the
     /// contact has never signed out, so nothing is revoked.
     pub tokens_valid_from: Option<DateTime<Utc>>,
+    /// PMS-993: whether this contact is the billing contact of the company in
+    /// the token's `cid` claim. Rides along in the same read for the same
+    /// reason the cutoff does.
+    pub is_billing_contact: bool,
 }
 
 impl PortalContactSnapshot {
@@ -195,6 +205,7 @@ mod tests {
             first_name: "Portal".to_string(),
             last_name: "Contact".to_string(),
             tokens_valid_from: cutoff,
+            is_billing_contact: false,
         }
     }
 

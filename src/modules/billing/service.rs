@@ -326,6 +326,65 @@ impl BillingService {
         Ok(())
     }
 
+    /// PMS-993: the company's billing contact, the invoice recipient of record.
+    ///
+    /// `companies.default_billing_contact_id` is the single carrier: it is
+    /// per-company by construction, so "exactly one billing contact per
+    /// company" needs no uniqueness rule of its own and reassigning it demotes
+    /// the previous holder in the same write.
+    async fn resolve_company_billing_contact(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Option<Uuid>> {
+        let found: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(found.flatten())
+    }
+
+    /// Validate that `contact_id` is a contact of `company_id` in the caller's
+    /// tenant (PMS-993). `invoices.billing_contact_id` was bound straight from
+    /// the request at every write with no check at all, and FK checks bypass
+    /// RLS, so a caller could address an invoice to another tenant's contact:
+    /// the PMS-333 hole that `assert_payment_term_in_tenant` closes next door.
+    ///
+    /// Membership accepts either carrier, because both are live: the legacy
+    /// `contacts.company_id` scalar (which PMS-806 keeps as the mirror of the
+    /// primary link) and a `contact_companies` row for a contact who works at
+    /// several companies.
+    async fn assert_billing_contact_for_company(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        let found: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM contacts c \
+             WHERE c.tenant_id = $1 AND c.id = $3 \
+               AND (c.company_id = $2 \
+                    OR EXISTS(SELECT 1 FROM contact_companies l \
+                              WHERE l.tenant_id = $1 AND l.contact_id = c.id \
+                                AND l.company_id = $2)))",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !found {
+            return Err(AppError::BadRequest(
+                "billing_contact_id does not reference a contact of this company".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve a set of payment-term ids to their names, tenant-scoped
     /// (PMS-333). Lets `enrich_invoices` attach `payment_term_name` without a
     /// per-row round-trip.
@@ -577,6 +636,26 @@ impl BillingService {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
 
+        // PMS-993: an explicit recipient is checked, an absent one falls back
+        // to the company's billing contact, so a draft carries who it is for
+        // from the moment it is created rather than only at send.
+        let billing_contact_id = match request.billing_contact_id {
+            Some(contact_id) => {
+                Self::assert_billing_contact_for_company(
+                    &mut tx,
+                    tenant_id,
+                    request.company_id,
+                    contact_id,
+                )
+                .await?;
+                Some(contact_id)
+            }
+            None => {
+                Self::resolve_company_billing_contact(&mut tx, tenant_id, request.company_id)
+                    .await?
+            }
+        };
+
         let invoice_id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -595,7 +674,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
         .bind(request.due_date)
@@ -841,6 +920,24 @@ impl BillingService {
             .due_date
             .unwrap_or_else(|| invoice_date + chrono::Duration::days(30));
 
+        // PMS-993: same recipient rule as `create_invoice`.
+        let billing_contact_id = match request.billing_contact_id {
+            Some(contact_id) => {
+                Self::assert_billing_contact_for_company(
+                    &mut tx,
+                    tenant_id,
+                    request.company_id,
+                    contact_id,
+                )
+                .await?;
+                Some(contact_id)
+            }
+            None => {
+                Self::resolve_company_billing_contact(&mut tx, tenant_id, request.company_id)
+                    .await?
+            }
+        };
+
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
         sqlx::query(
@@ -859,7 +956,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(invoice_date)
         .bind(due_date)
@@ -1218,6 +1315,19 @@ impl BillingService {
         // so numbers stay gapless.
         let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
+        // PMS-993: this insert hard-coded NULL, so a recurring draft could
+        // never resolve a recipient and the sweep produced invoices nobody
+        // could send. The sweep runs cross-tenant from the worker, so the
+        // company's billing contact is the only recipient available here.
+        let billing_contact_id =
+            Self::resolve_company_billing_contact(&mut tx, tenant_id, company_id).await?;
+        if billing_contact_id.is_none() {
+            tracing::warn!(
+                target: "mokosh_server.billing", tenant = %tenant_id, company = %company_id,
+                "recurring invoice created with no billing contact; it cannot be sent",
+            );
+        }
+
         sqlx::query(
             r#"
             INSERT INTO invoices (
@@ -1226,7 +1336,7 @@ impl BillingService {
                 subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number
             )
-            VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
+            VALUES ($1, $2, $3, $4, $13, $5, 'draft', $6, $7, 'net30', $8, $9,
                     $10, $11, 0, $11, 'USD', $12, NULL)
             "#,
         )
@@ -1244,6 +1354,7 @@ impl BillingService {
         .bind(format!(
             "Recurring billing for {period_start} to {period_end}"
         ))
+        .bind(billing_contact_id)
         .execute(&mut *tx)
         .await?;
 
@@ -2664,9 +2775,13 @@ impl BillingService {
         let total = subtotal + tax - discount;
         let balance_due = total - amount_paid;
 
-        // `sent_at` is stamped when the status first moves to `sent`.
+        // `sent_at` is stamped when the status first moves to `sent`. PMS-993:
+        // that transition is now named once and reused, because the recipient
+        // guard, the issuer freeze and the pay-now hook all key off it and a
+        // fourth copy of the condition is a fourth chance to drift.
         let status = request.status.unwrap_or(locked_status);
-        let sent_at = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none() {
+        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
+        let sent_at = if just_sent {
             Some(Utc::now())
         } else {
             current.sent_at
@@ -2675,14 +2790,46 @@ impl BillingService {
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
+        if let Some(contact_id) = request.billing_contact_id {
+            Self::assert_billing_contact_for_company(
+                &mut tx,
+                tenant_id,
+                current.company_id,
+                contact_id,
+            )
+            .await?;
+        }
+
+        // PMS-993: an invoice cannot be sent to nobody. On the first send,
+        // settle the recipient here and WRITE it below, because the UPDATE
+        // COALESCEs `$2` over the stored value and a `{"status":"sent"}` body
+        // carries no `billing_contact_id`: resolving without binding would pass
+        // the guard and still leave the row NULL, which is the defect this
+        // guard exists to close. Placed before `freeze_issuer` and the issued
+        // document, so a refused send leaves no frozen issuer and no document.
+        let recipient = if just_sent {
+            let mut resolved = request.billing_contact_id.or(current.billing_contact_id);
+            if resolved.is_none() {
+                resolved =
+                    Self::resolve_company_billing_contact(&mut tx, tenant_id, current.company_id)
+                        .await?;
+            }
+            if resolved.is_none() {
+                return Err(AppError::Conflict(
+                    "Invoice cannot be sent: this company has no billing contact".to_string(),
+                ));
+            }
+            resolved
+        } else {
+            request.billing_contact_id
+        };
 
         // PMS-911: the MSP's identity as it stands right now, frozen onto the
         // invoice on the transition that freezes the invoice. In this
         // transaction and not in the `just_sent` hook below it, because that
         // hook is post-commit and best-effort: an invoice must never freeze
         // carrying no identity.
-        let issuer_snapshot = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none()
-        {
+        let issuer_snapshot = if just_sent {
             Some(Self::freeze_issuer(&mut tx, tenant_id).await?)
         } else {
             None
@@ -2715,7 +2862,7 @@ impl BillingService {
             "#,
         )
         .bind(invoice_id)
-        .bind(request.billing_contact_id)
+        .bind(recipient)
         .bind(request.contract_id)
         .bind(request.invoice_date)
         .bind(request.due_date)
@@ -2799,7 +2946,6 @@ impl BillingService {
         // undo the status change. No-op unless this instance carries a mailer
         // (agent-facing only), the invoice actually just moved to `sent`, and
         // the tenant has an active payment gateway.
-        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
         if just_sent {
             self.notify_invoice_pay_now(tenant_id, invoice_id).await;
         }
@@ -2929,7 +3075,14 @@ impl BillingService {
                 return;
             }
         };
+        // PMS-993: `update_invoice` refuses the send transition without a
+        // recipient and writes the resolved one, so reaching here with none
+        // means the guard was bypassed. Loud, not a silent return.
         let Some(contact_id) = invoice.billing_contact_id else {
+            tracing::warn!(
+                target: "mokosh_server.billing", invoice = %invoice_id,
+                "pay-now email: sent invoice has no billing contact; not sending",
+            );
             return;
         };
         let email = match self.billing_contact_email(tenant_id, contact_id).await {
