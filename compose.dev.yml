@@ -255,6 +255,10 @@ services:
       # need two names.
       INFISICAL_ADDRESS: ${MOKOSH_SERVER_INFISICAL_ADDRESS:-}
       INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}
+      # PMS-967: `database` (the default) or `infisical`. The `:-` default
+      # reproduces the code's own fallback in SecretsConfig::from_env, so an
+      # unset variable behaves the same here as it does in production.
+      SECRET_BACKEND: ${SECRET_BACKEND:-database}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
       INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}
