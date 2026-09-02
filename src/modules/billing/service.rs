@@ -37,16 +37,29 @@ pub struct BillingService {
     /// PMS-711: SPA/portal origin the "Pay Now" email links point at. `None`
     /// disables the email (no base to build the link from).
     portal_origin: Option<String>,
+    /// PMS-968: where a tenant's gateway credentials live. Injected rather than
+    /// built here, so the backend is chosen once at startup by
+    /// `secrets::store_from_env` and no constructor can pick a different one.
+    secrets: Arc<dyn crate::secrets::SecretStore>,
 }
 
 impl BillingService {
+    /// Zero-key constructor for callers that never touch secret material (the
+    /// QA seeder). Its secret store is the database one under the same zero
+    /// key, so the two halves agree; nothing on that path reads a gateway
+    /// credential.
     pub fn new(db: Database) -> Self {
+        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+            db.clone(),
+            [0u8; 32],
+        ));
         Self {
             db,
             encryption_key: [0u8; 32],
             http: reqwest::Client::new(),
             mailer: None,
             portal_origin: None,
+            secrets,
         }
     }
 
@@ -377,12 +390,32 @@ impl BillingService {
     /// payment-gateway-config write path so secrets never hit the DB
     /// in cleartext.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
+        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+            db.clone(),
+            encryption_key,
+        ));
+        Self::with_secrets(db, encryption_key, secrets)
+    }
+
+    /// PMS-968: the constructor that takes the configured secret store.
+    ///
+    /// `with_encryption_key` keeps the database backend, which is correct for
+    /// the callers that have no configuration to consult (tests, the seeder).
+    /// Every serving instance is built through here from
+    /// `secrets::store_from_env`, so a deployment on Infisical has all of them
+    /// on Infisical rather than whichever ones remembered.
+    pub fn with_secrets(
+        db: Database,
+        encryption_key: [u8; 32],
+        secrets: Arc<dyn crate::secrets::SecretStore>,
+    ) -> Self {
         Self {
             db,
             encryption_key,
             http: reqwest::Client::new(),
             mailer: None,
             portal_origin: None,
+            secrets,
         }
     }
 
@@ -396,6 +429,7 @@ impl BillingService {
         encryption_key: [u8; 32],
         mailer: Arc<dyn Mailer>,
         portal_origin: String,
+        secrets: Arc<dyn crate::secrets::SecretStore>,
     ) -> Self {
         Self {
             db,
@@ -403,6 +437,7 @@ impl BillingService {
             http: reqwest::Client::new(),
             mailer: Some(mailer),
             portal_origin: Some(portal_origin),
+            secrets,
         }
     }
 
@@ -1607,7 +1642,11 @@ impl BillingService {
                 provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
-                configured: !r.config_encrypted.is_empty(),
+                // PMS-968: NULL means the credential is in the secret store,
+                // so the row is configured. Non-NULL and non-empty is the
+                // pre-move state and equally configured. Only an empty string
+                // would not be, and nothing writes one.
+                configured: r.config_encrypted.as_ref().is_none_or(|c| !c.is_empty()),
             })
             .collect();
 
@@ -1647,19 +1686,31 @@ impl BillingService {
             )));
         }
 
-        // Encrypt only when the caller supplied a new config; `None` means
-        // "keep the existing secret" (write-only update semantics, PMS-342).
-        let encrypted = match request.config.as_ref() {
+        // PMS-968: a supplied credential goes to the configured secret store,
+        // and the row records only that it is there. `None` still means "keep
+        // the existing secret" (write-only update semantics, PMS-342).
+        //
+        // The store write happens BEFORE the row is touched, and that order is
+        // load-bearing. The two are not one transaction, because the store may
+        // be Infisical, so one of them can succeed alone. Store-first fails as
+        // an orphaned secret with the row still holding whatever it held, which
+        // keeps working; row-first fails as a row claiming its credential is in
+        // a store that never received it, which is an integration that cannot
+        // charge and cannot say why. Same rule as PMS-960's mover: the record
+        // follows the thing it describes.
+        let stored_in_secret_store = match request.config.as_ref() {
             Some(config) => {
                 let plaintext = serde_json::to_string(config).map_err(|e| {
                     AppError::BadRequest(format!("Config must serialise to JSON: {e}"))
                 })?;
-                Some(crate::utils::crypto::encrypt(
-                    &plaintext,
-                    &self.encryption_key,
-                )?)
+                let key = crate::secrets::SecretKey::payment_gateway(
+                    tenant_id.get(),
+                    request.provider.as_str(),
+                );
+                self.secrets.put(&key, &plaintext).await?;
+                true
             }
-            None => None,
+            None => false,
         };
 
         // Mutation + audit row in one transaction. PMS-117. The secret
@@ -1683,10 +1734,10 @@ impl BillingService {
             AuditAction::Create
         };
 
-        // A brand-new gateway must carry a config: `config_encrypted` is NOT
-        // NULL, and there is no existing secret to preserve.
-        let id: Uuid = match encrypted.as_ref() {
-            Some(encrypted) => {
+        // A brand-new gateway must carry a config: there is no existing secret
+        // to preserve.
+        let id: Uuid = if stored_in_secret_store {
+            {
                 sqlx::query_scalar(
                     r#"
                     INSERT INTO payment_gateway_configs
@@ -1704,11 +1755,14 @@ impl BillingService {
                 .bind(request.provider.as_str())
                 .bind(request.is_active)
                 .bind(request.is_test_mode)
-                .bind(encrypted)
+                // NULL: the credential is in the secret store now, at the
+                // address this row's own (tenant_id, provider) gives.
+                .bind(Option::<String>::None)
                 .fetch_one(&mut *tx)
                 .await?
             }
-            None => {
+        } else {
+            {
                 if before.is_none() {
                     return Err(AppError::BadRequest(
                         "Config is required when first configuring a gateway".to_string(),
@@ -1797,6 +1851,20 @@ impl BillingService {
             .execute(&mut *tx)
             .await?;
 
+        // PMS-968: the credential goes with the row. Deleting the row and
+        // leaving the secret would keep a disconnected tenant's live API key in
+        // the store indefinitely, and a later reconnect would silently inherit
+        // it. This runs after the DELETE, matching `SecretStore::delete` being
+        // best-effort: the row is the thing that points at the secret, so a
+        // secret with no row is orphaned rather than dangerous, whereas a row
+        // whose secret is already gone cannot serve a payment.
+        self.secrets
+            .delete(&crate::secrets::SecretKey::payment_gateway(
+                tenant_id.get(),
+                provider.as_str(),
+            ))
+            .await?;
+
         if let Some((id, before)) = row {
             audit_write(
                 &mut *tx,
@@ -1818,15 +1886,50 @@ impl BillingService {
     // PMS-711: Stripe "Pay Now" - checkout sessions + webhook reconciliation.
     // ========================================================================
 
-    /// Decrypt a stored `payment_gateway_configs.config_encrypted` blob and
-    /// build the provider it names. The plaintext never leaves this function
-    /// as data returned to a client (PMS-342).
-    fn build_provider(
+    /// Recover a gateway's credential, from wherever this row keeps it.
+    ///
+    /// PMS-968: a non-NULL `config_encrypted` is the pre-move state and is
+    /// decrypted here; NULL means the credential is in the secret store, at the
+    /// address the row's own `(tenant_id, provider)` gives. Both states are
+    /// live at once on a deployment the mover has not finished, which is the
+    /// point of keeping them distinguishable.
+    ///
+    /// A NULL column with nothing in the store is a hard error and never a
+    /// missing-gateway `None`. The row asserts a credential exists; if it does
+    /// not, something moved half-way, and answering "not configured" would turn
+    /// that into a payment integration that silently switched itself off.
+    async fn gateway_plaintext(
         &self,
+        tenant_id: Uuid,
         provider_id: &str,
-        config_encrypted: &str,
+        config_encrypted: Option<String>,
+    ) -> AppResult<String> {
+        match config_encrypted {
+            Some(ciphertext) => crate::utils::crypto::decrypt(&ciphertext, &self.encryption_key),
+            None => {
+                let key = crate::secrets::SecretKey::payment_gateway(tenant_id, provider_id);
+                self.secrets.get(&key).await?.ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "gateway {provider_id:?} says its credential is in the secret store, but the store has none"
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Build the provider a resolved row names.
+    ///
+    /// The plaintext never leaves this function as data returned to a client
+    /// (PMS-342).
+    async fn build_provider(
+        &self,
+        tenant_id: Uuid,
+        provider_id: &str,
+        config_encrypted: Option<String>,
     ) -> AppResult<Box<dyn PaymentProvider>> {
-        let plaintext = crate::utils::crypto::decrypt(config_encrypted, &self.encryption_key)?;
+        let plaintext = self
+            .gateway_plaintext(tenant_id, provider_id, config_encrypted)
+            .await?;
         provider::build(provider_id, &plaintext, self.http.clone())
     }
 
@@ -1843,8 +1946,10 @@ impl BillingService {
     /// from, so it is refused. It is unreachable today, because `SUPPORTED`
     /// holds one entry; PMS-969 is what makes it reachable, and enforcing one
     /// active gateway per tenant at write time belongs with that change.
-    fn select_serveable(rows: Vec<(String, String)>) -> AppResult<Option<(String, String)>> {
-        let mut serveable: Vec<(String, String)> = rows
+    fn select_serveable(
+        rows: Vec<(String, Option<String>)>,
+    ) -> AppResult<Option<(String, Option<String>)>> {
+        let mut serveable: Vec<(String, Option<String>)> = rows
             .into_iter()
             .filter(|(id, _)| provider::is_supported(id))
             .collect();
@@ -1872,7 +1977,7 @@ impl BillingService {
         tenant_id: TenantId,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT provider, config_encrypted FROM payment_gateway_configs \
              WHERE tenant_id = $1 AND is_active = TRUE",
         )
@@ -1880,7 +1985,7 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
         match Self::select_serveable(rows)? {
-            Some((id, enc)) => Ok(Some(self.build_provider(&id, &enc)?)),
+            Some((id, enc)) => Ok(Some(self.build_provider(tenant_id.into(), &id, enc).await?)),
             None => Ok(None),
         }
     }
@@ -1920,7 +2025,7 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT provider, config_encrypted FROM payment_gateway_configs \
              WHERE tenant_id = $1 AND is_active = TRUE",
         )
@@ -1928,7 +2033,7 @@ impl BillingService {
         .fetch_all(self.db.migrator_pool())
         .await?;
         match Self::select_serveable(rows)? {
-            Some((id, enc)) => Ok(Some(self.build_provider(&id, &enc)?)),
+            Some((id, enc)) => Ok(Some(self.build_provider(tenant_id, &id, enc).await?)),
             None => Ok(None),
         }
     }
@@ -4268,7 +4373,7 @@ struct PaymentGatewayRow {
     provider: String,
     is_active: bool,
     is_test_mode: bool,
-    config_encrypted: String,
+    config_encrypted: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -4806,8 +4911,11 @@ impl From<ProductRow> for ProductResponse {
 mod gateway_resolution {
     use super::*;
 
-    fn row(provider: &str) -> (String, String) {
-        (provider.to_string(), format!("ciphertext-for-{provider}"))
+    fn row(provider: &str) -> (String, Option<String>) {
+        (
+            provider.to_string(),
+            Some(format!("ciphertext-for-{provider}")),
+        )
     }
 
     /// The property that makes PMS-966 a refactor rather than a change: a
@@ -4845,7 +4953,8 @@ mod gateway_resolution {
         // Constructed from `SUPPORTED` rather than from two hard-coded names,
         // so this keeps testing the ambiguity once a second provider lands
         // instead of quietly becoming unreachable.
-        let mut rows: Vec<(String, String)> = provider::SUPPORTED.iter().map(|p| row(p)).collect();
+        let mut rows: Vec<(String, Option<String>)> =
+            provider::SUPPORTED.iter().map(|p| row(p)).collect();
         if rows.len() < 2 {
             rows.push(row(provider::SUPPORTED[0]));
         }

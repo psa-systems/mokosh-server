@@ -1,0 +1,30 @@
+-- PMS-968: let a gateway row say "my credential is not here".
+--
+-- `payment_gateway_configs.config_encrypted` has been NOT NULL since migration
+-- 010, holding AES-256-GCM ciphertext under the host `ENCRYPTION_KEY`. PMS-967
+-- built `crate::secrets`, which puts that decision in one place and lets an
+-- operator choose Infisical instead. This is the column change that lets a row
+-- point at it.
+--
+-- NULL means "the credential lives in the secret store"; a non-NULL value means
+-- it is still here and has not been moved yet. Those are the only two states,
+-- and they are distinguishable, which is the whole point: a row mid-migration
+-- keeps working off its own ciphertext, and the mover can find exactly the rows
+-- that still need it with `WHERE config_encrypted IS NOT NULL`.
+--
+-- NULL rather than an empty string, for the reason migration 131 gave for the
+-- other direction: "present but blank" is a third state somebody has to
+-- interpret, and every reader would have to remember to treat `''` as absent.
+--
+-- There is no reference column, deliberately. The secret's address is
+-- `SecretKey::payment_gateway(tenant_id, provider)`, and both halves are
+-- already on this row and already unique together. Storing a derived string
+-- beside them would be a second source of truth for where the credential is,
+-- and the failure it invites is a row whose reference and whose identity
+-- disagree.
+--
+-- The column is NOT dropped. A deployment that has not finished moving still
+-- reads it, and dropping the fallback in the same change that introduces the
+-- move would leave a half-migrated database with no way back.
+
+ALTER TABLE payment_gateway_configs ALTER COLUMN config_encrypted DROP NOT NULL;

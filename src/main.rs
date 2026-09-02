@@ -505,6 +505,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
+    // PMS-968: the secret store, built once for the whole process. A
+    // misconfigured backend ends startup here rather than surfacing when a
+    // customer tries to pay. Built before the scheduler because the credential
+    // mover needs it, and shared with the router below so every reader of a
+    // gateway credential is looking in the same place.
+    let secrets = mokosh_server::secrets::store_from_env(db.clone(), encryption_key)
+        .expect("secret store configuration");
+
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw
@@ -579,6 +587,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::knowledge_base::KbAttachmentMover::new(db.clone());
     scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
 
+    // PMS-968: one-shot move of pre-existing gateway credentials into the
+    // configured secret store. The scheduler fires every job once at startup,
+    // so an hour gives the one-shot behaviour plus a retry if the store was
+    // briefly unreachable, and once the move is done the tick is one query
+    // returning no rows.
+    let gateway_credential_mover = mokosh_server::modules::billing::GatewayCredentialMover::new(
+        db.clone(),
+        secrets.clone(),
+        encryption_key,
+    );
+    scheduler.register(
+        gateway_credential_mover,
+        std::time::Duration::from_secs(3600),
+    );
+
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
@@ -641,6 +664,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.abuse_contact_email,
         config.public_api_base_url,
         config.deployment_mode,
+        secrets.clone(),
     );
     let router = psa_router;
 

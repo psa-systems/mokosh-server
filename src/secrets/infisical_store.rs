@@ -95,9 +95,9 @@ pub struct InfisicalSecretStore {
 }
 
 impl InfisicalSecretStore {
-    pub async fn new(config: InfisicalSecretsConfig) -> AppResult<Self> {
+    pub fn new(config: InfisicalSecretsConfig) -> AppResult<Self> {
         let client =
-            InfisicalClient::new(&config.address, &config.client_id, &config.client_secret).await?;
+            InfisicalClient::connect(&config.address, &config.client_id, &config.client_secret)?;
         Ok(Self {
             client: Arc::new(client),
             project_id: config.project_id,
@@ -107,8 +107,8 @@ impl InfisicalSecretStore {
         })
     }
 
-    pub async fn from_env() -> AppResult<Self> {
-        Self::new(InfisicalSecretsConfig::from_env()?).await
+    pub fn from_env() -> AppResult<Self> {
+        Self::new(InfisicalSecretsConfig::from_env()?)
     }
 
     /// Drop a cached entry so the next read goes to Infisical.

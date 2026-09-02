@@ -59,6 +59,16 @@ impl InfisicalClient {
         client_id: &str,
         client_secret: &str,
     ) -> Result<Self, AppError> {
+        Self::connect(base_url, client_id, client_secret)
+    }
+
+    /// The same construction without the `async`.
+    ///
+    /// Nothing here awaits: authentication happens on the first API call, so
+    /// `new` was only ever async by signature. PMS-968 needs a client from
+    /// `create_api_router`, which is sync, so the body moved here and `new`
+    /// delegates rather than every existing caller changing.
+    pub fn connect(base_url: &str, client_id: &str, client_secret: &str) -> Result<Self, AppError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()

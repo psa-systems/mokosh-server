@@ -270,6 +270,28 @@ impl SecretsConfig {
     }
 }
 
+/// Build the store this deployment is configured for.
+///
+/// The ONE place a `SecretBackend` becomes a `SecretStore`, so no construction
+/// site can pick a backend of its own. It is fallible and sync on purpose:
+/// callers build it once at startup where a `Result` can end the process, which
+/// is what makes "a half-configured deployment fails at boot rather than when a
+/// customer tries to pay" true rather than aspirational.
+pub fn store_from_env(
+    db: crate::db::Database,
+    encryption_key: [u8; 32],
+) -> AppResult<std::sync::Arc<dyn SecretStore>> {
+    let config = SecretsConfig::from_env()?;
+    let store: std::sync::Arc<dyn SecretStore> = match config.backend {
+        SecretBackend::Database => {
+            std::sync::Arc::new(DatabaseSecretStore::new(db, encryption_key))
+        }
+        SecretBackend::Infisical => std::sync::Arc::new(InfisicalSecretStore::from_env()?),
+    };
+    tracing::info!(backend = config.backend.as_str(), "secret store selected");
+    Ok(store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

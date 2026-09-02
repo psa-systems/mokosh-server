@@ -754,14 +754,33 @@ async fn payment_gateway_secret_is_write_only(pool: PgPool) {
         "a stored gateway reports configured = true"
     );
 
-    // Capture the encrypted secret as stored, to prove a metadata-only update
-    // leaves it untouched.
-    let secret_before: String = sqlx::query_scalar(
+    // PMS-968: the credential is in the secret store now, not in the row. The
+    // column being NULL is what says so, and the ciphertext lives in `secrets`
+    // under the key the row's own (tenant_id, provider) gives.
+    let column: Option<String> = sqlx::query_scalar(
         "SELECT config_encrypted FROM payment_gateway_configs WHERE provider = 'stripe'",
     )
     .fetch_one(&app.pool)
     .await
+    .expect("read gateway column");
+    assert!(
+        column.is_none(),
+        "a credential written through the API lives in the secret store, not the row"
+    );
+
+    // Capture the stored secret, to prove a metadata-only update leaves it
+    // untouched. Still ciphertext at rest: the database backend encrypts with
+    // the same host key the column used to.
+    let secret_before: String = sqlx::query_scalar(
+        "SELECT value_encrypted FROM secrets WHERE name LIKE 'PAYMENT_GATEWAY%'",
+    )
+    .fetch_one(&app.pool)
+    .await
     .expect("read stored secret");
+    assert!(
+        !secret_before.contains(SECRET),
+        "the stored secret must be ciphertext, not the plaintext"
+    );
 
     // 2. `GET /payment-gateways` exposes metadata but never the secret.
     let resp = app
@@ -811,16 +830,22 @@ async fn payment_gateway_secret_is_write_only(pool: PgPool) {
         resp.status()
     );
 
-    let (secret_after, is_active_after, is_test_after): (String, bool, bool) = sqlx::query_as(
-        "SELECT config_encrypted, is_active, is_test_mode \
+    let (is_active_after, is_test_after): (bool, bool) = sqlx::query_as(
+        "SELECT is_active, is_test_mode \
          FROM payment_gateway_configs WHERE provider = 'stripe'",
     )
     .fetch_one(&app.pool)
     .await
     .expect("read gateway after metadata update");
+    let secret_after: String = sqlx::query_scalar(
+        "SELECT value_encrypted FROM secrets WHERE name LIKE 'PAYMENT_GATEWAY%'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("read stored secret after metadata update");
     assert_eq!(
         secret_after, secret_before,
-        "a config-less update must preserve the stored encrypted secret"
+        "a config-less update must preserve the stored secret, wherever it lives"
     );
     assert!(
         !is_active_after,
