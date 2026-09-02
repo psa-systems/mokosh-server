@@ -346,3 +346,36 @@ async fn the_credit_note_pdf_is_finance_gated(pool: PgPool) {
         "the gate answers before the lookup, so an unknown id is still 403"
     );
 }
+
+/// PMS-990: the preview IS the document. A draft renders live and stores
+/// nothing; the send renders once more and stores that. Because `pdf::render`
+/// is a pure function of the document (PMS-911 made it byte-deterministic)
+/// and the branding is the same at both moments, the bytes an operator
+/// previewed are the bytes the client receives. Nothing here regenerates on
+/// edit or freezes on finalize as a mechanism: a live render plus a store at
+/// send already has that shape, and this pins that the two agree.
+#[sqlx::test]
+async fn a_draft_preview_is_byte_identical_to_the_document_stored_at_send(pool: PgPool) {
+    install_test_attachment_env();
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let invoice_id = draft_invoice(&app, &token, company_id).await;
+    let (status, preview) = pdf(&app, &token, &format!("/api/v1/invoices/{invoice_id}/pdf")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !document_path(&invoice_id).exists(),
+        "a draft preview stores nothing"
+    );
+
+    send_invoice(&app, &token, &invoice_id).await;
+    let stored = std::fs::read(document_path(&invoice_id)).expect("the document stored at send");
+    assert_eq!(
+        preview, stored,
+        "the previewed draft and the stored document differ"
+    );
+    let (_, served) = pdf(&app, &token, &format!("/api/v1/invoices/{invoice_id}/pdf")).await;
+    assert_eq!(served, stored, "the route serves the stored bytes");
+}
